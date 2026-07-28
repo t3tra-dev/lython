@@ -455,6 +455,28 @@ bool ownershipConsumingUseInvalidatesGroup(FuncContractCache &contracts,
          callConsumesTrackedHeader(contracts, call, group, aliases);
 }
 
+// AN AGGREGATE RELEASE CANNOT BE A LOCAL TOKEN'S DEATH. `aggregate_release`
+// marks the discharge of an `aggregate(parent, path)` resource -- a slot's or a
+// literal source's token, owned by the container (rfc/memory-safety-proof.md,
+// Aggregates). When the walked group is a retain-rooted owned-local marker
+// (own::ownedLocalMarkerIsRetainRooted) the object carries BOTH that token and
+// the one the retain minted, and they alias, so counting the aggregate release
+// as this token's death leaves the mint with no release at all: one element
+// object leaked per execution of every container literal whose element is read
+// back (`ys = [99]; total += ys[0]`, 64 B/iteration, unbounded).
+//
+// Why NOT treat every foreign-named consume that way (measured, 2026-07-28): a
+// BARE release names some local token and this walk cannot tell which, so the
+// only safe reading is "this one". Skipping bare ones too aborted
+// `golden.cases.dict_methods_complete` with `Ly_DecRef observed non-positive
+// refcount` -- shapes where the mint's release is already placed under the
+// head's advanced lanes got a second one. The narrow rule's failure direction is
+// a bounded leak on paths where a bare release is the only competing consume;
+// the wide rule's is a double free.
+bool consumeIsAggregateRelease(mlir::OpOperand &use) {
+  return use.getOwner()->hasAttr(own::kAggregateReleaseAttr);
+}
+
 mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
   if (!lhs)
     return rhs;
@@ -587,12 +609,17 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
   return current;
 }
 
+// `ownNamesOnlyConsume`: see `consumeIsAggregateRelease`. When set, an AGGREGATE
+// release reached through an alias rather than through one of the group's own
+// names does not end this token -- it discharges the container's -- and counts
+// only as liveness here. Bare releases still end it either way.
 std::optional<ReleaseInsertion>
 findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
                      llvm::ArrayRef<mlir::Value> group,
                      llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                      own::AliasAnalysis &aliases, unsigned depth = 0,
-                     llvm::ArrayRef<mlir::Value> views = {}) {
+                     llvm::ArrayRef<mlir::Value> views = {},
+                     bool ownNamesOnlyConsume = false) {
   if (!owner || group.empty() || depth > 16)
     return std::nullopt;
   mlir::Block *block = owner->getBlock();
@@ -651,7 +678,9 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
           continue;
         if (usePrecedesOwnerInBlock(owner, user, block))
           continue;
-        if (ownershipConsumingUseInvalidatesGroup(contracts, use, group,
+        if (!(ownNamesOnlyConsume && consumeIsAggregateRelease(use) &&
+              !llvm::is_contained(group, equivalent)) &&
+            ownershipConsumingUseInvalidatesGroup(contracts, use, group,
                                                   aliases))
           return std::nullopt;
 
@@ -696,7 +725,7 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
             std::optional<ReleaseInsertion> release =
                 findReleaseInsertion(contracts, regionOwner, *mapped,
                                      deallocators, aliases, depth + 1,
-                                     mappedViews);
+                                     mappedViews, ownNamesOnlyConsume);
             if (!release)
               return std::nullopt;
             forwardedRelease =
@@ -1164,9 +1193,20 @@ bool releaseOwnedGroupByLiveness(
     FuncContractCache &contracts, mlir::Operation *selfOp,
     mlir::Block *defBlock, mlir::Location loc, const own::ResourceGroup &group,
     own::AliasAnalysis &aliases, bool consumeIsDeath = false,
-    llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {}) {
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {},
+    bool ownNamesOnlyConsume = false) {
   if (!group.deallocator || group.condition)
     return false;
+  // See `consumeIsAggregateRelease`: an aggregate release under a name this
+  // token does not own discharges the container's token, not this one.
+  auto consumingUseEndsThisToken = [&](mlir::OpOperand &use,
+                                       mlir::Value equivalent) {
+    if (ownNamesOnlyConsume && consumeIsAggregateRelease(use) &&
+        !llvm::is_contained(group.values, equivalent))
+      return false;
+    return ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
+                                                 aliases);
+  };
   if (!defBlock)
     return false;
   mlir::Region *region = defBlock->getParent();
@@ -1279,8 +1319,7 @@ bool releaseOwnedGroupByLiveness(
       for (mlir::OpOperand &use : equivalent.getUses()) {
         if (use.getOwner() == selfOp)
           continue;
-        if (ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
-                                                  aliases)) {
+        if (consumingUseEndsThisToken(use, equivalent)) {
           groupHasConsumingCall = true;
           break;
         }
@@ -1329,8 +1368,7 @@ bool releaseOwnedGroupByLiveness(
           continue;
         if (usePrecedesDefinition(user))
           continue;
-        if (ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
-                                                  aliases)) {
+        if (consumingUseEndsThisToken(use, equivalent)) {
           if (!consumeIsDeath)
             return false;
           if (user->getBlock()->getParent() != region)
@@ -2592,15 +2630,47 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
   return mlir::success();
 }
 
+bool ownedLocalTraceEnabled() {
+  static bool enabled = [] {
+    auto v = llvm::sys::Process::GetEnv("LYTHON_TRACE_OWNED_LOCAL");
+    return v && !v->empty() && *v != "0";
+  }();
+  return enabled;
+}
+
 mlir::LogicalResult insertOwnedLocalObjectReleases(
     mlir::ModuleOp module, mlir::Operation *op, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
   mlir::func::FuncOp enclosing = op->getParentOfType<mlir::func::FuncOp>();
+  // SEVERAL MINTS ON ONE HEAD NEED NO SPECIAL CASE, and the measurement that
+  // said otherwise did not survive. Reading one element back twice (`c = [i, i]`
+  // read at both indices, or the three `0`s of `counts = {"app": 0, "net": 0,
+  // "val": 0}`) puts two or more retain-rooted markers on one object, and an
+  // earlier tree refused `golden.cases.cross_except_star_views` for it with
+  // `released or transferred more than once` -- so this pass declined the second
+  // mint. Re-measured after the affine walk learned to prefer a release written
+  // under the token's own name: 494/494 with the restriction and 494/494
+  // without, and the four residual leaking shapes are byte-identical either way.
+  // An inert restriction is not a safeguard, so it is gone.
+  const bool retainRooted = own::ownedLocalMarkerIsRetainRooted(op, aliases);
+  if (ownedLocalTraceEnabled()) {
+    auto contract =
+        op->getAttrOfType<mlir::StringAttr>(own::kOwnedLocalObjectContractAttr);
+    llvm::errs() << "[owned-local] marker in @"
+                 << (enclosing ? enclosing.getSymName() : "<none>")
+                 << " contract=" << (contract ? contract.getValue() : "<none>")
+                 << " retain-rooted=" << (retainRooted ? 1 : 0) << " groups="
+                 << own::collectOwnedLocalObjectGroups(op, deallocators).size()
+                 << "\n";
+  }
   for (own::ResourceGroup group :
        own::collectOwnedLocalObjectGroups(op, deallocators)) {
-    if (!group.deallocator)
+    if (!group.deallocator) {
+      if (ownedLocalTraceEnabled())
+        llvm::errs() << "[owned-local]   no-deallocator\n";
       continue;
+    }
 
     // Same reason as for call-result groups: an owned local whose payload was
     // mutated must be released through the post-mutation lanes. The marker
@@ -2611,7 +2681,7 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
 
     std::optional<ReleaseInsertion> release =
         findReleaseInsertion(contracts, op, group.values, deallocators,
-                             aliases, /*depth=*/0, group.views);
+                             aliases, /*depth=*/0, group.views, retainRooted);
     if (release) {
       mlir::OpBuilder builder(op);
       if (release->before)
@@ -2620,20 +2690,37 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
         builder.setInsertionPointAfter(release->after);
       mlir::func::CallOp::create(builder, op->getLoc(),
                                  group.deallocator->function, release->group);
+      if (ownedLocalTraceEnabled())
+        llvm::errs() << "[owned-local]   placed=straight-line\n";
       continue;
     }
 
     // Straight-line placement failed (e.g. the entity crosses blocks inside a
     // loop body): fall back to CFG liveness, mirroring the owned-call-result
     // path.
+    unsigned before = 0;
+    if (ownedLocalTraceEnabled() && enclosing)
+      enclosing.walk([&](mlir::func::CallOp) { ++before; });
     if (releaseOwnedGroupByLiveness(contracts, op, op->getBlock(),
                                     op->getLoc(), group, aliases,
-                                    /*consumeIsDeath=*/true))
+                                    /*consumeIsDeath=*/true,
+                                    /*deallocators=*/{}, retainRooted)) {
+      if (ownedLocalTraceEnabled()) {
+        unsigned after = 0;
+        if (enclosing)
+          enclosing.walk([&](mlir::func::CallOp) { ++after; });
+        llvm::errs() << "[owned-local]   placed=liveness emitted="
+                     << (after - before) << "\n";
+      }
       continue;
+    }
 
     mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
-    if (!function)
+    if (!function) {
+      if (ownedLocalTraceEnabled())
+        llvm::errs() << "[owned-local]   DROPPED no-enclosing-function\n";
       continue;
+    }
 
     bool canReleaseAtExits = true;
     for (mlir::Value result : group.values) {
@@ -2647,8 +2734,10 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
           if (user == op)
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
-              ownershipConsumingUseInvalidatesGroup(contracts, use,
-                                                    group.values, aliases) ||
+              (!(retainRooted && consumeIsAggregateRelease(use) &&
+                 !llvm::is_contained(group.values, equivalent)) &&
+               ownershipConsumingUseInvalidatesGroup(contracts, use,
+                                                     group.values, aliases)) ||
               mlir::isa<mlir::func::ReturnOp>(user) ||
               branchForwardsGroupToBlockArgument(user, group.values, aliases)) {
             canReleaseAtExits = false;
@@ -2661,8 +2750,11 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
       if (!canReleaseAtExits)
         break;
     }
-    if (!canReleaseAtExits)
+    if (!canReleaseAtExits) {
+      if (ownedLocalTraceEnabled())
+        llvm::errs() << "[owned-local]   DROPPED consumed-or-forwarded\n";
       continue;
+    }
 
     mlir::DominanceInfo dominance(function);
     llvm::SmallVector<mlir::func::ReturnOp, 4> returns;
@@ -2675,6 +2767,9 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
       mlir::func::CallOp::create(builder, returnOp.getLoc(),
                                  group.deallocator->function, group.values);
     }
+    if (ownedLocalTraceEnabled())
+      llvm::errs() << "[owned-local]   placed=dominated-returns count="
+                   << returns.size() << "\n";
   }
   return mlir::success();
 }

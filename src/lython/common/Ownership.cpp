@@ -14,6 +14,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -1050,6 +1051,67 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
   appendEntityViews(group, op->getResults(), 0);
   groups.push_back(std::move(group));
   return groups;
+}
+
+// TWO OWNED TOKENS CAN SHARE ONE OBJECT, AND ONLY ONE OF THEM IS SPELLED BY THE
+// NAME A GIVEN RELEASE USES. An owned-local marker that a retain mints (an
+// evidence-selected container element: retain the borrowed element, then root it
+// through an identity cast) names a token the object did not have before. Every
+// other name for that object -- the literal's element source, the local binding
+// it came from -- carries a DIFFERENT token with its own release. Reading one of
+// those releases as this token's death leaked one element object per execution
+// of every container literal whose element is read back (`ys = [99]; total +=
+// ys[0]`, 64 B/iteration, unbounded); answering the other way for the OTHER kind
+// of marker double-frees.
+//
+// The other kind is the re-root, which republishes an already-owned head with no
+// retain at all and leaves its own results unused -- every real use, including
+// the consuming one, is on the pre-marker name. So the two kinds need opposite
+// answers about the head's other releases, and one attribute covers both.
+//
+// Why the retain must be the marker's IMMEDIATE predecessor and not merely
+// present before it: two markers on one head would each find the other's retain
+// and both claim a token. Adjacency is what the producer emits (the
+// header-spelling ops precede the retain call), so the tight form costs nothing.
+// If a producer ever stops emitting them adjacently, this goes quiet and the
+// behaviour falls back to the leak -- the safe direction, since the other one is
+// a double free.
+// `LYTHON_ABLATE_OWNED_LOCAL_TOKEN_SPLIT=1` restores the shipped answer (no
+// marker roots a token of its own), so an A/B runs off ONE binary -- a rebuild
+// of the same source does not reproduce byte for byte, so "the shas differ"
+// never establishes that two arms differ. Its failure mode is the leak, so it is
+// for bisecting a regression to this rule, never for production.
+bool ownedLocalTokenSplitAblated() {
+  static const bool ablated = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_ABLATE_OWNED_LOCAL_TOKEN_SPLIT");
+    return value && !value->empty() && *value != "0";
+  }();
+  return ablated;
+}
+
+bool ownedLocalMarkerIsRetainRooted(mlir::Operation *marker,
+                                    AliasAnalysis &aliases) {
+  if (ownedLocalTokenSplitAblated())
+    return false;
+  if (!marker || !marker->hasAttr(kOwnedLocalObjectAttr) ||
+      marker->getNumOperands() == 0)
+    return false;
+  auto call = mlir::dyn_cast_or_null<mlir::func::CallOp>(marker->getPrevNode());
+  if (!call || call.getNumOperands() != 1 ||
+      call->hasAttr(kAggregateRetainAttr))
+    return false;
+  auto module = marker->getParentOfType<mlir::ModuleOp>();
+  if (!module)
+    return false;
+  auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  if (!callee)
+    return false;
+  auto primitive =
+      callee->getAttrOfType<mlir::StringAttr>(contracts::kManifestPrimitiveAttr);
+  if (!primitive || primitive.getValue() != "retain")
+    return false;
+  return aliases.same(call.getOperand(0), marker->getOperand(0));
 }
 
 llvm::StringRef ownedResultContractName(mlir::func::FuncOp function,

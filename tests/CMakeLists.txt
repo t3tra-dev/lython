@@ -414,8 +414,17 @@ if(APPLE)
     # slow/bench label -- but that is a Debug measurement and the bar is not
     # comparable across build types. One test per case rather than one test over
     # all five, so a failure names the case instead of the batch.
+    #
+    # The last two were REPAIRED into this list rather than measured clean by
+    # luck: both leaked one element object per execution of a container literal
+    # whose element is read back (dict_literal_source_move_frequency 17 roots /
+    # 1088 B, dict_methods_complete 3 roots / 192 B) until the retain that roots
+    # the read-back element got a release. They are the two cases that pin that
+    # repair; the rest of the family is still leaking and is named in
+    # rfc/test-suite-debt.md.
     set(LYTHON_LEAK_GATE_CASES
-        hello dict_build str_compare iterate list_methods)
+        hello dict_build str_compare iterate list_methods
+        dict_literal_source_move_frequency dict_methods_complete)
     foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
         add_test(NAME "leak.${leak_case}"
             COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
