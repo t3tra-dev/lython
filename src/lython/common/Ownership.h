@@ -353,6 +353,15 @@ collectRuntimeResourceGroups(mlir::ValueRange values,
 llvm::SmallVector<ResourceGroup, 4>
 collectOwnedLocalObjectGroups(mlir::Operation *op,
                               llvm::ArrayRef<RuntimeDeallocator> deallocators);
+class AliasAnalysis;
+// Does this owned-local marker root a token a retain just MINTED, as opposed to
+// republishing one the head already had? The two kinds sit behind one attribute
+// and need opposite answers about the head's other releases, so both the
+// release placer and the affine verifier ask this one predicate -- if insertion
+// and verification disagreed about which token a release discharges, the proof
+// would be void (rfc/memory-safety-proof.md).
+bool ownedLocalMarkerIsRetainRooted(mlir::Operation *marker,
+                                    AliasAnalysis &aliases);
 // `symbols`, when non-null, must be a symbol table over `module`; it only
 // short-circuits the callee lookup (a module-symbol-list walk otherwise) for
 // callers that sweep every call op and can build the table once.
