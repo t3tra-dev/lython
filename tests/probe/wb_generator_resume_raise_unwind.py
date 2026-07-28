@@ -1,6 +1,25 @@
 # TWO OPEN DEFECTS on df48b61, both isolated, NEITHER FIXED. They share one
 # shape: an exception raised INSIDE a generator body, escaping the resume.
 #
+# ⚠️⚠️ THE AXIS BELOW IS WRONG ON bcfbbf9 -- see
+# `wb_forloop_handler_local_unwind.py`, which has NO generator and raises NO
+# exception and still SIGSEGVs 5/5. Two rows of the minimisation table have
+# moved since it was taken:
+#
+#     same try/except/accumulator, NO generator ...... recorded OK, now CRASH
+#     handler returns a constant instead of reading .. recorded OK, now REFUSED
+#
+# The real trigger is `for` loop (over anything) + `try`/`except` in the same
+# function + a local written in the loop and read in the handler. The generator
+# is not part of it. The root cause -- ONE cell object tracked as TWO ownership
+# entities across a loop-header block-argument rename, with all three consumers
+# handling the rename forward-only -- is written up in that other file, together
+# with the measured ablation of a four-part repair that fixes every spelling and
+# refuses 80 of 490 tests, and is therefore NOT SHIPPED.
+#
+# Keep this file: defect (2) below (the bounded leak) is recorded nowhere else,
+# and its numbers were taken on a frozen compiler that no longer exists.
+#
 # This file is the CRASHING spelling. Run it: it SIGSEGVs. CPython prints 100.
 #
 # ============================================================

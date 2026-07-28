@@ -88,6 +88,23 @@ bool staleRebindDropDisabled() {
   return disabled;
 }
 
+// LYTHON_EXP_PREV_NAME_RELEASE=1 enables part C of the unfinished two-entity
+// repair: honour a release written under a PRE-RENAME name of the tracked group
+// even when no borrow-edge retain is outstanding. NOT SHIPPED on its own --
+// this walk's rename is forward-only, and lifting the borrow precondition
+// without parts B/D still leaves the pad release that the rename made invisible.
+//
+// One binary, one flag: `lyc` does not rebuild byte-for-byte, so differing
+// binary hashes cannot establish that two arms differ
+// (rfc/stdlib-semantics.md 13j-7). Named for what it ENABLES (13j-4).
+bool previousNameReleaseConsumesEnabled() {
+  static const bool enabled = [] {
+    const char *setting = std::getenv("LYTHON_EXP_PREV_NAME_RELEASE");
+    return setting && llvm::StringRef(setting) == "1";
+  }();
+  return enabled;
+}
+
 // LYTHON_ABLATE_RELEASED_DOMINANCE=1 restores the use-after-release rule that
 // fired on any op mentioning the group's ALIAS class, whether or not the
 // producer dominates it. Same purpose as the hatch above: it lets a sentinel and
@@ -2385,6 +2402,30 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           op = op->getNextNode();
           continue;
         }
+        // With NO outstanding borrow, a release through a pre-rename name is the
+        // release OF THIS TOKEN. The rename happens whenever a branch forwards
+        // the group into a block argument, so a loop-invariant object entering a
+        // loop header is renamed for the rest of the walk -- including down the
+        // exception edge into an `except` block, whose release is written under
+        // the pre-loop name. Without this the walk reports a leak at the return
+        // for a token that is demonstrably released.
+        //
+        // Why NOT leave it to the pad release that used to keep this quiet: that
+        // release was the defect. It freed the object while the handler in the
+        // same function still read it (SIGSEGV in `Ly_IncRef`), and the walk
+        // stayed silent only because the freeing happened under the name it was
+        // tracking. A verifier that needs a double free to accept a program is
+        // reporting the wrong side of the judgment.
+        //
+        // Why NOT weaken this to "ignore the release": marking the token
+        // Released keeps the AFFINE property checkable -- a second release, under
+        // either name, is now a double consume this same walk reports, which is
+        // how the normal-path over-release in this family stays caught.
+        if (!consumes && state.borrowed == 0 && mentionsTracked &&
+            previousNameReleaseConsumesEnabled() &&
+            callConsumesStaleValue(contracts, call, state.previous, state.group,
+                                   aliases))
+          consumes = true;
         bool retains = mentionsTracked &&
                        callRetainsGroup(contracts, call, state.group, aliases);
         // A slot-absorption retain (`aggregate_retain`: an element/field store)
