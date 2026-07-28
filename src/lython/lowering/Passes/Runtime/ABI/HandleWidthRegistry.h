@@ -33,6 +33,17 @@
 // It ran out in four container conversions, exactly as the 24-vs-6 arithmetic
 // said it would, which is the one thing this file was built to make visible
 // before rather than after the fact.
+//
+// ⛔ AND THE REMAINING WORK IT IS COUNTING IS NOT WHAT IT SAYS. "`str`, ~70
+// exception contracts, and class instances" is, measured (see the block after
+// int's, at the end of this file): ONE deferred conversion (`str`), ONE
+// declaration rather than ~70 (the whole exception family shares
+// `LyBaseException_DecRef`; 66 of the 67 contracts declare only a shape, and
+// those 66 shapes are dropped by `collectRuntimeDeallocators` for want of a
+// deallocator to join to), and ONE non-item (class instances never choose a
+// width -- their handle is `memref<16xi64>` by construction). Both real
+// conversions were measured to reduce ambiguity by zero. So the free list being
+// empty is not the thing blocking the work; the work is not there.
 // ===========================================================================
 //
 // ===========================================================================
@@ -490,6 +501,11 @@ namespace py::lowering::handle_width {
 // `memref<16xi64>` is listed above as unique to `builtins.object`, so an
 // ambiguous exit there needs a second candidate -- class instances taking
 // object's shape is the obvious reading and it is a READING, not a measurement.
+// ✅ NOW MEASURED, and the cause is stronger than the reading was: every user
+// class gets a SYNTHESISED `ly.runtime.deallocator` (`RuntimeABI.cpp:1276`), so
+// `class_object_field_ops.py` has 12 candidates at `(memref<16xi64>)` and not
+// two. Item 5 of the block at the end of this file; the consequence is that
+// width 16 is unique only in the manifests.
 // The width-3 tie reaches 153, an order above the 18 recorded from
 // `list_methods.py`. **None of these is int's, and none is fixed by converting
 // int**; they are logged here because the sweep that answered int's question
@@ -917,6 +933,237 @@ inline constexpr int kFreeHandleWidthCount = 0;
 // on an already-shortened branch operand list -- but no program in the suite
 // builds a block that reaches it, so "could not construct a reaching form" is
 // what is established, not "safe".
+// ===========================================================================
+//
+// ===========================================================================
+// ⛔ AND SO ARE THE OTHER THREE. `builtins.str`, the exception family and class
+// instances measured 2026-07-28 on main `51fb04d` by the same replay, which is
+// now a file (`tests/probe/tools/laneswap.py`) rather than a number in a commit
+// message -- it reproduces int's published 80 / 80 / 190, 4 / 4 / 114 and
+// 110 / 110 columns exactly before answering anything new.
+//
+// This retires the item this whole file is organised around. The header opens
+// with "Still to convert: list, set, frozenset, tuple, int, str, ~70 exception
+// contracts, and class instances" and treats the empty free list as the crisis.
+// Measured, the tail of that list is TWO conversions and one non-item, and both
+// conversions reduce ambiguity by exactly zero:
+//
+//                                      BEFORE   at a free width   at width 2/3
+//   total ambiguous exits                 80          80            331 / 312
+//   ambiguous on (memref<2xi64>)           4           4            255 /   4
+//   ambiguous on (memref<3xi64>)          35          35             35 / 267
+//   resolved builtins.str                251         251                251
+//     of which decided by shapeMatch     251           0                  0
+//   resolved builtins.BaseException      232         232                232
+//     of which decided by shapeMatch       0           0                  0
+//
+//   (`str` columns are str@17 and str@2; exception columns are
+//    BaseException@18 and BaseException@3. 17 and 18 are hypotheticals -- there
+//    is no free width -- chosen because a width no interface mentions is what
+//    sole candidacy needs. 331 - 80 = 251 and 255 - 4 = 251 close against str's
+//    shape-decided count; 312 - 80 = 232 and 267 - 35 = 232 close against the
+//    exception family's arity-decided count. The controls earn their widths
+//    exactly as int's did, and the widths still buy nothing.)
+//
+// 1. `str` IS THE SAME ANSWER AS `int`, FOR THE SAME REASON. 80 -> 80, 4 -> 4.
+//    Removing `str` from the width-2 tie leaves `int` and `nullcontext` still
+//    tied there, and a two-way tie returns nullptr exactly as a three-way one
+//    does. The protection at stake is 251 sites (§8.3's "27" is not the figure,
+//    the same way it was not int's 110), and all 251 survive a free width as
+//    sole-candidate resolutions -- so the conversion is safe on the width axis
+//    and, again, is not an ambiguity fix.
+//
+// 2. BUT THE WIDTH-2 TIE IS NOT A THREE-STEP LADDER, AND EMPTYING IT IS WORSE
+//    THAN LEAVING IT. This is the finding that generalises past `str`, and it
+//    contradicts the obvious reading of the rows above. Moving BOTH `str` and
+//    `int` off 2 does clear it -- 4 -> 0, total 80 -> 76, and only two of the
+//    three have to move because `contextlib.nullcontext` declares no
+//    `ly.runtime.shape` and becomes the sole candidate. But look at WHICH four
+//    exits those are, and what they become:
+//
+//        __ly_long_operand_view   (memref<2xi64>, memref<?xi32>)   off 0
+//        __ly_str_iterator_alloc  (memref<2xi64>, memref<2xi64>)   off 0
+//        __ly_str_iterator_alloc  (memref<2xi64>, memref<2xi64>)   off 1
+//        LyNullContext_New        (memref<2xi64>)                  off 0
+//
+//    Three of the four are an int meta+digits view and a str iterator's header
+//    and state. Neither is short by accident: `LyUnicodeStrIterator_DecRef` is a
+//    FOUR-input interface (iterator header, state, source header, source bytes)
+//    and `__ly_str_iterator_alloc` returns only the first two, so the scan is
+//    probing a range that no deallocator can cover. With `str` and `int` gone
+//    those offsets do not become clean -- all four become
+//    **`contextlib.nullcontext` resolutions** (measured, not derived: 4 sites,
+//    the same 4), because sole candidacy does not check that the value IS a
+//    nullcontext, only that the types match. That trades mechanism (A), which
+//    drops a group and presents as a leak, for mechanism (C), which returns
+//    `LyNullContext_DecRef` for an int's digits view and presents as nothing at
+//    all. **Emptying a tie is only a fix when the survivor is the right answer
+//    at every offset it covered**, and at width 2 it is not. Anyone proposing
+//    to move `str` or `int` off 2 "to clean up the tie" is proposing this, and
+//    must give `nullcontext` a shape or a width of its own FIRST.
+//
+// 3. NOR IS THERE A set/frozenset DEFECT IN `str` -- and it holds a real lane,
+//    so this is the case the audit said to check rather than assume. `str`'s
+//    canonical shape has a genuine second SSA lane (`memref<?xi8>`), unlike
+//    every single-lane member of the width 3/4/5/8 ties. Counted rather than
+//    read (`lanemutate.py`, whose entity-allocation criterion reproduces int's
+//    recorded "two, both fresh-entity" -- `__ly_long_alloc_raw` 5874 and
+//    `LyLong_FromI64` 6181 -- before being pointed at str):
+//
+//        entity allocation sites for builtins.str .......... 1  (fresh-entity)
+//          __ly_unicode_alloc, builtins.mlir:8820
+//        reallocation sites ............................... 0
+//        sites that free a str block ...................... 1
+//          LyUnicode_DecRef, builtins.mlir:2073
+//
+//    The structural reason the count is 0: the bytes lane is
+//    `memref.view %block[24]` into the entity's own single allocation, so its
+//    address is a function of the header's and there is no stored base-address
+//    word that a reallocation could overwrite. Only FOUR `memref.dealloc` of a
+//    `memref<2xi64>` exist in all 19 manifests.
+//
+//    The nearest counterexample, checked and rejected rather than not found:
+//    `LyBuiltin_Input` (builtins.mlir:16651, 16668) really does grow a byte
+//    buffer by allocate-copy-free. The buffer is function-local and is never a
+//    `builtins.str` lane -- no str exists until `LyUnicode_FromBytes` at 16703,
+//    after the growth loop, and the raw buffer is freed at 16704. A
+//    reallocating buffer that is not a lane is not the defect.
+//
+// 4. THE EXCEPTION FAMILY IS ONE CONTRACT, NOT ~70. The "~70 exception
+//    contracts" in this file's opening arithmetic -- half of the 24-vs-6 crisis
+//    that declared the free list exhausted -- is a count of NAMES, and the
+//    thing a conversion would touch is one declaration:
+//
+//        contracts naming ly.runtime.contract anywhere ........ 104
+//          of which declare a deallocator ..................... 34
+//        exception-shaped contracts .......................... 67
+//          of which declare a deallocator ..................... 1   BaseException
+//          of which declare a shape ........................... 66
+//          distinct shapes among those 66 ..................... 1
+//              (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+//
+//    And the 66 shapes are INERT in the deallocator table: the shape walk in
+//    `collectRuntimeDeallocators` joins by contract name, and a contract with
+//    no deallocator entry has nothing to join to, so all 66 are dropped. The
+//    table is 34 entries and the family contributes exactly one.
+//
+//    THE REPRESENTATION, checked separately from the inheritance, because a
+//    shared deallocator does NOT prove a shared layout -- the dict-payload track
+//    found "same code so same defect" wrong in both directions, and this is the
+//    same shape of claim. Not the deallocator this time, the constructors:
+//
+//        per-subclass exception constructors (_New + _Init) ....... 134
+//          that ALLOCATE their own block ......................... 0
+//          that FORWARD to LyBaseException_{New,Init} ............ 132
+//          the family constructors themselves .................... 2
+//        distinct return type lists among all 134 ................. 1
+//
+//    plus the independent entity-allocation census, which finds ONE allocation
+//    site in the family (`LyBaseException_New`, builtins.mlir:2284) taking
+//    `%class_id: i64 {ly.runtime.class_id_argument}` -- the subclass is DATA in
+//    a word of the block, not a layout. Three routes, one representation. Worth
+//    naming the case that would have broken it: CPython's `UnicodeDecodeError`
+//    carries encoding/object/start/end/reason, and Lython's does not -- its
+//    every signature is the same triple, so the one subclass with a reason to
+//    diverge does not.
+//
+//    `LyBaseException_DecRef` is also not one-lane-able in the sense the rest of
+//    this file uses. It is a THREE-input interface with no shape declaration, so
+//    its shapeTypes default to its inputTypes and its shape score is 0 always.
+//    All 232 of its resolutions are won by ARITY -- the mechanism (B) path this
+//    file documents, and the 206 "inherited by design" preemptions
+//    `preemption.py` reports are the same fact seen from the other side.
+//    Converting it to one lane at a free width preserves all 232 as
+//    sole-candidate resolutions and changes ambiguity by nothing; converting it
+//    at the entity-root width 3, which is what "one-lane it" naively means,
+//    destroys all 232 into the bool/float/ReadyIntAwaitable tie.
+//
+// 5. CLASS INSTANCES ARE NOT A PENDING CONVERSION, AND UNIQUENESS IS NOT MERELY
+//    EXHAUSTED FOR THEM -- IT IS UNDEFINABLE. The unrecorded `memref<16xi64>`
+//    ties logged above needed "a second candidate", and the note says class
+//    instances taking object's shape is a READING. Measured, the cause is
+//    stronger than the reading: `RuntimeABI.cpp:1276` SYNTHESISES a
+//    `ly.runtime.deallocator` per user class, named `__ly_dealloc_<Class>`, with
+//    its own contract name, an interface built out of `memref<16xi64>` object
+//    handles, and NO `ly.runtime.shape` -- so score 0. Dumping
+//    `golden/cases/class_object_field_ops.py`:
+//
+//        (memref<16xi64>)  12 candidates -- LyObject_DecRef plus __ly_dealloc_
+//          {Box,DictBox,DictHolder,Factory,Four,FourHolder,Holder,Inner,
+//           ListBox,ListHolder,SelfStore}
+//
+//    and `cross_nested_field_chain.py` gives `__ly_dealloc_{L1,L2,L3}` all at
+//    `(memref<16xi64>, memref<16xi64>)`, a three-way arity-2 tie, which is the
+//    `(16, 16)` row. So width 16 is "unique to builtins.object" only in the
+//    manifests; in a compiled program the candidate set is generated from the
+//    user's source, and N classes of equal field arity give N+1 candidates.
+//
+//    PRECISELY, because "class instances are one-lane" is nearly right and the
+//    near-miss matters: the HANDLE is always `memref<16xi64>`, so no width is
+//    ever chosen for a class. The ARITY is not fixed -- it is one plus the
+//    storage lanes of the fields, so `Inner` is `(16)` and `L1` is `(16, 16)`.
+//    A class whose interface is already `(16)` is therefore in an (N+1)-way tie
+//    with every other such class in the same program, and one-laning the
+//    multi-lane ones would move them INTO that tie rather than out of anything.
+//    That is int@2 structurally -- a conversion that strictly increases
+//    ambiguity -- and it is DERIVED from the arity rule here, not measured,
+//    because the arm cannot be replayed against the manifests: the deallocators
+//    do not exist until a user program is compiled.
+//
+//    **No entry in a checked-in registry can separate two user classes**: both
+//    are `memref<16xi64>` by construction, and the program that collides them
+//    does not exist when the registry is written. This is the strongest form of
+//    the argument the `range`/`range_iterator` row already makes -- a tie no
+//    width can break -- and it is the case that ends the scheme rather than
+//    stressing it. The fix is GAP 1 and GAP 2; the names here already exist, and
+//    the sweep confirms the surviving traffic is the nameless origin.
+//
+// 6. SUITE-WIDE, and this reproduces the unrecorded rows above with a cause
+//    instead of a reading. `LYTHON_DEALLOC_CENSUS=1` over 292 golden cases, rc
+//    recorded per program, 0 MISSING:
+//
+//     origin                              tied interface          progs min max
+//     scan/collectRuntimeResourceGroups   (memref<2xi64>)           289  21  21
+//     other                               (memref<2xi64>)           126   1  77
+//     scan/...                            (memref<3xi64>)            20   9 153
+//     scan/...                            (memref<16xi64>)           10   9  63
+//     scan/...                            (memref<8xi64>)             7   9  36
+//     scan/...                            (memref<16xi64>, 16xi64)    6   9  90
+//     scan/...                            (memref<5xi64>)             1  18  18
+//     other                               (memref<16xi64>)            1   4   4
+//     other                               (memref<16xi64>, 16xi64)    1  10  10
+//
+//    The width-16 rows are class programs (`class_object_field_ops`, `union`,
+//    `stdlib_time`, `stdlib_os_fs`, `w3_cross_os_try_rebind`, `stdlib_pathlib`,
+//    `loop_call_object_args`, `class_object_field_store`, `generic_classes`,
+//    `namedtuple_desugar`, `cross_nested_field_chain`,
+//    `interior_view_nested_chain_grow`), i.e. exactly the surface in item 5.
+//
+// SO: three items, three times not now. `str` is int's answer with a worse
+// multiplier -- its block is `24 + count*width` bytes, so a one-character
+// latin-1 str at a 17-word handle goes 25 B -> 137 B, **5.5x**, against a
+// measured ambiguity reduction of zero and a 548-signature surface. The
+// exception family is one declaration whose conversion also changes nothing,
+// and whose current protection is arity rather than shape. Class instances have
+// no width to schedule at all -- their handle is `memref<16xi64>` by
+// construction and their tie is generated per program.
+//
+// WHAT WOULD CHANGE THIS:
+//   * for `str` and the exception family, the same triggers as int -- a program
+//     that reaches the structural path and MIS-ATTRIBUTES
+//     (`LYTHON_DEALLOC_CENSUS=1`, watch a `resolved builtins.str` that moves
+//     when no str is in the program);
+//   * for the width-2 tie specifically, `contextlib.nullcontext` getting a shape
+//     or a width of its own -- until then item 2 says emptying that tie makes it
+//     worse, and that is a REASON NOT TO CONVERT rather than a caveat;
+//   * for class instances, nothing on this axis. Only GAP 1 / GAP 2.
+//
+// WHAT IS NOT ESTABLISHED, and is stated as such: all of the above is the STATIC
+// surface plus per-program census counts. That the four width-2 exits and the
+// width-16 exits DROP A RELEASE rather than being speculative probes that some
+// named path already covers is NOT shown -- `ctest -L leak` is green on all five
+// and no leaking program has been constructed. "Could not construct a reaching
+// form" is what holds, not "safe".
 // ===========================================================================
 //
 // ---------------------------------------------------------------------------
