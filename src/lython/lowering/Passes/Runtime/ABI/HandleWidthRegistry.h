@@ -314,9 +314,15 @@ namespace py::lowering::handle_width {
 //                                                           single-input release
 //                                                           interface
 //      15  builtins.int                                     RESERVED, NOT YET
-//                                                           CONVERTED -- see the
-//                                                           note at the end of
-//                                                           this file
+//                                                           CONVERTED, AND
+//                                                           DEFERRED ON PURPOSE
+//                                                           -- see the note at
+//                                                           the end of this
+//                                                           file. The
+//                                                           reservation is now
+//                                                           machine-checked by
+//                                                           ctest
+//                                                           `abi.handle_width_reservations`
 //      16  builtins.object                                  payload box / boxed
 //                                                           field slot
 //      64  types.GeneratorType                              frame
@@ -437,6 +443,57 @@ namespace py::lowering::handle_width {
 // ambiguous exit -- every one of the 119 comes from a call site that enters the
 // contract-less overload DIRECTLY. So GAP 1 does not present as an empty
 // contract name at this call site; it presents as call sites that never had one.
+//
+// ⛔ The `:450` figure is STALE as of `bcfbbf9` (measured 2026-07-28 with the
+// permanent `LYTHON_DEALLOC_CENSUS=1` instrument): `fallback_450` is **0**, not
+// 1078-1312, and so are `empty_name` and `contract_aware_ambiguous`. Site A
+// preferring the declared name (`5c52ae0`) is what closed it -- the named
+// overload now type-matches on the first try, so nothing falls through. The
+// surviving GAP-1 surface is `declared_name_absent = 308`, invariant across every
+// program measured. Quote 308, not 1078-1312, and note that a `:450` count of 0
+// means the fallback is no longer the path to instrument.
+//
+// ⛔ AND "THE WIDTH-2 AMBIGUITY IS N" IS NOT A PROPERTY OF THE TREE. This file
+// records 21 and `rfc/memory-safety-proof.md` records 42, each as though it were
+// the figure. Measured over **294 programs** (291 golden cases plus three
+// probes), exit code checked on every one so a crashed compile reports MISSING
+// rather than 0:
+//
+//     origin                              tied interface     programs  min  max
+//     scan/collectRuntimeResourceGroups    (memref<2xi64>)        294   21   21
+//     other                                (memref<2xi64>)        126    1   77
+//
+// **Both recorded figures are right, and both are per-program.** The nameless
+// bare-range scan is a hard constant at 21 -- identical in all 294, including a
+// three-line `str` control that never mentions `int` -- and it is the part no
+// declaration can reach. Everything above 21 comes from `other`, an origin
+// NEITHER figure attributed, being the collectors that set no `OriginScope`. The
+// per-program total ranges **21 to 98** (42 in 5 programs, 83 in 4, 98 in
+// `w3_cross_random_json.py`). So the correct form is "21 invariant plus 0-77
+// program-driven", and a single number quoted without its program is not
+// checkable.
+//
+// I reproduced the 21 first, from three small probes, and concluded that ALL
+// width-2 ambiguity came from the nameless scanner. **That was wrong, and the
+// broader set refuted it**: `other` fires in 126 of 294 programs and my probes
+// reached none of them. Recording it because the failure mode is the one this
+// file keeps hitting -- a program-limited measurement that looks like a tree
+// property.
+//
+// ⛔ UNRECORDED TIES FOUND BY THE SAME SWEEP, at widths this file lists as clean:
+//
+//     scan/...  (memref<16xi64>)                      10 programs   4-63
+//     scan/...  (memref<16xi64>, memref<16xi64>)       6 programs   9-90
+//     scan/...  (memref<8xi64>)                        7 programs   9-36
+//     scan/...  (memref<3xi64>)                       21 programs   9-153
+//
+// `memref<16xi64>` is listed above as unique to `builtins.object`, so an
+// ambiguous exit there needs a second candidate -- class instances taking
+// object's shape is the obvious reading and it is a READING, not a measurement.
+// The width-3 tie reaches 153, an order above the 18 recorded from
+// `list_methods.py`. **None of these is int's, and none is fixed by converting
+// int**; they are logged here because the sweep that answered int's question
+// answered theirs too, and an unrecorded tie reads as an absent one.
 //
 // So read the rows below as "a tie whose reachability is unmeasured, and which
 // four programs failed to reach", not as a live defect. That makes the case for
@@ -668,7 +725,21 @@ inline constexpr int kFreeHandleWidthCount = 0;
 // coincidence ends when the width moves. Listed here because the width move is
 // what exposes them.
 //
-//   before `builtins.str`:  @LyLong_Repr (`builtins.mlir:8614`)
+// ✅ RESOLVED (2026-07-28): the `@LyLong_Repr` entry below is DONE, and the
+// mechanism-(C) repair was not the attribute alone. `5c52ae0` (merge `522917d`)
+// both declared `ly.runtime.result_contract = "builtins.str"` on `@LyLong_Repr`
+// and made site A (`collectContractOwnedResultGroups`) prefer the declared name
+// over the receiver's -- which is the half that made the attribute do anything,
+// because the attribute alone was measured byte-identical over 10 programs while
+// the receiver name was still preferred. 24 owned results were retargeted.
+// `DriverTest.IntReprStringIsReleasedByStrDeallocator` pins it. Verified by
+// reading `builtins.mlir` on `bcfbbf9`: the attribute is present.
+//
+// Keeping the entry rather than deleting it because the ORDER matters to the next
+// converter: an attribute whose reader prefers a different name is inert, so
+// "declare the result contract" is not by itself a fix for (C).
+//
+//   before `builtins.str`:  @LyLong_Repr (`builtins.mlir:8614`) -- DONE, above
 //       `contract = "builtins.int"`, `__repr__`, owned result 0 is a
 //       `builtins.str` header pair, and it declares NO result contract --
 //       `@LyLong_Str` immediately above it does, which is why the omission is
@@ -706,6 +777,18 @@ inline constexpr int kFreeHandleWidthCount = 0;
 //       ENTITY word, then the handle's own words) is unchanged and still has
 //       to land in the same change that flips `LyLong_Shape`.
 //
+//       WHY IT CANNOT LAND EARLIER, checked 2026-07-28 because "de-risk the
+//       blocker first" is the obvious plan and it does not work. The fix routes
+//       through the entity word and then reads sign/count/digits out of **the
+//       handle's own words** -- which only exist once int is one-laned. While int
+//       is three lanes the entity word yields the header alone, and sign, count
+//       and digits base are reachable only through the lane addresses in box
+//       words 5 and 6, i.e. exactly what the accessor already does. So the
+//       accessor is CORRECT today and the repair is genuinely coupled to the
+//       shape flip; there is no separable preparatory commit. Verified against
+//       `builtins.mlir:15530` on `bcfbbf9`: still `%c5`/`%c6`, three callers
+//       (`__ly_box_equal_numeric`, `__ly_boxed_num_as_f64`, `__ly_box_less`).
+//
 // Verified clear for float/complex/range on this branch (the check to repeat per
 // conversion): of the functions whose owned result 0 is a ONE-LANE handle at a
 // width these contracts own (3, 5, 7), 38 declare their own contract, 6 declare
@@ -727,6 +810,115 @@ inline constexpr int kFreeHandleWidthCount = 0;
 // which contract a length-1 `memref<3xi64>` result actually is cannot be decided
 // from types. Only the declaration decides -- which is the point.
 
+// ===========================================================================
+// ⛔ `builtins.int` AT 15 IS DEFERRED, AND THE REASON IS NOT THE WIDTH.
+// Measured 2026-07-28 on main `bcfbbf9`, Debug, load recorded per run below.
+// The section after this one describes the conversion and is still accurate
+// about HOW; this block is the adjudication of WHETHER, and it says not now.
+//
+// 1. WHAT TAKING WIDTH 15 GUARANTEES. Not "uniqueness" -- that framing is what
+//    the census refuted, since 16 of 28 single-input deallocators share a width
+//    and sharing is the tree's normal condition. What 15 buys is narrower and
+//    checkable: **exact-type SOLE CANDIDACY**. `valueRangeMatchesTypes` compares
+//    types by equality (`common/Ownership.cpp:388`), and no deallocator interface
+//    in any manifest mentions `memref<15xi64>` in ANY position -- verified against
+//    both claim shapes, single-input and every position of a multi-input
+//    interface, and now machine-checked by ctest
+//    `abi.handle_width_reservations`. So for a value range where int's release
+//    interface type-matches, the selection loop finds exactly one candidate:
+//    `ambiguous` cannot be set, and the shape score is never consulted.
+//
+//    That is STRICTLY STRONGER than the `shapeMatch` = 3 it replaces, which only
+//    wins where int's full three-lane shape matches at that exact offset and
+//    which loses outright to any equal-arity rival that also scores 3.
+//
+//    What it does NOT guarantee, explicitly: nothing about the other four ties,
+//    nothing about `declared_name_absent` (308, invariant), and nothing about
+//    mechanism (C) -- except that a wrong declared name would begin failing to
+//    type-check and fall to `:450`, which is the benign direction.
+//
+// 2. THE PROTECTION IS 110 SITES, NOT 27, AND IT TRANSFERS INTACT. §8.3's "27
+//    sites" is `str`'s figure; int's is larger because int scores 3. Replaying
+//    `collectRuntimeResourceGroups` over the manifests with its real offset
+//    advance (`offset += inputTypes + views`, so a group that covers an offset
+//    hides it) gives, over 1180 functions with results and 37 deallocators:
+//
+//                                    BEFORE      int@15      int@2 (control)
+//      total ambiguous exits            80          80            190
+//      ambiguous on (memref<2xi64>)      4           4            114
+//      resolved builtins.int           110         110            110
+//      int resolutions decided by
+//        shapeMatch                    110           0              0
+//
+//    **All 110 of int's structural resolutions depend on the shape score, and
+//    all 110 survive the move to 15 as sole-candidate resolutions.** The control
+//    column is the one that earns the width: one-laning int WITHOUT moving it off
+//    2 costs +110 ambiguous exits, and 114 - 4 = 110 closes the arithmetic
+//    exactly against the shape-decided count. The width choice is therefore
+//    load-bearing and correct -- 12 is a mechanism-(B) hazard and 13/14 are
+//    taken, so 15 is the narrowest safe free width.
+//
+// 3. AND THE CONVERSION REDUCES AMBIGUITY BY ZERO. This is the finding that
+//    changes the schedule. 80 -> 80 total, 4 -> 4 at width 2. Removing int from
+//    the width-2 tie leaves `str` and `nullcontext` still tied there, and a
+//    two-way tie returns nullptr exactly as a three-way one does. So the
+//    conversion is not an ambiguity fix, and it cannot be justified as one.
+//
+// 4. NOR IS THERE A DEFECT OF THE set/frozenset KIND. That one needed a mutable
+//    interior buffer held as a separate SSA lane, so a holder could keep a lane a
+//    reallocation freed. Checked for int by a route independent of the shape
+//    audit above -- enumerating allocation sites in the int family -- there are
+//    **two, both fresh-entity** (`__ly_long_alloc_raw`, `LyLong_FromI64`) and
+//    **zero reallocation sites**. int entities are immutable once normalised and
+//    arithmetic allocates a new one, so no int digits lane can go stale. The
+//    scratch buffers in the format/divmod paths are function-local and freed in
+//    the same body.
+//
+// 5. WHAT IT COSTS, which is the other half of the trade. A width IS object size,
+//    and for int the multiplier is the worst in the tree. The block is
+//    `32 + 4*capacity` bytes today (header 16, meta 16, digits inline); at width
+//    15 the handle view alone forces 120, giving `120 + 4*capacity`. A
+//    single-limb int goes from ~48 B to ~128 B allocated -- **+80 B, 2.67x** --
+//    and 10 of those 15 words are dead space bought for identity. This is not a
+//    cold path: the user body of a four-line `for i in range(10): n = n + i`
+//    program references `LyLong_FromI64`/`__ly_long_alloc` 10 times and calls
+//    `LyLong_DecRef` 7 times, so ordinary integer code allocates int entities.
+//
+// 6. AND THE MECHANICAL SCOPE REPRODUCES EXACTLY. The §8.3 experiment re-run on
+//    `bcfbbf9` (flip `LyLong_Shape` alone, build, attribute, revert): **107 gate
+//    errors over 107 distinct declarations in 9 manifests** -- builtins 65, _io
+//    17, posix 7, _time 5, _random 3, lyrt 3, math 3, unicodedata 2, asyncio 2;
+//    by check, 65 declared result, 39 method receiver, 2 next element, 1
+//    initializer. Identical to the figures recorded below, which are therefore
+//    confirmed rather than stale. Below the declaration level, 455 lines across
+//    10 manifests name int's triple and the family is 95 functions.
+//
+// SO: the conversion is SAFE on the width axis and buys no measured safety today,
+// against a 2.67x size regression on the language's hottest type, a ten-manifest
+// change, and the `@__ly_boxed_long_view` blocker below whose failure mode is
+// "prints correct output, then SIGSEGVs" and which no static oracle sees. The
+// registry's own argument applies to itself here: a contract at a wider width
+// "just delays the collision while paying for it on every allocation."
+//
+// WHAT WOULD CHANGE THIS, so the next reader does not re-litigate it:
+//   * a program that reaches int's structural path and mis-attributes -- the
+//     instrument is `LYTHON_DEALLOC_CENSUS=1` and the key to watch is a
+//     `resolved builtins.int` that MOVES when int is not in the program;
+//   * `Interior` conformance being required rather than desirable for int (it is
+//     9/13 today and int's observable consequence is satisfied);
+//   * the size cost being retired by an unboxed small-int representation, after
+//     which 15 words costs nothing on the common path. **This is the one that
+//     makes the conversion cheap, and it is the sequencing recommendation:
+//     unbox small ints first, convert second.**
+//
+// NOT MEASURED, and stated as such: whether the conversion would fire
+// `dropUnusedLogicalBlockArguments` (`ABI/Returns.cpp`). Its index defect was
+// found and fixed by reading during this work -- it used a block-argument index
+// on an already-shortened branch operand list -- but no program in the suite
+// builds a block that reaches it, so "could not construct a reaching form" is
+// what is established, not "safe".
+// ===========================================================================
+//
 // ---------------------------------------------------------------------------
 // `builtins.int` at 15: RESERVED, NOT CONVERTED. Why the width is booked before
 // the work, and what the work actually measures.
@@ -781,15 +973,12 @@ inline constexpr int kFreeHandleWidthCount = 0;
 //
 // Two prerequisites, both inside `int`'s own change:
 //   1. `@__ly_boxed_long_view` -- the mechanism-(C)/box-accessor blocker above.
-//   2. `@LyLong_Repr` still declares no `ly.runtime.result_contract`. It is
-//      listed under `str` above, but converting `int` reaches it first from the
-//      other side: once `LyLong_DecRef` takes `memref<15xi64>` it stops
-//      type-checking against the str header pair, so the single-candidate (C)
-//      path stops resolving and falls back to `:450`. That is the benign
-//      direction today -- `str` still scores a positive `shapeMatch` and wins --
-//      but it means the conversion silently changes which path a str result
-//      takes, so declare `result_contract = "builtins.str"` in the same change
-//      and do not rely on the fallback.
+//   2. `@LyLong_Repr` -- ✅ ALREADY DONE in `5c52ae0`, no longer a prerequisite.
+//      The reasoning that put it here still holds and is worth keeping: once
+//      `LyLong_DecRef` takes `memref<15xi64>` it stops type-checking against the
+//      str header pair, so the single-candidate (C) path would stop resolving.
+//      That is now moot because the declared name selects `builtins.str`
+//      directly. Do NOT re-derive this as outstanding work.
 // ---------------------------------------------------------------------------
 
 } // namespace py::lowering::handle_width
