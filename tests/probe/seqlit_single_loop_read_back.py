@@ -1,3 +1,17 @@
+# ✅ STILL CLEAN after the 2026-07-28 repair, and the guard below held: the fix
+# charges the slot retain to its holder rather than skipping it, so the read-back
+# stays legal.
+#
+# ⚠️ AND IT IS STILL A LATENT USE-AFTER-FREE. `LYTHON_EXP_HOLDER_DISCHARGE=1`
+# turns on the holder-release discharge and this program is then refused with
+# `used after release (by call to 'LyLong_Add')` -- correctly: the emitted order
+# is `Ly_IncRef(i)` +1, `LyList_DecRef(ys)` -1 (the deallocator drops the slot),
+# `LyLong_DecRef(i)` -1 (the source move), and only then the read. The refcount
+# reaches zero one call before the use. It prints 12 because the block has not
+# been reused. The discharge is off by default because 23 golden cases have this
+# shape; enabling it needs the container's release moved past the reads its slots
+# handed out.
+#
 # ⛔ GUARD PROBE. This program is CLEAN on main 4699488 and must stay clean.
 #
 # It exists to stop a specific repair that looks right and is not: making the

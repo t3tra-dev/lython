@@ -27,14 +27,97 @@ mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
       .getResult();
 }
 
+// The identity of the container an aggregate slot store lands in, allocated on
+// first ask and reused after. Unique within the enclosing function, which is the
+// scope every ownership walk runs in.
+//
+// Why NOT a process-wide counter: the runtime lowering pass is free to visit
+// functions concurrently, and a shared counter would make the emitted IR depend
+// on scheduling. Per-function ids are also the only ones an ownership walk can
+// check, since it never leaves the function it is verifying.
+std::optional<std::int64_t> aggregateIdentityOf(mlir::Operation *parent) {
+  if (!parent)
+    return std::nullopt;
+  if (auto existing =
+          parent->getAttrOfType<mlir::IntegerAttr>(ownership::kAggregateIdAttr))
+    return existing.getInt();
+  auto function = parent->getParentOfType<mlir::func::FuncOp>();
+  if (!function)
+    return std::nullopt;
+  auto i64 = mlir::IntegerType::get(parent->getContext(), 64);
+  std::int64_t next = 1;
+  if (auto counter = function->getAttrOfType<mlir::IntegerAttr>(
+          ownership::kAggregateIdNextAttr))
+    next = counter.getInt();
+  function->setAttr(ownership::kAggregateIdNextAttr,
+                    mlir::IntegerAttr::get(i64, next + 1));
+  parent->setAttr(ownership::kAggregateIdAttr,
+                  mlir::IntegerAttr::get(i64, next));
+  return next;
+}
+
+// Charge to `container` every slot-absorption retain emitted since `anchor`, so
+// an ownership walk can name the `parent` of `aggregate(parent, path)`. The
+// retains are found by their existing marker rather than returned by the emitter
+// because one logical slot store can emit several (a union member per active
+// arm, a boxed payload plus its header).
+//
+// `anchor` is the op that PRECEDED the builder's insertion point before the
+// retains were emitted, or null when that point was the block's beginning.
+//
+// Why NOT the insertion ITERATOR captured up front: an ilist insert happens
+// BEFORE the iterator, so the iterator still names the same op afterwards and
+// the range between the two captures is always empty. Written that way, this
+// emitted the id on the container and no link on any retain; the walk read that
+// as "no parent" and fell back to shipped behaviour with no diagnostic at all.
+// It surfaced only as `parked=0` in the state-explosion message, which is why
+// that counter is printed there.
+//
+// Why NOT widen `retainAggregateSlot` to return its calls: it recurses over
+// union members and box layouts and there is no single call to return; the
+// marker attribute already identifies them, and reading it back keeps the parent
+// link in one place instead of on every recursion arm.
+void chargeSlotRetainsToParent(mlir::OpBuilder &builder, mlir::Block *block,
+                               mlir::Operation *anchor,
+                               const RuntimeBundle &container) {
+  if (!block || builder.getInsertionBlock() != block)
+    return;
+  llvm::ArrayRef<mlir::Value> lanes = container.physicalValues();
+  if (lanes.empty())
+    return;
+  std::optional<std::int64_t> identity =
+      aggregateIdentityOf(lanes.front().getDefiningOp());
+  if (!identity)
+    return;
+  auto attr = mlir::IntegerAttr::get(
+      mlir::IntegerType::get(builder.getContext(), 64), *identity);
+  mlir::Block::iterator it =
+      anchor ? std::next(anchor->getIterator()) : block->begin();
+  for (mlir::Block::iterator last = builder.getInsertionPoint(); it != last;
+       ++it)
+    if (it->hasAttr(ownership::kAggregateRetainAttr) &&
+        !it->hasAttr(ownership::kAggregateParentAttr))
+      it->setAttr(ownership::kAggregateParentAttr, attr);
+}
+
+// The op the builder would insert after, or null at a block's beginning.
+mlir::Operation *insertionAnchor(mlir::OpBuilder &builder) {
+  mlir::Block *block = builder.getInsertionBlock();
+  if (!block)
+    return nullptr;
+  mlir::Block::iterator point = builder.getInsertionPoint();
+  if (point == block->begin())
+    return nullptr;
+  return &*std::prev(point);
+}
+
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
                           unsigned value) {
   return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
 }
 
-// EXPERIMENT (uncommitted): can `from` reach itself without passing through
-// `barrier`? Used to ask whether a use can execute more than once per single
-// production of the value it uses.
+// Can `from` reach itself without passing through `barrier`? Asks whether a use
+// can execute more than once per single production of the value it uses.
 bool blockReachesItselfAvoiding(mlir::Block *from, mlir::Block *barrier) {
   if (!from || from == barrier)
     return false;
@@ -493,35 +576,19 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
   return mlir::success();
 }
 
-// ⛔ A USE-SET FACT IS NOT A PROXY FOR AN EXECUTION-FREQUENCY FACT, and its only
-// caller (`initializeSequencePayload`) needs the second one. "Every use of this
-// value is this op" says nothing about how many times that ONE op runs per single
-// production of the value. A literal nested in a loop the source is defined
-// OUTSIDE of has exactly one use, satisfies this predicate, and executes N times
-// -- so the source's single token is handed to a container N times.
+// ⛔ A USE-SET FACT IS NOT A PROXY FOR AN EXECUTION-FREQUENCY FACT, and this
+// predicate's only callers need the second one. "Every use of this value is this
+// op" says nothing about how many times that ONE op runs per single production of
+// the value. A literal nested in a loop the source is defined OUTSIDE of has
+// exactly one use, satisfies this predicate, and executes N times -- so the
+// source's single token would be handed to a container N times.
 //
-// That is the root cause of a shipped over-release, measured 2026-07-28:
-// `for i in range(4): for j in range(4): ys = [i, j]` either aborts with
-// `Ly_DecRef observed non-positive refcount` or silently prints 0, varying
-// between runs of one binary, and it survives --release. It is masked while the
-// loop variable stays inside the immortal small-int cache {0, 1, 2}, which is why
-// it reads as a threshold at n=4 rather than as a frequency bug.
-// tests/probe/seqlit_outer_var_nested_overrelease.py pins it.
-//
-// Why NOT simply decline the move when the frequencies differ (a CFG query: can
-// the literal's block reach itself without passing through the source's defining
-// block?). Measured: it removes the extra release, but the source's release is
-// then never placed -- the claim below that "the refcount pass places that
-// release at the source's real last use instead" is FALSE for this shape, and the
-// affine walk does not even converge. Worse, combined with skipping
-// slot-absorption retains in the affine walk it turns a refusal into a SILENT
-// wrong answer (tests/probe/seqlit_nested_read_only_silent.py).
-//
-// So the repair is not local to this predicate: it needs the release-placement
-// half in Passes/Runtime/Passes/Ownership.cpp
-// (`releaseOwnedGroupByLiveness`) to land with it, and it must not disturb the
-// read-back balance that tests/probe/seqlit_single_loop_read_back.py and
-// seqlit_literal_elem_read_back.py guard.
+// `initializeSequencePayload` therefore does NOT decide the move on this answer
+// alone; it conjoins the CFG frequency query documented at its call site.
+// `initializeDictPayload` below still does, which is a KNOWN GAP rather than a
+// judgement: the dict shape was never measured, and an unmeasured shape is not
+// an input to a shipping decision. It is written this way so the two read
+// differently to the next person instead of looking uniformly considered.
 bool RuntimeBundleLowerer::valueIsConsumedOnlyBy(mlir::Value value,
                                                  mlir::Operation *op) {
   if (!value || !op)
@@ -554,24 +621,21 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   //     the next read silently printed the empty string. The refcount pass
   //     places that release at the source's real last use instead.
   //
-  // ⛔ THAT LAST SENTENCE IS MEASURED FALSE for a source whose literal sits in a
-  // loop the source is defined outside of (2026-07-28). The refcount pass does
-  // not place the release at the source's real last use; it places none, and the
-  // affine walk then fails to converge. It is the same shape of error as the
-  // `borrowEdgeRetainIsSpellable` note in Passes/Ownership.cpp: an invariant that
-  // held only because something else happened to hold. Here the something else is
-  // that the shipped predicate below always MOVES the token for a
-  // single-use source, so the "keeps its claim" branch was never exercised inside
-  // a loop -- and the no-move-in-a-loop shape it describes is refused today
-  // (tests/probe/seqlit_slot_retain_in_loop_str.py).
-  //
-  // The `keeps its claim` case is also NOT symmetric with the move case in the
-  // verifier: the slot retain it emits is counted into the affine walk's
-  // visited-state key, so one inside a loop prevents the fixpoint from closing.
+  // ⚠️ THE "KEEPS ITS CLAIM" BRANCH WAS UNREACHABLE INSIDE A LOOP UNTIL
+  // 2026-07-28, because the single-use predicate below always moved the token
+  // first. The moment the frequency query started declining those moves, two
+  // things that had never run had to be repaired with it: the affine walk did not
+  // converge on the retain this branch emits (fixed by charging it to the holder
+  // -- verifier/runtime/AffineOwnership.cpp), and the container's contents
+  // evidence became a lie (fixed at the end of this function). Neither was a new
+  // defect; both were invariants that held only because something else happened
+  // to hold, the same shape as the `borrowEdgeRetainIsSpellable` note in
+  // Passes/Ownership.cpp.
   //
   // One value can fill several slots (`(j, j)`): every slot retains, but the
   // source hands over the ONE token it holds, so the move is deduped.
   llvm::SmallPtrSet<void *, 4> movedSources;
+  bool declinedLoopLevelMove = false;
   for (auto [index, element] : llvm::enumerate(elements)) {
     if (!element)
       continue;
@@ -579,9 +643,12 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
         RuntimeBundleLowerer::materializePayloadObjectBundle(op, *element);
     if (mlir::failed(payload))
       return mlir::failure();
+    mlir::Block *retainBlock = builder.getInsertionBlock();
+    mlir::Operation *retainAnchor = insertionAnchor(builder);
     if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
             op, *payload, "sequence.literal")))
       return mlir::failure();
+    chargeSlotRetainsToParent(builder, retainBlock, retainAnchor, container);
     if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
             op, container, static_cast<unsigned>(index), *payload)))
       return mlir::failure();
@@ -590,35 +657,43 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     bool sourceIsTemporary =
         logicalSources.empty() || !logicalSource ||
         RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op);
-    // ⚠️ INVESTIGATION SCAFFOLD, NOT A PROPOSED FIX. Default OFF (shipped);
-    // `LYTHON_EXP_LOOP_LEVEL_SOURCE_MOVE=1` enables it. Kept so the repro set is
-    // reproducible from ONE binary.
+    // A LITERAL THAT CAN RUN MORE OFTEN THAN ITS SOURCE IS PRODUCED MAY NOT TAKE
+    // THE SOURCE'S TOKEN. `valueIsConsumedOnlyBy` above answers a use-SET
+    // question and the move needs an execution-FREQUENCY one; the CFG query here
+    // supplies the missing half. `for i in range(4): for j in range(4):
+    // ys = [i, j]` has one use of `i` that runs four times per production, and
+    // handing the one token over four times over-released it: shipped, it
+    // alternated between `Ly_DecRef observed non-positive refcount` and silently
+    // printing 0 for the same binary, and it survived `--release`. The immortal
+    // small-int cache {0, 1, 2} absorbed it while the loop variable stayed in
+    // that set, which is why it read as a threshold at n=4 rather than as a
+    // frequency bug (tests/probe/seqlit_cache_boundary_pair.py holds the pair
+    // that separates the two readings).
     //
-    // The defect it targets is real and is the root cause of a shipped
-    // double-free: `valueIsConsumedOnlyBy` above is a use-SET fact used as a
-    // proxy for an execution-FREQUENCY one. A literal nested in a loop the
-    // source is defined OUTSIDE of has ONE use that runs many times, so the one
-    // token is handed over many times -- `for i in range(4): for j in range(4):
-    // ys = [i, j]` over-releases `i` and either aborts with `Ly_DecRef observed
-    // non-positive refcount` or silently prints 0, varying between runs.
+    // `LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE=1` restores the shipped predicate.
+    // Its failure mode is the over-release above, so it is for bisecting a
+    // regression to this rule, never for production.
     //
-    // ⛔ Why this predicate alone is not the repair: declining the move leaves
-    // the source's release unplaced, and the comment at the head of this
-    // function claiming "the refcount pass places that release at the source's
-    // real last use instead" is MEASURED FALSE for this shape -- the affine
-    // walk does not converge. It needs the release-placement half in
-    // `Passes/Runtime/Passes/Ownership.cpp` to land with it.
+    // ⛔ Why this predicate ALONE is not the repair, measured 2026-07-28: it
+    // needs the parked-retain modelling in verifier/runtime/AffineOwnership.cpp
+    // (or the affine walk does not converge on the no-move shape it creates) AND
+    // the evidence demotion at the end of this function (or the read-back of an
+    // element the container does not own becomes a silent wrong answer). Landing
+    // any two of the three was measured worse than landing none.
     static bool loopLevelGuard = [] {
-      auto value = llvm::sys::Process::GetEnv("LYTHON_EXP_LOOP_LEVEL_SOURCE_MOVE");
-      return value && !value->empty() && *value != "0";
+      auto value =
+          llvm::sys::Process::GetEnv("LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE");
+      return !(value && !value->empty() && *value != "0");
     }();
     if (loopLevelGuard && sourceIsTemporary && logicalSource && op->getBlock()) {
       mlir::Block *defBlock = logicalSource.getParentBlock();
       if (mlir::Operation *defOp = logicalSource.getDefiningOp())
         defBlock = defOp->getBlock();
       if (defBlock && defBlock->getParent() == op->getBlock()->getParent() &&
-          blockReachesItselfAvoiding(op->getBlock(), defBlock))
+          blockReachesItselfAvoiding(op->getBlock(), defBlock)) {
         sourceIsTemporary = false;
+        declinedLoopLevelMove = true;
+      }
     }
     if (sourceIsTemporary &&
         payload->objectValue.ownership == ownership::OwnershipKind::Own) {
@@ -644,6 +719,35 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
           std::make_shared<RuntimeBundle>(stored);
     if (index < container.sequenceElements.size())
       container.sequenceElements[index] = stored.objectValue;
+  }
+  // A DECLINED MOVE INVALIDATES THE COMPILE-TIME CONTENTS EVIDENCE. Evidence
+  // resolves `ys[0]` to the very SSA value that was stored, so the reader gets
+  // the element with no reference of its own -- fine while the literal owned the
+  // source's token (the container was then the sole owner and outlived every
+  // read), and wrong the moment the source keeps its claim: binding the read to
+  // a name that outlives the container leaves that name dangling.
+  //
+  // Measured: with the move declined and the evidence kept,
+  // `for i in range(3,4): for j in range(2): ys = [i]; v = ys[0]` prints a freed
+  // value with exit 0 -- a refusal on shipped turned into a SILENT WRONG ANSWER,
+  // the one direction this family may never move in
+  // (tests/probe/seqlit_nested_read_only_silent.py).
+  //
+  // Why NOT retain at the read instead: the read is lowered from the evidence in
+  // another pass, and a retain there would double-count every read the evidence
+  // path already resolves correctly for a container that DID take the token.
+  // Dropping the evidence puts the element back behind the runtime accessor,
+  // which returns a value with its own reference, and it is local to the exact
+  // literal whose ownership rule just changed.
+  //
+  // Why NOT drop it for every literal: the evidence is what turns a literal's
+  // element access into no code at all, and the declined move is a rare shape (a
+  // literal in a loop its element's source is defined outside of).
+  if (declinedLoopLevelMove) {
+    container.sequenceElements.clear();
+    container.sequenceElementBundles.clear();
+    container.sequenceIndices.clear();
+    container.sequenceEvidenceBacked = false;
   }
   return mlir::success();
 }
@@ -734,12 +838,15 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
                                                              *values[index]);
     if (mlir::failed(payloadValue))
       return mlir::failure();
+    mlir::Block *retainBlock = builder.getInsertionBlock();
+    mlir::Operation *retainAnchor = insertionAnchor(builder);
     if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
             op, *payloadKey, "dict.literal.key")))
       return mlir::failure();
     if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
             op, *payloadValue, "dict.literal.value")))
       return mlir::failure();
+    chargeSlotRetainsToParent(builder, retainBlock, retainAnchor, container);
     if (mlir::failed(RuntimeBundleLowerer::storeDictKeyPayload(
             op, container, static_cast<unsigned>(index), *payloadKey)))
       return mlir::failure();

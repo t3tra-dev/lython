@@ -293,6 +293,28 @@ struct AffinePathState {
   // entered a cleanup handler from ANOTHER cleanup handler, which is the shape
   // no per-op message can show.
   llvm::SmallVector<unsigned, 16> trail;
+  // Slot-absorption retains that are currently PARKED IN A CONTAINER, listed by
+  // the container's aggregate identity (own::kAggregateIdAttr) in the order
+  // they were charged. This is the kernel's `aggregate(parent, path)` with the
+  // question answered by `parent`: the token is still outstanding -- so it keeps
+  // a read-back of the element legal -- but the obligation to discharge it
+  // belongs to the holder, and releasing the holder discharges it here.
+  //
+  // Why NOT keep counting these in `retained`. `retained` is part of the
+  // visited-state key and a container built inside a loop charges one retain per
+  // iteration, so the key increases forever and the fixpoint never closes --
+  // shipped, and it refused `s = "abc"` / `for k in range(3): t = (s,)` with
+  // `ownership CFG exploration exceeded 20000 states`. Attributing the retain to
+  // the holder bounds it instead: the same loop charges and discharges the same
+  // identity every trip, so the second iteration reaches a state already visited.
+  //
+  // Why NOT drop the retain instead (`LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN`,
+  // deleted with this change): the two walks track different resource kinds and
+  // the borrowed walk's exemption is not transferable. Reading an element back
+  // out (`total += ys[0]`) hands the reader a token derived from the slot, and
+  // this walk needs the retain to justify the reader's later release; dropping it
+  // refused 39 golden cases that compile today.
+  llvm::SmallVector<std::int64_t, 2> slotParents;
 };
 
 struct BorrowedEntryResource {
@@ -328,7 +350,18 @@ bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
          lhs.token == rhs.token && lhs.retained == rhs.retained &&
          lhs.borrowed == rhs.borrowed &&
          lhs.exceptional == rhs.exceptional &&
+         lhs.slotParents == rhs.slotParents &&
          own::sameEntityRoot(lhs.group, rhs.group);
+}
+
+// Tokens that keep a RELEASED group alive on this path: the walk's own retains
+// plus the ones parked in a container (`slotParents`). Every rule that asks
+// "may this released group still be named here" must ask this and not
+// `state.retained` alone -- a slot-absorption retain no longer lands in
+// `retained`, and reading only `retained` at two of the region-terminator rules
+// refused 23 golden cases that compile today.
+unsigned outstandingTokens(const AffinePathState &state) {
+  return state.retained + static_cast<unsigned>(state.slotParents.size());
 }
 
 bool sameBorrowedPathState(const BorrowedPathState &lhs,
@@ -351,7 +384,9 @@ std::size_t dedupBucket(llvm::hash_code code) {
 std::size_t pathStateDedupKey(const AffinePathState &state) {
   llvm::hash_code code = llvm::hash_combine(
       state.block, state.start, static_cast<int>(state.token), state.retained,
-      state.borrowed, state.exceptional);
+      state.borrowed, state.exceptional,
+      llvm::hash_combine_range(state.slotParents.begin(),
+                               state.slotParents.end()));
   // Hashing the whole lane list would break the equal-implies-same-hash
   // contract now that equality is by root: two equal states would land in
   // different buckets and the dedup would silently stop deduping.
@@ -580,6 +615,45 @@ public:
     return entry->second;
   }
 
+  // The aggregate identity a slot-absorption retain charged its token to, or
+  // nothing when the retain carries no parent link or the link cannot be
+  // resolved to exactly one producer in this function.
+  //
+  // Why "exactly one": a clone or an inline can republish an id, and an
+  // ambiguous parent cannot answer `aggregate(parent, path)`. Reporting nothing
+  // then falls back to counting the retain in `retained`, which is what shipped
+  // -- conservative in the direction that keeps a read-back legal.
+  std::optional<std::int64_t> slotRetainParent(mlir::func::CallOp call) {
+    auto attr = call->getAttrOfType<mlir::IntegerAttr>(
+        own::kAggregateParentAttr);
+    if (!attr)
+      return std::nullopt;
+    buildAggregateParents();
+    auto entry = aggregateParents.find(attr.getInt());
+    if (entry == aggregateParents.end() || entry->second.empty())
+      return std::nullopt;
+    return attr.getInt();
+  }
+
+  // Does `call` release the container `identity` names? This is the DISCHARGE
+  // of every slot retain parked in that container: the holder's release runs the
+  // deallocator, and the deallocator's lemma releases each slot
+  // (rfc/memory-safety-proof.md, Aggregates -- "aggregate effects reduce to the
+  // same produce/retain/release/transfer rules over aggregate(parent, path)").
+  bool callDischargesAggregate(mlir::func::CallOp call,
+                               std::int64_t identity) {
+    buildAggregateParents();
+    auto entry = aggregateParents.find(identity);
+    if (entry == aggregateParents.end() || entry->second.empty())
+      return false;
+    return own::callConsumesGroup(contracts, call, entry->second, aliases);
+  }
+
+  bool anyAggregateParents() {
+    buildAggregateParents();
+    return !aggregateParents.empty();
+  }
+
   // `aliases.same(value, candidate)` for some candidate in a fixed candidate
   // list, with the candidates reduced to their alias roots up front: the query
   // is asked per path state and the candidate list is function-sized.
@@ -647,6 +721,36 @@ public:
   }
 
 private:
+  // Container producers by aggregate identity, with the container's release
+  // interface as the lane list (lane 0 is the entity root, which is what every
+  // deallocator names as operand 0). An identity claimed by more than one
+  // producer is erased rather than resolved: an ambiguous `parent` cannot
+  // discharge anything, and the caller falls back to shipped behaviour.
+  void buildAggregateParents() {
+    if (aggregateParentsBuilt)
+      return;
+    aggregateParentsBuilt = true;
+    if (function.isDeclaration())
+      return;
+    llvm::DenseSet<std::int64_t> ambiguous;
+    function.walk([&](mlir::Operation *op) {
+      auto attr = op->getAttrOfType<mlir::IntegerAttr>(own::kAggregateIdAttr);
+      if (!attr)
+        return;
+      std::int64_t identity = attr.getInt();
+      if (ambiguous.contains(identity))
+        return;
+      llvm::SmallVector<mlir::Value, 4> lanes(op->getResults());
+      if (lanes.empty())
+        return;
+      auto [entry, inserted] = aggregateParents.try_emplace(identity, lanes);
+      if (!inserted) {
+        ambiguous.insert(identity);
+        aggregateParents.erase(entry);
+      }
+    });
+  }
+
   // The block of `function`'s own region that contains `block` (itself, when
   // `block` already belongs to that region).
   mlir::Block *topLevelBlock(mlir::Block *block) {
@@ -765,6 +869,9 @@ private:
   llvm::DenseMap<mlir::Operation *, mlir::func::CallOp> anchorGuarded;
   llvm::DenseMap<mlir::Operation *, bool> guardedCalls;
   llvm::DenseMap<mlir::Operation *, RaiseFacts> raiseFactsByCall;
+  llvm::DenseMap<std::int64_t, llvm::SmallVector<mlir::Value, 4>>
+      aggregateParents;
+  bool aggregateParentsBuilt = false;
   std::unique_ptr<mlir::DominanceInfo> dominance;
 };
 
@@ -1425,7 +1532,7 @@ handleRegionTerminator(mlir::Operation *terminator, TrackedResource &resource,
 
   if (state.token == AffineTokenState::Released) {
     if (groupContainsOperand(terminator, state.group, aliases) &&
-        state.retained == 0)
+        outstandingTokens(state) == 0)
       return terminator->emitError()
              << "released owned resource from " << resource.producerLabel
              << " is used by region terminator";
@@ -1508,7 +1615,7 @@ handleGenericRegionReturn(mlir::Operation *terminator,
       groupHasValueDefinedInsideRegion(state.group, currentRegion);
   if (state.token == AffineTokenState::Released) {
     if (groupContainsOperand(terminator, state.group, aliases) &&
-        state.retained == 0)
+        outstandingTokens(state) == 0)
       return terminator->emitError()
              << "released owned resource from " << resource.producerLabel
              << " is used by region terminator";
@@ -1932,6 +2039,41 @@ collectUnwindAmbiguousRetainOperands(mlir::func::FuncOp function,
   return values;
 }
 
+// ⚠️ OPT-IN EXPERIMENT, DEFAULT OFF, AND WHAT IT FOUND IS WHY IT IS OFF.
+// `LYTHON_EXP_HOLDER_DISCHARGE=1` makes the holder's release cancel the slot
+// retains parked in it. That is the more faithful reading of
+// `aggregate(parent, path)`, and it is not shippable yet, because the walk then
+// reports a use-after-release that IS REAL and that predates this change:
+//
+//   for i in range(3, 6): ys = [i]; total += ys[0]
+//
+// lowers to `Ly_IncRef(i)` (+1), `LyList_DecRef(ys)` (the deallocator drops the
+// slot, -1), `LyLong_DecRef(i)` (the source move, -1) and only then
+// `LyLong_Add(total, i)`. The refcount reaches zero one call before the read,
+// and the program prints the right answer only because the block has not been
+// reused yet. Discharging makes the verifier say so, and golden cases with that
+// shape are refused -- so enabling it requires first moving the container's
+// release past the reads its slots handed out, which this change does not do.
+//
+// Why NOT keep it on and accept the refusals: they are refusals of programs that
+// run correctly today, and trading a latent use-after-free for a rejected valid
+// program is not obviously the better half of that trade. It has to land with
+// the placement fix, not before it.
+//
+// Why NOT delete the code path: the finding above is the only evidence that the
+// early release exists at all, and it is reproducible from a shipped binary only
+// while this switch is here. Pinning the container's liveness on the values its
+// slots handed out was tried and did NOT move the release
+// (`releaseOwnedGroupByLiveness` is not what places a container literal's
+// release), so the next attempt should start by finding what does.
+bool dischargeOnHolderRelease() {
+  static bool on = [] {
+    auto v = llvm::sys::Process::GetEnv("LYTHON_EXP_HOLDER_DISCHARGE");
+    return v && !v->empty() && *v != "0";
+  }();
+  return on;
+}
+
 mlir::LogicalResult verifyResourceOnCFGPaths(
     FuncContractCache &contracts, TrackedResource &resource,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
@@ -1960,26 +2102,45 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     visited.insert(state);
     if (ownershipPathTraceEnabled())
       state.trail.push_back(blockOrdinal(state.block));
+    // Outstanding tokens of every provenance: this walk's own retains plus the
+    // ones parked in containers (`state.slotParents`). Both keep a released
+    // group alive and both can pay for a second consume, so every rule that
+    // used to read `state.retained` alone reads this instead.
+    //
+    // Why NOT leave the parked ones out of these rules: splitting the pools
+    // without rejoining them here is precisely how the deleted skip experiment
+    // produced `released or transferred more than once` on three golden cases
+    // and `used after release` on thirty-six more.
+    auto outstanding = [&state] { return outstandingTokens(state); };
+    // Spend a plain retain first, a parked one only when no plain one is left.
+    // Why that order: a plain retain has no other discharge on this path, while
+    // a parked one still has the holder's release ahead of it.
+    auto spendOutstanding = [&state] {
+      if (state.retained > 0)
+        --state.retained;
+      else if (!state.slotParents.empty())
+        state.slotParents.pop_back();
+    };
     // ⚠️ THIS EXIT IS NOT A SAFE-SIDE FAILURE, and reading it as one cost a day
     // (2026-07-28). Bailing here says nothing about the judgements downstream of
     // where the walk stopped: "the verifier passed" and "the verifier REACHED
     // that check" are different claims, and only the second licenses a
-    // conclusion. Measured instance: a slot retain inside a loop makes
-    // `state.retained` -- part of the visited-state key -- increase every
-    // iteration, so the fixpoint never closes and this fires; making it converge
-    // then reported a REAL `used after release` in the same family of programs
-    // that had been invisible the whole time. The state explosion was a cover,
-    // not a diagnostic.
+    // conclusion. Measured instance, since repaired: a slot retain inside a loop
+    // made `state.retained` -- part of the visited-state key -- increase every
+    // iteration, so the fixpoint never closed and this fired; making it converge
+    // then reported a REAL `used after release` in the same family of programs,
+    // invisible the whole time it had been firing. The state explosion was a
+    // cover, not a diagnostic.
     //
     // So a rise in this diagnostic must be investigated as a possible masked
     // finding, and any claim of the form "the affine verifier is green on X"
     // requires that X did not hit this cap.
-    // tests/probe/seqlit_slot_retain_in_loop_str.py is a shipped program that
-    // does.
+    // tests/probe/seqlit_slot_retain_in_loop_str.py is the program that did.
     if (visited.size() > kMaxAffineStates)
       return resource.producer->emitError()
              << "ownership CFG exploration exceeded " << kMaxAffineStates
              << " states (last: retained=" << state.retained
+             << " parked=" << state.slotParents.size()
              << " borrowed=" << state.borrowed << " prev=" << state.previous.size()
              << " stale=" << state.stale.size() << " group=" << state.group.size()
              << " token=" << static_cast<int>(state.token) << ")";
@@ -2085,7 +2246,10 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                     "transfer, or owned return";
         }
         if (uses) {
-          if (state.retained > 0 &&
+          // `outstanding()`, not `state.retained`: returning the element inside
+          // the very container that absorbed it is the shape whose only
+          // outstanding token is a parked one.
+          if (outstanding() > 0 &&
               returnCarriesGroupInsideOwnedAggregate(
                   resource.function, ret, state.group, deallocators, aliases))
             break;
@@ -2113,11 +2277,16 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               llvm::SmallVector<mlir::Value, 4> mappedViews =
                   remapGroupForSuccessor(op, successorIndex, successor,
                                          state.views, aliases);
-              worklist.push_back(AffinePathState{
+              AffinePathState next{
                   successor, firstOperation(successor), nextToken,
                   state.retained, std::move(mappedGroup),
                   /*stale=*/{}, /*previous=*/{}, std::move(mappedViews),
-                  /*borrowed=*/0, state.exceptional});
+                  /*borrowed=*/0, state.exceptional};
+              // Parked slot retains follow the path, not the group's names:
+              // the container that holds them is unaffected by a union-tag
+              // branch on the element.
+              next.slotParents = state.slotParents;
+              worklist.push_back(std::move(next));
             }
             op = nullptr;
             break;
@@ -2168,6 +2337,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                 next.token = AffineTokenState::Released;
               else if (next.retained > 0)
                 --next.retained;
+              else if (!next.slotParents.empty())
+                next.slotParents.pop_back();
             };
             // Release helpers scheduled between the marker and the guarded
             // call (a raise statement's dying locals) run BEFORE any unwind,
@@ -2216,55 +2387,51 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         }
         bool retains = mentionsTracked &&
                        callRetainsGroup(contracts, call, state.group, aliases);
-        // ⚠️ INVESTIGATION SCAFFOLD, NOT A PROPOSED FIX. Default is OFF, i.e.
-        // shipped behaviour; `LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN=1` turns the
-        // experiment on. It is kept only so the repro set below is reproducible
-        // from ONE binary, and it MUST NOT be flipped on without reading the
-        // measurement that killed it.
+        // A slot-absorption retain (`aggregate_retain`: an element/field store)
+        // parks the token in the HOLDER. `aggregate(parent, path)` is a resource
+        // of `parent` (rfc/memory-safety-proof.md, Aggregates), so the token is
+        // charged to the container's identity instead of to this walk's free
+        // counter, and the container's release discharges it below.
         //
-        // The idea: a slot-absorption retain (`aggregate_retain`: an
-        // element/field store) parks the token in the HOLDER, and the holder's
-        // release discharges it -- `aggregate(parent, path)` answered by
-        // `parent` (rfc/memory-safety-proof.md, Aggregates). The borrowed-entry
-        // walk already skips these (see `kAggregateRetainAttr` above), and not
-        // skipping them here means `retained` -- part of the visited-state key --
-        // increases on every iteration of a loop containing a slot store, so the
-        // fixpoint never closes. That is a real shipped defect: it refuses
-        // `s = "abc"` / `for k in range(3): t = (s,)` with
-        // `ownership CFG exploration exceeded 20000 states`, and it also hides
-        // whatever the walk would have found afterwards.
-        //
-        // ⛔ Why skipping them is NOT the repair (measured 2026-07-28): the
-        // asymmetry with the borrowed walk is not a licence to copy it -- the two
-        // walks track different resource kinds. Reading an element BACK out of a
-        // container (`total += ys[0]`) hands the reader a token derived from the
-        // slot, and this walk needs that retain to justify the reader's later
-        // release. Skipping it refuses programs that work today:
+        // ⛔ Why NOT skip these the way the borrowed-entry walk does (the
+        // `LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN` experiment, measured
+        // 2026-07-28 and deleted here): the two walks track different resource
+        // kinds and the asymmetry is not a licence to copy the exemption.
+        // Reading an element BACK out of a container (`total += ys[0]`) hands
+        // the reader a token derived from the slot, and this walk needs the
+        // retain to justify the reader's later release. Skipping it refused
+        // programs that compile today --
         //
         //     for i in range(3, 6):      ys = [i]; total += ys[0]   -> refused
         //     for i in ... for j in ...: ys = [7]; total += ys[0]   -> refused
         //
-        // and, combined with the CollectionPayload source-move predicate, turns a
-        // refusal into a SILENT WRONG ANSWER for `v = ys[0]` in a nested loop --
-        // the one direction that may never be traded into. 9 of the first 40
-        // golden cases were newly refused.
+        // -- 39 golden cases in all, and combined with the CollectionPayload
+        // source-move predicate it turned a refusal into a SILENT WRONG ANSWER
+        // for `v = ys[0]` in a nested loop, the one direction this family may
+        // never move in. Charging the token to the parent keeps it outstanding
+        // (so the read-back stays legal) while bounding the state key (so the
+        // fixpoint closes).
         //
-        // The actual requirement is narrower and is a modelling change, not a
-        // predicate flip: the container's release must DISCHARGE the slot retains
-        // it absorbed, rather than the walk pretending the retain never happened.
-        static bool skipAggregateSlotRetain = [] {
-          auto value = llvm::sys::Process::GetEnv(
-              "LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN");
-          return value && !value->empty() && *value != "0";
-        }();
-        // Scoped to the still-OWNED case below rather than applied to `retains`
-        // outright: a retain seen after the token was already released is a
-        // resurrection, which is the only thing making a later use legal.
-        // (Narrowing it here changed no measured outcome -- kept because it is
-        // the more conservative scope, not because it fixed a symptom.)
-        bool slotAbsorptionRetain = retains && skipAggregateSlotRetain &&
+        // Why NOT charge it when the parent link is missing or ambiguous: an
+        // unnamed parent can never be released by name either, so the charge
+        // would never be discharged and would only cost states. Those fall
+        // through to `retained`, which is exactly what shipped.
+        std::optional<std::int64_t> slotParent;
+        bool slotAbsorptionRetain = retains &&
                                     call->hasAttr(own::kAggregateRetainAttr) &&
                                     !isBlockArgMergeBorrowRetain(call);
+        if (slotAbsorptionRetain) {
+          slotParent = walk.slotRetainParent(call);
+          slotAbsorptionRetain = slotParent.has_value();
+        }
+        // The DISCHARGE. Checked for every call, not only ones mentioning the
+        // tracked group: the container's release names the CONTAINER, and a
+        // walk that only looks at ops naming the element never sees it. That
+        // blindness is what let `state.retained` grow without bound.
+        if (!state.slotParents.empty() && dischargeOnHolderRelease())
+          llvm::erase_if(state.slotParents, [&](std::int64_t identity) {
+            return walk.callDischargesAggregate(call, identity);
+          });
         if (mentionsTracked &&
             callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
@@ -2275,11 +2442,11 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
 
         if (state.token == AffineTokenState::Released) {
           if (consumes) {
-            if (state.retained == 0 && resource.condition) {
+            if (outstanding() == 0 && resource.condition) {
               op = op->getNextNode();
               continue;
             }
-            if (state.retained == 0) {
+            if (outstanding() == 0) {
               if (ownershipPathTraceEnabled()) {
                 llvm::errs() << "[ownership-path] double consume of "
                              << resource.producerLabel << " (produced in ^bb"
@@ -2299,20 +2466,26 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                      << " is released or transferred more than once on one CFG "
                         "path";
             }
-            --state.retained;
+            spendOutstanding();
             op = op->getNextNode();
             continue;
           }
           if (mentionsTracked &&
               (groupContainsOperand(op, state.group, aliases) ||
                groupContainsOperand(op, state.views, aliases)) &&
-              state.retained == 0)
+              outstanding() == 0)
             return call.emitError()
                    << "released owned resource from " << resource.producerLabel
                    << " is used after release (by call to '"
                    << call.getCallee() << "')";
-          if (retains)
+          if (retains) {
+            // A retain seen after the token was already released is a
+            // resurrection, and it is the only thing that makes a later use
+            // legal. Charging it to a parent instead would let the holder's
+            // release cancel it, so it stays a plain retain here even when it
+            // carries a parent link.
             ++state.retained;
+          }
         } else if (state.token == AffineTokenState::Owned && consumes) {
           if (std::optional<llvm::SmallVector<mlir::Value, 4>> replacement =
                   callTransfersGroupToOwnedResult(contracts, call, state.group,
@@ -2323,10 +2496,13 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             state.token = AffineTokenState::Released;
           }
         }
-        if (state.token == AffineTokenState::Owned && retains &&
-            !slotAbsorptionRetain) {
+        if (state.token == AffineTokenState::Owned && retains) {
           if (isBlockArgMergeBorrowRetain(call))
             ++state.borrowed;
+          else if (slotAbsorptionRetain) {
+            if (!llvm::is_contained(state.slotParents, *slotParent))
+              state.slotParents.push_back(*slotParent);
+          }
           else
             ++state.retained;
         }
@@ -2378,7 +2554,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                     "must release, transfer, or return it";
       } else if (state.token == AffineTokenState::Released && mentionsTracked &&
                  groupContainsOperand(op, state.group, aliases) &&
-                 state.retained == 0 &&
+                 outstanding() == 0 &&
                  (releasedUseDominanceDisabled() ||
                   walk.producerDominates(resource.producer, op))) {
         return op->emitError()
@@ -2463,6 +2639,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       mlir::Block *successor = op->getSuccessor(index);
       AffineTokenState nextToken = state.token;
       unsigned nextRetained = state.retained;
+      llvm::SmallVector<std::int64_t, 2> nextSlotParents = state.slotParents;
       bool nextExceptional =
           state.exceptional || (anchorTerminator && index == 0);
       if (anchorEdgeConsumes && index == 0) {
@@ -2471,6 +2648,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           nextToken = AffineTokenState::Released;
         else if (nextRetained > 0)
           --nextRetained;
+        else if (!nextSlotParents.empty())
+          nextSlotParents.pop_back();
       }
       llvm::SmallVector<bool, 4> mappedMask;
       llvm::SmallVector<mlir::Value, 4> mappedGroup = remapGroupForSuccessor(
@@ -2520,14 +2699,20 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           continue;
         mappedViews.push_back(view);
       }
-      worklist.push_back(AffinePathState{successor, firstOperation(successor),
-                                         nextToken, nextRetained,
-                                         std::move(mappedGroup),
-                                         std::move(mappedStale),
-                                         std::move(mappedPrevious),
-                                         std::move(mappedViews),
-                                         state.borrowed, nextExceptional,
-                                         state.trail});
+      AffinePathState next{successor,   firstOperation(successor),
+                           nextToken,   nextRetained,
+                           std::move(mappedGroup),
+                           std::move(mappedStale),
+                           std::move(mappedPrevious),
+                           std::move(mappedViews),
+                           state.borrowed,
+                           nextExceptional};
+      // Parked slot retains are keyed by the HOLDER's identity, so unlike
+      // group/stale/previous/views they need no rename across the edge: the
+      // container is the same allocation on both sides of it.
+      next.slotParents = std::move(nextSlotParents);
+      next.trail = state.trail;
+      worklist.push_back(std::move(next));
     }
   }
 

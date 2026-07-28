@@ -1,3 +1,7 @@
+# ✅ REPAIRED 2026-07-28. All three blocks now print CPython's values. Kept
+# because the pair is what separates "trip count" from "immortal small-int cache"
+# as the axis, and any future regression here will look like a threshold again.
+#
 # The axis of the nested-loop over-release, as a pair that differs only in the
 # VALUE the outer loop variable takes -- not in trip count, not in structure.
 #

@@ -1,3 +1,9 @@
+# ✅ REPAIRED 2026-07-28: the source move is declined when the literal's block can
+# reach itself without passing through the source's defining block, and the
+# container's compile-time contents evidence is dropped with it (or the read-back
+# of an element the container does not own becomes a silent wrong answer). Now
+# prints 48 on every rep.
+#
 # SHIPPED DEFECT (2026-07-28), not yet repaired. Nested loop, container literal.
 #
 # `initializeSequencePayload` (Passes/Runtime/Core/CollectionPayload.cpp) hands the

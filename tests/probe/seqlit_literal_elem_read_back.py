@@ -1,3 +1,7 @@
+# ✅ STILL CLEAN after the 2026-07-28 repair. Same latent-use-after-free note as
+# seqlit_single_loop_read_back.py applies: `LYTHON_EXP_HOLDER_DISCHARGE=1`
+# refuses it, and correctly.
+#
 # ⛔ GUARD PROBE. CLEAN on main 4699488 and must stay clean.
 #
 # Companion to seqlit_single_loop_read_back.py. Same guard, but with NO loop
