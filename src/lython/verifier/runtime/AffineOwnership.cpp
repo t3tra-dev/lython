@@ -249,41 +249,34 @@ struct TrackedResource {
 // question the same way -- if insertion and verification disagreed about which
 // token a release discharges, the proof would be void.
 //
-// Why NOT skip every foreign-named consume: a BARE release names some local
-// token and neither pass can tell which, so the only safe reading is "this one".
-// Measured: skipping bare ones as well made the placer emit a second release
-// where the mint was already paid for under the head's advanced lanes, and
-// `golden.cases.dict_methods_complete` aborted with `Ly_DecRef observed
-// non-positive refcount`.
-// 0 = off, 1 = skip foreign AGGREGATE releases only, 2 = skip every
-// foreign-named release. Under measurement; see the report.
-unsigned verifierForeignSkipMode() {
-  static const unsigned mode = [] {
-    const char *value = std::getenv("LYTHON_EXP_VERIFIER_FOREIGN_SKIP");
-    return value ? static_cast<unsigned>(std::atoi(value)) : 1u;
-  }();
-  return mode;
-}
-
+// Why NOT skip every foreign-named consume (measured, and both directions were
+// measured on the same day):
+//
+//   skip only foreign aggregate releases  -> 492/492
+//   skip every foreign-named release      -> 20 refusals, and with the wider
+//                                            placer rule that pairs with it,
+//                                            `golden.cases.dict_methods_complete`
+//                                            aborted with `Ly_DecRef observed
+//                                            non-positive refcount`
+//   match the marker's OPERANDS instead    ->  5 refusals (`golden.cases.oop`
+//                                            releases the foreign token under a
+//                                            THIRD name -- a second marker's
+//                                            results over the same allocation)
+//
+// A BARE release names some local token and neither pass can tell which, so the
+// only safe reading of one is "this token". `aggregate_release` is the one label
+// that decides the question from the proof kernel rather than from a guess.
 bool callReleasesForeignAggregate(
     bool retainRootedLocal,
     std::initializer_list<llvm::ArrayRef<mlir::Value>> ourNames,
     mlir::func::CallOp call) {
-  unsigned mode = verifierForeignSkipMode();
-  if (mode == 0 || !retainRootedLocal)
+  if (!retainRootedLocal || !call->hasAttr(own::kAggregateReleaseAttr))
     return false;
-  if (mode == 1 && !call->hasAttr(own::kAggregateReleaseAttr))
-    return false;
-  bool namesAnotherMarker = false;
-  for (mlir::Value operand : call.getOperands()) {
+  for (mlir::Value operand : call.getOperands())
     for (llvm::ArrayRef<mlir::Value> names : ourNames)
       if (llvm::is_contained(names, operand))
         return false;
-    if (auto result = mlir::dyn_cast<mlir::OpResult>(operand))
-      if (result.getOwner()->hasAttr(own::kOwnedLocalObjectAttr))
-        namesAnotherMarker = true;
-  }
-  return mode != 3 || namesAnotherMarker;
+  return true;
 }
 
 std::string describeOwnershipProducer(mlir::Operation *op) {
@@ -1277,10 +1270,10 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
     if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
       bool consumes = callConsumesGroup(contracts, call, group, aliases);
-      if (consumes &&
-          callReleasesForeignAggregate(resource.retainRootedLocal &&
-                                           resource.hasOwnNamedRelease,
-                                   {group, resource.views}, call))
+      if (consumes && callReleasesForeignAggregate(
+                          resource.retainRootedLocal &&
+                              resource.hasOwnNamedRelease,
+                          {group, resource.views}, call))
         continue;
       bool retains = callRetainsGroup(contracts, call, group, aliases);
       if (callPartiallyConsumesGroup(contracts, call, group, aliases))
@@ -2889,13 +2882,14 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
                             std::move(group.views));
       resources.back().retainRootedLocal =
           own::ownedLocalMarkerIsRetainRooted(op, aliases);
-      if (resources.back().retainRootedLocal && group.deallocator)
+      if (resources.back().retainRootedLocal && group.deallocator) {
+        mlir::func::FuncOp deallocator = group.deallocator->function;
         for (mlir::Value value : resources.back().group)
           for (mlir::OpOperand &use : value.getUses())
             if (auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner()))
-              if (call.getCallee() ==
-                  group.deallocator->function.getName())
+              if (call.getCallee() == deallocator.getName())
                 resources.back().hasOwnNamedRelease = true;
+      }
       return;
     }
     if (!op->hasAttr(own::kOwnedLocalObjectContractAttr) &&

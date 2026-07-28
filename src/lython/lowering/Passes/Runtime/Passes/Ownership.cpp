@@ -609,10 +609,10 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
   return current;
 }
 
-// `ownNamesOnlyConsume`: see `ownedLocalMarkerIsRetainRooted`. When set, a
-// consuming call only ends THIS token if it uses one of the group's own names;
-// a consume reached through an alias belongs to another token on the same
-// object and is plain liveness here.
+// `ownNamesOnlyConsume`: see `consumeIsAggregateRelease`. When set, an AGGREGATE
+// release reached through an alias rather than through one of the group's own
+// names does not end this token -- it discharges the container's -- and counts
+// only as liveness here. Bare releases still end it either way.
 std::optional<ReleaseInsertion>
 findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
                      llvm::ArrayRef<mlir::Value> group,
@@ -2643,33 +2643,17 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
   mlir::func::FuncOp enclosing = op->getParentOfType<mlir::func::FuncOp>();
-  // ONE HEAD, SEVERAL MINTS IS NOT A SHAPE THIS RULE CAN CARRY. Reading the same
-  // element back twice (`counts["a"]` after `counts["a"]`, or `c = [i, i]` read
-  // at both indices) puts two retain-rooted markers on one object. Each mint is
-  // real and each needs a release, but the affine walk names tokens by SSA value
-  // and every one of those names aliases every other, so it reads the second
-  // release as a double consume and refuses the program
-  // (`golden.cases.cross_except_star_views`, measured 2026-07-28: three markers
-  // on the `0` of `counts = {"app": 0, "net": 0, "val": 0}`).
-  //
-  // Why NOT teach the walk to tell them apart instead: three shapes of that were
-  // measured and each traded one refusal for another (a foreign-name rule refused
-  // `cross_float_range_contracts_fields` for a token whose only release IS under
-  // a foreign name; a marker-operand rule refused four class-field cases). Until
-  // the walk counts tokens rather than naming them, the honest scope of this
-  // repair is one mint per head -- and the residue is a bounded leak on the
-  // multi-read shapes, not a refusal and not a double free.
-  bool retainRooted = own::ownedLocalMarkerIsRetainRooted(op, aliases);
-  if (retainRooted && enclosing) {
-    enclosing.walk([&](mlir::Operation *other) {
-      if (other == op || !other->hasAttr(own::kOwnedLocalObjectAttr) ||
-          other->getNumOperands() == 0)
-        return;
-      if (own::ownedLocalMarkerIsRetainRooted(other, aliases) &&
-          aliases.same(other->getOperand(0), op->getOperand(0)))
-        retainRooted = false;
-    });
-  }
+  // SEVERAL MINTS ON ONE HEAD NEED NO SPECIAL CASE, and the measurement that
+  // said otherwise did not survive. Reading one element back twice (`c = [i, i]`
+  // read at both indices, or the three `0`s of `counts = {"app": 0, "net": 0,
+  // "val": 0}`) puts two or more retain-rooted markers on one object, and an
+  // earlier tree refused `golden.cases.cross_except_star_views` for it with
+  // `released or transferred more than once` -- so this pass declined the second
+  // mint. Re-measured after the affine walk learned to prefer a release written
+  // under the token's own name: 494/494 with the restriction and 494/494
+  // without, and the four residual leaking shapes are byte-identical either way.
+  // An inert restriction is not a safeguard, so it is gone.
+  const bool retainRooted = own::ownedLocalMarkerIsRetainRooted(op, aliases);
   if (ownedLocalTraceEnabled()) {
     auto contract =
         op->getAttrOfType<mlir::StringAttr>(own::kOwnedLocalObjectContractAttr);
