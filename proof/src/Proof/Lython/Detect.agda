@@ -63,12 +63,6 @@ danglingAnchor es x with lookupVar es x
 ...     | just _  = nothing
 
 -- Soundness: what the checker reports really is a dangling borrow.
---
--- The reverse direction -- completeness -- is not proved here, and the
--- difference matters: a sound checker never cries wolf, and this one may still
--- miss cases the specification calls dangling. It does not, but that is not
--- established below, and reporting it as if it were is the failure this project
--- has recorded repeatedly.
 danglingAnchor-sound :
   ∀ (es : Env) (x a : Var) → danglingAnchor es x ≡ just a → DanglingBorrow es x
 danglingAnchor-sound es x a rep with lookupVar es x in lx
@@ -142,3 +136,40 @@ drop-strands-its-borrows es x y o look ne gone still =
 -- shadows, so an environment with two bindings for `x` keeps one after
 -- `unbindVar`. Requiring it rather than assuming it is the difference between a
 -- theorem about this model and a theorem about a model where names are unique.
+
+------------------------------------------------------------------------
+-- Completeness.
+--
+-- The other direction, and the one that makes running the checker WORTH
+-- anything: every dangling borrow is reported. Sound alone means "never cries
+-- wolf" and is satisfied by a checker that reports nothing at all.
+--
+-- The proof is short because the specification and the procedure look at the
+-- same two lookups. That is not luck -- it is why the anchor was put into
+-- `Mode.borrowed` rather than left to be recovered by an analysis.
+
+danglingAnchor-complete :
+  ∀ (es : Env) (x : Var) → (d : DanglingBorrow es x) →
+  danglingAnchor es x ≡ just (anchor d)
+danglingAnchor-complete es x d with is-borrow d
+... | (o , look) rewrite look | anchor-gone d = refl
+
+-- Put together: the checker reports exactly the dangling borrows.
+--
+-- Stated as the two implications rather than as an `iff`, because they are used
+-- in different places -- soundness by whoever acts on a report, completeness by
+-- whoever concludes from silence that there is nothing to act on. The second is
+-- the one a pass relies on when it elides a check.
+danglingAnchor-exact :
+  ∀ (es : Env) (x : Var) →
+  ((a : Var) → danglingAnchor es x ≡ just a → DanglingBorrow es x)
+  × ((d : DanglingBorrow es x) → danglingAnchor es x ≡ just (anchor d))
+danglingAnchor-exact es x = danglingAnchor-sound es x , danglingAnchor-complete es x
+
+-- And the contrapositive, which is the form a pass actually uses: silence means
+-- there is nothing there.
+silence-means-safe :
+  ∀ (es : Env) (x : Var) →
+  danglingAnchor es x ≡ nothing → ¬ DanglingBorrow es x
+silence-means-safe es x quiet d with trans (sym quiet) (danglingAnchor-complete es x d)
+... | ()

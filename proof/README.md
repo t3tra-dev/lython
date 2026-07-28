@@ -85,7 +85,9 @@ shown not to reach it.
 - **a borrow may not outlive its anchor.** `Mode.borrowed` records the name it
   came from, so the check is a second lookup and needs no analysis.
   `drop-strands-its-borrows` says *where* it belongs: at the drop, not at the
-  borrow.
+  borrow. **Sound *and* complete** — `danglingAnchor-exact`. Soundness alone is
+  satisfied by a checker that reports nothing; completeness is what lets a pass
+  conclude from silence, and `silence-means-safe` is that form.
 
 ### The one-lane object — a redesign, not a transcription
 
@@ -227,11 +229,12 @@ And for the one-lane object:
   `RaceFree` are defined; nothing proves any program satisfies the second.
   **A predicate being definable is not the same as any program being shown free
   of it**, and the module says so in place.
-- **The dangling-borrow checker is proved SOUND, not complete.** It never cries
-  wolf; whether it misses cases the specification calls dangling is not
-  established.
-- **`WFRC` preservation is still not proved**, although "reachable" now has a
-  referent. The per-step lemmas exist; nothing composes them.
+- **`step-preserves-WFRC` is not exported.** Its five fields now rest on proved
+  lemmas or on `reachable-keeps-the-heap`, and the two IR-level obstructions are
+  gone — but each field is ∀-quantified over *all* objects, so every rule needs
+  the untouched-object case too. That is assembly, not discovery, and it is not
+  yet written. **"The obstruction is gone" and "the theorem is proved" are
+  different statements** and only the first is claimed.
 - **`WFRC` is never established.** The invariant is *stated* and the operations
   are proved to move both counts together, but no theorem yet says "every
   reachable machine satisfies `WFRC`". That is the preservation proof, and it is

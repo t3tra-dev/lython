@@ -96,7 +96,9 @@ retain-ghost m o pr dst m' free eq
 -- would satisfy the theorem above.
 retain-ghost-others :
   ∀ (m : Machine) (o p : ObjId) (pr : ProtectedRef m o) (dst : OwnerSite) m' →
-  ¬ (o ≡ p) →
+  -- The disequality is stated over the BOOLEAN that `logicalRC` branches on.
+  -- `sameObj-sound` converts the other way when a caller has a proposition.
+  sameObj o p ≡ false →
   strongAt (sites m) dst ≡ nothing →
   retain m o pr dst ≡ ok m' →
   ghostRC m' p ≡ ghostRC m p

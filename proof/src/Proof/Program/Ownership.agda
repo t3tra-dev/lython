@@ -30,6 +30,7 @@ open import Relation.Binary.PropositionalEquality
 open import Relation.Nullary using (Dec; yes; no; ¬_)
 
 open import Proof.RC.Object using (ObjId; objAllocation; objGeneration;
+  sameObj; sameObj-refl;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; bumpUp)
 open import Proof.RC.OwnerSite using (OwnerSite; occupy; vacate; logicalRC;
@@ -101,13 +102,10 @@ two-names-one-object es x y o px py = aliased o px py
 -- "≡ᵇ is reflexive" are two things that can drift, and the object comparison in
 -- Env has to agree with the one in the machine or the program-level count and
 -- the ghost count would be counting with different notions of equality.
-sameObjB-refl : ∀ p → sameObjB p p ≡ true
-sameObjB-refl p rewrite ≡ᵇ-refl (objAllocation p) | ≡ᵇ-refl (objGeneration p) = refl
-
 owned-names-are-counted :
   ∀ (es : Env) (x : Var) (o : ObjId) →
   ownedCount (bindVar es x (bind o owned)) o ≡ suc (ownedCount es o)
-owned-names-are-counted es x o rewrite sameObjB-refl o = refl
+owned-names-are-counted es x o rewrite sameObj-refl o = refl
 
 -- A borrow does NOT add to the count. This is the row of the table where the
 -- correct number of runtime operations is zero, now stated over the program
@@ -150,10 +148,10 @@ step-borrow-preserves-everything (step-borrow _) = refl
 -- theorem without re-deriving it at each step.
 
 steps-preserve-heap : ∀ {f s t} → f ⊢ s —→ t → heap (mach t) ≡ heap (mach s)
-steps-preserve-heap (by-instr (step-new _))    = refl
+steps-preserve-heap (by-instr (step-new _))     = refl
 steps-preserve-heap (by-instr (step-move _))   = refl
 steps-preserve-heap (by-instr (step-dup _))    = refl
-steps-preserve-heap (by-instr (step-drop _))   = refl
+steps-preserve-heap (by-instr (step-drop _ _ _)) = refl
 steps-preserve-heap (by-instr (step-borrow _)) = refl
 steps-preserve-heap (by-term (step-br _ _ _ _))            = refl
 steps-preserve-heap (by-term (step-cond-then _ _ _ _))     = refl

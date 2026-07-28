@@ -25,6 +25,7 @@ open import Proof.RC.Object using (ObjId; obj; Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; bumpUp; bumpDown)
 open import Proof.RC.OwnerSite using (OwnerSite; local; temp; SiteMap; strongAt;
   occupy; vacate; logicalRC)
+open import Proof.Memory.Descriptor Sig using (Desc)
 open import Proof.RC.Machine Sig
 open import Proof.Program.Syntax
 open import Proof.Program.Env
@@ -76,13 +77,20 @@ stepDownAt ts o = updateObj ts o down
 data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
 
   -- `new`: fresh object, refcount 1, one owner site, one owned name.
+  --
+  -- The cell is CONSTRUCTED by the rule rather than taken as a parameter. The
+  -- first version let the rule install any cell at all, including one already
+  -- at count 0 -- and then `live-positive` was unprovable, not because the
+  -- invariant was wrong but because the IR could produce a state violating it.
+  -- Starting at 1 is also the right semantics: at 0 the object would be
+  -- reclaimable the instant it exists.
   step-new :
-    ∀ {bid rest es m x c o cell} →
+    ∀ {bid rest es m x c o bk} →
     lookupObj (objects m) o ≡ nothing →
     f ⊢ pstate bid (new x c ∷ rest) es m
       —→ᵢ pstate bid rest
             (bindVar es x (bind o owned))
-            (machine (heap m) ((o , cell) ∷ objects m)
+            (machine (heap m) ((o , cell live (counted 1) bk) ∷ objects m)
                      (occupy (sites m) (siteOf x) o))
 
   -- `move`: the entity changes hands. NO change to the count and none to the
@@ -113,9 +121,14 @@ data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
   -- `drop` = py.decref. The name goes, the site goes, the counter goes down.
   -- Reaching zero moves the object to `finalizing` and does NOT free it: the
   -- storage handoff is a separate step with its own precondition.
+  -- The object must be LIVE. Without this premise a drop on a dead object would
+  -- move it back to `finalizing` -- a resurrection the model would then have to
+  -- explain, and `dead-unowned` would be false at the state it produced.
   step-drop :
-    ∀ {bid rest es m x o} →
+    ∀ {bid rest es m x o c} →
     lookupVar es x ≡ just (bind o owned) →
+    lookupObj (objects m) o ≡ just c →
+    life c ≡ live →
     f ⊢ pstate bid (drop x ∷ rest) es m
       —→ᵢ pstate bid rest
             (unbindVar es x)

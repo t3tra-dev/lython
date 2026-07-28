@@ -60,6 +60,7 @@ import Proof.Program.Syntax
 import Proof.Program.Env
 import Proof.Program.Step
 import Proof.Program.Ownership
+import Proof.Program.Preservation
 
 -- Concurrency: threads, a nondeterministic scheduler, happens-before and the
 -- race predicate. No permission algebra yet, so no race-freedom theorem.

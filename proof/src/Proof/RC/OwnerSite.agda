@@ -14,14 +14,18 @@
 
 module Proof.RC.OwnerSite where
 
+open import Data.Bool using (Bool; true; false; if_then_else_; _∧_)
+open import Data.Empty using (⊥; ⊥-elim)
 open import Data.List using (List; []; _∷_; length; filter)
 open import Data.Maybe using (Maybe; just; nothing)
 open import Data.Nat using (ℕ; zero; suc; _≟_; _+_)
+open import Data.Nat.Base using (_≡ᵇ_)
 open import Data.Product using (_×_; _,_)
 open import Relation.Binary.PropositionalEquality using (_≡_; refl; cong)
 open import Relation.Nullary using (Dec; yes; no; ¬_)
 
-open import Proof.RC.Object using (ObjId; obj; _≟-obj_)
+open import Proof.RC.Object using (ObjId; obj; _≟-obj_; sameObj; sameObj-refl;
+  sameObj-sound; ≡ᵇ-refl)
 
 ThreadId LocalSlot FieldId GlobalId QueueId Ticket TempId : Set
 ThreadId  = ℕ
@@ -97,53 +101,94 @@ temp _ _    ≟-site queue _ _  = no λ ()
 SiteMap : Set
 SiteMap = List (OwnerSite × ObjId)
 
+-- Boolean, for the same reason the object table is: `with s ≟-site t` compiles
+-- to an auxiliary function, and then `vacate` and `logicalRC` branch on terms a
+-- goal cannot abstract together. The counting lemmas below are unprovable
+-- otherwise, and they are what WFRC preservation rests on.
+sameSite : OwnerSite → OwnerSite → Bool
+sameSite (local t s)  (local t' s')  = (t ≡ᵇ t') ∧ (s ≡ᵇ s')
+sameSite (field′ o f) (field′ o' f') = sameObj o o' ∧ (f ≡ᵇ f')
+sameSite (global g)   (global g')    = g ≡ᵇ g'
+sameSite (queue q k)  (queue q' k')  = (q ≡ᵇ q') ∧ (k ≡ᵇ k')
+sameSite (temp t i)   (temp t' i')   = (t ≡ᵇ t') ∧ (i ≡ᵇ i')
+sameSite _            _              = false
+
+sameSite-refl : ∀ s → sameSite s s ≡ true
+sameSite-refl (local t s)  rewrite ≡ᵇ-refl t | ≡ᵇ-refl s = refl
+sameSite-refl (field′ o f) rewrite sameObj-refl o | ≡ᵇ-refl f = refl
+sameSite-refl (global g)   rewrite ≡ᵇ-refl g = refl
+sameSite-refl (queue q k)  rewrite ≡ᵇ-refl q | ≡ᵇ-refl k = refl
+sameSite-refl (temp t i)   rewrite ≡ᵇ-refl t | ≡ᵇ-refl i = refl
+
 strongAt : SiteMap → OwnerSite → Maybe ObjId
 strongAt []             _ = nothing
-strongAt ((s , o) ∷ ss) t with s ≟-site t
-... | yes _ = just o
-... | no  _ = strongAt ss t
+strongAt ((s , o) ∷ ss) t = if sameSite s t then just o else strongAt ss t
 
 -- THE definition. The reference count of an object is how many owner sites hold
 -- it -- an ordinary count over ghost state, with no runtime counter involved.
 logicalRC : SiteMap → ObjId → ℕ
 logicalRC []             _ = 0
-logicalRC ((_ , p) ∷ ss) o with p ≟-obj o
-... | yes _ = suc (logicalRC ss o)
-... | no  _ = logicalRC ss o
+logicalRC ((_ , p) ∷ ss) o = if sameObj p o then suc (logicalRC ss o) else logicalRC ss o
 
 ------------------------------------------------------------------------
 -- The three site operations, and what each does to the count.
---
--- These are the ONLY ways the map changes, which is what makes the counting
--- lemmas below exhaustive rather than merely true of the cases considered.
 
--- Taking a site that was free. Corresponds to py.incref's destination, or to
--- the destination of a move.
 occupy : SiteMap → OwnerSite → ObjId → SiteMap
 occupy ss s o = (s , o) ∷ ss
 
--- Releasing a site. Removes the FIRST binding for it, which is the right
--- semantics because `occupy` shadows: a site is occupied once at a time, and
--- the model's `strongAt` already reads the most recent.
 vacate : SiteMap → OwnerSite → SiteMap
 vacate []             _ = []
-vacate ((s , o) ∷ ss) t with s ≟-site t
-... | yes _ = ss
-... | no  _ = (s , o) ∷ vacate ss t
+vacate ((s , o) ∷ ss) t = if sameSite s t then ss else (s , o) ∷ vacate ss t
 
 ------------------------------------------------------------------------
 -- Counting lemmas.
 
 occupy-same : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
               logicalRC (occupy ss s o) o ≡ suc (logicalRC ss o)
-occupy-same ss s o with o ≟-obj o
-... | yes _  = refl
-... | no ¬p  = ⊥-elim (¬p refl)
-  where open import Data.Empty using (⊥-elim)
+occupy-same ss s o rewrite sameObj-refl o = refl
 
-occupy-other : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) → ¬ (o ≡ p) →
+occupy-other : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) → sameObj o p ≡ false →
                logicalRC (occupy ss s o) p ≡ logicalRC ss p
-occupy-other ss s o p ne with o ≟-obj p
-... | yes q = ⊥-elim (ne q)
-  where open import Data.Empty using (⊥-elim)
-... | no  _ = refl
+-- Stated over the BOOLEAN rather than over the proposition, because that is
+-- what `logicalRC` branches on. Callers turn a disequality into it with
+-- `sameObj-sound` contraposed.
+occupy-other ss s o p ne rewrite ne = refl
+
+-- ⭐ Vacating a site that HOLDS the object drops the count by exactly one.
+--
+-- This is the lemma WFRC preservation for `drop` needs, and the reason the site
+-- map had to move to a boolean test: `strongAt` and `vacate` branch on the same
+-- decision, and with `_≟-site_` they branch on two different auxiliary
+-- functions that no single `with` abstracts.
+vacate-holder : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+                strongAt ss s ≡ just o →
+                logicalRC ss o ≡ suc (logicalRC (vacate ss s) o)
+vacate-holder [] s o ()
+vacate-holder ((t , p) ∷ ss) s o held with sameSite t s
+... | true  = helper (just-inj held)
+  where
+    just-inj : ∀ {A : Set} {x y : A} → just x ≡ just y → x ≡ y
+    just-inj refl = refl
+    helper : p ≡ o → logicalRC ((t , p) ∷ ss) o ≡ suc (logicalRC ss o)
+    helper refl rewrite sameObj-refl p = refl
+... | false with sameObj p o
+...   | true  = cong suc (vacate-holder ss s o held)
+...   | false = vacate-holder ss s o held
+
+-- And vacating a site that does NOT hold the object leaves its count alone.
+-- Without this, `move` -- which vacates one site and occupies another -- could
+-- not be shown to preserve anything.
+vacate-other : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+               strongAt ss s ≡ nothing →
+               logicalRC (vacate ss s) o ≡ logicalRC ss o
+vacate-other [] s o _ = refl
+vacate-other ((t , p) ∷ ss) s o miss with sameSite t s
+... | true  = ⊥-elim (bad miss)
+  where
+    open import Data.Empty using (⊥-elim)
+    bad : just p ≡ nothing → ⊥
+    bad ()
+    open import Data.Empty using (⊥)
+... | false with sameObj p o
+...   | true  = cong suc (vacate-other ss s o miss)
+...   | false = vacate-other ss s o miss

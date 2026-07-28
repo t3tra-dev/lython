@@ -17,7 +17,8 @@ open import Data.Product using (_×_; _,_; proj₁; proj₂)
 open import Relation.Binary.PropositionalEquality using (_≡_; refl; sym; trans; cong)
 open import Relation.Nullary using (Dec; yes; no; ¬_)
 
-open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration)
+open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
+  sameObj; sameObj-refl; sameObj-sound)
 open import Proof.Program.Syntax using (Var)
 
 -- How a name holds its entity.
@@ -138,14 +139,10 @@ bindParams _  (_ ∷ _)  []       = nothing
 -- refcount invariant. Borrowed bindings are NOT counted, which is the whole
 -- content of "a borrow costs nothing".
 
-sameObjB : ObjId → ObjId → Bool
-sameObjB p q = (objAllocation p ≡ᵇ objAllocation q)
-             ∧ (objGeneration p ≡ᵇ objGeneration q)
-
 ownedCount : Env → ObjId → ℕ
 ownedCount []             _ = 0
 ownedCount ((_ , b) ∷ es) o with mode b
 ... | borrowed _ = ownedCount es o
-... | owned      with sameObjB (entity b) o
+... | owned      with sameObj (entity b) o
 ...   | true  = suc (ownedCount es o)
 ...   | false = ownedCount es o

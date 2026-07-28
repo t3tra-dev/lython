@@ -46,18 +46,8 @@ ObjTable = List (ObjId × ObjCell)
 -- the one in the goal, and `with` cannot abstract both at once. Proving
 -- `lookupObj (updateObj ts o f) o ≡ just (f c)` then becomes impossible without
 -- inspect-idiom scaffolding. With `if`, both occurrences are the same term.
-sameObj : ObjId → ObjId → Bool
-sameObj (obj a g) (obj a' g') = (a ≡ᵇ a') ∧ (g ≡ᵇ g')
-
--- `≡ᵇ` reflexivity is proved by induction here rather than pulled from the
--- library: stdlib states it as `T (a ≡ᵇ a)`, and what the `if` needs is the
--- Boolean equation itself.
-≡ᵇ-refl : ∀ (n : ℕ) → (n ≡ᵇ n) ≡ true
-≡ᵇ-refl zero    = refl
-≡ᵇ-refl (suc n) = ≡ᵇ-refl n
-
-sameObj-refl : ∀ o → sameObj o o ≡ true
-sameObj-refl (obj a g) rewrite ≡ᵇ-refl a | ≡ᵇ-refl g = refl
+-- `sameObj`, `≡ᵇ-refl` and `sameObj-refl` now live in Proof.RC.Object, so the
+-- site map and the program environment use the same one.
 
 lookupObj : ObjTable → ObjId → Maybe ObjCell
 lookupObj []             _ = nothing
