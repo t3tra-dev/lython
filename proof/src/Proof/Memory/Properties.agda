@@ -45,7 +45,11 @@ open import Proof.Memory.Heap
 open import Proof.Memory.Index using (Ix)
 open import Proof.Memory.Descriptor Sig
 open import Proof.Memory.Resolve Sig
-open import Proof.Memory.Ops Sig
+-- The operations come from the dialect transcription. Proof.Memory.Ops used to
+-- define its own alloc/load/store/dealloc; two definitions of the same
+-- operation are two things that can drift apart, and the one the theorems are
+-- about would not have been the one the model exports.
+open import Proof.MemRef.Dialect Sig
 
 private
   -- The heap transformation `dealloc` performs, named so theorems can talk
@@ -81,20 +85,33 @@ lookup-update-other (x ∷ xs) (suc n) (suc m) f ne =
 -- the whole heap after any other allocation anywhere.
 
 alloc-preserves-old : ∀ (h : Heap) sp τ count al (a : AllocId) → a < length h →
-                      lookupBlock (proj₁ (allocate h sp τ count al)) a ≡ lookupBlock h a
+                      lookupBlock (proj₁ (alloc h sp τ count al)) a ≡ lookupBlock h a
 alloc-preserves-old h sp τ count al a lt = lookup-fresh-old h _ a lt
 
+-- `heapAlloc` is part of the statement, not incidental. It is what makes the
+-- block deallocatable, and an `alloc` that produced stack storage would satisfy
+-- every other theorem here while making its own result impossible to free.
 alloc-new-is-live : ∀ (h : Heap) sp τ count al →
-                    lookupBlock (proj₁ (allocate h sp τ count al)) (freshId h)
+                    lookupBlock (proj₁ (alloc h sp τ count al)) (freshId h)
                       ≡ just (block 0 sp (width τ *ℕ count) al
-                                     (replicate (width τ *ℕ count) uninit) live)
+                                     (replicate (width τ *ℕ count) uninit)
+                                     live heapAlloc)
 alloc-new-is-live h sp τ count al = lookup-fresh-new h _
+
+-- And alloca produces stack storage, which dealloc must refuse. Stated next to
+-- the previous one because together they are the reason `Storage` exists.
+alloca-is-stack : ∀ (h : Heap) f sp τ count al →
+                  lookupBlock (proj₁ (alloca h f sp τ count al)) (freshId h)
+                    ≡ just (block 0 sp (width τ *ℕ count) al
+                                   (replicate (width τ *ℕ count) uninit)
+                                   live (stackAlloc f))
+alloca-is-stack h f sp τ count al = lookup-fresh-new h _
 
 -- The descriptor alloc hands back names the allocation alloc just made. Stated
 -- because it is the only link between the two halves of the return value, and a
 -- model where they disagreed would still satisfy every other theorem here.
 alloc-desc-names-block : ∀ (h : Heap) sp τ count al →
-                         allocation (proj₂ (allocate h sp τ count al)) ≡ freshId h
+                         allocation (proj₂ (alloc h sp τ count al)) ≡ freshId h
 alloc-desc-names-block h sp τ count al = refl
 
 ------------------------------------------------------------------------
@@ -137,18 +154,60 @@ dealloc-succeeds :
   lookupBlock h (allocation d) ≡ just b →
   generation d ≡ generation b →
   liveness b ≡ live →
+  storage b ≡ heapAlloc →
   IsRootOf b d →
   dealloc h d ≡ ok (killed h (allocation d))
-dealloc-succeeds h d b look gen liv root
+dealloc-succeeds h d b look gen liv st root
   rewrite look
   with generation d ≟ generation b
 ... | no ¬p = ⊥-elim (¬p gen)
 ... | yes _
   with liveness b | liv
 ... | .live | refl
+  with storage b | st
+... | .heapAlloc | refl
   with isRootOf? b d
 ... | no ¬r = ⊥-elim (¬r root)
 ... | yes _ = refl
+
+-- An alloca cannot be deallocated, and the fault is `invalid-free`. MLIR says
+-- so, and this compiler emits 27 allocas -- a model that accepted this would
+-- agree with a program the runtime would break, which is the direction that
+-- matters.
+alloca-cannot-be-deallocated :
+  ∀ (h : Heap) {r} (d : Desc r) b f →
+  lookupBlock h (allocation d) ≡ just b →
+  generation d ≡ generation b →
+  liveness b ≡ live →
+  storage b ≡ stackAlloc f →
+  dealloc h d ≡ err invalid-free
+alloca-cannot-be-deallocated h d b f look gen liv st
+  rewrite look
+  with generation d ≟ generation b
+... | no ¬p = ⊥-elim (¬p gen)
+... | yes _
+  with liveness b | liv
+... | .live | refl
+  with storage b | st
+... | .(stackAlloc f) | refl = refl
+
+-- Same for a global. Lython emits 151 of them.
+global-cannot-be-deallocated :
+  ∀ (h : Heap) {r} (d : Desc r) b →
+  lookupBlock h (allocation d) ≡ just b →
+  generation d ≡ generation b →
+  liveness b ≡ live →
+  storage b ≡ staticData →
+  dealloc h d ≡ err invalid-free
+global-cannot-be-deallocated h d b look gen liv st
+  rewrite look
+  with generation d ≟ generation b
+... | no ¬p = ⊥-elim (¬p gen)
+... | yes _
+  with liveness b | liv
+... | .live | refl
+  with storage b | st
+... | .staticData | refl = refl
 
 -- Freeing what is already freed is `double-free`. Not `use-after-free`: they are
 -- different mistakes, and a model that returned one for the other could not be
@@ -185,15 +244,18 @@ non-root-cannot-free :
   lookupBlock h (allocation d) ≡ just b →
   generation d ≡ generation b →
   liveness b ≡ live →
+  storage b ≡ heapAlloc →
   ¬ IsRootOf b d →
   dealloc h d ≡ err invalid-free
-non-root-cannot-free h d b look gen liv ¬root
+non-root-cannot-free h d b look gen liv st ¬root
   rewrite look
   with generation d ≟ generation b
 ... | no ¬p = ⊥-elim (¬p gen)
 ... | yes _
   with liveness b | liv
 ... | .live | refl
+  with storage b | st
+... | .heapAlloc | refl
   with isRootOf? b d
 ... | yes r = ⊥-elim (¬root r)
 ... | no  _ = refl

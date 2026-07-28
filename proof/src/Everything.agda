@@ -19,8 +19,25 @@ import Proof.Memory.Index
 import Proof.Memory.Heap
 import Proof.Memory.Descriptor
 import Proof.Memory.Resolve
-import Proof.Memory.Ops
 import Proof.Memory.Properties
+
+-- The memref dialect, transcribed op by op, and realloc.
+import Proof.MemRef.Dialect
+import Proof.MemRef.Realloc
+
+-- Quantitative type theory's multiplicities, and the reference modes they do
+-- not determine.
+import Proof.QTT.Quantity
+
+-- Reference counting: owner sites, the ghost count the runtime counter has to
+-- implement, py.incref / py.decref, and the invariant tying them together.
+import Proof.RC.Object
+import Proof.RC.OwnerSite
+import Proof.RC.Machine
+import Proof.RC.Ops
+import Proof.RC.Invariant
+import Proof.RC.Properties
+import Proof.RC.Trace
 
 -- The instantiation, and a trace that exercises it. Both are load-bearing: the
 -- modules above are parameterised over an element signature, and every theorem

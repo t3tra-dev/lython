@@ -31,7 +31,7 @@ open import Proof.Memory.Lython using (LythonSig; LyTy; i8; i64)
 
 open import Proof.Memory.Descriptor LythonSig
 open import Proof.Memory.Resolve    LythonSig
-open import Proof.Memory.Ops        LythonSig
+open import Proof.MemRef.Dialect    LythonSig
 
 ------------------------------------------------------------------------
 -- A four-byte allocation in memory space 0.
@@ -40,7 +40,7 @@ h₀ : Heap
 h₀ = []
 
 allocated : Heap × Desc 1
-allocated = allocate h₀ 0 i8 4 1
+allocated = alloc h₀ 0 i8 4 1
 
 h₁ : Heap
 h₁ = proj₁ allocated
@@ -130,7 +130,7 @@ descriptor-overruns-allocation = refl
 -- `resolve` is observable, and a concrete trace is what makes it so.
 
 wide : Heap × Desc 1
-wide = allocate h₂ 0 i8 16 8
+wide = alloc h₂ 0 i8 16 8
 
 h₄ : Heap
 h₄ = proj₁ wide

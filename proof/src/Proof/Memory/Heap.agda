@@ -10,10 +10,12 @@
 
 module Proof.Memory.Heap where
 
+open import Data.Bool using (Bool; true; false; if_then_else_)
 open import Data.Fin using (Fin)
 open import Data.List using (List; []; _∷_; length; _++_; [_])
 open import Data.Maybe using (Maybe; just; nothing)
 open import Data.Nat using (ℕ; zero; suc; _+_; _<_; s≤s; z≤n)
+open import Data.Nat.Base using (_≡ᵇ_)
 open import Data.Vec using (Vec; []; _∷_)
 open import Relation.Binary.PropositionalEquality using (_≡_; refl; cong)
 open import Relation.Nullary using (Dec; yes; no)
@@ -30,6 +32,25 @@ Generation = ℕ
 data Liveness : Set where
   live dead : Liveness
 
+FrameId : Set
+FrameId = ℕ
+
+-- Where the storage came from, because the three kinds have DIFFERENT
+-- deallocation rules and MLIR enforces all three:
+--
+--   memref.alloc   -> freed by memref.dealloc, and only by it
+--   memref.alloca  -> freed automatically when its scope ends; calling
+--                     memref.dealloc on it is invalid
+--   memref.global  -> never freed at all
+--
+-- A single `live : Bool` cannot express that, so `dealloc` would either accept
+-- freeing a stack slot or reject freeing a heap block. Lython emits 27 allocas
+-- and 151 globals, so both wrong answers are reachable in its own output.
+data Storage : Set where
+  heapAlloc  : Storage
+  stackAlloc : FrameId → Storage
+  staticData : Storage
+
 record Block : Set where
   constructor block
   field
@@ -39,6 +60,7 @@ record Block : Set where
     alignment  : ℕ
     contents   : Vec StoredByte sizeBytes
     liveness   : Liveness
+    storage    : Storage
 
 open Block public
 
@@ -112,3 +134,21 @@ lookup-fresh-new : ∀ (h : Heap) (b : Block) →
                    lookupBlock (allocBlock h b) (freshId h) ≡ just b
 lookup-fresh-new []       b = refl
 lookup-fresh-new (x ∷ xs) b = lookup-fresh-new xs b
+
+------------------------------------------------------------------------
+-- Scope exit for memref.alloca.
+
+sameFrame? : Storage → FrameId → Bool
+sameFrame? heapAlloc      _ = false
+sameFrame? staticData     _ = false
+sameFrame? (stackAlloc f) g = f ≡ᵇ g
+
+-- Ending a scope kills every alloca made inside it. Modelling this rather than
+-- ignoring it is what makes an escaping alloca a `use-after-free` here instead
+-- of a silent read of a reused frame -- which is how that class of defect
+-- actually presents.
+popFrame : Heap → FrameId → Heap
+popFrame []       _ = []
+popFrame (b ∷ bs) f =
+  (if sameFrame? (storage b) f then record b { liveness = dead } else b)
+    ∷ popFrame bs f
