@@ -138,6 +138,37 @@ bool blockReachesItselfAvoiding(mlir::Block *from, mlir::Block *barrier) {
   return false;
 }
 
+// Can this collection literal execute more often than `logicalSource` is
+// produced? The half of the source-move rule that `valueIsConsumedOnlyBy` cannot
+// answer, factored out because the sequence and dict literals need the SAME
+// query: a per-container copy would let the two drift, and they already had
+// drifted once -- the dict literal shipped deciding the move on the use-set
+// answer alone while the sequence literal conjoined this one, which is how the
+// nested-loop over-release stayed reachable through `{"a": i}` after `[i]` was
+// closed.
+//
+// `LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE=1` restores the shipped predicate for
+// both. Its failure mode is an over-release, so it is for bisecting a regression
+// to this rule, never for production.
+//
+// Why NOT name the toggle after the container: one toggle answering for both is
+// what makes an ablation sweep comparable across them.
+bool literalMayOutrunSource(mlir::Operation *op, mlir::Value logicalSource) {
+  static bool guardEnabled = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE");
+    return !(value && !value->empty() && *value != "0");
+  }();
+  if (!guardEnabled || !logicalSource || !op->getBlock())
+    return false;
+  mlir::Block *defBlock = logicalSource.getParentBlock();
+  if (mlir::Operation *defOp = logicalSource.getDefiningOp())
+    defBlock = defOp->getBlock();
+  if (!defBlock || defBlock->getParent() != op->getBlock()->getParent())
+    return false;
+  return blockReachesItselfAvoiding(op->getBlock(), defBlock);
+}
+
 } // namespace
 
 bool RuntimeBundleLowerer::isMutableContainerContractName(
@@ -583,12 +614,23 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
 // exactly one use, satisfies this predicate, and executes N times -- so the
 // source's single token would be handed to a container N times.
 //
-// `initializeSequencePayload` therefore does NOT decide the move on this answer
-// alone; it conjoins the CFG frequency query documented at its call site.
-// `initializeDictPayload` below still does, which is a KNOWN GAP rather than a
-// judgement: the dict shape was never measured, and an unmeasured shape is not
-// an input to a shipping decision. It is written this way so the two read
-// differently to the next person instead of looking uniformly considered.
+// NEITHER `initializeSequencePayload` NOR `initializeDictPayload` decides the
+// move on this answer alone; both conjoin `literalMayOutrunSource` above.
+//
+// The dict side was labelled a KNOWN GAP here until 2026-07-28 -- measured
+// rather than reasoned about, because an unmeasured shape is not an input to a
+// shipping decision. The measurement found the gap real (11 of 25 enumerated
+// shapes aborted, 1 was silently wrong) AND found a second defect the sequence
+// side never had: no dedup of a source filling several slots. So "same code,
+// same defect" would have been wrong in both directions -- the dict path was
+// also missing something the sequence path already had.
+//
+// ⚠️ What this predicate still cannot answer, and what therefore must not be
+// built on it: it says nothing about whether the container ever RELEASES what it
+// retained. A literal that moves the token correctly still leaks one object per
+// execution (measured 2026-07-28 on both container kinds, unbounded, pre-dating
+// all of this work). That is a teardown-accounting defect, tracked separately;
+// do not read a correct move decision here as a balanced one.
 bool RuntimeBundleLowerer::valueIsConsumedOnlyBy(mlir::Value value,
                                                  mlir::Operation *op) {
   if (!value || !op)
@@ -670,9 +712,8 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     // frequency bug (tests/probe/seqlit_cache_boundary_pair.py holds the pair
     // that separates the two readings).
     //
-    // `LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE=1` restores the shipped predicate.
-    // Its failure mode is the over-release above, so it is for bisecting a
-    // regression to this rule, never for production.
+    // `LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE=1` restores the shipped predicate
+    // (see literalMayOutrunSource above, which both literal kinds share).
     //
     // ⛔ Why this predicate ALONE is not the repair, measured 2026-07-28: it
     // needs the parked-retain modelling in verifier/runtime/AffineOwnership.cpp
@@ -680,20 +721,9 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
     // the evidence demotion at the end of this function (or the read-back of an
     // element the container does not own becomes a silent wrong answer). Landing
     // any two of the three was measured worse than landing none.
-    static bool loopLevelGuard = [] {
-      auto value =
-          llvm::sys::Process::GetEnv("LYTHON_ABLATE_LOOP_LEVEL_SOURCE_MOVE");
-      return !(value && !value->empty() && *value != "0");
-    }();
-    if (loopLevelGuard && sourceIsTemporary && logicalSource && op->getBlock()) {
-      mlir::Block *defBlock = logicalSource.getParentBlock();
-      if (mlir::Operation *defOp = logicalSource.getDefiningOp())
-        defBlock = defOp->getBlock();
-      if (defBlock && defBlock->getParent() == op->getBlock()->getParent() &&
-          blockReachesItselfAvoiding(op->getBlock(), defBlock)) {
-        sourceIsTemporary = false;
-        declinedLoopLevelMove = true;
-      }
+    if (sourceIsTemporary && literalMayOutrunSource(op, logicalSource)) {
+      sourceIsTemporary = false;
+      declinedLoopLevelMove = true;
     }
     if (sourceIsTemporary &&
         payload->objectValue.ownership == ownership::OwnershipKind::Own) {
@@ -826,6 +856,13 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
   container.mappingCapacity =
       RuntimeBundleLowerer::collectionInitialCapacity(keys.size());
   container.mappingEvidenceBacked = true;
+  // ONE dedup set for both sides and all entries: the move hands over the ONE
+  // token a source holds, so a source that fills several slots may only be
+  // released once. Not per-side and not per-entry, because `{"a": x, "b": x}`
+  // repeats across ENTRIES while the sequence literal's `(j, j)` repeats within
+  // one -- the same defect reached by a different spelling.
+  llvm::SmallPtrSet<void *, 4> movedSources;
+  bool declinedLoopLevelMove = false;
   for (auto [index, key] : llvm::enumerate(keys)) {
     if (!key || !values[index])
       return op->emitError() << "dict payload entry has no object evidence";
@@ -856,8 +893,25 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
     // Same temporary-only move rule as initializeSequencePayload: a literal
     // may take over a temporary's token, but `d = {"k": s}` must leave the
     // local `s` its claim or `s` dangles once the dict dies.
+    //
+    // ⛔ THIS DECIDED THE MOVE ON `valueIsConsumedOnlyBy` ALONE UNTIL
+    // 2026-07-28, so the nested-loop over-release the sequence literal was
+    // repaired for stayed reachable through the dict literal. Measured on
+    // bcfbbf9 over 25 enumerated shapes: 11 aborted (`Ly_DecRef observed
+    // non-positive refcount` / SIGSEGV), 1 was a silent wrong answer, 1 was
+    // refused by state explosion, and the cache axis reproduced exactly --
+    // `range(0,3)` clean and `range(3,6)` aborting at the same trip count,
+    // because the immortal small-int cache {0, 1, 2} absorbs the over-release.
+    //
+    // Only the VALUE side can carry arbitrary provenance. A dict literal reaches
+    // this function only when every key is a `py.str_constant`
+    // (PackAndBindingOps.cpp), so `{i: v}` never gets here -- one non-static key
+    // sends the whole literal down the `setitem_box` probe path. The key side is
+    // still routed through the same rule rather than special-cased, because
+    // "constants are never Own" is a property of another pass, not of this one.
     auto moveSourceIfTemporary =
-        [&](const RuntimeBundle &payload, llvm::ArrayRef<mlir::Value> sources,
+        [&](const RuntimeBundle &payload, const RuntimeBundle &element,
+            llvm::ArrayRef<mlir::Value> sources,
             llvm::StringRef slot) -> mlir::LogicalResult {
       if (payload.objectValue.ownership != ownership::OwnershipKind::Own)
         return mlir::success();
@@ -866,12 +920,34 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
       if (!sources.empty() && logicalSource &&
           !RuntimeBundleLowerer::valueIsConsumedOnlyBy(logicalSource, op))
         return mlir::success();
+      if (literalMayOutrunSource(op, logicalSource)) {
+        declinedLoopLevelMove = true;
+        return mlir::success();
+      }
+      // LYTHON_ABLATE_DICT_SOURCE_MOVE_DEDUP=1 restores the shipped behaviour
+      // (release once per SLOT rather than once per SOURCE). Its failure mode is
+      // an over-release of a source that fills two entries, which reached a
+      // SILENT WRONG ANSWER, not an abort: `x = "q" + "rs"; d = {"a": x, "b": x}`
+      // printed `len(d["a"])` as 0 on 5/5 reps.
+      static bool dedupEnabled =
+          !llvm::sys::Process::GetEnv("LYTHON_ABLATE_DICT_SOURCE_MOVE_DEDUP")
+               .has_value();
+      // Key on the ELEMENT's physical identity, not the materialized payload's:
+      // materialization mints a fresh per-slot box view, so two slots fed by one
+      // source would not compare equal through the payload.
+      mlir::ValueRange sourceValues = element.physicalValues().empty()
+                                          ? payload.physicalValues()
+                                          : element.physicalValues();
+      if (dedupEnabled && !sourceValues.empty() &&
+          !movedSources.insert(sourceValues.front().getAsOpaquePointer()).second)
+        return mlir::success();
       return RuntimeBundleLowerer::releaseAggregateSlot(op, payload, slot);
     };
-    if (mlir::failed(moveSourceIfTemporary(*payloadKey, logicalKeySources,
+    if (mlir::failed(moveSourceIfTemporary(*payloadKey, *key, logicalKeySources,
                                            "dict.literal.key.source")))
       return mlir::failure();
-    if (mlir::failed(moveSourceIfTemporary(*payloadValue, logicalValueSources,
+    if (mlir::failed(moveSourceIfTemporary(*payloadValue, *values[index],
+                                           logicalValueSources,
                                            "dict.literal.value.source")))
       return mlir::failure();
     RuntimeBundle storedKey = payloadKey->withObjectOwnership(
@@ -888,6 +964,43 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
           std::make_shared<RuntimeBundle>(storedValue);
     if (index < container.mappingValues.size())
       container.mappingValues[index] = storedValue.objectValue;
+  }
+  // A DECLINED MOVE INVALIDATES THE COMPILE-TIME CONTENTS EVIDENCE, for the same
+  // reason it does on the sequence side (see the end of
+  // initializeSequencePayload): evidence resolves `d["a"]` to the very SSA value
+  // that was stored, which is only sound while the container owns the source's
+  // token. With the move declined the source keeps its claim, so binding the read
+  // to a name that outlives the container leaves that name dangling.
+  //
+  // Measured 2026-07-28 on the dict side specifically: with the frequency query
+  // in and this demotion out, `for i in range(3,6): for j in range(2):
+  // d = {"a": i}; acc += d["a"]` printed a wrong sum with exit 0. Dropping the
+  // evidence sends the read back through lowerDictEvidenceGetItem's
+  // `mappingKeys.empty()` bail-out to the runtime accessor, which returns a value
+  // with a reference of its own.
+  //
+  // Why NOT call demoteMutableContainerEvidence: that also zeroes
+  // `mappingCapacity`, which is not evidence but the PHYSICAL extent of the
+  // arrays this function just wrote into -- storeDictValuePayload would then
+  // re-grow an already-grown dict.
+  //
+  // Why NOT demote every dict literal: the evidence is what turns `d["a"]` into
+  // no code at all, and a declined move is a rare shape (a literal in a loop its
+  // value's source is defined outside of).
+  //
+  // LYTHON_ABLATE_DICT_EVIDENCE_DEMOTION=1 keeps the evidence, which is the
+  // two-of-three combination the sequence side measured as WORSE than shipping
+  // nothing. It exists so that combination stays reproducible from one binary.
+  static bool demotionEnabled =
+      !llvm::sys::Process::GetEnv("LYTHON_ABLATE_DICT_EVIDENCE_DEMOTION")
+           .has_value();
+  if (declinedLoopLevelMove && demotionEnabled) {
+    container.mappingKeys.clear();
+    container.mappingKeyBundles.clear();
+    container.mappingValues.clear();
+    container.mappingValueBundles.clear();
+    container.mappingPresent.clear();
+    container.mappingEvidenceBacked = false;
   }
   return mlir::success();
 }
