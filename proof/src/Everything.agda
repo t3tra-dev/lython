@@ -39,6 +39,7 @@ import Proof.RC.Invariant
 import Proof.RC.Properties
 import Proof.RC.Trace
 import Proof.Object.Trace
+import Proof.Program.Trace
 
 -- The one-lane object: a redesign, not a transcription. An object reference is
 -- ONE descriptor and every field is an index into it, with the mutable part in
@@ -49,6 +50,20 @@ import Proof.Object.Layout
 import Proof.Object.Box
 import Proof.Object.Ops
 import Proof.Object.Coherence
+
+-- The program layer: names distinct from allocations, control flow, unwind
+-- edges, a step relation and reachability. This is where placement becomes
+-- expressible -- six of the eleven defects the gap analysis found inexpressible
+-- were placement defects.
+import Proof.Program.Syntax
+import Proof.Program.Env
+import Proof.Program.Step
+import Proof.Program.Ownership
+
+-- Concurrency: threads, a nondeterministic scheduler, happens-before and the
+-- race predicate. No permission algebra yet, so no race-freedom theorem.
+import Proof.Concurrent.Event
+import Proof.Concurrent.Machine
 
 -- The instantiation, and a trace that exercises it. Both are load-bearing: the
 -- modules above are parameterised over an element signature, and every theorem

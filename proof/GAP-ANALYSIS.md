@@ -49,27 +49,35 @@ defect possible, not the class of reasoning error that produced it.
 | `WFRC` holds of every reachable machine | there is **no notion of "reachable"**: no step relation, so "every reachable machine" has no referent |
 | the runtime counter never drifts from the owner count over a program | same reason — the per-operation lemmas exist (`retain-ghost`, `retain-counter`), nothing composes them |
 
-### Inexpressible — 11, and they are the majority
+### Inexpressible — 11 when this was written; **6 have since become expressible**
 
-| defect (all measured on this tree) | what is missing |
-|---|---|
-| **`for` in `try` SIGSEGV** — `rc=139`, deterministic, on `try: for v in [1,2]: total += v except: total += 100`. Root: `for` allocates the cell once and threads it as a block argument, so **one allocation has two SSA names and the ownership machinery makes that two entities**; the unwind pad frees the cell before the handler in the same function reads it | CFG, unwind edges, **SSA identity** |
-| **normal-path double dealloc** — the shipped compiler runs `__ly_dealloc___ly_cell_1` twice for the same cell; benign only because the freed read does not come back as 1 | CFG |
-| **loop `else`-only write lost** — `in else 7 / after 0`, silent, rc=0 | CFG |
-| **family C**: release placement abandoned when one consuming use existed (`consumeIsDeath=false`) — 6 goldens green while leaking | CFG + placement |
-| **families A/B**: latent double release on unwind edges no input reaches (`stdlib_string_catch` −93 DecRefs) | CFG + unwind edges |
-| **family D**: retain omitted by provenance, not layout | SSA provenance (`func.call` result vs `memref.alloc` result) |
-| **family E**: block-argument index space vs successor-operand index space | CFG, block arguments |
-| **sequence/dict literal source move** — a use-**set** fact standing in for an execution-**frequency** fact; nondeterministically silent-wrong or aborting | **execution frequency**: the model has no loops and no notion of how often an operation runs |
-| **read-back token** — `retainEvidenceElement` mints a second owned token on the same SSA values, and the placer finds the literal's `aggregate_release` among the alias equivalents | SSA aliasing + **aggregates** |
-| **holder discharge / remaining leak families** — need a token **count**, not a token **name** | aggregates with multiplicity |
-| **deallocator selection**: 5 of 14 widths shared, `dict` in a 7-way tie, `N` user classes giving `N+1` candidates at `memref<16xi64>` | **contracts**. The model has exactly one way to free a block; the compiler's problem is *choosing which deallocator*, which presupposes a manifest |
+> **Update.** `Proof.Program.*` and `Proof.Concurrent.*` were built in response
+> to this section. The six placement defects are now **statable** — there is a
+> step relation, block arguments, an unwind edge and reachability — and one of
+> them is **exhibited**: `Proof.Program.Trace` computes
+> `ownedCount env o ≡ suc (logicalRC (sites m) o)` after a branch, which is the
+> SIGSEGV's root as an equation. Statable is not proved-absent; the rows below
+> are kept as written, with the current status in the last column.
+
+| defect (all measured on this tree) | what was missing | now |
+|---|---|---|
+| **`for` in `try` SIGSEGV** — `rc=139`, deterministic, on `try: for v in [1,2]: total += v except: total += 100`. Root: `for` allocates the cell once and threads it as a block argument, so **one allocation has two SSA names and the ownership machinery makes that two entities**; the unwind pad frees the cell before the handler in the same function reads it | CFG, unwind edges, **SSA identity** | **exhibited** — `one-object-two-names`, `names-and-sites-disagree` |
+| **normal-path double dealloc** — the shipped compiler runs `__ly_dealloc___ly_cell_1` twice for the same cell; benign only because the freed read does not come back as 1 | **statable** |
+| **loop `else`-only write lost** — `in else 7 / after 0`, silent, rc=0 | CFG | **statable** |
+| **family C**: release placement abandoned when one consuming use existed | CFG + placement | **statable** |
+| **families A/B**: latent double release on unwind edges no input reaches | CFG + unwind edges | **statable** — `step-invoke-throw` is the edge |
+| **family D**: retain omitted by provenance, not layout | SSA provenance | **partly** — names exist; the IR does not yet record which op produced one |
+| **family E**: block-argument index space vs successor-operand index space | CFG, block arguments | **statable** — `bindParams` refuses a length mismatch |
+| **sequence/dict literal source move** — a use-**set** fact standing in for an execution-**frequency** fact | execution frequency | **partly** — loops are now expressible as a back edge; "how often" still is not |
+| **read-back token** — a second owned token on the same SSA values | SSA aliasing + aggregates | **partly** — `Aliases` is exactly this; aggregates are still absent |
+| **holder discharge / remaining leak families** — need a token **count**, not a token **name** | aggregates with multiplicity | **no change** |
+| **deallocator selection**: 5 of 14 widths shared, `dict` in a 7-way tie | contracts | **no change** |
 
 ---
 
 ## 2. The five structural gaps
 
-### 2.1 There is no program
+### 2.1 There is no program — **CLOSED**
 
 The model has **operations** and no **program**. `Proof.Memory.Properties` and
 `Proof.RC.Properties` prove things about one operation applied to one state.
@@ -80,12 +88,22 @@ relation.
 The note asks for this in §5 and it was skipped in favour of getting the state
 model right first. That was defensible; it is now the binding constraint.
 
+> **Closed.** `Proof.Program.Step` has instruction steps, terminator steps with
+> the current block's terminator as a premise, an `invoke` unwind edge, and
+> `_—→*_` with transitivity. `reachable-preserves-heap` is the first theorem
+> stated over reachability rather than over one operation.
+>
+> One modelling bug was caught while building it: the first terminator rules did
+> not read the current block's terminator, so control could go to any label.
+> A step relation that lets control go anywhere makes every reachability
+> theorem vacuous — the opposite of what the layer is for.
+
 **Cost, exactly.** Six of the eleven inexpressible defects are *placement*
 defects — the operation is right and the position is wrong. A model with no
 positions cannot have a wrong one. `WFRC` preservation is unprovable for the
 same reason: "reachable" is undefined.
 
-### 2.2 There is no SSA layer, and this is a level mismatch rather than a gap
+### 2.2 There is no SSA layer — **CLOSED, and it exhibited the defect**
 
 This is the sharpest finding, and it is not "add a feature".
 
@@ -106,10 +124,31 @@ token (a second token minted **on the same SSA values**).
 
 The note describes the missing layer in §4: a **linear resource IR** with
 explicit `dup`/`drop`/`move`/`borrow`, typed with separated owned and borrowed
-contexts. `Proof.QTT.Quantity` records the vocabulary and stops. Until that
-layer exists, `proof/` cannot be about the same objects the compiler's passes
-manipulate, and any "refinement to `src/lython`" would have to bridge two levels
-at once.
+contexts.
+
+> **Closed.** `Proof.Program.Env` makes a name primitive and `Aliases es x y` --
+> two names, one entity -- is the sentence that was missing.
+>
+> And it does more than restate the defect. `Proof.Program.Trace` computes both
+> counts after a branch and finds them **different**:
+>
+> ```agda
+> owned-names-after-branch  : ownedCount envAfterBr theObj ≡ 2
+> ghost-count-after-branch  : logicalRC (sites machAfterNew) theObj ≡ 1
+> names-and-sites-disagree  : ownedCount envAfterBr theObj
+>                              ≡ suc (logicalRC (sites machAfterNew) theObj)
+> ```
+>
+> `bindParams` binds a name and does **not** occupy an owner site, because a
+> block argument is not a new reference. So a pass reading the name count as the
+> number of references to release emits **one drop too many** -- the
+> over-release -- and a pass occupying a site per block argument emits **one
+> retain too few**.
+>
+> The fix is in neither count. `br` must either not create an owning name (it is
+> a MOVE) or must occupy a site (it is a DUP), and **the IR as written leaves it
+> ambiguous**. That ambiguity is where the compiler's bug lives, and it is now a
+> property of a datatype rather than a description in prose.
 
 ### 2.3 A leak cannot be stated
 
@@ -215,17 +254,43 @@ single-threaded.
 
 ---
 
-## 5. Honest summary
+## 5. Concurrency, as built
+
+Modelled ahead of need, because the alternative is worse: bolting a thread pool
+onto a step relation that assumed one thread means revisiting every ownership
+rule. The sequential relation is now the one-thread case of the concurrent one.
+
+Present: threads with **private environments and a shared machine** (which is
+the whole difficulty in one line), a **nondeterministic** `Scheduled` -- a
+relation and not a function, because safety must hold for every schedule --
+spawn/join, an event history, program-order and spawn/join happens-before edges,
+and `Race` as a conflict that nothing orders **in either direction**.
+
+`Conflict` carries all six conjuncts as real propositions, including a
+**constructive** overlap witness, so the shared byte can be pointed at. The
+first draft had two of them as `⊤` placeholders, which would have made a
+"conflict" derivable for any two events.
+
+Absent, and deliberately: the **permission algebra**. Without it there is no
+theorem that a well-formed program is race-free. `RaceFree` is the statement
+such a theorem would prove; nothing proves it, and **`Race` being definable is
+not the same as any program being shown free of one.**
+
+## 6. Honest summary
 
 Of the seventeen memory-safety defects this session found and measured:
 
 - **1** is excluded by the redesign outright
 - **5** have theorems in the model
-- **11** are inexpressible, and **6 of those 11 are placement defects** that need
-  a control-flow layer the model does not have
+- **11** were inexpressible when this was written; **6 are now statable and 1 is
+  exhibited as a computed mismatch**, after the program layer was built
+- **4 remain inexpressible**: aggregates with multiplicity, deallocator
+  selection, and the two "partly" rows above
 
-The model is a good *state* model and not yet a model of a *program*. That is
-the gap, stated in one line, and every item in §4 is downstream of it.
+The two barriers that were ranked first and second in §4 are closed. What
+remains at the top of the list is **aggregates with multiplicity** -- the two
+open leak families were characterised as needing a token *count* rather than a
+token *name*, which is exactly `aggregate(parent, path)` as a judgment.
 
 Two things should not be read into the current state. The proof directory does
 **not** yet constrain the compiler — no refinement exists, and the README says
