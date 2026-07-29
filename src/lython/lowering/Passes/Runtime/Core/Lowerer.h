@@ -679,6 +679,28 @@ private:
   std::optional<RuntimeValue> retainEvidenceElement(mlir::Operation *op,
                                                     const RuntimeValue &value,
                                                     bool atOperation = false);
+  // ⭐ The bookkeeping half of the above, without the retain: mark the element
+  // as a frame-owned local so the ordinary owned-result machinery RELEASES it,
+  // and take no reference because the element already arrives with one.
+  //
+  // The two halves were one function, and that coupling was a measured leak.
+  // `LyObject_FromSlot` (runtime/modules/builtins.mlir) allocates a fresh box
+  // and stores 1 into its refcount word -- it is declared
+  // `ly.ownership.owned_results = [0]` and it means it. Retaining that result
+  // as well left the counter at 2 against one release, so every boxed slot read
+  // leaked one object, unbounded (measured: 10 reads -> 10 roots, 50 -> 50).
+  //
+  // Why NOT decide it from `RuntimeValue::ownership`: `bindEvidenceObjectResult`
+  // hardcodes `ownsObject=false` and discards that field, so setting it here
+  // would change nothing while reading as though it did. And the retain path is
+  // shared with three sites that inherit ownership from a bundle
+  // (GetItemOps.cpp bindRetainedEvidenceBundle and the two selection merges),
+  // where an `Own` inherited from elsewhere would then silently drop a retain
+  // that IS required. The caller knows which primitive produced the element;
+  // the shared helper does not.
+  std::optional<RuntimeValue> rootOwnedEvidenceElement(mlir::Operation *op,
+                                                       const RuntimeValue &value,
+                                                       bool atOperation = false);
   mlir::LogicalResult forEachActiveUnionMember(
       mlir::Operation *op, py::UnionType unionType, mlir::ValueRange values,
       llvm::StringRef abiLabel,
@@ -713,6 +735,18 @@ private:
   bindRetainedEvidenceValue(mlir::Operation *op, mlir::Value resultValue,
                             llvm::StringRef label, const RuntimeValue &value,
                             const RuntimeBundle *container = nullptr);
+  // Bind an element that ALREADY carries a reference. Same as the above minus
+  // the retain: the marker still goes on, so the release still comes.
+  //
+  // No container fallback, and that is not an omission: the fallback exists to
+  // retry a retain `atOperation` for elements whose defining ops are spread
+  // across blocks, and an element that arrives owned comes straight out of one
+  // runtime call. If its anchor cannot be found the frame has no way to release
+  // it, so this REFUSES rather than binding a value nothing will free.
+  mlir::LogicalResult bindOwnedEvidenceValue(mlir::Operation *op,
+                                             mlir::Value resultValue,
+                                             llvm::StringRef label,
+                                             const RuntimeValue &value);
   mlir::LogicalResult
   bindRetainedEvidenceBundle(mlir::Operation *op, mlir::Value resultValue,
                              RuntimeBundle bundle,

@@ -63,6 +63,69 @@ mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
 // alive (its container has not been released yet). Contracts without an `own`
 // primitive keep the borrowed binding (their uses stay tied to structurally
 // live containers, e.g. instance fields).
+namespace {
+
+// The point where an evidence element's frame bookkeeping may be written: just
+// after the last of its defining ops, where the element is provably alive (its
+// container has not been released yet). Null when there is no single such point.
+//
+// Pure — it emits nothing — so the retain and the ownership marker can be placed
+// at the same anchor without either recomputing it, and so an element that
+// arrives already-owned can be marked at exactly the point one would have been
+// retained at.
+mlir::Operation *evidenceElementAnchor(const RuntimeValue &value) {
+  // An inline-constructed local (its entity root is a raw alloc) is not yet
+  // initialized at its defining op — the refcount word store lands later in
+  // the construction sequence — so bookkeeping placed after the def would read
+  // garbage. Such evidence elements need the at-operation form (with a
+  // container pin, the caller's responsibility) or stay borrowed.
+  // Slot-reconstructed and selection-merged elements (loads/casts/merges at
+  // the access site) are long-initialized and are safe after their defs,
+  // independent of any container pin.
+  if (mlir::isa_and_nonnull<mlir::memref::AllocOp>(
+          value.values.front().getDefiningOp()))
+    return nullptr;
+  mlir::Operation *latest = nullptr;
+  for (mlir::Value physical : value.values) {
+    mlir::Operation *definition = physical.getDefiningOp();
+    if (!definition)
+      return nullptr;
+    if (!latest) {
+      latest = definition;
+    } else if (definition->getBlock() != latest->getBlock()) {
+      return nullptr;
+    } else if (latest->isBeforeInBlock(definition)) {
+      latest = definition;
+    }
+  }
+  return latest;
+}
+
+// Mark an element as a frame-owned local, so the ordinary owned-result
+// machinery releases it. An identity cast erased at reconciliation; the
+// attribute is the whole content. Assumes the insertion point is already set.
+//
+// This is the ONLY place the marker is written, which is the point of splitting
+// it out: "take a reference" and "record that the frame holds one" are two
+// operations, and a caller needs to be able to ask for the second alone.
+RuntimeValue rootAsOwnedLocal(mlir::OpBuilder &builder, mlir::Location loc,
+                              const RuntimeValue &value,
+                              llvm::StringRef contract) {
+  llvm::SmallVector<mlir::Type, 4> resultTypes;
+  for (mlir::Value physical : value.values)
+    resultTypes.push_back(physical.getType());
+  auto rooted = mlir::UnrealizedConversionCastOp::create(
+      builder, loc, resultTypes, value.values);
+  rooted->setAttr(ownership::kOwnedLocalObjectAttr, builder.getUnitAttr());
+  rooted->setAttr(ownership::kOwnedLocalObjectContractAttr,
+                  builder.getStringAttr(contract));
+  RuntimeValue out = value;
+  out.values.assign(rooted.getResults().begin(), rooted.getResults().end());
+  return out;
+}
+
+} // namespace
+
 std::optional<RuntimeValue>
 RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
                                             const RuntimeValue &value,
@@ -77,36 +140,13 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
     return std::nullopt;
   mlir::Operation *latest = nullptr;
   if (!atOperation) {
-    // An inline-constructed local (its entity root is a raw alloc) is not yet
-    // initialized at its defining op — the refcount word store lands later in
-    // the construction sequence — so a retain placed after the def would read
-    // garbage. Such evidence elements need the at-operation retain (with a
-    // container pin, the caller's responsibility) or stay borrowed.
-    // Slot-reconstructed and selection-merged elements (loads/casts/merges at
-    // the access site) are long-initialized and retain safely after their
-    // defs, independent of any container pin.
-    if (mlir::isa_and_nonnull<mlir::memref::AllocOp>(
-            value.values.front().getDefiningOp()))
-      return std::nullopt;
-    for (mlir::Value physical : value.values) {
-      mlir::Operation *definition = physical.getDefiningOp();
-      if (!definition)
-        return std::nullopt;
-      if (!latest) {
-        latest = definition;
-      } else if (definition->getBlock() != latest->getBlock()) {
-        return std::nullopt;
-      } else if (latest->isBeforeInBlock(definition)) {
-        latest = definition;
-      }
-    }
+    latest = evidenceElementAnchor(value);
     if (!latest)
       return std::nullopt;
   }
-  // Borrow → own: one retain on the entity root, rooted for the ownership
-  // machinery by the owned-local-object aggregation marker (an identity cast
-  // erased at reconciliation). The contract → retain relation is static; no
-  // per-contract runtime wrapper is involved.
+  // Borrow → own: one retain on the entity root, then the owned-local marker.
+  // The contract → retain relation is static; no per-contract runtime wrapper is
+  // involved.
   mlir::OpBuilder::InsertionGuard guard(builder);
   if (atOperation)
     builder.setInsertionPoint(op);
@@ -119,18 +159,31 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   if (!header)
     return std::nullopt;
   mlir::func::CallOp::create(builder, loc, retain, header);
-  llvm::SmallVector<mlir::Type, 4> resultTypes;
-  for (mlir::Value physical : value.values)
-    resultTypes.push_back(physical.getType());
-  auto rooted = mlir::UnrealizedConversionCastOp::create(
-      builder, loc, resultTypes, value.values);
-  rooted->setAttr(ownership::kOwnedLocalObjectAttr, builder.getUnitAttr());
-  rooted->setAttr(ownership::kOwnedLocalObjectContractAttr,
-                  builder.getStringAttr(contract));
-  RuntimeValue retained = value;
-  retained.values.assign(rooted.getResults().begin(),
-                         rooted.getResults().end());
-  return retained;
+  return rootAsOwnedLocal(builder, loc, value, contract);
+}
+
+std::optional<RuntimeValue>
+RuntimeBundleLowerer::rootOwnedEvidenceElement(mlir::Operation *op,
+                                               const RuntimeValue &value,
+                                               bool atOperation) {
+  std::string contract = runtimeContractName(value.contract);
+  if (contract.empty() || value.values.empty())
+    return std::nullopt;
+  if (!ownership::isObjectHeaderLikeType(value.values.front().getType()))
+    return std::nullopt;
+  mlir::Operation *latest = nullptr;
+  if (!atOperation) {
+    latest = evidenceElementAnchor(value);
+    if (!latest)
+      return std::nullopt;
+  }
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  if (atOperation)
+    builder.setInsertionPoint(op);
+  else
+    builder.setInsertionPointAfter(latest);
+  mlir::Location loc = atOperation ? op->getLoc() : latest->getLoc();
+  return rootAsOwnedLocal(builder, loc, value, contract);
 }
 
 mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
@@ -215,6 +268,22 @@ mlir::LogicalResult RuntimeBundleLowerer::bindRetainedEvidenceValue(
     return mlir::failure();
   if (mlir::failed(bindEvidenceObjectResult(op, resultValue, label,
                                             *retained ? **retained : value)))
+    return mlir::failure();
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::bindOwnedEvidenceValue(
+    mlir::Operation *op, mlir::Value resultValue, llvm::StringRef label,
+    const RuntimeValue &value) {
+  std::optional<RuntimeValue> rooted =
+      RuntimeBundleLowerer::rootOwnedEvidenceElement(op, value);
+  if (!rooted)
+    return op->emitError()
+           << label
+           << " element already carries a reference but has no point to mark it "
+              "frame-owned, so nothing would release it";
+  if (mlir::failed(bindEvidenceObjectResult(op, resultValue, label, *rooted)))
     return mlir::failure();
   erase.push_back(op);
   return mlir::success();
@@ -908,6 +977,12 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
       mlir::arith::SelectOp::create(builder, loc, inRange, normalized, zero)
           .getResult();
   llvm::SmallVector<mlir::Value, 4> elementValues;
+  // ⭐ Which branch ran decides whether the element ARRIVES with a reference.
+  // The erased lane calls `from_slot`, which allocates a fresh box at refcount 1;
+  // the multi-lane branch reads the container's own box words, which is a borrow.
+  // Retaining both left the erased lane at 2 against one release -- one leaked
+  // object per boxed slot read, unbounded.
+  bool elementArrivesOwned = false;
   mlir::FailureOr<mlir::Value> itemsView =
       RuntimeBundleLowerer::containerInteriorView(
           op, container, ContainerInterior::Primary, "runtime list getitem");
@@ -924,6 +999,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
     mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
         loc, *fromSlot, mlir::ValueRange{*itemsView, safe, inRange});
     elementValues.push_back(boxed.getResult(0));
+    elementArrivesOwned = true;
   } else {
     mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
         builder, loc, box_abi::kWordsPerBox, 64);
@@ -950,9 +1026,13 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   RuntimeValue element{elementContract, *canonical,
                        ownership::logicalOwnershipKind(elementContract,
                                                        /*ownsObject=*/false)};
-  if (mlir::failed(bindRetainedEvidenceValue(op, op.getResult(),
-                                             "runtime sequence __getitem__",
-                                             element)))
+  if (mlir::failed(elementArrivesOwned
+                       ? bindOwnedEvidenceValue(op, op.getResult(),
+                                                "runtime sequence __getitem__",
+                                                element)
+                       : bindRetainedEvidenceValue(op, op.getResult(),
+                                                   "runtime sequence __getitem__",
+                                                   element)))
     return mlir::failure();
   if (mlir::failed(pinContainerLiveness(op, container,
                                         /*insertAfterOp=*/true)))
@@ -1040,6 +1120,9 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
           op, container, ContainerInterior::Secondary, "runtime dict getitem");
   if (mlir::failed(valuesView))
     return mlir::failure();
+  // See lowerRuntimeSequenceGetItem: "fresh owned object box" is literal, so
+  // this branch's element needs marking and NOT retaining.
+  bool valueArrivesOwned = false;
   if (runtimeContractName(valueContract) == "builtins.object") {
     // Erased read lane: box the slot's canonical payload handle into a
     // fresh owned object box (the slot's raw words are not an object box).
@@ -1055,6 +1138,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
     mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
         loc, *fromSlot, mlir::ValueRange{*valuesView, safe, present});
     resultValues.push_back(boxed.getResult(0));
+    valueArrivesOwned = true;
   } else {
     mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
         builder, loc, box_abi::kWordsPerBox, 64);
@@ -1081,9 +1165,12 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   RuntimeValue value{valueContract, *canonical,
                      ownership::logicalOwnershipKind(valueContract,
                                                      /*ownsObject=*/false)};
-  if (mlir::failed(bindRetainedEvidenceValue(op, op.getResult(),
-                                             "runtime dict __getitem__",
-                                             value)))
+  if (mlir::failed(valueArrivesOwned
+                       ? bindOwnedEvidenceValue(op, op.getResult(),
+                                                "runtime dict __getitem__", value)
+                       : bindRetainedEvidenceValue(op, op.getResult(),
+                                                   "runtime dict __getitem__",
+                                                   value)))
     return mlir::failure();
   if (mlir::failed(pinContainerLiveness(op, container,
                                         /*insertAfterOp=*/true)))

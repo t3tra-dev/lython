@@ -422,9 +422,22 @@ if(APPLE)
     # the read-back element got a release. They are the two cases that pin that
     # repair; the rest of the family is still leaking and is named in
     # rfc/test-suite-debt.md.
+    # `tuple_boxed_slot_read` was REPAIRED into this list, like the two above it.
+    # Every element read through the erased `builtins.object` lane leaked one
+    # object, unbounded -- `LyObject_FromSlot` hands back a box at refcount 1 and
+    # says so (`ly.ownership.owned_results = [0]`), and the lowering retained it
+    # again, leaving the counter at 2 against one release. The case makes 12 such
+    # reads, so a regression comes back as roughly twelve roots rather than one.
+    #
+    # It is a new case rather than `tuple_one_lane_interior`, which is where the
+    # defect was found: that case STILL leaks 2 roots / 10368 B from a different
+    # and unrepaired defect (four-or-more-argument `print` over a nested tuple --
+    # `print(n, n[0], n[1], n[1])` leaks and `print(n, n[0], n[1])` does not), so
+    # it cannot join a gate that demands net zero. Named in rfc/test-suite-debt.md.
     set(LYTHON_LEAK_GATE_CASES
         hello dict_build str_compare iterate list_methods
-        dict_literal_source_move_frequency dict_methods_complete)
+        dict_literal_source_move_frequency dict_methods_complete
+        tuple_boxed_slot_read)
     foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
         add_test(NAME "leak.${leak_case}"
             COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
