@@ -34,6 +34,14 @@ record ObjCell : Set where
     life    : Life
     count   : RuntimeCount
     backing : Desc 1
+    -- How many payload fields the object's class has.
+    --
+    -- Without it "release every field" is not an operation, only an operation
+    -- applied to a list someone supplies -- which is what
+    -- Proof.RC.Aggregate recorded as the last piece of the aggregate story.
+    -- With it the field ids are enumerable and `aggregate_release` is
+    -- derivable rather than described.
+    arity   : ℕ
 
 open ObjCell public
 

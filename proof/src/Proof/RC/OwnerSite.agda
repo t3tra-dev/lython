@@ -18,14 +18,15 @@ open import Data.Bool using (Bool; true; false; if_then_else_; _∧_)
 open import Data.Empty using (⊥; ⊥-elim)
 open import Data.List using (List; []; _∷_; length; filter)
 open import Data.Maybe using (Maybe; just; nothing)
-open import Data.Nat using (ℕ; zero; suc; _≟_; _+_)
+open import Data.Nat using (ℕ; zero; suc; _≟_; _+_; _<_; s≤s; z≤n)
 open import Data.Nat.Base using (_≡ᵇ_)
 open import Data.Product using (_×_; _,_)
-open import Relation.Binary.PropositionalEquality using (_≡_; refl; cong)
+open import Relation.Binary.PropositionalEquality
+  using (_≡_; _≢_; refl; sym; trans; cong; cong₂)
 open import Relation.Nullary using (Dec; yes; no; ¬_)
 
 open import Proof.RC.Object using (ObjId; obj; _≟-obj_; sameObj; sameObj-refl;
-  sameObj-sound; ≡ᵇ-refl)
+  sameObj-sound; ≡ᵇ-refl; ≡ᵇ-sound)
 
 ThreadId LocalSlot FieldId GlobalId QueueId Ticket TempId : Set
 ThreadId  = ℕ
@@ -120,9 +121,66 @@ sameSite-refl (global g)   rewrite ≡ᵇ-refl g = refl
 sameSite-refl (queue q k)  rewrite ≡ᵇ-refl q | ≡ᵇ-refl k = refl
 sameSite-refl (temp t i)   rewrite ≡ᵇ-refl t | ≡ᵇ-refl i = refl
 
+-- Reflection, as for `sameObj`. Needed as soon as a proof has to turn "the
+-- lookup matched here" into "this really is that site".
+sameSite-sound : ∀ s t → sameSite s t ≡ true → s ≡ t
+sameSite-sound (local a x)  (local b y)  e = go a b x y e
+  where go : ∀ a b x y → ((a ≡ᵇ b) ∧ (x ≡ᵇ y)) ≡ true → local a x ≡ local b y
+        go a b x y e with a ≡ᵇ b | ≡ᵇ-sound a b
+        ... | true | f with x ≡ᵇ y | ≡ᵇ-sound x y
+        ...   | true | g = cong₂ local (f refl) (g refl)
+sameSite-sound (field′ o f) (field′ p g) e = go o p f g e
+  where go : ∀ o p f g → (sameObj o p ∧ (f ≡ᵇ g)) ≡ true → field′ o f ≡ field′ p g
+        go o p f g e with sameObj o p | sameObj-sound o p
+        ... | true | u with f ≡ᵇ g | ≡ᵇ-sound f g
+        ...   | true | v = cong₂ field′ (u refl) (v refl)
+sameSite-sound (global a)   (global b)   e = cong global (≡ᵇ-sound a b e)
+sameSite-sound (queue q k)  (queue r l)  e = go q r k l e
+  where go : ∀ q r k l → ((q ≡ᵇ r) ∧ (k ≡ᵇ l)) ≡ true → queue q k ≡ queue r l
+        go q r k l e with q ≡ᵇ r | ≡ᵇ-sound q r
+        ... | true | f with k ≡ᵇ l | ≡ᵇ-sound k l
+        ...   | true | g = cong₂ queue (f refl) (g refl)
+sameSite-sound (temp a i)   (temp b j)   e = go a b i j e
+  where go : ∀ a b i j → ((a ≡ᵇ b) ∧ (i ≡ᵇ j)) ≡ true → temp a i ≡ temp b j
+        go a b i j e with a ≡ᵇ b | ≡ᵇ-sound a b
+        ... | true | f with i ≡ᵇ j | ≡ᵇ-sound i j
+        ...   | true | g = cong₂ temp (f refl) (g refl)
+
+-- and the reverse direction, which is what turns a `false` into a disequality.
+sameSite-complete : ∀ {s t} → s ≡ t → sameSite s t ≡ true
+sameSite-complete {s} refl = sameSite-refl s
+
+sameSite-false : ∀ {s t} → sameSite s t ≡ false → s ≢ t
+sameSite-false ne eq with trans (sym (sameSite-complete eq)) ne
+... | ()
+
+sameSite-sym : ∀ s t → sameSite s t ≡ sameSite t s
+sameSite-sym s t with sameSite s t in st | sameSite t s in ts
+... | true  | true  = refl
+... | false | false = refl
+... | true  | false = ⊥-elim (bad (trans (sym (sameSite-complete
+                        (sym (sameSite-sound s t st)))) ts))
+  where bad : true ≡ false → ⊥
+        bad ()
+... | false | true  = ⊥-elim (bad (trans (sym (sameSite-complete
+                        (sym (sameSite-sound t s ts)))) st))
+  where bad : true ≡ false → ⊥
+        bad ()
+
 strongAt : SiteMap → OwnerSite → Maybe ObjId
 strongAt []             _ = nothing
 strongAt ((s , o) ∷ ss) t = if sameSite s t then just o else strongAt ss t
+
+-- The two equations, carried explicitly, for the same reason as everywhere else
+-- in this development: reduction under a `vacate` or an `occupy` creates a
+-- scrutinee no with-abstraction saw.
+strongAt-cons-true : ∀ s q (ss : SiteMap) u → sameSite s u ≡ true →
+                     strongAt ((s , q) ∷ ss) u ≡ just q
+strongAt-cons-true s q ss u e rewrite e = refl
+
+strongAt-cons-false : ∀ s q (ss : SiteMap) u → sameSite s u ≡ false →
+                      strongAt ((s , q) ∷ ss) u ≡ strongAt ss u
+strongAt-cons-false s q ss u e rewrite e = refl
 
 -- THE definition. The reference count of an object is how many owner sites hold
 -- it -- an ordinary count over ghost state, with no runtime counter involved.
@@ -185,10 +243,93 @@ vacate-other [] s o _ = refl
 vacate-other ((t , p) ∷ ss) s o miss with sameSite t s
 ... | true  = ⊥-elim (bad miss)
   where
-    open import Data.Empty using (⊥-elim)
     bad : just p ≡ nothing → ⊥
     bad ()
-    open import Data.Empty using (⊥)
 ... | false with sameObj p o
 ...   | true  = cong suc (vacate-other ss s o miss)
 ...   | false = vacate-other ss s o miss
+
+-- ⭐ Vacating a site that holds `o` leaves EVERY OTHER object's count alone.
+--
+-- The companion of `vacate-holder`, and the one `move` and `drop` preservation
+-- need. `vacate-other` is not it: that one is about vacating a site that holds
+-- nothing, which is not the case here -- the site holds something, just not the
+-- object being counted.
+vacate-holder-other : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) →
+                      strongAt ss s ≡ just o → sameObj o p ≡ false →
+                      logicalRC (vacate ss s) p ≡ logicalRC ss p
+vacate-holder-other [] s o p () _
+vacate-holder-other ((t , q) ∷ ss) s o p held ne with sameSite t s
+... | true  = helper (just-inj held)
+  where
+    just-inj : ∀ {A : Set} {u v : A} → just u ≡ just v → u ≡ v
+    just-inj refl = refl
+    -- `q ≡ o` and `sameObj o p ≡ false`, so the head does not contribute to
+    -- `p`'s count and dropping it changes nothing.
+    helper : q ≡ o → logicalRC ss p ≡ logicalRC ((t , q) ∷ ss) p
+    helper refl rewrite ne = refl
+... | false with sameObj q p
+...   | true  = cong suc (vacate-holder-other ss s o p held ne)
+...   | false = vacate-holder-other ss s o p held ne
+
+-- Vacating one site does not disturb what any OTHER site reports.
+strongAt-vacate-other : ∀ (ss : SiteMap) (s t : OwnerSite) →
+                        sameSite s t ≡ false →
+                        strongAt (vacate ss s) t ≡ strongAt ss t
+strongAt-vacate-other []             s t _  = refl
+strongAt-vacate-other ((u , p) ∷ ss) s t ne with sameSite u s in us
+... | true  rewrite sym (sameSite-sound u s us) | ne = refl
+... | false with sameSite u t
+...   | true  = refl
+...   | false = strongAt-vacate-other ss s t ne
+
+------------------------------------------------------------------------
+-- ⭐ Holding a site, as MEMBERSHIP rather than as a lookup.
+--
+-- `strongAt` reports the FIRST entry at a site, and that is the right thing for
+-- reading. It is the wrong thing for an invariant, because it is not preserved
+-- by `vacate`: removing the first entry at a site exposes whatever was behind
+-- it, and a property that only constrained first-entries says nothing about the
+-- exposed one.
+--
+-- `WFRC.no-stale-owner` was stated over `strongAt` and was therefore not
+-- preservable by `drop`. Over `Holds` it is, and it is also the property one
+-- actually wants: every reference the site map records has live storage at a
+-- matching generation, not merely the ones a lookup happens to reach.
+
+data Holds : SiteMap → OwnerSite → ObjId → Set where
+  holds-here  : ∀ {ss s o} → Holds ((s , o) ∷ ss) s o
+  holds-there : ∀ {ss s o t p} → Holds ss s o → Holds ((t , p) ∷ ss) s o
+
+-- What a lookup finds really is held.
+strongAt-holds : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+                 strongAt ss s ≡ just o → Holds ss s o
+strongAt-holds []             s o ()
+strongAt-holds ((u , p) ∷ ss) s o held with sameSite u s in us
+... | true  = helper (sameSite-sound u s us) (just-inj held)
+  where
+    just-inj : ∀ {A : Set} {x y : A} → just x ≡ just y → x ≡ y
+    just-inj refl = refl
+    helper : u ≡ s → p ≡ o → Holds ((u , p) ∷ ss) s o
+    helper refl refl = holds-here
+... | false = holds-there (strongAt-holds ss s o held)
+
+-- Vacating removes; it never invents. So everything still held was held before.
+holds-vacate : ∀ (ss : SiteMap) (t s : OwnerSite) (o : ObjId) →
+               Holds (vacate ss t) s o → Holds ss s o
+holds-vacate []             t s o ()
+holds-vacate ((u , p) ∷ ss) t s o h with sameSite u t
+... | true  = holds-there h
+holds-vacate ((u , p) ∷ ss) t s o holds-here      | false = holds-here
+holds-vacate ((u , p) ∷ ss) t s o (holds-there h) | false =
+  holds-there (holds-vacate ss t s o h)
+
+-- Anything held contributes to its object's count, so the count is positive.
+-- This is what lets `owned-storage-live` be reached from a site rather than
+-- from an arithmetic fact about the count.
+holds-positive : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+                 Holds ss s o → 0 < logicalRC ss o
+holds-positive ((s , o) ∷ ss) s o holds-here rewrite sameObj-refl o = s≤s z≤n
+holds-positive ((t , p) ∷ ss) s o (holds-there h) with sameObj p o
+... | true  = s≤s z≤n
+... | false = holds-positive ss s o h

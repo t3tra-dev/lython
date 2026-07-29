@@ -46,7 +46,7 @@ site₂ = local 0 2
 
 m₀ : Machine
 m₀ = machine (proj₁ allocated)
-             ((theObj , cell live (counted 1) (proj₂ allocated)) ∷ [])
+             ((theObj , cell live (counted 1) (proj₂ allocated) 0) ∷ [])
              ((site₁ , theObj) ∷ [])
 
 -- The starting point IS consistent: counter 1, one owner site. Checked rather
@@ -137,7 +137,7 @@ reclaimed = reclaim m₃ theObj
 reclaim-yields-root : reclaimed ≡ ok (proj₂ allocated
                                      , machine (heap m₃)
                                                ((theObj , cell dead (counted 0)
-                                                               (proj₂ allocated)) ∷ [])
+                                                               (proj₂ allocated) 0) ∷ [])
                                                (sites m₃))
 reclaim-yields-root = refl
 
@@ -175,7 +175,7 @@ immortalObj = obj 1 0
 
 mᵢ : Machine
 mᵢ = machine (proj₁ allocated)
-             ((immortalObj , cell live immortal (proj₂ allocated)) ∷ [])
+             ((immortalObj , cell live immortal (proj₂ allocated) 0) ∷ [])
              ((site₁ , immortalObj) ∷ [])
 
 immortal-incref-is-noop :
@@ -185,7 +185,7 @@ immortal-incref-is-noop = refl
 immortal-decref-keeps-live :
   (release mᵢ site₁ immortalObj) ≡
     ok (machine (heap mᵢ)
-                ((immortalObj , cell live immortal (proj₂ allocated)) ∷ [])
+                ((immortalObj , cell live immortal (proj₂ allocated) 0) ∷ [])
                 [])
 immortal-decref-keeps-live = refl
 
@@ -196,6 +196,6 @@ immortal-decref-keeps-live = refl
 -- has to be there rather than being an oversight.
 immortal-can-have-zero-owners :
   ghostRC (machine (heap mᵢ)
-                   ((immortalObj , cell live immortal (proj₂ allocated)) ∷ [])
+                   ((immortalObj , cell live immortal (proj₂ allocated) 0) ∷ [])
                    []) immortalObj ≡ 0
 immortal-can-have-zero-owners = refl

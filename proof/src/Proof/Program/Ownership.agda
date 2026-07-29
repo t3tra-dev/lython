@@ -33,8 +33,8 @@ open import Proof.RC.Object using (ObjId; objAllocation; objGeneration;
   sameObj; sameObj-refl;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; bumpUp)
-open import Proof.RC.OwnerSite using (OwnerSite; occupy; vacate; logicalRC;
-  occupy-same; occupy-other)
+open import Proof.RC.OwnerSite using (OwnerSite; ThreadId; SiteMap; occupy; vacate;
+  logicalRC; occupy-same; occupy-other)
 open import Proof.RC.Machine Sig
 open import Proof.Program.Syntax
 open import Proof.Program.Env
@@ -52,41 +52,50 @@ entity-bind-same : ∀ (es : Env) (x : Var) (o : ObjId) (md : Mode) →
 entity-bind-same es x o md rewrite sameVar-refl x = refl
 
 ------------------------------------------------------------------------
--- 1. A branch creates a SECOND NAME for the SAME entity.
+-- 1. A branch MOVES. It does not create a second name.
 --
--- This is the construct the SIGSEGV turns on. `bindParams` binds the
--- successor's parameter to the binding the operand had, so afterwards the
--- parameter and the operand denote one entity under two names.
+-- This is the decision, and it changed what this section says. `bindParams`
+-- bound the successor's parameter and left the operand bound, so one entity had
+-- two owned names and one owner site -- the shape of the shipped SIGSEGV.
 --
--- Stated for the one-parameter case, which is the whole of the phenomenon: a
--- loop-carried value threaded through a block argument.
+-- `moveOne` unbinds the operand and relocates its site. What is left is one
+-- name, one site, and a counter nobody touched.
 
-bindParams-one :
-  ∀ (es : Env) (p a : Var) (b : Binding) →
+moveOne-binds-the-parameter :
+  ∀ (t : ThreadId) (es : Env) (ss : SiteMap) (p a : Var) (b : Binding) →
   lookupVar es a ≡ just b →
-  bindParams es (p ∷ []) (a ∷ []) ≡ just (bindVar es p b)
-bindParams-one es p a b look rewrite look = refl
+  lookupVar (unbindVar es a) a ≡ nothing →
+  moveOne t (es , ss) p a
+    ≡ just (bindVar (unbindVar es a) p b , relocate t ss a p b)
+moveOne-binds-the-parameter t es ss p a b look gone rewrite look | gone = refl
 
-br-creates-an-alias :
-  ∀ (es : Env) (p a : Var) (o : ObjId) (md : Mode) →
-  lookupVar es a ≡ just (bind o md) →
-  ∀ es' → bindParams es (p ∷ []) (a ∷ []) ≡ just es' →
-  entityOf es' p ≡ just o
-br-creates-an-alias es p a o md look es' bp
-  with trans (sym (bindParams-one es p a (bind o md) look)) bp
-... | refl = entity-bind-same es p o md
+-- ⭐ And the operand's name is GONE. Stated because it is the whole difference:
+-- a pass that still sees `a` after the branch places a release for it, and that
+-- release is the over-release.
+moveOne-unbinds-the-operand :
+  ∀ (t : ThreadId) (es : Env) (p a : Var) (b : Binding) →
+  sameVar p a ≡ false →
+  lookupVar (unbindVar es a) a ≡ nothing →
+  lookupVar (bindVar (unbindVar es a) p b) a ≡ nothing
+moveOne-unbinds-the-operand t es p a b ne gone
+  rewrite lookupVar-cons-false p b (unbindVar es a) a ne = gone
+
+-- A shadowed operand has NO step: `moveOne` refuses rather than moving a name
+-- that survives its own unbind.
+moveOne-refuses-shadowing :
+  ∀ (t : ThreadId) (es : Env) (ss : SiteMap) (p a : Var) (b c : Binding) →
+  lookupVar es a ≡ just b →
+  lookupVar (unbindVar es a) a ≡ just c →
+  moveOne t (es , ss) p a ≡ nothing
+moveOne-refuses-shadowing t es ss p a b c look still rewrite look | still = refl
 
 ------------------------------------------------------------------------
--- 2. Why treating the two names as two entities is unsound.
+-- 2. Where an alias comes from now.
 --
--- If a pass believes the block parameter is a separate entity, it will place a
--- release for it and another for the operand. Both releases name the SAME
--- object, so the count goes down twice for one owner going away.
---
--- The model says this directly: `drop` of either name steps the counter down
--- once, and the two drops compose. There is nothing in the machine that would
--- notice they were the same entity -- which is exactly the compiler's position,
--- and why the bug is a bug rather than something the runtime catches.
+-- Not from a branch. `dup` is the only instruction that gives one entity two
+-- owned names, and it PAYS for it: a second owner site and a counter that went
+-- up. That is the difference between an alias the model licenses and the one it
+-- used to admit for free.
 
 two-names-one-object :
   ∀ (es : Env) (x y : Var) (o : ObjId) →
@@ -94,14 +103,6 @@ two-names-one-object :
   Aliases es x y
 two-names-one-object es x y o px py = aliased o px py
 
--- And the count that matters is over ENTITIES, not names: two owned names of
--- one object contribute two, which is right, and it is why a release for each
--- is right ONLY IF a retain for each happened. The defect is a release without
--- its retain -- expressible now, and not before.
--- Reusing Proof.RC.Machine's proof rather than restating it: two definitions of
--- "≡ᵇ is reflexive" are two things that can drift, and the object comparison in
--- Env has to agree with the one in the machine or the program-level count and
--- the ghost count would be counting with different notions of equality.
 owned-names-are-counted :
   ∀ (es : Env) (x : Var) (o : ObjId) →
   ownedCount (bindVar es x (bind o owned)) o ≡ suc (ownedCount es o)
@@ -123,15 +124,15 @@ borrowed-names-are-not-counted es x anchor o = refl
 -- a pass that emitted a release for it would be emitting one release too many.
 
 step-move-preserves-objects :
-  ∀ {f bid rest es m src dst o s'} →
-  f ⊢ pstate bid (move dst src ∷ rest) es m —→ᵢ s' →
+  ∀ {f t bid rest es m src dst o s'} →
+  f ⊢ pstate t bid (move dst src ∷ rest) es m —→ᵢ s' →
   lookupVar es src ≡ just (bind o owned) →
   objects (mach s') ≡ objects m
-step-move-preserves-objects (step-move _) _ = refl
+step-move-preserves-objects (step-move _ _) _ = refl
 
 step-borrow-preserves-everything :
-  ∀ {f bid rest es m src dst s'} →
-  f ⊢ pstate bid (borrow dst src ∷ rest) es m —→ᵢ s' →
+  ∀ {f t bid rest es m src dst s'} →
+  f ⊢ pstate t bid (borrow dst src ∷ rest) es m —→ᵢ s' →
   mach s' ≡ m
 step-borrow-preserves-everything (step-borrow _) = refl
 
@@ -148,11 +149,11 @@ step-borrow-preserves-everything (step-borrow _) = refl
 -- theorem without re-deriving it at each step.
 
 steps-preserve-heap : ∀ {f s t} → f ⊢ s —→ t → heap (mach t) ≡ heap (mach s)
-steps-preserve-heap (by-instr (step-new _))     = refl
-steps-preserve-heap (by-instr (step-move _))   = refl
-steps-preserve-heap (by-instr (step-dup _))    = refl
-steps-preserve-heap (by-instr (step-drop _ _ _)) = refl
-steps-preserve-heap (by-instr (step-borrow _)) = refl
+steps-preserve-heap (by-instr (step-new _ _ _ _ _)) = refl
+steps-preserve-heap (by-instr (step-move _ _))      = refl
+steps-preserve-heap (by-instr (step-dup _ _ _))     = refl
+steps-preserve-heap (by-instr (step-drop _ _ _ _))  = refl
+steps-preserve-heap (by-instr (step-borrow _))      = refl
 steps-preserve-heap (by-term (step-br _ _ _ _))            = refl
 steps-preserve-heap (by-term (step-cond-then _ _ _ _))     = refl
 steps-preserve-heap (by-term (step-cond-else _ _ _ _))     = refl
@@ -176,11 +177,11 @@ reachable-preserves-heap (more p ps) =
 -- the edge EXISTS as a step, which is precisely what was missing.
 
 unwind-edge-is-a-step :
-  ∀ (f : Function) bid es m x l a pad pa cur nxt es' →
+  ∀ (f : Function) t bid es m x l a pad pa cur nxt es' ss' →
   findBlock f bid ≡ cur ∷ [] →
   term cur ≡ invoke x l a pad pa →
   findBlock f pad ≡ nxt ∷ [] →
-  bindParams es (params nxt) pa ≡ just es' →
-  f ⊢ pstate bid [] es m —→ pstate pad (body nxt) es' m
-unwind-edge-is-a-step f bid es m x l a pad pa cur nxt es' fb tm fp bp =
+  moveArgs t (env-and-sites es m) (params nxt) pa ≡ just (es' , ss') →
+  f ⊢ pstate t bid [] es m —→ pstate t pad (body nxt) es' (afterArgs m ss')
+unwind-edge-is-a-step f t bid es m x l a pad pa cur nxt es' ss' fb tm fp bp =
   by-term (step-invoke-throw fb tm fp bp)

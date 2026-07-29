@@ -43,14 +43,25 @@ sameObj (obj a g) (obj a' g') = (a ≡ᵇ a') ∧ (g ≡ᵇ g')
 sameObj-refl : ∀ o → sameObj o o ≡ true
 sameObj-refl (obj a g) rewrite ≡ᵇ-refl a | ≡ᵇ-refl g = refl
 
+-- Top-level rather than local to `sameObj-sound`, because the program
+-- environment's `sameVar` is the same boolean on the same type and needs the
+-- same reflection. Two copies of it would be two things that can drift, which
+-- is the reason `sameObj` itself was consolidated here.
+≡ᵇ-sound : ∀ (m n : ℕ) → (m ≡ᵇ n) ≡ true → m ≡ n
+≡ᵇ-sound zero    zero    _ = refl
+≡ᵇ-sound (suc m) (suc n) e = cong suc (≡ᵇ-sound m n e)
+
+≡ᵇ-sym : ∀ (m n : ℕ) → (m ≡ᵇ n) ≡ (n ≡ᵇ m)
+≡ᵇ-sym zero    zero    = refl
+≡ᵇ-sym zero    (suc n) = refl
+≡ᵇ-sym (suc m) zero    = refl
+≡ᵇ-sym (suc m) (suc n) = ≡ᵇ-sym m n
+
 -- Reflecting the boolean back into a proposition, which is what the counting
 -- lemmas need when they have to know the two objects really are the same.
 sameObj-sound : ∀ o p → sameObj o p ≡ true → o ≡ p
 sameObj-sound (obj a g) (obj a' g') eq = go a a' g g' eq
   where
-    ≡ᵇ-sound : ∀ (m n : ℕ) → (m ≡ᵇ n) ≡ true → m ≡ n
-    ≡ᵇ-sound zero    zero    _ = refl
-    ≡ᵇ-sound (suc m) (suc n) e = cong suc (≡ᵇ-sound m n e)
     go : ∀ a a' g g' → ((a ≡ᵇ a') ∧ (g ≡ᵇ g')) ≡ true → obj a g ≡ obj a' g'
     go a a' g g' e with a ≡ᵇ a' | ≡ᵇ-sound a a'
     ... | true  | f with g ≡ᵇ g' | ≡ᵇ-sound g g'

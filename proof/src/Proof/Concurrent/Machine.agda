@@ -19,7 +19,7 @@ open ElemSig Sig
 
 open import Data.Bool using (Bool; true; false; if_then_else_)
 open import Data.List using (List; []; _∷_; length; _++_)
-open import Data.Maybe using (Maybe; just; nothing)
+open import Data.Maybe using (Maybe; just; nothing; maybe′)
 open import Data.Nat using (ℕ; zero; suc; _≟_)
 open import Data.Nat.Base using (_≡ᵇ_)
 open import Data.Product using (_×_; _,_; proj₁; proj₂)
@@ -29,8 +29,92 @@ open import Relation.Nullary using (Dec; yes; no; ¬_)
 open import Proof.RC.Machine Sig using (Machine)
 open import Proof.Program.Syntax using (Function; Var; BlockId; Instr)
 open import Proof.Program.Env using (Env)
-open import Proof.Program.Step Sig using (PState; pstate; _⊢_—→_; env; mach)
+open import Proof.Program.Step Sig
+  using (PState; pstate; _⊢_—→_; current; pending; env; mach)
 open import Proof.Concurrent.Event
+open import Proof.RC.Object using (ObjId)
+open import Proof.Program.Env using (entityOf; lookupVar; mode; entity; isOwned)
+open import Proof.Program.Syntax
+  using (Var; Instr; new; move; dup; drop; borrow; getField; setField)
+
+------------------------------------------------------------------------
+-- ⭐ The event an instruction performs.
+--
+-- The first version let the scheduler record ANY event. A history is what
+-- `Race` quantifies over, so an arbitrary history makes a race a statement
+-- about nothing: a `borrow` could record a write, and two events of one thread
+-- could be attributed to two. Deriving the event from the instruction is what
+-- makes the history a record of the program.
+--
+-- The table is the ownership table read as memory traffic:
+--
+--   new     allocates, and touches no existing object
+--   dup     a read-modify-write of the refcount word     -- py.incref
+--   drop    the same                                     -- py.decref
+--   move    NOTHING. This is the row where the correct number of runtime
+--           operations is zero, and it has to be `nothing` here or the model
+--           would claim traffic that the compiler is right not to emit.
+--   borrow  nothing, for the same reason
+--
+-- `getField` / `setField` are `nothing` too, and that is a LIMITATION rather
+-- than a claim: their footprint is a payload word, which needs the object's
+-- layout, and the layout lives in Proof.Object.Layout over a different element
+-- signature. Field traffic is therefore invisible to the race predicate here.
+
+-- What the compiler emits for an object's refcount updates.
+--
+-- `nothing` means NO memory operation at all, which is the right answer for an
+-- immortal: `bumpUp immortal ≡ immortal`, so there is nothing to write and a
+-- compiler that emitted a plain rmw there would be creating a race for a value
+-- that never changes. `just plain` and `just atomic` are the two real
+-- emissions.
+--
+-- A parameter rather than a constant, because it is the only decision in the
+-- whole emission that can be wrong -- `Proof.Concurrent.RaceFree` is the
+-- theorem about choosing it correctly.
+Policy : Set
+Policy = ObjId → Maybe Atomicity
+
+-- A refcount update, if the policy asks for one at all. Only for an OWNED
+-- name: `step-dup` and `step-drop` both require it, and an event emitted for a
+-- borrow would be traffic the step relation says does not happen.
+rcEventFor : ThreadId → Policy → Env → Var → Maybe Event
+rcEventFor t pol es v =
+  maybe′ (λ b → if isOwned (mode b)
+                  then maybe′ (λ a → just (event t (access rmw a)
+                                                 (just (rcFootprint (entity b)))))
+                              nothing (pol (entity b))
+                  else nothing)
+         nothing (lookupVar es v)
+
+-- A payload access. The footprint is one word, at `HeaderWords + k` -- which is
+-- never word 0, so it can never be mistaken for refcount traffic.
+fieldEventFor : ThreadId → AccessMode → Env → Var → FieldId → Maybe Event
+fieldEventFor t md es v k =
+  maybe′ (λ o → just (event t (access md plain) (just (fieldFootprint o k))))
+         nothing (entityOf es v)
+
+instrEvent : ThreadId → Policy → Instr → Env → Maybe Event
+instrEvent t pol (new x c)        es = just (event t allocate nothing)
+instrEvent t pol (dup dst src)    es = rcEventFor t pol es src
+instrEvent t pol (drop x)         es = rcEventFor t pol es x
+instrEvent t pol (move _ _)       es = nothing
+instrEvent t pol (borrow _ _)     es = nothing
+instrEvent t pol (getField _ src k) es = fieldEventFor t reads  es src k
+instrEvent t pol (setField dst k _) es = fieldEventFor t writes es dst k
+
+-- The event of the instruction a thread is about to run. A thread at a
+-- terminator has none.
+eventFor : ThreadId → Policy → List Instr → Env → Maybe Event
+eventFor t pol []      es = nothing
+eventFor t pol (i ∷ _) es = instrEvent t pol i es
+
+-- Recording it. Operations that perform no memory traffic append nothing --
+-- which is what makes "a move is free" true of the history and not only of the
+-- counter.
+record? : Maybe Event → List Event → List Event
+record? nothing  hs = hs
+record? (just e) hs = e ∷ hs
 
 ------------------------------------------------------------------------
 -- The thread pool.
@@ -91,16 +175,41 @@ data Scheduled (p : ThreadPool) : Thread → Set where
 -- appended to the history. `spawn` and `join` are separate rules because they
 -- change the POOL, which no sequential rule can do.
 
-data _⊢_⇒_ (f : Function) : CMachine → CMachine → Set where
+data _⊢[_]_⇒_ (f : Function) (pol : Policy) : CMachine → CMachine → Set where
 
   -- A thread runs. Its private state changes, the shared machine changes, and
   -- the event is recorded.
+  --
+  -- Two things here were wrong in the first version and were found by asking
+  -- whether the relation had ever been inhabited -- it had not, and it could
+  -- not have been.
+  --
+  -- (1) The pool was carried through UNCHANGED and the rule instead demanded
+  --     `mkThread (tid t) (current s') (pending s') (env s') ≡ t`: that the
+  --     thread be identical after the step. Every real step consumes an
+  --     instruction, so `pending` shrinks and the equation is unsatisfiable.
+  --     A thread that cannot advance is not a scheduler rule, and the whole
+  --     concurrent layer was uninhabitable through it.
+  --
+  -- (2) The event `e` was a free variable of the rule, so the history was
+  --     unconstrained -- a single-threaded program could record events
+  --     attributed to other threads and `Conflict.different-threads` became
+  --     satisfiable inside it. It is now DERIVED by `eventFor` from the
+  --     instruction being run, so `e` is not a parameter of the rule at all.
   sched-step :
-    ∀ {p sh hs t s' e} →
+    ∀ {p sh hs t s'} →
     Scheduled p t →
-    f ⊢ pstate (pos t) (todo t) (tenv t) sh —→ s' →
-    mkThread (tid t) (PState.current s') (PState.pending s') (env s') ≡ t →
-    f ⊢ cmachine p sh hs ⇒ cmachine p (mach s') (e ∷ hs)
+    -- ⭐ The sequential state is now created ON THE SCHEDULED THREAD. Before
+    -- `PState` carried a thread id, `siteOf` named a fixed one, and any
+    -- instruction that touched the site map would have attributed thread 1's
+    -- owner sites to thread 0 -- so the concurrent layer could only schedule
+    -- instructions that leave the machine alone. It can now schedule anything.
+    f ⊢ pstate (tid t) (pos t) (todo t) (tenv t) sh —→ s' →
+    f ⊢[ pol ] cmachine p sh hs
+      ⇒ cmachine (replaceThread p (tid t)
+                    (mkThread (tid t) (current s') (pending s') (env s')))
+                 (mach s')
+                 (record? (eventFor (tid t) pol (todo t) (tenv t)) hs)
 
   -- Spawning adds a thread with its OWN environment. The parent's names are not
   -- the child's: whatever the child is to own has to be passed, which is where
@@ -109,7 +218,8 @@ data _⊢_⇒_ (f : Function) : CMachine → CMachine → Set where
     ∀ {p sh hs parent child e} →
     Scheduled p parent →
     kind e ≡ spawn (tid child) →
-    f ⊢ cmachine p sh hs ⇒ cmachine (child ∷ p) sh (e ∷ hs)
+    thread e ≡ tid parent →
+    f ⊢[ pol ] cmachine p sh hs ⇒ cmachine (child ∷ p) sh (e ∷ hs)
 
   -- Joining removes it. The child's owned names have to have gone somewhere
   -- before this, and that obligation is `join-collects-permissions` below --
@@ -118,11 +228,12 @@ data _⊢_⇒_ (f : Function) : CMachine → CMachine → Set where
     ∀ {p sh hs joiner childId e} →
     Scheduled p joiner →
     kind e ≡ join childId →
-    f ⊢ cmachine p sh hs ⇒ cmachine p sh (e ∷ hs)
+    thread e ≡ tid joiner →
+    f ⊢[ pol ] cmachine p sh hs ⇒ cmachine p sh (e ∷ hs)
 
-data _⊢_⇒*_ (f : Function) : CMachine → CMachine → Set where
-  cdone : ∀ {c} → f ⊢ c ⇒* c
-  cmore : ∀ {c d e} → f ⊢ c ⇒ d → f ⊢ d ⇒* e → f ⊢ c ⇒* e
+data _⊢[_]_⇒*_ (f : Function) (pol : Policy) : CMachine → CMachine → Set where
+  cdone : ∀ {c} → f ⊢[ pol ] c ⇒* c
+  cmore : ∀ {c d e} → f ⊢[ pol ] c ⇒ d → f ⊢[ pol ] d ⇒* e → f ⊢[ pol ] c ⇒* e
 
 ------------------------------------------------------------------------
 -- Happens-before, and the race predicate.

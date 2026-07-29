@@ -28,6 +28,7 @@ import Proof.MemRef.Realloc
 -- Quantitative type theory's multiplicities, and the reference modes they do
 -- not determine.
 import Proof.QTT.Quantity
+import Proof.QTT.Trace
 
 -- Reference counting: owner sites, the ghost count the runtime counter has to
 -- implement, py.incref / py.decref, and the invariant tying them together.
@@ -38,6 +39,12 @@ import Proof.RC.Ops
 import Proof.RC.Invariant
 import Proof.RC.Properties
 import Proof.RC.Trace
+-- Machines that SATISFY the invariant. Without these `WFRC` is a record nobody
+-- has built, and every theorem conditional on it is vacuous.
+import Proof.RC.WellFormed
+-- Aggregates: field paths as a judgment, and the multiplicity an omitted
+-- aggregate release leaks.
+import Proof.RC.Aggregate
 import Proof.Object.Trace
 import Proof.Program.Trace
 import Proof.Lython.Trace
@@ -51,6 +58,8 @@ import Proof.Object.Layout
 import Proof.Object.Box
 import Proof.Object.Ops
 import Proof.Object.Coherence
+-- The shape witness bundled with its descriptor, so it cannot be mis-paired.
+import Proof.Object.Shaped
 
 -- The program layer: names distinct from allocations, control flow, unwind
 -- edges, a step relation and reachability. This is where placement becomes
@@ -61,16 +70,30 @@ import Proof.Program.Env
 import Proof.Program.Step
 import Proof.Program.Ownership
 import Proof.Program.Preservation
+-- Every instruction rule, taken as an actual step. Proof.Program.Trace derives
+-- only terminator steps, so without this the five rules the refcount story
+-- rests on had never been applied.
+import Proof.Program.Run
+-- Owned names against owner sites: preserved by every instruction, broken by
+-- `br`. The half that turns "the counts disagree" into an attribution.
+import Proof.Program.Coherence
 
 -- Concurrency: threads, a nondeterministic scheduler, happens-before and the
 -- race predicate. No permission algebra yet, so no race-freedom theorem.
 import Proof.Concurrent.Event
 import Proof.Concurrent.Machine
+import Proof.Concurrent.Trace
+-- Race freedom for the races this IR can have: no permission algebra needed,
+-- because the only conflicting traffic is the refcount word.
+import Proof.Concurrent.RaceFree
 
 -- Lython-specific invalidity: the handful of things THIS language forbids, with
 -- decision procedures and soundness. Not a permission algebra.
 import Proof.Lython.Invalid
 import Proof.Lython.Detect
+-- `Valid`, decided: all four invalidities have sound and complete procedures,
+-- and silence on all of them means no `Invalidity` is derivable.
+import Proof.Lython.Decide
 
 -- The instantiation, and a trace that exercises it. Both are load-bearing: the
 -- modules above are parameterised over an element signature, and every theorem

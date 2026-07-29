@@ -11,6 +11,7 @@ module Proof.Program.Env where
 open import Data.Bool using (Bool; true; false; if_then_else_; _∧_)
 open import Data.List using (List; []; _∷_; length)
 open import Data.Maybe using (Maybe; just; nothing)
+import Data.Maybe
 open import Data.Nat using (ℕ; zero; suc; _≟_)
 open import Data.Nat.Base using (_≡ᵇ_)
 open import Data.Product using (_×_; _,_; proj₁; proj₂)
@@ -18,7 +19,7 @@ open import Relation.Binary.PropositionalEquality using (_≡_; refl; sym; trans
 open import Relation.Nullary using (Dec; yes; no; ¬_)
 
 open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
-  sameObj; sameObj-refl; sameObj-sound)
+  sameObj; sameObj-refl; sameObj-sound; ≡ᵇ-sound)
 open import Proof.Program.Syntax using (Var)
 
 -- How a name holds its entity.
@@ -57,6 +58,12 @@ sameVar-refl : ∀ x → sameVar x x ≡ true
 sameVar-refl zero    = refl
 sameVar-refl (suc n) = sameVar-refl n
 
+-- Reflection, shared with `sameObj-sound` rather than reproved: `sameVar` IS
+-- `_≡ᵇ_` on ℕ, and a second proof of the same fact is a second thing to keep in
+-- step.
+sameVar-sound : ∀ x y → sameVar x y ≡ true → x ≡ y
+sameVar-sound = ≡ᵇ-sound
+
 lookupVar : Env → Var → Maybe Binding
 lookupVar []             _ = nothing
 lookupVar ((y , b) ∷ es) x = if sameVar y x then just b else lookupVar es x
@@ -70,10 +77,35 @@ unbindVar : Env → Var → Env
 unbindVar []             _ = []
 unbindVar ((y , b) ∷ es) x = if sameVar y x then es else (y , b) ∷ unbindVar es x
 
+-- The four equations, carried explicitly.
+--
+-- Reduction inside `lookupVar (unbindVar es x) y` creates a scrutinee that no
+-- with-abstraction ever saw, so a proof that case splits at the top gets stuck
+-- one layer down. Carrying the equation avoids the question -- the same device
+-- and the same reason as `lookupObj-cons-true` and its siblings.
+lookupVar-cons-true : ∀ u b (es : Env) y → sameVar u y ≡ true →
+                      lookupVar ((u , b) ∷ es) y ≡ just b
+lookupVar-cons-true u b es y e rewrite e = refl
+
+lookupVar-cons-false : ∀ u b (es : Env) y → sameVar u y ≡ false →
+                       lookupVar ((u , b) ∷ es) y ≡ lookupVar es y
+lookupVar-cons-false u b es y e rewrite e = refl
+
+unbindVar-cons-true : ∀ u b (es : Env) x → sameVar u x ≡ true →
+                      unbindVar ((u , b) ∷ es) x ≡ es
+unbindVar-cons-true u b es x e rewrite e = refl
+
+unbindVar-cons-false : ∀ u b (es : Env) x → sameVar u x ≡ false →
+                       unbindVar ((u , b) ∷ es) x ≡ (u , b) ∷ unbindVar es x
+unbindVar-cons-false u b es x e rewrite e = refl
+
+-- Written with `map` rather than with a `with`, and the difference is not
+-- cosmetic: a `with` compiles to an auxiliary function, so a caller that case
+-- splits on `lookupVar es x` does NOT thereby reduce an `entityOf es x` sitting
+-- in a hypothesis, and inverting "this name denotes o" back to "this name is
+-- bound" becomes unprovable. Same reason `sameObj` is a boolean.
 entityOf : Env → Var → Maybe ObjId
-entityOf es x with lookupVar es x
-... | just b  = just (entity b)
-... | nothing = nothing
+entityOf es x = Data.Maybe.map entity (lookupVar es x)
 
 ------------------------------------------------------------------------
 -- THE predicate.
@@ -139,10 +171,20 @@ bindParams _  (_ ∷ _)  []       = nothing
 -- refcount invariant. Borrowed bindings are NOT counted, which is the whole
 -- content of "a borrow costs nothing".
 
+isOwned : Mode → Bool
+isOwned owned        = true
+isOwned (borrowed _) = false
+
+-- One boolean scrutinee, not two nested `with`s, and for the third time in this
+-- development the reason is that a `with` becomes an auxiliary function: through
+-- one, `sameObj (entity b) o` inside this count is not the same term as the one
+-- inside `logicalRC`, and no single case split reduces both. Comparing the two
+-- counts is the entire point of having them, so they have to branch on the same
+-- thing. `isOwned (mode b) ∧ …` reduces to `sameObj (entity b) o` exactly when
+-- the binding is owned, which is what makes that comparison possible.
 ownedCount : Env → ObjId → ℕ
 ownedCount []             _ = 0
-ownedCount ((_ , b) ∷ es) o with mode b
-... | borrowed _ = ownedCount es o
-... | owned      with sameObj (entity b) o
-...   | true  = suc (ownedCount es o)
-...   | false = ownedCount es o
+ownedCount ((_ , b) ∷ es) o =
+  if isOwned (mode b) ∧ sameObj (entity b) o
+    then suc (ownedCount es o)
+    else ownedCount es o

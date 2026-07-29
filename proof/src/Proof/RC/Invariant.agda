@@ -51,8 +51,16 @@ record WFRC (m : Machine) : Set where
     -- is where the refcount layer meets the memory layer: an owner site that
     -- survived a realloc is caught by this field and not by `resolve`, which is
     -- one step too late.
+    --
+    -- Stated over `Holds` -- MEMBERSHIP in the site map -- and not over
+    -- `strongAt`. The first version used the lookup, and was then not preserved
+    -- by `drop`: `vacate` removes the first entry at a site and exposes whatever
+    -- was behind it, about which a property quantified over first-entries says
+    -- nothing. Over membership the field is preserved, and it is also the
+    -- property one wants: every reference the map records has live storage at a
+    -- matching generation, not merely the ones a lookup happens to reach.
     no-stale-owner :
-      ∀ s o → strongAt (sites m) s ≡ just o →
+      ∀ s o → Holds (sites m) s o →
       Σ _ λ b → (lookupBlock (heap m) (objAllocation o) ≡ just b)
               × (generation b ≡ objGeneration o)
 

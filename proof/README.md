@@ -38,11 +38,14 @@ Steps 1–4 of the note's implementation order, the memref dialect's memory API,
 | `Proof.MemRef.Dialect` | **the memref op set, transcribed** |
 | `Proof.MemRef.Realloc` | `realloc`, and the invalidation it forces |
 | `Proof.QTT.Quantity` | multiplicities, `RefMode`, and what quantity does *not* decide |
+| `Proof.QTT.Trace` | the erasure judgment, and the five refutations that give it content |
 | `Proof.RC.Object` | `ObjId`, `Life`, `RuntimeCount`, immortals |
 | `Proof.RC.OwnerSite` | owner sites and `logicalRC` |
 | `Proof.RC.Machine` | heap + object table + ghost site map |
 | `Proof.RC.Ops` | **py.incref / py.decref**, move, borrow, reclaim |
 | `Proof.RC.Invariant` | `WFRC`: what makes the counter mean something |
+| `Proof.RC.WellFormed` | **machines that satisfy `WFRC`**, at every point of the RC trace |
+| `Proof.RC.Aggregate` | field paths, **multiplicity**, `aggregateRelease`, and the orphan |
 | `Proof.RC.Properties` | the refcount theorems |
 | `Proof.Object.Word` | 8-byte words, encode/decode, and the bounded round trip |
 | `Proof.Object.WordSig` | an element signature with a designated word type |
@@ -50,16 +53,26 @@ Steps 1–4 of the note's implementation order, the memref dialect's memory API,
 | `Proof.Object.Box` | the box: one descriptor, fields as indices into it |
 | `Proof.Object.Ops` | new / retain / release / move / free / resize |
 | `Proof.Object.Coherence` | **alloc / free / move coherence** |
+| `Proof.Object.Shaped` | the shape witness bundled with its box, so it cannot be mis-paired |
 | `Proof.Program.Syntax` | the linear resource IR: names, blocks, terminators |
 | `Proof.Program.Env` | names to entities, and **`Aliases`** |
 | `Proof.Program.Step` | **the step relation**, unwind edges, reachability |
 | `Proof.Program.Ownership` | ownership across a program |
+| `Proof.Program.Run` | **every instruction rule, taken as a step**, both counts read at each point |
+| `Proof.Program.Coherence` | **owned names vs owner sites**: kept by the instructions, broken by `br`; **coherence = leak-freedom** |
+| `Proof.Program.Preservation` | **⭐ every instruction step preserves the invariant** |
 | `Proof.Concurrent.Event` | events, `Conflict` |
 | `Proof.Concurrent.Machine` | threads, scheduler, happens-before, `Race` |
+| `Proof.Concurrent.Trace` | **the scheduler taking steps**, a race, and three non-races |
+| `Proof.Concurrent.RaceFree` | **⭐ race freedom**, without a permission algebra |
 | `Proof.Lython.Invalid` | **what Lython's semantics forbid** |
-| `Proof.Lython.Detect` | the decision procedures, with soundness |
+| `Proof.Lython.Detect` | the four decision procedures, **sound and complete** |
+| `Proof.Lython.Decide` | **⭐ `Valid`, decided by a FINITE check** over the state's own lists |
 | `Proof.Memory.Lython` | the element signature Lython actually lowers to |
 | `Proof.Memory.Trace`, `Proof.RC.Trace`, `Proof.Object.Trace`, `Proof.Program.Trace`, `Proof.Lython.Trace` | concrete traces, checked by computation |
+
+Every predicate in the development is inhabited by one of the trace modules. That
+is checked, not assumed — see "Why inhabitation is measured" below.
 
 ### Invalidity, matched to this language rather than in general
 
@@ -199,6 +212,91 @@ And in the reference-counting layer:
 - **immortals never reach zero**, by construction: there is no constructor of
   `ReachedZero` at `immortal`. Lython's small-int cache is exactly this, and one
   of its shipped defects turned on the `{0,1,2}` boundary.
+- **⭐ `WFRC` is satisfiable, and is maintained across the whole trace** —
+  `Proof.RC.WellFormed` carries a witness at each of allocate, incref, decref,
+  decref-to-zero and reclaim. Every field is discharged with a *real* hypothesis
+  somewhere; the module tabulates which, because a witness set in which some
+  field is vacuous everywhere leaves that field possibly-unsatisfiable and every
+  theorem resting on it worth what it was worth before.
+
+And at the program layer, in `Proof.Program.Run`:
+
+- **every instruction rule takes a step** — `new`, `dup`, `borrow`, `move`,
+  `drop`, on one block, with each state written in *normal form* so the rule has
+  to prove it produces what is written. Both counts are read at every point and
+  `counts-agree` states the agreement as one equation per state.
+- **⭐ owned names and owner sites are kept in step by every instruction, and
+  broken by `br`** (`Proof.Program.Coherence`). That is what turns "the two
+  counts disagree after a branch" from an observation into an *attribution*: the
+  fix is not in either count, it is that `br` must become either a move or a dup.
+- **⚠ two findings came out of running it.** `step-move` has no premise about
+  names borrowed from its source, so a program can move out from under a live
+  borrow — `move` is a second point, besides the drop, where the check has to go.
+  And `reclaim`'s preconditions are met at a state where a *borrowed* name still
+  denotes the object (`reclaim-is-licensed` typechecks): a borrow is a name that
+  holds no site, so the ghost count reaching zero does not mean nothing refers to
+  the object.
+
+And the theorem the whole program layer was for, in
+`Proof.Program.Preservation`:
+
+- **⭐ every step takes a well-formed state to a well-formed state, and so does
+  every run** — `reachable-preserves-WF`, over `—→*`: five instruction rules and
+  five terminators, five invariant fields, quantified over *all* objects.
+  `Proof.Program.Run` uses it: `WF s₆` is obtained from `WF s₀` by stepping, not
+  by writing the witness down.
+- **⭐ A BLOCK ARGUMENT IS A MOVE.** That was the open design decision and it is
+  taken: `moveArgs` unbinds the operand and relocates its owner site to the
+  parameter. The counter is untouched, so a block argument costs nothing — which
+  is why move rather than dup: a loop-carried value would otherwise pay a
+  retain/release pair per turn for a reference that never went anywhere. The
+  operand's name is *gone* after the branch (`Proof.Program.Trace.x-is-gone`), so
+  the two-owned-names state the shipped SIGSEGV turns on is not reachable.
+- Two things had to change first, and both were changes to the IR rather than to
+  the invariant. `no-stale-owner` moved from `strongAt` to **membership**,
+  because `vacate` removes the first entry at a site and exposes the next, about
+  which a first-entry property says nothing. And five rules gained premises —
+  a `dup` of a dead object is a resurrection, a `new` onto absent storage is a
+  dangling reference at birth, and `move`/`drop` on a *shadowed* name leave the
+  environment owning a reference the site map no longer records. Each premise
+  was mutation-tested: removing it makes the preservation proof fail.
+- **The invariant is bigger than `WFRC` and has to be.** `backed` — every owned
+  name occupies its own site holding its own entity — is what lets a rule that
+  consults the *environment* be shown to do the right thing to the *machine*.
+
+And in the concurrent layer, in `Proof.Concurrent.Trace`:
+
+- **the scheduler takes steps**, in both positions of a two-thread pool, and a
+  plain refcount RMW from each of two threads is a `Race` — with the
+  happens-before refutation, not by assertion.
+- **and three things are not races**: two atomics, two reads, and one thread with
+  itself. Without those the definitions are consistent with `Conflict` holding of
+  every pair.
+- **⭐ race freedom for whole histories, without a permission algebra**
+  (`Proof.Concurrent.RaceFree`). **Every access this IR performs is one word of
+  one object's own allocation** — the one-lane layout leaves nothing else to
+  point at — so two accesses overlap exactly when they name the same word of the
+  same object, and the algebra a general model needs collapses into one
+  arithmetic lemma (`aligned-blocks-disjoint`). What is left is two obligations
+  belonging to different people: refcount traffic is the *compiler's* and is
+  decided by `sharedPair`; payload traffic is the *program's* and no lowering can
+  fix it. `history-is-race-free` discharges the first and takes the second as a
+  hypothesis, which is the honest split.
+- **⭐ different fields never conflict, and a field never touches the refcount
+  word** — `HeaderWords` is positive, so payload traffic cannot be mistaken for
+  refcount traffic. And **different objects never conflict**, which is the payoff
+  of identity being provenance: with addresses two objects could share one and
+  that theorem would be false.
+- **A policy may emit *nothing*.** `Policy = ObjId → Maybe Atomicity`, and
+  `nothing` is the right answer for an immortal — `bumpUp immortal ≡ immortal`,
+  so there is nothing to write. `Proof.Concurrent.Trace` shows all three
+  policies on one program: the naive one fails the obligation, atomic and
+  eliding meet it.
+- **⚠ `sched-step` was uninhabitable** and asking for an inhabitant is what found
+  it. It carried the pool through unchanged and demanded the stepping thread be
+  *identical* afterwards — which no real step can satisfy — and it left the
+  recorded event unconstrained, so a single-threaded program could fabricate a
+  race. Both are fixed.
 
 And for the one-lane object:
 
@@ -225,20 +323,23 @@ And for the one-lane object:
 
 - **Nothing about the compiler.** These are theorems about the model. Connecting
   them to `src/lython/` is a refinement obligation that does not exist yet.
-- **No permission algebra, and so no race-freedom theorem.** `Race` and
-  `RaceFree` are defined; nothing proves any program satisfies the second.
-  **A predicate being definable is not the same as any program being shown free
-  of it**, and the module says so in place.
-- **`step-preserves-WFRC` is not exported.** Its five fields now rest on proved
-  lemmas or on `reachable-keeps-the-heap`, and the two IR-level obstructions are
-  gone — but each field is ∀-quantified over *all* objects, so every rule needs
-  the untouched-object case too. That is assembly, not discovery, and it is not
-  yet written. **"The obstruction is gone" and "the theorem is proved" are
-  different statements** and only the first is claimed.
-- **`WFRC` is never established.** The invariant is *stated* and the operations
-  are proved to move both counts together, but no theorem yet says "every
-  reachable machine satisfies `WFRC`". That is the preservation proof, and it is
-  the next real piece of work in this layer.
+- **Race freedom is for a PAIR of emissions, not for a whole history.** Lifting
+  it needs every event in a history to be shown to come from `eventFor`, which
+  is an induction over `⇒*`. Mechanical, and not written.
+- **`PayloadSeparated` is a hypothesis, deliberately.** Two threads writing one
+  field of one object race in Lython exactly as in CPython without the GIL, and
+  no lowering can prevent it. What a lowering *can* do is not add traffic of its
+  own, and that half is decided.
+- **`FollowsTheChecker` is still ∀-quantified over `ObjId`.** The four
+  invalidity checks are not — `Proof.Lython.Decide` runs them over the lists the
+  state provides and `Proof.Program.Coherence` establishes `Valid` on a
+  reachable state that way. The emission-side obligation has no such list
+  because it is about instructions the compiler is *about to write*, not about
+  a state.
+- **`Aggregate` does not distinguish "unset" from "absent".** It is a path
+  through the site map, so a field the class declares but nothing has set has no
+  entry and no path. Right for release; not enough for a reachability analysis.
+  Distinguishing them needs the field slots in the cell, not just their count.
 - **No elaboration.** `Proof.QTT.Quantity` records that a quantity does not
   determine a reference mode, and stops there. Translating a `qω` source program
   into explicit `dup`/`drop` — the step where escape analysis and liveness come
@@ -251,13 +352,13 @@ And for the one-lane object:
   way would mean a second lane — which is the thing this design removes. It is a
   real trade and `Proof.Object.Trace.double-free-reports-use-after-free` is what
   it costs.
-- **`WellShaped` is a side proof.** A box is a bare `Desc 1`, so the shape
-  invariant travels beside it rather than inside it. That is deliberate — a box
-  that were a *pair* of descriptor and proof would be two values again — but it
-  means nothing stops a caller pairing a well-formedness witness with the wrong
-  descriptor. Making that impossible needs the witness erased at runtime and
-  bundled at compile time, which Agda can express and this development does not
-  yet do.
+- **`WellShaped` is bundled but not erased.** `Proof.Object.Shaped` makes the
+  wrong pairing impossible — the witness travels inside the value and
+  `allocShaped` builds it by `refl`, so nobody supplies one. Run-time erasure is
+  a different matter and Agda refuses it: `@0` forbids transporting a *relevant*
+  value along an erased equation, and `wordIx`'s result type `Ix (sizes b)`
+  needs `spans-box`. Genuine erasure needs the index type to stop depending on
+  the proof, which is a redesign of `Proof.Object.Box`.
 - **No finalizers, no weak references, no cycles.** `Life` has a `finalizing`
   state and `reclaim` requires it, but nothing runs user code in that window.
 - **The root token is weaker than the note asks for.** The note wants a linear
@@ -282,6 +383,24 @@ error in its sentinel, so Agda rejected it for a reason unrelated to the lemma
 being false — and the target printed "the checker is live". A guard whose pass
 criterion is "the tool failed" passes whenever the guard itself is broken.
 
+## Why inhabitation is measured
+
+Agda tells you a theorem is correct. It does not tell you the theorem has
+*content*. `WFRC m → X` is unconditionally true when nothing satisfies `WFRC`,
+and `¬ P` is free when `P` is empty — so a development can be entirely `--safe`,
+mutation-tested, and still be about nothing.
+
+The only instrument for that layer is an **inhabitation census**: for each
+predicate, is one ever built in a trace? Running it here found that `WFRC` had
+never been satisfied, that no instruction rule had ever been applied, and that
+the whole concurrent layer had never taken a step — through a rule that turned
+out to be unsatisfiable.
+
+The census itself failed twice before it worked, both times returning "0 for
+everything". That is the dangerous shape: **the warning condition and the
+instrument's own failure mode coincide exactly.** Verify the census against a
+known inhabitant before believing any zero it reports.
+
 ## Why the trace module exists
 
 Every theorem in `Properties` is conditional: *if* the lookup succeeds *and* the
@@ -304,12 +423,16 @@ failure, `NonInstantiationIsNotConformance` in `rfc/memory-safety-proof.md`.
 
 In the note's order (§9), and each is a separate piece of work:
 
-1. **Preservation of `WFRC`**: every operation takes a well-formed machine to a
-   well-formed machine. Without it the invariant is a definition nobody has to
-   satisfy.
+1. **Decide what `br` is.** `step-preserves-WF` covers every instruction and
+   stops at argument passing. The IR has to make a block argument either a MOVE
+   (the operand's name dies at the branch) or a DUP (it occupies a site). That
+   is a design decision this development has localised and not taken.
 2. **Elaboration**: `qω` source to a linear resource IR with explicit
    `dup`/`drop`, and the theorem that the result is well-typed.
-3. Threads, spawn/join, and the permission algebra that makes race freedom
-   provable.
+3. **Field footprints and the permission algebra** they need — the one place a
+   general PCM is actually required.
 4. A refinement from this model down to what `src/lython/lowering` emits. Until
-   that exists, nothing here constrains the compiler.
+   that exists, nothing here constrains the compiler. All four checkers are
+   sound *and* complete and each rests on exactly one representational decision
+   in the compiler; `danglingAnchor` (the anchor recorded in `Mode.borrowed`) is
+   still the cheapest to transfer.

@@ -38,7 +38,7 @@ open import Data.Bool using (Bool; true; false)
 open import Data.Empty using (⊥; ⊥-elim)
 open import Data.List using (List; []; _∷_)
 open import Data.Maybe using (Maybe; just; nothing)
-open import Data.Nat using (ℕ; zero; suc; _≟_)
+open import Data.Nat using (ℕ; zero; suc; _≟_; _<_; s≤s; z≤n)
 open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Relation.Binary.PropositionalEquality using (_≡_; _≢_; refl; sym; trans)
 open import Relation.Nullary using (Dec; yes; no; ¬_)
@@ -47,7 +47,7 @@ open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal)
 open import Proof.RC.OwnerSite using (OwnerSite; local; field′; global; queue; temp;
-  ThreadId; SiteMap; strongAt; logicalRC)
+  ThreadId; SiteMap; strongAt; logicalRC; Holds; holds-here; holds-there)
 open import Proof.RC.Machine Sig
 open import Proof.Program.Syntax using (Var)
 open import Proof.Program.Env
@@ -55,7 +55,7 @@ open import Proof.Prelude using (ByteRange; range)
 open import Proof.Memory.Heap using (AllocId; Generation)
 open import Proof.Object.Word using (WordBytes)
 open import Proof.Concurrent.Event using (Event; kind; footprint; modeOf;
-  AccessMode; reads; writes; rmw; Atomicity; plain; atomic)
+  AccessMode; reads; writes; rmw; Atomicity; plain; atomic; rcFootprint)
 
 ------------------------------------------------------------------------
 -- 1. Sharing, and when a refcount update has to be atomic.
@@ -75,12 +75,16 @@ ownerThread (queue _ _)  = nothing
 
 -- Two sites hold the object and they belong to different threads -- or one of
 -- them belongs to no thread at all, which is the escaped case.
+-- Over `Holds` rather than `strongAt`, for the reason `no-stale-owner` is:
+-- what matters is that the map RECORDS a reference from that site, not that a
+-- lookup happens to reach it first. A shadowed entry is still a reference a
+-- thread can reach.
 record SharedAcrossThreads (m : Machine) (o : ObjId) : Set where
   constructor shared-by
   field
     site₁ site₂ : OwnerSite
-    holds₁ : strongAt (sites m) site₁ ≡ just o
-    holds₂ : strongAt (sites m) site₂ ≡ just o
+    holds₁ : Holds (sites m) site₁ o
+    holds₂ : Holds (sites m) site₂ o
     -- Different sites, and not both owned by the same thread. Stated as a
     -- disjunction so the escaped case (`nothing`, a field or a global) is a
     -- witness in its own right rather than an afterthought.
@@ -109,11 +113,6 @@ immortal-needs-no-atomic :
   countOf m o ≡ just immortal → ¬ NeedsAtomicRC m o
 immortal-needs-no-atomic m o imm (_ , (n , cnt)) with trans (sym imm) cnt
 ... | ()
-
--- The byte range a refcount update touches: word 0 of the object's own
--- allocation, which is where the one-lane layout puts it.
-rcFootprint : ObjId → AllocId × Generation × ByteRange
-rcFootprint o = objAllocation o , objGeneration o , range 0 WordBytes
 
 -- THE invalidity: a PLAIN read-modify-write on the refcount word of an object
 -- that needs an atomic one.
@@ -220,6 +219,33 @@ record PrematureReclaim (es : Env) (m : Machine) (o : ObjId) : Set where
 open PrematureReclaim public
 
 ------------------------------------------------------------------------
+-- 5. A leak.
+--
+-- The other direction of memory safety, and the one the development had no
+-- sentence for. Use-after-free is "the storage went away while a name still
+-- denotes it" (`PrematureReclaim` above). A leak is its mirror: an owner SITE
+-- still holds the object and no NAME does, so nothing will ever release it.
+--
+-- Both counts are needed and neither alone will do. `ghostRC` alone cannot see
+-- a leak -- a positive count is the normal state of a live object. `ownedCount`
+-- alone cannot either -- zero owned names is the normal state after the last
+-- drop. It is the two DISAGREEING that is the defect, which is why
+-- `Proof.Program.Coherence.NameSiteCoherent` is the property that rules it out.
+--
+-- This is the shape of the compiler's unattributed leak size classes: a release
+-- that was not emitted leaves exactly this state.
+
+record Leaked (es : Env) (m : Machine) (o : ObjId) : Set where
+  constructor leaked
+  field
+    -- Someone still holds it, so it will never be reclaimed ...
+    still-owned : 0 < ghostRC m o
+    -- ... and no name is left that could do the releasing.
+    unnamed     : ownedCount es o ≡ 0
+
+open Leaked public
+
+------------------------------------------------------------------------
 -- The whole list, as one predicate.
 --
 -- A state is INVALID when any of them holds. Enumerating them rather than
@@ -232,6 +258,7 @@ data Invalidity (es : Env) (m : Machine) : Set where
   refcount-race     : ∀ {o e} → RefcountRace m o e → Invalidity es m
   dangling-borrow   : ∀ {x} → DanglingBorrow es x → Invalidity es m
   premature-reclaim : ∀ {o} → PrematureReclaim es m o → Invalidity es m
+  leak              : ∀ {o} → Leaked es m o → Invalidity es m
 
 Valid : Env → Machine → Set
 Valid es m = ¬ Invalidity es m
