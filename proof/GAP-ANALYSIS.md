@@ -206,8 +206,24 @@ exists for exactly this and nothing yet uses it.
 > an incoherent start or a transition the relation lacks, and there are exactly
 > two of those — **function entry** (no callee frame) and **scope exit** (nothing
 > discards an environment). So a leak is a boundary and not a placement, which
-> is the opposite of families A–E. That is a prediction about where the two open
-> leak families live and it has **not** been checked compiler-side.
+> is the opposite of families A–E.
+>
+> **⛔ That prediction was measured and is WRONG (2026-07-30).** The largest
+> leaking golden is neither boundary nor placement: `LyObject_FromSlot` returns a
+> reference (refcount initialised to 1, `ly.ownership.owned_results = [0]`) and
+> `runtime-lowering` retains it anyway, so the counter is one high and the
+> release — which is present, same value, same block chain — cannot get it to
+> zero. It is an **over-retain**, unbounded, one per boxed slot read.
+>
+> The reason the theorem missed it names the next gap. Model `dup` is ATOMIC: the
+> counter bump, the owner site and the name arrive together, so a redundant `dup`
+> preserves both `WFRC` and coherence — the model says an extra retain is SAFE.
+> The compiler's extra retain is a BARE counter bump, no site and no name, and the
+> model has no rule for one. `Proof.Program.Recorded` models it as a real `dup`,
+> so it gets the arithmetic right (`the-unrecorded-retain-bumps-the-counter`) and
+> the consequence wrong. Closing it means splitting `dup` the way `new` was split
+> into `alloc`/`init`, for the same reason: one instruction doing two things with
+> no way to speak about the gap between them.
 
 ### 2.4 There is no contract, so deallocator selection is invisible
 
