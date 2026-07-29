@@ -20,7 +20,7 @@ module Proof.Program.Run where
 open import Data.List using (List; []; _∷_)
 open import Data.Maybe using (Maybe; just; nothing)
 open import Data.Nat using (ℕ; zero; suc)
-open import Data.Product using (_×_; _,_; proj₁; proj₂)
+open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Data.Integer using (+_)
 open import Data.Vec using ([]; _∷_)
 open import Relation.Binary.PropositionalEquality using (_≡_; refl)
@@ -29,7 +29,11 @@ open import Relation.Nullary using (¬_)
 open import Proof.Memory.Heap using (Heap)
 open import Proof.Memory.Lython using (LythonSig; i64)
 open import Proof.Memory.Descriptor LythonSig using (Desc)
-open import Proof.MemRef.Dialect LythonSig using (alloc)
+-- ⭐ Renamed on import rather than renaming the instruction. `Instr.alloc` IS
+-- this operation seen from the program layer, so the two SHOULD have the same
+-- name; what a reader needs here is to know which level a given occurrence is
+-- at, and that is what the rename says.
+open import Proof.MemRef.Dialect LythonSig renaming (alloc to allocBlock)
 open import Proof.RC.Object
 open import Proof.RC.OwnerSite using (OwnerSite; local; SiteMap; logicalRC)
 open import Proof.RC.Machine LythonSig
@@ -38,6 +42,8 @@ open import Proof.Prelude using (Result; ok; err)
 open import Proof.Program.Syntax
 open import Proof.Program.Env
 open import Proof.Program.Step LythonSig
+open import Proof.Program.Ownership LythonSig
+  using (no-dup-in-the-initialisation-window)
 open import Proof.Program.Preservation LythonSig
 open import Proof.RC.Invariant LythonSig using (WFRC; counted-exact)
 open import Data.Empty using (⊥; ⊥-elim)
@@ -51,7 +57,8 @@ open import Proof.Lython.Detect LythonSig
 ------------------------------------------------------------------------
 -- The program.
 --
---   bb0(): new x ; dup y x ; borrow z y ; move w y ; drop w ; drop x ; unwind
+--   bb0(): alloc x ; init x ; dup y x ; borrow z y ; move w y ; drop w ; drop x
+--          ; unwind
 --
 -- The `borrow` is deliberately anchored at `y`, which the `move` two
 -- instructions later removes. That is not an accident of the example: it is the
@@ -69,7 +76,7 @@ bb0 : BlockId
 bb0 = 0
 
 fullBody : List Instr
-fullBody = new x 7 ∷ dup y x ∷ borrow z y ∷ move w y ∷ drop w ∷ drop x ∷ []
+fullBody = alloc x 7 ∷ init x ∷ dup y x ∷ borrow z y ∷ move w y ∷ drop w ∷ drop x ∷ []
 
 prog : Function
 prog = function (block bb0 [] fullBody unwind ∷ []) bb0
@@ -78,7 +85,7 @@ prog = function (block bb0 [] fullBody unwind ∷ []) bb0
 -- The allocation the object will live in, and the object.
 
 allocated : Heap × Desc 1
-allocated = alloc [] 0 i64 1 8
+allocated = allocBlock [] 0 i64 1 8
 
 h : Heap
 h = proj₁ allocated
@@ -94,6 +101,13 @@ theObj = obj 0 0
 
 s₀ : PState
 s₀ = pstate 0 bb0 fullBody [] (machine h [] [])
+
+-- ⭐ INSIDE THE INITIALISATION WINDOW. `x` owns storage; the object table is
+-- still empty, so there is nothing here with a refcount.
+sWindow : PState
+sWindow = pstate 0 bb0 (init x ∷ dup y x ∷ borrow z y ∷ move w y ∷ drop w ∷ drop x ∷ [])
+                 ((x , bind theObj owned) ∷ [])
+                 (machine h [] ((local 0 x , theObj) ∷ []))
 
 s₁ : PState
 s₁ = pstate 0 bb0 (dup y x ∷ borrow z y ∷ move w y ∷ drop w ∷ drop x ∷ [])
@@ -136,11 +150,17 @@ s₆ = pstate 0 bb0 []
 -- The six derivations. ⭐ This is what the module exists for: before it, none
 -- of these five constructors had ever been applied.
 
--- `new`: the rule CONSTRUCTS `cell live (counted 1) bk 0`. That change was made
--- to remove an obstruction to `WFRC.live-positive`, and this is the first time
--- the changed rule has been used.
-run-new : prog ⊢ s₀ —→ᵢ s₁
-run-new = step-new refl refl refl refl refl
+-- `alloc`: storage and a name, and NO CELL. The object table of `sWindow` is
+-- `[]`, which is the window as a value rather than as a description.
+run-alloc : prog ⊢ s₀ —→ᵢ sWindow
+run-alloc = step-alloc refl refl refl refl refl
+
+-- `init`: the header write. The rule CONSTRUCTS `cell live (counted 1) bk 0` --
+-- a change made to remove an obstruction to `WFRC.live-positive` -- and its
+-- third premise is `logicalRC (sites m) o ≡ 1`, the condition that the storage
+-- being initialised has exactly one owner.
+run-init : prog ⊢ sWindow —→ᵢ s₁
+run-init = step-init refl refl refl
 
 run-dup : prog ⊢ s₁ —→ᵢ s₂
 run-dup = step-dup refl refl refl
@@ -162,12 +182,52 @@ run-drop-x = step-drop refl refl refl refl
 -- and they compose.
 whole-block : prog ⊢ s₀ —→* s₆
 whole-block =
-  more (by-instr run-new)
+  more (by-instr run-alloc)
+  (more (by-instr run-init)
   (more (by-instr run-dup)
   (more (by-instr run-borrow)
   (more (by-instr run-move)
   (more (by-instr run-drop-w)
-  (more (by-instr run-drop-x) done)))))
+  (more (by-instr run-drop-x) done))))))
+
+------------------------------------------------------------------------
+-- ⭐ THE INITIALISATION WINDOW, read off this run.
+--
+-- `sWindow` is the state between `alloc` and `init`: `x` owns the storage, one
+-- site holds it, and the object table is empty. Every one of these is computed
+-- from the state the step relation produced, not written down.
+
+window-owns-the-storage : entityOf (env sWindow) x ≡ just theObj
+window-owns-the-storage = refl
+
+window-has-one-owner : logicalRC (sites (mach sWindow)) theObj ≡ 1
+window-has-one-owner = refl
+
+window-has-no-object : countOf (mach sWindow) theObj ≡ nothing
+window-has-no-object = refl
+
+window-has-no-life : lifeOf (mach sWindow) theObj ≡ nothing
+window-has-no-life = refl
+
+-- ⭐ THE IR THE COMPILER USED TO EMIT: the retain hoisted to the handle's
+-- definition, which is inside the window. Same environment, same machine, one
+-- instruction reordered.
+sHoisted : PState
+sHoisted = pstate 0 bb0 (dup y x ∷ init x ∷ borrow z y ∷ move w y ∷ drop w ∷ drop x ∷ [])
+                  (env sWindow) (mach sWindow)
+
+-- and it has NO STEP. Not "a step that is unsound", not "a step whose result
+-- fails the invariant" -- the relation has no derivation, so a compiler that
+-- emits this is emitting an operation the semantics does not have. That is the
+-- `Ly_IncRef observed non-positive refcount` crash as an absence.
+hoisted-retain-has-no-step : ¬ (Σ PState λ u → prog ⊢ sHoisted —→ᵢ u)
+hoisted-retain-has-no-step = no-dup-in-the-initialisation-window refl refl
+
+-- The same retain one instruction later is fine, and `run-dup` above is the
+-- derivation. Stated here so the pair reads as "too early" rather than
+-- "forbidden".
+same-retain-after-init : prog ⊢ s₁ —→ᵢ s₂
+same-retain-after-init = run-dup
 
 ------------------------------------------------------------------------
 -- Both counts, at every point.
@@ -397,12 +457,25 @@ end-is-well-formed = reachable-preserves-WF the-run start-is-well-formed
 end-has-a-real-object : countOf (mach s₆) theObj ≡ just (counted 0)
 end-has-a-real-object = refl
 
+-- ⭐ The window is a LEGITIMATE state, not an error state.
+--
+-- This is the half that keeps `no-dup-in-the-initialisation-window` from being
+-- a statement that the window is broken. `WFRC` holds at `sWindow`: the storage
+-- is live, the site is not stale, and every field about a counter is vacuous
+-- because there is no cell. A model that made the window ill-formed would be
+-- saying the compiler must not allocate before it initialises, which is not the
+-- finding -- the finding is that it must not INCREF in between.
+window-is-well-formed : WF sWindow
+window-is-well-formed =
+  reachable-preserves-WF (more (by-instr run-alloc) done) start-is-well-formed
+
 -- The invariant at a state where it says something. At `s₂` the counter reads 2
 -- and two sites hold the object; `counted-exact` there is the statement that
 -- those are the same number, obtained from the theorem rather than by hand.
 midpoint-is-well-formed : WF s₂
 midpoint-is-well-formed =
-  reachable-preserves-WF (more (by-instr run-new) (more (by-instr run-dup) done))
+  reachable-preserves-WF
+    (more (by-instr run-alloc) (more (by-instr run-init) (more (by-instr run-dup) done)))
     start-is-well-formed
 
 midpoint-counted-exact : 2 ≡ ghostRC (mach s₂) theObj

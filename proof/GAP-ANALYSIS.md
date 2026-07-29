@@ -67,6 +67,8 @@ defect possible, not the class of reasoning error that produced it.
 | **family C**: release placement abandoned when one consuming use existed | CFG + placement | **statable** |
 | **families A/B**: latent double release on unwind edges no input reaches | CFG + unwind edges | **statable** — `step-invoke-throw` is the edge |
 | **family D**: retain omitted by provenance, not layout | SSA provenance | **partly** — names exist; the IR does not yet record which op produced one |
+| **retain inside the initialisation window** — `Ly_IncRef observed non-positive refcount`, three golden cases, from a retain anchored at a `memref.alloc` result whose prefix words are stored afterwards | a state between "storage exists" and "object exists" | **excluded** — `new` is split into `alloc` and `init`; `no-dup-in-the-initialisation-window` and `no-drop-in-the-initialisation-window` say the relation has no such step, and `dup-resumes-after-init` says the window closes. `Proof.Program.Run.hoisted-retain-has-no-step` is the IR the compiler used to emit, refuted |
+| **ownership taken and not recorded** — `boxRuntimeObject` retained the payload without marking the box owned, so an attribute-driven pass read a frame-owned box as borrowed and tried to synthesise a retain for a MOVE | a distinction between what is true and what the IR records | **inexpressible** — `Mode` in the model IS the truth; there is no second, fallible reading of it to disagree with |
 | **family E**: block-argument index space vs successor-operand index space | CFG, block arguments | **statable** — `bindParams` refuses a length mismatch |
 | **sequence/dict literal source move** — a use-**set** fact standing in for an execution-**frequency** fact | execution frequency | **partly** — loops are now expressible as a back edge; "how often" still is not |
 | **read-back token** — a second owned token on the same SSA values | SSA aliasing + aggregates | **partly** — `Aliases` is exactly this; aggregates are still absent |
@@ -213,6 +215,7 @@ work.
 |---|---|
 | an object reference is the root descriptor of its own allocation | **four remain multi-value**: `int`, `str`, the exception family and class instances still carry interior state as a tuple of SSA values beside the root (`rfc/memory-safety-proof.md`). Every container and every fixed-width scalar is already one lane |
 | fresh storage reads as `uninitialized-read` | no uninitialised-read check exists at any layer |
+| **no refcount operation exists between `alloc` and `init`** — the step relation has no derivation for one, so it is not an operation the compiler may choose to emit | enforced by `prefixIsInitializedAtDefinition` (ABI/EntityHeaderPrefix.h), which is a **convention about producers**: it accepts call results and block arguments and declines everything else, so a new producer costs a counted omission rather than a wrong retain. Correct today; nothing checks it stays correct |
 | `dealloc` refuses non-root descriptors | enforced by shape matching, which was measured to be ambiguous in 21–98 places per program |
 | the refcount is inside the object's own allocation | true today |
 | resizing reallocates the **buffer**, never the object | true today — `memref.realloc` appears nowhere, and the box/payload split is already the shape |

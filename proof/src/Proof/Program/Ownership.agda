@@ -22,7 +22,7 @@ open import Data.Bool using (Bool; true; false)
 open import Data.Empty using (⊥; ⊥-elim)
 open import Data.List using (List; []; _∷_)
 open import Data.Maybe using (Maybe; just; nothing)
-open import Data.Nat using (ℕ; zero; suc)
+open import Data.Nat using (ℕ; zero; suc; _<_; s≤s; z≤n)
 open import Data.Nat.Base using (_≡ᵇ_)
 open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Relation.Binary.PropositionalEquality
@@ -149,7 +149,8 @@ step-borrow-preserves-everything (step-borrow _) = refl
 -- theorem without re-deriving it at each step.
 
 steps-preserve-heap : ∀ {f s t} → f ⊢ s —→ t → heap (mach t) ≡ heap (mach s)
-steps-preserve-heap (by-instr (step-new _ _ _ _ _)) = refl
+steps-preserve-heap (by-instr (step-alloc _ _ _ _ _)) = refl
+steps-preserve-heap (by-instr (step-init _ _ _))     = refl
 steps-preserve-heap (by-instr (step-move _ _))      = refl
 steps-preserve-heap (by-instr (step-dup _ _ _))     = refl
 steps-preserve-heap (by-instr (step-drop _ _ _ _))  = refl
@@ -185,3 +186,91 @@ unwind-edge-is-a-step :
   f ⊢ pstate t bid [] es m —→ pstate t pad (body nxt) es' (afterArgs m ss')
 unwind-edge-is-a-step f t bid es m x l a pad pa cur nxt es' ss' fb tm fp bp =
   by-term (step-invoke-throw fb tm fp bp)
+
+------------------------------------------------------------------------
+-- ⭐ THE INITIALISATION WINDOW.
+--
+-- Between `alloc` and `init` a name owns storage whose header has not been
+-- written. This is the state `boxRuntimeObject` (ABI/RuntimeABI.cpp) is in
+-- after its `memref.alloc` and before its two prefix stores, and it is where
+-- three golden cases died with `Ly_IncRef observed non-positive refcount`: a
+-- retain anchored at the handle's definition read an uninitialised word.
+--
+-- The compiler now declines that anchor, by a predicate
+-- (`prefixIsInitializedAtDefinition`, ABI/EntityHeaderPrefix.h) whose
+-- correctness was a CONVENTION -- "the ownership marker is emitted only once
+-- the entity is complete". A convention holds until someone adds a producer.
+-- Below it is a theorem, and it holds for producers nobody has thought of,
+-- because it is not about producers at all: there is no object to increment.
+--
+-- Fuzzing cannot reach this. The window is a few instructions wide and closes
+-- on every input that a program actually runs; the three inputs that hit it did
+-- so through one specific boxing path.
+
+private
+  bind-obj′ : ∀ {o₁ o₂ md₁ md₂} → bind o₁ md₁ ≡ bind o₂ md₂ → o₁ ≡ o₂
+  bind-obj′ refl = refl
+
+  just-inj′ : ∀ {A : Set} {u v : A} → just u ≡ just v → u ≡ v
+  just-inj′ refl = refl
+
+  one-is-not-more : ¬ (1 < 1)
+  one-is-not-more (s≤s ())
+
+-- No incref. `step-dup` requires a cell, and in the window there is none.
+no-dup-in-the-initialisation-window :
+  ∀ {f t bid rest es m dst src o} →
+  lookupVar es src ≡ just (bind o owned) →
+  lookupObj (objects m) o ≡ nothing →
+  ¬ (Σ PState λ u → f ⊢ pstate t bid (dup dst src ∷ rest) es m —→ᵢ u)
+no-dup-in-the-initialisation-window {m = m} look fresh (_ , step-dup look′ tbl _)
+  with trans (sym (subst (λ q → lookupObj (objects m) q ≡ nothing)
+                         (bind-obj′ (just-inj′ (trans (sym look) look′))) fresh))
+             tbl
+... | ()
+
+-- No decref either, and for the same reason. A release emitted in the window is
+-- not an operation the semantics has -- so it cannot be justified as "harmless
+-- because the count is high enough".
+no-drop-in-the-initialisation-window :
+  ∀ {f t bid rest es m src o} →
+  lookupVar es src ≡ just (bind o owned) →
+  lookupObj (objects m) o ≡ nothing →
+  ¬ (Σ PState λ u → f ⊢ pstate t bid (drop src ∷ rest) es m —→ᵢ u)
+no-drop-in-the-initialisation-window {m = m} look fresh (_ , step-drop look′ tbl _ _)
+  with trans (sym (subst (λ q → lookupObj (objects m) q ≡ nothing)
+                         (bind-obj′ (just-inj′ (trans (sym look) look′))) fresh))
+             tbl
+... | ()
+
+-- ⭐ And the window CLOSES. Without this the two theorems above would also hold
+-- of a model in which `dup` never steps at all, and the prohibition would be
+-- about nothing.
+dup-resumes-after-init :
+  ∀ {f : Function} (t : ThreadId) (bid : BlockId) (rest : List Instr)
+    (es : Env) (m : Machine) (dst src : Var) (o : ObjId) (c : ObjCell) →
+  lookupVar es src ≡ just (bind o owned) →
+  lookupObj (objects m) o ≡ just c →
+  life c ≡ live →
+  Σ PState λ u → f ⊢ pstate t bid (dup dst src ∷ rest) es m —→ᵢ u
+dup-resumes-after-init t bid rest es m dst src o c look tbl alive =
+  _ , step-dup look tbl alive
+
+-- ⭐ Storage two names own cannot be initialised.
+--
+-- The counter is written as 1, so a second owner would put the ghost count at 2
+-- against a runtime count of 1 -- `counted-exact` broken by the birth of the
+-- object rather than by anything done to it afterwards. This is the condition
+-- the compiler has to meet at the point it emits the ownership marker, and it
+-- is the reason `step-init` carries `alone` rather than deriving it.
+no-init-when-shared :
+  ∀ {f t bid rest es m x o} →
+  lookupVar es x ≡ just (bind o owned) →
+  1 < logicalRC (sites m) o →
+  ¬ (Σ PState λ u → f ⊢ pstate t bid (init x ∷ rest) es m —→ᵢ u)
+no-init-when-shared {m = m} look shared (_ , step-init look′ _ alone) =
+  one-is-not-more
+    (subst (1 <_)
+           (subst (λ q → logicalRC (sites m) q ≡ 1)
+                  (sym (bind-obj′ (just-inj′ (trans (sym look) look′)))) alone)
+           shared)

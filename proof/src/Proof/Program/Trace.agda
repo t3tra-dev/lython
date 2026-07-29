@@ -10,7 +10,7 @@
 -- and the finding was that no sentence in the model could say it. The sentence
 -- was written here, on this program:
 --
---     bb0(): new x ; br bb1(x)
+--     bb0(): alloc x ; init x ; br bb1(x)
 --     bb1(p): drop p ; ...
 --
 -- and it said: after the branch `x` and `p` are two owned names of one entity
@@ -65,7 +65,7 @@ theObj = obj 0 0
 
 -- bb0 allocates and branches, passing the name it just bound.
 block0 : Block
-block0 = block bb0 [] (new x 7 ∷ []) (br bb1 (x ∷ []))
+block0 = block bb0 [] (alloc x 7 ∷ init x ∷ []) (br bb1 (x ∷ []))
 
 -- bb1 takes a PARAMETER. This is where the second name used to be created.
 block1 : Block

@@ -59,7 +59,7 @@ open import Proof.RC.Properties Sig using (lookupObj-cons-true;
   lookupObj-cons-false; updateObj-cons-true; updateObj-cons-false;
   lookupObj-update-same)
 open import Proof.Program.Syntax
-  using (Var; Function; Instr; new; move; dup; drop; borrow; params)
+  using (Var; Function; Instr; alloc; init; move; dup; drop; borrow; params)
 open import Proof.Program.Env
 open import Proof.Program.Step Sig
 
@@ -244,15 +244,19 @@ private
   bind-obj refl = refl
 
 ------------------------------------------------------------------------
--- `new`: fresh object, count 1, one site, one name.
+-- `alloc`: storage and a name, and no object yet.
 --
 -- A parameterised module rather than a `where` block: every field of the
--- invariant needs the same six premises and the same four hit/miss lemmas, and
--- threading them through five signatures obscured which fact each field used.
+-- invariant needs the same five premises, and threading them through five
+-- signatures obscured which fact each field used.
+--
+-- Every field about a counter or a life is discharged by CONTRADICTION at the
+-- fresh id, because `lookupObj` answers `nothing` there. That is the model of
+-- the initialisation window: the storage exists and is owned, and there is no
+-- object to have a refcount.
 
-module New
-  {t : ThreadId} {es : Env} {m : Machine} {x : Var} {o : ObjId}
-  {bk : Desc 1} {b : Block}
+module Alloc
+  {t : ThreadId} {es : Env} {m : Machine} {x : Var} {o : ObjId} {b : Block}
   (fresh   : lookupObj (objects m) o ≡ nothing)
   (unowned : logicalRC (sites m) o ≡ 0)
   (blk     : lookupBlock (heap m) (objAllocation o) ≡ just b)
@@ -262,36 +266,15 @@ module New
   where
 
   private
-    fresh-cell : ObjCell
-    fresh-cell = cell live (counted 1) bk 0
-
-    ts' : ObjTable
-    ts' = (o , fresh-cell) ∷ objects m
-
     ss' : SiteMap
     ss' = occupy (sites m) (siteOf t x) o
 
     m' : Machine
-    m' = machine (heap m) ts' ss'
+    m' = machine (heap m) (objects m) ss'
 
-    count-hit : ∀ p → sameObj o p ≡ true → countOf m' p ≡ just (counted 1)
-    count-hit p e = count-from ts' p fresh-cell (lookupObj-cons-true o fresh-cell (objects m) p e)
+    no-cell : ∀ p → sameObj o p ≡ true → lookupObj (objects m) p ≡ nothing
+    no-cell p e rewrite same→eq o p e = fresh
 
-    life-hit : ∀ p → sameObj o p ≡ true → lifeOf m' p ≡ just live
-    life-hit p e = life-from ts' p fresh-cell (lookupObj-cons-true o fresh-cell (objects m) p e)
-
-    tbl-miss : ∀ p → sameObj o p ≡ false → lookupObj ts' p ≡ lookupObj (objects m) p
-    tbl-miss p e = lookupObj-cons-false o fresh-cell (objects m) p e
-
-    count-miss : ∀ p → sameObj o p ≡ false → countOf m' p ≡ countOf m p
-    count-miss p e = count-eq ts' (objects m) p (tbl-miss p e)
-
-    life-miss : ∀ p → sameObj o p ≡ false → lifeOf m' p ≡ lifeOf m p
-    life-miss p e = life-eq ts' (objects m) p (tbl-miss p e)
-
-    -- The fresh object's ghost count is 1, and this is where `unowned` earns
-    -- its place among the premises: without it the site map could already hold
-    -- the id and the counter would say 1 while the map said 2.
     ghost-hit : ∀ p → sameObj o p ≡ true → ghostRC m' p ≡ 1
     ghost-hit p e rewrite same→eq o p e =
       trans (occupy-same (sites m) (siteOf t x) o) (cong suc unowned)
@@ -311,34 +294,29 @@ module New
       ce p n cnt lif = go (sameObj o p) refl
         where
           go : (bb : Bool) → sameObj o p ≡ bb → n ≡ ghostRC m' p
-          go true  e = trans (counted-inj (just-inj (trans (sym cnt) (count-hit p e))))
-                             (sym (ghost-hit p e))
-          go false e = trans (counted-exact (rc w) p n
-                               (trans (sym (count-miss p e)) cnt)
-                               (trans (sym (life-miss p e)) lif))
-                             (sym (ghost-miss p e))
+          go true  e with trans (sym (cong (Data.Maybe.map count) (no-cell p e))) cnt
+          ...           | ()
+          go false e = trans (counted-exact (rc w) p n cnt lif) (sym (ghost-miss p e))
 
       lp : ∀ p → lifeOf m' p ≡ just live → IsCounted m' p → 0 < ghostRC m' p
-      lp p lif (n , cnt) = go (sameObj o p) refl
+      lp p lif cnt = go (sameObj o p) refl
         where
           go : (bb : Bool) → sameObj o p ≡ bb → 0 < ghostRC m' p
-          go true  e = subst (0 <_) (sym (ghost-hit p e)) (s≤s z≤n)
-          go false e = subst (0 <_) (sym (ghost-miss p e))
-                         (live-positive (rc w) p (trans (sym (life-miss p e)) lif)
-                           (n , trans (sym (count-miss p e)) cnt))
+          go true  e with trans (sym (cong (Data.Maybe.map life) (no-cell p e))) lif
+          ...           | ()
+          go false e = subst (0 <_) (sym (ghost-miss p e)) (live-positive (rc w) p lif cnt)
 
       du : ∀ p → lifeOf m' p ≡ just dead → ghostRC m' p ≡ 0
       du p lif = go (sameObj o p) refl
         where
           go : (bb : Bool) → sameObj o p ≡ bb → ghostRC m' p ≡ 0
-          go true  e with trans (sym (life-hit p e)) lif
+          go true  e with trans (sym (cong (Data.Maybe.map life) (no-cell p e))) lif
           ...           | ()
-          go false e = trans (ghost-miss p e)
-                             (dead-unowned (rc w) p (trans (sym (life-miss p e)) lif))
+          go false e = trans (ghost-miss p e) (dead-unowned (rc w) p lif)
 
       -- The new site is the only one the rule adds, and the three heap premises
-      -- are exactly what it needs to satisfy this field. Every other site was
-      -- already covered.
+      -- are exactly what it needs. This is why they sit on `alloc` rather than
+      -- on `init`: the site exists from here.
       ns : ∀ s p → Holds ss' s p →
            Σ _ λ bb → (lookupBlock (heap m) (objAllocation p) ≡ just bb)
                     × (generation bb ≡ objGeneration p)
@@ -371,6 +349,85 @@ module New
                      (trans (sameSite-siteOf t x y) e))
                   (backed w y q
                      (trans (sym (lookupVar-cons-false x (bind o owned) es y e)) h))
+
+------------------------------------------------------------------------
+-- `init`: the header write.
+--
+-- The site map and the environment are untouched, so `no-stale-owner`,
+-- `owned-storage-live` and `backed` transfer unchanged -- the site this object
+-- occupies was vetted by `alloc` and nothing has happened to it since. The only
+-- work is `counted-exact` at the new cell, and `alone` is exactly what it needs:
+-- the counter is written as 1, so one site had better be holding it.
+
+module Init
+  {t : ThreadId} {es : Env} {m : Machine} {x : Var} {o : ObjId} {bk : Desc 1}
+  (look  : lookupVar es x ≡ just (bind o owned))
+  (fresh : lookupObj (objects m) o ≡ nothing)
+  (alone : logicalRC (sites m) o ≡ 1)
+  (w     : WFES t es m)
+  where
+
+  private
+    born : ObjCell
+    born = cell live (counted 1) bk 0
+
+    ts' : ObjTable
+    ts' = (o , born) ∷ objects m
+
+    m' : Machine
+    m' = machine (heap m) ts' (sites m)
+
+    count-hit : ∀ p → sameObj o p ≡ true → countOf m' p ≡ just (counted 1)
+    count-hit p e = count-from ts' p born (lookupObj-cons-true o born (objects m) p e)
+
+    life-hit : ∀ p → sameObj o p ≡ true → lifeOf m' p ≡ just live
+    life-hit p e = life-from ts' p born (lookupObj-cons-true o born (objects m) p e)
+
+    tbl-miss : ∀ p → sameObj o p ≡ false → lookupObj ts' p ≡ lookupObj (objects m) p
+    tbl-miss p e = lookupObj-cons-false o born (objects m) p e
+
+    count-miss : ∀ p → sameObj o p ≡ false → countOf m' p ≡ countOf m p
+    count-miss p e = count-eq ts' (objects m) p (tbl-miss p e)
+
+    life-miss : ∀ p → sameObj o p ≡ false → lifeOf m' p ≡ lifeOf m p
+    life-miss p e = life-eq ts' (objects m) p (tbl-miss p e)
+
+    ghost-hit : ∀ p → sameObj o p ≡ true → ghostRC m' p ≡ 1
+    ghost-hit p e rewrite same→eq o p e = alone
+
+  preserves : WFES t es m'
+  preserves = wfs (record { counted-exact = ce
+                          ; live-positive = lp
+                          ; dead-unowned = du
+                          ; no-stale-owner = no-stale-owner (rc w)
+                          ; owned-storage-live = owned-storage-live (rc w) }) (backed w)
+    where
+      ce : ∀ p n → countOf m' p ≡ just (counted n) → lifeOf m' p ≡ just live →
+           n ≡ ghostRC m' p
+      ce p n cnt lif = go (sameObj o p) refl
+        where
+          go : (bb : Bool) → sameObj o p ≡ bb → n ≡ ghostRC m' p
+          go true  e = trans (counted-inj (just-inj (trans (sym cnt) (count-hit p e))))
+                             (sym (ghost-hit p e))
+          go false e = counted-exact (rc w) p n
+                         (trans (sym (count-miss p e)) cnt)
+                         (trans (sym (life-miss p e)) lif)
+
+      lp : ∀ p → lifeOf m' p ≡ just live → IsCounted m' p → 0 < ghostRC m' p
+      lp p lif (n , cnt) = go (sameObj o p) refl
+        where
+          go : (bb : Bool) → sameObj o p ≡ bb → 0 < ghostRC m' p
+          go true  e = subst (0 <_) (sym (ghost-hit p e)) (s≤s z≤n)
+          go false e = live-positive (rc w) p (trans (sym (life-miss p e)) lif)
+                         (n , trans (sym (count-miss p e)) cnt)
+
+      du : ∀ p → lifeOf m' p ≡ just dead → ghostRC m' p ≡ 0
+      du p lif = go (sameObj o p) refl
+        where
+          go : (bb : Bool) → sameObj o p ≡ bb → ghostRC m' p ≡ 0
+          go true  e with trans (sym (life-hit p e)) lif
+          ...           | ()
+          go false e = dead-unowned (rc w) p (trans (sym (life-miss p e)) lif)
 
 ------------------------------------------------------------------------
 -- `dup` = py.incref. Counter up, one more site, one more name.
@@ -932,8 +989,9 @@ moveArgs-preserves t m es ss (_ ∷ _)  []      es' ss' eq w with eq
 -- ⭐ THE THEOREMS.
 
 instr-preserves-WF : ∀ {f s u} → f ⊢ s —→ᵢ u → WF s → WF u
-instr-preserves-WF (step-new fresh unowned blk gen alv) w =
-  New.preserves fresh unowned blk gen alv w
+instr-preserves-WF (step-alloc fresh unowned blk gen alv) w =
+  Alloc.preserves fresh unowned blk gen alv w
+instr-preserves-WF (step-init look fresh alone)        w = Init.preserves look fresh alone w
 instr-preserves-WF (step-move look nodup)              w = Move.preserves look nodup w
 instr-preserves-WF (step-dup look tbl alive)           w = Dup.preserves look tbl alive w
 instr-preserves-WF (step-drop look tbl alive nodup)    w = Drop.preserves look tbl alive nodup w

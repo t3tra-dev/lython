@@ -113,31 +113,68 @@ stepDownAt ts o = updateObj ts o stepDownCell
 
 data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
 
-  -- `new`: fresh object, refcount 1, one owner site, one owned name.
+  -- `alloc`: storage, a name that owns it, and NO OBJECT YET.
   --
-  -- The cell is CONSTRUCTED by the rule rather than taken as a parameter. The
-  -- first version let the rule install any cell at all, including one already
-  -- at count 0 -- and then `live-positive` was unprovable, not because the
-  -- invariant was wrong but because the IR could produce a state violating it.
+  -- The object table is untouched. That is the whole point of splitting `new`:
+  -- between this rule and `step-init` the name denotes memory whose header has
+  -- not been written, and every field of `WFRC` that talks about a counter or a
+  -- life is vacuous there because `lookupObj` answers `nothing`.
   --
   -- Freshness is required in the object table AND in the ghost state: an id
   -- that some site already holds is not fresh however empty the table is, and
   -- occupying a second site for it would put the counter at 1 while the ghost
   -- count went to 2.
   --
-  -- The three heap premises are what makes the reference valid at birth.
-  step-new :
-    ∀ {t bid rest es m x c o bk b} →
+  -- The three heap premises are what makes the reference valid at birth. They
+  -- belong HERE and not on `step-init`, because they are facts about the
+  -- storage rather than about the header, and the site that must satisfy
+  -- `no-stale-owner` is occupied by this rule.
+  step-alloc :
+    ∀ {t bid rest es m x c o b} →
     lookupObj (objects m) o ≡ nothing →
     logicalRC (sites m) o ≡ 0 →
     lookupBlock (heap m) (objAllocation o) ≡ just b →
     generation b ≡ objGeneration o →
     liveness b ≡ blockLive →
-    f ⊢ pstate t bid (new x c ∷ rest) es m
+    f ⊢ pstate t bid (alloc x c ∷ rest) es m
       —→ᵢ pstate t bid rest
             (bindVar es x (bind o owned))
+            (machine (heap m) (objects m) (occupy (sites m) (siteOf t x) o))
+
+  -- `init`: the header write. Storage the name owns becomes an object.
+  --
+  -- The cell is CONSTRUCTED by the rule rather than taken as a parameter. The
+  -- first version let the rule install any cell at all, including one already
+  -- at count 0 -- and then `live-positive` was unprovable, not because the
+  -- invariant was wrong but because the IR could produce a state violating it.
+  --
+  -- ⭐ `alone` is the legality condition, and it is the one the compiler has to
+  -- meet at the ownership marker: initialising storage that TWO names already
+  -- hold would write 1 into a counter whose ghost count is 2. It is not
+  -- derivable from `backed`, which gives only that the site is held.
+  --
+  -- ⛔ `fresh` is NOT load-bearing for preservation, measured rather than
+  -- assumed: weakened to `o ≡ o` in this rule and in `Preservation.Init`'s
+  -- telescope -- arity preserved, so nothing breaks for pattern-matching
+  -- reasons -- the whole tree still typechecks. It is kept because without it
+  -- `init` means "overwrite an object" as readily as "make one": `lookupObj`
+  -- returns the first match, so a second cell would shadow the first and the
+  -- object would silently acquire a new `backing` descriptor -- a DIFFERENT
+  -- deallocator for the same storage.
+  --
+  -- That `WFRC` cannot see this is a gap in the invariant, not a reason to drop
+  -- the premise: no field mentions `backing`, so "re-initialising an object
+  -- swaps the block `dealloc` will be handed" is invisible here. Recorded in
+  -- REMAINING-GAPS.md rather than papered over.
+  step-init :
+    ∀ {t bid rest es m x o bk} →
+    lookupVar es x ≡ just (bind o owned) →
+    lookupObj (objects m) o ≡ nothing →
+    logicalRC (sites m) o ≡ 1 →
+    f ⊢ pstate t bid (init x ∷ rest) es m
+      —→ᵢ pstate t bid rest es
             (machine (heap m) ((o , cell live (counted 1) bk 0) ∷ objects m)
-                     (occupy (sites m) (siteOf t x) o))
+                     (sites m))
 
   -- `move`: the entity changes hands. NO change to the count and none to the
   -- object table -- the number of owner sites is the same, one vacated and one

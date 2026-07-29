@@ -30,7 +30,7 @@ open import Proof.RC.OwnerSite using (OwnerSite; SiteMap; ThreadId; sameSite;
   sameSite-false; sameSite-refl; sameSite-sound; sameSite-sym;
   Holds; holds-here; holds-there; holds-positive; logicalRC)
 open import Proof.RC.Machine Sig
-open import Proof.Program.Syntax using (Var; Instr; new; move; dup; drop; borrow)
+open import Proof.Program.Syntax using (Var; Instr; alloc; init; move; dup; drop; borrow)
 open import Proof.Program.Env
 open import Proof.Program.Step Sig
 open import Proof.Lython.Invalid Sig

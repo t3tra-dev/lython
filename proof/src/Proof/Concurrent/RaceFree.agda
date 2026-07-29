@@ -48,8 +48,8 @@ open import Proof.RC.OwnerSite using (OwnerSite)
 open import Proof.RC.Machine Sig
 open import Proof.Concurrent.Event
 open import Proof.Concurrent.Machine Sig
-open import Proof.Program.Syntax using (Var; Instr; new; move; dup; drop; borrow;
-  getField; setField)
+open import Proof.Program.Syntax using (Var; Instr; alloc; init; move; dup; drop;
+  borrow; getField; setField)
 open import Proof.Program.Env
 open import Proof.Lython.Invalid Sig
 open import Proof.Lython.Detect Sig using (sharedPair)
@@ -143,7 +143,9 @@ private
 instrEvent-shape :
   ∀ t (pol : Policy) (i : Instr) (es : Env) e →
   instrEvent t pol i es ≡ just e → Emitted pol e
-instrEvent-shape t pol (new x c) es e eq with just-inj eq
+instrEvent-shape t pol (alloc x c) es e eq with just-inj eq
+... | refl = inert refl
+instrEvent-shape t pol (init x)   es e eq with just-inj eq
 ... | refl = inert refl
 instrEvent-shape t pol (dup dst src)      es e eq = rc-shape t pol es src e eq
 instrEvent-shape t pol (drop v)           es e eq = rc-shape t pol es v e eq

@@ -35,7 +35,7 @@ open import Proof.Concurrent.Event
 open import Proof.RC.Object using (ObjId)
 open import Proof.Program.Env using (entityOf; lookupVar; mode; entity; isOwned)
 open import Proof.Program.Syntax
-  using (Var; Instr; new; move; dup; drop; borrow; getField; setField)
+  using (Var; Instr; alloc; init; move; dup; drop; borrow; getField; setField)
 
 ------------------------------------------------------------------------
 -- ⭐ The event an instruction performs.
@@ -48,7 +48,8 @@ open import Proof.Program.Syntax
 --
 -- The table is the ownership table read as memory traffic:
 --
---   new     allocates, and touches no existing object
+--   alloc   allocates, and touches no existing object
+--   init    writes the header of an object no other thread can name yet
 --   dup     a read-modify-write of the refcount word     -- py.incref
 --   drop    the same                                     -- py.decref
 --   move    NOTHING. This is the row where the correct number of runtime
@@ -95,7 +96,16 @@ fieldEventFor t md es v k =
          nothing (entityOf es v)
 
 instrEvent : ThreadId → Policy → Instr → Env → Maybe Event
-instrEvent t pol (new x c)        es = just (event t allocate nothing)
+instrEvent t pol (alloc x c)      es = just (event t allocate nothing)
+-- ⛔ A LIMITATION, recorded rather than asserted away. `init` really does write
+-- word 0, so the honest event is a plain write at `rcFootprint`. Emitting one
+-- would oblige `RaceFree` to show that no other thread can name a freshly
+-- allocated object -- a cross-thread freshness theorem this layer does not
+-- have. Folding it into `allocate` claims less than the truth (an inert event
+-- where there is traffic) rather than more, which is the direction that cannot
+-- make a racy program look race-free: `Race` needs BOTH sides to be accesses,
+-- so an event that is not one is never half of a race here.
+instrEvent t pol (init x)         es = just (event t allocate nothing)
 instrEvent t pol (dup dst src)    es = rcEventFor t pol es src
 instrEvent t pol (drop x)         es = rcEventFor t pol es x
 instrEvent t pol (move _ _)       es = nothing

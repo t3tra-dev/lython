@@ -47,8 +47,30 @@ _≟-var_ = _≟_
 -- that eliding a retain was correct.
 
 data Instr : Set where
-  -- Allocate a fresh object and bind it to a name, owned, refcount 1.
-  new     : Var → ClassId → Instr
+  -- ⭐ Allocation and initialisation are TWO instructions, not one.
+  --
+  -- `alloc` produces storage and a name that owns it. The object does not
+  -- exist yet: there is no cell, so no life and no counter. `init` writes the
+  -- header -- refcount 1, live -- and only then is there an object.
+  --
+  -- The single `new` that used to stand here made the gap between them
+  -- unrepresentable, and the gap is where a shipped defect lived:
+  -- `boxRuntimeObject` (ABI/RuntimeABI.cpp) emits `memref.alloc` and THEN
+  -- stores words 0 and 1, so a retain anchored at the handle's definition reads
+  -- an uninitialised refcount (`Ly_IncRef observed non-positive refcount`, three
+  -- golden cases). The compiler now declines that anchor by a predicate whose
+  -- correctness was a convention; with the window in the model it is a theorem
+  -- (`no-dup-in-the-initialisation-window`).
+  --
+  -- Why NOT model it as a `Life` constructor (`initialising`) on the cell: a
+  -- cell in the table is an object, and `counted-exact` is guarded on
+  -- `lifeOf ≡ just live`, so an uninitialised cell would have to be excluded
+  -- from the count invariant by widening every field to talk about "counting
+  -- states". Absence from the table says the same thing and costs nothing --
+  -- `countOf` is already `nothing` there, so every field is already vacuous.
+  alloc   : Var → ClassId → Instr
+  -- The header write. Turns storage that a name owns into an object.
+  init    : Var → Instr
   -- Transfer ownership from one name to another. The source name is gone
   -- afterwards; no runtime operation.
   move    : Var → Var → Instr
