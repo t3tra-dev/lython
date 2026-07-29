@@ -69,7 +69,7 @@ defect possible, not the class of reasoning error that produced it.
 | **family D**: retain omitted by provenance, not layout | SSA provenance | **partly** — names exist; the IR does not yet record which op produced one |
 | **family E**: block-argument index space vs successor-operand index space | CFG, block arguments | **statable** — `bindParams` refuses a length mismatch |
 | **sequence/dict literal source move** — a use-**set** fact standing in for an execution-**frequency** fact | execution frequency | **partly** — loops are now expressible as a back edge; "how often" still is not |
-| **read-back token** — a second owned token on the same SSA values | SSA aliasing + aggregates | **partly** — `Aliases` is exactly this; aggregates are still absent |
+| **read-back token** — a second owned token on the same SSA values | SSA aliasing + aggregates | ⭐ **proved, and the model was right first.** Measured on 2026-07-30 as a live unbounded leak: reading one container slot twice reconstructs the same handle, the lowering minted two owned tokens on it, and ownership is tracked per SSA VALUE downstream — two retains, one release, the whole inner entity leaked (2 roots/10368 B for a two-element inner tuple, 69/14656 for a seventy-element one, saturating). `WFES.backed` is exactly the violated invariant: every owned name occupies its OWN site, one token per name. The repair is `step-borrow` — a re-read binds a second name and takes no reference — and the model gave that answer before the measurement did |
 | **holder discharge / remaining leak families** — need a token **count**, not a token **name** | aggregates with multiplicity | **no change** |
 | **deallocator selection**: 5 of 14 widths shared, `dict` in a 7-way tie | contracts | **no change** |
 
