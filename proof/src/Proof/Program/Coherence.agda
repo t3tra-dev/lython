@@ -36,30 +36,22 @@ open import Proof.RC.Object using (ObjId; obj; sameObj)
 open import Proof.RC.OwnerSite using (logicalRC)
 open import Proof.RC.Machine LythonSig using (Machine; ghostRC; sites)
 open import Proof.Program.Env using (Env; ownedCount)
-open import Proof.Program.Step LythonSig using (PState; env; mach)
+open import Proof.Program.Step LythonSig using (PState; pstate; env; mach; _⊢_—→*_)
 open import Proof.Lython.Invalid LythonSig
   using (Leaked; leaked; still-owned; unnamed; Invalidity; leak)
 open import Proof.Lython.Detect LythonSig using (leaked?; Every; every-nil; every-cons)
 open import Proof.Lython.Invalid LythonSig using (Valid)
 open import Proof.Lython.Decide LythonSig
   using (AllChecksSilent; checks-silent; silence-means-valid)
+-- The property and the leak theorem live in the parameterised module, so that
+-- the general preservation proof and these concrete witnesses are about the same
+-- predicate rather than two copies of it.
+open import Proof.Program.Leak LythonSig
+  using (NameSiteCoherent; Coherent; coherent-has-no-leaks;
+         no-reachable-state-leaks)
 
 import Proof.Program.Run  as R
 import Proof.Program.Trace as T
-
-------------------------------------------------------------------------
--- The property.
---
--- Quantified over ALL objects, not just the one in play. A version stated at a
--- single object would be satisfied by a machine that leaked every other one,
--- and leaks are precisely what the owned-name side is there to see.
-
-NameSiteCoherent : Env → Machine → Set
-NameSiteCoherent es m = ∀ o → ownedCount es o ≡ ghostRC m o
-
--- Convenience: the property of a program state.
-Coherent : PState → Set
-Coherent s = NameSiteCoherent (env s) (mach s)
 
 ------------------------------------------------------------------------
 -- ⭐ Every state of the six-instruction run is coherent.
@@ -137,33 +129,34 @@ the-counts-match : ownedCount T.envAfterBr T.theObj
 the-counts-match = refl
 
 ------------------------------------------------------------------------
--- What this does not say.
+-- What these witnesses are FOR, now that the general theorem exists.
 --
--- These are seven witnesses, not a preservation theorem: nothing here proves
--- `Coherent s → f ⊢ s —→ᵢ t → Coherent t` for arbitrary states. The witnesses
--- rule out the property being unsatisfiable and they attribute the break to one
--- rule, which is what the gap analysis asked for; the general statement needs
--- the same untouched-object case analysis that `step-preserves-WFRC` needs, and
--- is not claimed.
+-- This section used to say "these are seven witnesses, not a preservation
+-- theorem", and that was the honest reading: nothing proved
+-- `Coherent s → f ⊢ s —→ t → Coherent t`, so leak-freedom held of the states
+-- written down here and no others.
+--
+-- `Proof.Program.Leak.step-preserves-coherence` closes it, and these witnesses
+-- keep a different job. They rule out the property being unsatisfiable -- a
+-- preservation theorem for an empty predicate is free -- and they attribute a
+-- break to ONE rule, which a theorem quantified over all steps cannot do.
+--
+-- ⭐ And `coherent₀` is what the general theorem needs as its hypothesis: the
+-- run starts coherent, so `no-reachable-state-leaks` applies to every state it
+-- reaches rather than to the seven listed above.
 
 ------------------------------------------------------------------------
 -- ⭐ Coherence is exactly leak-freedom.
 --
--- The development had no sentence for a leak. `Leaked es m o` is one: an owner
--- SITE still holds the object and no NAME does, so nothing will ever release
--- it. And coherence rules it out, for every object at once -- which is what the
--- ∀-quantification in `NameSiteCoherent` was for.
+-- `coherent-has-no-leaks` now lives in `Proof.Program.Leak`, next to the
+-- preservation theorem that makes it reach further than a list of states.
 
-coherent-has-no-leaks :
-  ∀ (es : Env) (m : Machine) → NameSiteCoherent es m → ∀ o → ¬ Leaked es m o
-coherent-has-no-leaks es m coh o lk
-  with subst (0 <_) (trans (sym (coh o)) (unnamed lk)) (still-owned lk)
-... | ()
-
--- Every state of the run is therefore leak-free. Not by inspection -- by the
--- theorem above applied to the witnesses.
+-- Every state of the run is leak-free -- and not because each was checked. This
+-- goes through reachability: one coherent start, and the theorem covers the
+-- whole run.
 run-is-leak-free : ∀ o → ¬ Leaked (env R.s₆) (mach R.s₆) o
-run-is-leak-free = coherent-has-no-leaks (env R.s₆) (mach R.s₆) coherent₆
+run-is-leak-free =
+  no-reachable-state-leaks R.whole-block R.start-is-well-formed coherent₀
 
 ------------------------------------------------------------------------
 -- ⭐ And a leak, exhibited.
@@ -177,6 +170,9 @@ run-is-leak-free = coherent-has-no-leaks (env R.s₆) (mach R.s₆) coherent₆
 -- removes the name and the site together, so the model cannot leak. The leak is
 -- what a COMPILER produces when it emits the scope exit and not the release,
 -- and this is the state to check for.
+--
+-- ⭐ "Not reachable" used to be a claim in this comment. `leak-is-unreachable`
+-- below is the claim as a proof.
 
 leakyEnv : Env
 leakyEnv = env R.s₆
@@ -204,6 +200,27 @@ leaky-state-is-incoherent coh = coherent-has-no-leaks leakyEnv leakyMach coh R.t
 -- `Invalidity` gains its fourth constructor here.
 leak-is-an-invalidity : Invalidity leakyEnv leakyMach
 leak-is-an-invalidity = leak the-leak
+
+------------------------------------------------------------------------
+-- ⭐ AND THE LEAK IS UNREACHABLE.
+--
+-- Not "no path was found" and not "the rules look fine": if a path existed,
+-- `no-reachable-state-leaks` applied to it would refute `the-leak`. This is the
+-- statement the suite's leak stage was built to check, and it is now about the
+-- step relation rather than about a list of states.
+--
+-- What it does NOT say, and the distinction is the useful part: it does not say
+-- this compiler is leak-free. It says a leak cannot be produced by running
+-- instructions, so a leak needs a BOUNDARY the relation does not have -- function
+-- entry or scope exit. A leak is not a misplaced release, which is the opposite
+-- of families A-E.
+
+leakyState : PState
+leakyState = pstate 0 R.bb0 [] leakyEnv leakyMach
+
+leak-is-unreachable : ¬ (R.prog ⊢ R.s₀ —→* leakyState)
+leak-is-unreachable r =
+  no-reachable-state-leaks r R.start-is-well-formed coherent₀ R.theObj the-leak
 
 ------------------------------------------------------------------------
 -- ⭐ `Valid`, established on a state the step relation reaches.

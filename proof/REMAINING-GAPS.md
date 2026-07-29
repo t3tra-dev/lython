@@ -1,19 +1,19 @@
 # 残りのギャップ
 
-`proof/` 50 モジュール 11008 行、`--safe`、postulate / TERMINATING / hole ゼロ、`make` / `make redcheck` 通過時点。
+`proof/` 51 モジュール 11388 行、`--safe`、postulate / TERMINATING / hole ゼロ、`make` / `make redcheck` 通過時点。
 
 `GAP-ANALYSIS.md` は **モデルと C++ 実装の差** を扱う。この文書は **モデル内部で何が未証明か** を扱う。
 
 ---
 
-## 0. 棚卸しの方法と、この会話で 3 回起きた計測失敗
+## 0. 棚卸しの方法と、この会話で 4 回起きた計測失敗
 
 型検査器は「書いた定理が正しい」ことしか言わない。**「その定理に中身があるか」は言わない。** それを見る道具は 2 つある。
 
 1. **inhabitation census** — 各述語が trace で一度でも構築されたか。ゼロなら、その述語についての全定理は空虚かもしれない。
 2. **変異テスト** — 前提や補題を壊したとき、実際に赤くなるか。
 
-どちらも計測器であり、**この会話で 3 回壊れた**。3 回とも「壊れた計測器が合格を報告する」形だった:
+どちらも計測器であり、**この会話で 4 回壊れた**。最初の 3 回は「壊れた計測器が合格を報告する」形、4 回目は逆向きだった:
 
 | # | 何が壊れたか | 誤った出力 |
 |---|---|---|
@@ -38,7 +38,7 @@
 
 ## 現在の census
 
-未構築の述語は **ゼロ**。命令ステップ 5 規則すべて、並行ステップ、`WFRC` (6+)、`NameSiteCoherent` (7)、`Conflict` / `Race` / `Earlier` / `HappensBefore`、`Invalidity` 4 構成子すべて、`Leaked`、`Orphaned`、`Aggregate`、`ErasedHasNoRuntimeOp`、`ReachedZero` が実体化されている。
+未構築の述語は **ゼロ**。命令ステップ 5 規則すべて、並行ステップ、`WFRC` (6+)、`NameSiteCoherent` (7 + 保存定理)、`Conflict` / `Race` / `Earlier` / `HappensBefore`、`Invalidity` 4 構成子すべて、`Leaked`、`Orphaned`、`Aggregate`、`ErasedHasNoRuntimeOp`、`ReachedZero` が実体化されている。
 
 ---
 
@@ -101,7 +101,9 @@ dup にしなかった理由: ループ搬送値が毎周 retain/release の対�
 
 `Leaked es m o` = site は保持しているが所有名がない。`coherent-has-no-leaks : NameSiteCoherent es m → ∀ o → ¬ Leaked es m o`。全オブジェクトに量化してあるのが要点。
 
-具体例は `Run.s₅` の機械 × `Run.s₆` の環境 — 名前がスコープを抜けたのに site が残った状態、すなわち `drop` を出し忘れたコンパイラが作る状態。ステップ関係では到達不能 (`step-drop` は名前と site を同時に消す) であり、**それが正しい**: リークはモデルの欠陥ではなくコンパイラの欠陥である。
+具体例は `Run.s₅` の機械 × `Run.s₆` の環境 — 名前がスコープを抜けたのに site が残った状態、すなわち `drop` を出し忘れたコンパイラが作る状態。
+
+**「到達不能」は #16 まで主張であってコメントに書いてあるだけだった。**
 
 ### 6. race freedom — `Proof.Concurrent.RaceFree` ★
 
@@ -196,6 +198,34 @@ lowering パスは意味論を読めない。読むのは属性 (`ly.ownership.*
 
 削った命題を 1 つ記録しておく。`the-pass-cannot-see-the-difference` を書いたが、前提 2 つから `md₁ ≡ md₂` が即座に従うので **`refl` の言い換え**だった。一般形は補題を要さない — `edgeRetain` の型がそれである。
 
+### 16. ⭐ リークを到達可能性に結びつけた — `Proof.Program.Leak`
+
+`Proof.Program.Coherence` は自分でこう書いていた: 「これは 7 つの証人であって保存定理ではない」。`Leaked` は定義でき `coherent-has-no-leaks` は coherence をリーク自由性に変換していたが、**プログラムを走らせても coherence が保たれることは何も言っていなかった** — つまりリーク自由性は誰かが書き下した 7 状態についてしか成り立っていなかった。`WFRC` が `Preservation` 以前に抱えていたのと同じ穴で、しかも最も重い場所にある: スイートの leak 段が存在するのは golden 7 件が**リークしながら緑だった**からであり、リークはクラッシュも fuzz も見つけない唯一の欠陥である。
+
+`bump : Bool → ℕ → ℕ` を置いて、名前側と site 側を**同じ形**にした。これは `ownedCount` を `with` ではなく `if isOwned (mode b) ∧ …` で書いた設計上の見返りである — 名前を束縛することと site を占めることは数に対する同じ操作 (述語が成り立つとき 1 足す) で、同じ `if` で綴られているので 1 回の場合分けで両方が reduce する。`with` なら 2 つの補助関数になり、どの単一の分割でも両方には届かない。
+
+要になった補題 2 本:
+
+| 補題 | 内容 |
+|---|---|
+| `ownedCount-unbind` | `lookupVar` は最初の項目を返し `unbindVar` は最初の項目を消すので、消える項目は規則が引いた項目そのもの。だから等式になる (SSA 前提は不要) |
+| `logicalRC-vacate` | 保持している site の vacate はちょうど 1 減らし他は動かさない — `OwnerSite` が別々に証明している 2 つを 1 つの形に合わせたもの |
+
+定理は `no-reachable-state-leaks`、そして `Coherence.leak-is-unreachable` が具体例に適用した形である。**「経路が見つからない」ではない**: 経路があれば定理が `the-leak` を反駁する。
+
+`WF` は仮説であり落とせない。`logicalRC-vacate` は vacate される site が本当にそのオブジェクトを保持していたことを要求し、それを規則の環境前提から機械の事実に変えるのは `WFES.backed` だけである。
+
+変異テスト (arity 保存、両方向対照付き):
+
+| 変異 | 結果 |
+|---|---|
+| コメントのみ（対照） | ACCEPTED |
+| `NameSiteCoherent` を空虚な述語に | REJECTED |
+| `after-removal` の `held` を弱め呼び出し側も調整 | REJECTED |
+| **`br` を DUP に (vacate せず occupy)** | REJECTED |
+
+最後の 1 つが要点である。**ブロック引数が move であることがリーク自由性を支えている。**
+
 ---
 
 ## 残っているもの
@@ -224,6 +254,12 @@ lowering パスは意味論を読めない。読むのは属性 (`ly.ownership.*
 | `aggregateRelease` | オブジェクトがクラスのアリティを持つこと |
 
 6 つとも健全かつ完全 (あるいは操作として導出済み) で、依存しているのは**表現上の決定 1 つずつ**である。最も安いのは依然 `danglingAnchor`。
+
+### ⭐ 「リークは境界にある」は予測であって検証済みではない
+
+`no-reachable-state-leaks` から言えるのは、リークには**不整合な開始状態**か、**この関係が持たない遷移**が必要だということである。後者はちょうど 2 つある: **関数入口** (`invoke` は同じ関数の後続ブロックへ被演算子を移すだけで、被呼び出し側フレームは無い) と **スコープ退出** (環境を捨てる規則が無い)。したがって命令列はリークを作れず、リークは配置ではなく境界の問題になる。
+
+これは families A–E (すべて配置) と逆向きの結論で、**どこを見るべきか**を言っている。しかし**未検証の予測である**: 残っている 2 つのリーク族が実際にこの 2 つの境界にあるかはコンパイラ側で確認していない。確認手段は `LYTHON_DEALLOC_CENSUS=1` を関数入口/退出で切って数えることだが、やっていない。
 
 ### ⭐ `WFRC` は `backing` について何も言わない
 

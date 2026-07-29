@@ -165,7 +165,7 @@ contexts.
 > ambiguous**. That ambiguity is where the compiler's bug lives, and it is now a
 > property of a datatype rather than a description in prose.
 
-### 2.3 A leak cannot be stated
+### 2.3 A leak cannot be stated — **CLOSED, by a different route than proposed**
 
 `WFRC.owned-storage-live` reads
 
@@ -185,6 +185,29 @@ Adding the converse is not free: it is false during construction, when a fresh
 object is live and not yet stored anywhere. It needs the `finalizing` window and
 a notion of a transient owner site — the `temp` constructor of `OwnerSite`
 exists for exactly this and nothing yet uses it.
+
+> **Closed, and the paragraph above proposed the wrong route.** The leak is not
+> stated as a converse field of `WFRC` and `temp` is still unused. It is a
+> SEPARATE invariant over the two counts — `NameSiteCoherent es m = ∀ o →
+> ownedCount es o ≡ ghostRC m o` — because `WFRC` is about sites and a leak is
+> about sites *without names*, which no field of `WFRC` mentions. And the
+> construction window is handled by splitting `new` into `alloc` and `init`
+> (§"Found after this document was written"), not by a transient site: an
+> uninitialised object is absent from the object table, so it has no life to be
+> live.
+>
+> `Proof.Program.Leak` proves coherence preserved by every rule and hence
+> `no-reachable-state-leaks`; `Coherence.leak-is-unreachable` applies it to the
+> exhibited leak. The mutation that matters: making `br` a DUP (occupy without
+> vacate) breaks it, so **the block-argument-is-a-move decision is what leak
+> freedom rests on.**
+>
+> What it does not say: it does not say this compiler is leak-free. A leak needs
+> an incoherent start or a transition the relation lacks, and there are exactly
+> two of those — **function entry** (no callee frame) and **scope exit** (nothing
+> discards an environment). So a leak is a boundary and not a placement, which
+> is the opposite of families A–E. That is a prediction about where the two open
+> leak families live and it has **not** been checked compiler-side.
 
 ### 2.4 There is no contract, so deallocator selection is invisible
 
@@ -257,6 +280,10 @@ the compiler does, it is a *completion* of a split the compiler already made.
 4. **The leak direction of the invariant.** live ⇒ owned, with the construction
    window handled by `temp` sites.
 
+   > **Closed, and both halves of this line turned out wrong.** Not a direction
+   > of `WFRC` but a separate two-count invariant, and the construction window is
+   > the `alloc`/`init` split rather than a transient site. See §2.3.
+
 5. **Erased `WellShaped`.** Small, and it removes the one way the box invariant
    can be misapplied.
 
@@ -303,10 +330,18 @@ Of the seventeen memory-safety defects this session found and measured:
 - **4 remain inexpressible**: aggregates with multiplicity, deallocator
   selection, and the two "partly" rows above
 
-The two barriers that were ranked first and second in §4 are closed. What
-remains at the top of the list is **aggregates with multiplicity** -- the two
-open leak families were characterised as needing a token *count* rather than a
-token *name*, which is exactly `aggregate(parent, path)` as a judgment.
+The two barriers that were ranked first and second in §4 are closed, and so are
+§4.3 (`Proof.RC.Aggregate`) and §4.4 (§2.3 above). The sentence that used to sit
+here -- "what remains at the top of the list is aggregates with multiplicity" --
+is stale and is kept only as a record of what was believed: §4.3 is done and the
+top of the list is now §4.6, **refinement**, which cannot be closed inside
+`proof/` at all.
+
+The leak result changes the reading of the two open leak families rather than
+closing them. They were characterised as needing a token *count* rather than a
+token *name*; `no-reachable-state-leaks` says no instruction sequence produces a
+leak, so the count is needed at a **boundary** -- function entry or scope exit --
+and not along a path. That is a prediction, not a measurement.
 
 Two things should not be read into the current state. The proof directory does
 **not** yet constrain the compiler — no refinement exists, and the README says

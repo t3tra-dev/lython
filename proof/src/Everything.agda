@@ -75,6 +75,11 @@ import Proof.Program.Preservation
 -- the pass can reach -- and it was inexpressible while `mode` was the only
 -- notion of ownership in the model.
 import Proof.Program.Recorded
+-- A leak, tied to reachability. Coherence -- owned names equal owner sites -- is
+-- preserved by every rule, so no sequence of instructions can produce a leak;
+-- every leak is therefore a MISSING operation at scope exit rather than a
+-- misplaced one.
+import Proof.Program.Leak
 -- Every instruction rule, taken as an actual step. Proof.Program.Trace derives
 -- only terminator steps, so without this the five rules the refcount story
 -- rests on had never been applied.
