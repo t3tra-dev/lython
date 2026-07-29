@@ -67,13 +67,26 @@ defect possible, not the class of reasoning error that produced it.
 | **family C**: release placement abandoned when one consuming use existed | CFG + placement | **statable** |
 | **families A/B**: latent double release on unwind edges no input reaches | CFG + unwind edges | **statable** — `step-invoke-throw` is the edge |
 | **family D**: retain omitted by provenance, not layout | SSA provenance | **partly** — names exist; the IR does not yet record which op produced one |
-| **retain inside the initialisation window** — `Ly_IncRef observed non-positive refcount`, three golden cases, from a retain anchored at a `memref.alloc` result whose prefix words are stored afterwards | a state between "storage exists" and "object exists" | **excluded** — `new` is split into `alloc` and `init`; `no-dup-in-the-initialisation-window` and `no-drop-in-the-initialisation-window` say the relation has no such step, and `dup-resumes-after-init` says the window closes. `Proof.Program.Run.hoisted-retain-has-no-step` is the IR the compiler used to emit, refuted |
-| **ownership taken and not recorded** — `boxRuntimeObject` retained the payload without marking the box owned, so an attribute-driven pass read a frame-owned box as borrowed and tried to synthesise a retain for a MOVE | a distinction between what is true and what the IR records | **inexpressible** — `Mode` in the model IS the truth; there is no second, fallible reading of it to disagree with |
 | **family E**: block-argument index space vs successor-operand index space | CFG, block arguments | **statable** — `bindParams` refuses a length mismatch |
 | **sequence/dict literal source move** — a use-**set** fact standing in for an execution-**frequency** fact | execution frequency | **partly** — loops are now expressible as a back edge; "how often" still is not |
 | **read-back token** — a second owned token on the same SSA values | SSA aliasing + aggregates | **partly** — `Aliases` is exactly this; aggregates are still absent |
 | **holder discharge / remaining leak families** — need a token **count**, not a token **name** | aggregates with multiplicity | **no change** |
 | **deallocator selection**: 5 of 14 widths shared, `dict` in a 7-way tie | contracts | **no change** |
+
+### Found after this document was written — 2, both closed
+
+The two root causes behind the "unspellable borrow-edge retain" the compiler
+carried. Both were diagnosed against the model and both are now theorems, so
+they are kept apart from the counts above rather than folded into them.
+
+| defect | what was missing | now |
+|---|---|---|
+| **retain inside the initialisation window** — `Ly_IncRef observed non-positive refcount`, three golden cases, from a retain anchored at a `memref.alloc` result whose prefix words are stored afterwards | a state between "storage exists" and "object exists" | **excluded** — `new` is split into `alloc` and `init`; `no-dup-in-the-initialisation-window` and its `drop` twin say the relation has no such step, `dup-resumes-after-init` says the window closes, and `window-is-well-formed` says the window itself is legitimate. `Proof.Program.Run.hoisted-retain-has-no-step` is the IR the compiler used to emit, refuted |
+| **ownership taken and not recorded** — `boxRuntimeObject` retained the payload without marking the box owned, so an attribute-driven pass read a frame-owned box as borrowed and tried to synthesise a retain for a MOVE | a distinction between what is TRUE and what the IR RECORDS | **proved** — `Proof.Program.Recorded`. `edgeRetain : Maybe Mode → …` is `isOwnedIncoming` with its actual input, and its type is the finding: a pass cannot consult the truth. `not-recording-breaks-faithfulness` is the obligation the boxing path failed; `no-drop-of-a-borrow` is the opposite mis-record, which is what a blanket `owned` attribute would have introduced |
+
+`Proof.Program.Run` carries both as computed facts on a state the step relation
+produced: `ledgerAsShipped` emits a retain, `ledgerRepaired` emits nothing, and
+`attrsSayBorrow` is one ledger with two truths, faithful to one of them.
 
 ---
 

@@ -70,6 +70,11 @@ import Proof.Program.Env
 import Proof.Program.Step
 import Proof.Program.Ownership
 import Proof.Program.Preservation
+-- What the IR RECORDS against what is TRUE. A pass reads attributes, not the
+-- semantics, so "ownership taken and not recorded" is a defect no care inside
+-- the pass can reach -- and it was inexpressible while `mode` was the only
+-- notion of ownership in the model.
+import Proof.Program.Recorded
 -- Every instruction rule, taken as an actual step. Proof.Program.Trace derives
 -- only terminator steps, so without this the five rules the refcount story
 -- rests on had never been applied.

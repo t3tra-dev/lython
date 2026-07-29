@@ -1,6 +1,6 @@
 # 残りのギャップ
 
-`proof/` 49 モジュール 10691 行、`--safe`、postulate / TERMINATING / hole ゼロ、`make` / `make redcheck` 通過時点。
+`proof/` 50 モジュール 11008 行、`--safe`、postulate / TERMINATING / hole ゼロ、`make` / `make redcheck` 通過時点。
 
 `GAP-ANALYSIS.md` は **モデルと C++ 実装の差** を扱う。この文書は **モデル内部で何が未証明か** を扱う。
 
@@ -175,6 +175,26 @@ dup にしなかった理由: ループ搬送値が毎周 retain/release の対�
 `Proof.Program.Run` で実物を出している。`sHoisted` は**コンパイラがかつて出していた IR** — retain をハンドル定義位置へ吊り上げた形 — で、`hoisted-retain-has-no-step` がそれに導出が無いことを示す。`window-is-well-formed` が対になっていて、**ウィンドウ自体は正当な状態である** (壊れているのは確保ではなく、その間の incref である) ことを言う。
 
 C++ 側では `prefixIsInitializedAtDefinition` (ABI/EntityHeaderPrefix.h) が「所有権マーカーが立つ時点で prefix は書かれている」という**規約**でこれを守っている。規約は誰かが producer を足すまで持つ。モデル側は producer について何も言わないので、まだ存在しない producer にも効く。**fuzz では届かない**: ウィンドウは数命令幅で、実際に踏んだ 3 入力は 1 本の boxing 経路を通ったものだった。
+
+### 15. ⭐ 記録された所有権 vs 実際の所有権 — `Proof.Program.Recorded`
+
+モデルの所有権は `Binding.mode` ただ 1 つで、構成上つねに真実だった。コンパイラには 2 つある。**その食い違いが、今セッションで直した欠陥の根本原因である。**
+
+lowering パスは意味論を読めない。読むのは属性 (`ly.ownership.*`) であって、そこから判断する。`boxRuntimeObject` が payload retain を出しながら box を owned と記録しなかったのは「retain の漏れ」ではない — retain は出ていた。**記録の漏れ**であり、後で box を borrow と読んだパスは**間違った台帳を正しく読んでいた**。
+
+`edgeRetain : Maybe Mode → Var → Var → List Instr` が `isOwnedIncoming` そのもので、**型が結論である**: 台帳しか受け取らず `Env` を受け取らない。パス内部をどれだけ注意深く書いてもこの欠陥には届かない。義務は台帳を書く側にある。
+
+| 定理 | 内容 |
+|---|---|
+| `faithful-edge-is-free` | 台帳が忠実なら owned 被演算子への発行は `[]` |
+| `unrecorded-ownership-emits-a-retain` | 未記録は borrow 経路に落ち、retain を出す (`nothing` = 「所有でない」はコンパイラの実挙動) |
+| `the-unrecorded-retain-bumps-the-counter` | その retain はカウンタを 1 上げる — ステップを添えて述べてある |
+| `no-drop-of-a-borrow` | 逆向きの誤記録。borrow への release に**ステップが無い** |
+| `not-recording-breaks-faithfulness` | 所有を取って記録せずに返ると、その後何をしても不忠実 |
+
+`Proof.Program.Run` に実物がある。`ledgerAsShipped` (= 空) は retain を出し、`ledgerRepaired` (= 記録した版) は同じパスに何も出させない。`attrsSayBorrow` は**1 つの台帳と 2 つの真実**で、片方にだけ忠実である。
+
+削った命題を 1 つ記録しておく。`the-pass-cannot-see-the-difference` を書いたが、前提 2 つから `md₁ ≡ md₂` が即座に従うので **`refl` の言い換え**だった。一般形は補題を要さない — `edgeRetain` の型がそれである。
 
 ---
 

@@ -17,13 +17,14 @@
 
 module Proof.Program.Run where
 
+open import Data.Bool using (Bool; true; false)
 open import Data.List using (List; []; _∷_)
 open import Data.Maybe using (Maybe; just; nothing)
 open import Data.Nat using (ℕ; zero; suc)
 open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Data.Integer using (+_)
 open import Data.Vec using ([]; _∷_)
-open import Relation.Binary.PropositionalEquality using (_≡_; refl)
+open import Relation.Binary.PropositionalEquality using (_≡_; refl; sym; trans; cong)
 open import Relation.Nullary using (¬_)
 
 open import Proof.Memory.Heap using (Heap)
@@ -44,6 +45,9 @@ open import Proof.Program.Env
 open import Proof.Program.Step LythonSig
 open import Proof.Program.Ownership LythonSig
   using (no-dup-in-the-initialisation-window)
+open import Proof.Program.Recorded LythonSig
+  using (Attrs; recordedMode; recordedMode-cons-true; Faithful; edgeRetain;
+         record-owned; recording-is-faithful)
 open import Proof.Program.Preservation LythonSig
 open import Proof.RC.Invariant LythonSig using (WFRC; counted-exact)
 open import Data.Empty using (⊥; ⊥-elim)
@@ -228,6 +232,79 @@ hoisted-retain-has-no-step = no-dup-in-the-initialisation-window refl refl
 -- "forbidden".
 same-retain-after-init : prog ⊢ s₁ —→ᵢ s₂
 same-retain-after-init = run-dup
+
+------------------------------------------------------------------------
+-- ⭐ THE LEDGER, on this run.
+--
+-- At `s₁` the object exists and `x` owns it. What a pass sees is not that --
+-- it is whatever attributes were written, and `boxRuntimeObject` wrote none.
+
+x-is-owned-here : lookupVar (env s₁) x ≡ just (bind theObj owned)
+x-is-owned-here = refl
+
+-- The ledger as shipped: the retain was emitted, the record was not written.
+ledgerAsShipped : Attrs
+ledgerAsShipped = []
+
+ledger-is-silent : recordedMode ledgerAsShipped x ≡ nothing
+ledger-is-silent = refl
+
+-- so `isOwnedIncoming` takes the borrow path and the pass emits a retain for an
+-- edge that is a MOVE. One instruction, and it is the whole defect.
+shipped-ledger-emits-a-retain :
+  edgeRetain (recordedMode ledgerAsShipped x) y x ≡ dup y x ∷ []
+shipped-ledger-emits-a-retain = refl
+
+-- The repair is not "stop emitting retains" and not "assume owned everywhere".
+-- It is to write down the ownership the boxing path actually takes.
+ledgerRepaired : Attrs
+ledgerRepaired = record-owned ledgerAsShipped x theObj
+
+repaired-ledger-is-faithful : Faithful ledgerRepaired (env s₁)
+repaired-ledger-is-faithful = recording-is-faithful [] [] x theObj (λ y b ())
+
+-- ⭐ and the SAME pass, on the repaired ledger, emits nothing.
+repaired-ledger-emits-nothing : edgeRetain (recordedMode ledgerRepaired x) y x ≡ []
+repaired-ledger-emits-nothing = refl
+
+------------------------------------------------------------------------
+-- ⭐ ONE LEDGER, TWO TRUTHS.
+--
+-- The pass reads the ledger, so its emission is fixed by it. Here is one ledger
+-- and two environments it could describe -- and the emission that is exactly
+-- right for the first is a retain for a move in the second.
+
+attrsSayBorrow : Attrs
+attrsSayBorrow = (x , borrowed w) ∷ []
+
+envTruthBorrow envTruthOwned : Env
+envTruthBorrow = (x , bind theObj (borrowed w)) ∷ []
+envTruthOwned  = (x , bind theObj owned) ∷ []
+
+-- One emission, and the pass had no other input to distinguish them by.
+same-emission : edgeRetain (recordedMode attrsSayBorrow x) y x ≡ dup y x ∷ []
+same-emission = refl
+
+-- It is the right answer for the borrow ...
+borrow-truth-is-faithful : Faithful attrsSayBorrow envTruthBorrow
+borrow-truth-is-faithful z b h = go (sameVar x z) refl
+  where
+    just-inj : ∀ {A : Set} {u v : A} → just u ≡ just v → u ≡ v
+    just-inj refl = refl
+
+    go : (bb : Bool) → sameVar x z ≡ bb → recordedMode attrsSayBorrow z ≡ just (mode b)
+    go true e =
+      trans (recordedMode-cons-true x (borrowed w) [] z e)
+            (cong just (cong mode (just-inj
+              (trans (sym (lookupVar-cons-true x (bind theObj (borrowed w)) [] z e)) h))))
+    go false e
+      with trans (sym (lookupVar-cons-false x (bind theObj (borrowed w)) [] z e)) h
+    ...  | ()
+
+-- ... and the wrong one for the owned truth, which the ledger does not describe.
+owned-truth-is-not-faithful : ¬ Faithful attrsSayBorrow envTruthOwned
+owned-truth-is-not-faithful faith with faith x (bind theObj owned) refl
+... | ()
 
 ------------------------------------------------------------------------
 -- Both counts, at every point.
