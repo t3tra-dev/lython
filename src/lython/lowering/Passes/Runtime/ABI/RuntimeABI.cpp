@@ -890,9 +890,16 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
     return mlir::failure();
   concrete.setObjectLogicalOwnership(retainPayload);
 
-  // MEASUREMENT ONLY -- record the frame's ownership of the box in the IR, the
-  // way GetItemOps.cpp does for its borrow->own conversion, so the census can
-  // say how many releases that would add.
+  // ⭐ Record the frame's ownership of the box in the IR, the way GetItemOps.cpp
+  // does for its borrow->own conversion.
+  //
+  // Not a measurement scaffold, though this comment said "MEASUREMENT ONLY" for
+  // one commit: the box IS frame-owned when the payload was retained, and
+  // `isOwnedIncoming` reads attributes, so leaving it unrecorded made a
+  // frame-owned box read as borrowed and sent the pass looking for a retain on
+  // what is a MOVE. Measured equivalent to no marker on the three cases the
+  // owned-token uniqueness check flags (identical leak figures with and without
+  // it), so it neither causes nor hides those.
   mlir::Value boxRoot = box;
   if (retainPayload) {
     auto rooted = mlir::UnrealizedConversionCastOp::create(
