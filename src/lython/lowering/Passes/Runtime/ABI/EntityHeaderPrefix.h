@@ -127,6 +127,23 @@ inline mlir::Value handleProvenanceRoot(mlir::Value handle) {
 inline bool prefixIsInitializedAtDefinition(mlir::Value handle) {
   if (!typeCarriesHeaderPrefix(handle.getType()))
     return false;
+  // ⭐ An ownership marker answers this question directly.
+  //
+  // `ly.ownership.owned_local_object` is emitted only once the entity is
+  // COMPLETE -- the boxing path in `ABI/RuntimeABI.cpp` stores the prefix words
+  // and takes the payload retain BEFORE rooting the value in the marker, and
+  // `Ops/GetItemOps.cpp` emits its retain before rooting. So at the marker the
+  // prefix is written, which is exactly what this predicate is asked.
+  //
+  // Why NOT let `handleProvenanceRoot` decide it: that walk deliberately
+  // follows identity-shaped casts, so it walks straight THROUGH the marker to
+  // the `memref.alloc` underneath and answers about raw storage -- the state
+  // the marker exists to say the value has left. Asking the marker is asking
+  // what is true at the point the retain will be inserted; walking past it is
+  // asking how the storage was made.
+  if (mlir::Operation *definition = handle.getDefiningOp())
+    if (definition->hasAttr("ly.ownership.owned_local_object"))
+      return true;
   mlir::Value root = handleProvenanceRoot(handle);
   if (!typeCarriesHeaderPrefix(root.getType()))
     return false;

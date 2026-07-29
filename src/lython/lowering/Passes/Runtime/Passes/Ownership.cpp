@@ -75,29 +75,6 @@ bool unwindDeathDelayEnabled() {
   return enabled;
 }
 
-// A borrow edge is admitted on the promise that a retain balances the
-// destination group's release. When the retain cannot be spelled the emission
-// declines it and the promise is broken silently -- and it is silent to the
-// FINAL verifier too, which counts the retains and releases that are PRESENT: a
-// dropped retain leaves each group's own arithmetic balanced, because the retain
-// belongs to the argument reconciling two groups rather than to either of them
-// (rfc/memory-safety-proof.md, third failure shape).
-//
-// So the omission is traced rather than left to be re-derived. Why a trace and
-// not a diagnostic: the wide-non-argument candidates are balanced today only
-// because nothing else releases their source, and 5595d16 measured that
-// declining the EDGE instead is worse -- it removes the destination's release as
-// well. Rejecting here would refuse programs that currently run. Counting the
-// sites is what says whether the residual is exercised at all, which is the
-// question a reader of that debt entry actually has.
-bool ownershipRetainOmissionTraceEnabled() {
-  static bool enabled = [] {
-    auto value =
-        llvm::sys::Process::GetEnv("LYTHON_OWNERSHIP_TRACE_RETAIN_OMISSIONS");
-    return value && !value->empty() && *value != "0";
-  }();
-  return enabled;
-}
 
 // LYTHON_OWNERSHIP_TRACE_PLACEMENT=1 names, for every owned call-result group,
 // which of the five placement strategies in `insertOwnedResultReleases` took it
@@ -197,16 +174,52 @@ void reportOwnershipWorkShape(llvm::StringRef scope, std::uint64_t symbols,
                << (ownershipSymbolTableDisabled() ? "ABLATED" : "on") << "\n";
 }
 
-void traceOmittedBorrowEdgeRetain(mlir::Value header, mlir::Operation *anchor) {
-  if (!ownershipRetainOmissionTraceEnabled())
-    return;
-  auto function = anchor->getParentOfType<mlir::func::FuncOp>();
-  llvm::errs() << "[ownership-retain-omitted] in @"
-               << (function ? function.getName() : "<none>") << ": header type "
-               << header.getType() << ", "
-               << (mlir::isa<mlir::BlockArgument>(header) ? "block argument"
-                                                         : "op result")
-               << "\n";
+// A borrow edge is admitted on the promise that a retain balances the
+// destination group's release. When the retain cannot be spelled, breaking that
+// promise is SILENT -- silent to the final verifier too, which counts the
+// retains and releases that are PRESENT: a dropped retain leaves each group's
+// own arithmetic balanced, because the retain belongs to the argument
+// reconciling two groups rather than to either of them
+// (rfc/memory-safety-proof.md, third failure shape).
+//
+// So it is refused. The kernel's rule is that an operation whose premises
+// cannot be met has NO STEP -- a branch whose ownership obligation cannot be
+// discharged is a program the model does not run, not one it runs
+// approximately.
+//
+// This was tried once BEFORE the root cause was found and it refused three
+// working programs; the history is on `borrowEdgeRetainIsSpellable` below. Two
+// repairs made the path unreachable and both left the emitted code byte-
+// identical over 324 golden cases and examples (retain 31006, release 168445,
+// zero files differing):
+//
+//   `ABI/RuntimeABI.cpp`  the boxing path now RECORDS the ownership it takes,
+//                         so a merge fed by a box is seen as the move it is
+//                         rather than as an edge needing a retain.
+//   `ABI/EntityHeaderPrefix.h`  an ownership marker now answers
+//                         "is the prefix stored here?" directly, instead of
+//                         being walked through to the raw storage underneath.
+//
+// What reaching this diagnostic means for a future program: the merge really
+// does need a retain (the operand outlives the branch), and the value is not
+// complete at its own definition and does not say otherwise with a marker.
+// The fix is to mark it where it becomes complete, not to relax this.
+mlir::LogicalResult reportUnspellableBorrowEdgeRetain(mlir::Value header,
+                                                      mlir::Operation *anchor) {
+  return anchor->emitError()
+         << "ownership: this block-argument merge needs a retain on the edge "
+            "and the header prefix cannot be spelled at the point the retain "
+            "must go (header type "
+         << header.getType() << ", "
+         << (mlir::isa<mlir::BlockArgument>(header) ? "block argument"
+                                                    : "op result")
+         << "). The retain has to precede any release in the same block, so it "
+            "is placed at the header's definition -- and there the entity's "
+            "refcount/class words are not yet stored. An entity that is "
+            "complete at its definition says so with "
+         << own::kOwnedLocalObjectAttr
+         << "; this one does not, so emitting the branch would leave the "
+            "merged value's release unbalanced.";
 }
 
 using own::CachedFuncContract;
@@ -1677,10 +1690,9 @@ bool releaseOwnedGroupByLiveness(
 //         return total
 //
 // aborts with `Ly_DecRef observed non-positive refcount` (exit 134) while CPython
-// prints 6. `LYTHON_OWNERSHIP_TRACE_RETAIN_OMISSIONS=1` names the site:
-// `header type memref<9xi64>, op result` -- the merge argument reconciling the
-// two incoming list groups, declined here because the header is an op result
-// rather than a block argument.
+// prints 6. The site was `header type memref<9xi64>, op result` -- the merge
+// argument reconciling the two incoming list groups, declined here because the
+// header is an op result rather than a block argument.
 //
 // So the residual on this branch is NOT a bounded leak. It is a shipped
 // over-release: it survives `--release`, and the affine verifier cannot see it
@@ -2226,6 +2238,85 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
   // the checked-retain premise: the SSA operand is provably alive at the
   // terminator), so every edge transfers uniformly. Candidates with no
   // owned-transfer edge at all are plain borrow merges: dropped.
+  // Why an incoming value fails this test, measured over 324 golden cases and
+  // examples (2026-07-29), 299 borrow-edge retains in total:
+  //
+  //     200  still-live        the operand outlives the branch -- a REAL dup,
+  //                            and the only class the kernel agrees needs a
+  //                            retain. This is what a `dup` migration has to
+  //                            find another emitter for; it is not surplus.
+  //      70  never-candidate   ALL SEVENTY are FUNCTION PARAMETERS -- entry
+  //                            block arguments, `preds=0`, no exceptions -- and
+  //                            all seventy are BORROWED: not one carries
+  //                            `transfer_args`, `release_args` or `retain_args`
+  //                            at its index. So `isOwnedIncoming` is RIGHT
+  //                            about every one of them, and their edge retains
+  //                            are correct. (json._apply_exp2 12,
+  //                            Counter.most_common 9, json.dumps 6, and a tail
+  //                            of user functions taking objects by borrow.)
+  //      13  no-transfer-edge  seeded, then dropped because no edge of the
+  //                            group transferred.
+  //      10  both              outlives AND unowned.
+  //       6  not-owned-nonarg  an op result, not a block argument.
+  //
+  // So of the 299, only ONE population is a defect of this test:
+  //
+  //   `still-live`       200. The retain BELONGS -- the operand outlives the
+  //                      branch, so the kernel calls this a dup too, and all
+  //                      200 are emitted correctly today.
+  //
+  //                      Moving them to an explicit `py.incref` while the value
+  //                      still has a bundle does NOT work, and the reason is in
+  //                      `ABI/ControlFlowABI.cpp`: the merge argument is
+  //                      created before the back edge exists, so liveness --
+  //                      the very question that decides move vs dup -- cannot
+  //                      be asked there. 183 of the 200 are block-arg to
+  //                      block-arg, i.e. loop-carried, which is exactly the
+  //                      case that needs the back edge.
+  //   `never-candidate`  70. Borrowed parameters. NOT a defect -- measured.
+  //   `was-candidate`    13. All block arguments of groups that were dropped
+  //                      because NO edge transferred. A group nothing hands
+  //                      ownership to is not an owned group, so its arguments
+  //                      are borrows and a downstream merge taking one needs a
+  //                      retain. Correct.
+  //   `both`             10 (6 block-arg, 4 memref.get_global). `still-live` is
+  //                      set, so the retain is needed whatever the ownership
+  //                      says. Correct by construction.
+  //   `not-owned-nonarg` 6: get_global 3 (static data, borrowed), scf.if 2,
+  //                      and ONE memref.alloc -- `stdlib_functools`,
+  //                      `memref<2xi64>`. Not the boxing shape: two words is
+  //                      the refcount/class header itself, made by the class
+  //                      instance path at `ABI/RuntimeABI.cpp:1154` which
+  //                      calls `initializeObjectHeader` immediately after, not
+  //                      by `boxRuntimeObject`. It is not `still-live` and
+  //                      takes the `cast` path, so it never reaches the
+  //                      diagnostic. Correct.
+  //
+  // So all 299 are correctly classified as of 2026-07-30 and nothing here is
+  // outstanding. What remains open is not a defect but a REPRESENTATION gap,
+  // recorded in `proof/`: the kernel cannot say "the emitted code disagrees
+  // with the ghost state", which is the shape every one of these bugs had.
+  //
+  // How the 299 reach `Ly_IncRef`'s input type, measured the same way:
+  //
+  //     278  cast    the type is directly cast-compatible; the initialisation
+  //                  predicate is never consulted.
+  //      21  spell   a prefix subview, all of them from block arguments (19)
+  //                  and call results (2) -- both unconditionally "initialised
+  //                  at definition".
+  //       0  refused
+  //
+  // So every `memref.get_global` (7), `scf.if` (2) and `memref.alloc` (1)
+  // header takes the CAST path and never asks the predicate. Extending it to
+  // reason about globals or region yields would be speculative: nothing in the
+  // corpus consults it for them. It is left alone deliberately.
+  //
+  // Why the parameter population looked like the boxing bug and is not: there
+  // the ownership was real and merely unrecorded, so recording it changed no
+  // output. Here the values are genuinely borrowed, so teaching this test to
+  // call them owned would DROP retains that are load-bearing. The shapes are
+  // similar and the answers are opposite, which is why it was measured rather
+  // than argued.
   auto isOwnedIncoming = [&](mlir::Value v) {
     if (ownedValues.count(v))
       return true;
@@ -2463,13 +2554,10 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       } else if (borrowEdgeRetainIsSpellable(retain.header, retainFunction)) {
         header = own::spellHeaderPrefix(builder, anchor->getLoc(), header,
                                         retainInput);
-        if (!header) {
-          traceOmittedBorrowEdgeRetain(retain.header, anchor);
-          continue;
-        }
+        if (!header)
+          return reportUnspellableBorrowEdgeRetain(retain.header, anchor);
       } else {
-        traceOmittedBorrowEdgeRetain(retain.header, anchor);
-        continue;
+        return reportUnspellableBorrowEdgeRetain(retain.header, anchor);
       }
     }
     auto call = mlir::func::CallOp::create(builder, anchor->getLoc(),

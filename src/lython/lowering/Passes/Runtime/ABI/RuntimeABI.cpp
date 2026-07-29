@@ -890,8 +890,22 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
     return mlir::failure();
   concrete.setObjectLogicalOwnership(retainPayload);
 
+  // MEASUREMENT ONLY -- record the frame's ownership of the box in the IR, the
+  // way GetItemOps.cpp does for its borrow->own conversion, so the census can
+  // say how many releases that would add.
+  mlir::Value boxRoot = box;
+  if (retainPayload) {
+    auto rooted = mlir::UnrealizedConversionCastOp::create(
+        builder, loc, mlir::TypeRange{box.getType()}, mlir::ValueRange{box});
+    rooted->setAttr(own::kOwnedLocalObjectAttr, builder.getUnitAttr());
+    rooted->setAttr(own::kOwnedLocalObjectContractAttr,
+                    builder.getStringAttr("builtins.object"));
+    boxRoot = rooted.getResult(0);
+  }
+
   RuntimeBundle boxed = RuntimeBundle::object(
-      runtimeContractType(context, "builtins.object"), mlir::ValueRange{box});
+      runtimeContractType(context, "builtins.object"),
+      mlir::ValueRange{boxRoot});
   boxed.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
   return boxed;
 }
