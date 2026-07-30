@@ -13817,6 +13817,11 @@ module attributes {
       %names = memref.get_global @__ly_fmt_msg_name_bool : memref<4xi8>
       %name = memref.cast %names : memref<4xi8> to memref<?xi8>
       %nlen = arith.constant 4 : i64
+      // The int goes before the raise: the release below is on the path this one
+      // replaces, and the raise does not return. Found by
+      // RuntimeRaisePathTests -- a text scan missed it because `%ih, %im, %id =`
+      // is a multi-result definition and the pattern only matched single results.
+      func.call @LyLong_DecRef(%ih) : (memref<2xi64>) -> ()
       func.call @__ly_fmt_raise_invalid_spec(%spec_header, %spec_bytes, %name, %nlen) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> ()
     }
     %names2 = memref.get_global @__ly_fmt_msg_name_bool : memref<4xi8>

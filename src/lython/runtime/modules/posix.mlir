@@ -379,8 +379,12 @@ module attributes {
     %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
+    // The throw is UNCONDITIONAL here, so this function never returns. There was a
+    // `LyBytes_DecRef(%enc_header)` after the call: unreachable before the object
+    // changed hands, and a double release the moment anyone made the raise
+    // conditional. Deleted rather than left as a comment, because dead code that
+    // says the wrong thing about ownership is what the next reader copies.
     func.call @__ly_posix_throw(%code, %enc_header) : (i32, memref<6xi64>) -> ()
-    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
 

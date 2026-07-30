@@ -92,6 +92,7 @@ add_executable(lython_unit_tests
     unit/EvidenceVerifierTests.cpp
     unit/LayerManifestTests.cpp
     unit/ParserTests.cpp
+    unit/RuntimeRaisePathTests.cpp
     unit/TypeInferenceTests.cpp
     unit/TypeSystemTests.cpp
     unit/UnicodeTablesTests.cpp
@@ -119,6 +120,12 @@ target_link_libraries(lython_unit_tests
     gtest
     gtest_main
 )
+# The raise-path test reads the runtime manifest sources themselves, so it needs
+# to know where they are. A define rather than a generated header: it is one path,
+# and the test asserts the directory holds at least ten modules so a wrong value
+# fails loudly instead of passing on an empty scan.
+target_compile_definitions(lython_unit_tests PRIVATE
+    LYTHON_RUNTIME_MODULES_DIR="${CMAKE_SOURCE_DIR}/src/lython/runtime/modules")
 target_compile_options(lython_unit_tests PRIVATE -frtti)
 if(APPLE)
     target_link_options(lython_unit_tests
@@ -151,10 +158,14 @@ set(LYTHON_UNIT_PATTERNS_emit
     "DriverTest.ReportsEmitErrorDiagnostics")
 set(LYTHON_UNIT_PATTERNS_abi
     "EntityHeaderPrefixTest.*")
+# `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
+# manifest sources and asks a dataflow question about them, which is the suite
+# checking the tree rather than the compiler.
 set(LYTHON_UNIT_PATTERNS_tables
     "UnicodeTablesTest.*")
 set(LYTHON_UNIT_PATTERNS_meta
-    "LayerManifestTest.*")
+    "LayerManifestTest.*"
+    "RuntimeRaisePathTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"
