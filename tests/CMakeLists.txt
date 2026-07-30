@@ -475,7 +475,9 @@ set(LYTHON_LEAK_GATE_CASES
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
     cross_exception_field_box_slot sequence_literal_source_move_frequency
-    module_globals object_inherited_dunders itertools_value_position)
+    module_globals object_inherited_dunders itertools_value_position
+    tuple_duplicate_element class_protocol
+    class_field_store_inline_independent)
 foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
     add_test(NAME "leak.${leak_case}"
         COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"

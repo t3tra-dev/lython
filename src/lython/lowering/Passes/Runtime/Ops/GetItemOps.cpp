@@ -198,6 +198,113 @@ RuntimeValue rootAsOwnedLocal(mlir::OpBuilder &builder, mlir::Location loc,
   return out;
 }
 
+// Was this value PRODUCED owned by this frame? A call that declares the result
+// owned, or a speculation `scf.if` whose every arm yields such a call at the
+// same position -- the shape `j = pick(2)` actually has here, because the
+// primitive-i64 speculation wraps the call in an if whose arms box the
+// speculated word or make the real call.
+bool valueIsFrameOwnedProduct(mlir::ModuleOp module, mlir::Value value,
+                              unsigned depth) {
+  if (depth > 4)
+    return false;
+  auto result = mlir::dyn_cast_or_null<mlir::OpResult>(
+      ownership::underlyingObjectValue(value));
+  if (!result)
+    return false;
+  if (auto call = mlir::dyn_cast<mlir::func::CallOp>(result.getOwner())) {
+    auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+    return callee &&
+           ownership::callResultGroupIsOwned(callee, result.getResultNumber());
+  }
+  auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(result.getOwner());
+  if (!ifOp)
+    return false;
+  unsigned index = result.getResultNumber();
+  for (mlir::Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+    if (region->empty())
+      return false;
+    mlir::Operation *terminator = region->front().getTerminator();
+    if (!terminator || index >= terminator->getNumOperands())
+      return false;
+    if (!valueIsFrameOwnedProduct(module, terminator->getOperand(index),
+                                  depth + 1))
+      return false;
+  }
+  return true;
+}
+
+// ⭐ The frame already owns this entity under a NAME OF ITS OWN -- an owned call
+// result it has not handed to any container -- so reading it back out is a
+// borrow of that name and costs nothing.
+//
+// `existingOwnedLocalToken` above answers the same question for a value the
+// frame owns through a TOKEN, and the reason it is not enough is that most
+// bindings have no token: `j = pick()` owns its entity as a plain owned call
+// result, released by liveness. Reading the same entity back out of a container
+// therefore looked unowned and minted a second reference:
+//
+//     j = pick(2); t = (1, j); print(t[1], j)
+//
+// Downstream that is one entity with two owners and ONE release. The alias
+// analysis sees through the token's identity cast, so `insertOwnedResultReleases`
+// releasing the call result IS read as the token's death by
+// `insertOwnedLocalObjectReleases`, and the token's reference is never given
+// back. Measured 52 B per read -- `tuple_duplicate_element`, `class_protocol`,
+// `generator_local_list`.
+//
+// Why NOT fix it downstream by teaching the two steps apart: they share the
+// alias model with the affine-ownership verifier, which refuses two releases of
+// one aliased resource on a path. Making the insertion pass emit the second
+// release turned five goldens red -- `dict_methods_complete` aborting with
+// `Ly_DecRef observed non-positive refcount`, four more refused as "released or
+// transferred more than once". One entity with one owner is what the whole
+// model is built on; the repair belongs where the second owner was invented.
+//
+// ⛔ "HAS NOT HANDED IT OVER" IS THE LOAD-BEARING HALF. A container literal whose
+// element source is dead after the store MOVES the reference -- spelled as the
+// slot retain plus an `aggregate_release`-marked release of the source -- and
+// after that the frame owns nothing, so a borrow would be freed under the reader
+// when the container dies. The literal lowers before the read, so that release
+// is already in the IR: the question is answered by LOOKING, not by predicting.
+// Any such release anywhere in the function declines the borrow, which is the
+// conservative direction (a token is minted, as before).
+bool frameKeepsOwnedSourceOf(mlir::ModuleOp module, mlir::Operation *op,
+                             const RuntimeValue &value) {
+  if (value.values.empty())
+    return false;
+  mlir::Value head = ownership::underlyingObjectValue(value.values.front());
+  mlir::Operation *producer = head.getDefiningOp();
+  if (!producer || !valueIsFrameOwnedProduct(module, head, /*depth=*/0))
+    return false;
+
+  mlir::func::FuncOp function = op->getParentOfType<mlir::func::FuncOp>();
+  if (!function || producer->getParentOfType<mlir::func::FuncOp>() != function)
+    return false;
+  mlir::DominanceInfo dominance(function);
+  if (!dominance.properlyDominates(producer, op))
+    return false;
+
+  for (mlir::Operation *user : head.getUsers()) {
+    auto userCall = mlir::dyn_cast<mlir::func::CallOp>(user);
+    if (!userCall)
+      continue;
+    // Handed to a container, or consumed by a callee that takes ownership:
+    // either way the frame's reference is no longer the frame's.
+    if (userCall->hasAttr(ownership::kAggregateReleaseAttr))
+      return false;
+    for (unsigned index = 0, end = userCall.getNumOperands(); index < end;
+         ++index) {
+      if (ownership::underlyingObjectValue(userCall.getOperand(index)) != head)
+        continue;
+      if (ownership::functionConsumesOperandAt(
+              module.lookupSymbol<mlir::func::FuncOp>(userCall.getCallee()),
+              index))
+        return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 std::optional<RuntimeValue>
@@ -226,6 +333,10 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
     borrowed.values.assign(held.getResults().begin(), held.getResults().end());
     return borrowed;
   }
+  // Same rule for the other way a frame owns an entity: under the name of an
+  // owned call result, with no token at all. See `frameKeepsOwnedSourceOf`.
+  if (frameKeepsOwnedSourceOf(module, op, value))
+    return value;
   // Borrow → own: one retain on the entity root, then the owned-local marker.
   // The contract → retain relation is static; no per-contract runtime wrapper is
   // involved.
