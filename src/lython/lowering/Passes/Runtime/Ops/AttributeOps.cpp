@@ -225,40 +225,38 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
     releaseOperand =
         mlir::memref::CastOp::create(builder, loc, expectedBox, releaseOperand)
             .getResult();
-  // A SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`) stores the
-  // object the box already holds. Its reference must not be given up: the
-  // in-place mutation primitive reallocated arrays but created no new
-  // reference, so the box's single reference is the only one there is, and
-  // releasing it here plus the caller's release of the "owned" result drops it
-  // to zero while the program still reads through it.
+  // ⭐ ALWAYS release what the box held. A store is a replace: retain the new
+  // reference (above), give up the old one.
   //
-  // Decided at RUNTIME by comparing the payload's header pointer rather than by
-  // following SSA transfers, because that relation is only visible while the
-  // producer is in this frame: an inlined method exposes it and the same method
-  // reached through a call does not, so a static test would make correctness
-  // depend on an inlining decision. Word 2 is zero on the constructor's
-  // placeholder, so a first store always takes the release branch (where the
-  // owned flag makes it a no-op).
-  context->loadDialect<mlir::scf::SCFDialect>();
-  mlir::Value payloadWordSlot =
-      mlir::arith::ConstantIndexOp::create(builder, loc, 2).getResult();
-  mlir::Value heldPayload =
-      mlir::memref::LoadOp::create(builder, loc, box, payloadWordSlot)
-          .getResult();
-  mlir::Value replaces =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
-                                  heldPayload, (*words)[2])
-          .getResult();
-  auto releaseIf = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
-                                           replaces,
-                                           /*withElseRegion=*/false);
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(&releaseIf.getThenRegion().front());
-    mlir::func::CallOp::create(builder, loc, releaseBoxed,
-                               mlir::ValueRange{releaseOperand});
-  }
-  builder.setInsertionPointAfter(releaseIf);
+  // This release used to be guarded by a runtime comparison of the payload header
+  // pointer, so a SELF-store (`ks = self._kids; ks.append(v); self._kids = ks`)
+  // took the retain and skipped the release. That is +1 per self-store, and it
+  // leaked the whole payload: measured 2 allocations / 8264 B for a one-element
+  // list -- 8192 of it the list payload at `minimum_capacity` -- and it is where
+  // `class_field_list_mutation` spent 16736 B.
+  //
+  // The guard's reasoning was that releasing here "plus the caller's release of
+  // the owned result drops it to zero while the program still reads through it".
+  // Recount it for the self-store: the box holds one, the read that produced the
+  // local retained a second, this retain makes three, this release makes two, and
+  // the frame's release of the local makes one -- which is what the box holds. The
+  // arithmetic works BECAUSE the retain above is unconditional; the guard made
+  // only one half of the pair conditional, which is the shape that cannot balance.
+  //
+  // Why NOT make the retain conditional instead, to match: tried, and it is wrong
+  // in two ways the suite names. `retainAggregateSlot` is not only a refcount
+  // bump -- it is the accounting that parks the incoming token in the container --
+  // so skipping it leaves the token neither released nor parked, and
+  // `try_loop_carried_entity_rebind` and `try_inner_handler_rebind_loop_carried`
+  // both fail with "reaches function exit without release, transfer, or owned
+  // return". `cross_container_box_fronted_fields` fails harder, with a
+  // use-after-free. Those three are the red-check for this repair.
+  //
+  // Word 2 is zero on the constructor's placeholder, so the very first store
+  // releases a null payload -- a no-op inside `LyObject_ReleaseBoxedPayloadRaw`,
+  // which is why an unconditional release is safe on a fresh instance.
+  mlir::func::CallOp::create(builder, loc, releaseBoxed,
+                             mlir::ValueRange{releaseOperand});
   for (auto [wordIndex, word] : llvm::enumerate(*words)) {
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
         builder, loc, static_cast<std::int64_t>(wordIndex));
