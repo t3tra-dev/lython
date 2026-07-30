@@ -41,14 +41,15 @@ import Data.Maybe
 open import Data.Nat using (ℕ; zero; suc)
 open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Relation.Binary.PropositionalEquality
-  using (_≡_; refl; sym; trans; cong; subst)
+  using (_≡_; _≢_; refl; sym; trans; cong; subst)
 open import Relation.Nullary using (¬_)
 
 open import Proof.RC.Object using (ObjId; Life; live; RuntimeCount; counted;
-  bumpUp)
+  bumpUp; bumpDown)
 open import Proof.RC.OwnerSite using (ThreadId)
 open import Proof.RC.Machine Sig
 open import Proof.RC.Properties Sig using (lookupObj-update-same)
+open import Proof.RC.Invariant Sig using (WFRC; counted-exact)
 open import Proof.Program.Syntax using (Var; BlockId; Function; Instr; dup; drop)
 open import Proof.Program.Env
 open import Proof.Program.Step Sig
@@ -233,3 +234,157 @@ not-recording-breaks-faithfulness as es x o silent faith
              (faith x (bind o owned)
                     (lookupVar-cons-true x (bind o owned) es x (sameVar-refl x)))
 ... | ()
+
+------------------------------------------------------------------------
+-- ⭐ THE RUNTIME HALF OF `dup`, ALONE.
+--
+-- `step-dup` does three things at once: bump the counter, occupy an owner site,
+-- bind a name. That atomicity is why a REDUNDANT `dup` is harmless here --
+-- `Dup.preserves` and `instr-preserves-coherence` both go through -- and it is
+-- why this model said an extra retain was SAFE while a measured, unbounded leak
+-- in the compiler said otherwise.
+--
+-- The compiler can emit the counter bump alone: `Ly_IncRef` on a value is one
+-- call, and nothing makes it arrive with a site and a name. Two such calls landed
+-- on one value and one release came back, which is the leak. So the operation the
+-- compiler actually has is SMALLER than any rule in this development, and the gap
+-- between them is where the defect lived.
+--
+-- ⛔ Modelled as a FUNCTION on machines, not as a step rule, and the choice is
+-- the point. A rule would have to be carved out of `step-preserves-WF`, because
+-- it cannot preserve `WFRC` -- that being the whole content -- and weakening a
+-- totality theorem to accommodate one unsound operation buys less than naming the
+-- operation and proving exactly what it breaks. `Proof.Program.Step` stays the
+-- relation of operations the semantics HAS; this is the one it does not.
+
+private
+  suc-inj : ∀ {a b : ℕ} → suc a ≡ suc b → a ≡ b
+  suc-inj refl = refl
+
+  suc≢self : ∀ (n : ℕ) → suc n ≢ n
+  suc≢self zero    ()
+  suc≢self (suc n) e = suc≢self n (suc-inj e)
+
+  -- `countOf`/`lifeOf` answering `just` means the cell is there. Needed because
+  -- the statements below are phrased over the counters a compiler can observe,
+  -- not over the table.
+  cellBehind : ∀ {A : Set} (x : Maybe ObjCell) (f : ObjCell → A) {y : A} →
+               Data.Maybe.map f x ≡ just y → Σ ObjCell λ c → x ≡ just c
+  cellBehind (just c) f _ = c , refl
+  cellBehind nothing  f ()
+
+  just-inj′ : ∀ {A : Set} {u v : A} → just u ≡ just v → u ≡ v
+  just-inj′ refl = refl
+
+-- A retain with no site and no name: the counter moves, the ghost state does not.
+retainWithoutASite : Machine → ObjId → Machine
+retainWithoutASite m o =
+  machine (heap m)
+          (updateObj (objects m) o (λ c → record c { count = bumpUp (count c) }))
+          (sites m)
+
+-- and its mirror, so the pair says "neither half may be emitted alone".
+releaseWithoutVacating : Machine → ObjId → Machine
+releaseWithoutVacating m o =
+  machine (heap m)
+          (updateObj (objects m) o (λ c → record c { count = bumpDown (count c) }))
+          (sites m)
+
+-- ⭐ A RETAIN THAT OCCUPIES NO SITE BREAKS THE COUNT INVARIANT.
+--
+-- This is the sentence the model was missing. `the-unrecorded-retain-bumps-the-
+-- counter` above gets the arithmetic right -- the counter goes up by one -- and
+-- the consequence wrong, because it models the emission as a real `step-dup`,
+-- which brings a site along and so lands in a well-formed state. Here nothing
+-- comes along, and the state is not well-formed at all.
+retain-without-a-site-breaks-WFRC :
+  ∀ (m : Machine) (o : ObjId) (n : ℕ) →
+  countOf m o ≡ just (counted n) → lifeOf m o ≡ just live →
+  WFRC m → ¬ WFRC (retainWithoutASite m o)
+retain-without-a-site-breaks-WFRC m o n cnt lif wf broken =
+  suc≢self n (trans after (sym prior))
+  where
+    up : ObjCell → ObjCell
+    up c = record c { count = bumpUp (count c) }
+
+    found : Σ ObjCell λ c → lookupObj (objects m) o ≡ just c
+    found = cellBehind (lookupObj (objects m) o) count cnt
+
+    tbl : lookupObj (objects m) o ≡ just (proj₁ found)
+    tbl = proj₂ found
+
+    counted-n : count (proj₁ found) ≡ counted n
+    counted-n = just-inj′ (trans (sym (cong (Data.Maybe.map count) tbl)) cnt)
+
+    live-cell : life (proj₁ found) ≡ live
+    live-cell = just-inj′ (trans (sym (cong (Data.Maybe.map life) tbl)) lif)
+
+    hit : lookupObj (objects (retainWithoutASite m o)) o ≡ just (up (proj₁ found))
+    hit = lookupObj-update-same (objects m) o up (proj₁ found) tbl
+
+    -- The counter now reads one more, and the ghost count is untouched, so
+    -- `counted-exact` at this object says `suc n ≡ n`.
+    after : suc n ≡ ghostRC m o
+    after = counted-exact broken o (suc n)
+              (trans (cong (Data.Maybe.map count) hit)
+                     (cong (λ r → just (bumpUp r)) counted-n))
+              (trans (cong (Data.Maybe.map life) hit) (cong just live-cell))
+
+    prior : n ≡ ghostRC m o
+    prior = counted-exact wf o n cnt lif
+
+-- ⭐ And a release that vacates no site breaks it the other way.
+--
+-- Stated at `suc n` because `bumpDown (counted zero)` stays at zero: a decrement
+-- of a counter already at zero changes nothing, so there is nothing to break, and
+-- a statement quantified over every counter would be false for that one.
+release-without-vacating-breaks-WFRC :
+  ∀ (m : Machine) (o : ObjId) (n : ℕ) →
+  countOf m o ≡ just (counted (suc n)) → lifeOf m o ≡ just live →
+  WFRC m → ¬ WFRC (releaseWithoutVacating m o)
+release-without-vacating-breaks-WFRC m o n cnt lif wf broken =
+  suc≢self n (trans prior (sym after))
+  where
+    down : ObjCell → ObjCell
+    down c = record c { count = bumpDown (count c) }
+
+    found : Σ ObjCell λ c → lookupObj (objects m) o ≡ just c
+    found = cellBehind (lookupObj (objects m) o) count cnt
+
+    tbl : lookupObj (objects m) o ≡ just (proj₁ found)
+    tbl = proj₂ found
+
+    counted-n : count (proj₁ found) ≡ counted (suc n)
+    counted-n = just-inj′ (trans (sym (cong (Data.Maybe.map count) tbl)) cnt)
+
+    live-cell : life (proj₁ found) ≡ live
+    live-cell = just-inj′ (trans (sym (cong (Data.Maybe.map life) tbl)) lif)
+
+    hit : lookupObj (objects (releaseWithoutVacating m o)) o
+            ≡ just (down (proj₁ found))
+    hit = lookupObj-update-same (objects m) o down (proj₁ found) tbl
+
+    after : n ≡ ghostRC m o
+    after = counted-exact broken o n
+              (trans (cong (Data.Maybe.map count) hit)
+                     (cong (λ r → just (bumpDown r)) counted-n))
+              (trans (cong (Data.Maybe.map life) hit) (cong just live-cell))
+
+    prior : suc n ≡ ghostRC m o
+    prior = counted-exact wf o (suc n) cnt lif
+
+-- ⛔ What this does NOT say, and it matters for reading the compiler against it.
+--
+-- It does not say the compiler's extra retain is unsound in general. An IMMORTAL
+-- object's counter is not a count -- `bumpUp immortal ≡ immortal` -- so a bare
+-- retain on one changes nothing and breaks nothing, and `counted-exact` is
+-- guarded on `counted n` precisely to exempt it. Both statements above therefore
+-- take a `counted` premise, and neither reaches an immortal.
+--
+-- That exemption is not decidable in the compiler, because immortality there is a
+-- runtime value (a refcount of INT64_MAX, fixed at creation) rather than a static
+-- property. So the phase gate that enforces the site side
+-- (`verifyOwnedTokenUniqueness`) is stricter than these theorems: it rejects a
+-- second token on an immortal too. That is the right direction -- the IR is
+-- malformed either way -- but the difference is real and is why the gate cannot
+-- be justified by these lemmas alone.

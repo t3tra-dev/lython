@@ -215,15 +215,32 @@ exists for exactly this and nothing yet uses it.
 > release — which is present, same value, same block chain — cannot get it to
 > zero. It is an **over-retain**, unbounded, one per boxed slot read.
 >
-> The reason the theorem missed it names the next gap. Model `dup` is ATOMIC: the
-> counter bump, the owner site and the name arrive together, so a redundant `dup`
-> preserves both `WFRC` and coherence — the model says an extra retain is SAFE.
-> The compiler's extra retain is a BARE counter bump, no site and no name, and the
-> model has no rule for one. `Proof.Program.Recorded` models it as a real `dup`,
-> so it gets the arithmetic right (`the-unrecorded-retain-bumps-the-counter`) and
-> the consequence wrong. Closing it means splitting `dup` the way `new` was split
-> into `alloc`/`init`, for the same reason: one instruction doing two things with
-> no way to speak about the gap between them.
+> The reason the theorem missed it named the next gap, and it is now closed. Model
+> `dup` is ATOMIC: the counter bump, the owner site and the name arrive together,
+> so a redundant `dup` preserves both `WFRC` and coherence — the model said an
+> extra retain was SAFE. The compiler's extra retain is a BARE counter bump, no
+> site and no name, and the model had no rule for one.
+>
+> **Closed.** `Proof.Program.Recorded` names the bare operation —
+> `retainWithoutASite`, and its mirror `releaseWithoutVacating` — and proves each
+> breaks `WFRC`: after a retain that occupies no site, `counted-exact` at that
+> object demands `suc n ≡ n`. As FUNCTIONS on machines rather than step rules,
+> because a rule would have to be carved out of `step-preserves-WF` (it cannot
+> preserve the invariant, that being the content), and weakening a totality
+> theorem to hold one unsound operation buys less than naming the operation and
+> proving what it breaks. `Proof.Program.Step` stays the relation of operations the
+> semantics HAS.
+>
+> Both halves are exhibited on a reachable state in `Proof.Program.Run`, because
+> either alone proves the wrong thing: that some machine fails `WFRC` is
+> uninteresting if no reachable machine satisfies it, and that `dup` preserves it
+> is uninteresting if the bare bump did too.
+>
+> One limit, stated because it separates the theorem from the compiler's gate: an
+> immortal object's counter is not a count, so a bare retain on one breaks nothing,
+> and both theorems carry a `counted` premise that excludes it. The phase gate that
+> enforces the site side is stricter than that — it rejects a duplicate on an
+> immortal too — so the gate cannot be justified by these lemmas alone.
 
 ### 2.4 There is no contract, so deallocator selection is invisible
 

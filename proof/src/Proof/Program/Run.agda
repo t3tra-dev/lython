@@ -47,7 +47,8 @@ open import Proof.Program.Ownership LythonSig
   using (no-dup-in-the-initialisation-window)
 open import Proof.Program.Recorded LythonSig
   using (Attrs; recordedMode; recordedMode-cons-true; Faithful; edgeRetain;
-         record-owned; recording-is-faithful)
+         record-owned; recording-is-faithful; retainWithoutASite;
+         retain-without-a-site-breaks-WFRC)
 open import Proof.Program.Preservation LythonSig
 open import Proof.RC.Invariant LythonSig using (WFRC; counted-exact)
 open import Data.Empty using (⊥; ⊥-elim)
@@ -558,3 +559,34 @@ midpoint-is-well-formed =
 midpoint-counted-exact : 2 ≡ ghostRC (mach s₂) theObj
 midpoint-counted-exact =
   counted-exact (rc midpoint-is-well-formed) theObj 2 refl refl
+
+------------------------------------------------------------------------
+-- ⭐ THE BARE RETAIN, on this run.
+--
+-- `run-dup` takes `s₁` to `s₂`: counter 1 -> 2, a second owner site, a second
+-- name, all three together. `retainWithoutASite` is what the compiler can emit
+-- instead -- the counter alone -- and the state it lands in is NOT well-formed.
+--
+-- Both halves are here because either alone proves the wrong thing. That a
+-- machine fails `WFRC` is uninteresting if no reachable machine satisfies it; that
+-- `dup` preserves it is uninteresting if the bare bump did too.
+
+s₁-counts-one : countOf (mach s₁) theObj ≡ just (counted 1)
+s₁-counts-one = refl
+
+s₁-has-one-site : logicalRC (sites (mach s₁)) theObj ≡ 1
+s₁-has-one-site = refl
+
+-- ⭐ The counter alone: 2 against one site, and no state like that is well-formed.
+bare-retain-is-not-well-formed : ¬ WFRC (retainWithoutASite (mach s₁) theObj)
+bare-retain-is-not-well-formed =
+  retain-without-a-site-breaks-WFRC (mach s₁) theObj 1 refl refl
+    (rc (reachable-preserves-WF (more (by-instr run-alloc)
+                                (more (by-instr run-init) done))
+                                start-is-well-formed))
+
+-- and the real `dup`, which brings a site and a name with it, IS well-formed --
+-- via the theorem rather than by inspection of `s₂`.
+real-dup-is-well-formed : WF s₂
+real-dup-is-well-formed = midpoint-is-well-formed
+

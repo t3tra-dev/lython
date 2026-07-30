@@ -42,10 +42,11 @@
 #   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak
 #
 #   `leak` is the one suite that measures something no other label can observe:
-#   allocation reachable at exit, via `leaks --atExit` on an AOT binary, minus
-#   the baseline every AOT binary carries. Everything else in the taxonomy sees
-#   exit codes, stdout and diagnostics, all of which a leaking program gets
-#   right. macOS only, because `leaks` is.
+#   allocation reachable at exit, via LeakSanitizer on an AOT binary, minus the
+#   baseline every AOT binary carries. Everything else in the taxonomy sees exit
+#   codes, stdout and diagnostics, all of which a leaking program gets right.
+#   Every platform whose toolchain has a leak sanitizer; the rest SKIP, which was
+#   `leaks --atExit` and macOS-only until the port.
 #
 # `slow` and `bench` membership is a measurement, and a measurement of one build
 # type. Compare only within a build type: the default is RelWithDebInfo, where
@@ -405,67 +406,79 @@ set_tests_properties("abi.handle_width_reservations" PROPERTIES
 # named in rfc/test-suite-debt.md instead. Growing this list is how a repaired
 # case gets locked in.
 #
-# APPLE-only because `leaks` is: on other platforms the stage registers nothing
-# rather than reporting a green it did not measure.
-if(APPLE)
-    set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
-    # Measured net-zero on 2c5f722. Each costs one AOT build plus one leaks
-    # run: 10.8-13.0 s at -j5 on a Debug build, under the 20 s bar, so no
-    # slow/bench label -- but that is a Debug measurement and the bar is not
-    # comparable across build types. One test per case rather than one test over
-    # all five, so a failure names the case instead of the batch.
+# ⭐ NOT platform-guarded any more. It was `if(APPLE)` because `leaks` is macOS
+# only, which meant the stage registered NOTHING on Linux -- including in CI, so
+# the one class of defect no other label can see went unmeasured exactly where the
+# suite runs unattended. The gate now measures with `lyc --fsanitize=leak`
+# (LeakSanitizer), which runs on both.
+#
+# A toolchain without a leak sanitizer SKIPS rather than fails: the gate exits 2
+# for "could not measure" and SKIP_RETURN_CODE maps that to a skip. That keeps the
+# old property -- never report a green that was not measured -- without hiding the
+# stage behind a platform name.
+set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
+# Measured net-zero on 2c5f722. Each costs one AOT build plus one leaks
+# run: 10.8-13.0 s at -j5 on a Debug build, under the 20 s bar, so no
+# slow/bench label -- but that is a Debug measurement and the bar is not
+# comparable across build types. One test per case rather than one test over
+# all five, so a failure names the case instead of the batch.
+#
+# The last two were REPAIRED into this list rather than measured clean by
+# luck: both leaked one element object per execution of a container literal
+# whose element is read back (dict_literal_source_move_frequency 17 roots /
+# 1088 B, dict_methods_complete 3 roots / 192 B) until the retain that roots
+# the read-back element got a release. They are the two cases that pin that
+# repair; the rest of the family is still leaking and is named in
+# rfc/test-suite-debt.md.
+# The last three were REPAIRED into this list. Two distinct defects, both
+# found by taking `tuple_one_lane_interior` apart, and each has a case that
+# pins it on its own rather than only through the case they were found in:
+#
+#   tuple_boxed_slot_read   -- every element read through the erased
+#     `builtins.object` lane leaked one object, unbounded.
+#     `LyObject_FromSlot` hands back a box at refcount 1 and says so
+#     (`ly.ownership.owned_results = [0]`); the lowering retained it again,
+#     leaving the counter at 2 against one release. 12 such reads, so a
+#     regression returns roughly twelve roots rather than one.
+#
+#   container_slot_reread   -- reading the SAME slot twice reconstructs the
+#     same handle, and ownership is tracked per SSA VALUE downstream, so two
+#     owned tokens on one value became two retains and ONE release. The whole
+#     inner entity leaked, saturating rather than scaling with the reads. 35
+#     owned tokens are minted here.
+#
+#   tuple_one_lane_interior -- where both were found, at 15 roots / 22016 B
+#     when it was first measured and 11 / 11520 by the time this session got
+#     to it. It joins now that it is net zero: it is the only member that
+#     covers the two defects INTERACTING, and it was the interaction that hid
+#     the second one (repairing the first took it from 11 roots to 2, which is
+#     when the second became visible at all).
+#   cross_exception_field_box_slot / sequence_literal_source_move_frequency
+#     -- found by the owned-token uniqueness verifier, not by anyone looking.
+#     Both carried two frame-ownership tokens on one value and leaked (9 roots
+#     / 1120 B and 3 roots / 192 B); the second is the sequence twin of the
+#     dict literal family whose dict side was repaired earlier and which
+#     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
+set(LYTHON_LEAK_GATE_CASES
+    hello dict_build str_compare iterate list_methods
+    dict_literal_source_move_frequency dict_methods_complete
+    tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
+    cross_exception_field_box_slot sequence_literal_source_move_frequency)
+foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
+    add_test(NAME "leak.${leak_case}"
+        COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
+            $<TARGET_FILE:lyc>
+            "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${leak_case}.py")
+    # SKIP_RETURN_CODE 2 is the gate's "could not measure": no leak sanitizer in
+    # this toolchain, a program that does not exit 0 on its own, or a sanitizer
+    # that stayed silent on every attempt. A skip says so; a pass would be a green
+    # nobody measured, which is the failure this whole stage exists to avoid.
     #
-    # The last two were REPAIRED into this list rather than measured clean by
-    # luck: both leaked one element object per execution of a container literal
-    # whose element is read back (dict_literal_source_move_frequency 17 roots /
-    # 1088 B, dict_methods_complete 3 roots / 192 B) until the retain that roots
-    # the read-back element got a release. They are the two cases that pin that
-    # repair; the rest of the family is still leaking and is named in
-    # rfc/test-suite-debt.md.
-    # The last three were REPAIRED into this list. Two distinct defects, both
-    # found by taking `tuple_one_lane_interior` apart, and each has a case that
-    # pins it on its own rather than only through the case they were found in:
-    #
-    #   tuple_boxed_slot_read   -- every element read through the erased
-    #     `builtins.object` lane leaked one object, unbounded.
-    #     `LyObject_FromSlot` hands back a box at refcount 1 and says so
-    #     (`ly.ownership.owned_results = [0]`); the lowering retained it again,
-    #     leaving the counter at 2 against one release. 12 such reads, so a
-    #     regression returns roughly twelve roots rather than one.
-    #
-    #   container_slot_reread   -- reading the SAME slot twice reconstructs the
-    #     same handle, and ownership is tracked per SSA VALUE downstream, so two
-    #     owned tokens on one value became two retains and ONE release. The whole
-    #     inner entity leaked, saturating rather than scaling with the reads. 35
-    #     owned tokens are minted here.
-    #
-    #   tuple_one_lane_interior -- where both were found, at 15 roots / 22016 B
-    #     when it was first measured and 11 / 11520 by the time this session got
-    #     to it. It joins now that it is net zero: it is the only member that
-    #     covers the two defects INTERACTING, and it was the interaction that hid
-    #     the second one (repairing the first took it from 11 roots to 2, which is
-    #     when the second became visible at all).
-    #   cross_exception_field_box_slot / sequence_literal_source_move_frequency
-    #     -- found by the owned-token uniqueness verifier, not by anyone looking.
-    #     Both carried two frame-ownership tokens on one value and leaked (9 roots
-    #     / 1120 B and 3 roots / 192 B); the second is the sequence twin of the
-    #     dict literal family whose dict side was repaired earlier and which
-    #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
-    set(LYTHON_LEAK_GATE_CASES
-        hello dict_build str_compare iterate list_methods
-        dict_literal_source_move_frequency dict_methods_complete
-        tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
-        cross_exception_field_box_slot sequence_literal_source_move_frequency)
-    foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
-        add_test(NAME "leak.${leak_case}"
-            COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
-                $<TARGET_FILE:lyc>
-                "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${leak_case}.py")
-        set_tests_properties("leak.${leak_case}" PROPERTIES
-            TIMEOUT 360 LABELS "e2e;leak")
-    endforeach()
-endif()
-
+    # 600 s rather than 360: each member now builds TWO sanitized binaries (the
+    # subject and the `print(0)` baseline) and may run each up to three times.
+    set_tests_properties("leak.${leak_case}" PROPERTIES
+        TIMEOUT 600 LABELS "e2e;leak" SKIP_RETURN_CODE 2)
+endforeach()
 file(GLOB LYTHON_GOLDEN_ERRORS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/errors/*.py")
 foreach(case_path IN LISTS LYTHON_GOLDEN_ERRORS)
