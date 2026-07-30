@@ -202,7 +202,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
                << "; box the object at the owning ABI boundary first";
       mlir::FailureOr<RuntimeBundle> boxed =
           RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
-              op, source, runtimeInputConsumesObject(symbol, inputIndex));
+              op, source, /*retainPayload=*/true);
       if (mlir::failed(boxed))
         return mlir::failure();
       boxedSource = std::move(*boxed);
