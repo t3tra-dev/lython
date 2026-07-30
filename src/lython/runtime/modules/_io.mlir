@@ -235,13 +235,39 @@ module attributes {
   //
   // The message is built and the scratch freed BEFORE the throw: the raise does
   // not return, so a dealloc after it would be unreachable.
-  func.func private @__ly_io_throw_errno_path(%err: i32, %path: memref<?xi8>, %path_len: i64) {
+  // The path argument is the WHOLE bytes object, and this function OWNS it.
+  //
+  // It used to take `(payload view, length)` -- the object's interior, handed
+  // round without its root -- and the caller released the root after the call.
+  // A throw does not return, so that release never ran: measured as a leak of the
+  // entire bytes block on every raising path (`io_file` leaked 83 B = 19 + 48 + 16,
+  // the block for the path that fails inside a `try`).
+  //
+  // Moving the release before the call is not the repair either: the message
+  // builder reads the payload, so freeing first would read freed memory. The
+  // object has to change hands. `ly.ownership.release_args` says so, and the
+  // release happens HERE -- after the message has been copied into `%buffer` and
+  // before the throw, which is the one point where both obligations hold.
+  //
+  // Taking the root rather than the interior is the general rule, not a detail of
+  // this function: an entity is one allocation with one root (`__ly_bytes_alloc`
+  // allocates a single block and the header is a view of its start), so a
+  // signature that accepts the payload alone cannot free what it was given and
+  // cannot be handed ownership. Passing the two halves separately is how the
+  // release ended up somewhere the object could outlive.
+  func.func private @__ly_io_throw_errno_path(%err: i32, %path_object: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [1]} {
     %c0 = arith.constant 0 : index
     %cap_index = arith.constant 1024 : index
     %cap = arith.constant 1024 : i64
     %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %path = func.call @__ly_bytes_payload(%path_object) : (memref<6xi64>) -> memref<?xi8>
+    %path_dim = memref.dim %path, %c0 : memref<?xi8>
+    %path_len = arith.index_cast %path_dim : index to i64
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_OSErrorMessagePath(%err, %path, %path_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    // See the posix twin: the message is copied, so the object goes now, before a
+    // throw that does not return.
+    func.call @LyBytes_DecRef(%path_object) : (memref<6xi64>) -> ()
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
     %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
@@ -1602,41 +1628,60 @@ module attributes {
     %path_len = arith.index_cast %enc_dim : index to i64
     %handle = func.call @LyHost_FOpen(%enc_bytes, %path_len, %cmode_dyn, %cmode_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     %failed = arith.cmpi eq, %handle, %zero : i64
-    scf.if %failed {
-      // errno decides the class and the message. The old code hardcoded
-      // FileNotFoundError with its own wording for EVERY fopen failure, so
-      // `except PermissionError` never fired on an EACCES path and the message
-      // lacked CPython's "[Errno N] " prefix.
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_io_throw_errno_path(%err, %enc_bytes, %path_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // EXPLICIT BLOCKS, not `scf.if`, and the reason is the ownership verifier
+    // rather than taste. The raising arms hand the encoded path object to the
+    // thrower (`ly.ownership.release_args`), and the success arm releases it. With
+    // an `scf.if` the region can structurally fall through, so the verifier sees a
+    // transfer AND a release on one path and refuses -- correctly, since it cannot
+    // know `LyEH_ThrowException` does not return. Written as blocks, each path
+    // carries exactly one, which is also what is true.
+    //
+    // The comment this replaces said the encoded path "leaks on that exception
+    // path, like every Wave 0 exception edge until unwinding cleanup lands". It
+    // did: measured at 83 B for `io_file`, the whole bytes block. Handing the
+    // object to the thrower closes it without waiting for unwinding cleanup.
+    cf.cond_br %failed, ^raise_open, ^opened
+
+  ^raise_open:
+    // errno decides the class and the message. The old code hardcoded
+    // FileNotFoundError with its own wording for EVERY fopen failure, so
+    // `except PermissionError` never fired on an EACCES path and the message
+    // lacked CPython's "[Errno N] " prefix.
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_io_throw_errno_path(%err, %enc_header) : (i32, memref<6xi64>) -> ()
+    // Unreachable: the call above throws. A terminator is still required, and a
+    // return here is what tells the verifier this path ends after one transfer.
+    func.return %zero : i64
+
+  ^opened:
     // fopen on a directory SUCCEEDS on the BSD libcs, and every later read then
     // answered "": a silent wrong answer where CPython raises, because
     // CPython reaches the kernel through open(2), which rejects a directory
     // itself. stat decides it here instead; S_IFMT/S_IFDIR are the two bit
     // patterns that are the same on every target we build for, so they are the
     // one part of this that can be a literal.
-    %opened = arith.cmpi ne, %handle, %zero : i64
-    scf.if %opened {
-      %stat_fields = memref.alloc(%c10) : memref<?xi64>
-      %stat_rc = func.call @LyHost_Stat(%enc_bytes, %path_len, %stat_fields) : (memref<?xi8>, i64, memref<?xi64>) -> i32
-      %stat_ok = arith.cmpi eq, %stat_rc, %zero_i32 : i32
-      %mode = memref.load %stat_fields[%c0] : memref<?xi64>
-      memref.dealloc %stat_fields : memref<?xi64>
-      %s_ifmt = arith.constant 61440 : i64
-      %s_ifdir = arith.constant 16384 : i64
-      %fmt = arith.andi %mode, %s_ifmt : i64
-      %is_dir_bits = arith.cmpi eq, %fmt, %s_ifdir : i64
-      %is_dir = arith.andi %stat_ok, %is_dir_bits : i1
-      scf.if %is_dir {
-        %eisdir = func.call @LyHost_ErrnoValue_EISDIR() : () -> i32
-        func.call @LyHost_FClose(%handle) : (i64) -> i32
-        func.call @__ly_io_throw_errno_path(%eisdir, %enc_bytes, %path_len) : (i32, memref<?xi8>, i64) -> ()
-      }
-    }
-    // Single release on every structural CFG path; the raise above unwinds
-    // before reaching it (the encoded path leaks on that exception path,
-    // like every Wave 0 exception edge until unwinding cleanup lands).
+    //
+    // No `%opened` test any more: this block IS the handle-is-nonzero case, so the
+    // old `scf.if %opened` was re-deriving what the branch already decided.
+    %stat_fields = memref.alloc(%c10) : memref<?xi64>
+    %stat_rc = func.call @LyHost_Stat(%enc_bytes, %path_len, %stat_fields) : (memref<?xi8>, i64, memref<?xi64>) -> i32
+    %stat_ok = arith.cmpi eq, %stat_rc, %zero_i32 : i32
+    %mode = memref.load %stat_fields[%c0] : memref<?xi64>
+    memref.dealloc %stat_fields : memref<?xi64>
+    %s_ifmt = arith.constant 61440 : i64
+    %s_ifdir = arith.constant 16384 : i64
+    %fmt = arith.andi %mode, %s_ifmt : i64
+    %is_dir_bits = arith.cmpi eq, %fmt, %s_ifdir : i64
+    %is_dir = arith.andi %stat_ok, %is_dir_bits : i1
+    cf.cond_br %is_dir, ^raise_isdir, ^done
+
+  ^raise_isdir:
+    %eisdir = func.call @LyHost_ErrnoValue_EISDIR() : () -> i32
+    func.call @LyHost_FClose(%handle) : (i64) -> i32
+    func.call @__ly_io_throw_errno_path(%eisdir, %enc_header) : (i32, memref<6xi64>) -> ()
+    func.return %zero : i64
+
+  ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return %handle : i64
   }

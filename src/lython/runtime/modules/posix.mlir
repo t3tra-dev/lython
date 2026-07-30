@@ -170,13 +170,19 @@ module attributes {
   // class id comes from the compiler's kOSErrorErrnoMap through
   // LyHost_OSErrorClassId, so `except FileNotFoundError` matches here exactly
   // as it does for a hand-raised one.
-  func.func private @__ly_posix_throw(%err: i32, %path: memref<?xi8>, %path_len: i64) {
+  // One place where a posix errno failure becomes a thrown OSError subclass.
+  //
+  // Takes the scratch message buffer and FREES it. A dealloc at the call site
+  // would never run, because the throw at the bottom does not return -- the same
+  // reason the object-owning entry points below release their object before
+  // calling in rather than after. Every "release after the throw" in this file was
+  // a leak on the raising path; this is where they all end up instead.
+  //
+  // Not marked with an ownership attribute: `%buffer` is scratch, not an entity --
+  // no header, no refcount, one `memref.alloc` with no interior. The attributes
+  // describe objects.
+  func.func private @__ly_posix_throw_message(%class_id: i64, %buffer: memref<?xi8>, %len: i64) {
     %c0 = arith.constant 0 : index
-    %cap_index = arith.constant 1024 : index
-    %cap = arith.constant 1024 : i64
-    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
-    %buffer = memref.alloc(%cap_index) : memref<?xi8>
-    %len = func.call @LyHost_OSErrorMessagePath(%err, %path, %path_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
     %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
@@ -185,19 +191,76 @@ module attributes {
     func.return
   }
 
-  // The two-path variant, for rename's "'src' -> 'dst'" message.
-  func.func private @__ly_posix_throw2(%err: i32, %src: memref<?xi8>, %src_len: i64, %dst: memref<?xi8>, %dst_len: i64) {
+  // The path argument is the WHOLE bytes object, and this function OWNS it.
+  //
+  // It used to take `(payload view, length)` -- the object's interior, handed
+  // round without its root -- and the caller released the root after the call.
+  // A throw does not return, so that release never ran: measured as a leak of the
+  // entire bytes block on every raising path (`io_file` leaked 83 B = 19 + 48 + 16,
+  // the block for the path that fails inside a `try`).
+  //
+  // Moving the release before the call is not the repair either: the message
+  // builder reads the payload, so freeing first would read freed memory. The
+  // object has to change hands. `ly.ownership.release_args` says so, and the
+  // release happens after the message has been copied into `%buffer` and before
+  // the throw -- the one point where both obligations hold.
+  //
+  // Taking the ROOT rather than the interior is the general rule, not a detail of
+  // this function: an entity is one allocation with one root (`__ly_bytes_alloc`
+  // allocates a single block and the header is a view of its start), so a
+  // signature that accepts the payload alone cannot free what it was given and
+  // cannot be handed ownership. Passing the two halves separately is how the
+  // release ended up somewhere the object could outlive.
+  func.func private @__ly_posix_throw(%err: i32, %path_object: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [1]} {
     %c0 = arith.constant 0 : index
     %cap_index = arith.constant 1024 : index
     %cap = arith.constant 1024 : i64
     %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %path = func.call @__ly_bytes_payload(%path_object) : (memref<6xi64>) -> memref<?xi8>
+    %path_dim = memref.dim %path, %c0 : memref<?xi8>
+    %path_len = arith.index_cast %path_dim : index to i64
+    %buffer = memref.alloc(%cap_index) : memref<?xi8>
+    %len = func.call @LyHost_OSErrorMessagePath(%err, %path, %path_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    func.call @LyBytes_DecRef(%path_object) : (memref<6xi64>) -> ()
+    func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // The two-path variant, for rename's "'src' -> 'dst'" message. Two objects,
+  // both owned, same rule as the one-path form.
+  func.func private @__ly_posix_throw2(%err: i32, %src_object: memref<6xi64> {ly.ownership.object_header}, %dst_object: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [1, 2]} {
+    %c0 = arith.constant 0 : index
+    %cap_index = arith.constant 1024 : index
+    %cap = arith.constant 1024 : i64
+    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %src = func.call @__ly_bytes_payload(%src_object) : (memref<6xi64>) -> memref<?xi8>
+    %src_dim = memref.dim %src, %c0 : memref<?xi8>
+    %src_len = arith.index_cast %src_dim : index to i64
+    %dst = func.call @__ly_bytes_payload(%dst_object) : (memref<6xi64>) -> memref<?xi8>
+    %dst_dim = memref.dim %dst, %c0 : memref<?xi8>
+    %dst_len = arith.index_cast %dst_dim : index to i64
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_OSErrorMessagePath2(%err, %src, %src_len, %dst, %dst_len, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    memref.dealloc %buffer : memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @LyBytes_DecRef(%src_object) : (memref<6xi64>) -> ()
+    func.call @LyBytes_DecRef(%dst_object) : (memref<6xi64>) -> ()
+    func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // The no-path form, for a failure with nothing to name (getcwd). A bytes object
+  // invented just to be freed would be a second way to get this wrong.
+  func.func private @__ly_posix_throw_no_path(%err: i32) {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %cap_index = arith.constant 1024 : index
+    %cap = arith.constant 1024 : i64
+    %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %empty_index = arith.constant 0 : index
+    %empty = memref.alloc(%empty_index) : memref<?xi8>
+    %buffer = memref.alloc(%cap_index) : memref<?xi8>
+    %len = func.call @LyHost_OSErrorMessagePath(%err, %empty, %zero, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+    memref.dealloc %empty : memref<?xi8>
+    func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -316,7 +379,7 @@ module attributes {
     %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
     %enc_dim = memref.dim %enc_bytes, %c0 : memref<?xi8>
     %enc_len = arith.index_cast %enc_dim : index to i64
-    func.call @__ly_posix_throw(%code, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
+    func.call @__ly_posix_throw(%code, %enc_header) : (i32, memref<6xi64>) -> ()
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
@@ -331,9 +394,18 @@ module attributes {
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_GetCwd(%buffer, %cap) : (memref<?xi8>, i64) -> i64
     %failed = arith.cmpi slt, %len, %zero : i64
+    // Kept as a region rather than blocks: nothing is TRANSFERRED here, so there is
+    // no one-per-path obligation to make visible -- the raise takes no object.
     scf.if %failed {
       %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %buffer, %zero) : (i32, memref<?xi8>, i64) -> ()
+      // The scratch buffer goes before the raise, for the same reason an object
+      // would: the dealloc below is on the path the raise does not take. It is not
+      // an object, so it is freed rather than handed over -- and the raise does not
+      // read it, since there is no path to name in a getcwd failure.
+      memref.dealloc %buffer : memref<?xi8>
+      // No path to name here: `%buffer` is the scratch getcwd was writing INTO,
+      // not an object, and passing it as one is what the old signature invited.
+      func.call @__ly_posix_throw_no_path(%err) : (i32) -> ()
     }
     %out_header, %out_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
@@ -349,10 +421,24 @@ module attributes {
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Chdir(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_posix_throw(%err, %enc_header) : (i32, memref<6xi64>) -> ()
+    // Unreachable -- the call throws -- but a terminator is required and this is
+    // what says the path ends after one transfer.
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
@@ -368,10 +454,24 @@ module attributes {
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Rmdir(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_posix_throw(%err, %enc_header) : (i32, memref<6xi64>) -> ()
+    // Unreachable -- the call throws -- but a terminator is required and this is
+    // what says the path ends after one transfer.
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
@@ -385,10 +485,24 @@ module attributes {
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Unlink(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_posix_throw(%err, %enc_header) : (i32, memref<6xi64>) -> ()
+    // Unreachable -- the call throws -- but a terminator is required and this is
+    // what says the path ends after one transfer.
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
@@ -402,10 +516,24 @@ module attributes {
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_Mkdir(%enc_bytes, %enc_len, %mode) : (memref<?xi8>, i64, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_posix_throw(%err, %enc_header) : (i32, memref<6xi64>) -> ()
+    // Unreachable -- the call throws -- but a terminator is required and this is
+    // what says the path ends after one transfer.
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
@@ -423,10 +551,22 @@ module attributes {
     %dst_len = arith.index_cast %dst_dim : index to i64
     %status = func.call @LyHost_Rename(%src_enc, %src_len, %dst_enc, %dst_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw2(%err, %src_enc, %src_len, %dst_enc, %dst_len) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_posix_throw2(%err, %src_enc_header, %dst_enc_header) : (i32, memref<6xi64>, memref<6xi64>) -> ()
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%src_enc_header) : (memref<6xi64>) -> ()
     func.call @LyBytes_DecRef(%dst_enc_header) : (memref<6xi64>) -> ()
     func.return
@@ -506,9 +646,14 @@ module attributes {
     %dir = func.call @LyHost_OpenDir(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i64
     %opened = arith.cmpi ne, %dir, %zero : i64
     %missing = arith.cmpi eq, %dir, %zero : i64
+    // Region form, unlike its siblings above: the `scf.if %opened -> i64` below
+    // YIELDS a value, so turning this function inside out into blocks means block
+    // arguments for it. The transfer is what closes the leak either way; the block
+    // form is about making one-per-path visible, and this is the one place where
+    // it would cost a control-flow rewrite to buy that.
     scf.if %missing {
       %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
+      func.call @__ly_posix_throw(%err, %enc_header) : (i32, memref<6xi64>) -> ()
     }
     %count = scf.if %opened -> i64 {
       %name = memref.alloc(%cap_index) : memref<?xi8>
@@ -655,10 +800,25 @@ module attributes {
     %value_len = arith.index_cast %value_dim : index to i64
     %status = func.call @LyHost_SetEnv(%name_enc, %name_len, %value_enc, %value_len) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %name_enc, %name_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    // The value object is not in the message, so it is released here rather than
+    // handed over -- its release in ^done is on the path this one replaces.
+    func.call @LyBytes_DecRef(%value_enc_header) : (memref<6xi64>) -> ()
+    func.call @__ly_posix_throw(%err, %name_enc_header) : (i32, memref<6xi64>) -> ()
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%name_enc_header) : (memref<6xi64>) -> ()
     func.call @LyBytes_DecRef(%value_enc_header) : (memref<6xi64>) -> ()
     func.return
@@ -673,10 +833,24 @@ module attributes {
     %enc_len = arith.index_cast %enc_dim : index to i64
     %status = func.call @LyHost_UnsetEnv(%enc_bytes, %enc_len) : (memref<?xi8>, i64) -> i32
     %failed = arith.cmpi ne, %status, %zero32 : i32
-    scf.if %failed {
-      %err = func.call @LyHost_Errno() : () -> i32
-      func.call @__ly_posix_throw(%err, %enc_bytes, %enc_len) : (i32, memref<?xi8>, i64) -> ()
-    }
+    // Explicit blocks rather than `scf.if`: the raising arm HANDS the encoded
+    // object to the thrower and the success arm releases it, so each path must
+    // carry exactly one. An `scf.if` region can structurally fall through, which
+    // reads as a transfer and a release on one path. See __ly_io_fopen in
+    // _io.mlir, where the ownership verifier refuses exactly that -- and note
+    // that it does NOT look at this file at all (a deliberate double release here
+    // compiles and crashes at runtime), so this shape is what keeps the property
+    // true rather than what a checker enforces.
+    cf.cond_br %failed, ^raise, ^done
+
+  ^raise:
+    %err = func.call @LyHost_Errno() : () -> i32
+    func.call @__ly_posix_throw(%err, %enc_header) : (i32, memref<6xi64>) -> ()
+    // Unreachable -- the call throws -- but a terminator is required and this is
+    // what says the path ends after one transfer.
+    func.return
+
+  ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     func.return
   }
