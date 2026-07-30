@@ -445,10 +445,17 @@ if(APPLE)
     #     covers the two defects INTERACTING, and it was the interaction that hid
     #     the second one (repairing the first took it from 11 roots to 2, which is
     #     when the second became visible at all).
+    #   cross_exception_field_box_slot / sequence_literal_source_move_frequency
+    #     -- found by the owned-token uniqueness verifier, not by anyone looking.
+    #     Both carried two frame-ownership tokens on one value and leaked (9 roots
+    #     / 1120 B and 3 roots / 192 B); the second is the sequence twin of the
+    #     dict literal family whose dict side was repaired earlier and which
+    #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
     set(LYTHON_LEAK_GATE_CASES
         hello dict_build str_compare iterate list_methods
         dict_literal_source_move_frequency dict_methods_complete
-        tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior)
+        tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
+        cross_exception_field_box_slot sequence_literal_source_move_frequency)
     foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
         add_test(NAME "leak.${leak_case}"
             COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"

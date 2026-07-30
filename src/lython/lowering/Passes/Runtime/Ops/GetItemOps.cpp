@@ -130,16 +130,33 @@ mlir::Operation *evidenceElementAnchor(const RuntimeValue &value) {
 // Why NOT teach `refcount-insertion` to count tokens instead: the count is not
 // what the semantics needs. Two names for one entity is one reference, so a
 // counting consumer would be maintaining a number that must always be one.
+// `anchor` is the op the new token would be placed immediately after -- the last
+// defining op of the values -- or null for the at-operation form, where `op` is
+// the insertion point.
+//
+// ⛔ The reference point is the ANCHOR, not `op`, and the first version of this
+// got it wrong. Tokens are placed after the values' defining op, which is
+// frequently in a different block from the py operation being lowered, so
+// comparing against `op` rejected the reuse and minted a second token anyway --
+// measured: three goldens still carried duplicates
+// (`sequence_literal_source_move_frequency`, `cross_exception_field_box_slot`,
+// `cross_enum_generic_handler`), two of them leaking. The anchor is sound as the
+// reference because it DEFINES the values, so it dominates every use of them
+// including `op`; a token placed just after it dominates `op` for the same
+// reason, which is what makes its results safe to use in place of a new one.
 mlir::UnrealizedConversionCastOp
 existingOwnedLocalToken(const RuntimeValue &value, mlir::Operation *op,
-                        llvm::StringRef contract) {
+                        mlir::Operation *anchor, llvm::StringRef contract) {
+  mlir::Operation *reference = anchor ? anchor : op;
   for (mlir::Operation *user : value.values.front().getUsers()) {
     auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user);
     if (!cast || !cast->hasAttr(ownership::kOwnedLocalObjectAttr))
       continue;
-    // Must reach `op`: a token minted in another block, or after this
-    // operation, is not one this read can borrow from.
-    if (cast->getBlock() != op->getBlock() || !cast->isBeforeInBlock(op))
+    if (cast->getBlock() != reference->getBlock())
+      continue;
+    // Anchored: the token to reuse is the one already sitting after the values'
+    // definition. At-operation: it has to precede this operation.
+    if (anchor ? !anchor->isBeforeInBlock(cast) : !cast->isBeforeInBlock(op))
       continue;
     auto marked = cast->getAttrOfType<mlir::StringAttr>(
         ownership::kOwnedLocalObjectContractAttr);
@@ -195,19 +212,19 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   mlir::func::FuncOp retain = RuntimeBundleLowerer::findRetainFunction();
   if (!retain || retain.getFunctionType().getNumInputs() != 1)
     return std::nullopt;
-  // ⭐ Already owned by this frame: borrow the existing token, take no second
-  // reference. See `existingOwnedLocalToken` for why a second one leaks.
-  if (mlir::UnrealizedConversionCastOp held =
-          existingOwnedLocalToken(value, op, contract)) {
-    RuntimeValue borrowed = value;
-    borrowed.values.assign(held.getResults().begin(), held.getResults().end());
-    return borrowed;
-  }
   mlir::Operation *latest = nullptr;
   if (!atOperation) {
     latest = evidenceElementAnchor(value);
     if (!latest)
       return std::nullopt;
+  }
+  // ⭐ Already owned by this frame: borrow the existing token, take no second
+  // reference. See `existingOwnedLocalToken` for why a second one leaks.
+  if (mlir::UnrealizedConversionCastOp held =
+          existingOwnedLocalToken(value, op, latest, contract)) {
+    RuntimeValue borrowed = value;
+    borrowed.values.assign(held.getResults().begin(), held.getResults().end());
+    return borrowed;
   }
   // Borrow → own: one retain on the entity root, then the owned-local marker.
   // The contract → retain relation is static; no per-contract runtime wrapper is
@@ -236,21 +253,21 @@ RuntimeBundleLowerer::rootOwnedEvidenceElement(mlir::Operation *op,
     return std::nullopt;
   if (!ownership::isObjectHeaderLikeType(value.values.front().getType()))
     return std::nullopt;
-  // Same one-token-per-value rule as the retain path. An already-owned element
-  // normally comes from a fresh runtime call and so has no prior token, but the
-  // rule is about the DOWNSTREAM map and does not care where the value came
-  // from, so it is applied here too rather than assumed not to matter.
-  if (mlir::UnrealizedConversionCastOp held =
-          existingOwnedLocalToken(value, op, contract)) {
-    RuntimeValue borrowed = value;
-    borrowed.values.assign(held.getResults().begin(), held.getResults().end());
-    return borrowed;
-  }
   mlir::Operation *latest = nullptr;
   if (!atOperation) {
     latest = evidenceElementAnchor(value);
     if (!latest)
       return std::nullopt;
+  }
+  // Same one-token-per-value rule as the retain path. An already-owned element
+  // normally comes from a fresh runtime call and so has no prior token, but the
+  // rule is about the DOWNSTREAM map and does not care where the value came
+  // from, so it is applied here too rather than assumed not to matter.
+  if (mlir::UnrealizedConversionCastOp held =
+          existingOwnedLocalToken(value, op, latest, contract)) {
+    RuntimeValue borrowed = value;
+    borrowed.values.assign(held.getResults().begin(), held.getResults().end());
+    return borrowed;
   }
   mlir::OpBuilder::InsertionGuard guard(builder);
   if (atOperation)

@@ -11,9 +11,11 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 
@@ -225,6 +227,96 @@ public:
   }
 };
 
+// ⭐ ONE OWNED TOKEN PER SSA VALUE.
+//
+// `ly.ownership.owned_local_object` marks a value the FRAME owns and must
+// release. `refcount-insertion` emits one release per marked VALUE, however many
+// times it is marked -- so two tokens on one value are two retains against one
+// release, which is a leak.
+//
+// That was assumed by the consumer and enforced nowhere until an unbounded leak
+// came out of it: reading one container slot twice reconstructs the same handle
+// and the lowering minted a token per read, so
+//
+//     n = ((1, 2), (3, 4))
+//     a = n[0]
+//     b = n[0]
+//
+// never freed the inner entity -- 2 roots / 10368 B for a two-element inner
+// tuple, 69 roots / 14656 B for a seventy-element one, and saturating, which is
+// what a per-value map looks like from the outside.
+//
+// The invariant is `proof/`'s `WFES.backed` -- every owned name occupies its OWN
+// site -- and the model had it before the leak was measured. A state invariant
+// belongs in a phase gate, not in the memory of whoever next mints a token: this
+// runs between the pass that mints tokens and the pass that consumes them.
+//
+// ⛔ DOMINANCE, not mere co-occurrence. Two markers on one value in mutually
+// exclusive blocks are FINE: exactly one retain executes, and one release is
+// emitted, so the counts balance. Rejecting those would refuse correct IR. The
+// defect is two tokens on a path that runs both, which is exactly "one dominates
+// the other" -- so that is the condition tested.
+//
+// This check found three duplicate-token goldens the producer fix had missed,
+// two of which were leaking (`cross_exception_field_box_slot` 9 roots / 1120 B,
+// `sequence_literal_source_move_frequency` 3 roots / 192 B) and one of which was
+// benign because an enum member is an immortal singleton. All three came from one
+// producer comparing against the wrong reference point; the check is what made
+// them visible rather than a guess about where else to look.
+mlir::LogicalResult verifyOwnedTokenUniquenessIn(mlir::func::FuncOp function) {
+  llvm::SmallVector<mlir::Operation *, 8> tokens;
+  function.walk([&](mlir::Operation *op) {
+    if (op->hasAttr(own::kOwnedLocalObjectAttr))
+      tokens.push_back(op);
+  });
+  if (tokens.size() < 2)
+    return mlir::success();
+  mlir::DominanceInfo dominance(function);
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    for (std::size_t j = i + 1; j < tokens.size(); ++j) {
+      mlir::Operation *a = tokens[i];
+      mlir::Operation *b = tokens[j];
+      if (a->getNumOperands() == 0 || a->getOperands() != b->getOperands())
+        continue;
+      mlir::Operation *first = dominance.dominates(a, b) ? a : b;
+      mlir::Operation *second = first == a ? b : a;
+      if (!dominance.dominates(first, second))
+        continue;
+      return second->emitError()
+             << own::kOwnedLocalObjectAttr
+             << " marks a value this frame already owns; the earlier token at "
+             << first->getLoc()
+             << " dominates this one, so both retains run and only one release "
+                "is emitted. A re-read of an entity the frame owns is a borrow: "
+                "reuse the existing token instead of minting a second";
+    }
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult verifyOwnedTokenUniquenessImpl(mlir::ModuleOp module) {
+  return walkVerify<mlir::func::FuncOp>(module, verifyOwnedTokenUniquenessIn);
+}
+
+class OwnedTokenUniquenessVerifierPass
+    : public mlir::PassWrapper<OwnedTokenUniquenessVerifierPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(OwnedTokenUniquenessVerifierPass)
+
+  llvm::StringRef getArgument() const final {
+    return "lython-owned-token-uniqueness-verifier";
+  }
+  llvm::StringRef getDescription() const final {
+    return "verify that no SSA value carries two frame-ownership tokens";
+  }
+
+  void runOnOperation() final {
+    if (mlir::failed(verifyOwnedTokenUniqueness(getOperation())))
+      signalPassFailure();
+  }
+};
+
 class LLVMCallOwnershipVerifierPass
     : public mlir::PassWrapper<LLVMCallOwnershipVerifierPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -250,6 +342,10 @@ mlir::LogicalResult verifyOwnershipContractShapes(mlir::ModuleOp module) {
   return verifyOwnershipContractShapesImpl(module);
 }
 
+mlir::LogicalResult verifyOwnedTokenUniquenessShapes(mlir::ModuleOp module) {
+  return verifyOwnedTokenUniquenessImpl(module);
+}
+
 } // namespace py::lowering
 
 namespace py {
@@ -262,6 +358,16 @@ createOwnershipVerifierPass() {
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLLVMCallOwnershipVerifierPass() {
   return std::make_unique<lowering::LLVMCallOwnershipVerifierPass>();
+}
+
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createOwnedTokenUniquenessVerifierPass() {
+  return std::make_unique<lowering::OwnedTokenUniquenessVerifierPass>();
+}
+
+mlir::LogicalResult verifyOwnedTokenUniqueness(mlir::ModuleOp module) {
+  PerfScope perf("owned-token-uniqueness");
+  return lowering::verifyOwnedTokenUniquenessShapes(module);
 }
 
 mlir::LogicalResult verifyOwnership(mlir::ModuleOp module) {

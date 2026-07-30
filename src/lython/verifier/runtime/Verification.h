@@ -39,6 +39,11 @@ preserveLoweredSafetyContracts(mlir::ModuleOp module,
 
 mlir::LogicalResult verifyOwnership(mlir::ModuleOp module);
 mlir::LogicalResult verifyLLVMCallOwnership(mlir::ModuleOp module);
+// One frame-ownership token per SSA value. Runs in the verifier phase between the
+// pass that MINTS tokens (runtime-lowering) and the one that consumes them
+// (refcount-insertion), because that is where the property has to hold. This is
+// `proof/`'s `WFES.backed` as a phase gate.
+mlir::LogicalResult verifyOwnedTokenUniqueness(mlir::ModuleOp module);
 mlir::LogicalResult verifyTypeEvidence(mlir::ModuleOp module);
 mlir::LogicalResult verifyRuntimeManifestCompleteness(mlir::ModuleOp module);
 
@@ -46,6 +51,8 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createOwnershipVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLLVMCallOwnershipVerifierPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createOwnedTokenUniquenessVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLLVMThreadSafeVerifierPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>

@@ -244,6 +244,10 @@ LogicalResult runLoweringPipeline(ModuleOp module,
 
   if (failed(runVerifierPhase("runtime-native-verifier", [&](PassManager &pm) {
         pm.addPass(createNativeVerificationPass());
+        // Between the pass that mints frame-ownership tokens and the one that
+        // consumes them: two tokens on one value are two retains against one
+        // release. `proof/`'s `WFES.backed` as a phase gate.
+        pm.addPass(createOwnedTokenUniquenessVerifierPass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "runtime-native-verifier", module);
