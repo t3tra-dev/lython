@@ -154,11 +154,21 @@ def measure(binary: pathlib.Path,
 
 def build(lyc: pathlib.Path, source: pathlib.Path, out: pathlib.Path,
           timeout: float) -> bool:
+    """Build in `out`'s directory, not the caller's.
+
+    ⛔ The docstring at the top of this file has claimed "a scratch cwd" since the
+    gate was written, and the code never changed directory. `lyc` drops an `a.out`
+    beside the working directory, so a stale one from any earlier run makes every
+    later build fail with `symbol 'main' already exists` -- reported as "could not
+    measure", which after SKIP_RETURN_CODE reads as a skip rather than a problem.
+    It cost a whole-suite survey two unmeasured cases and a diagnosis session an
+    afternoon. Now the claim is true.
+    """
     try:
         r = subprocess.run([str(lyc), str(source), "--fsanitize=leak",
                             *EXTRA_LYC_FLAGS, "-o", str(out)],
                            capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, cwd=str(out.parent))
     except subprocess.TimeoutExpired:
         return False
     if r.returncode != 0:
