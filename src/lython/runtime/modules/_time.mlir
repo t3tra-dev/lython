@@ -107,6 +107,20 @@ module attributes {
   memref.global "private" constant @__ly_time_msg_neg_sleep : memref<33xi8> = dense<[115, 108, 101, 101, 112, 32, 108, 101, 110, 103, 116, 104, 32, 109, 117, 115, 116, 32, 98, 101, 32, 110, 111, 110, 45, 110, 101, 103, 97, 116, 105, 118, 101]>
   memref.global "private" constant @__ly_time_msg_bad_time : memref<17xi8> = dense<[121, 101, 97, 114, 32, 111, 117, 116, 32, 111, 102, 32, 114, 97, 110, 103, 101]>
 
+  // The tail takes the message as a STRING OBJECT, which is what lets a caller
+  // that had to build its message in a heap buffer free that buffer before the
+  // throw. `__ly_time_throw` below keeps the byte-view form for the common case of
+  // a static global, where there is nothing to free.
+  //
+  // The string is not released here: `LyBaseException_Init` declares
+  // `transfer_args` for it, so the exception takes it.
+  func.func private @__ly_time_throw_str(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) {
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
   func.func private @__ly_time_throw(%class_id: i64, %message: memref<?xi8>, %length: i64) {
     %c0 = arith.constant 0 : index
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
@@ -119,15 +133,14 @@ module attributes {
   func.func private @__ly_time_raise_neg_sleep() {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c33 = arith.constant 33 : index
     %len = arith.constant 33 : i64
     %class_id = arith.constant 53 : i64
-    %buffer = memref.alloc(%c33) : memref<?xi8>
+    // The message is a static global, so it is passed as a view rather than copied
+    // into a heap buffer first. The copy was the leak: nothing frees it, and the
+    // throw below does not return. `__ly_io_raise` has always been called with a
+    // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_time_msg_neg_sleep : memref<33xi8>
-    scf.for %i = %c0 to %c33 step %c1 {
-      %byte = memref.load %text[%i] : memref<33xi8>
-      memref.store %byte, %buffer[%i] : memref<?xi8>
-    }
+    %buffer = memref.cast %text : memref<33xi8> to memref<?xi8>
     func.call @__ly_time_throw(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
@@ -135,15 +148,14 @@ module attributes {
   func.func private @__ly_time_raise_bad_time() {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c17 = arith.constant 17 : index
     %len = arith.constant 17 : i64
     %class_id = arith.constant 53 : i64
-    %buffer = memref.alloc(%c17) : memref<?xi8>
+    // The message is a static global, so it is passed as a view rather than copied
+    // into a heap buffer first. The copy was the leak: nothing frees it, and the
+    // throw below does not return. `__ly_io_raise` has always been called with a
+    // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_time_msg_bad_time : memref<17xi8>
-    scf.for %i = %c0 to %c17 step %c1 {
-      %byte = memref.load %text[%i] : memref<17xi8>
-      memref.store %byte, %buffer[%i] : memref<?xi8>
-    }
+    %buffer = memref.cast %text : memref<17xi8> to memref<?xi8>
     func.call @__ly_time_throw(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
@@ -154,9 +166,15 @@ module attributes {
     %cap_index = arith.constant 256 : index
     %cap = arith.constant 256 : i64
     %class_id = func.call @LyHost_OSErrorClassId(%err) : (i32) -> i64
+    %c0 = arith.constant 0 : index
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_OSErrorMessage(%err, %buffer, %cap) : (i32, memref<?xi8>, i64) -> i64
-    func.call @__ly_time_throw(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    // A real buffer this time, so the string object is built here and the buffer
+    // freed before the throw -- `__ly_time_throw` could not free it, because its
+    // other callers hand it a static global.
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    memref.dealloc %buffer : memref<?xi8>
+    func.call @__ly_time_throw_str(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 

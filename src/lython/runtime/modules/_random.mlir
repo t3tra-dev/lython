@@ -97,15 +97,14 @@ module attributes {
   func.func private @__ly_random_raise_empty() {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c24 = arith.constant 24 : index
     %len = arith.constant 24 : i64
     %class_id = arith.constant 53 : i64
-    %buffer = memref.alloc(%c24) : memref<?xi8>
+    // The message is a static global, so it is passed as a view rather than copied
+    // into a heap buffer first. The copy was the leak: nothing frees it, and the
+    // throw below does not return. `__ly_io_raise` has always been called with a
+    // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_random_msg_empty : memref<24xi8>
-    scf.for %i = %c0 to %c24 step %c1 {
-      %byte = memref.load %text[%i] : memref<24xi8>
-      memref.store %byte, %buffer[%i] : memref<?xi8>
-    }
+    %buffer = memref.cast %text : memref<24xi8> to memref<?xi8>
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
@@ -134,6 +133,13 @@ module attributes {
       memref.store %byte, %buffer[%dest] : memref<?xi8>
     }
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    // This one really needs a buffer -- it joins two globals -- so it is freed as
+    // soon as the string object has copied it, and BEFORE the throw, which does
+    // not return. The sibling above passes a global view instead and has nothing
+    // to free; deallocating THAT is a free of a non-heap pointer, which is how
+    // this landed in the wrong function once (SIGABRT, caught by the leak gate
+    // refusing to measure a program that does not exit 0 on its own).
+    memref.dealloc %buffer : memref<?xi8>
     %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
