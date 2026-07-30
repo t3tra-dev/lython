@@ -241,10 +241,31 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
           op, op.getName(), *valueTypes, values)))
     return mlir::failure();
   // The reader takes its own reference so a later rebinding of the global
-  // cannot release the object out from under it.
-  if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-          op.getOperation(), type, values, "module.global")))
-    return mlir::failure();
+  // cannot release the object out from under it -- AND records that the frame
+  // is the holder, which is what makes `refcount-insertion` give it back.
+  //
+  // Why NOT `retainAggregateSlot` here, which is what this did: that helper
+  // emits the retain alone. It is the SLOT idiom -- the reference it takes
+  // belongs to the aggregate being stored into, so the store is the record and
+  // no frame token is wanted. Nothing is stored here; the reader is the holder,
+  // and a retain with no holder recorded is a leak by construction. Measured:
+  // one reference per object-global read, so `ORIGIN.x + ORIGIN.y` left the
+  // instance at 3 and the rebinding release could not reach 0.
+  if (ownership::isObjectHeaderLikeType(values.front().getType())) {
+    std::optional<RuntimeValue> owned =
+        RuntimeBundleLowerer::retainEvidenceElement(
+            op.getOperation(), RuntimeValue::object(type, values),
+            /*atOperation=*/true);
+    // Not a fall-back to the borrowed binding: for a header-fronted global the
+    // reference IS required, so a missing retain primitive has to be reported
+    // rather than quietly dropped back to the shape that leaks.
+    if (!owned)
+      return op.emitError()
+             << "module global '" << op.getName() << "' of " << type
+             << " has no runtime retain primitive, so a read cannot take the "
+                "reference that protects it from a later rebinding";
+    values.assign(owned->values.begin(), owned->values.end());
+  }
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
           op.getOperation(), type, values, result,
