@@ -314,6 +314,36 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
       ownedLocalRoot = mlir::isa<mlir::UnrealizedConversionCastOp>(rootDef) &&
                        rootDef->hasAttr(ownership::kOwnedLocalObjectAttr);
 
+  // ⭐ The lane group IS this clone's entry argument group -- `yield v` for an
+  // object PARAMETER -- so the borrowed-entry return rule takes the reference
+  // and this must not take a second one.
+  //
+  // `refcount-insertion` retains any owned result group that is (or derives
+  // from) the entry arguments, and the affine-ownership verifier holds that
+  // obligation to EXACTLY ONE retained token per borrowed entry argument at an
+  // owned return -- counting only the unmarked retain, because an
+  // `ly.ownership.aggregate_retain` discharges a SLOT obligation, and a return
+  // value is not a slot. So a retain here was a second reference with no
+  // release: the whole yielded entity leaked once per generator built (measured
+  // 41 B for a one-character str argument, 8264 B for a list), and
+  // `itertools.repeat` -- whose synthesized body is exactly
+  // `while ...: yield o` over a parameter -- carried it into
+  // `itertools_value_position`.
+  //
+  // Dropping a retain is the dangerous direction in general, which is why the
+  // verifier is what makes it safe here: if the borrowed-entry rule does NOT
+  // fire where this predicts it will, the exactly-one check refuses the build
+  // ("returned as owned without a dominating retain") instead of shipping a
+  // reference nobody took.
+  //
+  // Why NOT when `forceRetain`: that flags the SAME value carried by two lanes,
+  // and two lanes are two references however the first one was obtained.
+  bool borrowedEntryReturn = false;
+  if (!forceRetain && !bundle.physicalValues().empty())
+    if (auto function = op->getParentOfType<mlir::func::FuncOp>())
+      borrowedEntryReturn = ownership::valueGroupEqualsEntryArgumentGroup(
+          function, bundle.physicalValues());
+
   bool bundleIsNone = bundle.contractName() == "types.NoneType";
   if (bundleIsNone) {
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead =
@@ -338,7 +368,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
                << lane.physicalCount;
       if ((forceRetain ||
            (bundle.objectValue.ownership != ownership::OwnershipKind::Own &&
-            !ownedLocalRoot)) &&
+            !ownedLocalRoot && !borrowedEntryReturn)) &&
           mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
               op, bundle, "generator yield lane")))
         return mlir::failure();
@@ -405,7 +435,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
                           << lane.physicalCount;
   if ((forceRetain ||
        (bundle.objectValue.ownership != ownership::OwnershipKind::Own &&
-        !ownedLocalRoot)) &&
+        !ownedLocalRoot && !borrowedEntryReturn)) &&
       mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
           op, bundle, "generator yield lane")))
     return mlir::failure();
