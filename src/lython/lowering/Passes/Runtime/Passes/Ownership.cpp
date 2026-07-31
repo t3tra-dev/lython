@@ -490,6 +490,66 @@ bool consumeIsAggregateRelease(mlir::OpOperand &use) {
   return use.getOwner()->hasAttr(own::kAggregateReleaseAttr);
 }
 
+// The buffer a retain argument was spelled from: retains take a header PREFIX,
+// so the call operand is a cast or subview of the entity root, not the root.
+mlir::Value retainSpellingRoot(mlir::Value value) {
+  value = own::underlyingObjectValue(value);
+  // Bounded: each hop moves to the view's source; the cap keeps malformed IR
+  // from spinning here.
+  for (unsigned step = 0; step < 8; ++step) {
+    mlir::Operation *definition = value.getDefiningOp();
+    if (auto cast = mlir::dyn_cast_or_null<mlir::memref::CastOp>(definition)) {
+      value = cast.getSource();
+      continue;
+    }
+    if (auto view = mlir::dyn_cast_or_null<mlir::memref::SubViewOp>(definition)) {
+      value = view.getSource();
+      continue;
+    }
+    break;
+  }
+  return own::underlyingObjectValue(value);
+}
+
+// ⭐ A `py.incref` the EMITTER already placed in this block for this header --
+// its loop-edge token ledger paying for a lane the edge is about to fill.
+//
+// `t = base` inside a loop acquires a token for `t`'s lane, and the emitter
+// knows it must: base's creation token stays claimed by the pre-loop local that
+// still binds it, so the ledger mints one (EmitterLoops.cpp, "must not steal
+// base's token"). The borrow-edge rule below then reaches the same conclusion
+// from the other side -- the incoming value is owned and does not die on the
+// edge -- and lends a SECOND token. One release, two retains: the entity leaked
+// once per loop, 41 B for `loop_alias_carry`'s one-character str and 52 B three
+// times over in `stdlib_json_build`, whose `_object_keys` dedupe is the same
+// `j = m` shape hidden behind a heap int.
+//
+// The evidence is consumed, not just observed: `credited` holds the increfs
+// already spent on another lane of the same edge, so two lanes acquiring the
+// same header still get one token each.
+mlir::func::CallOp
+emitterLaneIncrefInBlock(mlir::Block *block, mlir::Value header,
+                         mlir::func::FuncOp retainFunction,
+                         const llvm::DenseSet<mlir::Operation *> &credited) {
+  if (!block || !header || !retainFunction)
+    return nullptr;
+  mlir::Value root = retainSpellingRoot(header);
+  if (!root)
+    return nullptr;
+  for (mlir::Operation &op : *block) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+    if (!call || call.getCallee() != retainFunction.getSymName() ||
+        call.getNumOperands() != 1 || credited.contains(call.getOperation()))
+      continue;
+    auto label = call->getAttrOfType<mlir::StringAttr>(own::kAggregateRetainAttr);
+    if (!label || !label.getValue().ends_with(":py.incref"))
+      continue;
+    if (retainSpellingRoot(call.getOperand(0)) == root)
+      return call;
+  }
+  return nullptr;
+}
+
 mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
   if (!lhs)
     return rhs;
@@ -2406,6 +2466,9 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     changed = false;
     llvm::SmallVector<mlir::Value, 8> toRemove;
     edgeRetains.clear();
+    // Per pass over the candidate set: an emitter incref may pay for only one
+    // lane, and the set is rebuilt because the candidates are.
+    llvm::DenseSet<mlir::Operation *> creditedIncrefs;
     for (auto &entry : candidates) {
       Candidate &candidate = entry.second;
       auto firstArg = mlir::cast<mlir::BlockArgument>(candidate.args.front());
@@ -2452,7 +2515,15 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
           }
           if (!sound)
             break;
-          if (transfers) {
+          mlir::func::CallOp lane =
+              transfers ? nullptr
+                        : emitterLaneIncrefInBlock(pred, header, retainFunction,
+                                                   creditedIncrefs);
+          if (transfers || lane) {
+            // A lane the emitter's ledger already paid for is a transfer: the
+            // token it minted belongs to the destination argument.
+            if (lane)
+              creditedIncrefs.insert(lane.getOperation());
             anyTransfer = true;
           } else if (retainFunction && header &&
                      ownership::isObjectHeaderLikeType(header.getType())) {
