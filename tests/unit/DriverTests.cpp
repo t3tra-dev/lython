@@ -1,4 +1,5 @@
 #include "Driver.h"
+#include "DriverCodeGen.h"
 
 #include "embedded.h"
 
@@ -95,6 +96,47 @@ TEST(DriverTest, CompilesHelloToVerifiedLLVMIR) {
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   ASSERT_TRUE(result.verified.llvmModule);
   EXPECT_NE(result.verified.llvmModule->getFunction("__main__"), nullptr);
+}
+
+// A Python `def main()` still links as an executable.
+//
+// The AOT entry point installs a C `main`, and the user's function is lowered
+// under its Python name, so the two collided and the driver refused the program
+// with "symbol 'main' already exists". `def main()` is the single most ordinary
+// function name in Python, and it compiled under JIT the whole time -- the two
+// output modes disagreed on a valid program.
+//
+// Why here and not in the leak gate (the only other stage that links AOT): that
+// gate reports an unbuildable subject as "could not measure", which ctest maps
+// to SKIP. A regression of this would turn it green-by-omission rather than red.
+TEST(DriverTest, InstallsAOTEntryPointBesideAPythonMain) {
+  CompileResult result = compileSource("def main() -> None:\n"
+                                       "    print(\"hi\")\n"
+                                       "\n"
+                                       "main()\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+  llvm::Function *pythonMain = result.verified.llvmModule->getFunction("main");
+  ASSERT_NE(pythonMain, nullptr);
+  ASSERT_FALSE(pythonMain->isDeclaration());
+
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::installAOTEntryPoint(
+      *result.verified.llvmModule, diag)))
+      << diagnostics;
+
+  // The C entry is the one now named `main`, and it is the (i32, ptr) -> i32
+  // one the linker needs -- not the Python function that used to hold the name.
+  llvm::Function *entry = result.verified.llvmModule->getFunction("main");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->arg_size(), 2u);
+  EXPECT_TRUE(entry->getReturnType()->isIntegerTy(32));
+  EXPECT_NE(entry, pythonMain);
+  // The Python function is still in the module, still called: renaming moved
+  // the symbol, it did not drop the definition.
+  EXPECT_FALSE(pythonMain->isDeclaration());
+  EXPECT_FALSE(pythonMain->use_empty());
 }
 
 TEST(DriverTest, ReportsParseErrorDiagnostics) {

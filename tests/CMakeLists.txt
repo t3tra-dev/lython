@@ -177,7 +177,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
     "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
-    "DriverTest.RepeatedCompileIsStable")
+    "DriverTest.RepeatedCompileIsStable"
+    "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")
@@ -479,7 +480,8 @@ set(LYTHON_LEAK_GATE_CASES
     tuple_duplicate_element class_protocol
     class_field_store_inline_independent loop_alias_carry stdlib_json_build
     io_seek scalar_ops cross_float_range_contracts_fields
-    loop_iterator_element_into_container_literal dict_iteration_views)
+    loop_iterator_element_into_container_literal dict_iteration_views
+    comprehension)
 foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
     add_test(NAME "leak.${leak_case}"
         COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"

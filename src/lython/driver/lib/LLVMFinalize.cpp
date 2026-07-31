@@ -60,11 +60,26 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
   }
 
   if (llvm::Function *existing = llvmModule.getFunction("main")) {
-    if (!existing->isDeclaration()) {
-      diag << "error: cannot build executable: symbol 'main' already exists\n";
-      return failure();
+    if (existing->isDeclaration()) {
+      existing->eraseFromParent();
+    } else {
+      // `def main()` IS the ordinary Python idiom, and the definition standing
+      // here is the user's function, not a second C entry: the C one is created
+      // below and there is nothing else in the module that could have claimed
+      // the name. Move it aside instead of refusing the program.
+      //
+      // Renaming is safe because LLVM references are by Value*, not by symbol
+      // name -- every call site keeps pointing at the same Function -- and the
+      // symbol has no external meaning: a Python function is reached through
+      // this module's own calls, never through the C name.
+      //
+      // Why NOT mangle Python function symbols in the emitter instead: the
+      // clash exists only in the AOT link, since JIT installs no C `main`, so
+      // mangling would rename a symbol everywhere for a conflict that arises in
+      // one of the two output modes -- and that name is what `--emit-llvm`
+      // output and every backtrace are read by.
+      existing->setName("__ly_py_main");
     }
-    existing->eraseFromParent();
   }
   constexpr llvm::StringLiteral kAOTEntryThunkName = "__lython_aot_entry";
   if (llvm::Function *existing = llvmModule.getFunction(kAOTEntryThunkName)) {
