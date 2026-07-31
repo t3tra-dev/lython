@@ -8,6 +8,18 @@ Runs `lyc jit <case.py>` and verifies against sidecar files next to the case:
 --exit-only N skips sidecar lookup and only checks the exit code; ctest uses
 it to smoke-run examples/ without adding expectation files there.
 
+--aot builds an executable and runs it instead of JIT-ing, and --release passes
+`--release` to lyc. Both are checked against the SAME sidecars by the SAME code
+below: what they pin is that the other output mode and the release
+configuration agree with the one the suite already believes. Reimplementing the
+contract per mode is how they would drift, and the drift is not hypothetical --
+a `def main()` was unbuildable as an executable while passing under JIT,
+because nothing but the leak gate ever linked one.
+
+--aot needs a scratch directory of its own: lyc writes the executable where it
+is told but a case may write files into the working directory, and two of those
+running under -j8 in one directory is a race.
+
 --timeout S bounds the lyc run; exceeding it is reported as its own failure
 reason rather than as differing output.
 
@@ -33,6 +45,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 PERF_LINE = re.compile(r"^\[LYTHON_PERF\] phase=(\S+)")
 
@@ -76,13 +89,45 @@ def strip_perf(stderr: str) -> str:
     return "".join(line + "\n" for line in kept)
 
 
+def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
+            env: "dict[str, str]", release: bool
+            ) -> "subprocess.CompletedProcess[str] | None":
+    """Build an executable, then run it. Failure to BUILD is returned as the
+    result, so the caller reports it as this case failing rather than as a
+    missing measurement -- the shape that let an unbuildable `def main()` sit in
+    the suite while the leak gate skipped it."""
+    with tempfile.TemporaryDirectory() as scratch:
+        binary = pathlib.Path(scratch) / "prog"
+        command = [str(lyc), str(case)]
+        if release:
+            command.append("--release")
+        command += ["-o", str(binary)]
+        try:
+            built = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=timeout, env=env,
+                                   stdin=subprocess.DEVNULL, cwd=scratch)
+        except subprocess.TimeoutExpired:
+            return None
+        if built.returncode != 0:
+            return built
+        try:
+            return subprocess.run([str(binary)], capture_output=True,
+                                  text=True, timeout=timeout, env=env,
+                                  stdin=subprocess.DEVNULL, cwd=scratch)
+        except subprocess.TimeoutExpired:
+            return None
+
+
 def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
-            perf: bool) -> "subprocess.CompletedProcess[str] | None":
+            perf: bool, aot: bool = False, release: bool = False
+            ) -> "subprocess.CompletedProcess[str] | None":
     env = dict(os.environ)
     if perf:
         env["LYTHON_PERF"] = "1"
     else:
         env.pop("LYTHON_PERF", None)
+    if aot:
+        return run_aot(lyc, case, timeout, env, release)
     try:
         # stdin=DEVNULL, not inherited: a case calling input() blocks until its
         # stdin reaches EOF, and whether the ambient stdin ever does is a
@@ -92,8 +137,12 @@ def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
         # separate investigations after contention, build type and thread
         # starvation. DEVNULL is at EOF immediately, so input() raises EOFError
         # deterministically, which is what such a case is pinning anyway.
-        return subprocess.run([str(lyc), "jit", str(case)], capture_output=True,
-                              text=True, timeout=timeout, env=env,
+        command = [str(lyc), "jit"]
+        if release:
+            command.append("--release")
+        command.append(str(case))
+        return subprocess.run(command, capture_output=True, text=True,
+                              timeout=timeout, env=env,
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None
@@ -128,10 +177,14 @@ def fail(message: str, stdout: str, stderr: str, where: str = "") -> int:
     return 1
 
 
-def report_reached_layer(lyc: pathlib.Path, case: pathlib.Path,
-                         timeout: float) -> None:
-    """Say which stage the compiler reached, so a red test localizes itself."""
-    result = run_lyc(lyc, case, timeout, perf=True)
+def report_reached_layer(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
+                         aot: bool = False, release: bool = False) -> None:
+    """Say which stage the compiler reached, so a red test localizes itself.
+
+    The re-run repeats the MODE as well as the case: a JIT re-run of an --aot
+    failure would report a stage the failing run never went through.
+    """
+    result = run_lyc(lyc, case, timeout, perf=True, aot=aot, release=release)
     if result is None:
         print("--- reached layer: unknown, the LYTHON_PERF re-run timed out",
               file=sys.stderr)
@@ -156,6 +209,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--expect-layer", choices=DECLARABLE_LAYERS,
                         default=None)
+    parser.add_argument("--aot", action="store_true")
+    parser.add_argument("--release", action="store_true")
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
 
@@ -163,7 +218,8 @@ def main() -> int:
     # nonzero, so ctest labels the run "Failed" exactly like a wrong-output
     # case and the report gives no hint that the budget was the cause.
     result = run_lyc(args.lyc, args.case, args.timeout,
-                     perf=args.expect_layer is not None)
+                     perf=args.expect_layer is not None, aot=args.aot,
+                     release=args.release)
     if result is None:
         # Why no layer report here: the re-run would spend the same budget
         # over again and end the same way.
@@ -181,7 +237,8 @@ def main() -> int:
     def failed(message: str, where: str = "") -> int:
         code = fail(message, stdout, stderr, where)
         if args.expect_layer is None:
-            report_reached_layer(args.lyc, args.case, args.timeout)
+            report_reached_layer(args.lyc, args.case, args.timeout,
+                                 aot=args.aot, release=args.release)
         else:
             print(f"--- reached layer: {reached}", file=sys.stderr)
         return code

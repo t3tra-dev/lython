@@ -39,7 +39,14 @@
 #             does not move it. Separate from `slow` on purpose: merged, a
 #             compiler fix would look like it had not worked
 #
-#   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak
+#   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak,
+#                 aot, release
+#
+#   `aot` and `release` are agreement stages: the same cases and the same
+#   sidecars as the JIT golden, through the other output mode and through
+#   the verifier-less configuration. They assert nothing new about the
+#   program, only that those two answer the same way -- which is a claim
+#   nothing made until a `def main()` turned out to be unbuildable.
 #
 #   `leak` is the one suite that measures something no other label can observe:
 #   allocation reachable at exit, via LeakSanitizer on an AOT binary, minus the
@@ -515,6 +522,91 @@ if(LYTHON_GOLDEN_DECLARED_LAYERS)
         "tests/golden/layers.txt declares stages for cases that do not "
         "exist: ${layer_orphans}")
 endif()
+
+# --- AOT agreement and --release agreement -----------------------------------
+#
+# The golden suite runs `lyc jit`. Until now the ONLY stage that linked an
+# executable was the leak gate, and it checks the exit code and nothing else --
+# so `def main()`, the most ordinary function name in Python, was unbuildable as
+# an executable while `golden.cases.comprehension` passed. The gate could not
+# have caught it either: an unbuildable subject is "could not measure" there,
+# which ctest maps to SKIP.
+#
+# `--release` had it worse: it appears in golden docstrings and probe scripts and
+# in no ctest test at all. It is the configuration that turns the verifier phases
+# off, i.e. the one a user ships.
+#
+# Both stages run the SAME runner against the SAME sidecars as the JIT test.
+# What they assert is agreement -- that the other output mode and the release
+# configuration produce the bytes the suite already believes -- so a divergence
+# names itself instead of appearing as an unrelated failure somewhere else.
+#
+# ⭐ SELECTED BY MECHANISM, NOT BY COUNT. Each AOT member below is the cheapest
+# case that reaches one thing the AOT path does and the JIT path does not
+# (tools/CLI.cpp): link the native runtime into the module, rewrite the
+# exception personality, install the C entry point, run the coro lowering, and
+# hand the whole thing to a target machine. A subset picked by "the first N
+# alphabetically" would cover whichever of those the alphabet happened to hit.
+#
+# Whole-suite AOT was measured instead of assumed: all 297 cases agree today
+# (rfc/test-suite-debt.md). What these members buy is not the finding, it is the
+# guard -- a sweep that was green once and a test that stays red are different
+# things, which is the whole reason `def main()` survived.
+set(LYTHON_AOT_AGREEMENT_CASES
+    # installAOTEntryPoint: a Python `def main()` beside the C entry point.
+    comprehension
+    # The floor: native runtime link plus the LyRunPythonMain return path, on
+    # the smallest program the suite has.
+    hello
+    # rewriteExceptionPersonalityForTarget, and the invoke/landingpad wiring the
+    # personality is for: this one raises out of a loop body inside a try.
+    dict_iteration_views
+    # The C entry's non-zero return path. The leak gate refuses this case by
+    # construction (it requires exit 0), so nothing else links it AOT.
+    sys_exit
+    # runLLVMCoroLowering, which runs in the AOT LLVM pipeline.
+    generator_close_finally
+    # Embedded stdlib modules linked into the executable rather than resolved by
+    # the JIT.
+    stdlib_json_build
+    # Method symbols (`__ly_method$...`) as the object linker sees them.
+    class_protocol)
+
+# `--release` skips every verifier phase and, with it,
+# collectLinkedLLVMSafetyContracts. The members are the cases whose own
+# docstrings make a claim about release mode -- the authors who thought about
+# the configuration are the ones who left something to check -- plus `hello` as
+# the floor.
+set(LYTHON_RELEASE_AGREEMENT_CASES
+    hello
+    set_one_lane_interior
+    sequence_literal_source_move_frequency
+    list_merge_arg_loop_release
+    dict_literal_source_move_frequency
+    try_structural_rebind
+    ownership_borrowed_container_grow)
+
+function(lython_add_agreement_case kind case_name extra_arg)
+    set(case_path "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${case_name}.py")
+    if(NOT EXISTS "${case_path}")
+        message(FATAL_ERROR
+            "LYTHON_${kind} names ${case_name}, which is not a golden case. "
+            "A stale entry asserts nothing while looking like coverage.")
+    endif()
+    string(TOLOWER "${kind}" suite)
+    add_test(NAME "golden.${suite}.${case_name}"
+        COMMAND Python3::Interpreter "${LYTHON_GOLDEN_RUNNER}"
+            --lyc $<TARGET_FILE:lyc> --timeout 300 ${extra_arg} "${case_path}")
+    set_tests_properties("golden.${suite}.${case_name}" PROPERTIES
+        TIMEOUT 360 LABELS "e2e;${suite}")
+endfunction()
+
+foreach(case_name IN LISTS LYTHON_AOT_AGREEMENT_CASES)
+    lython_add_agreement_case(aot "${case_name}" --aot)
+endforeach()
+foreach(case_name IN LISTS LYTHON_RELEASE_AGREEMENT_CASES)
+    lython_add_agreement_case(release "${case_name}" --release)
+endforeach()
 
 # --- examples/ smoke tests (exit code only) ----------------------------------
 # examples/ stays a user-facing sample directory: no expectation files are
