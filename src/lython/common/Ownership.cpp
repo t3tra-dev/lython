@@ -1090,6 +1090,15 @@ bool ownedLocalTokenSplitAblated() {
   return ablated;
 }
 
+bool perReferenceReleaseLabels() {
+  static const bool ablated = [] {
+    auto value =
+        llvm::sys::Process::GetEnv("LYTHON_ABLATE_REFERENCE_RELEASE");
+    return value && !value->empty() && *value != "0";
+  }();
+  return !ablated;
+}
+
 bool unwindTracksMintedTokensSeparately() {
   static const bool ablated = [] {
     auto value =

@@ -221,6 +221,16 @@ struct TrackedResource {
   // count (`callReleasesForeignAggregate`). False for every other resource, which
   // leaves those walks unchanged.
   bool retainRootedLocal = false;
+  // Is this resource an increment of its OWN, so a release NAMING another
+  // reference on the same entity cannot be its death? True for a retain-minted
+  // marker and for an owned call result (one reference per owned result); false
+  // for a marker that republishes a reference the frame already holds, which
+  // shares that one and must keep reading its release as its own.
+  //
+  // Only `own::kReferenceReleaseAttr` is read through this. The aggregate label
+  // keeps the narrower `retainRootedLocal` gate -- see
+  // `callReleasesForeignAggregate`.
+  bool ownsReference = false;
   // Does some call release this group under one of ITS OWN names? If it does,
   // an aliasing aggregate release is redundant credit and must not also be read
   // as this token's death; if it does not, that aggregate release is the only
@@ -266,11 +276,27 @@ struct TrackedResource {
 // A BARE release names some local token and neither pass can tell which, so the
 // only safe reading of one is "this token". `aggregate_release` is the one label
 // that decides the question from the proof kernel rather than from a guess.
+//
+// TWO LABELS, TWO CLAIMS, AND THE GATES DIFFER. `aggregate_release` says "this
+// discharges the CONTAINER's token", which is foreign only to a retain-MINTED
+// token: a TRANSFERRED source has it as its only death (a module global's
+// initializer hands its construction straight to the global, so the global's
+// teardown release IS that discharge), and letting an owned call result skip one
+// double-freed every enum member in `cross_enum_generic_handler`.
+// `own::kReferenceReleaseAttr` says "this discharges exactly the reference my
+// operands name" -- a statement about the release, not about the reader -- so
+// any resource holding an increment of its own may act on it. The placer splits
+// them the same way; a disagreement here would void the proof.
 bool callReleasesForeignAggregate(
-    bool retainRootedLocal,
+    bool retainRootedLocal, bool ownsReference,
     std::initializer_list<llvm::ArrayRef<mlir::Value>> ourNames,
     mlir::func::CallOp call) {
-  if (!retainRootedLocal || !call->hasAttr(own::kAggregateReleaseAttr))
+  bool foreignAggregate =
+      retainRootedLocal && call->hasAttr(own::kAggregateReleaseAttr);
+  bool foreignReference = ownsReference &&
+                          own::perReferenceReleaseLabels() &&
+                          call->hasAttr(own::kReferenceReleaseAttr);
+  if (!foreignAggregate && !foreignReference)
     return false;
   for (mlir::Value operand : call.getOperands())
     for (llvm::ArrayRef<mlir::Value> names : ourNames)
@@ -1270,10 +1296,11 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
     if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
       bool consumes = callConsumesGroup(contracts, call, group, aliases);
-      if (consumes && callReleasesForeignAggregate(
-                          resource.retainRootedLocal &&
-                              resource.hasOwnNamedRelease,
-                          {group, resource.views}, call))
+      if (consumes &&
+          callReleasesForeignAggregate(
+              resource.retainRootedLocal && resource.hasOwnNamedRelease,
+              resource.ownsReference && resource.hasOwnNamedRelease,
+              {group, resource.views}, call))
         continue;
       bool retains = callRetainsGroup(contracts, call, group, aliases);
       if (callPartiallyConsumesGroup(contracts, call, group, aliases))
@@ -2402,10 +2429,12 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
 
       // A release written under the other token's name is invisible here
       // (`callReleasesForeignAggregate`).
-      if (mentionsTracked && resource.retainRootedLocal) {
+      if (mentionsTracked &&
+          (resource.retainRootedLocal || resource.ownsReference)) {
         if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
           if (callReleasesForeignAggregate(
                   resource.retainRootedLocal && resource.hasOwnNamedRelease,
+                  resource.ownsReference && resource.hasOwnNamedRelease,
                   {state.group, state.views, state.previous, state.stale},
                   call) &&
               callConsumesGroup(contracts, call, state.group, aliases)) {
@@ -2870,6 +2899,20 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
   auto advance = [&](own::ResourceGroup &group) {
     own::advanceGroupLanesThroughReRoots(contracts, function, group, aliases);
   };
+  // See `TrackedResource::hasOwnNamedRelease`: without a release of its own the
+  // foreign one is the only release this resource has, and disowning it would
+  // report a leak that is not there.
+  auto noteOwnNamedRelease = [](TrackedResource &resource,
+                                const own::RuntimeDeallocator *deallocator) {
+    if (!resource.ownsReference || !deallocator)
+      return;
+    llvm::StringRef name = mlir::func::FuncOp(deallocator->function).getName();
+    for (mlir::Value value : resource.group)
+      for (mlir::OpOperand &use : value.getUses())
+        if (auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner()))
+          if (call.getCallee() == name)
+            resource.hasOwnNamedRelease = true;
+  };
 
   function.walk([&](mlir::Operation *op) {
     if (!op->hasAttr(own::kOwnedLocalObjectAttr))
@@ -2882,14 +2925,8 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
                             std::move(group.views));
       resources.back().retainRootedLocal =
           own::ownedLocalMarkerIsRetainRooted(op, aliases);
-      if (resources.back().retainRootedLocal && group.deallocator) {
-        mlir::func::FuncOp deallocator = group.deallocator->function;
-        for (mlir::Value value : resources.back().group)
-          for (mlir::OpOperand &use : value.getUses())
-            if (auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner()))
-              if (call.getCallee() == deallocator.getName())
-                resources.back().hasOwnNamedRelease = true;
-      }
+      resources.back().ownsReference = resources.back().retainRootedLocal;
+      noteOwnNamedRelease(resources.back(), group.deallocator);
       return;
     }
     if (!op->hasAttr(own::kOwnedLocalObjectContractAttr) &&
@@ -2910,6 +2947,8 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
       appendTrackedResource(resources, function, call.getOperation(),
                             group.offset, std::move(group.values),
                             group.condition, std::move(group.views));
+      resources.back().ownsReference = own::perReferenceReleaseLabels();
+      noteOwnNamedRelease(resources.back(), group.deallocator);
     }
   });
 

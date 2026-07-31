@@ -487,7 +487,59 @@ bool ownershipConsumingUseInvalidatesGroup(FuncContractCache &contracts,
 // a bounded leak on paths where a bare release is the only competing consume;
 // the wide rule's is a double free.
 bool consumeIsAggregateRelease(mlir::OpOperand &use) {
-  return use.getOwner()->hasAttr(own::kAggregateReleaseAttr);
+  return use.getOwner()->hasAttr(own::kAggregateReleaseAttr) ||
+         (own::perReferenceReleaseLabels() &&
+          use.getOwner()->hasAttr(own::kReferenceReleaseAttr));
+}
+
+// Emit `group`'s release at the builder's insertion point.
+//
+// `ownsReference` is the claim `own::kReferenceReleaseAttr` records: true when
+// the group holds an increment of its own, so this release discharges exactly
+// the reference its operands name.
+//
+// Not stamped when the label is ablated: an attribute is still IR, and two
+// otherwise identical release calls that differ by one stop being
+// interchangeable downstream -- with every reader off, the stamp ALONE changed
+// what `loop_iterator_element_into_container_literal` compiled to, which would
+// have made the A/B measure the wrong thing.
+mlir::func::CallOp emitGroupRelease(mlir::OpBuilder &builder, mlir::Location loc,
+                                    const own::ResourceGroup &group,
+                                    mlir::ValueRange values,
+                                    bool ownsReference) {
+  auto call = mlir::func::CallOp::create(builder, loc,
+                                         group.deallocator->function, values);
+  if (ownsReference && own::perReferenceReleaseLabels())
+    call->setAttr(own::kReferenceReleaseAttr, builder.getUnitAttr());
+  return call;
+}
+
+// IS THIS NAME ANOTHER REFERENCE'S, SO THAT USES UNDER IT ARE NOT OUR LIVENESS?
+//
+// The other half of `own::kReferenceReleaseAttr`, and splitting only the deaths
+// is not enough. `("k", 5) in h.items()` proves it: the element's own +1 is
+// discharged by the literal's `sequence.literal.source` release, but the token a
+// later retain minted on the same object keeps being USED afterwards, and
+// reaching those uses through the alias relation made the element look live past
+// its own death -- so it got a second release, which the token's missing one
+// silently paid for. Fix one side alone and the compensation breaks: 3
+// increments against 4 decrements, and the runtime's own guard fires.
+//
+// A minted marker holds an increment of its own, so the entity outlives our
+// release whatever happens under its name -- that is what makes dropping these
+// uses safe. A marker that merely republishes our reference holds nothing and
+// its uses stay ours, which is why the set is the MINTED ones and not every
+// marker.
+bool nameBelongsToAnotherMintedReference(
+    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    mlir::Value equivalent, llvm::ArrayRef<mlir::Value> group,
+    llvm::ArrayRef<mlir::Value> views) {
+  if (!own::perReferenceReleaseLabels() || mintedMarkers.empty() ||
+      llvm::is_contained(group, equivalent) ||
+      llvm::is_contained(views, equivalent))
+    return false;
+  mlir::Operation *definition = equivalent.getDefiningOp();
+  return definition && mintedMarkers.contains(definition);
 }
 
 // The retain-rooted owned-local markers of the module, by marker op.
@@ -498,7 +550,8 @@ bool consumeIsAggregateRelease(mlir::OpOperand &use) {
 llvm::DenseSet<mlir::Operation *>
 collectMintedLocalMarkers(mlir::ModuleOp module, own::AliasAnalysis &aliases) {
   llvm::DenseSet<mlir::Operation *> minted;
-  if (!own::unwindTracksMintedTokensSeparately())
+  if (!own::unwindTracksMintedTokensSeparately() &&
+      !own::perReferenceReleaseLabels())
     return minted;
   module.walk([&](mlir::Operation *op) {
     if (op->hasAttr(own::kOwnedLocalObjectAttr) &&
@@ -931,7 +984,8 @@ std::optional<mlir::Operation *> findLastConditionalUserInActiveBlock(
 mlir::LogicalResult
 insertReleaseOnActiveEdge(mlir::func::CallOp call,
                           const own::ResourceGroup &group,
-                          ConditionalReleaseBlocks &blocks) {
+                          ConditionalReleaseBlocks &blocks,
+                          bool ownsReference) {
   auto branch = mlir::cast<mlir::cf::CondBranchOp>(blocks.branch);
   if ((blocks.activeSuccessor == 0 && !branch.getTrueDestOperands().empty()) ||
       (blocks.activeSuccessor == 1 && !branch.getFalseDestOperands().empty()))
@@ -941,8 +995,7 @@ insertReleaseOnActiveEdge(mlir::func::CallOp call,
   mlir::Block *releaseBlock = builder.createBlock(blocks.active->getParent(),
                                                   blocks.active->getIterator());
   builder.setInsertionPointToStart(releaseBlock);
-  mlir::func::CallOp::create(builder, call.getLoc(),
-                             group.deallocator->function, group.values);
+  emitGroupRelease(builder, call.getLoc(), group, group.values, ownsReference);
   mlir::cf::BranchOp::create(builder, call.getLoc(), blocks.active);
 
   llvm::SmallVector<mlir::Value, 4> trueOperands(
@@ -966,7 +1019,8 @@ insertReleaseOnActiveEdge(mlir::func::CallOp call,
 
 mlir::FailureOr<bool> insertConditionalOwnedResultRelease(
     FuncContractCache &contracts, mlir::func::CallOp call,
-    const own::ResourceGroup &group, own::AliasAnalysis &aliases) {
+    const own::ResourceGroup &group, own::AliasAnalysis &aliases,
+    bool ownsReference) {
   if (!group.condition)
     return false;
 
@@ -988,12 +1042,12 @@ mlir::FailureOr<bool> insertConditionalOwnedResultRelease(
   } else if (llvm::hasSingleElement(blocks->active->getPredecessors())) {
     builder.setInsertionPointToStart(blocks->active);
   } else {
-    if (mlir::failed(insertReleaseOnActiveEdge(call, group, *blocks)))
+    if (mlir::failed(
+            insertReleaseOnActiveEdge(call, group, *blocks, ownsReference)))
       return mlir::failure();
     return true;
   }
-  mlir::func::CallOp::create(builder, call.getLoc(),
-                             group.deallocator->function, group.values);
+  emitGroupRelease(builder, call.getLoc(), group, group.values, ownsReference);
   return true;
 }
 
@@ -1102,7 +1156,8 @@ delayPastUnwindingCallSites(mlir::Operation *insertAfter,
 bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
                                       mlir::func::CallOp call,
                                       const own::ResourceGroup &group,
-                                      own::AliasAnalysis &aliases) {
+                                      own::AliasAnalysis &aliases,
+                                      bool ownsReference) {
   if (!group.deallocator || group.condition)
     return false;
   mlir::Block *defBlock = call->getBlock();
@@ -1212,8 +1267,8 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
           unwindIds ? delayPastUnwindingCallSites(last, unwindIds) : last);
     else
       builder.setInsertionPointToStart(successor);
-    mlir::func::CallOp::create(builder, call.getLoc(),
-                               group.deallocator->function, group.values);
+    emitGroupRelease(builder, call.getLoc(), group, group.values,
+                     ownsReference);
   }
   return true;
 }
@@ -1223,13 +1278,12 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
 // only edge); for cf.cond_br the edge is split with a dedicated release block.
 // Returns false for unsupported terminators.
 bool releaseOnTerminatorEdge(mlir::Operation *terminator, unsigned succIndex,
-                             const own::ResourceGroup &group,
-                             mlir::Location loc) {
+                             const own::ResourceGroup &group, mlir::Location loc,
+                             bool ownsReference) {
   mlir::OpBuilder builder(terminator);
   if (mlir::isa<mlir::cf::BranchOp>(terminator)) {
     builder.setInsertionPoint(terminator);
-    mlir::func::CallOp::create(builder, loc, group.deallocator->function,
-                               group.values);
+    emitGroupRelease(builder, loc, group, group.values, ownsReference);
     return true;
   }
   auto condbr = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator);
@@ -1244,8 +1298,7 @@ bool releaseOnTerminatorEdge(mlir::Operation *terminator, unsigned succIndex,
   mlir::Block *releaseBlock = builder.createBlock(successor->getParent(),
                                                   successor->getIterator());
   builder.setInsertionPointToStart(releaseBlock);
-  mlir::func::CallOp::create(builder, loc, group.deallocator->function,
-                             group.values);
+  emitGroupRelease(builder, loc, group, group.values, ownsReference);
   mlir::cf::BranchOp::create(builder, loc, successor,
                              succIndex == 0 ? trueOps : falseOps);
   builder.setInsertionPoint(condbr);
@@ -1283,7 +1336,9 @@ forwardedBlockArgGroup(mlir::Operation *terminator,
 bool releaseOwnedGroupByLiveness(
     FuncContractCache &contracts, mlir::Operation *selfOp,
     mlir::Block *defBlock, mlir::Location loc, const own::ResourceGroup &group,
-    own::AliasAnalysis &aliases, bool consumeIsDeath = false,
+    own::AliasAnalysis &aliases,
+    const llvm::DenseSet<mlir::Operation *> &mintedMarkers, bool ownsReference,
+    bool consumeIsDeath = false,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {},
     bool ownNamesOnlyConsume = false) {
   if (!group.deallocator || group.condition)
@@ -1381,20 +1436,6 @@ bool releaseOwnedGroupByLiveness(
   // the entity: every use is a plain liveness contribution. Box-word
   // reconstructions (borrowed memref views assembled from the entity's box
   // words) pin the same way.
-  llvm::SmallVector<mlir::Value, 8> pinnedViews(group.views.begin(),
-                                                group.views.end());
-  {
-    llvm::SmallVector<mlir::Value, 8> groupEquivalents;
-    for (mlir::Value result : group.values) {
-      llvm::SmallVector<mlir::Value, 8> equivalentValues;
-      aliases.aliasesOf(result, equivalentValues);
-      if (equivalentValues.empty())
-        equivalentValues.push_back(result);
-      groupEquivalents.append(equivalentValues.begin(),
-                              equivalentValues.end());
-    }
-    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews);
-  }
   // Nested-region uses may pin liveness at their top-level ancestor — but
   // only when the group has NO consuming calls: this walk is order-blind
   // within blocks, so extending liveness past a mid-block consume would place
@@ -1422,6 +1463,33 @@ bool releaseOwnedGroupByLiveness(
       break;
   }
 
+  llvm::SmallVector<mlir::Value, 8> pinnedViews(group.views.begin(),
+                                                group.views.end());
+  {
+    llvm::SmallVector<mlir::Value, 8> groupEquivalents;
+    for (mlir::Value result : group.values) {
+      llvm::SmallVector<mlir::Value, 8> equivalentValues;
+      aliases.aliasesOf(result, equivalentValues);
+      if (equivalentValues.empty())
+        equivalentValues.push_back(result);
+      for (mlir::Value equivalent : equivalentValues) {
+        // A box-word view assembled from ANOTHER minted reference's names pins
+        // that reference, not this one -- same rule as the use walk below, and
+        // it has to be applied here too because these pins never reach it. Two
+        // mints on one entity (a global read the lowerer marks twice) left the
+        // first one's release riding on loads of the second one's payload
+        // handle, so it outlived its own `dict.literal.value.source` discharge
+        // and got a second release: three increments against four decrements
+        // once the second mint gained the release it was owed.
+        if (groupHasConsumingCall &&
+            nameBelongsToAnotherMintedReference(mintedMarkers, equivalent,
+                                                group.values, group.views))
+          continue;
+        groupEquivalents.push_back(equivalent);
+      }
+    }
+    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews);
+  }
   for (mlir::Value view : pinnedViews) {
     for (mlir::OpOperand &use : view.getUses()) {
       mlir::Operation *user = use.getOwner();
@@ -1452,7 +1520,22 @@ bool releaseOwnedGroupByLiveness(
     aliases.aliasesOf(result, equivalents);
     if (equivalents.empty())
       equivalents.push_back(result);
-    for (mlir::Value equivalent : equivalents)
+    for (mlir::Value equivalent : equivalents) {
+      // Only PAST OUR OWN DEATH, and only as a LIVENESS PIN. With no consume of
+      // ours there is nothing to be past; with one, these are exactly the uses
+      // that made this reference look live after its own discharge
+      // (`nameBelongsToAnotherMintedReference`).
+      //
+      // Why not `continue` over the whole name: every bail in the loop below is
+      // a safety condition (a consume, a transferring return, a nested-region
+      // forward), and skipping the name skips those too -- which moved
+      // placements into and out of nested regions and double-freed
+      // `cross_enum_generic_handler`. Dropping only the pin is the smallest
+      // form of "these uses are not mine".
+      const bool pinsAnotherReference =
+          groupHasConsumingCall &&
+          nameBelongsToAnotherMintedReference(mintedMarkers, equivalent,
+                                              group.values, group.views);
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
         if (user == selfOp)
@@ -1523,9 +1606,12 @@ bool releaseOwnedGroupByLiveness(
               latestUserInBlock(lastUse[blockUser->getBlock()], blockUser);
           continue;
         }
+        if (pinsAnotherReference)
+          continue;
         lastUse[user->getBlock()] =
             latestUserInBlock(lastUse[user->getBlock()], user);
       }
+    }
   }
   // A call root with no uses is handled by findReleaseInsertion; only bail for
   // it here. A block-argument root with no uses dies at its defining block and
@@ -1703,21 +1789,19 @@ bool releaseOwnedGroupByLiveness(
     mlir::Operation *anchor = delayPastCallSiteMarkers(afterOp);
     mlir::OpBuilder builder(anchor);
     builder.setInsertionPointAfter(anchor);
-    mlir::func::CallOp::create(builder, loc, group.deallocator->function,
-                               group.values);
+    emitGroupRelease(builder, loc, group, group.values, ownsReference);
   }
   for (mlir::Block *block : beforeTermReleases) {
     mlir::OpBuilder builder(block->getTerminator());
-    mlir::func::CallOp::create(builder, loc, group.deallocator->function,
-                               group.values);
+    emitGroupRelease(builder, loc, group, group.values, ownsReference);
   }
   for (mlir::Block *block : atStartReleases) {
     mlir::OpBuilder builder(&block->front());
-    mlir::func::CallOp::create(builder, loc, group.deallocator->function,
-                               group.values);
+    emitGroupRelease(builder, loc, group, group.values, ownsReference);
   }
   for (auto &edge : edgeReleases)
-    if (!releaseOnTerminatorEdge(edge.first, edge.second, group, loc))
+    if (!releaseOnTerminatorEdge(edge.first, edge.second, group, loc,
+                                 ownsReference))
       return false;
   return true;
 }
@@ -1874,10 +1958,11 @@ bool borrowEdgeRetainIsSpellable(mlir::Value header,
 // failure mode is the refusal this change removes -- a rejected valid program,
 // never a released-twice one -- which is the only direction an ablation switch
 // over release placement may fail in.
-bool insertOwnedValueReleasesByLiveness(FuncContractCache &contracts,
-                                        mlir::func::CallOp call,
-                                        const own::ResourceGroup &group,
-                                        own::AliasAnalysis &aliases) {
+bool insertOwnedValueReleasesByLiveness(
+    FuncContractCache &contracts, mlir::func::CallOp call,
+    const own::ResourceGroup &group, own::AliasAnalysis &aliases,
+    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    bool ownsReference) {
   static bool consumeIsDeathDisabled = [] {
     auto value = llvm::sys::Process::GetEnv(
         "LYTHON_ABLATE_CONSUME_IS_DEATH_CALL_RESULTS");
@@ -1885,7 +1970,7 @@ bool insertOwnedValueReleasesByLiveness(FuncContractCache &contracts,
   }();
   return releaseOwnedGroupByLiveness(contracts, call.getOperation(),
                                      call->getBlock(), call.getLoc(), group,
-                                     aliases,
+                                     aliases, mintedMarkers, ownsReference,
                                      /*consumeIsDeath=*/!consumeIsDeathDisabled);
 }
 
@@ -2023,7 +2108,9 @@ bool renamedArgGroupExclusionEnabled() {
 mlir::LogicalResult insertOwnedBlockArgumentReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases, mlir::SymbolTable *symbols,
+    own::AliasAnalysis &aliases,
+    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    mlir::SymbolTable *symbols,
     llvm::SmallVectorImpl<own::ResourceGroup> *unwindGroups,
     bool insertReleases = true) {
   std::uint64_t calleeResolutions = 0;
@@ -2674,10 +2761,15 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     if (unwindGroups)
       unwindGroups->push_back(destGroup);
     if (insertReleases)
+      // Not labelled: a merge argument's token is LENT by the borrow-edge
+      // retains above and cancelled by the pre-merge name's decref, so its
+      // release is one half of a pair rather than the discharge of an increment
+      // of its own. Claiming otherwise would let the other half disown it.
       releaseOwnedGroupByLiveness(contracts, /*selfOp=*/nullptr,
                                   firstArg.getOwner(), firstArg.getLoc(),
-                                  destGroup, aliases, /*consumeIsDeath=*/true,
-                                  deallocators);
+                                  destGroup, aliases, mintedMarkers,
+                                  /*ownsReference=*/false,
+                                  /*consumeIsDeath=*/true, deallocators);
   }
   // Both numbers, always: an exclusion count alone cannot be read (zero means
   // either "no renamings" or "the loop never ran"), and this suite has three
@@ -2700,6 +2792,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
                           FuncContractCache &contracts,
                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                           own::AliasAnalysis &aliases,
+                          const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
                           mlir::SymbolTable *symbols) {
   if (call.getNumResults() == 0)
     return mlir::success();
@@ -2720,7 +2813,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
 
     if (group.condition) {
       mlir::FailureOr<bool> inserted = insertConditionalOwnedResultRelease(
-          contracts, call, group, aliases);
+          contracts, call, group, aliases, /*ownsReference=*/true);
       if (mlir::failed(inserted))
         return mlir::failure();
       if (*inserted) {
@@ -2738,18 +2831,21 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
         builder.setInsertionPoint(release->before);
       else
         builder.setInsertionPointAfter(release->after);
-      mlir::func::CallOp::create(builder, call.getLoc(),
-                                 group.deallocator->function, release->group);
+      emitGroupRelease(builder, call.getLoc(), group, release->group,
+                       /*ownsReference=*/true);
       tracePlacement("straight-line", call, group);
       continue;
     }
 
-    if (insertImmediateSuccessorReleases(contracts, call, group, aliases)) {
+    if (insertImmediateSuccessorReleases(contracts, call, group, aliases,
+                                         /*ownsReference=*/true)) {
       tracePlacement("immediate-successor", call, group);
       continue;
     }
 
-    if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases)) {
+    if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases,
+                                           mintedMarkers,
+                                           /*ownsReference=*/true)) {
       tracePlacement("liveness", call, group);
       continue;
     }
@@ -2799,8 +2895,8 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     });
     for (mlir::func::ReturnOp returnOp : returns) {
       mlir::OpBuilder builder(returnOp);
-      mlir::func::CallOp::create(builder, returnOp.getLoc(),
-                                 group.deallocator->function, group.values);
+      emitGroupRelease(builder, returnOp.getLoc(), group, group.values,
+                       /*ownsReference=*/true);
     }
     tracePlacement("dominated-returns", call, group);
   }
@@ -2818,7 +2914,8 @@ bool ownedLocalTraceEnabled() {
 mlir::LogicalResult insertOwnedLocalObjectReleases(
     mlir::ModuleOp module, mlir::Operation *op, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases) {
+    own::AliasAnalysis &aliases,
+    const llvm::DenseSet<mlir::Operation *> &mintedMarkers) {
   mlir::func::FuncOp enclosing = op->getParentOfType<mlir::func::FuncOp>();
   // SEVERAL MINTS ON ONE HEAD NEED NO SPECIAL CASE, and the measurement that
   // said otherwise did not survive. Reading one element back twice (`c = [i, i]`
@@ -2865,8 +2962,8 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
         builder.setInsertionPoint(release->before);
       else
         builder.setInsertionPointAfter(release->after);
-      mlir::func::CallOp::create(builder, op->getLoc(),
-                                 group.deallocator->function, release->group);
+      emitGroupRelease(builder, op->getLoc(), group, release->group,
+                       /*ownsReference=*/retainRooted);
       if (ownedLocalTraceEnabled())
         llvm::errs() << "[owned-local]   placed=straight-line\n";
       continue;
@@ -2878,8 +2975,9 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     unsigned before = 0;
     if (ownedLocalTraceEnabled() && enclosing)
       enclosing.walk([&](mlir::func::CallOp) { ++before; });
-    if (releaseOwnedGroupByLiveness(contracts, op, op->getBlock(),
-                                    op->getLoc(), group, aliases,
+    if (releaseOwnedGroupByLiveness(contracts, op, op->getBlock(), op->getLoc(),
+                                    group, aliases, mintedMarkers,
+                                    /*ownsReference=*/retainRooted,
                                     /*consumeIsDeath=*/true,
                                     /*deallocators=*/{}, retainRooted)) {
       if (ownedLocalTraceEnabled()) {
@@ -2941,8 +3039,8 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     });
     for (mlir::func::ReturnOp returnOp : returns) {
       mlir::OpBuilder builder(returnOp);
-      mlir::func::CallOp::create(builder, returnOp.getLoc(),
-                                 group.deallocator->function, group.values);
+      emitGroupRelease(builder, returnOp.getLoc(), group, group.values,
+                       /*ownsReference=*/retainRooted);
     }
     if (ownedLocalTraceEnabled())
       llvm::errs() << "[owned-local]   placed=dominated-returns count="
@@ -3681,7 +3779,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           // minted token looked already gone at every unwind point and no
           // cleanup was written for it -- `try: print(zs[0] / zs[1])` leaked
           // both elements, 80 B, on the path the exception actually takes.
-          if (group.mintedBy && call->hasAttr(own::kAggregateReleaseAttr) &&
+          if (group.mintedBy && consumeIsAggregateRelease(use) &&
               !llvm::is_contained(group.values, equivalent))
             continue;
           if (callPartiallyConsumesGroup(contracts, call, group.values,
@@ -4270,7 +4368,11 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         if (!op->hasAttr(own::kOwnedLocalObjectAttr) &&
             !op->hasAttr(own::kOwnedLocalObjectContractAttr))
           return;
-        mlir::Operation *mintedBy = mintedMarkers.contains(op) ? op : nullptr;
+        mlir::Operation *mintedBy =
+            own::unwindTracksMintedTokensSeparately() &&
+                    mintedMarkers.contains(op)
+                ? op
+                : nullptr;
         for (const own::ResourceGroup &g :
              own::collectOwnedLocalObjectGroups(op, deallocators))
           addGroup(g, mintedBy);
@@ -4707,7 +4809,8 @@ public:
       py::PerfScope perf(
           "post-cleanup-unwind-insertion.block-argument-groups");
       if (mlir::failed(insertOwnedBlockArgumentReleases(
-              module, contracts, deallocators, aliases, symbolTable,
+              module, contracts, deallocators, aliases,
+              collectMintedLocalMarkers(module, aliases), symbolTable,
               &blockArgGroups, /*insertReleases=*/false))) {
         signalPassFailure();
         return;
@@ -4931,6 +5034,10 @@ public:
       symbols.emplace(module);
     mlir::SymbolTable *symbolTable = symbols ? &*symbols : nullptr;
 
+    // Before the first placement, for the reason in `collectMintedLocalMarkers`.
+    const llvm::DenseSet<mlir::Operation *> mintedMarkers =
+        collectMintedLocalMarkers(module, aliases);
+
     mlir::func::FuncOp retain = findRetainFunction(module);
     {
       py::PerfScope perf("refcount-insertion.borrowed-return-retains");
@@ -4955,9 +5062,9 @@ public:
     {
       py::PerfScope perf("refcount-insertion.owned-result-releases");
       for (mlir::func::CallOp call : calls) {
-        if (mlir::failed(insertOwnedResultReleases(module, call, contracts,
-                                                   deallocators, aliases,
-                                                   symbolTable))) {
+        if (mlir::failed(insertOwnedResultReleases(
+                module, call, contracts, deallocators, aliases, mintedMarkers,
+                symbolTable))) {
           signalPassFailure();
           return;
         }
@@ -4976,7 +5083,8 @@ public:
       py::PerfScope perf("refcount-insertion.local-object-releases");
       for (mlir::Operation *op : localObjects) {
         if (mlir::failed(insertOwnedLocalObjectReleases(
-                module, op, contracts, deallocators, aliases))) {
+                module, op, contracts, deallocators, aliases,
+                mintedMarkers))) {
           signalPassFailure();
           return;
         }
@@ -4987,8 +5095,8 @@ public:
     {
       py::PerfScope perf("refcount-insertion.block-argument-releases");
       if (mlir::failed(insertOwnedBlockArgumentReleases(
-              module, contracts, deallocators, aliases, symbolTable,
-              &blockArgGroups))) {
+              module, contracts, deallocators, aliases, mintedMarkers,
+              symbolTable, &blockArgGroups))) {
         signalPassFailure();
         return;
       }

@@ -45,6 +45,44 @@ inline constexpr llvm::StringLiteral kAggregateRetainAttr{
 inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
     "ly.ownership.aggregate_release"};
 
+// WHICH REFERENCE THIS RELEASE DISCHARGES: the one its own operands name, and no
+// other on the same entity.
+//
+// The same "an entity is not a resource" gap as `unwindTracksMintedTokensSeparately`
+// below, one step further in. `aggregate_release` lets a minted token disown the
+// CONTAINER's discharge, which is the only foreign release the walks could name;
+// a plain release stayed unattributable, so whichever reference was walked second
+// read the first one's release as its own and placed none. One discharge, two
+// references, an entity stuck at refcount one -- `for ch in s: ys = [ch]; out =
+// out + ys[0]` leaks its exhausted-iteration element exactly that way.
+//
+// The refcount-insertion pass knows the answer: it chose the operands from the
+// reference it was placing for. This attribute is it saying so, and it is a
+// CLAIM ABOUT THE OPERANDS rather than an opaque tag -- which is what lets the
+// placer and the affine verifier read it with one rule: a labelled release none
+// of whose operands is one of my names discharges someone else's reference.
+// Insert and verify must not drift here, or the proof is void
+// (rfc/memory-safety-proof.md).
+//
+// Why NOT widen who may skip `kAggregateReleaseAttr` instead: that label makes a
+// DIFFERENT claim, and it is foreign only to a retain-MINTED token. A
+// TRANSFERRED source has it as its only death -- a module global's initializer
+// hands its construction straight to the global, so the global's teardown
+// release IS that construction's discharge -- and letting an owned call result
+// skip one double-freed every enum member in cross_enum_generic_handler.
+//
+// Only placements for a reference of their OWN carry it. A marker that
+// republishes a reference the frame already holds has no increment to discharge,
+// and labelling its release would make the holder disown it and place a second.
+// An unlabelled release still reads as "could be mine", the pre-existing answer
+// and the safe direction.
+//
+// LYTHON_ABLATE_REFERENCE_RELEASE=1 removes the label and every reader of it.
+// Failure direction: the leaks above, never a double free.
+inline constexpr llvm::StringLiteral kReferenceReleaseAttr{
+    "ly.ownership.reference_release"};
+bool perReferenceReleaseLabels();
+
 // Does the unwind-cleanup analysis separate a retain-MINTED owned-local token
 // from the reference it was minted on, instead of treating one entity as one
 // resource?
