@@ -1275,8 +1275,29 @@ module attributes {
     %readable_slot = arith.constant 4 : index
     %writable_slot = arith.constant 5 : index
     %true_bit = arith.constant true
-    %base, %plus = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %true_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64)
-    %handle = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %true_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %zero_i64 = arith.constant 0 : i64
+    %zero_i32 = arith.constant 0 : i32
+    %base, %plus, %mode_failure = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %true_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64, i64)
+    %mode_bad = arith.cmpi ne, %mode_failure, %zero_i64 : i64
+    cf.cond_br %mode_bad, ^raise_mode, ^parsed
+
+  ^raise_mode:
+    // The object this frame was handed goes with the throw. Its release cannot
+    // wait for unwinding: the caller's cleanup skips arguments it transferred.
+    func.call @__ly_io_throw_mode_self(%mode_failure, %self) : (i64, memref<8xi64>) -> ()
+    // Unreachable, and the terminator says so: the transfer above ends the path.
+    func.return %self : memref<8xi64>
+
+  ^parsed:
+    %handle, %open_err = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %true_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> (i64, i32)
+    %open_bad = arith.cmpi ne, %open_err, %zero_i32 : i32
+    cf.cond_br %open_bad, ^raise_open, ^opened
+
+  ^raise_open:
+    func.call @__ly_io_throw_errno_str_self(%open_err, %path_header, %path_bytes, %self) : (i32, memref<2xi64>, memref<?xi8>, memref<8xi64>) -> ()
+    func.return %self : memref<8xi64>
+
+  ^opened:
     %readable, %writable = func.call @__ly_io_mode_readable(%base, %plus) : (i64, i64) -> (i64, i64)
     memref.store %handle, %self[%handle_slot] : memref<8xi64>
     memref.store %readable, %self[%readable_slot] : memref<8xi64>
@@ -1518,8 +1539,19 @@ module attributes {
   // ===== impls: open / shared mode parsing =====
   // Scan the Python mode string: r/w/a/x pick the base mode, '+' adds
   // read-write, 't' is the default. 'b' is rejected unless the caller is a
-  // binary stream (FileIO). Returns (base char, plus flag).
-  func.func private @__ly_io_parse_mode(%mode_header: memref<2xi64>, %mode_bytes: memref<?xi8>, %binary_ok: i1) -> (i64, i64) {
+  // binary stream (FileIO). Returns (base char, plus flag, failure code):
+  // 0 = ok, 1 = invalid mode, 2 = binary mode rejected.
+  //
+  // REPORTS the failure rather than raising it, and the reason is ownership
+  // at the CALLER, not style here. `LyFileIO_Init` is handed the object it is
+  // initializing (`ly.ownership.transfer_args`), so a raise from inside this
+  // call unwinds past a frame that owns an object no unwind cleanup can see:
+  // the caller's cleanup skips transferred arguments ("ownership already moved
+  // into the unwinding callee") and this callee never had them. The object was
+  // lost on every failed open -- measured UNBOUNDED, 50 failed opens in a loop
+  // leaking 50 objects / 3200 B. Handing the decision back lets the one frame
+  // that owns the object release it before it throws.
+  func.func private @__ly_io_parse_mode(%mode_header: memref<2xi64>, %mode_bytes: memref<?xi8>, %binary_ok: i1) -> (i64, i64, i64) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -1568,32 +1600,50 @@ module attributes {
     %no_base = arith.cmpi eq, %flags#0, %zero : i64
     %bad_unknown_or_dup = arith.cmpi eq, %flags#2, %one : i64
     %invalid = arith.ori %no_base, %bad_unknown_or_dup : i1
-    scf.if %invalid {
-      %class_id = arith.constant 53 : i64
-      %length = arith.constant 12 : i64
-      %static = memref.get_global @__ly_io_msg_invalid_mode : memref<12xi8>
-      %message = memref.cast %static : memref<12xi8> to memref<?xi8>
-      func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
-    }
     %two = arith.constant 2 : i64
     %binary = arith.cmpi eq, %flags#2, %two : i64
     %true_bit = arith.constant true
     %binary_rejected = arith.xori %binary_ok, %true_bit : i1
     %binary_bad = arith.andi %binary, %binary_rejected : i1
-    scf.if %binary_bad {
-      %class_id = arith.constant 53 : i64
-      %length = arith.constant 28 : i64
-      %static = memref.get_global @__ly_io_msg_binary_mode : memref<28xi8>
-      %message = memref.cast %static : memref<28xi8> to memref<?xi8>
-      func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
-    }
-    func.return %flags#0, %flags#1 : i64, i64
+    // Invalid wins over binary-rejected: it is the earlier test, so the message
+    // a caller sees is the one the raising version produced.
+    %binary_code = arith.select %binary_bad, %two, %zero : i64
+    %failure = arith.select %invalid, %one, %binary_code : i64
+    func.return %flags#0, %flags#1, %failure : i64, i64, i64
+  }
+
+  // The mode failures parse_mode no longer raises itself. Non-returning, so a
+  // caller ends its raising block with an unreachable terminator, exactly as
+  // the fopen paths do.
+  func.func private @__ly_io_throw_mode(%failure: i64) {
+    %one = arith.constant 1 : i64
+    %is_invalid = arith.cmpi eq, %failure, %one : i64
+    cf.cond_br %is_invalid, ^invalid, ^binary
+
+  ^invalid:
+    %class_invalid = arith.constant 53 : i64
+    %len_invalid = arith.constant 12 : i64
+    %static_invalid = memref.get_global @__ly_io_msg_invalid_mode : memref<12xi8>
+    %msg_invalid = memref.cast %static_invalid : memref<12xi8> to memref<?xi8>
+    func.call @__ly_io_raise(%class_invalid, %msg_invalid, %len_invalid) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+
+  ^binary:
+    %class_binary = arith.constant 53 : i64
+    %len_binary = arith.constant 28 : i64
+    %static_binary = memref.get_global @__ly_io_msg_binary_mode : memref<28xi8>
+    %msg_binary = memref.cast %static_binary : memref<28xi8> to memref<?xi8>
+    func.call @__ly_io_raise(%class_binary, %msg_binary, %len_binary) : (i64, memref<?xi8>, i64) -> ()
+    func.return
   }
 
   // fopen the parsed mode ('b' appended for binary streams so Windows text
   // translation stays off), raising the OSError subclass errno maps to (with
   // the path) when it fails; returns the FILE* handle.
-  func.func private @__ly_io_fopen(%path_header: memref<2xi64>, %path_bytes: memref<?xi8>, %base: i64, %plus: i64, %with_b: i1) -> i64 {
+  // Returns (handle, errno). Zero errno means the handle is open; a non-zero
+  // errno means the handle is 0 and the CALLER raises -- see `__ly_io_parse_mode`
+  // for why the decision comes back here rather than being thrown from inside.
+  func.func private @__ly_io_fopen(%path_header: memref<2xi64>, %path_bytes: memref<?xi8>, %base: i64, %plus: i64, %with_b: i1) -> (i64, i32) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -1640,18 +1690,17 @@ module attributes {
     // path, like every Wave 0 exception edge until unwinding cleanup lands". It
     // did: measured at 83 B for `io_file`, the whole bytes block. Handing the
     // object to the thrower closes it without waiting for unwinding cleanup.
-    cf.cond_br %failed, ^raise_open, ^opened
+    cf.cond_br %failed, ^failed_open, ^opened
 
-  ^raise_open:
-    // errno decides the class and the message. The old code hardcoded
-    // FileNotFoundError with its own wording for EVERY fopen failure, so
-    // `except PermissionError` never fired on an EACCES path and the message
-    // lacked CPython's "[Errno N] " prefix.
+  ^failed_open:
+    // errno decides the class and the message at the caller. The oldest code
+    // here hardcoded FileNotFoundError with its own wording for EVERY fopen
+    // failure, so `except PermissionError` never fired on an EACCES path and the
+    // message lacked CPython's "[Errno N] " prefix; the errno travels out so
+    // that stays true.
     %err = func.call @LyHost_Errno() : () -> i32
-    func.call @__ly_io_throw_errno_path(%err, %enc_header) : (i32, memref<6xi64>) -> ()
-    // Unreachable: the call above throws. A terminator is still required, and a
-    // return here is what tells the verifier this path ends after one transfer.
-    func.return %zero : i64
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
+    func.return %zero, %err : i64, i32
 
   ^opened:
     // fopen on a directory SUCCEEDS on the BSD libcs, and every later read then
@@ -1673,17 +1722,45 @@ module attributes {
     %fmt = arith.andi %mode, %s_ifmt : i64
     %is_dir_bits = arith.cmpi eq, %fmt, %s_ifdir : i64
     %is_dir = arith.andi %stat_ok, %is_dir_bits : i1
-    cf.cond_br %is_dir, ^raise_isdir, ^done
+    cf.cond_br %is_dir, ^failed_isdir, ^done
 
-  ^raise_isdir:
+  ^failed_isdir:
     %eisdir = func.call @LyHost_ErrnoValue_EISDIR() : () -> i32
     func.call @LyHost_FClose(%handle) : (i64) -> i32
-    func.call @__ly_io_throw_errno_path(%eisdir, %enc_header) : (i32, memref<6xi64>) -> ()
-    func.return %zero : i64
+    func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
+    func.return %zero, %eisdir : i64, i32
 
   ^done:
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
-    func.return %handle : i64
+    func.return %handle, %zero_i32 : i64, i32
+  }
+
+  // Encode the path and throw the errno error the caller was handed. The
+  // encoding is redone here rather than travelling out of `__ly_io_fopen`,
+  // because an object that is owned on ONE of a function's exits is exactly the
+  // shape the ownership verifier cannot express -- and this is the failure path,
+  // where one encode costs nothing.
+  func.func private @__ly_io_throw_errno_str(%err: i32, %path_header: memref<2xi64>, %path_bytes: memref<?xi8>) {
+    %enc = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    func.call @__ly_io_throw_errno_path(%err, %enc) : (i32, memref<6xi64>) -> ()
+    func.return
+  }
+
+  // The same two throws for a caller that is holding the object it was
+  // initializing. It releases FIRST, then throws, so the whole object is gone
+  // before the stack leaves -- the caller cannot do it itself, because a raise
+  // from inside a callee unwinds past a frame whose transferred argument no
+  // unwind cleanup releases.
+  func.func private @__ly_io_throw_mode_self(%failure: i64, %self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [1]} {
+    func.call @LyFileIO_DecRef(%self) : (memref<8xi64>) -> ()
+    func.call @__ly_io_throw_mode(%failure) : (i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_io_throw_errno_str_self(%err: i32, %path_header: memref<2xi64>, %path_bytes: memref<?xi8>, %self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [3]} {
+    func.call @LyFileIO_DecRef(%self) : (memref<8xi64>) -> ()
+    func.call @__ly_io_throw_errno_str(%err, %path_header, %path_bytes) : (i32, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
   }
 
   // readable/writable per mode: r -> read (+ -> also write); w/a/x ->
@@ -1704,8 +1781,25 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %false_bit = arith.constant false
-    %base, %plus = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %false_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64)
-    %handle = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %false_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %zero_i32 = arith.constant 0 : i32
+    %base, %plus, %mode_failure = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %false_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64, i64)
+    %mode_bad = arith.cmpi ne, %mode_failure, %zero : i64
+    cf.cond_br %mode_bad, ^raise_mode, ^parsed
+
+  ^raise_mode:
+    func.call @__ly_io_throw_mode(%mode_failure) : (i64) -> ()
+    cf.br ^parsed
+
+  ^parsed:
+    %handle, %open_err = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %false_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> (i64, i32)
+    %open_bad = arith.cmpi ne, %open_err, %zero_i32 : i32
+    cf.cond_br %open_bad, ^raise_open, ^opened
+
+  ^raise_open:
+    func.call @__ly_io_throw_errno_str(%open_err, %path_header, %path_bytes) : (i32, memref<2xi64>, memref<?xi8>) -> ()
+    cf.br ^opened
+
+  ^opened:
     %readable, %writable = func.call @__ly_io_mode_readable(%base, %plus) : (i64, i64) -> (i64, i64)
 
     %wrapper = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
@@ -1738,8 +1832,25 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %true_bit = arith.constant true
-    %base, %plus = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %true_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64)
-    %handle = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %true_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
+    %zero_i32 = arith.constant 0 : i32
+    %base, %plus, %mode_failure = func.call @__ly_io_parse_mode(%mode_header, %mode_bytes, %true_bit) : (memref<2xi64>, memref<?xi8>, i1) -> (i64, i64, i64)
+    %mode_bad = arith.cmpi ne, %mode_failure, %zero : i64
+    cf.cond_br %mode_bad, ^raise_mode, ^parsed
+
+  ^raise_mode:
+    func.call @__ly_io_throw_mode(%mode_failure) : (i64) -> ()
+    cf.br ^parsed
+
+  ^parsed:
+    %handle, %open_err = func.call @__ly_io_fopen(%path_header, %path_bytes, %base, %plus, %true_bit) : (memref<2xi64>, memref<?xi8>, i64, i64, i1) -> (i64, i32)
+    %open_bad = arith.cmpi ne, %open_err, %zero_i32 : i32
+    cf.cond_br %open_bad, ^raise_open, ^opened
+
+  ^raise_open:
+    func.call @__ly_io_throw_errno_str(%open_err, %path_header, %path_bytes) : (i32, memref<2xi64>, memref<?xi8>) -> ()
+    cf.br ^opened
+
+  ^opened:
     %readable, %writable = func.call @__ly_io_mode_readable(%base, %plus) : (i64, i64) -> (i64, i64)
 
     %wrapper = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
