@@ -621,6 +621,31 @@ emitterLaneIncrefInBlock(mlir::Block *block, mlir::Value header,
   return nullptr;
 }
 
+// Does `block` LEND this group's entity to a merge argument -- i.e. does it
+// contain the `block-arg-merge-borrow` retain that pays for the destination
+// argument group's token?
+//
+// The lend is what makes a forwarding edge NOT a transfer. Without it the
+// destination argument group inherits this group's token and the source is
+// consumed on the edge; with it the destination has an increment of its own and
+// the source keeps hers, so both are live past the merge and both need a
+// cleanup on an unwinding edge.
+bool blockLendsGroupToMergeArgument(mlir::Block *block,
+                                    llvm::ArrayRef<mlir::Value> group,
+                                    own::AliasAnalysis &aliases) {
+  if (!block || group.empty())
+    return false;
+  for (mlir::Operation &op : *block) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+    if (!call || !own::isBlockArgMergeBorrowRetain(call) ||
+        call.getNumOperands() != 1)
+      continue;
+    if (aliases.same(retainSpellingRoot(call.getOperand(0)), group.front()))
+      return true;
+  }
+  return false;
+}
+
 mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
   if (!lhs)
     return rhs;
@@ -3796,13 +3821,20 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
             continue;
           }
           if (callRetainsGroup(contracts, call, group.values, aliases) &&
-              (!call->hasAttr(own::kAggregateRetainAttr) ||
-               isBlockArgMergeBorrowRetain(call))) {
-            // A live extra token (plain retain) or a lent merge token: the
+              !call->hasAttr(own::kAggregateRetainAttr)) {
+            // A live extra token under no name this walk can charge it to: the
             // balance at an unwind point is no longer just held/consumed.
             group.skip = true;
             return;
           }
+          // A LENT MERGE TOKEN IS SOMEBODY ELSE'S INCREMENT, not an unknown
+          // balance. It pays for the destination argument group -- which this
+          // analysis tracks separately and writes its own cleanup for -- and
+          // leaves this group holding exactly what it held before. Bailing on it
+          // dropped the source from the analysis entirely, so a raise out of a
+          // `for` body inside `try` left the iterated container with no cleanup
+          // at all: `try:\n for k in d: d["boom"] = 0` leaked the whole dict,
+          // 17 KB, on the path the mutation guard actually takes.
           continue;
         }
         if (user->hasTrait<mlir::OpTrait::IsTerminator>() &&
@@ -3812,7 +3844,14 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           // forwarding edge; treat the terminator as consuming so a point
           // past the merge never sees this group as held (the destination
           // group covers it there).
-          if (!deadAfterNoReturnRaise(contracts, user) &&
+          //
+          // Unless the edge LENDS (`blockLendsGroupToMergeArgument`): then the
+          // destination was given an increment of its own and nothing moved, so
+          // reading the forward as a consume would retire a token that is still
+          // held.
+          if (!blockLendsGroupToMergeArgument(user->getBlock(), group.values,
+                                              aliases) &&
+              !deadAfterNoReturnRaise(contracts, user) &&
               seenConsumes.insert(user).second)
             group.consumeSites.push_back(user);
         }
