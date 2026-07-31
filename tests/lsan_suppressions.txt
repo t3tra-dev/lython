@@ -1,0 +1,21 @@
+# Allocations LeakSanitizer reports that this project did not make.
+#
+# Each entry names the ALLOCATING frame -- a function inside a system library
+# that our code cannot call directly -- rather than a frame we appear under.
+# That distinction is the whole safety argument: `dispatch_apply` runs some of
+# its work items on the calling thread, so `_dispatch_apply_with_attr_f` sits in
+# the stack of allocations OUR parallel bodies make, and suppressing by that
+# frame would hide real leaks in the parallel matmul path. libdispatch's own
+# allocators cannot appear in a stack we allocated on.
+#
+# Measured on `prim_tensor_matmul_panels` and `prim_tensor_parallel_matmul`,
+# which reported 4 allocations / 208 B each and were read as compiler defects
+# until the stacks were looked at: 64 + 64 + 64 + 16 bytes, every one of them
+# under `LyPoolMother -> dispatch_apply`, none of them ours. The figure is a
+# one-time libdispatch cache, not per call -- both cases run several matmuls and
+# report the same 208 B.
+
+# libdispatch's continuation and attribute caches, allocated on the first
+# dispatch_apply and never freed by design.
+leak:_dispatch_continuation_alloc_from_heap
+leak:_dispatch_calloc_typed

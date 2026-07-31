@@ -76,10 +76,17 @@ import tempfile
 SUMMARY = re.compile(
     r"SUMMARY: \w*Sanitizer: (\d+) byte\(s\) leaked in (\d+) allocation")
 
+# Allocations made by system libraries on our behalf and never freed by them.
+# Kept in a file next to this one rather than inline so the reasoning for each
+# entry has room; see the file. Without it the two `prim_tensor_*` cases report
+# 208 B of libdispatch's one-time dispatch_apply cache, which reads exactly like
+# a compiler defect and was chased as one.
+SUPPRESSIONS = pathlib.Path(__file__).with_name("lsan_suppressions.txt")
+
 # Hardcoded, not merged with the caller's environment: the determinism of every
 # figure this gate prints depends on them, so letting LSAN_OPTIONS through from
 # outside would let a caller silently turn the gate into a coin flip.
-DETECT_ENV = "use_stacks=0:use_registers=0"
+DETECT_ENV = f"use_stacks=0:use_registers=0:suppressions={SUPPRESSIONS}"
 NO_DETECT_ENV = "detect_leaks=0"
 
 # From the measured 1-in-40 silence rate; see the module docstring.
@@ -186,7 +193,12 @@ def main() -> int:
 
     lyc = args.lyc.resolve()
     source = args.source.resolve()
-    for label, path in (("lyc", lyc), ("source", source)):
+    # The suppressions file is checked like the binary and the source, not
+    # assumed: LSan aborts the child when it cannot open one, which arrives here
+    # as silence and would be reported as "could not measure" -- true, but
+    # pointing at the sanitizer instead of at the missing file.
+    for label, path in (("lyc", lyc), ("source", source),
+                        ("suppressions file", SUPPRESSIONS)):
         if not path.exists():
             print(f"{label} does not exist: {path}", file=sys.stderr)
             return 2
