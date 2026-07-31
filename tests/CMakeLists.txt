@@ -478,7 +478,7 @@ set(LYTHON_LEAK_GATE_CASES
     module_globals object_inherited_dunders itertools_value_position
     tuple_duplicate_element class_protocol
     class_field_store_inline_independent loop_alias_carry stdlib_json_build
-    io_seek)
+    io_seek scalar_ops)
 foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
     add_test(NAME "leak.${leak_case}"
         COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"

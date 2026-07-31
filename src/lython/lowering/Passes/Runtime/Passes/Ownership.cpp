@@ -4727,6 +4727,140 @@ public:
         cond.erase();
       }
     }
+    {
+      // Expand `arith.select` over an object handle back into the branch the
+      // canonicalizer folded it from.
+      //
+      // A select is the one place ownership cannot be spelled. Two owned
+      // temporaries flow in, one flows out, and WHICH one is a runtime fact, so
+      // there is no program point at which either can be released by name --
+      // and the alias analysis, which sees through the select in both
+      // directions, fuses all three values into one class. Two real objects
+      // then share one release obligation: `min(2.5, 1.5)` leaked the operand
+      // that lost, 40 B, and so did every float/str/heap-int min-max whose
+      // operands are temporaries (`scalar_ops`,
+      // `cross_float_range_contracts_fields`).
+      //
+      // The branch form has the answer already: each arm forwards one value and
+      // the other DIES there, which is exactly what the per-edge machinery
+      // below is built to release. So rather than teach three consumers (both
+      // release-insertion steps and the affine verifier, which share the alias
+      // model on purpose) to tell a may-alias from a must-alias, this puts the
+      // IR back into the shape they already handle. Measured on the other road
+      // first: making the insertion pass emit the second release turned five
+      // goldens red, one of them aborting on a double free.
+      //
+      // Runs, not single ops: one contract-typed select becomes one select per
+      // physical lane during runtime lowering (a str is header + payload, an
+      // int is header + digits + primitive pair), and the lanes must land in ONE
+      // diamond or the destination group is split across two merges.
+      py::PerfScope perf("refcount-insertion.expand-object-selects");
+      llvm::SmallVector<llvm::SmallVector<mlir::arith::SelectOp, 4>, 4> runs;
+      module.walk([&](mlir::func::FuncOp function) {
+        for (mlir::Block &block : function.getBody()) {
+          // Branching out of a nested single-block region is not expressible,
+          // so only a function's own blocks are candidates.
+          if (!mlir::isa<mlir::func::FuncOp>(block.getParentOp()))
+            continue;
+          for (mlir::Operation &op : block) {
+            auto select = mlir::dyn_cast<mlir::arith::SelectOp>(&op);
+            if (!select)
+              continue;
+            if (!runs.empty() && !runs.back().empty() &&
+                runs.back().back()->getNextNode() == select.getOperation() &&
+                runs.back().back().getCondition() == select.getCondition()) {
+              runs.back().push_back(select);
+              continue;
+            }
+            runs.push_back({select});
+          }
+        }
+      });
+      // Does the frame own what this value names? Only then can a select
+      // strand a reference.
+      auto frameProduces = [&](mlir::Value value) {
+        mlir::Value root = own::underlyingObjectValue(value);
+        mlir::Operation *definition = root.getDefiningOp();
+        if (!definition)
+          return false;
+        if (definition->hasAttr(own::kOwnedLocalObjectAttr) ||
+            definition->hasAttr(own::kObjectHeaderAttr))
+          return true;
+        auto call = mlir::dyn_cast<mlir::func::CallOp>(definition);
+        if (!call)
+          return false;
+        auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+        auto result = mlir::dyn_cast<mlir::OpResult>(root);
+        return callee && result &&
+               own::callResultGroupIsOwned(callee, result.getResultNumber());
+      };
+      for (auto &run : llvm::reverse(runs)) {
+        bool ownsAnObject = false;
+        for (mlir::arith::SelectOp select : run)
+          if (own::isObjectHeaderLikeType(select.getType()))
+            ownsAnObject = true;
+        if (!ownsAnObject)
+          continue;
+        // ONLY when an operand is frame-owned, and the reason is a golden that
+        // went red without this test. `def first(a: str, b: str): return a or b`
+        // is a select over two BORROWED entry arguments, and the borrowed-return
+        // rule recognises it there (`valueGroupDerivedFromEntryArguments` reads
+        // through a select). As a merge it is a destination group no edge
+        // transfers into, which the candidate scan drops entirely -- so the
+        // retain an owned return needs was never placed and the affine verifier
+        // refused the program. Nothing is stranded in that shape anyway: neither
+        // arm holds a reference to lose.
+        bool strandable = false;
+        for (mlir::arith::SelectOp select : run)
+          if (frameProduces(select.getTrueValue()) ||
+              frameProduces(select.getFalseValue()))
+            strandable = true;
+        if (!strandable)
+          continue;
+        // A run that feeds itself cannot be lifted whole: the later select's
+        // operand would be defined in a block the arms do not reach.
+        llvm::SmallPtrSet<mlir::Operation *, 4> inRun;
+        for (mlir::arith::SelectOp select : run)
+          inRun.insert(select.getOperation());
+        bool selfFeeding = false;
+        for (mlir::arith::SelectOp select : run)
+          for (mlir::Value operand : select->getOperands())
+            if (operand.getDefiningOp() && inRun.contains(operand.getDefiningOp()))
+              selfFeeding = true;
+        if (selfFeeding)
+          continue;
+
+        mlir::arith::SelectOp first = run.front();
+        mlir::Location loc = first.getLoc();
+        mlir::Value condition = first.getCondition();
+        mlir::Block *head = first->getBlock();
+        mlir::Region *region = head->getParent();
+        mlir::Block *join = head->splitBlock(first.getOperation());
+        llvm::SmallVector<mlir::Value, 4> trueValues, falseValues;
+        for (mlir::arith::SelectOp select : run) {
+          trueValues.push_back(select.getTrueValue());
+          falseValues.push_back(select.getFalseValue());
+          mlir::Value merged = join->addArgument(select.getType(),
+                                                 select.getLoc());
+          select.getResult().replaceAllUsesWith(merged);
+        }
+        for (mlir::arith::SelectOp select : llvm::reverse(run))
+          select.erase();
+        auto makeArm = [&](mlir::ValueRange values) {
+          auto *arm = new mlir::Block;
+          region->getBlocks().insert(join->getIterator(), arm);
+          mlir::OpBuilder armBuilder(arm, arm->begin());
+          mlir::cf::BranchOp::create(armBuilder, loc, join, values);
+          return arm;
+        };
+        mlir::Block *trueArm = makeArm(trueValues);
+        mlir::Block *falseArm = makeArm(falseValues);
+        mlir::OpBuilder builder(head, head->end());
+        mlir::cf::CondBranchOp::create(builder, loc, condition, trueArm,
+                                       mlir::ValueRange{}, falseArm,
+                                       mlir::ValueRange{});
+      }
+    }
     own::AliasAnalysis aliases;
     {
       py::PerfScope perf("refcount-insertion.alias-analysis");
