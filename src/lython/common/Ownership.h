@@ -44,6 +44,19 @@ inline constexpr llvm::StringLiteral kAggregateRetainAttr{
     "ly.ownership.aggregate_retain"};
 inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
     "ly.ownership.aggregate_release"};
+
+// Does the unwind-cleanup analysis separate a retain-MINTED owned-local token
+// from the reference it was minted on, instead of treating one entity as one
+// resource?
+//
+// `LYTHON_ABLATE_UNWIND_MINTED_TOKENS=1` restores the entity-wide reading. Its
+// failure direction is the leak this separation removes -- the analysis
+// attributes more releases to one resource, which places fewer cleanups and
+// never more -- so it is for bisecting a regression to this rule, never for
+// production. One binary, two arms: a rebuild of the same source does not
+// reproduce byte for byte, so "the shas differ" never establishes that two arms
+// differ.
+bool unwindTracksMintedTokensSeparately();
 // The `parent` half of the kernel's `aggregate(parent, path)` resource, spelled
 // so an ownership walk can name it. `kAggregateIdAttr` is an i64 identity on the
 // op that PRODUCES a container; `kAggregateParentAttr` carries the same number

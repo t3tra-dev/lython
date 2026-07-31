@@ -490,6 +490,24 @@ bool consumeIsAggregateRelease(mlir::OpOperand &use) {
   return use.getOwner()->hasAttr(own::kAggregateReleaseAttr);
 }
 
+// The retain-rooted owned-local markers of the module, by marker op.
+//
+// One walk, up front: `ownedLocalMarkerIsRetainRooted` recognises the mint by
+// position (the retain is the marker's previous node), so asking per group in a
+// pass that inserts calls would be answering a question about IR that has moved.
+llvm::DenseSet<mlir::Operation *>
+collectMintedLocalMarkers(mlir::ModuleOp module, own::AliasAnalysis &aliases) {
+  llvm::DenseSet<mlir::Operation *> minted;
+  if (!own::unwindTracksMintedTokensSeparately())
+    return minted;
+  module.walk([&](mlir::Operation *op) {
+    if (op->hasAttr(own::kOwnedLocalObjectAttr) &&
+        own::ownedLocalMarkerIsRetainRooted(op, aliases))
+      minted.insert(op);
+  });
+  return minted;
+}
+
 // The buffer a retain argument was spelled from: retains take a header PREFIX,
 // so the call operand is a cast or subview of the entity root, not the root.
 mlir::Value retainSpellingRoot(mlir::Value value) {
@@ -2978,6 +2996,16 @@ struct UnwindTrackedGroup {
   // Top-level ancestors of every user (values, interior views, box-word
   // derived views): liveness pins for the handler-side check.
   llvm::SmallVector<mlir::Operation *, 8> useSites;
+  // The owned-local marker whose retain MINTED this token, when one did.
+  //
+  // AN ENTITY IS NOT A RESOURCE, and this is the only thing that tells the two
+  // apart here. A retain-minted marker and the reference it was minted on share
+  // every name -- `underlyingObjectValue` walks through the identity cast the
+  // marker is spelled as, so even their entity roots are the same value -- yet
+  // they are two increments with two releases. Both the dedup and the consume
+  // scan below ask "is this the same obligation as that one", and without the
+  // producer they could only answer "same entity, so yes".
+  mlir::Operation *mintedBy = nullptr;
 };
 
 // How the unwind-cleanup CFG questions below are answered.
@@ -3645,6 +3673,17 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           group.useSites.push_back(top);
 
         if (auto call = mlir::dyn_cast<mlir::func::CallOp>(user)) {
+          // The same rule the release placer and the affine verifier already
+          // apply (`consumeIsAggregateRelease`, `callReleasesForeignAggregate`):
+          // an `aggregate_release` written under a name this MINTED token does
+          // not own discharges the container's token, not this one. This
+          // analysis was the one place that still read it as a consume, so a
+          // minted token looked already gone at every unwind point and no
+          // cleanup was written for it -- `try: print(zs[0] / zs[1])` leaked
+          // both elements, 80 B, on the path the exception actually takes.
+          if (group.mintedBy && call->hasAttr(own::kAggregateReleaseAttr) &&
+              !llvm::is_contained(group.values, equivalent))
+            continue;
           if (callPartiallyConsumesGroup(contracts, call, group.values,
                                          aliases) ||
               callConsumesTrackedHeader(contracts, call, group.values,
@@ -3966,7 +4005,9 @@ std::int64_t nextUnusedExceptionHandlerId(mlir::ModuleOp module) {
 mlir::LogicalResult insertUnwindCleanupReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases, mlir::SymbolTable *symbols,
+    own::AliasAnalysis &aliases,
+    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    mlir::SymbolTable *symbols,
     llvm::ArrayRef<own::ResourceGroup> blockArgGroups) {
   std::int64_t nextHandlerId = nextUnusedExceptionHandlerId(module);
   auto anchorFn = module.lookupSymbol<mlir::func::FuncOp>("LyEH_TryCatchAnchor");
@@ -4158,7 +4199,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       steps.mark(UnwindStepTimer::Analysis);
 
       // Owned groups whose token could be held at an exceptional exit.
-      auto addGroup = [&](const own::ResourceGroup &g) {
+      auto addGroup = [&](const own::ResourceGroup &g,
+                          mlir::Operation *mintedBy) {
         if (!g.deallocator || g.condition || g.values.empty())
           return;
         UnwindTrackedGroup tracked;
@@ -4199,12 +4241,21 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         // Region merges can map several in-region producers onto ONE parent
         // result group (both arms yield into the same result lanes); tracking
         // it twice would release the same token twice in one cleanup handler.
+        //
+        // Same entity is NOT the same obligation, though, which is why the
+        // producer has to match too (`UnwindTrackedGroup::mintedBy`). A minted
+        // marker shares an entity root with the reference it was minted on, so
+        // the root test alone dropped it from this analysis entirely -- nothing
+        // ever asked whether ITS token was held on an unwinding edge.
         for (const UnwindTrackedGroup &existing : groups) {
+          if (existing.mintedBy != mintedBy)
+            continue;
           own::reportEntityRootParity("unwindGroupDedup", existing.values,
                                       tracked.values);
           if (own::sameEntityRoot(existing.values, tracked.values))
             return;
         }
+        tracked.mintedBy = mintedBy;
         collectUnwindGroupSites(contracts, aliases, region, analysis.dominance,
                                 tracked);
         addForwardedNameUseSites(aliases, region, tracked);
@@ -4213,15 +4264,16 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       function.walk([&](mlir::func::CallOp call) {
         for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
                  module, call, deallocators, symbols))
-          addGroup(g);
+          addGroup(g, /*mintedBy=*/nullptr);
       });
       function.walk([&](mlir::Operation *op) {
         if (!op->hasAttr(own::kOwnedLocalObjectAttr) &&
             !op->hasAttr(own::kOwnedLocalObjectContractAttr))
           return;
+        mlir::Operation *mintedBy = mintedMarkers.contains(op) ? op : nullptr;
         for (const own::ResourceGroup &g :
              own::collectOwnedLocalObjectGroups(op, deallocators))
-          addGroup(g);
+          addGroup(g, mintedBy);
       });
       for (const own::ResourceGroup &g : blockArgGroups) {
         if (g.values.empty())
@@ -4229,7 +4281,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
         if (!blockArg || blockArg.getOwner()->getParent() != region)
           continue;
-        addGroup(g);
+        addGroup(g, /*mintedBy=*/nullptr);
       }
       steps.mark(UnwindStepTimer::Groups);
       steps.blocks = analysis.blocks.size();
@@ -4664,10 +4716,10 @@ public:
     {
       py::PerfScope perf(
           "post-cleanup-unwind-insertion.unwind-cleanup-releases");
-      if (mlir::failed(insertUnwindCleanupReleases(module, contracts,
-                                                   deallocators, aliases,
-                                                   symbolTable,
-                                                   blockArgGroups)))
+      if (mlir::failed(insertUnwindCleanupReleases(
+              module, contracts, deallocators, aliases,
+              collectMintedLocalMarkers(module, aliases), symbolTable,
+              blockArgGroups)))
         signalPassFailure();
     }
   }
@@ -4947,7 +4999,8 @@ public:
       // held-token analysis must see.
       py::PerfScope perf("refcount-insertion.unwind-cleanup-releases");
       if (mlir::failed(insertUnwindCleanupReleases(
-              module, contracts, deallocators, aliases, symbolTable,
+              module, contracts, deallocators, aliases,
+              collectMintedLocalMarkers(module, aliases), symbolTable,
               blockArgGroups)))
         signalPassFailure();
     }
