@@ -489,11 +489,46 @@ set(LYTHON_LEAK_GATE_CASES
     io_seek scalar_ops cross_float_range_contracts_fields
     loop_iterator_element_into_container_literal dict_iteration_views
     comprehension)
+
+# Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
+#
+# The gate used to require exit 0 outright, which put this whole class outside
+# what it can see -- `sys.exit()` and every uncaught exception. It was not an
+# empty class: the reference `LyEH_TakeCurrentDescriptor` transfers to
+# `LyRunPythonMain` was never discharged, so all of them leaked the exception
+# object (96 B and 105 B here). Declaring the expected code keeps the guard --
+# a crash or a wrong status is still refused, which is what stops a SIGSEGV
+# being read as "leaks 0" -- and removes the blind spot.
+#
+# Two members, because the class has two exits: SystemExit returns the status
+# through the C entry, an uncaught exception prints a traceback and returns 1.
+set(LYTHON_LEAK_GATE_EXIT_CASES
+    "cases/sys_exit=5"
+    "errors/key_error=1")
+set(LYTHON_LEAK_GATE_ENTRIES)
 foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
+    list(APPEND LYTHON_LEAK_GATE_ENTRIES "cases/${leak_case}=0")
+endforeach()
+list(APPEND LYTHON_LEAK_GATE_ENTRIES ${LYTHON_LEAK_GATE_EXIT_CASES})
+
+foreach(leak_entry IN LISTS LYTHON_LEAK_GATE_ENTRIES)
+    string(REGEX MATCH "^([a-z]+)/([A-Za-z0-9_]+)=(-?[0-9]+)$" _m "${leak_entry}")
+    if(NOT _m)
+        message(FATAL_ERROR "leak gate entry '${leak_entry}' is not <dir>/<case>=<exit>")
+    endif()
+    set(leak_dir "${CMAKE_MATCH_1}")
+    set(leak_case "${CMAKE_MATCH_2}")
+    set(leak_exit "${CMAKE_MATCH_3}")
+    set(leak_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/golden/${leak_dir}/${leak_case}.py")
+    if(NOT EXISTS "${leak_source}")
+        message(FATAL_ERROR
+            "leak gate names ${leak_dir}/${leak_case}, which does not exist. "
+            "A stale entry measures nothing while looking like coverage.")
+    endif()
     add_test(NAME "leak.${leak_case}"
         COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
-            $<TARGET_FILE:lyc>
-            "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${leak_case}.py")
+            $<TARGET_FILE:lyc> "${leak_source}" --expect-exit ${leak_exit})
     # SKIP_RETURN_CODE 2 is the gate's "could not measure": no leak sanitizer in
     # this toolchain, a program that does not exit 0 on its own, or a sanitizer
     # that stayed silent on every attempt. A skip says so; a pass would be a green

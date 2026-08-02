@@ -2237,6 +2237,22 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Value messageStride = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i64(), partsField(b, descriptor, 2, 4),
       /*alignment=*/8);
+  // The reference `LyEH_TakeCurrentDescriptor` transferred to this frame. Every
+  // path out of here discharges it (`release_taken_exception`); the words are
+  // read now because the descriptor's storage is an alloca the exit paths still
+  // read from, and taking them once keeps the three paths spelling the same
+  // thing.
+  mlir::Value takenHeader =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
+  mlir::Value takenMessageHeader =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageHeader);
+  mlir::Value takenMessageData =
+      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageData);
+  auto releaseTaken = [&]() {
+    mlir::func::CallOp::create(
+        b.builder, b.loc, "release_taken_exception", mlir::TypeRange{},
+        mlir::ValueRange{takenHeader, takenMessageHeader, takenMessageData});
+  };
   mlir::Value isSystemExit =
       b.cmpi(mlir::arith::CmpIPredicate::eq, classId, b.iconst(64));
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, isSystemExit, systemExit,
@@ -2253,6 +2269,7 @@ void buildRunPythonMain(SupportBuilder &b) {
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
+  releaseTaken();
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "__cxa_end_catch", mlir::ValueRange{});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
@@ -2272,6 +2289,7 @@ void buildRunPythonMain(SupportBuilder &b) {
                                exitWithMessage);
 
   b.builder.setInsertionPointToEnd(exitWithStatus);
+  releaseTaken();
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "__cxa_end_catch", mlir::ValueRange{});
   mlir::Value status = mlir::LLVM::LoadOp::create(
@@ -2294,6 +2312,7 @@ void buildRunPythonMain(SupportBuilder &b) {
       b.builder, b.loc, "write_char", mlir::TypeRange{},
       mlir::ValueRange{b.iconst32(2), b.iconst8(10)});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{messageCStr});
+  releaseTaken();
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "__cxa_end_catch", mlir::ValueRange{});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,

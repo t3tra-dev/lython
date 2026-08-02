@@ -48,13 +48,22 @@ What it measures: the LSan total on an AOT binary, MINUS the baseline measured o
 Three ways it refuses instead of answering, because the thing being looked for is
 an absence and an absence is what a broken instrument also reports:
 
-  1. The program must exit 0 on its own, checked BEFORE going near the leak
-     detector. LSan exits 23 whenever it finds anything -- including the baseline
-     -- so its status masks the program's, exactly as `leaks` did (a program
-     exiting 3 came back as 1). The check runs the same binary under
-     `detect_leaks=0`, which gives the program's own exit code back. A crash read
-     through an unguarded parser is a clean zero; that is how a shipped SIGSEGV
-     was once relayed as "this case leaks 0".
+  1. The program must exit with the code it is DECLARED to exit with, checked
+     BEFORE going near the leak detector. LSan exits 23 whenever it finds
+     anything -- including the baseline -- so its status masks the program's,
+     exactly as `leaks` did (a program exiting 3 came back as 1). The check runs
+     the same binary under `detect_leaks=0`, which gives the program's own exit
+     code back. A crash read through an unguarded parser is a clean zero; that is
+     how a shipped SIGSEGV was once relayed as "this case leaks 0".
+
+     The declaration is `--expect-exit N`, default 0. Requiring 0 outright is
+     what it used to do, and it put EVERY program that ends by design with a
+     non-zero status outside what this gate can see -- `sys.exit()` and every
+     uncaught exception. That class was not empty: the reference
+     `LyEH_TakeCurrentDescriptor` transfers to `LyRunPythonMain` was never
+     discharged, so all of them leaked the exception object. Declaring the
+     expected code keeps the guard (silence and crashes are still refused) and
+     stops it from being a blind spot.
   2. The baseline run must produce a parseable summary within ATTEMPTS tries.
      Without one there is no zero point and every number below is meaningless.
   3. The subject run must produce one too. Silence is not zero -- treating it as
@@ -189,6 +198,8 @@ def main() -> int:
     ap.add_argument("lyc", type=pathlib.Path)
     ap.add_argument("source", type=pathlib.Path)
     ap.add_argument("--timeout", type=float, default=300.0)
+    # The subject's own exit code. The BASELINE is always 0: it is `print(0)`.
+    ap.add_argument("--expect-exit", type=int, default=0)
     args = ap.parse_args()
 
     lyc = args.lyc.resolve()
@@ -223,13 +234,14 @@ def main() -> int:
         if not build(lyc, source, subject_bin, args.timeout):
             return 2
 
-        for label, binary in (("subject", subject_bin),
-                              ("baseline", baseline_bin)):
+        for label, binary, want in (("subject", subject_bin, args.expect_exit),
+                                    ("baseline", baseline_bin, 0)):
             code = run_alone(binary, args.timeout)
-            if code != 0:
-                print(f"{label} does not exit 0 on its own (rc={code}); the "
-                      f"sanitizer's own status would mask that, so a measurement "
-                      f"here could read as zero. Refusing.", file=sys.stderr)
+            if code != want:
+                print(f"{label} exits {code} on its own, not the declared "
+                      f"{want}; the sanitizer's own status would mask that, so a "
+                      f"measurement here could read as zero. Refusing.",
+                      file=sys.stderr)
                 return 2
 
         base = measure(baseline_bin, args.timeout)

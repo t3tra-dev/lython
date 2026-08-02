@@ -621,6 +621,64 @@ void buildReleaseChainNode(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
+// void release_taken_exception(i64 header, i64 msgHeader, i64 msgData): drop the
+// reference `LyEH_TakeCurrentDescriptor` handed to its caller.
+//
+// "Take" is a transfer: the runtime's in-flight slot gives up its reference and
+// the caller owns one. `LyRunPythonMain` is the only caller, and it printed the
+// traceback and returned without ever discharging it -- so every program that
+// ends by unwinding out of `__main__`, and every `sys.exit()`, lost the
+// exception object (56 B) and, when it held the only reference, its message.
+//
+// Bounded and terminal, but a lost reference at a transfer boundary all the
+// same, and one nothing could observe: the leak gate requires a subject to exit
+// 0 on its own, so every program in this class was outside what it measures.
+//
+// The body is `release_chain_node`'s freePayload path, which owns the same kind
+// of reference and already spells the sequence. It is a DECREMENT first
+// (`release_storage_raw_to_zero`) and frees only at zero, so a payload the chain
+// still shares survives this correctly rather than by anybody's argument that
+// sharing cannot happen here.
+void buildReleaseTakenException(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "release_taken_exception",
+      b.builder.getFunctionType({b.i64(), b.i64(), b.i64()}, {}),
+      /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *alive = b.builder.createBlock(&body);
+  mlir::Block *freePayload = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value headerWord = entry->getArgument(0);
+  mlir::Value msgHeader = entry->getArgument(1);
+  mlir::Value msgData = entry->getArgument(2);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value isNull =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, headerWord, b.iconst(0));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
+                                 mlir::ValueRange{}, alive,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(alive);
+  mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
+                                  mlir::ValueRange{headerWord})
+                               .front();
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero, freePayload,
+                                 mlir::ValueRange{}, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(freePayload);
+  b.call("release_exception_extras", mlir::TypeRange{},
+         mlir::ValueRange{headerWord});
+  b.call("release_unicode_raw", mlir::TypeRange{},
+         mlir::ValueRange{msgHeader, msgData});
+  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{headerWord});
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // void release_current_chain(): drop the in-flight exception's chain state.
 void buildReleaseCurrentChain(SupportBuilder &b) {
   auto fn = b.beginFunction("release_current_chain",
@@ -3096,6 +3154,7 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildTracebackPop(b);
   buildTracebackClear(b);
   buildReleaseChainNode(b);
+  buildReleaseTakenException(b);
   buildReleaseCurrentChain(b);
   buildStashCurrentAsContext(b);
   buildSetCurrentSuppress(b);
