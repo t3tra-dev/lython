@@ -175,6 +175,42 @@ existingOwnedLocalToken(const RuntimeValue &value, mlir::Operation *op,
   return nullptr;
 }
 
+// IS THIS VALUE ITSELF A TOKEN THE FRAME ALREADY HOLDS?
+//
+// `existingOwnedLocalToken` above looks for a SIBLING marker over the same
+// inputs. It cannot see the case where the value handed in is a marker's own
+// RESULTS: those are different SSA values, so the input comparison misses and a
+// second retain is minted on a name that already denotes the frame's reference.
+//
+// A module global read is exactly that shape. `lowerObjectGlobalGet` roots the
+// reference it takes, so the value reaching a consumer is already a token, and
+// the consumer asking for one again got `Ly_IncRef` + marker stacked on marker:
+// two increments and two releases for one read of `Color.RED`. Correct, and one
+// retain/release pair per read wasted.
+//
+// The whole result list has to match, not a prefix: a value that is only PART of
+// a marker's results is a lane of that entity, not the reference itself, and
+// answering yes for one would hand back a token for something the caller did not
+// ask about.
+bool valueIsOwnedLocalToken(const RuntimeValue &value,
+                            llvm::StringRef contract) {
+  if (value.values.empty())
+    return false;
+  auto marker = value.values.front().getDefiningOp<
+      mlir::UnrealizedConversionCastOp>();
+  if (!marker || !marker->hasAttr(ownership::kOwnedLocalObjectAttr))
+    return false;
+  auto marked = marker->getAttrOfType<mlir::StringAttr>(
+      ownership::kOwnedLocalObjectContractAttr);
+  if (!marked || marked.getValue() != contract)
+    return false;
+  return marker.getResults().size() == value.values.size() &&
+         llvm::all_of(llvm::zip_equal(marker.getResults(), value.values),
+                      [](auto pair) {
+                        return std::get<0>(pair) == std::get<1>(pair);
+                      });
+}
+
 // Mark an element as a frame-owned local, so the ordinary owned-result
 // machinery releases it. An identity cast erased at reconciliation; the
 // attribute is the whole content. Assumes the insertion point is already set.
@@ -327,6 +363,11 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   }
   // ⭐ Already owned by this frame: borrow the existing token, take no second
   // reference. See `existingOwnedLocalToken` for why a second one leaks.
+  //
+  // The value may already BE the token rather than have one beside it, which is
+  // the cheaper question and so the one asked first (`valueIsOwnedLocalToken`).
+  if (valueIsOwnedLocalToken(value, contract))
+    return value;
   if (mlir::UnrealizedConversionCastOp held =
           existingOwnedLocalToken(value, op, latest, contract)) {
     RuntimeValue borrowed = value;
@@ -374,6 +415,8 @@ RuntimeBundleLowerer::rootOwnedEvidenceElement(mlir::Operation *op,
   // normally comes from a fresh runtime call and so has no prior token, but the
   // rule is about the DOWNSTREAM map and does not care where the value came
   // from, so it is applied here too rather than assumed not to matter.
+  if (valueIsOwnedLocalToken(value, contract))
+    return value;
   if (mlir::UnrealizedConversionCastOp held =
           existingOwnedLocalToken(value, op, latest, contract)) {
     RuntimeValue borrowed = value;

@@ -1467,26 +1467,49 @@ bool releaseOwnedGroupByLiveness(
   // a second (double-freeing) release downstream. Groups with consuming uses
   // keep the conservative nested-use bail.
   bool groupHasConsumingCall = false;
+  // THE TOKEN IS GONE AFTER ITS CONSUME, and a use past one is somebody else's.
+  //
+  // A container literal takes a slot reference and releases the SOURCE's, so
+  // reading the element back afterwards -- `by_name = {"red": Color.RED}` then
+  // printing `by_name["red"]` -- loads the payload through a handle the frame no
+  // longer has a reference to. Those loads are safe: the container's slot is
+  // what keeps the object alive. They are not this group's liveness, and
+  // counting them extended a dead token's range and placed a SECOND release
+  // after its own discharge.
+  //
+  // Dominance, not block membership: a consume in a branch does not end the
+  // token on the sibling branch or past the merge, and only the uses a consume
+  // actually reaches are the ones it has already paid for.
+  //
+  // Failure direction if this ever drops a use it should have kept: one release
+  // fewer, which is a leak. The behaviour it replaces was one release more.
+  llvm::SmallVector<mlir::Operation *, 4> consumeSites;
   for (mlir::Value result : group.values) {
     llvm::SmallVector<mlir::Value, 8> equivalents;
     aliases.aliasesOf(result, equivalents);
     if (equivalents.empty())
       equivalents.push_back(result);
-    for (mlir::Value equivalent : equivalents) {
+    for (mlir::Value equivalent : equivalents)
       for (mlir::OpOperand &use : equivalent.getUses()) {
         if (use.getOwner() == selfOp)
           continue;
         if (consumingUseEndsThisToken(use, equivalent)) {
           groupHasConsumingCall = true;
-          break;
+          if (!llvm::is_contained(consumeSites, use.getOwner()))
+            consumeSites.push_back(use.getOwner());
         }
       }
-      if (groupHasConsumingCall)
-        break;
-    }
-    if (groupHasConsumingCall)
-      break;
   }
+  auto useFollowsAConsume = [&](mlir::Operation *user) {
+    if (consumeSites.empty() || !selfOp)
+      return false;
+    if (!dominance)
+      dominance.emplace(selfOp->getParentOfType<mlir::func::FuncOp>());
+    for (mlir::Operation *consume : consumeSites)
+      if (consume != user && dominance->properlyDominates(consume, user))
+        return true;
+    return false;
+  };
 
   llvm::SmallVector<mlir::Value, 8> pinnedViews(group.views.begin(),
                                                 group.views.end());
@@ -1521,6 +1544,14 @@ bool releaseOwnedGroupByLiveness(
       if (user == selfOp)
         continue;
       if (usePrecedesDefinition(user))
+        continue;
+      // Past this group's own consume the pin belongs to whoever still holds a
+      // reference -- the container's slot, for an element read back out of a
+      // literal (`useFollowsAConsume`). Box-word views need the test as much as
+      // the plain uses do, and more: a reconstruction's uses never reach the use
+      // walk, so filtering only there left the pin in place and the dead token
+      // got its second release anyway.
+      if (useFollowsAConsume(user))
         continue;
       // A use nested inside a region op (e.g. the boxed lane of a prim/boxed
       // scf.if dispatch) pins liveness at its top-level ancestor. Nested
@@ -1631,7 +1662,7 @@ bool releaseOwnedGroupByLiveness(
               latestUserInBlock(lastUse[blockUser->getBlock()], blockUser);
           continue;
         }
-        if (pinsAnotherReference)
+        if (pinsAnotherReference || useFollowsAConsume(user))
           continue;
         lastUse[user->getBlock()] =
             latestUserInBlock(lastUse[user->getBlock()], user);
