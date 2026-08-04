@@ -439,8 +439,11 @@ public:
   mlir::Value find(mlir::Value value);
   bool same(mlir::Value lhs, mlir::Value rhs);
   void unionValues(mlir::Value lhs, mlir::Value rhs);
-  void aliasesOf(mlir::Value value,
-                 llvm::SmallVectorImpl<mlir::Value> &aliases);
+  // Every name `value` is known by, ITSELF INCLUDED. A value with no recorded
+  // aliases still has one name, and every one of the twelve callers of the
+  // bucket-only predicate this replaced had to say so itself -- twelve copies
+  // of the same three lines, none of which wanted the raw answer.
+  void namesOf(mlir::Value value, llvm::SmallVectorImpl<mlir::Value> &names);
 
 private:
   void invalidateAliasBuckets();

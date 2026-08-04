@@ -1469,17 +1469,19 @@ bool AliasAnalysis::same(mlir::Value lhs, mlir::Value rhs) {
   return lhs && rhs && find(lhs) == find(rhs);
 }
 
-void AliasAnalysis::aliasesOf(mlir::Value value,
-                              llvm::SmallVectorImpl<mlir::Value> &aliases) {
+void AliasAnalysis::namesOf(mlir::Value value,
+                           llvm::SmallVectorImpl<mlir::Value> &names) {
   if (!value)
     return;
   mlir::Value root = find(value);
   if (aliasBucketsDirty)
     rebuildAliasBuckets();
   auto found = aliasBuckets.find(root);
-  if (found == aliasBuckets.end())
+  if (found == aliasBuckets.end()) {
+    names.push_back(value); // untracked: it is still a name for itself
     return;
-  aliases.append(found->second.begin(), found->second.end());
+  }
+  names.append(found->second.begin(), found->second.end());
 }
 
 void AliasAnalysis::invalidateAliasBuckets() {

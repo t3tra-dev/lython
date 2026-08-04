@@ -1249,9 +1249,7 @@ verifyStraightLineResource(FuncContractCache &contracts,
   trackedValues.append(resource.views.begin(), resource.views.end());
   for (mlir::Value value : trackedValues) {
     llvm::SmallVector<mlir::Value, 8> equivalentValues;
-    aliases.aliasesOf(value, equivalentValues);
-    if (equivalentValues.empty())
-      equivalentValues.push_back(value);
+    aliases.namesOf(value, equivalentValues);
     for (mlir::Value equivalent : equivalentValues) {
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user =

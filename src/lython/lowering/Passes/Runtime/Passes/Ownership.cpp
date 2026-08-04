@@ -823,9 +823,7 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
     llvm::SmallVector<mlir::Value, 8> groupEquivalents;
     for (mlir::Value result : group) {
       llvm::SmallVector<mlir::Value, 8> equivalentValues;
-      aliases.aliasesOf(result, equivalentValues);
-      if (equivalentValues.empty())
-        equivalentValues.push_back(result);
+      aliases.namesOf(result, equivalentValues);
       groupEquivalents.append(equivalentValues.begin(),
                               equivalentValues.end());
     }
@@ -856,9 +854,7 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
   std::optional<ReleaseInsertion> terminalRelease;
   for (mlir::Value result : group) {
     llvm::SmallVector<mlir::Value, 8> equivalentValues;
-    aliases.aliasesOf(result, equivalentValues);
-    if (equivalentValues.empty())
-      equivalentValues.push_back(result);
+    aliases.namesOf(result, equivalentValues);
 
     for (mlir::Value equivalent : equivalentValues) {
       for (mlir::OpOperand &use : equivalent.getUses()) {
@@ -1083,9 +1079,7 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
 
   for (mlir::Value result : group.values) {
     llvm::SmallVector<mlir::Value, 8> equivalents;
-    aliases.aliasesOf(result, equivalents);
-    if (equivalents.empty())
-      equivalents.push_back(result);
+    aliases.namesOf(result, equivalents);
     for (mlir::Value equivalent : equivalents) {
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
@@ -1365,9 +1359,7 @@ bool releaseOwnedGroupByLiveness(
   llvm::SmallVector<mlir::Operation *, 4> consumeSites;
   for (mlir::Value result : group.values) {
     llvm::SmallVector<mlir::Value, 8> equivalents;
-    aliases.aliasesOf(result, equivalents);
-    if (equivalents.empty())
-      equivalents.push_back(result);
+    aliases.namesOf(result, equivalents);
     for (mlir::Value equivalent : equivalents)
       for (mlir::OpOperand &use : equivalent.getUses()) {
         if (use.getOwner() == selfOp)
@@ -1396,9 +1388,7 @@ bool releaseOwnedGroupByLiveness(
     llvm::SmallVector<mlir::Value, 8> groupEquivalents;
     for (mlir::Value result : group.values) {
       llvm::SmallVector<mlir::Value, 8> equivalentValues;
-      aliases.aliasesOf(result, equivalentValues);
-      if (equivalentValues.empty())
-        equivalentValues.push_back(result);
+      aliases.namesOf(result, equivalentValues);
       for (mlir::Value equivalent : equivalentValues) {
         // A box-word view assembled from ANOTHER minted reference's names pins
         // that reference, not this one -- same rule as the use walk below, and
@@ -1451,9 +1441,7 @@ bool releaseOwnedGroupByLiveness(
   }
   for (mlir::Value result : group.values) {
     llvm::SmallVector<mlir::Value, 8> equivalents;
-    aliases.aliasesOf(result, equivalents);
-    if (equivalents.empty())
-      equivalents.push_back(result);
+    aliases.namesOf(result, equivalents);
     for (mlir::Value equivalent : equivalents) {
       // Only PAST OUR OWN DEATH, and only as a LIVENESS PIN. With no consume of
       // ours there is nothing to be past; with one, these are exactly the uses
@@ -1598,6 +1586,34 @@ bool releaseOwnedGroupByLiveness(
   };
 
   llvm::SmallVector<std::pair<mlir::Operation *, unsigned>, 8> edgeReleases;
+  // Which outgoing edges of `terminator` the group dies on. Four ways it does
+  // NOT die, and the caller must not care which arm it is asking from: the two
+  // arms below reached this question by different routes -- a block whose
+  // consume forwards on only some edges, and a block that is simply live-out --
+  // and wrote the same four guards in two different orders. Nothing made them
+  // stay the same order, or stay four.
+  auto collectEdgeDeaths = [&](mlir::Operation *terminator) {
+    for (unsigned index = 0, end = terminator->getNumSuccessors(); index < end;
+         ++index) {
+      mlir::Block *successor = terminator->getSuccessor(index);
+      if (liveIn[successor])
+        continue; // still needed there
+      if (forwardsGroupToSuccessor(terminator, index))
+        continue; // the token leaves with the forward
+      // A continue edge identity-forwards the token into the next iteration's
+      // incarnation of the same block arguments: a transfer, not a death.
+      if (successor == defBlock && isIdentitySelfForward(terminator))
+        continue;
+      // Or the successor only passes it back into that next iteration (the
+      // non-mutating arm of a conditional structural mutation). Identity
+      // self-forwards are invisible to the liveness above, but the token
+      // survives through them.
+      if (!successor->empty() &&
+          isIdentitySelfForward(successor->getTerminator()))
+        continue;
+      edgeReleases.push_back({terminator, index});
+    }
+  };
   llvm::SmallVector<mlir::Operation *, 8> afterUseReleases;
   llvm::SmallVector<mlir::Block *, 8> beforeTermReleases;
   llvm::SmallVector<mlir::Block *, 4> atStartReleases;
@@ -1624,22 +1640,8 @@ bool releaseOwnedGroupByLiveness(
         mlir::Operation *terminator = block->getTerminator();
         auto it = lastUse.find(block);
         if (!groupHasConsumingCall && it != lastUse.end() &&
-            it->second == terminator && forwardsGroupAnywhere(terminator)) {
-          for (unsigned index = 0, end = terminator->getNumSuccessors();
-               index < end; ++index) {
-            if (forwardsGroupToSuccessor(terminator, index))
-              continue;
-            mlir::Block *successor = terminator->getSuccessor(index);
-            if (liveIn[successor])
-              continue;
-            if (successor == defBlock && isIdentitySelfForward(terminator))
-              continue;
-            if (!successor->empty() &&
-                isIdentitySelfForward(successor->getTerminator()))
-              continue;
-            edgeReleases.push_back({terminator, index});
-          }
-        }
+            it->second == terminator && forwardsGroupAnywhere(terminator))
+          collectEdgeDeaths(terminator);
         continue;
       }
       auto it = lastUse.find(block);
@@ -1652,32 +1654,7 @@ bool releaseOwnedGroupByLiveness(
       else
         beforeTermReleases.push_back(block);
     } else {
-      mlir::Operation *terminator = block->getTerminator();
-      for (unsigned index = 0, end = terminator->getNumSuccessors();
-           index < end; ++index) {
-        if (!liveIn[terminator->getSuccessor(index)]) {
-          // A continue edge identity-forwards the token into the next
-          // iteration's incarnation of the same block arguments: a transfer,
-          // not a death.
-          if (terminator->getSuccessor(index) == defBlock &&
-              isIdentitySelfForward(terminator))
-            continue;
-          // A whole-group forward into this successor's arguments transfers
-          // the token to the destination argument group: not a death either.
-          if (forwardsGroupToSuccessor(terminator, index))
-            continue;
-          // The successor itself may only pass the token back into the next
-          // iteration of the defining block's arguments (the non-mutating arm
-          // of a conditional structural mutation): identity self-forwards are
-          // invisible to the liveness above, but the token survives through
-          // them — not a death.
-          mlir::Block *successor = terminator->getSuccessor(index);
-          if (!successor->empty() &&
-              isIdentitySelfForward(successor->getTerminator()))
-            continue;
-          edgeReleases.push_back({terminator, index});
-        }
-      }
+      collectEdgeDeaths(block->getTerminator());
     }
   }
 
@@ -2007,9 +1984,7 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     mlir::Region *body = &fn.getBody();
     llvm::SmallPtrSet<mlir::Operation *, 4> seen;
     llvm::SmallVector<mlir::Value, 8> equivalents;
-    aliases.aliasesOf(values.front(), equivalents);
-    if (equivalents.empty())
-      equivalents.push_back(values.front());
+    aliases.namesOf(values.front(), equivalents);
     for (mlir::Value equivalent : equivalents)
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
@@ -2574,9 +2549,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     bool canReleaseAtExits = true;
     for (mlir::Value result : group.values) {
       llvm::SmallVector<mlir::Value, 8> equivalentValues;
-      aliases.aliasesOf(result, equivalentValues);
-      if (equivalentValues.empty())
-        equivalentValues.push_back(result);
+      aliases.namesOf(result, equivalentValues);
       for (mlir::Value equivalent : equivalentValues) {
         for (mlir::OpOperand &use : equivalent.getUses()) {
           mlir::Operation *user = use.getOwner();
@@ -2721,9 +2694,7 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     bool canReleaseAtExits = true;
     for (mlir::Value result : group.values) {
       llvm::SmallVector<mlir::Value, 8> equivalentValues;
-      aliases.aliasesOf(result, equivalentValues);
-      if (equivalentValues.empty())
-        equivalentValues.push_back(result);
+      aliases.namesOf(result, equivalentValues);
       for (mlir::Value equivalent : equivalentValues) {
         for (mlir::OpOperand &use : equivalent.getUses()) {
           mlir::Operation *user = use.getOwner();
@@ -3362,9 +3333,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
     llvm::SmallVector<mlir::Value, 8> equivalents;
     for (mlir::Value value : group.values) {
       llvm::SmallVector<mlir::Value, 8> aliasValues;
-      aliases.aliasesOf(value, aliasValues);
-      if (aliasValues.empty())
-        aliasValues.push_back(value);
+      aliases.namesOf(value, aliasValues);
       equivalents.append(aliasValues.begin(), aliasValues.end());
     }
     own::collectBoxWordDerivedViews(equivalents, tracked);
@@ -3374,9 +3343,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
   llvm::SmallPtrSet<mlir::Operation *, 8> seenConsumes;
   for (mlir::Value value : tracked) {
     llvm::SmallVector<mlir::Value, 8> equivalents;
-    aliases.aliasesOf(value, equivalents);
-    if (equivalents.empty())
-      equivalents.push_back(value);
+    aliases.namesOf(value, equivalents);
     for (mlir::Value equivalent : equivalents) {
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
