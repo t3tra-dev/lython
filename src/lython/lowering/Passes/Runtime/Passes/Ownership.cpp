@@ -1967,81 +1967,6 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     bool insertReleases = true) {
   std::uint64_t calleeResolutions = 0;
   llvm::DenseSet<mlir::Value> ownedValues;
-  module.walk([&](mlir::func::CallOp call) {
-    mlir::func::FuncOp fn = call->getParentOfType<mlir::func::FuncOp>();
-    if (!fn || own::isRuntimeManifestFunction(fn))
-      return;
-    ++calleeResolutions;
-    for (const own::ResourceGroup &g :
-         own::collectOwnedCallResultGroups(module, call, deallocators,
-                                          symbols)) {
-      if (!g.deallocator || g.condition)
-        continue;
-      for (mlir::Value v : g.values)
-        ownedValues.insert(v);
-      // The token also lives in every region-merge result the group maps
-      // through (e.g. the int fast/slow scf.if): those parent results are
-      // what function-level branches forward.
-      mlir::Block *callBlock = call->getBlock();
-      llvm::SmallVector<mlir::Value, 4> values(g.values.begin(),
-                                               g.values.end());
-      while (callBlock && callBlock->getTerminator() &&
-             !mlir::isa<mlir::func::FuncOp>(callBlock->getParentOp())) {
-        auto mapped = mapRegionTerminatorGroupToParentResults(
-            callBlock->getTerminator(), values, aliases);
-        if (!mapped)
-          break;
-        values = std::move(*mapped);
-        for (mlir::Value v : values)
-          ownedValues.insert(v);
-        callBlock = callBlock->getParentOp()->getBlock();
-      }
-    }
-  });
-
-  // Owned LOCAL OBJECT groups (the `ly.ownership.owned_local_object` cast
-  // markers: dataclass/user-class instances) transfer into merge arguments
-  // exactly like owned call results (`p = P(1,2) if c else P(3,4)`), so they
-  // must seed the same ownedValues/candidate sets -- omitting them classifies
-  // every incoming merge edge as a borrow and drops the destination group,
-  // leaking the merged object on the normal path and leaving its unwind
-  // token state Unknown. The branch forwards the marker's OPERANDS (the raw
-  // allocs), not its results, so the operands join ownedValues alongside the
-  // group values; alias equivalents beyond the marker's own operands (select
-  // results etc.) stay out -- they may equally alias values that were only
-  // borrowed.
-  module.walk([&](mlir::Operation *op) {
-    if (!op->hasAttr(own::kOwnedLocalObjectAttr))
-      return;
-    mlir::func::FuncOp fn = op->getParentOfType<mlir::func::FuncOp>();
-    if (!fn || own::isRuntimeManifestFunction(fn))
-      return;
-    for (const own::ResourceGroup &g :
-         own::collectOwnedLocalObjectGroups(op, deallocators)) {
-      if (!g.deallocator || g.condition)
-        continue;
-      for (mlir::Value v : g.values)
-        ownedValues.insert(v);
-      if (op->getNumOperands() == op->getNumResults())
-        for (mlir::Value operand : op->getOperands())
-          ownedValues.insert(operand);
-      mlir::Block *defBlock = op->getBlock();
-      llvm::SmallVector<mlir::Value, 4> values(g.values.begin(),
-                                               g.values.end());
-      while (defBlock && defBlock->getTerminator() &&
-             !mlir::isa<mlir::func::FuncOp>(defBlock->getParentOp())) {
-        auto mapped = mapRegionTerminatorGroupToParentResults(
-            defBlock->getTerminator(), values, aliases);
-        if (!mapped)
-          break;
-        values = std::move(*mapped);
-        for (mlir::Value v : values)
-          ownedValues.insert(v);
-        defBlock = defBlock->getParentOp()->getBlock();
-      }
-    }
-  });
-
   struct Candidate {
     llvm::SmallVector<mlir::Value, 4> args;
     llvm::SmallVector<mlir::Value, 4> views;
@@ -2097,73 +2022,100 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     return terminators;
   };
 
-  // Seed: owned call-result groups forwarded to block-arg groups. A group
-  // born inside a region merge (e.g. the int fast/slow scf.if) first maps
-  // through its region terminator(s) to the parent op's results; the
-  // function-level branch then decides the forward.
+  // What one owned group contributes before any edge can be classified: its
+  // values are OWNED, and every function-level branch that forwards them seeds
+  // a destination candidate. Returns none when the group never reaches a
+  // function-level branch -- nothing is seeded and nothing is worth tracing.
+  //
+  // Why one body: an owned call result and an owned-local marker differ in
+  // where the group comes from and in NOTHING this does with it. Written twice
+  // over two sets, the four copies drifted -- the ownedValues pair mapped no
+  // views and had no escape flag, so a group the candidate pair abandoned was
+  // still contributing owned lanes, and only the region-nesting depth decided
+  // whether that mattered.
+  struct Seeded {
+    unsigned candidates = 0;
+    std::size_t lanes = 0;
+    std::size_t views = 0;
+  };
+  auto seedGroup = [&](mlir::func::FuncOp fn, const own::ResourceGroup &g,
+                       mlir::Block *from) -> std::optional<Seeded> {
+    llvm::SmallVector<mlir::Value, 4> values(g.values.begin(), g.values.end());
+    llvm::SmallVector<mlir::Value, 4> views(g.views.begin(), g.views.end());
+    for (mlir::Value v : values)
+      ownedValues.insert(v);
+    // A group born inside a region merge (the int fast/slow scf.if) reaches a
+    // function-level branch only through the parent op's results, so walk out
+    // one region at a time. Every level's results hold the token too.
+    bool escaped = false;
+    while (from && from->getTerminator() &&
+           !mlir::isa<mlir::func::FuncOp>(from->getParentOp())) {
+      mlir::Operation *terminator = from->getTerminator();
+      auto mappedValues =
+          mapRegionTerminatorGroupToParentResults(terminator, values, aliases);
+      if (!mappedValues) {
+        escaped = true;
+        break;
+      }
+      values = std::move(*mappedValues);
+      for (mlir::Value v : values)
+        ownedValues.insert(v);
+      // Views that stop mapping cost the CANDIDATE, not the ownership: their
+      // uses would be invisible to the liveness, so no release may be placed,
+      // but the lanes are still owned and the walk keeps recording them.
+      if (!views.empty() && !escaped) {
+        auto mappedViews =
+            mapRegionTerminatorGroupToParentResults(terminator, views, aliases);
+        if (!mappedViews)
+          escaped = true;
+        else
+          views = std::move(*mappedViews);
+      }
+      from = from->getParentOp()->getBlock();
+    }
+    if (escaped || !from || !from->getTerminator())
+      return std::nullopt;
+
+    Seeded seeded{0, values.size(), views.size()};
+    for (mlir::Operation *terminator : forwardingTerminators(fn, values)) {
+      auto dest = forwardedBlockArgGroup(terminator, values, aliases);
+      if (!dest)
+        continue;
+      auto destViews = forwardedViews(terminator, views);
+      if (!destViews)
+        continue;
+      candidates.insert(
+          {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
+      ++seeded.candidates;
+    }
+    return seeded;
+  };
+
   module.walk([&](mlir::func::CallOp call) {
     mlir::func::FuncOp fn = call->getParentOfType<mlir::func::FuncOp>();
     if (!fn || own::isRuntimeManifestFunction(fn))
       return;
     ++calleeResolutions;
-    for (const own::ResourceGroup &g :
-         own::collectOwnedCallResultGroups(module, call, deallocators,
-                                          symbols)) {
+    for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
+             module, call, deallocators, symbols)) {
       if (!g.deallocator || g.condition)
         continue;
-      mlir::Block *callBlock = call->getBlock();
-      llvm::SmallVector<mlir::Value, 4> values(g.values.begin(),
-                                               g.values.end());
-      llvm::SmallVector<mlir::Value, 4> views(g.views.begin(), g.views.end());
-      bool escaped = false;
-      while (callBlock && callBlock->getTerminator() &&
-             !mlir::isa<mlir::func::FuncOp>(callBlock->getParentOp())) {
-        mlir::Operation *terminator = callBlock->getTerminator();
-        auto mappedValues = mapRegionTerminatorGroupToParentResults(
-            terminator, values, aliases);
-        if (!mappedValues) {
-          escaped = true;
-          break;
-        }
-        if (!views.empty()) {
-          auto mappedViews = mapRegionTerminatorGroupToParentResults(
-              terminator, views, aliases);
-          if (!mappedViews) {
-            escaped = true;
-            break;
-          }
-          views = std::move(*mappedViews);
-        }
-        values = std::move(*mappedValues);
-        callBlock = callBlock->getParentOp()->getBlock();
-      }
-      if (escaped || !callBlock || !callBlock->getTerminator())
-        continue;
-      unsigned seeded = 0;
-      for (mlir::Operation *terminator : forwardingTerminators(fn, values)) {
-        auto dest = forwardedBlockArgGroup(terminator, values, aliases);
-        if (!dest)
-          continue;
-        auto destViews = forwardedViews(terminator, views);
-        if (!destViews)
-          continue;
-        candidates.insert(
-            {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
-        ++seeded;
-      }
-      if (ownershipTransferTraceEnabled())
+      std::optional<Seeded> seeded = seedGroup(fn, g, call->getBlock());
+      if (seeded && ownershipTransferTraceEnabled())
         llvm::errs() << "[ownership-transfers] call-result group of "
                      << call.getCallee() << " in @" << fn.getName()
-                     << ": lanes=" << values.size()
-                     << " views=" << views.size() << " seeded=" << seeded
-                     << "\n";
+                     << ": lanes=" << seeded->lanes
+                     << " views=" << seeded->views
+                     << " seeded=" << seeded->candidates << "\n";
     }
   });
 
-  // Seed from owned local-object markers forwarded to block-arg groups (the
-  // fresh-instance arms of an IfExp / and-or merge). Same shape as the
-  // call-result seeding above; `forwardedBlockArgGroup` matches the branch's
-  // raw-alloc operands to the marker results through the alias analysis.
+  // Owned LOCAL OBJECT groups (the `ly.ownership.owned_local_object` cast
+  // markers: dataclass/user-class instances) transfer into merge arguments
+  // exactly like owned call results (`p = P(1,2) if c else P(3,4)`) -- omitting
+  // them classifies every incoming merge edge as a borrow and drops the
+  // destination group, leaking the merged object on the normal path and leaving
+  // its unwind token state Unknown.
   module.walk([&](mlir::Operation *op) {
     if (!op->hasAttr(own::kOwnedLocalObjectAttr))
       return;
@@ -2174,44 +2126,15 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
          own::collectOwnedLocalObjectGroups(op, deallocators)) {
       if (!g.deallocator || g.condition)
         continue;
-      mlir::Block *defBlock = op->getBlock();
-      llvm::SmallVector<mlir::Value, 4> values(g.values.begin(),
-                                               g.values.end());
-      llvm::SmallVector<mlir::Value, 4> views(g.views.begin(), g.views.end());
-      bool escaped = false;
-      while (defBlock && defBlock->getTerminator() &&
-             !mlir::isa<mlir::func::FuncOp>(defBlock->getParentOp())) {
-        mlir::Operation *terminator = defBlock->getTerminator();
-        auto mappedValues = mapRegionTerminatorGroupToParentResults(
-            terminator, values, aliases);
-        if (!mappedValues) {
-          escaped = true;
-          break;
-        }
-        if (!views.empty()) {
-          auto mappedViews = mapRegionTerminatorGroupToParentResults(
-              terminator, views, aliases);
-          if (!mappedViews) {
-            escaped = true;
-            break;
-          }
-          views = std::move(*mappedViews);
-        }
-        values = std::move(*mappedValues);
-        defBlock = defBlock->getParentOp()->getBlock();
-      }
-      if (escaped || !defBlock || !defBlock->getTerminator())
-        continue;
-      for (mlir::Operation *terminator : forwardingTerminators(fn, values)) {
-        auto dest = forwardedBlockArgGroup(terminator, values, aliases);
-        if (!dest)
-          continue;
-        auto destViews = forwardedViews(terminator, views);
-        if (!destViews)
-          continue;
-        candidates.insert(
-            {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
-      }
+      // What is specific to this source: the branch forwards the marker's
+      // OPERANDS (the raw allocs), not its results, so the operands are owned
+      // alongside the group values. Alias equivalents BEYOND the marker's own
+      // operands (select results etc.) stay out -- they may equally alias
+      // values that were only borrowed.
+      if (op->getNumOperands() == op->getNumResults())
+        for (mlir::Value operand : op->getOperands())
+          ownedValues.insert(operand);
+      seedGroup(fn, g, op->getBlock());
     }
   });
 
