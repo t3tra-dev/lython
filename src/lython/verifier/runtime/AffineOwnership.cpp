@@ -5,6 +5,7 @@
 
 #include "Contracts.h"
 #include "Ownership.h"
+#include "Reference.h"
 
 #include "PyDialectTypes.h"
 
@@ -220,7 +221,6 @@ struct TrackedResource {
   // carries a second token under other names, whose releases this walk must not
   // count (`callReleasesForeignAggregate`). False for every other resource, which
   // leaves those walks unchanged.
-  bool retainRootedLocal = false;
   // Is this resource an increment of its OWN, so a release NAMING another
   // reference on the same entity cannot be its death? True for a retain-minted
   // marker and for an owned call result (one reference per owned result); false
@@ -228,7 +228,7 @@ struct TrackedResource {
   // shares that one and must keep reading its release as its own.
   //
   // Only `own::kReferenceReleaseAttr` is read through this. The aggregate label
-  // keeps the narrower `retainRootedLocal` gate -- see
+  // keeps the narrower minted-only gate -- see
   // `callReleasesForeignAggregate`.
   bool ownsReference = false;
   // Does some call release this group under one of ITS OWN names? If it does,
@@ -236,6 +236,11 @@ struct TrackedResource {
   // as this token's death; if it does not, that aggregate release is the only
   // release the token has and dropping it would report a leak that is not there.
   bool hasOwnNamedRelease = false;
+  // Which increment this resource is the obligation for, when the analysis can
+  // name one (`own::ReferenceMap`). The placer asks the same map about the same
+  // groups; insert and verify disagreeing about which release discharges which
+  // reference is what voids the proof.
+  own::Reference reference;
   // Interior views of the same entity (canonical-shape tail beyond the
   // release interface): their uses are entity uses, never release operands.
   llvm::SmallVector<mlir::Value, 4> views;
@@ -287,21 +292,49 @@ struct TrackedResource {
 // operands name" -- a statement about the release, not about the reader -- so
 // any resource holding an increment of its own may act on it. The placer splits
 // them the same way; a disagreement here would void the proof.
+// Is this operand NOT one of the walked resource's names?
+//
+// The same condition the placer's `isNotOwnName` carries, and the same contract
+// on "no claim": where `own::ReferenceMap` can name the value it answers by
+// REFERENCE -- so a CAST of one of our names is recognised as ours, which the
+// containment test below cannot -- and where it cannot, the answer is the
+// previous reading, which HERE is containment. Insert and verify must agree
+// about which release discharges which reference or the proof is void, so this
+// is deliberately the same shape as the placer's.
+bool operandIsNotOurs(
+    const own::ReferenceMap &references,
+    std::initializer_list<llvm::ArrayRef<mlir::Value>> ourNames,
+    mlir::Value operand, own::Reference mine) {
+  // BOTH sides have to be nameable for the map to answer. With `mine` null the
+  // comparison says nothing, and returning "not ours" for every named operand is
+  // how this first read `LyLong_FromI64`'s result as somebody else's in
+  // stackguard_support.
+  if (mine)
+    if (own::Reference denoted = references.of(operand))
+      return denoted != mine;
+  for (llvm::ArrayRef<mlir::Value> names : ourNames)
+    if (llvm::is_contained(names, operand))
+      return false;
+  return true;
+}
+
 bool callReleasesForeignAggregate(
-    bool retainRootedLocal, bool ownsReference,
+    const own::ReferenceMap &references, bool hasOwnNamedRelease,
+    bool ownsReference, own::Reference mine,
     std::initializer_list<llvm::ArrayRef<mlir::Value>> ourNames,
     mlir::func::CallOp call) {
-  bool foreignAggregate =
-      retainRootedLocal && call->hasAttr(own::kAggregateReleaseAttr);
+  // `isMinted` rather than a bool recomputed per resource from
+  // `getPrevNode()`: the same fact, from the map the placer asks.
+  bool foreignAggregate = hasOwnNamedRelease && references.isMinted(mine) &&
+                          call->hasAttr(own::kAggregateReleaseAttr);
   bool foreignReference = ownsReference &&
                           own::perReferenceReleaseLabels() &&
                           call->hasAttr(own::kReferenceReleaseAttr);
   if (!foreignAggregate && !foreignReference)
     return false;
   for (mlir::Value operand : call.getOperands())
-    for (llvm::ArrayRef<mlir::Value> names : ourNames)
-      if (llvm::is_contained(names, operand))
-        return false;
+    if (!operandIsNotOurs(references, ourNames, operand, mine))
+      return false;
   return true;
 }
 
@@ -1223,7 +1256,8 @@ std::optional<mlir::LogicalResult>
 verifyStraightLineResource(FuncContractCache &contracts,
                            TrackedResource &resource,
                            llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-                           own::AliasAnalysis &aliases) {
+                           own::AliasAnalysis &aliases,
+                           const own::ReferenceMap &references) {
   if (resource.condition || !resource.producer)
     return std::nullopt;
   mlir::Block *block = resource.producer->getBlock();
@@ -1298,9 +1332,9 @@ verifyStraightLineResource(FuncContractCache &contracts,
       bool consumes = callConsumesGroup(contracts, call, group, aliases);
       if (consumes &&
           callReleasesForeignAggregate(
-              resource.retainRootedLocal && resource.hasOwnNamedRelease,
+              references, resource.hasOwnNamedRelease,
               resource.ownsReference && resource.hasOwnNamedRelease,
-              {group, resource.views}, call))
+              resource.reference, {group, resource.views}, call))
         continue;
       bool retains = callRetainsGroup(contracts, call, group, aliases);
       if (callPartiallyConsumesGroup(contracts, call, group, aliases))
@@ -2184,7 +2218,8 @@ bool dischargeOnHolderRelease() {
 mlir::LogicalResult verifyResourceOnCFGPaths(
     FuncContractCache &contracts, TrackedResource &resource,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases, OwnershipWalkCache &walk,
+    own::AliasAnalysis &aliases, const own::ReferenceMap &references,
+    OwnershipWalkCache &walk,
     bool modelMayRaiseUnwindExits,
     const llvm::DenseSet<mlir::Value> &ambiguousRetainRoots) {
   llvm::SmallVector<AffinePathState, 16> worklist;
@@ -2430,11 +2465,13 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       // A release written under the other token's name is invisible here
       // (`callReleasesForeignAggregate`).
       if (mentionsTracked &&
-          (resource.retainRootedLocal || resource.ownsReference)) {
+          (references.isMinted(resource.reference) ||
+           resource.ownsReference)) {
         if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
           if (callReleasesForeignAggregate(
-                  resource.retainRootedLocal && resource.hasOwnNamedRelease,
+                  references, resource.hasOwnNamedRelease,
                   resource.ownsReference && resource.hasOwnNamedRelease,
+                  resource.reference,
                   {state.group, state.views, state.previous, state.stale},
                   call) &&
               callConsumesGroup(contracts, call, state.group, aliases)) {
@@ -2888,8 +2925,17 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
                         mlir::func::FuncOp function,
                         llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                         own::AliasAnalysis &aliases,
-                        FuncContractCache &contracts) {
+                        FuncContractCache &contracts,
+                        const own::ReferenceMap &references) {
   llvm::SmallVector<TrackedResource, 16> resources;
+  // ⛔ FROM THE BIRTH LANES, not the advanced ones. A payload re-root replaces
+  // a group's lanes while leaving the obligation alone, so asking the map about
+  // an advanced lane names the MUTATION's reference instead of this one's --
+  // `cross_except_star_views` fails on exactly that. The reference is a property
+  // of the producer, so it is taken from the producer.
+  auto noteReference = [&](TrackedResource &resource, mlir::Value birth) {
+    resource.reference = references.of(birth);
+  };
   // Same lane advance the insertion pass performs, from the same shared
   // helper: insertion releases the CURRENT lanes, so a verifier still tracking
   // the birth lanes would read that release as naming another entity and
@@ -2919,13 +2965,17 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
       return;
     for (own::ResourceGroup group :
          own::collectOwnedLocalObjectGroups(op, deallocators)) {
+      mlir::Value birth = group.values.empty() ? mlir::Value{}
+                                               : group.values.front();
       advance(group);
       appendTrackedResource(resources, function, op, group.offset,
                             std::move(group.values), group.condition,
                             std::move(group.views));
-      resources.back().retainRootedLocal =
+      // Whether this marker mints is `isMinted(reference)` now, so the only
+      // thing left to record is that a marker CAN own one at all.
+      resources.back().ownsReference =
           own::ownedLocalMarkerIsRetainRooted(op, aliases);
-      resources.back().ownsReference = resources.back().retainRootedLocal;
+      noteReference(resources.back(), birth);
       noteOwnNamedRelease(resources.back(), group.deallocator);
       return;
     }
@@ -2943,11 +2993,14 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
     for (own::ResourceGroup group :
          own::collectOwnedCallResultGroups(module, call, deallocators,
                                            &symbols)) {
+      mlir::Value birth = group.values.empty() ? mlir::Value{}
+                                               : group.values.front();
       advance(group);
       appendTrackedResource(resources, function, call.getOperation(),
                             group.offset, std::move(group.values),
                             group.condition, std::move(group.views));
       resources.back().ownsReference = own::perReferenceReleaseLabels();
+      noteReference(resources.back(), birth);
       noteOwnNamedRelease(resources.back(), group.deallocator);
     }
   });
@@ -2959,7 +3012,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
     mlir::ModuleOp module, mlir::SymbolTable &symbols,
     mlir::func::FuncOp function,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-    own::AliasAnalysis &aliases, FuncContractCache &contracts) {
+    own::AliasAnalysis &aliases, FuncContractCache &contracts,
+    const own::ReferenceMap &references) {
   // The may-raise unwind-exit obligation only applies where the insertion
   // pass can pair it with marker wiring the final EH phase materializes:
   // functions with a Python source location, outside runtime-internal
@@ -2969,7 +3023,8 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
       !module->hasAttr(own::kRuntimeInternalLoweringAttr) &&
       findPythonSourceLoc(function.getLoc()).has_value();
   llvm::SmallVector<TrackedResource, 16> resources = collectTrackedResources(
-      module, symbols, function, deallocators, aliases, contracts);
+      module, symbols, function, deallocators, aliases, contracts,
+      references);
   llvm::SmallVector<BorrowedEntryResource, 8> borrowedEntryResources =
       collectBorrowedEntryResources(function, deallocators);
 
@@ -2978,7 +3033,7 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
     bool allResourcesHandled = true;
     for (TrackedResource &resource : resources) {
       std::optional<mlir::LogicalResult> result = verifyStraightLineResource(
-          contracts, resource, deallocators, aliases);
+          contracts, resource, deallocators, aliases, references);
       if (!result) {
         allResourcesHandled = false;
         break;
@@ -3003,7 +3058,7 @@ mlir::LogicalResult verifyFunctionAffineOwnership(
   OwnershipWalkCache walk(function, contracts, aliases, handlerEntries);
   for (TrackedResource &resource : resources)
     if (mlir::failed(verifyResourceOnCFGPaths(
-            contracts, resource, deallocators, aliases, walk,
+            contracts, resource, deallocators, aliases, references, walk,
             modelMayRaiseUnwindExits, ambiguousRetainRoots)))
       return mlir::failure();
 
@@ -3019,6 +3074,12 @@ mlir::LogicalResult verifyPathSensitiveAffineOwnership(
     mlir::ModuleOp module, llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases) {
   FuncContractCache contracts(module);
+  // The other analysis, beside the one it is not: `aliases` answers "same
+  // entity", this answers "same reference". The placer builds the same map from
+  // the same facts -- if insertion and verification disagreed about which
+  // reference a release discharges, the proof would be void
+  // (rfc/memory-safety-proof.md).
+  const own::ReferenceMap references(contracts, aliases);
   // One table for the whole module walk: resolving callees per call op through
   // the module's symbol list is what made resource collection O(calls x
   // symbols).
@@ -3028,7 +3089,8 @@ mlir::LogicalResult verifyPathSensitiveAffineOwnership(
         if (own::isRuntimeManifestFunction(function))
           return mlir::success();
         return verifyFunctionAffineOwnership(module, symbols, function,
-                                             deallocators, aliases, contracts);
+                                             deallocators, aliases, contracts,
+                                             references);
       });
 }
 
