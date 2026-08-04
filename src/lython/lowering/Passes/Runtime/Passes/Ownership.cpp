@@ -515,6 +515,30 @@ mlir::func::CallOp emitGroupRelease(mlir::OpBuilder &builder, mlir::Location loc
   return call;
 }
 
+// IS THIS NAME NOT ONE OF THE WALKED GROUP'S OWN?
+//
+// One condition of the death test, split out so it can be replaced -- and
+// measured -- on its own. The test around it is unchanged: a consume is another
+// reference's discharge when it carries `aggregate_release`, the walked group
+// mints, AND the name it was reached through is not the group's.
+//
+// The map answers "not mine" BY REFERENCE where it can name the value, which the
+// SSA containment test it replaces could not: a cast of one of my names is a
+// different spelling of the same reference, and containment called it another's.
+//
+// ⛔ WHERE THE MAP CANNOT NAME THE VALUE, THE ANSWER IS THE OLD TEST, not
+// `false`. "No claim" means the caller keeps its previous reading, and the
+// previous reading HERE was containment -- the liveness walk's previous reading
+// was the opposite, which is why that site and this one fall back differently.
+// Reading no-claim as "mine" fails six cases; as containment, none.
+bool isNotOwnName(const own::ReferenceMap &references,
+                  llvm::ArrayRef<mlir::Value> group, mlir::Value equivalent,
+                  own::Reference mine) {
+  if (own::Reference denoted = references.of(equivalent))
+    return !mine || denoted != mine;
+  return !llvm::is_contained(group, equivalent);
+}
+
 // IS THIS NAME ANOTHER REFERENCE'S, SO THAT USES UNDER IT ARE NOT OUR LIVENESS?
 //
 // `("k", 5) in h.items()` is why the question is asked at all: the element's own
@@ -774,17 +798,19 @@ mergeReleaseInsertion(std::optional<ReleaseInsertion> current,
   return current;
 }
 
-// `ownNamesOnlyConsume`: see `consumeIsAggregateRelease`. When set, an AGGREGATE
-// release reached through an alias rather than through one of the group's own
-// names does not end this token -- it discharges the container's -- and counts
-// only as liveness here. Bare releases still end it either way.
+// An AGGREGATE release reached through a name that is not this group's does not
+// end it -- it discharges the container's -- and counts only as liveness here.
+// Bare releases end it either way. Whether the group may make that claim at all
+// is `isMinted(mine)`: only a retain-minted token carries an increment on top of
+// the container's, so only it can have a release that is not this one.
 std::optional<ReleaseInsertion>
 findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
                      llvm::ArrayRef<mlir::Value> group,
                      llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
-                     own::AliasAnalysis &aliases, unsigned depth = 0,
-                     llvm::ArrayRef<mlir::Value> views = {},
-                     bool ownNamesOnlyConsume = false) {
+                     own::AliasAnalysis &aliases,
+                     const own::ReferenceMap &references, own::Reference mine,
+                     unsigned depth = 0,
+                     llvm::ArrayRef<mlir::Value> views = {}) {
   if (!owner || group.empty() || depth > 16)
     return std::nullopt;
   mlir::Block *block = owner->getBlock();
@@ -843,8 +869,8 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
           continue;
         if (usePrecedesOwnerInBlock(owner, user, block))
           continue;
-        if (!(ownNamesOnlyConsume && consumeIsAggregateRelease(use) &&
-              !llvm::is_contained(group, equivalent)) &&
+        if (!(references.isMinted(mine) && consumeIsAggregateRelease(use) &&
+              isNotOwnName(references, group, equivalent, mine)) &&
             ownershipConsumingUseInvalidatesGroup(contracts, use, group,
                                                   aliases))
           return std::nullopt;
@@ -889,8 +915,8 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
             }
             std::optional<ReleaseInsertion> release =
                 findReleaseInsertion(contracts, regionOwner, *mapped,
-                                     deallocators, aliases, depth + 1,
-                                     mappedViews, ownNamesOnlyConsume);
+                                     deallocators, aliases, references, mine,
+                                     depth + 1, mappedViews);
             if (!release)
               return std::nullopt;
             forwardedRelease =
@@ -1360,8 +1386,7 @@ bool releaseOwnedGroupByLiveness(
     own::AliasAnalysis &aliases,
     const own::ReferenceMap &references, bool ownsReference,
     bool consumeIsDeath = false,
-    llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {},
-    bool ownNamesOnlyConsume = false) {
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {}) {
   if (!group.deallocator || group.condition)
     return false;
   // The reference this walk is placing for, asked once. Only the liveness
@@ -1375,8 +1400,8 @@ bool releaseOwnedGroupByLiveness(
   // token does not own discharges the container's token, not this one.
   auto consumingUseEndsThisToken = [&](mlir::OpOperand &use,
                                        mlir::Value equivalent) {
-    if (ownNamesOnlyConsume && consumeIsAggregateRelease(use) &&
-        !llvm::is_contained(group.values, equivalent))
+    if (references.isMinted(mine) && consumeIsAggregateRelease(use) &&
+        isNotOwnName(references, group.values, equivalent, mine))
       return false;
     return ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                  aliases);
@@ -2881,7 +2906,8 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
 
     std::optional<ReleaseInsertion> release =
         findReleaseInsertion(contracts, call, group.values, deallocators,
-                             aliases, /*depth=*/0, group.views);
+                             aliases, references, /*mine=*/own::Reference{},
+                             /*depth=*/0, group.views);
     if (release) {
       mlir::OpBuilder builder(call);
       if (release->before)
@@ -3003,6 +3029,11 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
       continue;
     }
 
+    // Which increment this group is the obligation for, for `isNotOwnName`.
+    const own::Reference mine =
+        group.values.empty() ? own::Reference{}
+                             : references.of(group.values.front());
+
     // Same reason as for call-result groups: an owned local whose payload was
     // mutated must be released through the post-mutation lanes. The marker
     // re-root covers the shapes the lowerer can see; this covers the ones only
@@ -3012,7 +3043,8 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
 
     std::optional<ReleaseInsertion> release =
         findReleaseInsertion(contracts, op, group.values, deallocators,
-                             aliases, /*depth=*/0, group.views, retainRooted);
+                             aliases, references, mine, /*depth=*/0,
+                             group.views);
     if (release) {
       mlir::OpBuilder builder(op);
       if (release->before)
@@ -3036,7 +3068,7 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
                                     group, aliases, references,
                                     /*ownsReference=*/retainRooted,
                                     /*consumeIsDeath=*/true,
-                                    /*deallocators=*/{}, retainRooted)) {
+                                    /*deallocators=*/{})) {
       if (ownedLocalTraceEnabled()) {
         unsigned after = 0;
         if (enclosing)
@@ -3066,8 +3098,8 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
           if (user == op)
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
-              (!(retainRooted && consumeIsAggregateRelease(use) &&
-                 !llvm::is_contained(group.values, equivalent)) &&
+              (!(references.isMinted(mine) && consumeIsAggregateRelease(use) &&
+                 isNotOwnName(references, group.values, equivalent, mine)) &&
                ownershipConsumingUseInvalidatesGroup(contracts, use,
                                                      group.values, aliases)) ||
               mlir::isa<mlir::func::ReturnOp>(user) ||
@@ -3151,7 +3183,8 @@ struct UnwindTrackedGroup {
   // Top-level ancestors of every user (values, interior views, box-word
   // derived views): liveness pins for the handler-side check.
   llvm::SmallVector<mlir::Operation *, 8> useSites;
-  // The owned-local marker whose retain MINTED this token, when one did.
+  // Which increment this group is the obligation for, when the analysis can
+  // name one (`own::ReferenceMap`).
   //
   // AN ENTITY IS NOT A RESOURCE, and this is the only thing that tells the two
   // apart here. A retain-minted marker and the reference it was minted on share
@@ -3160,7 +3193,7 @@ struct UnwindTrackedGroup {
   // they are two increments with two releases. Both the dedup and the consume
   // scan below ask "is this the same obligation as that one", and without the
   // producer they could only answer "same entity, so yes".
-  mlir::Operation *mintedBy = nullptr;
+  own::Reference reference;
 };
 
 // How the unwind-cleanup CFG questions below are answered.
@@ -3780,7 +3813,9 @@ void addForwardedNameUseSites(own::AliasAnalysis &aliases, mlir::Region *region,
 }
 
 void collectUnwindGroupSites(FuncContractCache &contracts,
-                             own::AliasAnalysis &aliases, mlir::Region *region,
+                             own::AliasAnalysis &aliases,
+                             const own::ReferenceMap &references,
+                             mlir::Region *region,
                              mlir::DominanceInfo &dominance,
                              UnwindTrackedGroup &group) {
   // Operations before the producer belong to the token's production (e.g.
@@ -3836,8 +3871,17 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           // minted token looked already gone at every unwind point and no
           // cleanup was written for it -- `try: print(zs[0] / zs[1])` leaked
           // both elements, 80 B, on the path the exception actually takes.
-          if (group.mintedBy && consumeIsAggregateRelease(use) &&
-              !llvm::is_contained(group.values, equivalent))
+          // `group.reference` rather than a locally recomputed one: it is the
+          // obligation this analysis RECORDED for the group, so
+          // LYTHON_ABLATE_UNWIND_MINTED_TOKENS covers the consume scan and the
+          // dedup together. Recomputing it here left the switch covering half of
+          // what it names, and an arm that is neither behaviour is worse than no
+          // arm -- `dict_iteration_views` stopped showing the 17231 B the switch
+          // documents.
+          if (references.isMinted(group.reference) &&
+              consumeIsAggregateRelease(use) &&
+              isNotOwnName(references, group.values, equivalent,
+                           group.reference))
             continue;
           if (callPartiallyConsumesGroup(contracts, call, group.values,
                                          aliases) ||
@@ -4368,8 +4412,17 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       steps.mark(UnwindStepTimer::Analysis);
 
       // Owned groups whose token could be held at an exceptional exit.
-      auto addGroup = [&](const own::ResourceGroup &g,
-                          mlir::Operation *mintedBy) {
+      auto addGroup = [&](const own::ResourceGroup &g) {
+        // Only a MINTED reference discriminates here. A received one is the
+        // obligation a region merge maps several producers onto, and telling
+        // those apart would track one token as several and release it once per
+        // cleanup handler -- which is what the root-only dedup was for.
+        own::Reference groupReference;
+        if (own::unwindTracksMintedTokensSeparately() && !g.values.empty()) {
+          own::Reference head = references.of(g.values.front());
+          if (references.isMinted(head))
+            groupReference = head;
+        }
         if (!g.deallocator || g.condition || g.values.empty())
           return;
         UnwindTrackedGroup tracked;
@@ -4412,48 +4465,36 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         // it twice would release the same token twice in one cleanup handler.
         //
         // Same entity is NOT the same obligation, though, which is why the
-        // producer has to match too (`UnwindTrackedGroup::mintedBy`). A minted
+        // reference has to match too (`UnwindTrackedGroup::reference`). A minted
         // marker shares an entity root with the reference it was minted on, so
         // the root test alone dropped it from this analysis entirely -- nothing
         // ever asked whether ITS token was held on an unwinding edge.
         for (const UnwindTrackedGroup &existing : groups) {
-          if (existing.mintedBy != mintedBy)
+          if (existing.reference != groupReference)
             continue;
           own::reportEntityRootParity("unwindGroupDedup", existing.values,
                                       tracked.values);
           if (own::sameEntityRoot(existing.values, tracked.values))
             return;
         }
-        tracked.mintedBy = mintedBy;
-        collectUnwindGroupSites(contracts, aliases, region, analysis.dominance,
-                                tracked);
+        tracked.reference = groupReference;
+        collectUnwindGroupSites(contracts, aliases, references, region,
+                                analysis.dominance, tracked);
         addForwardedNameUseSites(aliases, region, tracked);
         groups.push_back(std::move(tracked));
       };
       function.walk([&](mlir::func::CallOp call) {
         for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
                  module, call, deallocators, symbols))
-          addGroup(g, /*mintedBy=*/nullptr);
+          addGroup(g);
       });
       function.walk([&](mlir::Operation *op) {
         if (!op->hasAttr(own::kOwnedLocalObjectAttr) &&
             !op->hasAttr(own::kOwnedLocalObjectContractAttr))
           return;
-        // The same pair of properties as the liveness exclusion, asked of this
-        // marker's own head: the dedup below is per OBLIGATION, and a marker
-        // that MINTS one is a different obligation from the reference it was
-        // minted on.
-        own::Reference head =
-            op->getNumResults() == 0 ? own::Reference{}
-                                     : references.of(op->getResult(0));
-        mlir::Operation *mintedBy =
-            own::unwindTracksMintedTokensSeparately() && head &&
-                    references.isMinted(head)
-                ? op
-                : nullptr;
         for (const own::ResourceGroup &g :
              own::collectOwnedLocalObjectGroups(op, deallocators))
-          addGroup(g, mintedBy);
+          addGroup(g);
       });
       for (const own::ResourceGroup &g : blockArgGroups) {
         if (g.values.empty())
@@ -4461,7 +4502,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
         if (!blockArg || blockArg.getOwner()->getParent() != region)
           continue;
-        addGroup(g, /*mintedBy=*/nullptr);
+        addGroup(g);
       }
       steps.mark(UnwindStepTimer::Groups);
       steps.blocks = analysis.blocks.size();
