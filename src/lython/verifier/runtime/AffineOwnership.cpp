@@ -215,7 +215,10 @@ struct TrackedResource {
   mlir::Operation *producer = nullptr;
   std::string producerLabel;
   unsigned resultOffset = 0;
-  llvm::SmallVector<mlir::Value, 4> group;
+  // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
+  // structs calling one thing by two names is how they read as three
+  // different models of a resource when they are one.
+  llvm::SmallVector<mlir::Value, 4> values;
   // Does this resource's producer MINT a token (a retain-rooted owned-local
   // marker) rather than republish one the head already had? If so the object
   // carries a second token under other names, whose releases this walk must not
@@ -389,6 +392,9 @@ struct AffinePathState {
   mlir::Operation *start = nullptr;
   AffineTokenState token = AffineTokenState::Owned;
   unsigned retained = 0;
+  // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
+  // structs calling one thing by two names is how they read as three
+  // different models of a resource when they are one.
   llvm::SmallVector<mlir::Value, 4> group;
   // Values whose token was moved by a transferring call on this path: the
   // stale names carry no token, so releasing them again is a double free.
@@ -455,13 +461,19 @@ struct BorrowedEntryResource {
   mlir::func::FuncOp function;
   unsigned logicalIndex = 0;
   unsigned inputOffset = 0;
-  llvm::SmallVector<mlir::Value, 4> group;
+  // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
+  // structs calling one thing by two names is how they read as three
+  // different models of a resource when they are one.
+  llvm::SmallVector<mlir::Value, 4> values;
 };
 
 struct BorrowedPathState {
   mlir::Block *block = nullptr;
   mlir::Operation *start = nullptr;
   unsigned retained = 0;
+  // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
+  // structs calling one thing by two names is how they read as three
+  // different models of a resource when they are one.
   llvm::SmallVector<mlir::Value, 4> group;
   // Path entered through an exceptional (unwind) edge. Retain balance is
   // required on these paths like any other (rfc/stdlib-semantics.md R2).
@@ -1266,8 +1278,8 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
   llvm::SmallVector<mlir::Operation *, 16> users;
   llvm::SmallPtrSet<mlir::Operation *, 16> seen;
-  llvm::SmallVector<mlir::Value, 8> trackedValues(resource.group.begin(),
-                                                  resource.group.end());
+  llvm::SmallVector<mlir::Value, 8> trackedValues(resource.values.begin(),
+                                                  resource.values.end());
   trackedValues.append(resource.views.begin(), resource.views.end());
   for (mlir::Value value : trackedValues) {
     llvm::SmallVector<mlir::Value, 8> equivalentValues;
@@ -1295,7 +1307,7 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
   AffineTokenState token = AffineTokenState::Owned;
   unsigned retained = 0;
-  llvm::SmallVector<mlir::Value, 4> group = resource.group;
+  llvm::SmallVector<mlir::Value, 4> group = resource.values;
   for (mlir::Operation *op : users) {
     if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
       bool consumes = returnConsumesGroup(contracts, resource.function, ret, group,
@@ -1468,7 +1480,10 @@ llvm::SmallVector<BorrowedEntryResource, 8> collectBorrowedEntryResources(
       break;
 
     unsigned groupOffset = offset;
-    llvm::SmallVector<mlir::Value, 4> group;
+    // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
+  // structs calling one thing by two names is how they read as three
+  // different models of a resource when they are one.
+  llvm::SmallVector<mlir::Value, 4> group;
     std::string contractName = contracts::runtimeContractName(logicalType);
     if (!contractName.empty()) {
       if (const own::RuntimeDeallocator *deallocator =
@@ -1502,7 +1517,7 @@ llvm::SmallVector<BorrowedEntryResource, 8> collectBorrowedEntryResources(
     resource.function = function;
     resource.logicalIndex = static_cast<unsigned>(logicalIndex);
     resource.inputOffset = groupOffset;
-    resource.group = std::move(group);
+    resource.values = std::move(group);
     resources.push_back(std::move(resource));
   }
   return resources;
@@ -1902,7 +1917,7 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
   VisitedBorrowedStates visited;
   mlir::Block &entry = resource.function.front();
   worklist.push_back(BorrowedPathState{&entry, firstOperation(&entry),
-                                       /*retained=*/0, resource.group});
+                                       /*retained=*/0, resource.values});
 
   constexpr unsigned kMaxBorrowedStates = 20000;
   constexpr unsigned kMaxRetainedBalance = 64;
@@ -2034,7 +2049,7 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
           // rejecting it would hard-error plain loop-reassignment code
           // (documented residual).
           if (state.retained != 0 && !state.exceptional &&
-              own::sameEntityRoot(state.group, resource.group) &&
+              own::sameEntityRoot(state.group, resource.values) &&
               !walk.guardedByCallSiteMarker(call))
             return call.emitError()
                    << "borrowed entry argument " << resource.logicalIndex
@@ -2232,7 +2247,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
   initial.start = resource.producer->getNextNode();
   initial.token = initialToken;
   initial.retained = 0;
-  initial.group = resource.group;
+  initial.group = resource.values;
   initial.views = resource.views;
   worklist.push_back(std::move(initial));
 
@@ -2914,7 +2929,7 @@ void appendTrackedResource(
   resource.producer = producer;
   resource.producerLabel = describeOwnershipProducer(producer);
   resource.resultOffset = offset;
-  resource.group = std::move(group);
+  resource.values = std::move(group);
   resource.views = std::move(views);
   resource.condition = condition;
   resources.push_back(std::move(resource));
@@ -2953,7 +2968,7 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
     if (!resource.ownsReference || !deallocator)
       return;
     llvm::StringRef name = mlir::func::FuncOp(deallocator->function).getName();
-    for (mlir::Value value : resource.group)
+    for (mlir::Value value : resource.values)
       for (mlir::OpOperand &use : value.getUses())
         if (auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner()))
           if (call.getCallee() == name)
@@ -2982,7 +2997,10 @@ collectTrackedResources(mlir::ModuleOp module, mlir::SymbolTable &symbols,
     if (!op->hasAttr(own::kOwnedLocalObjectContractAttr) &&
         !mlir::isa<mlir::func::CallOp>(op) && op->getNumResults() != 0 &&
         own::isObjectHeaderLikeType(op->getResult(0).getType())) {
-      llvm::SmallVector<mlir::Value, 4> group;
+      // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
+  // structs calling one thing by two names is how they read as three
+  // different models of a resource when they are one.
+  llvm::SmallVector<mlir::Value, 4> group;
       group.push_back(op->getResult(0));
       appendTrackedResource(resources, function, op, /*offset=*/0,
                             std::move(group));

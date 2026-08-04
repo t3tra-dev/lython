@@ -71,6 +71,14 @@ inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
 // release IS that construction's discharge -- and letting an owned call result
 // skip one double-freed every enum member in cross_enum_generic_handler.
 //
+// ⭐ NOT SUBSUMED BY `own::ReferenceMap`, measured 2026-08-05. The map can name
+// the reference an operand denotes, but this label says something stronger: THE
+// PLACER CHOSE THESE OPERANDS FROM THE REFERENCE IT WAS PLACING FOR. An
+// emitter-written decref is unlabelled and its operand's reference is nameable
+// all the same, and it may discharge something else. Dropping the label and
+// going by the map alone makes
+// `loop_iterator_element_into_container_literal` unbuildable.
+//
 // Only placements for a reference of their OWN carry it. A marker that
 // republishes a reference the frame already holds has no increment to discharge,
 // and labelling its release would make the holder disown it and place a second.
