@@ -987,6 +987,42 @@ private:
   std::unique_ptr<mlir::DominanceInfo> dominance;
 };
 
+// WHERE THE VIRTUAL UNWIND EDGE IS.
+//
+// An anchor cond_br's TRUE edge is the spelling of "the guarded call unwound":
+// at runtime it is only ever taken by an unwind, so a path down it must carry
+// the state the runtime unwind would -- the guarded call's consume applied, and
+// the path marked exceptional, exactly like the marker edges.
+//
+// Why one helper for two walks: this is ONE fact about the IR, and it was
+// written out once per walk. A new anchor spelling taught to one copy would
+// silently not exist in the other, and the two walks would then disagree about
+// which edge an exception takes -- in a verifier whose entire judgment is about
+// what happens on that edge. The two DIFFER in what they do with the answer
+// (one has a token to release, the other only a retain counter), which is why
+// this returns the fact and not the effect.
+struct AnchorTrueEdge {
+  bool isVirtualUnwind = false; // successor 0 is the anchor's unwind edge
+  bool consumesGroup = false;   // and the call it guards consumes the group
+};
+
+template <typename State>
+AnchorTrueEdge anchorTrueEdgeOf(OwnershipWalkCache &walk,
+                                FuncContractCache &contracts,
+                                mlir::Operation *terminator, const State &state,
+                                own::AliasAnalysis &aliases) {
+  AnchorTrueEdge edge;
+  if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator))
+    if (auto anchorCall =
+            cond.getCondition().getDefiningOp<mlir::func::CallOp>())
+      edge.isVirtualUnwind = anchorCall.getCallee() == "LyEH_TryCatchAnchor";
+  mlir::func::CallOp guarded = walk.anchorTrueEdgeGuardedCall(terminator);
+  edge.consumesGroup =
+      guarded && walk.mentionsTracked(guarded, state) &&
+      callConsumesGroup(contracts, guarded, state.group, aliases);
+  return edge;
+}
+
 // Alias roots of `values`. `aliases.same(v, c)` holding for some c in `values`
 // is exactly `aliases.find(v)` being one of these roots.
 llvm::DenseSet<mlir::Value> aliasRootsOf(llvm::ArrayRef<mlir::Value> values,
@@ -2080,23 +2116,14 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       continue;
     }
 
-    // Mirror the runtime unwind state on the anchor's virtual true edge
-    // (see the affine walk above), including the exceptional flag.
-    mlir::func::CallOp anchorGuarded = walk.anchorTrueEdgeGuardedCall(op);
-    bool anchorEdgeConsumes =
-        anchorGuarded && walk.mentionsTracked(anchorGuarded, state) &&
-        callConsumesGroup(contracts, anchorGuarded, state.group, aliases);
-    bool anchorTerminator = false;
-    if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(op))
-      if (auto anchorCall =
-              cond.getCondition().getDefiningOp<mlir::func::CallOp>())
-        anchorTerminator = anchorCall.getCallee() == "LyEH_TryCatchAnchor";
+    AnchorTrueEdge anchor =
+        anchorTrueEdgeOf(walk, contracts, op, state, aliases);
     for (unsigned index = 0; index < successors; ++index) {
       mlir::Block *successor = op->getSuccessor(index);
       BorrowedPathState next = state;
-      if (anchorTerminator && index == 0)
+      if (anchor.isVirtualUnwind && index == 0)
         next.exceptional = true;
-      if (anchorEdgeConsumes && index == 0 && next.retained > 0)
+      if (anchor.consumesGroup && index == 0 && next.retained > 0)
         --next.retained;
       next.block = successor;
       next.start = firstOperation(successor);
@@ -2741,28 +2768,16 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       continue;
     }
 
-    // An anchor cond_br's true edge is the virtual spelling of "the guarded
-    // call unwound": apply the guarded call's consume effect there so the
-    // virtual path carries the same token state the runtime unwind does --
-    // and mark the path exceptional, exactly like the marker edges (the
-    // true edge is only ever taken by an unwind at runtime).
-    mlir::func::CallOp anchorGuarded = walk.anchorTrueEdgeGuardedCall(op);
-    bool anchorEdgeConsumes =
-        anchorGuarded && walk.mentionsTracked(anchorGuarded, state) &&
-        callConsumesGroup(contracts, anchorGuarded, state.group, aliases);
-    bool anchorTerminator = false;
-    if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(op))
-      if (auto anchorCall =
-              cond.getCondition().getDefiningOp<mlir::func::CallOp>())
-        anchorTerminator = anchorCall.getCallee() == "LyEH_TryCatchAnchor";
+    AnchorTrueEdge anchor =
+        anchorTrueEdgeOf(walk, contracts, op, state, aliases);
     for (unsigned index = 0; index < successors; ++index) {
       mlir::Block *successor = op->getSuccessor(index);
       AffineTokenState nextToken = state.token;
       unsigned nextRetained = state.retained;
       llvm::SmallVector<std::int64_t, 2> nextSlotParents = state.slotParents;
       bool nextExceptional =
-          state.exceptional || (anchorTerminator && index == 0);
-      if (anchorEdgeConsumes && index == 0) {
+          state.exceptional || (anchor.isVirtualUnwind && index == 0);
+      if (anchor.consumesGroup && index == 0) {
         if (nextToken == AffineTokenState::Owned ||
             nextToken == AffineTokenState::Conditional)
           nextToken = AffineTokenState::Released;
