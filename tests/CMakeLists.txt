@@ -94,6 +94,7 @@ endforeach()
 
 add_executable(lython_unit_tests
     unit/DriverTests.cpp
+    unit/ReferenceMapTests.cpp
     unit/EmitterTests.cpp
     unit/EntityHeaderPrefixTests.cpp
     unit/EvidenceVerifierTests.cpp
@@ -164,7 +165,8 @@ set(LYTHON_UNIT_PATTERNS_emit
     "TypeInferenceTest.*"
     "DriverTest.ReportsEmitErrorDiagnostics")
 set(LYTHON_UNIT_PATTERNS_abi
-    "EntityHeaderPrefixTest.*")
+    "EntityHeaderPrefixTest.*"
+    "ReferenceMapTest.*")
 # `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
 # manifest sources and asks a dataflow question about them, which is the suite
 # checking the tree rather than the compiler.

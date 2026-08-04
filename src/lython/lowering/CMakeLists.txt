@@ -14,6 +14,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/ABI/Returns.cpp
     Passes/Runtime/ABI/RuntimeABI.cpp
     ../common/Ownership.cpp
+    ../common/Reference.cpp
     ../common/Contracts.cpp
     ../common/Native.cpp
     Passes/Runtime/Calls/Builtin.cpp

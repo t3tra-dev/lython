@@ -1,4 +1,5 @@
 #include "Ownership.h"
+#include "Reference.h"
 #include "Common/Instrumentation.h"
 #include "Common/PythonSourceRange.h"
 #include "Common/RuntimeSupport.h"
@@ -516,50 +517,45 @@ mlir::func::CallOp emitGroupRelease(mlir::OpBuilder &builder, mlir::Location loc
 
 // IS THIS NAME ANOTHER REFERENCE'S, SO THAT USES UNDER IT ARE NOT OUR LIVENESS?
 //
-// The other half of `own::kReferenceReleaseAttr`, and splitting only the deaths
-// is not enough. `("k", 5) in h.items()` proves it: the element's own +1 is
-// discharged by the literal's `sequence.literal.source` release, but the token a
-// later retain minted on the same object keeps being USED afterwards, and
-// reaching those uses through the alias relation made the element look live past
-// its own death -- so it got a second release, which the token's missing one
-// silently paid for. Fix one side alone and the compensation breaks: 3
-// increments against 4 decrements, and the runtime's own guard fires.
+// `("k", 5) in h.items()` is why the question is asked at all: the element's own
+// increment is discharged by the literal's `sequence.literal.source` release,
+// but the token a later retain minted on the same object keeps being USED
+// afterwards, and reaching those uses through the alias relation made the
+// element look live past its own death -- so it got a second release, which the
+// token's missing one silently paid for.
 //
-// A minted marker holds an increment of its own, so the entity outlives our
-// release whatever happens under its name -- that is what makes dropping these
-// uses safe. A marker that merely republishes our reference holds nothing and
-// its uses stay ours, which is why the set is the MINTED ones and not every
-// marker.
-bool nameBelongsToAnotherMintedReference(
-    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
-    mlir::Value equivalent, llvm::ArrayRef<mlir::Value> group,
-    llvm::ArrayRef<mlir::Value> views) {
-  if (!own::perReferenceReleaseLabels() || mintedMarkers.empty() ||
-      llvm::is_contained(group, equivalent) ||
-      llvm::is_contained(views, equivalent))
+// TWO properties, composed here and named separately because they are
+// independent and both were measured:
+//
+//   1. the name denotes a DIFFERENT reference (`own::ReferenceMap`). What stood
+//      here compared the defining op against a set of the module's minted
+//      markers -- the same question asked of one shape only, since a cast of a
+//      marker's result denotes the marker's reference and a set of ops cannot
+//      say so.
+//   2. that reference was MINTED rather than received
+//      (`own::ReferenceMap::isMinted`). A minted one is an increment taken on
+//      top of whatever else holds the entity, so it keeps the entity alive
+//      independently and uses under its names are safely somebody else's. A
+//      RECEIVED one may be the very reference that just died, and dropping the
+//      pins under it releases early: two leak-gate members regress the moment
+//      this condition goes.
+//
+// Composed, not folded. Collapsing the ownership walks' predicates into one
+// question was tried and measured: it does not converge, because at least this
+// pair and the `aggregate_release` label are orthogonal and each is load-bearing
+// somewhere (rfc/test-suite-debt.md).
+bool namesAnotherMintedReference(const own::ReferenceMap &references,
+                                 mlir::Value name, own::Reference mine) {
+  // The rule this predicate carries is the one LYTHON_ABLATE_REFERENCE_RELEASE
+  // exists to A/B, so it stays behind that switch even though it no longer reads
+  // the label: an ablation that stops covering half of what it names is worse
+  // than none, because the arm it produces is neither behaviour.
+  if (!own::perReferenceReleaseLabels())
     return false;
-  mlir::Operation *definition = equivalent.getDefiningOp();
-  return definition && mintedMarkers.contains(definition);
+  own::Reference denoted = references.of(name);
+  return mine && denoted && denoted != mine && references.isMinted(denoted);
 }
 
-// The retain-rooted owned-local markers of the module, by marker op.
-//
-// One walk, up front: `ownedLocalMarkerIsRetainRooted` recognises the mint by
-// position (the retain is the marker's previous node), so asking per group in a
-// pass that inserts calls would be answering a question about IR that has moved.
-llvm::DenseSet<mlir::Operation *>
-collectMintedLocalMarkers(mlir::ModuleOp module, own::AliasAnalysis &aliases) {
-  llvm::DenseSet<mlir::Operation *> minted;
-  if (!own::unwindTracksMintedTokensSeparately() &&
-      !own::perReferenceReleaseLabels())
-    return minted;
-  module.walk([&](mlir::Operation *op) {
-    if (op->hasAttr(own::kOwnedLocalObjectAttr) &&
-        own::ownedLocalMarkerIsRetainRooted(op, aliases))
-      minted.insert(op);
-  });
-  return minted;
-}
 
 // The buffer a retain argument was spelled from: retains take a header PREFIX,
 // so the call operand is a cast or subview of the entity root, not the root.
@@ -1362,12 +1358,19 @@ bool releaseOwnedGroupByLiveness(
     FuncContractCache &contracts, mlir::Operation *selfOp,
     mlir::Block *defBlock, mlir::Location loc, const own::ResourceGroup &group,
     own::AliasAnalysis &aliases,
-    const llvm::DenseSet<mlir::Operation *> &mintedMarkers, bool ownsReference,
+    const own::ReferenceMap &references, bool ownsReference,
     bool consumeIsDeath = false,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {},
     bool ownNamesOnlyConsume = false) {
   if (!group.deallocator || group.condition)
     return false;
+  // The reference this walk is placing for, asked once. Only the liveness
+  // exclusion reads it (`namesAnotherMintedReference`); the death test below
+  // still goes through the `aggregate_release` label, which is a separate
+  // property and stays separate.
+  const own::Reference mine =
+      group.values.empty() ? own::Reference{}
+                           : references.of(group.values.front());
   // See `consumeIsAggregateRelease`: an aggregate release under a name this
   // token does not own discharges the container's token, not this one.
   auto consumingUseEndsThisToken = [&](mlir::OpOperand &use,
@@ -1530,8 +1533,7 @@ bool releaseOwnedGroupByLiveness(
         // and got a second release: three increments against four decrements
         // once the second mint gained the release it was owed.
         if (groupHasConsumingCall &&
-            nameBelongsToAnotherMintedReference(mintedMarkers, equivalent,
-                                                group.values, group.views))
+            namesAnotherMintedReference(references, equivalent, mine))
           continue;
         groupEquivalents.push_back(equivalent);
       }
@@ -1580,7 +1582,7 @@ bool releaseOwnedGroupByLiveness(
       // Only PAST OUR OWN DEATH, and only as a LIVENESS PIN. With no consume of
       // ours there is nothing to be past; with one, these are exactly the uses
       // that made this reference look live after its own discharge
-      // (`nameBelongsToAnotherMintedReference`).
+      // (`namesAnotherMintedReference`).
       //
       // Why not `continue` over the whole name: every bail in the loop below is
       // a safety condition (a consume, a transferring return, a nested-region
@@ -1590,8 +1592,7 @@ bool releaseOwnedGroupByLiveness(
       // form of "these uses are not mine".
       const bool pinsAnotherReference =
           groupHasConsumingCall &&
-          nameBelongsToAnotherMintedReference(mintedMarkers, equivalent,
-                                              group.values, group.views);
+          namesAnotherMintedReference(references, equivalent, mine);
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
         if (user == selfOp)
@@ -2017,7 +2018,7 @@ bool borrowEdgeRetainIsSpellable(mlir::Value header,
 bool insertOwnedValueReleasesByLiveness(
     FuncContractCache &contracts, mlir::func::CallOp call,
     const own::ResourceGroup &group, own::AliasAnalysis &aliases,
-    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    const own::ReferenceMap &references,
     bool ownsReference) {
   static bool consumeIsDeathDisabled = [] {
     auto value = llvm::sys::Process::GetEnv(
@@ -2026,7 +2027,7 @@ bool insertOwnedValueReleasesByLiveness(
   }();
   return releaseOwnedGroupByLiveness(contracts, call.getOperation(),
                                      call->getBlock(), call.getLoc(), group,
-                                     aliases, mintedMarkers, ownsReference,
+                                     aliases, references, ownsReference,
                                      /*consumeIsDeath=*/!consumeIsDeathDisabled);
 }
 
@@ -2165,7 +2166,7 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases,
-    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    const own::ReferenceMap &references,
     mlir::SymbolTable *symbols,
     llvm::SmallVectorImpl<own::ResourceGroup> *unwindGroups,
     bool insertReleases = true) {
@@ -2823,7 +2824,7 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       // of its own. Claiming otherwise would let the other half disown it.
       releaseOwnedGroupByLiveness(contracts, /*selfOp=*/nullptr,
                                   firstArg.getOwner(), firstArg.getLoc(),
-                                  destGroup, aliases, mintedMarkers,
+                                  destGroup, aliases, references,
                                   /*ownsReference=*/false,
                                   /*consumeIsDeath=*/true, deallocators);
   }
@@ -2848,7 +2849,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
                           FuncContractCache &contracts,
                           llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
                           own::AliasAnalysis &aliases,
-                          const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+                          const own::ReferenceMap &references,
                           mlir::SymbolTable *symbols) {
   if (call.getNumResults() == 0)
     return mlir::success();
@@ -2900,7 +2901,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     }
 
     if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases,
-                                           mintedMarkers,
+                                           references,
                                            /*ownsReference=*/true)) {
       tracePlacement("liveness", call, group);
       continue;
@@ -2971,7 +2972,7 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     mlir::ModuleOp module, mlir::Operation *op, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases,
-    const llvm::DenseSet<mlir::Operation *> &mintedMarkers) {
+    const own::ReferenceMap &references) {
   mlir::func::FuncOp enclosing = op->getParentOfType<mlir::func::FuncOp>();
   // SEVERAL MINTS ON ONE HEAD NEED NO SPECIAL CASE, and the measurement that
   // said otherwise did not survive. Reading one element back twice (`c = [i, i]`
@@ -3032,7 +3033,7 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     if (ownedLocalTraceEnabled() && enclosing)
       enclosing.walk([&](mlir::func::CallOp) { ++before; });
     if (releaseOwnedGroupByLiveness(contracts, op, op->getBlock(), op->getLoc(),
-                                    group, aliases, mintedMarkers,
+                                    group, aliases, references,
                                     /*ownsReference=*/retainRooted,
                                     /*consumeIsDeath=*/true,
                                     /*deallocators=*/{}, retainRooted)) {
@@ -4174,7 +4175,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     mlir::ModuleOp module, FuncContractCache &contracts,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
     own::AliasAnalysis &aliases,
-    const llvm::DenseSet<mlir::Operation *> &mintedMarkers,
+    const own::ReferenceMap &references,
     mlir::SymbolTable *symbols,
     llvm::ArrayRef<own::ResourceGroup> blockArgGroups) {
   std::int64_t nextHandlerId = nextUnusedExceptionHandlerId(module);
@@ -4438,9 +4439,16 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         if (!op->hasAttr(own::kOwnedLocalObjectAttr) &&
             !op->hasAttr(own::kOwnedLocalObjectContractAttr))
           return;
+        // The same pair of properties as the liveness exclusion, asked of this
+        // marker's own head: the dedup below is per OBLIGATION, and a marker
+        // that MINTS one is a different obligation from the reference it was
+        // minted on.
+        own::Reference head =
+            op->getNumResults() == 0 ? own::Reference{}
+                                     : references.of(op->getResult(0));
         mlir::Operation *mintedBy =
-            own::unwindTracksMintedTokensSeparately() &&
-                    mintedMarkers.contains(op)
+            own::unwindTracksMintedTokensSeparately() && head &&
+                    references.isMinted(head)
                 ? op
                 : nullptr;
         for (const own::ResourceGroup &g :
@@ -4874,13 +4882,13 @@ public:
     // normal-path releases and borrow-edge retains were placed by the main
     // pass): the held-token analysis needs them to cover calls the cleanup
     // canonicalization hoisted out of folded region ops.
+    const own::ReferenceMap references(contracts, aliases);
     llvm::SmallVector<own::ResourceGroup, 8> blockArgGroups;
     {
       py::PerfScope perf(
           "post-cleanup-unwind-insertion.block-argument-groups");
       if (mlir::failed(insertOwnedBlockArgumentReleases(
-              module, contracts, deallocators, aliases,
-              collectMintedLocalMarkers(module, aliases), symbolTable,
+              module, contracts, deallocators, aliases, references, symbolTable,
               &blockArgGroups, /*insertReleases=*/false))) {
         signalPassFailure();
         return;
@@ -4891,7 +4899,7 @@ public:
           "post-cleanup-unwind-insertion.unwind-cleanup-releases");
       if (mlir::failed(insertUnwindCleanupReleases(
               module, contracts, deallocators, aliases,
-              collectMintedLocalMarkers(module, aliases), symbolTable,
+              references, symbolTable,
               blockArgGroups)))
         signalPassFailure();
     }
@@ -5104,9 +5112,10 @@ public:
       symbols.emplace(module);
     mlir::SymbolTable *symbolTable = symbols ? &*symbols : nullptr;
 
-    // Before the first placement, for the reason in `collectMintedLocalMarkers`.
-    const llvm::DenseSet<mlir::Operation *> mintedMarkers =
-        collectMintedLocalMarkers(module, aliases);
+    // ONE reference identity for the whole run, built beside the alias analysis
+    // it is not: `aliases` answers "same entity", this answers "same reference",
+    // and the walks below need both.
+    const own::ReferenceMap references(contracts, aliases);
 
     mlir::func::FuncOp retain = findRetainFunction(module);
     {
@@ -5133,7 +5142,7 @@ public:
       py::PerfScope perf("refcount-insertion.owned-result-releases");
       for (mlir::func::CallOp call : calls) {
         if (mlir::failed(insertOwnedResultReleases(
-                module, call, contracts, deallocators, aliases, mintedMarkers,
+                module, call, contracts, deallocators, aliases, references,
                 symbolTable))) {
           signalPassFailure();
           return;
@@ -5154,7 +5163,7 @@ public:
       for (mlir::Operation *op : localObjects) {
         if (mlir::failed(insertOwnedLocalObjectReleases(
                 module, op, contracts, deallocators, aliases,
-                mintedMarkers))) {
+                references))) {
           signalPassFailure();
           return;
         }
@@ -5165,7 +5174,7 @@ public:
     {
       py::PerfScope perf("refcount-insertion.block-argument-releases");
       if (mlir::failed(insertOwnedBlockArgumentReleases(
-              module, contracts, deallocators, aliases, mintedMarkers,
+              module, contracts, deallocators, aliases, references,
               symbolTable, &blockArgGroups))) {
         signalPassFailure();
         return;
@@ -5178,7 +5187,7 @@ public:
       py::PerfScope perf("refcount-insertion.unwind-cleanup-releases");
       if (mlir::failed(insertUnwindCleanupReleases(
               module, contracts, deallocators, aliases,
-              collectMintedLocalMarkers(module, aliases), symbolTable,
+              references, symbolTable,
               blockArgGroups)))
         signalPassFailure();
     }
