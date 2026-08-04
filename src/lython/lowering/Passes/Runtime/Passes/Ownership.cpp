@@ -2671,6 +2671,19 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       continue;
     }
 
+    // ⛔ Why NOT delete this one too, the way `conditional` went: it is not
+    // dead, only rare. 142 placements over 297 programs (0.11%), and removing
+    // it leaves 42 of the 61 affected programs BYTE-IDENTICAL -- the fallback
+    // reaches the same instruction -- but changes the other 19. Thirteen of
+    // those only slide the release later within its own block; six move
+    // releases into different blocks, mostly `__ly_unwind_cleanup_*`.
+    //
+    // Nothing can tell the two placements apart: with this arm disabled the
+    // suite is 541/541 and all 19 are LeakSanitizer- and AddressSanitizer-clean.
+    // That is the reason it stays rather than a reason to drop it -- deleting it
+    // would change codegen on 19 programs with no test able to see a regression,
+    // which is the silent direction. `conditional` was deletable because it
+    // placed NOTHING; this one places, and what it places is unverified.
     if (insertImmediateSuccessorReleases(contracts, call, group, aliases,
                                          /*ownsReference=*/true)) {
       tracePlacement("immediate-successor", call, group);
