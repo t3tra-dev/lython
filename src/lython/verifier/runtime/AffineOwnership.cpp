@@ -89,22 +89,6 @@ bool staleRebindDropDisabled() {
   return disabled;
 }
 
-// LYTHON_EXP_PREV_NAME_RELEASE=1 enables part C of the unfinished two-entity
-// repair: honour a release written under a PRE-RENAME name of the tracked group
-// even when no borrow-edge retain is outstanding. NOT SHIPPED on its own --
-// this walk's rename is forward-only, and lifting the borrow precondition
-// without parts B/D still leaves the pad release that the rename made invisible.
-//
-// One binary, one flag: `lyc` does not rebuild byte-for-byte, so differing
-// binary hashes cannot establish that two arms differ
-// (rfc/stdlib-semantics.md 13j-7). Named for what it ENABLES (13j-4).
-bool previousNameReleaseConsumesEnabled() {
-  static const bool enabled = [] {
-    const char *setting = std::getenv("LYTHON_EXP_PREV_NAME_RELEASE");
-    return setting && llvm::StringRef(setting) == "1";
-  }();
-  return enabled;
-}
 
 // LYTHON_ABLATE_RELEASED_DOMINANCE=1 restores the use-after-release rule that
 // fired on any op mentioning the group's ALIAS class, whether or not the
@@ -435,8 +419,8 @@ struct AffinePathState {
   // the holder bounds it instead: the same loop charges and discharges the same
   // identity every trip, so the second iteration reaches a state already visited.
   //
-  // Why NOT drop the retain instead (`LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN`,
-  // deleted with this change): the two walks track different resource kinds and
+  // Why NOT drop the retain instead: the two walks track different resource
+  // kinds and
   // the borrowed walk's exemption is not transferable. Reading an element back
   // out (`total += ys[0]`) hands the reader a token derived from the slot, and
   // this walk needs the retain to justify the reader's later release; dropping it
@@ -2177,40 +2161,6 @@ collectUnwindAmbiguousRetainOperands(mlir::func::FuncOp function,
   return values;
 }
 
-// ⚠️ OPT-IN EXPERIMENT, DEFAULT OFF, AND WHAT IT FOUND IS WHY IT IS OFF.
-// `LYTHON_EXP_HOLDER_DISCHARGE=1` makes the holder's release cancel the slot
-// retains parked in it. That is the more faithful reading of
-// `aggregate(parent, path)`, and it is not shippable yet, because the walk then
-// reports a use-after-release that IS REAL and that predates this change:
-//
-//   for i in range(3, 6): ys = [i]; total += ys[0]
-//
-// lowers to `Ly_IncRef(i)` (+1), `LyList_DecRef(ys)` (the deallocator drops the
-// slot, -1), `LyLong_DecRef(i)` (the source move, -1) and only then
-// `LyLong_Add(total, i)`. The refcount reaches zero one call before the read,
-// and the program prints the right answer only because the block has not been
-// reused yet. Discharging makes the verifier say so, and golden cases with that
-// shape are refused -- so enabling it requires first moving the container's
-// release past the reads its slots handed out, which this change does not do.
-//
-// Why NOT keep it on and accept the refusals: they are refusals of programs that
-// run correctly today, and trading a latent use-after-free for a rejected valid
-// program is not obviously the better half of that trade. It has to land with
-// the placement fix, not before it.
-//
-// Why NOT delete the code path: the finding above is the only evidence that the
-// early release exists at all, and it is reproducible from a shipped binary only
-// while this switch is here. Pinning the container's liveness on the values its
-// slots handed out was tried and did NOT move the release
-// (`releaseOwnedGroupByLiveness` is not what places a container literal's
-// release), so the next attempt should start by finding what does.
-bool dischargeOnHolderRelease() {
-  static bool on = [] {
-    auto v = llvm::sys::Process::GetEnv("LYTHON_EXP_HOLDER_DISCHARGE");
-    return v && !v->empty() && *v != "0";
-  }();
-  return on;
-}
 
 mlir::LogicalResult verifyResourceOnCFGPaths(
     FuncContractCache &contracts, TrackedResource &resource,
@@ -2561,11 +2511,6 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         // Released keeps the AFFINE property checkable -- a second release, under
         // either name, is now a double consume this same walk reports, which is
         // how the normal-path over-release in this family stays caught.
-        if (!consumes && state.borrowed == 0 && mentionsTracked &&
-            previousNameReleaseConsumesEnabled() &&
-            callConsumesStaleValue(contracts, call, state.previous, state.group,
-                                   aliases))
-          consumes = true;
         bool retains = mentionsTracked &&
                        callRetainsGroup(contracts, call, state.group, aliases);
         // A slot-absorption retain (`aggregate_retain`: an element/field store)
@@ -2575,7 +2520,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         // counter, and the container's release discharges it below.
         //
         // ⛔ Why NOT skip these the way the borrowed-entry walk does (the
-        // `LYTHON_EXP_SKIP_AGGREGATE_SLOT_RETAIN` experiment, measured
+        // slot-retain-skipping experiment, measured
         // 2026-07-28 and deleted here): the two walks track different resource
         // kinds and the asymmetry is not a licence to copy the exemption.
         // Reading an element BACK out of a container (`total += ys[0]`) hands
@@ -2609,10 +2554,6 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         // tracked group: the container's release names the CONTAINER, and a
         // walk that only looks at ops naming the element never sees it. That
         // blindness is what let `state.retained` grow without bound.
-        if (!state.slotParents.empty() && dischargeOnHolderRelease())
-          llvm::erase_if(state.slotParents, [&](std::int64_t identity) {
-            return walk.callDischargesAggregate(call, identity);
-          });
         if (mentionsTracked &&
             callPartiallyConsumesGroup(contracts, call, state.group, aliases))
           return call.emitError()
