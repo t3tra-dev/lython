@@ -78,7 +78,7 @@ bool unwindDeathDelayEnabled() {
 
 
 // LYTHON_OWNERSHIP_TRACE_PLACEMENT=1 names, for every owned call-result group,
-// which of the five placement strategies in `insertOwnedResultReleases` took it
+// which of the four placement strategies in `insertOwnedResultReleases` took it
 // -- including the strategy "none", which is the one that matters: a group no
 // strategy claims gets NO release, and the affine verifier then reports it as
 // reaching function exit unreleased, naming the producing call rather than the
@@ -421,17 +421,6 @@ mlir::LogicalResult insertBorrowedReturnRetains(
     });
   });
   return result;
-}
-
-bool isOwnershipConsumingUse(FuncContractCache &contracts,
-                             mlir::OpOperand &use) {
-  auto call = mlir::dyn_cast<mlir::func::CallOp>(use.getOwner());
-  if (!call)
-    return false;
-  auto cached = contracts.lookup(call.getCallee());
-  return mlir::succeeded(cached) && *cached &&
-         (*cached)->contract.consumesArg(
-             static_cast<unsigned>(use.getOperandNumber()));
 }
 
 bool callConsumesTrackedHeader(FuncContractCache &contracts,
@@ -960,151 +949,6 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
   release.after = lastUser ? lastUser : owner;
   release.group.append(group.begin(), group.end());
   return release;
-}
-
-struct ConditionalReleaseBlocks {
-  mlir::Block *active = nullptr;
-  mlir::Block *inactive = nullptr;
-  mlir::Operation *branch = nullptr;
-  unsigned activeSuccessor = 0;
-  unsigned inactiveSuccessor = 0;
-};
-
-std::optional<ConditionalReleaseBlocks>
-classifyConditionalBranch(mlir::Operation *op,
-                          const own::OwnershipCondition &condition) {
-  auto branch = mlir::dyn_cast<mlir::cf::CondBranchOp>(op);
-  if (!branch)
-    return std::nullopt;
-
-  std::optional<own::OwnershipConditionBranch> classified =
-      own::classifyOwnershipConditionBranch(op, condition);
-  if (!classified)
-    return std::nullopt;
-
-  ConditionalReleaseBlocks blocks;
-  blocks.branch = branch.getOperation();
-  blocks.active = classified->activeSuccessor == 0 ? branch.getTrueDest()
-                                                   : branch.getFalseDest();
-  blocks.inactive = classified->inactiveSuccessor == 0 ? branch.getTrueDest()
-                                                       : branch.getFalseDest();
-  blocks.activeSuccessor = classified->activeSuccessor;
-  blocks.inactiveSuccessor = classified->inactiveSuccessor;
-  return blocks;
-}
-
-std::optional<ConditionalReleaseBlocks> findConditionalBranchAfterOwner(
-    mlir::Operation *owner, llvm::ArrayRef<mlir::Value> group,
-    const own::OwnershipCondition &condition, own::AliasAnalysis &aliases) {
-  for (mlir::Operation *op = owner->getNextNode(); op; op = op->getNextNode()) {
-    if (std::optional<ConditionalReleaseBlocks> blocks =
-            classifyConditionalBranch(op, condition))
-      return blocks;
-    if (groupContainsOperand(op, group, aliases))
-      return std::nullopt;
-    if (op->hasTrait<mlir::OpTrait::IsTerminator>())
-      return std::nullopt;
-  }
-  return std::nullopt;
-}
-
-std::optional<mlir::Operation *> findLastConditionalUserInActiveBlock(
-    FuncContractCache &contracts, mlir::Operation *owner,
-    llvm::ArrayRef<mlir::Value> group, const ConditionalReleaseBlocks &blocks,
-    own::AliasAnalysis &aliases) {
-  mlir::Operation *lastUser = nullptr;
-  for (mlir::Value value : group) {
-    for (mlir::OpOperand &use : value.getUses()) {
-      mlir::Operation *user = use.getOwner();
-      if (user == owner || user == blocks.branch)
-        continue;
-      if (isOwnershipConsumingUse(contracts, use))
-        return std::nullopt;
-
-      mlir::Operation *activeUser = ancestorInBlock(user, blocks.active);
-      if (activeUser) {
-        if (activeUser->hasTrait<mlir::OpTrait::IsTerminator>())
-          return std::nullopt;
-        lastUser = latestUserInBlock(lastUser, activeUser);
-        continue;
-      }
-
-      if (ancestorInBlock(user, blocks.inactive))
-        return std::nullopt;
-      return std::nullopt;
-    }
-  }
-  return lastUser;
-}
-
-mlir::LogicalResult
-insertReleaseOnActiveEdge(mlir::func::CallOp call,
-                          const own::ResourceGroup &group,
-                          ConditionalReleaseBlocks &blocks,
-                          bool ownsReference) {
-  auto branch = mlir::cast<mlir::cf::CondBranchOp>(blocks.branch);
-  if ((blocks.activeSuccessor == 0 && !branch.getTrueDestOperands().empty()) ||
-      (blocks.activeSuccessor == 1 && !branch.getFalseDestOperands().empty()))
-    return mlir::success();
-
-  mlir::OpBuilder builder(call.getContext());
-  mlir::Block *releaseBlock = builder.createBlock(blocks.active->getParent(),
-                                                  blocks.active->getIterator());
-  builder.setInsertionPointToStart(releaseBlock);
-  emitGroupRelease(builder, call.getLoc(), group, group.values, ownsReference);
-  mlir::cf::BranchOp::create(builder, call.getLoc(), blocks.active);
-
-  llvm::SmallVector<mlir::Value, 4> trueOperands(
-      branch.getTrueDestOperands().begin(), branch.getTrueDestOperands().end());
-  llvm::SmallVector<mlir::Value, 4> falseOperands(
-      branch.getFalseDestOperands().begin(),
-      branch.getFalseDestOperands().end());
-  builder.setInsertionPoint(branch);
-  if (blocks.activeSuccessor == 0) {
-    mlir::cf::CondBranchOp::create(
-        builder, branch.getLoc(), branch.getCondition(), releaseBlock,
-        mlir::ValueRange{}, branch.getFalseDest(), falseOperands);
-  } else {
-    mlir::cf::CondBranchOp::create(
-        builder, branch.getLoc(), branch.getCondition(), branch.getTrueDest(),
-        trueOperands, releaseBlock, mlir::ValueRange{});
-  }
-  branch.erase();
-  return mlir::success();
-}
-
-mlir::FailureOr<bool> insertConditionalOwnedResultRelease(
-    FuncContractCache &contracts, mlir::func::CallOp call,
-    const own::ResourceGroup &group, own::AliasAnalysis &aliases,
-    bool ownsReference) {
-  if (!group.condition)
-    return false;
-
-  std::optional<ConditionalReleaseBlocks> blocks =
-      findConditionalBranchAfterOwner(call, group.values, *group.condition,
-                                      aliases);
-  if (!blocks)
-    return false;
-
-  std::optional<mlir::Operation *> lastUser =
-      findLastConditionalUserInActiveBlock(contracts, call, group.values,
-                                           *blocks, aliases);
-  if (!lastUser)
-    return false;
-
-  mlir::OpBuilder builder(call);
-  if (*lastUser) {
-    builder.setInsertionPointAfter(*lastUser);
-  } else if (llvm::hasSingleElement(blocks->active->getPredecessors())) {
-    builder.setInsertionPointToStart(blocks->active);
-  } else {
-    if (mlir::failed(
-            insertReleaseOnActiveEdge(call, group, *blocks, ownsReference)))
-      return mlir::failure();
-    return true;
-  }
-  emitGroupRelease(builder, call.getLoc(), group, group.values, ownsReference);
-  return true;
 }
 
 // Can `start` reach `target` by following successors without ever entering
@@ -2810,17 +2654,6 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     // their last use sits at the mutation itself -- in the middle of the
     // entity's live range.
     own::advanceGroupLanesThroughReRoots(contracts, enclosing, group, aliases);
-
-    if (group.condition) {
-      mlir::FailureOr<bool> inserted = insertConditionalOwnedResultRelease(
-          contracts, call, group, aliases, /*ownsReference=*/true);
-      if (mlir::failed(inserted))
-        return mlir::failure();
-      if (*inserted) {
-        tracePlacement("conditional", call, group);
-        continue;
-      }
-    }
 
     std::optional<ReleaseInsertion> release =
         findReleaseInsertion(contracts, call, group.values, deallocators,
