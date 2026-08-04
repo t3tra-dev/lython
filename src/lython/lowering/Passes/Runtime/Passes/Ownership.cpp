@@ -539,6 +539,31 @@ bool isNotOwnName(const own::ReferenceMap &references,
   return !llvm::is_contained(group, equivalent);
 }
 
+// IS THIS CONSUME SOMEBODY ELSE'S DISCHARGE?
+//
+// The composition all four walks want, spelled once. Three independent
+// properties, each its own predicate:
+//
+//   1. this group holds an increment of its own, so a release that is not its
+//      own is possible at all (`isMinted`);
+//   2. the release names the CONTAINER's obligation rather than a local token
+//      (`consumeIsAggregateRelease`);
+//   3. the name it was reached through is not this group's (`isNotOwnName`).
+//
+// Named after all four sites had been migrated one property at a time and
+// measured, not before: an earlier attempt to introduce this wrapper up front
+// hid which property owned which failure and cost six red cases
+// (rfc/test-suite-debt.md).
+bool consumeIsAnotherReferencesDischarge(const own::ReferenceMap &references,
+                                         mlir::OpOperand &use,
+                                         llvm::ArrayRef<mlir::Value> group,
+                                         mlir::Value equivalent,
+                                         own::Reference mine) {
+  return references.isMinted(mine) && consumeIsAggregateRelease(use) &&
+         isNotOwnName(references, group, equivalent, mine);
+}
+
+
 // IS THIS NAME ANOTHER REFERENCE'S, SO THAT USES UNDER IT ARE NOT OUR LIVENESS?
 //
 // `("k", 5) in h.items()` is why the question is asked at all: the element's own
@@ -869,8 +894,8 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
           continue;
         if (usePrecedesOwnerInBlock(owner, user, block))
           continue;
-        if (!(references.isMinted(mine) && consumeIsAggregateRelease(use) &&
-              isNotOwnName(references, group, equivalent, mine)) &&
+        if (!consumeIsAnotherReferencesDischarge(references, use, group,
+                                                equivalent, mine) &&
             ownershipConsumingUseInvalidatesGroup(contracts, use, group,
                                                   aliases))
           return std::nullopt;
@@ -1396,12 +1421,10 @@ bool releaseOwnedGroupByLiveness(
   const own::Reference mine =
       group.values.empty() ? own::Reference{}
                            : references.of(group.values.front());
-  // See `consumeIsAggregateRelease`: an aggregate release under a name this
-  // token does not own discharges the container's token, not this one.
   auto consumingUseEndsThisToken = [&](mlir::OpOperand &use,
                                        mlir::Value equivalent) {
-    if (references.isMinted(mine) && consumeIsAggregateRelease(use) &&
-        isNotOwnName(references, group.values, equivalent, mine))
+    if (consumeIsAnotherReferencesDischarge(references, use, group.values,
+                                            equivalent, mine))
       return false;
     return ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                  aliases);
@@ -3098,8 +3121,9 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
           if (user == op)
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
-              (!(references.isMinted(mine) && consumeIsAggregateRelease(use) &&
-                 isNotOwnName(references, group.values, equivalent, mine)) &&
+              (!consumeIsAnotherReferencesDischarge(references, use,
+                                                    group.values, equivalent,
+                                                    mine) &&
                ownershipConsumingUseInvalidatesGroup(contracts, use,
                                                      group.values, aliases)) ||
               mlir::isa<mlir::func::ReturnOp>(user) ||
@@ -3863,25 +3887,18 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           group.useSites.push_back(top);
 
         if (auto call = mlir::dyn_cast<mlir::func::CallOp>(user)) {
-          // The same rule the release placer and the affine verifier already
-          // apply (`consumeIsAggregateRelease`, `callReleasesForeignAggregate`):
-          // an `aggregate_release` written under a name this MINTED token does
-          // not own discharges the container's token, not this one. This
-          // analysis was the one place that still read it as a consume, so a
-          // minted token looked already gone at every unwind point and no
-          // cleanup was written for it -- `try: print(zs[0] / zs[1])` leaked
-          // both elements, 80 B, on the path the exception actually takes.
-          // `group.reference` rather than a locally recomputed one: it is the
-          // obligation this analysis RECORDED for the group, so
-          // LYTHON_ABLATE_UNWIND_MINTED_TOKENS covers the consume scan and the
-          // dedup together. Recomputing it here left the switch covering half of
-          // what it names, and an arm that is neither behaviour is worse than no
-          // arm -- `dict_iteration_views` stopped showing the 17231 B the switch
-          // documents.
-          if (references.isMinted(group.reference) &&
-              consumeIsAggregateRelease(use) &&
-              isNotOwnName(references, group.values, equivalent,
-                           group.reference))
+          // This analysis was the last one still reading a container's release
+          // as a minted token's consume, so such a token looked already gone at
+          // every unwind point and no cleanup was written for it: `try:
+          // print(zs[0] / zs[1])` leaked both elements, 80 B, on the path the
+          // exception actually takes.
+          //
+          // `group.reference`, not a locally recomputed one: the obligation this
+          // analysis RECORDED is what LYTHON_ABLATE_UNWIND_MINTED_TOKENS zeroes,
+          // so asking it keeps the switch covering the consume scan and the
+          // dedup together instead of half of what it names.
+          if (consumeIsAnotherReferencesDischarge(references, use, group.values,
+                                                 equivalent, group.reference))
             continue;
           if (callPartiallyConsumesGroup(contracts, call, group.values,
                                          aliases) ||

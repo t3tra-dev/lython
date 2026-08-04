@@ -250,51 +250,38 @@ struct TrackedResource {
   std::optional<own::OwnershipCondition> condition;
 };
 
-// IS THIS CONSUMING CALL THE DISCHARGE OF AN AGGREGATE RESOURCE RATHER THAN OF
-// THIS TOKEN? `aggregate_release` marks the discharge of an `aggregate(parent,
-// path)` -- a slot's or a literal source's token, owned by the container
-// (rfc/memory-safety-proof.md, Aggregates) -- so it can never be a LOCAL token's
-// death. It matters only for a retain-rooted owned-local marker
-// (own::ownedLocalMarkerIsRetainRooted), where the object carries both that
-// token and the one the retain minted and the two alias: measured on `for i in
-// range(3, 13): c = {"a": i}; one += c["a"]`, the pair read as a double consume
-// and the case was refused with `released or transferred more than once` on the
-// path `^bb5 > ^bb15`.
+// IS THIS CONSUMING CALL SOMEBODY ELSE'S DISCHARGE RATHER THAN THIS TOKEN'S?
 //
-// Why the name test is by IDENTITY and not through the alias set: the alias set
-// is precisely what cannot tell the two tokens apart (the marker is an identity
-// cast, so every name aliases every other). The release placer decides the same
-// question the same way -- if insertion and verification disagreed about which
-// token a release discharges, the proof would be void.
+// TWO LABELS, TWO CLAIMS, AND THE GATES DIFFER.
 //
-// Why NOT skip every foreign-named consume (measured, and both directions were
-// measured on the same day):
+// `aggregate_release` marks the discharge of an `aggregate(parent, path)` -- a
+// slot's or a literal source's token, owned by the container
+// (rfc/memory-safety-proof.md, Aggregates). It is foreign only to a
+// retain-MINTED token: a TRANSFERRED source has it as its only death, since a
+// module global's initializer hands its construction straight to the global and
+// the global's teardown release IS that discharge. Letting an owned call result
+// skip one double-freed every enum member in `cross_enum_generic_handler`.
 //
-//   skip only foreign aggregate releases  -> 492/492
-//   skip every foreign-named release      -> 20 refusals, and with the wider
-//                                            placer rule that pairs with it,
-//                                            `golden.cases.dict_methods_complete`
-//                                            aborted with `Ly_DecRef observed
-//                                            non-positive refcount`
-//   match the marker's OPERANDS instead    ->  5 refusals (`golden.cases.oop`
-//                                            releases the foreign token under a
-//                                            THIRD name -- a second marker's
-//                                            results over the same allocation)
+// `own::kReferenceReleaseAttr` says "this discharges exactly the reference my
+// operands name" -- a statement about the release rather than about the reader
+// -- so any resource holding an increment of its own may act on it.
+//
+// Why a LABEL at all rather than the reference alone (measured, both directions
+// on one day):
+//
+//   skip only labelled foreign releases -> 492/492
+//   skip every foreign-named release    -> 20 refusals, and with the wider
+//                                          placer rule that pairs with it,
+//                                          `dict_methods_complete` aborted with
+//                                          `Ly_DecRef observed non-positive
+//                                          refcount`
 //
 // A BARE release names some local token and neither pass can tell which, so the
-// only safe reading of one is "this token". `aggregate_release` is the one label
-// that decides the question from the proof kernel rather than from a guess.
+// only safe reading of one is "this token".
 //
-// TWO LABELS, TWO CLAIMS, AND THE GATES DIFFER. `aggregate_release` says "this
-// discharges the CONTAINER's token", which is foreign only to a retain-MINTED
-// token: a TRANSFERRED source has it as its only death (a module global's
-// initializer hands its construction straight to the global, so the global's
-// teardown release IS that discharge), and letting an owned call result skip one
-// double-freed every enum member in `cross_enum_generic_handler`.
-// `own::kReferenceReleaseAttr` says "this discharges exactly the reference my
-// operands name" -- a statement about the release, not about the reader -- so
-// any resource holding an increment of its own may act on it. The placer splits
-// them the same way; a disagreement here would void the proof.
+// The placer splits the two labels the same way and asks the same
+// `own::ReferenceMap` about the names. A disagreement here would void the proof.
+
 // Is this operand NOT one of the walked resource's names?
 //
 // The same condition the placer's `isNotOwnName` carries, and the same contract
@@ -793,11 +780,6 @@ public:
     if (entry == aggregateParents.end() || entry->second.empty())
       return false;
     return own::callConsumesGroup(contracts, call, entry->second, aliases);
-  }
-
-  bool anyAggregateParents() {
-    buildAggregateParents();
-    return !aggregateParents.empty();
   }
 
   // `aliases.same(value, candidate)` for some candidate in a fixed candidate

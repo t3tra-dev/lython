@@ -670,24 +670,6 @@ bool callResultGroupIsOwned(mlir::func::FuncOp callee, unsigned resultIndex) {
          (resultIndex == 0 && functionUsesOwnedReturnABI(callee));
 }
 
-llvm::StringRef ownershipKindName(OwnershipKind kind) {
-  switch (kind) {
-  case OwnershipKind::NonObject:
-    return "NonObject";
-  case OwnershipKind::Borrow:
-    return "Borrow";
-  case OwnershipKind::Own:
-    return "Own";
-  case OwnershipKind::Immortal:
-    return "Immortal";
-  }
-  return "Unknown";
-}
-
-bool ownershipKindCarriesObjectResource(OwnershipKind kind) {
-  return kind == OwnershipKind::Borrow || kind == OwnershipKind::Own;
-}
-
 OwnershipKind logicalOwnershipKind(mlir::Type logicalType, bool ownsObject) {
   std::string contractName = contracts::runtimeContractName(logicalType);
   if (contractName.empty())

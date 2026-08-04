@@ -95,13 +95,18 @@ bool perReferenceReleaseLabels();
 // from the reference it was minted on, instead of treating one entity as one
 // resource?
 //
-// `LYTHON_ABLATE_UNWIND_MINTED_TOKENS=1` restores the entity-wide reading. Its
-// failure direction is the leak this separation removes -- the analysis
-// attributes more releases to one resource, which places fewer cleanups and
-// never more -- so it is for bisecting a regression to this rule, never for
-// production. One binary, two arms: a rebuild of the same source does not
-// reproduce byte for byte, so "the shas differ" never establishes that two arms
-// differ.
+// `LYTHON_ABLATE_UNWIND_MINTED_TOKENS=1` restores the entity-wide reading. One
+// binary, two arms: a rebuild of the same source does not reproduce byte for
+// byte, so "the shas differ" never establishes that two arms differ.
+//
+// Failure direction, RE-MEASURED 2026-08-05 because the original claim went
+// stale: the ablated arm now REFUSES `cross_float_range_contracts_fields`
+// rather than leaking its 80 B. `own::ReferenceMap` is not behind this switch,
+// so the verifier still sees the reference the ablated analysis stops writing a
+// cleanup for, and says so. `dict_iteration_views`, which this switch was
+// introduced against, no longer moves at all -- three later rules prevent that
+// leak independently. A refusal is the safer direction, but the arm is for
+// bisecting a regression to this rule, never for production.
 bool unwindTracksMintedTokensSeparately();
 // The `parent` half of the kernel's `aggregate(parent, path)` resource, spelled
 // so an ownership walk can name it. `kAggregateIdAttr` is an i64 identity on the
@@ -322,8 +327,6 @@ bool callResultGroupIsOwned(mlir::func::FuncOp callee, unsigned resultIndex);
 
 enum class OwnershipKind { NonObject, Borrow, Own, Immortal };
 
-llvm::StringRef ownershipKindName(OwnershipKind kind);
-bool ownershipKindCarriesObjectResource(OwnershipKind kind);
 OwnershipKind logicalOwnershipKind(mlir::Type logicalType, bool ownsObject);
 
 struct OwnershipCondition {
