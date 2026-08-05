@@ -3294,20 +3294,43 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
 // every point its block can (exceptionally) reach with a false "maybe
 // already released" -- exactly the mixed state that made loop bodies with a
 // guarded raise skip their per-call-site cleanups.
-bool deadAfterNoReturnRaise(FuncContractCache &contracts,
-                            mlir::Operation *op) {
-  for (mlir::Operation *prev = op->getPrevNode(); prev;
-       prev = prev->getPrevNode()) {
-    auto call = mlir::dyn_cast<mlir::func::CallOp>(prev);
-    if (!call)
-      continue;
-    auto cached = contracts.lookup(call.getCallee());
-    if (mlir::succeeded(cached) && *cached &&
-        own::isRaiseLikeFunction((*cached)->function))
-      return true;
+// Is `op` unreachable because a raise-like call already ran earlier in its
+// block? A raise primitive never returns, so everything after it in the block
+// is dead code and its effects on a token are not effects at all.
+//
+// ONE FACT PER BLOCK, asked once. Written as a backward scan -- every preceding
+// operation, with a contract lookup on each call -- it cost O(ops) per query
+// and the query runs once per consuming use, which is O(ops) of them: measured
+// at 5.9 s of a 45.7 s compile of a 400-statement module, all of it re-deriving
+// where the block's first raise is. Whether ANY raise precedes `op` is the same
+// question as whether the FIRST one does.
+class DeadAfterRaiseCache {
+public:
+  bool deadAfter(FuncContractCache &contracts, mlir::Operation *op) {
+    mlir::Block *block = op->getBlock();
+    auto found = firstRaise.find(block);
+    if (found == firstRaise.end())
+      found = firstRaise.insert({block, findFirstRaise(contracts, block)}).first;
+    return found->second && found->second->isBeforeInBlock(op);
   }
-  return false;
-}
+
+private:
+  static mlir::Operation *findFirstRaise(FuncContractCache &contracts,
+                                         mlir::Block *block) {
+    for (mlir::Operation &op : *block) {
+      auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
+      if (!call)
+        continue;
+      auto cached = contracts.lookup(call.getCallee());
+      if (mlir::succeeded(cached) && *cached &&
+          own::isRaiseLikeFunction((*cached)->function))
+        return &op;
+    }
+    return nullptr;
+  }
+
+  llvm::DenseMap<mlir::Block *, mlir::Operation *> firstRaise;
+};
 
 
 
@@ -3316,6 +3339,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
                              const own::ReferenceMap &references,
                              mlir::Region *region,
                              mlir::DominanceInfo &dominance,
+                             DeadAfterRaiseCache &deadAfterRaise,
                              UnwindTrackedGroup &group) {
   // Operations before the producer belong to the token's production (e.g.
   // the boxing Ly_IncRef that mints an owned-local token): the token walk
@@ -3379,7 +3403,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
             return;
           }
           if (callConsumesGroup(contracts, call, group.values, aliases)) {
-            if (!deadAfterNoReturnRaise(contracts, call) &&
+            if (!deadAfterRaise.deadAfter(contracts, call) &&
                 seenConsumes.insert(top).second)
               group.consumeSites.push_back(top);
             continue;
@@ -3415,7 +3439,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           // held.
           if (!blockLendsGroupToMergeArgument(user->getBlock(), group.values,
                                               aliases) &&
-              !deadAfterNoReturnRaise(contracts, user) &&
+              !deadAfterRaise.deadAfter(contracts, user) &&
               seenConsumes.insert(user).second)
             group.consumeSites.push_back(user);
         }
@@ -3907,6 +3931,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       steps.mark(UnwindStepTimer::Analysis);
 
       // Owned groups whose token could be held at an exceptional exit.
+      llvm::DenseSet<std::pair<own::Reference, mlir::Value>> seenGroupKeys;
+      DeadAfterRaiseCache deadAfterRaise;
       auto addGroup = [&](const own::ResourceGroup &g) {
         // Only a MINTED reference discriminates here. A received one is the
         // obligation a region merge maps several producers onto, and telling
@@ -3964,17 +3990,31 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         // marker shares an entity root with the reference it was minted on, so
         // the root test alone dropped it from this analysis entirely -- nothing
         // ever asked whether ITS token was held on an unwinding edge.
-        for (const UnwindTrackedGroup &existing : groups) {
-          if (existing.reference != groupReference)
-            continue;
-          own::reportEntityRootParity("unwindGroupDedup", existing.values,
-                                      tracked.values);
-          if (own::sameEntityRoot(existing.values, tracked.values))
-            return;
-        }
+        // Indexed, not scanned. The scan this replaces asked every group
+        // already collected whether it was this one, and `addGroup` runs once
+        // per owned group in the function: 3,205 groups in a 400-statement
+        // module is 5.1 MILLION `sameEntityRoot` calls, and this phase's group
+        // collection measured 6.8 s of a 45.7 s compile with the CFG still one
+        // block -- all of it here.
+        //
+        // The key is exactly the scan's condition: the same reference AND the
+        // same entity root. A group with no resolvable root keeps out of the
+        // index entirely, which is what `sameEntityRoot` already said about it
+        // -- it matches nothing, including another rootless group.
+        mlir::Value entityRoot = own::entityRootOf(tracked.values);
+        if (entityRoot &&
+            !seenGroupKeys.insert({groupReference, entityRoot}).second)
+          return;
+        // The parity instrument's value is that it examines every pair, which
+        // is precisely what the index stops doing. It keeps its scan.
+        if (own::ownershipRootParityEnabled())
+          for (const UnwindTrackedGroup &existing : groups)
+            if (existing.reference == groupReference)
+              own::reportEntityRootParity("unwindGroupDedup", existing.values,
+                                          tracked.values);
         tracked.reference = groupReference;
         collectUnwindGroupSites(contracts, aliases, references, region,
-                                analysis.dominance, tracked);
+                                analysis.dominance, deadAfterRaise, tracked);
         groups.push_back(std::move(tracked));
       };
       function.walk([&](mlir::func::CallOp call) {

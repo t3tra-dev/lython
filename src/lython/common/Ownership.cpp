@@ -2103,17 +2103,29 @@ llvm::hash_code entityRootHash(llvm::ArrayRef<mlir::Value> group) {
   return llvm::hash_value(entityRootOf(group).getAsOpaquePointer());
 }
 
+namespace {
+enum class RootParityMode { Off, Log, Abort };
+RootParityMode rootParityMode() {
+  static const RootParityMode mode = [] {
+    const char *setting = std::getenv("LYTHON_OWNERSHIP_ROOT_PARITY");
+    if (!setting || !*setting || llvm::StringRef(setting) == "0")
+      return RootParityMode::Off;
+    return llvm::StringRef(setting) == "abort" ? RootParityMode::Abort
+                                               : RootParityMode::Log;
+  }();
+  return mode;
+}
+} // namespace
+
+bool ownershipRootParityEnabled() {
+  return rootParityMode() != RootParityMode::Off;
+}
+
 void reportEntityRootParity(llvm::StringRef site,
                             llvm::ArrayRef<mlir::Value> lhs,
                             llvm::ArrayRef<mlir::Value> rhs) {
-  enum class Mode { Off, Log, Abort };
-  static const Mode mode = [] {
-    const char *setting = std::getenv("LYTHON_OWNERSHIP_ROOT_PARITY");
-    if (!setting || !*setting || llvm::StringRef(setting) == "0")
-      return Mode::Off;
-    return llvm::StringRef(setting) == "abort" ? Mode::Abort : Mode::Log;
-  }();
-  if (mode == Mode::Off)
+  const RootParityMode mode = rootParityMode();
+  if (mode == RootParityMode::Off)
     return;
 
   bool byRoot = sameEntityRoot(lhs, rhs);
@@ -2124,7 +2136,7 @@ void reportEntityRootParity(llvm::StringRef site,
   llvm::errs() << "lython: ownership root parity divergence at " << site
                << ": same-root=" << byRoot << " same-lanes=" << byLanes
                << " (" << lhs.size() << " vs " << rhs.size() << " lanes)\n";
-  if (mode == Mode::Abort)
+  if (mode == RootParityMode::Abort)
     llvm::report_fatal_error("ownership root parity divergence");
 }
 

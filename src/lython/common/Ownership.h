@@ -595,6 +595,12 @@ bool sameValueGroup(llvm::ArrayRef<mlir::Value> lhs,
 // released resource, so lane 0 is the root; stripping identity casts makes it
 // survive a re-root, which republishes the SAME head through a fresh cast.
 mlir::Value entityRootOf(llvm::ArrayRef<mlir::Value> group);
+
+// Is the root-parity instrument switched on? Callers that replaced an
+// exhaustive pairwise scan with an index ask this to keep feeding it every
+// pair -- the instrument's whole value is that it examines what the fast path
+// no longer visits.
+bool ownershipRootParityEnabled();
 // Group identity. Two lane lists name the same entity iff they share a root,
 // regardless of whether their payload lanes still agree.
 bool sameEntityRoot(llvm::ArrayRef<mlir::Value> lhs,
