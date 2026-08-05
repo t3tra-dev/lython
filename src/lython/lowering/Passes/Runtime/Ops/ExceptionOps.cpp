@@ -493,6 +493,9 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
   mlir::func::FuncOp hasResidual = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarHasResidual",
       builder.getFunctionType({}, {builder.getI1Type()}));
+  mlir::func::FuncOp discardSplit = getOrCreatePrivateFunction(
+      module, builder, "LyEH_StarDiscardSplit",
+      builder.getFunctionType(triple, {}));
 
   mlir::Value residual =
       mlir::func::CallOp::create(builder, loc, hasResidual, mlir::ValueRange{})
@@ -515,7 +518,7 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
       return op.emitError() << "star_split must return two flagged triples";
     mlir::Value matched = splitCall.getResult(0);
     auto applyIf = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
-                                           matched, /*withElseRegion=*/false);
+                                           matched, /*withElseRegion=*/true);
     {
       mlir::OpBuilder::InsertionGuard applyGuard(builder);
       builder.setInsertionPointToStart(&applyIf.getThenRegion().front());
@@ -524,6 +527,17 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
           mlir::ValueRange{splitCall.getResult(4), splitCall.getResult(1),
                            splitCall.getResult(2), splitCall.getResult(3),
                            splitCall.getResult(5), splitCall.getResult(6),
+                           splitCall.getResult(7)});
+
+      // Nothing matched: `applyMatch` -- the only consumer of the halves
+      // star_split retained -- does not run, so the leftover it handed back is
+      // this clause's to discharge. The frame's residual still holds its own
+      // reference and is unchanged, which is why the half is DROPPED rather
+      // than installed.
+      builder.setInsertionPointToStart(&applyIf.getElseRegion().front());
+      mlir::func::CallOp::create(
+          builder, loc, discardSplit,
+          mlir::ValueRange{splitCall.getResult(5), splitCall.getResult(6),
                            splitCall.getResult(7)});
     }
     mlir::scf::YieldOp::create(builder, loc, mlir::ValueRange{matched});

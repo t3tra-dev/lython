@@ -2993,6 +2993,43 @@ void buildStarThrowCombined(SupportBuilder &b) {
   mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
 }
 
+// void LyEH_StarDiscardSplit(triple x15): release a half that star_split
+// handed back and the clause did not install.
+//
+// star_split owns BOTH halves it returns -- the matching leaf and the leftover
+// are each retained before they are yielded, because the assembler that takes
+// them (LyEH_StarApplyMatch for the matched half, the residual group builder
+// for the rest) consumes a reference. When NOTHING matched there is no
+// assembler: the clause skips LyEH_StarApplyMatch entirely and both halves
+// reach nobody. The leftover half is then a reference the frame's own residual
+// already accounts for, so it is dropped here rather than installed.
+//
+// Why NOT stop retaining in the no-match arm instead: the same arm of
+// `__ly_exc_star_split_rec` runs for a non-matching MEMBER of a group, whose
+// reference the enclosing residual group does take. One arm, two callers, and
+// only the caller knows which it is.
+void buildStarDiscardSplit(SupportBuilder &b) {
+  llvm::SmallVector<mlir::Type, 15> inputs;
+  for (int part = 0; part < 3; ++part) {
+    inputs.push_back(b.ptr());
+    inputs.push_back(b.ptr());
+    inputs.push_back(b.i64());
+    inputs.push_back(b.i64());
+    inputs.push_back(b.i64());
+  }
+  auto fn = starBeginLLVMFunction(b, "LyEH_StarDiscardSplit", {}, inputs);
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  auto alignedWord = [&](int section) -> mlir::Value {
+    return mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(),
+                                          entry->getArgument(section * 5 + 1))
+        .getResult();
+  };
+  b.call("release_exception_storage_raw", mlir::TypeRange{},
+         mlir::ValueRange{alignedWord(0), alignedWord(1), alignedWord(2)});
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // LyTraceback_PrintMessage(i64 class_id, i64 exc_ptr, ptr msg_header,
 // message view): chained sections (cause/context, innermost first) + header
 // + frames (most recent last, printed from the top of the stack downwards)
@@ -3186,6 +3223,7 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildStarRethrowResidual(b);
   buildStarRethrowSoleCollected(b);
   buildStarThrowCombined(b);
+  buildStarDiscardSplit(b);
 }
 
 } // namespace py::runtime_library

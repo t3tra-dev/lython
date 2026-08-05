@@ -502,11 +502,20 @@ set(LYTHON_LEAK_GATE_CASES
 # a crash or a wrong status is still refused, which is what stops a SIGSEGV
 # being read as "leaks 0" -- and removes the blind spot.
 #
-# Two members, because the class has two exits: SystemExit returns the status
+# Two members for the two exits of that class: SystemExit returns the status
 # through the C entry, an uncaught exception prints a traceback and returns 1.
+#
+# `except_star_naked_miss` is here for a different reason -- not the exit, the
+# CLAUSE. `except*` retains both halves of its split because whoever assembles
+# them takes a reference; when nothing matches nobody assembles, and the
+# leftover half was dropped. The whole errors/ directory was outside the gate
+# when that shipped, so a golden comparing stderr byte-for-byte was green over
+# a leaking program. Sweeping the directory found this one and three generator
+# cases (still open).
 set(LYTHON_LEAK_GATE_EXIT_CASES
     "cases/sys_exit=5"
-    "errors/key_error=1")
+    "errors/key_error=1"
+    "errors/except_star_naked_miss=1")
 set(LYTHON_LEAK_GATE_ENTRIES)
 foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
     list(APPEND LYTHON_LEAK_GATE_ENTRIES "cases/${leak_case}=0")
