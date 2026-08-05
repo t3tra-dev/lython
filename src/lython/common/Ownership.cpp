@@ -1767,7 +1767,6 @@ bool isNonRaisingRuntimeSymbol(llvm::StringRef name) {
   return name == "LyEH_BeginCatch" || name == "LyEH_ClassIdMatches" ||
          name == "LyEH_CurrentExceptionClassId" ||
          name == "LyEH_CurrentExceptionMatches" ||
-         name == "LyEH_DiscardCurrentExceptionIfMatches" ||
          name == "LyEH_DiscardCurrentException" ||
          name == "LyEH_StashCurrentAsContext" ||
          name == "LyEH_SetCurrentCause" || name == "LyEH_SetCurrentSuppress" ||

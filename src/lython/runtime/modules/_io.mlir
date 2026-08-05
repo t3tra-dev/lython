@@ -826,19 +826,6 @@ module attributes {
     func.return
   }
 
-  // read() consumes from the position to the end; getvalue() spans the
-  // whole buffer without moving the position.
-  func.func private @__ly_membuf_read_span(%self: memref<8xi64>) -> (i64, i64) {
-    %len_slot = arith.constant 3 : index
-    %pos_slot = arith.constant 5 : index
-    func.call @__ly_membuf_check_open(%self) : (memref<8xi64>) -> ()
-    %len = memref.load %self[%len_slot] : memref<8xi64>
-    %pos = memref.load %self[%pos_slot] : memref<8xi64>
-    %count = arith.subi %len, %pos : i64
-    memref.store %len, %self[%pos_slot] : memref<8xi64>
-    func.return %pos, %count : i64, i64
-  }
-
   // stringio.c/bytesio.c truncate: clip the length, keep the position, and
   // return the requested size (which may exceed the buffer; no extension).
   // The INT64_MIN sentinel is the "no size given" clinic default (truncate()

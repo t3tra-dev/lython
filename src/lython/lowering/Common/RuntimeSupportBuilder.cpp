@@ -1776,24 +1776,6 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-void buildDiscardCurrentExceptionIfMatches(SupportBuilder &b) {
-  auto fn = b.beginFunction("LyEH_DiscardCurrentExceptionIfMatches",
-                            b.builder.getFunctionType({b.i64()}, {b.i1()}));
-  mlir::Block *entry = fn.addEntryBlock();
-  b.builder.setInsertionPointToEnd(entry);
-  mlir::Value matches = b.call("LyEH_CurrentExceptionMatches", b.i1(),
-                               mlir::ValueRange{entry->getArgument(0)})
-                            .front();
-  auto discardIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
-                                           matches, /*withElseRegion=*/false);
-  {
-    mlir::OpBuilder::InsertionGuard guard(b.builder);
-    b.builder.setInsertionPointToStart(&discardIf.getThenRegion().front());
-    b.call("LyEH_DiscardCurrentException", mlir::TypeRange{}, {});
-  }
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{matches});
-}
-
 // LyEH_RethrowCurrent(): rethrows the still-stored payload with a fresh C++
 // carrier (the previous catch scope is closed first).
 void buildRethrowCurrent(SupportBuilder &b) {
@@ -2431,7 +2413,6 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildCurrentExceptionClassId(support);
   buildCurrentExceptionMatches(support);
   buildDiscardCurrentException(support);
-  buildDiscardCurrentExceptionIfMatches(support);
   buildRethrowCurrent(support);
   buildTakeCurrentDescriptor(support);
   buildStashCurrentException(support);
