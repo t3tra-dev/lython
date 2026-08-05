@@ -1,5 +1,7 @@
 #include "Ownership.h"
 
+#include "Common/PythonSourceRange.h"
+
 #include "PyDialectTypes.h"
 #include "Contracts.h"
 
@@ -1757,16 +1759,16 @@ bool mayRaisePythonException(mlir::func::FuncOp function) {
     return false;
   if (isRaiseLikeFunction(function))
     return true;
-  // Python-level callables can always raise (any call inside them can).
-  if (function->hasAttr(kCallableTypeAttr) && !function.isDeclaration())
-    return true;
   llvm::StringRef name = function.getName();
-  if (!name.starts_with("Ly"))
-    return false;
-  // Mirror of the final EH phase's non-raising runtime set
-  // (Cleanup/EH.cpp): EH bookkeeping, refcount maintenance, and traceback
-  // writes never throw, so classifying them as may-raise here would demand
-  // cleanup edges the EH phase never materializes.
+  // Mirror of the final EH phase's non-raising runtime set (Cleanup/EH.cpp):
+  // EH bookkeeping, refcount maintenance, and traceback writes never throw, so
+  // classifying them as may-raise here would demand cleanup edges the EH phase
+  // never materializes.
+  //
+  // FIRST, not last. The generated deallocators and unwind-cleanup thunks are
+  // written from a Python location, so the source test below reaches them; they
+  // are release compositions, and asking for a cleanup around the call that IS
+  // the cleanup makes the affine verifier refuse 42 programs that compile.
   if (name == "LyEH_BeginCatch" || name == "LyEH_ClassIdMatches" ||
       name == "LyEH_CurrentExceptionClassId" ||
       name == "LyEH_CurrentExceptionMatches" ||
@@ -1776,9 +1778,27 @@ bool mayRaisePythonException(mlir::func::FuncOp function) {
       name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_"))
     return false;
   if (name == "Ly_IncRef" || name == "Ly_DecRef" || name.ends_with("_DecRef") ||
-      name == "LyObject_ReleaseStorageToZero")
+      name == "LyObject_ReleaseStorageToZero" ||
+      name.starts_with("__ly_dealloc_") ||
+      name.starts_with("__ly_unwind_cleanup_"))
     return false;
-  return true;
+  // Python-level callables can always raise (any call inside them can).
+  if (function->hasAttr(kCallableTypeAttr) && !function.isDeclaration())
+    return true;
+  // AND ANYTHING ELSE COMPILED FROM PYTHON SOURCE, whatever it is named. This
+  // is the first clause of `mayPropagatePythonException` in Cleanup/EH.cpp,
+  // which this predicate is the mirror of, and it was the clause missing here.
+  //
+  // The name test below cannot stand in for it: the generator state machine
+  // emits `g__lyrt_gen_resume__step` from a Python `def`, and the EH phase
+  // invoke-converts calls to it -- the unwind edge is in the IR -- while this
+  // predicate said the callee could not raise, so no ownership cleanup was
+  // attached to that edge. `for v in g()` where `g` raises then unwound past
+  // the only place that would have released the 512-byte generator frame.
+  if (!function.isDeclaration() &&
+      findPythonSourceLoc(function.getLoc()).has_value())
+    return true;
+  return name.starts_with("Ly");
 }
 
 bool returnTransfersGroup(FuncContractCache &contracts,

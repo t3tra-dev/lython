@@ -512,10 +512,19 @@ set(LYTHON_LEAK_GATE_CASES
 # when that shipped, so a golden comparing stderr byte-for-byte was green over
 # a leaking program. Sweeping the directory found this one and three generator
 # cases (still open).
+# The two generator members are a second class, not a second instance: a
+# generator that RAISES leaves its 512-byte frame to an unwind edge, and the
+# ownership pass did not know that edge existed because its may-raise predicate
+# recognised Python code by a `Ly` name prefix or a `callable_type` attribute
+# and the state-machine step carries neither. `traceback_generator_raise` is
+# the plain `for v in g()` shape; `cross_generator_throw_unwind` is throw()
+# unwinding a suspended body through a finally.
 set(LYTHON_LEAK_GATE_EXIT_CASES
     "cases/sys_exit=5"
     "errors/key_error=1"
-    "errors/except_star_naked_miss=1")
+    "errors/except_star_naked_miss=1"
+    "errors/traceback_generator_raise=1"
+    "errors/cross_generator_throw_unwind=1")
 set(LYTHON_LEAK_GATE_ENTRIES)
 foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
     list(APPEND LYTHON_LEAK_GATE_ENTRIES "cases/${leak_case}=0")
