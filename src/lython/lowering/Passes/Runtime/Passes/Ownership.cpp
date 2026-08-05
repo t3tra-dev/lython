@@ -4091,6 +4091,20 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       // that left the block numbering, a terminator consume this analysis does
       // not model -- switches that group back to visiting every marker.
       //
+      // ⛔ WHAT IS LEFT IS NOT A MEMO PROBLEM, and the obvious repair does not
+      // work. Building these sets is 9,999 traversals and 10,104,416 block
+      // visits on a 400-statement module, one per (group, consume site) because
+      // the memo key carries the group's own defining block as the avoided
+      // node. Computing the union in ONE traversal per group instead -- which
+      // is sound, reachability being monotone in its seeds -- was implemented
+      // and measured: 2,805 walks at 3,602 blocks each is 10,104,416 block
+      // visits, THE SAME NUMBER. A walk seeded from every consume at once
+      // reaches proportionally more, so consolidating buys nothing, and the
+      // exact test still builds the per-site sets for the cells that survive
+      // this prune, so the union was pure addition (markers 7.5 s -> 11.7 s).
+      // Going below this needs the per-group `avoid` gone, not the walks
+      // merged.
+      //
       // The dominance half is asked 4.5 M times, so it is asked of the
       // dominator tree's DFS numbering rather than through `DominanceInfo`: a
       // block dominates another exactly when its interval contains the other's
