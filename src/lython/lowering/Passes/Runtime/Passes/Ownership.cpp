@@ -4091,19 +4091,30 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       // that left the block numbering, a terminator consume this analysis does
       // not model -- switches that group back to visiting every marker.
       //
-      // ⛔ WHAT IS LEFT IS NOT A MEMO PROBLEM, and the obvious repair does not
-      // work. Building these sets is 9,999 traversals and 10,104,416 block
-      // visits on a 400-statement module, one per (group, consume site) because
-      // the memo key carries the group's own defining block as the avoided
-      // node. Computing the union in ONE traversal per group instead -- which
-      // is sound, reachability being monotone in its seeds -- was implemented
-      // and measured: 2,805 walks at 3,602 blocks each is 10,104,416 block
-      // visits, THE SAME NUMBER. A walk seeded from every consume at once
-      // reaches proportionally more, so consolidating buys nothing, and the
-      // exact test still builds the per-site sets for the cells that survive
-      // this prune, so the union was pure addition (markers 7.5 s -> 11.7 s).
-      // Going below this needs the per-group `avoid` gone, not the walks
-      // merged.
+      // ⛔ WHAT IS LEFT IS NOT A CACHING PROBLEM. Building these sets is 9,999
+      // traversals and 10,104,416 block visits on a 400-statement module, one
+      // per (group, consume site) because the memo key carries the group's own
+      // defining block as the avoided node. Two regroupings were implemented
+      // and measured, and BOTH visited the same number of blocks:
+      //
+      //   per consume site  9,999 walks x 1,011 = 10,104,416   (shipped)
+      //   union per group   2,805 walks x 3,602 = 10,104,416   (reverted)
+      //   shared seed set   5,606 walks x 1,802 = 10,100,023   (reverted)
+      //
+      // Both are sound -- reachability is monotone in its seeds, and avoiding a
+      // block you never reach is not avoiding anything (9,999 distinct
+      // (seed, avoided) keys sit over only 5,606 distinct seeds). Both were
+      // slower anyway, because a walk that starts from more seeds, or does not
+      // stop at the avoided block, reaches proportionally further: fewer walks,
+      // bigger walks, same work, plus the bookkeeping. 7.5 s -> 11.7 s and
+      // 7.5 s -> 10.0 s.
+      //
+      // The block-visit count is invariant under every regrouping tried, so
+      // going below it means changing WHAT is asked, not how it is cached or
+      // shared. The question is per-group because the avoided node is the
+      // group's own definition; a formulation that does not need it -- or an
+      // under-approximation of "the consume reaches this point" that the exact
+      // test can also use -- is the next thing to try, and neither is a memo.
       //
       // The dominance half is asked 4.5 M times, so it is asked of the
       // dominator tree's DFS numbering rather than through `DominanceInfo`: a
