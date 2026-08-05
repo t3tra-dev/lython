@@ -184,6 +184,27 @@ bool isRaiseLikeFunction(mlir::func::FuncOp function);
 // known non-raising EH/refcount/traceback bookkeeping. Used to model the
 // unwind-out edge of calls in frames WITHOUT a local handler; an unmarked
 // may-raise call in such a frame exits the function with every held token.
+// Refcount maintenance, and the generated release compositions that are
+// nothing but refcount maintenance. Two facts hang off this set: a call to one
+// can never propagate a Python exception, and the ownership inserter may
+// schedule one between a try call-site marker and the call it marks without
+// breaking their adjacency.
+bool isRefcountMaintenanceSymbol(llvm::StringRef name);
+
+// Every runtime symbol a call to which can NEVER propagate a Python exception:
+// the above, plus EH bookkeeping and traceback writes.
+//
+// One list, because two predicates read it at two IR levels --
+// `mayRaisePythonException` here decides whether a token held across a call
+// needs an unwind cleanup, and `mayPropagatePythonException` in
+// Cleanup/EH.cpp decides whether that call becomes an invoke. They must agree:
+// a cleanup on an edge the EH phase never materializes is dead, and an edge
+// with no cleanup leaks whatever was held across it. Copied by hand they did
+// not agree -- three EH-bookkeeping symbols were on one list only, and the
+// generator resume step was on neither, which is the leak in
+// `errors/traceback_generator_raise`.
+bool isNonRaisingRuntimeSymbol(llvm::StringRef name);
+
 bool mayRaisePythonException(mlir::func::FuncOp function);
 
 // For `%c = call @LyEH_TryCatchAnchor(id); cf.cond_br %c, ^handler, ^tail`

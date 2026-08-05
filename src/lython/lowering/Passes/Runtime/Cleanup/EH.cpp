@@ -1,6 +1,8 @@
 #include "Common/PythonSourceRange.h"
 #include "Common/RuntimeSupport.h"
 
+#include "Ownership.h"
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -94,21 +96,15 @@ bool isPythonDebugFunction(const llvm::Function *function) {
 // inserter is free to place these between a try call-site marker and the
 // call it marks, so the EH pass must neither invoke-convert them nor let
 // them break the marker/call adjacency.
+//
+// The set itself lives in common/ because the ownership pass reads it too --
+// the generated source-class deallocators and unwind cleanup thunks are pure
+// release compositions (DecRef family + free), and treating them as pairing
+// breakers here silently unpaired a raise from its handler while treating them
+// as may-raise there demanded a cleanup around the call that IS the cleanup.
 bool isNonUnwindingRefcountHelper(const llvm::Function *callee) {
-  if (!callee)
-    return false;
-  llvm::StringRef name = callee->getName();
-  // The generated source-class deallocators and unwind cleanup thunks are
-  // pure release compositions (DecRef family + free): ownership insertion
-  // schedules them between a try-call marker and a guarded raise exactly
-  // like a plain DecRef, and treating them as pairing breakers silently
-  // unpaired the raise from its handler (the exception then resumed out of
-  // the frame past a matching except).
-  return name == "Ly_IncRef" || name == "Ly_DecRef" ||
-         name.ends_with("_DecRef") ||
-         name == "LyObject_ReleaseStorageToZero" ||
-         name.starts_with("__ly_dealloc_") ||
-         name.starts_with("__ly_unwind_cleanup_");
+  return callee &&
+         py::ownership::isRefcountMaintenanceSymbol(callee->getName());
 }
 
 bool mayPropagatePythonException(const llvm::Function *callee) {
@@ -118,18 +114,11 @@ bool mayPropagatePythonException(const llvm::Function *callee) {
       callee->doesNotThrow())
     return false;
   llvm::StringRef name = callee->getName();
-  if (name == "LyEH_ThrowException" || name.ends_with("_Raise") ||
-      name == "LyEH_BeginCatch" || name == "LyEH_ClassIdMatches" ||
-      name == "LyEH_CurrentExceptionClassId" ||
-      name == "LyEH_CurrentExceptionMatches" ||
-      name == "LyEH_DiscardCurrentExceptionIfMatches" ||
-      name == "LyEH_DiscardCurrentException" ||
-      name == "LyEH_StashCurrentAsContext" ||
-      name == "LyEH_SetCurrentCause" || name == "LyEH_SetCurrentSuppress" ||
-      name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
-      name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_"))
+  // A raise primitive is where an exception STARTS; the unwind edge out of it
+  // is `isPythonRuntimeRaiseCall`'s business, not a propagation.
+  if (name == "LyEH_ThrowException" || name.ends_with("_Raise"))
     return false;
-  if (isNonUnwindingRefcountHelper(callee))
+  if (py::ownership::isNonRaisingRuntimeSymbol(name))
     return false;
   return name.starts_with("Ly");
 }
