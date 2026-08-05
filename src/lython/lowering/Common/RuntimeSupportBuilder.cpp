@@ -1276,6 +1276,31 @@ void declareEHSupport(SupportBuilder &b) {
   };
   boolGlobal("g_current_exception");
   boolGlobal("g_native_catch_active");
+  // ⛔ THE ROOT OF THE EH RUNTIME'S DISTANCE FROM `proof/`, recorded here
+  // because everything above it inherits the shape and the rewrite has to
+  // start here rather than at the top.
+  //
+  // `g_current_parts` holds the in-flight exception as THREE MEMREF
+  // DESCRIPTORS FLATTENED INTO WORDS -- 120 bytes, 15 words, five per
+  // descriptor. Every consumer therefore rebuilds a descriptor from words
+  // (`InsertValueOp`, eight sites in TracebackSupportBuilder alone), which is
+  // the direction the memory model refuses: `extract_aligned_pointer_as_index`
+  // is documented there as where provenance is lost, and turning the integer
+  // back into a pointer is outside the model by its own statement.
+  //
+  // What that costs, measured while trying to fix the layers above it:
+  //
+  //   * the except* frame cannot become a `memref` box, because
+  //     `LyEH_StarResidualParts` has to ASSEMBLE descriptors out of the node's
+  //     words and only an LLVM-level function can do that;
+  //   * so the three LLVM-level star functions cannot move to func level;
+  //   * so the frame's slots cannot become fields, though the model now has
+  //     `getField`/`setField` for exactly that.
+  //
+  // The order is the reverse of the one it looks like from the top: the chain
+  // node and this slot have to hold descriptors before anything built on them
+  // can. Making the frame a value (which it now is) was independent of this and
+  // is done; making it a BOX is not.
   {
     auto parts = mlir::LLVM::GlobalOp::create(
         b.builder, b.loc, exceptionPartsType(b), /*isConstant=*/false,
