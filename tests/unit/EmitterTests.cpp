@@ -195,6 +195,57 @@ TEST(EmitterTest, IndexWalkGateStillAdmitsSequencesAndDictForLoops) {
           .ok());
 }
 
+// What this pins: that a yield inside a `try/except*` is refused HERE, by the
+// emitter, and that it is refused for the reason it is refused.
+//
+// The star frame became an SSA value produced by `except_star.begin`, so it is
+// live across the whole statement; a yield would make it cross a suspension and
+// the generator state machine carries only what it has a lane contract for.
+// Before the frame was a value the shape compiled and ran correctly, so this is
+// a deliberate narrowing and the test is what records it as deliberate.
+//
+// Not a golden: the program never reaches lowering, and the string is the whole
+// content. The control below is what keeps the rejection from being vacuous --
+// the same except* without the yield must still emit, and a yield outside any
+// except* must still emit.
+TEST(EmitterTest, RejectsYieldInsideExceptStar) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted = emitSource(
+      "from collections.abc import Generator\n"
+      "def g() -> Generator[int, None, None]:\n"
+      "    try:\n"
+      "        raise ValueError('x')\n"
+      "    except* ValueError:\n"
+      "        yield 1\n",
+      context);
+  EXPECT_FALSE(emitted.ok());
+  EXPECT_TRUE(reportsDiagnostic(emitted, "yield inside a try with except*"));
+  // The reason, not just the refusal: a message that named the generator
+  // lowering's straight-line restriction would be true and misleading.
+  EXPECT_TRUE(reportsDiagnostic(emitted, "cross the suspension"));
+}
+
+TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult star = emitSource(
+      "try:\n"
+      "    raise ValueError('x')\n"
+      "except* ValueError:\n"
+      "    print('caught')\n",
+      context);
+  EXPECT_TRUE(star.ok());
+
+  lython::emitter::EmitResult yielding = emitSource(
+      "from collections.abc import Generator\n"
+      "def g() -> Generator[int, None, None]:\n"
+      "    try:\n"
+      "        yield 1\n"
+      "    except ValueError:\n"
+      "        print('caught')\n",
+      context);
+  EXPECT_TRUE(yielding.ok());
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());

@@ -3,6 +3,8 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+
+#include <variant>
 #include "Contracts.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -230,6 +232,34 @@ bool isMutableContainerContract(mlir::Type type) {
   return name == "builtins.list" || name == "builtins.dict" ||
          name == "builtins.set" || name == "builtins.frozenset" ||
          name == "builtins.bytearray";
+}
+
+// A yield ANYWHERE inside a `try/except*`, expressions included.
+//
+// `containsStatementKind` cannot answer this: `yield` is an expression, so it
+// arrives wrapped in an `Expr` or on the right of an assignment, and a walk
+// over statement kinds never sees it. Nested callables are not descended into
+// -- their yields belong to them.
+bool containsYieldExpression(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "Yield" || node->kind == "YieldFrom")
+    return true;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "Lambda" || node->kind == "ClassDef")
+    return false;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (containsYieldExpression(child->get()))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &each : *children)
+        if (containsYieldExpression(each.get()))
+          return true;
+    }
+  }
+  return false;
 }
 
 } // namespace
@@ -1685,6 +1715,22 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
               "clause or restructure without except*"});
       return;
     }
+  }
+
+  // The star frame is an SSA value produced by `except_star.begin` and read by
+  // every clause, so it is live across the whole statement. A yield inside it
+  // would make that value cross a suspension, and the generator state machine
+  // carries only what it has a lane contract for. Refuse it here, where the
+  // reason can be said, rather than letting it fall through to the generator
+  // lowering's "straight-line pure int yield bodies" -- which is true and is
+  // not the reason.
+  if (containsYieldExpression(&statement)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "yield inside a try with except* is not implemented yet (the except* "
+        "frame would have to cross the suspension); move the yield out of the "
+        "statement or use except"});
+    return;
   }
 
   struct StarHandler {
