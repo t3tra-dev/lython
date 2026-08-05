@@ -356,6 +356,14 @@ def Py_ExceptCurrentMatchOp : Py_Op<"except.current_match", []> {
 
 def Py_StarBeginOp : Py_Op<"except_star.begin", []> {
   let summary = "Move the caught exception into a fresh star frame";
+  let description = [{
+    The frame is the op's RESULT and every other `except_star.*` op takes it as
+    an operand. It used to be reached through a mutable global holding a raw
+    pointer, with a parent slot linking the frames into a stack -- a shape the
+    memory model has no words for, since a descriptor cannot be stored. As a
+    value the nesting is lexical, which is what it always was.
+  }];
+  let results = (outs I64:$frame);
   let assemblyFormat = "attr-dict";
 }
 
@@ -368,14 +376,15 @@ def Py_ExceptStarMatchOp : Py_Op<"except_star.match", []> {
     the clause body) and the rest replaces the frame residual; the result
     reports whether the clause body runs.
   }];
-  let arguments = (ins TypeAttrOf<Py_TypeType>:$handler);
+  let arguments = (ins I64:$frame, TypeAttrOf<Py_TypeType>:$handler);
   let results = (outs I1:$result);
-  let assemblyFormat = "$handler attr-dict";
+  let assemblyFormat = "$frame `,` $handler attr-dict";
 }
 
 def Py_StarCollectOp : Py_Op<"except_star.collect", []> {
   let summary = "Park an exception raised by a clause body in the star frame";
-  let assemblyFormat = "attr-dict";
+  let arguments = (ins I64:$frame);
+  let assemblyFormat = "$frame attr-dict";
 }
 
 def Py_StarBodyEndOp : Py_Op<"except_star.body_end", []> {
@@ -391,7 +400,8 @@ def Py_StarFinishOp : Py_Op<"except_star.finish", []> {
     collected exception rethrows as itself, anything else rethrows as a fresh
     exception group wrapping them all.
   }];
-  let assemblyFormat = "attr-dict";
+  let arguments = (ins I64:$frame);
+  let assemblyFormat = "$frame attr-dict";
 }
 
 def Py_ExceptCurrentValueOp : Py_Op<"except.current_value", []> {

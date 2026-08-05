@@ -83,13 +83,6 @@ void declareTracebackSupport(SupportBuilder &b) {
                                  "g_tb_prefix_spaces",
                                  b.builder.getIntegerAttr(b.i64(), -1),
                                  /*alignment=*/8);
-    // Innermost except* frame (0 = none); frames chain through their parent
-    // word, so nested except* statements stack naturally.
-    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
-                                 /*isConstant=*/false,
-                                 mlir::LLVM::Linkage::Internal, "g_star_top",
-                                 b.builder.getIntegerAttr(b.i64(), 0),
-                                 /*alignment=*/8);
     auto stack = mlir::LLVM::GlobalOp::create(
         b.builder, b.loc, tracebackStackType(b), /*isConstant=*/false,
         mlir::LLVM::Linkage::Internal, "g_traceback_stack", mlir::Attribute(),
@@ -2396,8 +2389,18 @@ mlir::LLVM::LLVMFuncOp starBeginLLVMFunction(SupportBuilder &b,
       mlir::LLVM::LLVMFunctionType::get(resultType, inputs, false));
 }
 
-mlir::Value starTopFrame(SupportBuilder &b) {
-  return b.loadI64(b.addrOf("g_star_top"));
+// The frame is the first argument of every star function now. It used to be a
+// mutable global holding a raw pointer, with slot 3 linking the frames into a
+// stack -- neither of which the memory model can express, because a descriptor
+// cannot be stored and an identity laundered through an integer is outside it
+// by the model's own statement. As a parameter the nesting is lexical, and
+// `except_star.begin` hands the value to the ops that need it.
+mlir::Value starFrameArg(mlir::func::FuncOp fn) {
+  return fn.getBody().front().getArgument(0);
+}
+
+mlir::Value starFrameArg(mlir::LLVM::LLVMFuncOp fn) {
+  return fn.getBody().front().getArgument(0);
 }
 
 mlir::Value starFrameSlot(SupportBuilder &b, mlir::Value frame,
@@ -2520,7 +2523,7 @@ void buildReleaseStarNode(SupportBuilder &b) {
 // void LyEH_StarBegin(): push a star frame parking the caught exception.
 void buildStarBegin(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarBegin",
-                            b.builder.getFunctionType({}, {}));
+                            b.builder.getFunctionType({}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame =
@@ -2548,21 +2551,17 @@ void buildStarBegin(SupportBuilder &b) {
       b.builder, b.loc, b.i64(), present);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, presentWord,
                               b.gepI64(frame, b.iconst(1)), /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, starTopFrame(b),
-                              b.gepI64(frame, b.iconst(3)), /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, frameWord,
-                              b.addrOf("g_star_top"), /*alignment=*/8);
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{frameWord});
 }
 
 // i1 LyEH_StarHasResidual(): whether the innermost frame still holds an
 // unmatched slice.
 void buildStarHasResidual(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarHasResidual",
-                            b.builder.getFunctionType({}, {b.i1()}));
+                            b.builder.getFunctionType({b.i64()}, {b.i1()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   mlir::Value present =
       b.loadI64(starFrameSlot(b, frame, 1));
   mlir::Value result =
@@ -2574,10 +2573,10 @@ void buildStarHasResidual(SupportBuilder &b) {
 // residual exception (requires one).
 void buildStarResidualParts(SupportBuilder &b) {
   auto fn = starBeginLLVMFunction(b, "LyEH_StarResidualParts",
-                                  starBorrowPartsType(b), {});
+                                  starBorrowPartsType(b), {b.i64()});
   mlir::Block *entry = fn.addEntryBlock(b.builder);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
   auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
   mlir::Value result = mlir::LLVM::UndefOp::create(
@@ -2639,10 +2638,11 @@ void buildStarApplyMatch(SupportBuilder &b) {
     inputs.push_back(b.i64());
     inputs.push_back(b.i64());
   }
+  inputs.insert(inputs.begin(), b.i64());
   auto fn = starBeginLLVMFunction(b, "LyEH_StarApplyMatch", {}, inputs);
   mlir::Block *entry = fn.addEntryBlock(b.builder);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
 
   // Drop the frame's reference to the old residual payload.
@@ -2653,7 +2653,7 @@ void buildStarApplyMatch(SupportBuilder &b) {
 
   // Rest (descriptor words) into the node payload slots; absent rest zeroes
   // them and clears the present flag.
-  mlir::Value hasRest = entry->getArgument(0);
+  mlir::Value hasRest = entry->getArgument(1);
   auto restIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
                                         hasRest, /*withElseRegion=*/true);
   {
@@ -2661,7 +2661,7 @@ void buildStarApplyMatch(SupportBuilder &b) {
     b.builder.setInsertionPointToStart(&restIf.getThenRegion().front());
     for (int section = 0; section < 3; ++section)
       for (int field = 0; field < 5; ++field) {
-        mlir::Value word = entry->getArgument(16 + section * 5 + field);
+        mlir::Value word = entry->getArgument(17 + section * 5 + field);
         if (field < 2)
           word = mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(),
                                                 word);
@@ -2682,7 +2682,7 @@ void buildStarApplyMatch(SupportBuilder &b) {
   // Matched becomes the current exception.
   for (int section = 0; section < 3; ++section)
     for (int field = 0; field < 5; ++field) {
-      mlir::Value word = entry->getArgument(1 + section * 5 + field);
+      mlir::Value word = entry->getArgument(2 + section * 5 + field);
       if (field < 2)
         word =
             mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), word);
@@ -2738,10 +2738,10 @@ void buildStarApplyMatch(SupportBuilder &b) {
 // body) in the frame's collected list.
 void buildStarCollect(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarCollect",
-                            b.builder.getFunctionType({}, {}));
+                            b.builder.getFunctionType({b.i64()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   mlir::Value count = b.loadI64(starFrameSlot(b, frame, 2));
   mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::slt, count,
                                b.iconst(kStarCollectedLimit));
@@ -2764,19 +2764,19 @@ void buildStarCollect(SupportBuilder &b) {
 // i64 LyEH_StarCollectedCount() / i64 LyEH_StarNodesPtr(): finish inputs.
 void buildStarCollectedCount(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarCollectedCount",
-                            b.builder.getFunctionType({}, {b.i64()}));
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value count = b.loadI64(starFrameSlot(b, starTopFrame(b), 2));
+  mlir::Value count = b.loadI64(starFrameSlot(b, starFrameArg(fn), 2));
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
 }
 
 void buildStarNodesPtr(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarNodesPtr",
-                            b.builder.getFunctionType({}, {b.i64()}));
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value base = starFrameSlot(b, starTopFrame(b), kStarCollectedBase);
+  mlir::Value base = starFrameSlot(b, starFrameArg(fn), kStarCollectedBase);
   mlir::Value word =
       mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), base);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{word});
@@ -2786,16 +2786,13 @@ void buildStarNodesPtr(SupportBuilder &b) {
 // is each caller's business; here the residual node is fully released).
 void buildStarPop(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarPop",
-                            b.builder.getFunctionType({}, {}));
+                            b.builder.getFunctionType({b.i64()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   b.call("release_star_node", mlir::TypeRange{},
          mlir::ValueRange{b.loadI64(starFrameSlot(b, frame, 0)),
                           b.loadI64(starFrameSlot(b, frame, 1))});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(starFrameSlot(b, frame, 3)),
-                              b.addrOf("g_star_top"), /*alignment=*/8);
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -2824,18 +2821,15 @@ void buildStarThrowPending(SupportBuilder &b) {
 // slice rethrows with its original traceback and chain.
 void buildStarRethrowResidual(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarRethrowResidual",
-                            b.builder.getFunctionType({}, {}));
+                            b.builder.getFunctionType({b.i64()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   mlir::Value area = starFrameSlot(b, frame, 0);
   mlir::Value areaWord =
       mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
   b.call("LyEH_UnstashException", mlir::TypeRange{},
          mlir::ValueRange{areaWord});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(starFrameSlot(b, frame, 3)),
-                              b.addrOf("g_star_top"), /*alignment=*/8);
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2845,10 +2839,10 @@ void buildStarRethrowResidual(SupportBuilder &b) {
 // residual — that exception continues as itself (context intact).
 void buildStarRethrowSoleCollected(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarRethrowSoleCollected",
-                            b.builder.getFunctionType({}, {}));
+                            b.builder.getFunctionType({b.i64()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
   mlir::Value area = starFrameSlot(b, frame, kStarCollectedBase);
   mlir::Value areaWord =
       mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
@@ -2857,9 +2851,6 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
   b.call("release_star_node", mlir::TypeRange{},
          mlir::ValueRange{b.loadI64(starFrameSlot(b, frame, 0)),
                           b.loadI64(starFrameSlot(b, frame, 1))});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(starFrameSlot(b, frame, 3)),
-                              b.addrOf("g_star_top"), /*alignment=*/8);
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2878,10 +2869,11 @@ void buildStarThrowCombined(SupportBuilder &b) {
     inputs.push_back(b.i64());
     inputs.push_back(b.i64());
   }
+  inputs.insert(inputs.begin(), b.i64());
   auto fn = starBeginLLVMFunction(b, "LyEH_StarThrowCombined", {}, inputs);
   mlir::Block *entry = fn.addEntryBlock(b.builder);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value frame = starTopFrame(b);
+  mlir::Value frame = starFrameArg(fn);
 
   // Collected nodes: the combined group retained each member, so a plain
   // node release moves ownership to the group.
@@ -2972,7 +2964,7 @@ void buildStarThrowCombined(SupportBuilder &b) {
   // Install the combined exception and throw.
   for (int section = 0; section < 3; ++section)
     for (int field = 0; field < 5; ++field) {
-      mlir::Value word = entry->getArgument(section * 5 + field);
+      mlir::Value word = entry->getArgument(1 + section * 5 + field);
       if (field < 2)
         word =
             mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), word);
@@ -2984,9 +2976,6 @@ void buildStarThrowCombined(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       b.addrOf("g_current_exception"), /*alignment=*/4);
-  mlir::Value parent = b.loadI64(starFrameSlot(b, frame, 3));
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, parent,
-                              b.addrOf("g_star_top"), /*alignment=*/8);
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   mlir::func::CallOp::create(b.builder, b.loc, "star_throw_pending",
                              mlir::TypeRange{}, mlir::ValueRange{});

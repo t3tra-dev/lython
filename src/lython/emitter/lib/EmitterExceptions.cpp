@@ -1772,11 +1772,14 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
     tryOp.getExceptRegion().push_back(finishBlock);
 
     builder.setInsertionPointToStart(entryBlock);
-    {
-      mlir::OperationState beginState(loc(statement),
-                                      py::StarBeginOp::getOperationName());
-      builder.create(beginState);
-    }
+    // The frame is a VALUE from here on. Every clause below is dominated by
+    // this block, and the inner collect-try's region can see it, so the nesting
+    // that a global frame stack used to encode is just the CFG.
+    mlir::OperationState beginState(loc(statement),
+                                    py::StarBeginOp::getOperationName());
+    beginState.addTypes(builder.getI64Type());
+    mlir::Value starFrame =
+        mlir::cast<py::StarBeginOp>(builder.create(beginState)).getFrame();
     mlir::cf::BranchOp::create(builder, loc(statement), checkBlocks.front());
 
     for (auto [index, starHandler] : llvm::enumerate(starHandlers)) {
@@ -1788,6 +1791,7 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
       mlir::OperationState matchState(
           loc(handler), py::ExceptStarMatchOp::getOperationName());
       matchState.addTypes(builder.getI1Type());
+      matchState.addOperands(starFrame);
       matchState.addAttribute("handler",
                               mlir::TypeAttr::get(starHandler.handlerType));
       auto match =
@@ -1838,6 +1842,7 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
           builder.setInsertionPointToStart(collectBlock);
           mlir::OperationState collectState(
               loc(handler), py::StarCollectOp::getOperationName());
+          collectState.addOperands(starFrame);
           builder.create(collectState);
           py::ExceptYieldOp::create(builder, loc(handler), mlir::ValueRange{});
         }
@@ -1853,6 +1858,7 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
     {
       mlir::OperationState finishState(loc(statement),
                                        py::StarFinishOp::getOperationName());
+      finishState.addOperands(starFrame);
       builder.create(finishState);
     }
     py::ExceptYieldOp::create(builder, loc(statement), mlir::ValueRange{});
