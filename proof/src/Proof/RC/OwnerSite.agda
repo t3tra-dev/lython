@@ -188,6 +188,22 @@ logicalRC : SiteMap → ObjId → ℕ
 logicalRC []             _ = 0
 logicalRC ((_ , p) ∷ ss) o = if sameObj p o then suc (logicalRC ss o) else logicalRC ss o
 
+-- ⭐ The same count, restricted to FIELD sites.
+--
+-- `logicalRC` counts every owner site; a name holds some of them and a field
+-- holds others. The coherence invariant needs the split, because a store moves
+-- a hold from a name to a field and the name side alone then reads as a loss.
+-- Nothing else about the model changes: this is `logicalRC` with one extra
+-- conjunct, over the same list, so its lemmas are the same lemmas.
+isFieldSite : OwnerSite → Bool
+isFieldSite (field′ _ _) = true
+isFieldSite _            = false
+
+fieldRC : SiteMap → ObjId → ℕ
+fieldRC []             _ = 0
+fieldRC ((s , p) ∷ ss) o =
+  if isFieldSite s ∧ sameObj p o then suc (fieldRC ss o) else fieldRC ss o
+
 ------------------------------------------------------------------------
 -- The three site operations, and what each does to the count.
 
@@ -211,6 +227,50 @@ occupy-other : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) → sameObj o p 
 -- what `logicalRC` branches on. Callers turn a disequality into it with
 -- `sameObj-sound` contraposed.
 occupy-other ss s o p ne rewrite ne = refl
+
+-- What the site operations do to the FIELD half.
+--
+-- Occupying or vacating a site that is not a field cannot move it, and that is
+-- true by reduction rather than by induction for `occupy` -- the conjunct is
+-- already `false`. `vacate` needs the induction, because the entry it removes
+-- is somewhere in the list.
+fieldRC-occupy-nonfield : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) →
+                          isFieldSite s ≡ false →
+                          fieldRC (occupy ss s o) p ≡ fieldRC ss p
+fieldRC-occupy-nonfield ss s o p nf rewrite nf = refl
+
+fieldRC-occupy-field-same : ∀ (ss : SiteMap) (q : ObjId) (k : ℕ) (o : ObjId) →
+                            fieldRC (occupy ss (field′ q k) o) o ≡ suc (fieldRC ss o)
+fieldRC-occupy-field-same ss q k o rewrite sameObj-refl o = refl
+
+fieldRC-occupy-field-other : ∀ (ss : SiteMap) (q : ObjId) (k : ℕ) (o p : ObjId) →
+                             sameObj o p ≡ false →
+                             fieldRC (occupy ss (field′ q k) o) p ≡ fieldRC ss p
+fieldRC-occupy-field-other ss q k o p ne rewrite ne = refl
+
+-- `sameSite` is true only between sites of the same constructor, so a site that
+-- matches a non-field is a non-field. Stated over the boolean the counts branch
+-- on, like every other lemma here.
+sameSite-field : ∀ (s t : OwnerSite) → sameSite s t ≡ true →
+                 isFieldSite s ≡ isFieldSite t
+sameSite-field (local _ _)  (local _ _)  _ = refl
+sameSite-field (field′ _ _) (field′ _ _) _ = refl
+sameSite-field (global _)   (global _)   _ = refl
+sameSite-field (queue _ _)  (queue _ _)  _ = refl
+sameSite-field (temp _ _)   (temp _ _)   _ = refl
+
+fieldRC-vacate-nonfield : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+                          isFieldSite s ≡ false →
+                          fieldRC (vacate ss s) o ≡ fieldRC ss o
+fieldRC-vacate-nonfield []             s o nf = refl
+fieldRC-vacate-nonfield ((t , p) ∷ ss) s o nf = go (sameSite t s) refl
+  where
+    go : (bb : Bool) → sameSite t s ≡ bb →
+         fieldRC (vacate ((t , p) ∷ ss) s) o ≡ fieldRC ((t , p) ∷ ss) o
+    go true  e rewrite e | trans (sameSite-field t s e) nf = refl
+    go false e rewrite e =
+      cong (λ n → if isFieldSite t ∧ sameObj p o then suc n else n)
+           (fieldRC-vacate-nonfield ss s o nf)
 
 -- ⭐ Vacating a site that HOLDS the object drops the count by exactly one.
 --
