@@ -47,6 +47,7 @@ open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal)
 open import Proof.RC.OwnerSite using (OwnerSite; local; field′; global; queue; temp;
+  fieldRC;
   ThreadId; SiteMap; strongAt; logicalRC; Holds; holds-here; holds-there)
 open import Proof.RC.Machine Sig
 open import Proof.Program.Syntax using (Var)
@@ -242,6 +243,20 @@ record Leaked (es : Env) (m : Machine) (o : ObjId) : Set where
     still-owned : 0 < ghostRC m o
     -- ... and no name is left that could do the releasing.
     unnamed     : ownedCount es o ≡ 0
+    -- ... and no FIELD holds it either.
+    --
+    -- ⭐ Without this the record calls every aggregate member a leak: after a
+    -- store a field holds the object and no name does, which is the shape of an
+    -- element sitting in a list, and the parent's release is what vacates it.
+    -- The two counts disagreeing is still the defect; the name side is just not
+    -- the whole of the holding side once fields can hold.
+    --
+    -- ⛔ What this therefore does NOT call a leak is a CYCLE: two objects each
+    -- held by a field of the other and named by nobody satisfy `still-owned`
+    -- and `unnamed` but not this. That is not an oversight -- it is what a
+    -- reference count cannot see, and CPython leaks it too without its cycle
+    -- collector. It is a separate family and needs reachability, not counting.
+    unfielded   : fieldRC (sites m) o ≡ 0
 
 open Leaked public
 

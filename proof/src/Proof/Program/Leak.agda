@@ -32,7 +32,7 @@ open import Data.Bool using (Bool; true; false; if_then_else_; _∧_)
 open import Data.Empty using (⊥; ⊥-elim)
 open import Data.List using (List; []; _∷_)
 open import Data.Maybe using (Maybe; just; nothing; maybe′)
-open import Data.Nat using (ℕ; zero; suc; _<_; s≤s; z≤n)
+open import Data.Nat using (ℕ; zero; suc; _+_; _<_; s≤s; z≤n)
 open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Relation.Binary.PropositionalEquality
   using (_≡_; refl; sym; trans; cong; subst; subst₂)
@@ -40,6 +40,7 @@ open import Relation.Nullary using (¬_)
 
 open import Proof.RC.Object using (ObjId; sameObj; sameObj-sound; sameObj-refl)
 open import Proof.RC.OwnerSite using (OwnerSite; ThreadId; SiteMap; occupy; vacate;
+  fieldRC; isFieldSite; fieldRC-occupy-nonfield; fieldRC-vacate-nonfield;
   strongAt; logicalRC; vacate-holder; vacate-holder-other)
 open import Proof.RC.Machine Sig using (Machine; machine; heap; objects; sites;
   ghostRC)
@@ -48,7 +49,7 @@ open import Proof.Program.Env
 open import Proof.Program.Step Sig
 open import Proof.Program.Preservation Sig using (WF; WFES; backed;
   moveOne-preserves; step-preserves-WF)
-open import Proof.Lython.Invalid Sig using (Leaked; still-owned; unnamed)
+open import Proof.Lython.Invalid Sig using (Leaked; still-owned; unnamed; unfielded)
 
 ------------------------------------------------------------------------
 -- The property.
@@ -57,21 +58,39 @@ open import Proof.Lython.Invalid Sig using (Leaked; still-owned; unnamed)
 -- single object would be satisfied by a machine that leaked every other one,
 -- and leaks are precisely what the owned-name side is there to see.
 
+-- ⭐ Owned NAMES plus occupied FIELDS, against the count.
+--
+-- The name half alone was the invariant while the model had no field rule, and
+-- it is false the moment there is one: a store moves a hold from a name to a
+-- field, so the name side drops by one while the count does not move. Both
+-- halves together are what the runtime counter actually counts.
 NameSiteCoherent : Env → Machine → Set
-NameSiteCoherent es m = ∀ o → ownedCount es o ≡ ghostRC m o
+NameSiteCoherent es m = ∀ o → ownedCount es o + fieldRC (sites m) o ≡ ghostRC m o
 
 Coherent : PState → Set
 Coherent s = NameSiteCoherent (env s) (mach s)
 
 -- ⭐ Coherence is exactly leak-freedom.
 --
--- `Leaked es m o` says an owner SITE still holds the object and no NAME does,
--- so nothing will ever release it. Coherence rules that out for every object at
--- once, which is what the ∀-quantification is for.
+-- `Leaked es m o` says the count is positive while NOTHING holds it -- no name
+-- and no field. Coherence rules that out for every object at once, which is
+-- what the ∀-quantification is for: both holding sides add up to the count, so
+-- if both are zero the count is zero.
+--
+-- The field conjunct is what keeps this true once fields can hold. An aggregate
+-- member has no name and is not leaked; the parent's release vacates its field.
 coherent-has-no-leaks :
   ∀ (es : Env) (m : Machine) → NameSiteCoherent es m → ∀ o → ¬ Leaked es m o
 coherent-has-no-leaks es m coh o lk
-  with subst (0 <_) (trans (sym (coh o)) (unnamed lk)) (still-owned lk)
+  with subst (0 <_) (sym zeroed) (still-owned lk)
+  where
+    -- `0 + k` is `k` by reduction, so dropping the name half leaves the field
+    -- half, and dropping that leaves nothing for the count to be.
+    named-gone : ownedCount es o + fieldRC (sites m) o ≡ fieldRC (sites m) o
+    named-gone = cong (_+ fieldRC (sites m) o) (unnamed lk)
+
+    zeroed : 0 ≡ ghostRC m o
+    zeroed = trans (sym (unfielded lk)) (trans (sym named-gone) (coh o))
 ... | ()
 
 ------------------------------------------------------------------------
@@ -110,6 +129,13 @@ private
 
   same→eq : ∀ (o p : ObjId) → sameObj o p ≡ true → p ≡ o
   same→eq o p e = sym (sameObj-sound o p e)
+
+  -- The field half rides along. Every rule that bumps the name side leaves the
+  -- field side alone, so the two-sided equation follows from the one-sided one
+  -- by pushing the bump past an addition.
+  bump-plus : ∀ (b : Bool) (n k : ℕ) → bump b n + k ≡ bump b (n + k)
+  bump-plus true  n k = refl
+  bump-plus false n k = refl
 
 -- Whether a binding contributes to an object's owned-name count. Named because
 -- it appears in every statement below and because it is the boolean the site
@@ -199,28 +225,51 @@ private
     ∀ (t : ThreadId) (es : Env) (ss : SiteMap) (x : Var) (o : ObjId) →
     lookupVar es x ≡ just (bind o owned) →
     strongAt ss (siteOf t x) ≡ just o →
-    (∀ p → ownedCount es p ≡ logicalRC ss p) →
-    ∀ p → ownedCount (unbindVar es x) p ≡ logicalRC (vacate ss (siteOf t x)) p
+    (∀ p → ownedCount es p + fieldRC ss p ≡ logicalRC ss p) →
+    ∀ p → ownedCount (unbindVar es x) p + fieldRC (vacate ss (siteOf t x)) p
+            ≡ logicalRC (vacate ss (siteOf t x)) p
   after-removal t es ss x o look held coh p =
     bump-inj (sameObj o p) _ _
-      (trans (sym (ownedCount-unbind es x (bind o owned) look p))
-             (trans (coh p) (logicalRC-vacate ss (siteOf t x) o held p)))
+      (trans (cong (bump (sameObj o p))
+                   (cong (ownedCount (unbindVar es x) p +_)
+                         (fieldRC-vacate-nonfield ss (siteOf t x) p refl)))
+      (trans (sym (bump-plus (sameObj o p) (ownedCount (unbindVar es x) p)
+                             (fieldRC ss p)))
+      (trans (cong (_+ fieldRC ss p)
+                   (sym (ownedCount-unbind es x (bind o owned) look p)))
+             (trans (coh p) (logicalRC-vacate ss (siteOf t x) o held p)))))
+
+-- Occupying a NAME's site: one more owned name, one more site, and the field
+-- half untouched. Every rule that binds a name is this shape.
+private
+  keeps-fields :
+    ∀ (t : ThreadId) (x : Var) (o : ObjId) (ss : SiteMap) (n : ℕ) (p : ObjId) →
+    n + fieldRC ss p ≡ logicalRC ss p →
+    bump (sameObj o p) n + fieldRC (occupy ss (siteOf t x) o) p
+      ≡ bump (sameObj o p) (logicalRC ss p)
+  keeps-fields t x o ss n p e =
+    trans (cong (bump (sameObj o p) n +_)
+                (fieldRC-occupy-nonfield ss (siteOf t x) o p refl))
+    (trans (bump-plus (sameObj o p) n (fieldRC ss p))
+           (cong (bump (sameObj o p)) e))
 
 instr-preserves-coherence : ∀ {f s u} → f ⊢ s —→ᵢ u → WF s → Coherent s → Coherent u
 -- One more name, one more site, on the same boolean.
 instr-preserves-coherence {s = pstate t bid _ es m}
   (step-alloc {x = x} {o = o} _ _ _ _ _) w coh p =
-  cong (bump (sameObj o p)) (coh p)
+  keeps-fields t x o (sites m) (ownedCount es p) p (coh p)
 -- The header write touches neither side.
 instr-preserves-coherence (step-init _ _ _)                 w coh p = coh p
 instr-preserves-coherence {s = pstate t bid _ es m}
   (step-dup {dst = dst} {o = o} _ _ _) w coh p =
-  cong (bump (sameObj o p)) (coh p)
+  keeps-fields t dst o (sites m) (ownedCount es p) p (coh p)
 -- One off, one on, at both levels.
 instr-preserves-coherence {s = pstate t bid _ es m}
-  (step-move {src = src} {o = o} look _) w coh p =
-  cong (bump (sameObj o p))
-       (after-removal t es (sites m) src o look (backed w src o look) coh p)
+  (step-move {src = src} {dst = dst} {o = o} look _) w coh p =
+  keeps-fields t dst o (vacate (sites m) (siteOf t src))
+               (ownedCount (unbindVar es src) p) p
+               (after-removal t es (sites m) src o look (backed w src o look)
+                              coh p)
 instr-preserves-coherence {s = pstate t bid _ es m}
   (step-drop {x = x} {o = o} look _ _ _) w coh p =
   after-removal t es (sites m) x o look (backed w x o look) coh p
@@ -248,12 +297,15 @@ moveOne-preserves-coherence t m es ss p a es' ss' eq w coh = outer (lookupVar es
              NameSiteCoherent (bindVar (unbindVar es a) p b)
                               (afterArgs m (relocate t ss a p b))
     result (bind o owned) look q =
-      cong (bump (sameObj o q))
-           (after-removal t es ss a o look (backed w a o look) coh q)
+      keeps-fields t p o (vacate ss (siteOf t a))
+                   (ownedCount (unbindVar es a) q) q
+                   (after-removal t es ss a o look (backed w a o look) coh q)
     -- The borrowed case relocates NO site, and removes a name that was not
     -- counted -- so both sides are exactly where they were.
     result (bind o (borrowed v)) look q =
-      trans (sym (ownedCount-unbind es a (bind o (borrowed v)) look q)) (coh q)
+      trans (cong (_+ fieldRC ss q)
+                  (sym (ownedCount-unbind es a (bind o (borrowed v)) look q)))
+            (coh q)
 
     middle : ∀ (b : Binding) → lookupVar es a ≡ just b →
              (r : Maybe Binding) → lookupVar (unbindVar es a) a ≡ r →

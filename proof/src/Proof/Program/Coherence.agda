@@ -180,8 +180,13 @@ leakyEnv = env R.s₆
 leakyMach : Machine
 leakyMach = mach R.s₅
 
+-- The third component is `refl` because the run that builds this state uses no
+-- field at all: the site holding the object is a NAME's, vacated by nobody.
+-- That it is `refl` rather than an argument is the point -- the example is a
+-- leak for the reason it always was, and the field conjunct only stops the
+-- record from calling an aggregate member one.
 the-leak : Leaked leakyEnv leakyMach R.theObj
-the-leak = leaked (s≤s z≤n) refl
+the-leak = leaked (s≤s z≤n) refl refl
 
 -- The checker finds it.
 leak-checker-fires : leaked? leakyEnv leakyMach R.theObj ≡ true

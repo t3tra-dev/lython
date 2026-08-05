@@ -27,6 +27,7 @@ open import Proof.RC.Object using (ObjId; Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; sameObj; sameObj-refl; sameObj-sound;
   ≡ᵇ-refl; ≡ᵇ-sound; ≡ᵇ-sym)
 open import Proof.RC.OwnerSite using (OwnerSite; SiteMap; ThreadId; sameSite;
+  fieldRC;
   sameSite-false; sameSite-refl; sameSite-sound; sameSite-sym;
   Holds; holds-here; holds-there; holds-positive; logicalRC)
 open import Proof.RC.Machine Sig
@@ -370,8 +371,14 @@ zero? : ℕ → Bool
 zero? zero    = true
 zero? (suc _) = false
 
+-- The third conjunct is the one fields made necessary: an object with no name
+-- but a field holding it is an aggregate member, not a leak, and the parent's
+-- release is what vacates the field. `Leaked` says the same thing, and the
+-- decision procedure has to keep saying exactly what the record says or
+-- soundness and completeness stop being about the same predicate.
 leaked? : Env → Machine → ObjId → Bool
 leaked? es m o = positive? (ghostRC m o) ∧ zero? (ownedCount es o)
+                                         ∧ zero? (fieldRC (sites m) o)
 
 private
   positive?-sound : ∀ n → positive? n ≡ true → 0 < n
@@ -392,14 +399,17 @@ private
 leaked?-sound : ∀ (es : Env) (m : Machine) (o : ObjId) →
                 leaked? es m o ≡ true → Leaked es m o
 leaked?-sound es m o rep with ∧-true rep
-... | (gp , on) = leaked (positive?-sound (ghostRC m o) gp)
-                         (zero?-sound (ownedCount es o) on)
+... | (gp , rest) with ∧-true rest
+...   | (on , fz) = leaked (positive?-sound (ghostRC m o) gp)
+                           (zero?-sound (ownedCount es o) on)
+                           (zero?-sound (fieldRC (sites m) o) fz)
 
 leaked?-complete : ∀ (es : Env) (m : Machine) (o : ObjId) →
                    Leaked es m o → leaked? es m o ≡ true
 leaked?-complete es m o lk
   rewrite positive?-complete (ghostRC m o) (still-owned lk)
-        | zero?-complete (ownedCount es o) (unnamed lk) = refl
+        | zero?-complete (ownedCount es o) (unnamed lk)
+        | zero?-complete (fieldRC (sites m) o) (unfielded lk) = refl
 
 -- ⭐ The form a pass uses: if the check is silent at every object the pass
 -- touched, nothing was leaked there.
