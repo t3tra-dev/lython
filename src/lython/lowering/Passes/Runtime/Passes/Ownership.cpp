@@ -4064,11 +4064,194 @@ mlir::LogicalResult insertUnwindCleanupReleases(
               return TokenAtPoint::Unknown;
         return groupTokenAtPoint(analysis, group, point, aliases);
       };
+      // WHERE A GROUP'S TOKEN IS ALREADY GONE, one block bitset per group.
+      //
+      // The loop below asks #markers x #groups times "is this group held at
+      // this exit point". On a 400-statement module that is 8,987,220 cells, of
+      // which 9,604 can answer Held -- and the exact answer is not cheap: it
+      // walks the group's consume sites and asks a reachability question per
+      // site, which is 14 of the phase's 16 seconds.
+      //
+      // Two O(1) facts reject the rest. A point can hold the token only if the
+      // definition DOMINATES it, and only if no consume's dead state has
+      // reached its block: `groupTokenAtPoint` returns NotHeld or Unknown --
+      // never Held -- for a point a consume reaches. The dead sets are the
+      // reachability sets that test already builds and memoises, so this costs
+      // one OR per consume site and no new traversal.
+      //
+      // Why NOT bound the candidates by reachability FROM the definition, which
+      // reads like the natural companion to the dead set: dominance already
+      // implies it, so it rejects nothing extra -- and asking for it built one
+      // more reach set per group, 2,805 traversals and 10.1 M extra block
+      // visits, which cost more than the cells it saved (17.7 s -> 13.1 s
+      // instead of 17.7 s -> 2 s).
+      //
+      // A SUPERSET, deliberately. This decides nothing: every cell it keeps
+      // still gets the exact test. Any set it cannot compute exactly -- a walk
+      // that left the block numbering, a terminator consume this analysis does
+      // not model -- switches that group back to visiting every marker.
+      //
+      // The dominance half is asked 4.5 M times, so it is asked of the
+      // dominator tree's DFS numbering rather than through `DominanceInfo`: a
+      // block dominates another exactly when its interval contains the other's
+      // entry number, which is two integer comparisons instead of a ~1.5 us
+      // query (6.7 s of the 8.4 s left after the dead set).
+      //
+      // A single-block region has no dominator tree to ask (`getDomTree`
+      // requires more than one block) and nothing to prune: one block means one
+      // marker block, so the prune is simply switched off there.
+      llvm::DominatorTreeBase<mlir::Block, false> *domTree = nullptr;
+      if (!region->hasOneBlock()) {
+        domTree = &analysis.dominance.getDomTree(region);
+        domTree->updateDFSNumbers();
+      }
+      auto dfsIntervalOf = [&](mlir::Block *block)
+          -> std::optional<std::pair<unsigned, unsigned>> {
+        if (!domTree)
+          return std::nullopt;
+        if (auto *node = domTree->getNode(block))
+          return std::make_pair(node->getDFSNumIn(), node->getDFSNumOut());
+        return std::nullopt;
+      };
+      struct HeldBlocks {
+        llvm::BitVector dead;
+        unsigned defIn = 0;
+        unsigned defOut = 0;
+        bool usable = false;
+      };
+      llvm::SmallVector<HeldBlocks, 8> heldBlocks(groups.size());
+      for (auto [heldIndex, heldGroup] : llvm::enumerate(groups)) {
+        if (heldGroup.skip || !heldGroup.deallocator || heldGroup.values.empty())
+          continue;
+        mlir::Value root = heldGroup.values.front();
+        mlir::Operation *producer = root.getDefiningOp();
+        mlir::Block *defBlock =
+            producer ? producer->getBlock()
+                     : mlir::cast<mlir::BlockArgument>(root).getOwner();
+        llvm::BitVector dead(analysis.blocks.size(), false);
+        auto mark = [&](mlir::Block *block, bool value) {
+          if (std::optional<unsigned> at = analysis.indexOf(block))
+            dead[*at] = value;
+        };
+        auto absorb = [&](const UnwindCleanupAnalysis::ReachSet &set) {
+          llvm::BitVector members = set.members;
+          members.resize(analysis.blocks.size());
+          dead |= members;
+        };
+        bool exact = true;
+        for (mlir::Operation *consume : heldGroup.consumeSites) {
+          if (consume->hasTrait<mlir::OpTrait::IsTerminator>() &&
+              consume->getNumSuccessors() != 0) {
+            if (!mlir::isa<mlir::BranchOpInterface>(consume)) {
+              exact = false; // the exact test answers Unknown for every point
+              break;
+            }
+            for (unsigned edge = 0, end = consume->getNumSuccessors();
+                 edge < end && exact; ++edge) {
+              if (!terminatorForwardsGroupToSuccessor(consume, edge,
+                                                      heldGroup.values, aliases))
+                continue;
+              mlir::Block *successor = consume->getSuccessor(edge);
+              if (successor == defBlock)
+                continue; // the entry re-arms the token
+              mark(successor, true); // the point's own block: Unknown, not Held
+              const auto &beyond = analysis.reachSetAvoiding(
+                  successor, defBlock, /*fromAfter=*/nullptr);
+              if (!beyond.exact) {
+                exact = false;
+                break;
+              }
+              absorb(beyond);
+            }
+            continue;
+          }
+          const auto &beyond =
+              analysis.reachSetAvoiding(consume->getBlock(), defBlock, consume);
+          if (!beyond.exact) {
+            exact = false;
+            break;
+          }
+          absorb(beyond);
+        }
+        if (!exact)
+          continue;
+        // Alive regardless: a marker in the defining block, or one BEFORE a
+        // consume in the consume's own block, holds the token even when a loop
+        // puts that block in the dead set.
+        mark(defBlock, false);
+        for (mlir::Operation *consume : heldGroup.consumeSites)
+          mark(consume->getBlock(), false);
+        std::optional<std::pair<unsigned, unsigned>> interval =
+            dfsIntervalOf(defBlock);
+        if (!interval)
+          continue; // unreachable definition: leave the group unpruned
+        heldBlocks[heldIndex].dead = std::move(dead);
+        heldBlocks[heldIndex].defIn = interval->first;
+        heldBlocks[heldIndex].defOut = interval->second;
+        heldBlocks[heldIndex].usable = true;
+      }
+
+      // INVERTED, so a marker touches only its own candidates. Testing the two
+      // facts per cell still walks #markers x #groups of them, and at that size
+      // the walk itself is the cost -- streaming the group vector and a bitset
+      // per group is gigabytes of traffic for an answer that is No 99.9% of the
+      // time. Inverting costs one pass over blocks x groups of integer
+      // comparisons and leaves ~8 candidate blocks per group.
+      //
+      // Group order within a marker is preserved: the lists are filled in
+      // increasing group index, and the unprunable groups (which must be
+      // visited at every marker) are merged back in by index below.
+      llvm::SmallVector<llvm::SmallVector<unsigned, 4>, 8> candidatesByBlock(
+          analysis.blocks.size());
+      llvm::SmallVector<unsigned, 8> alwaysGroups;
+      {
+        llvm::SmallVector<unsigned, 32> dfsIn(analysis.blocks.size(), 0);
+        llvm::BitVector numbered(analysis.blocks.size(), false);
+        for (auto [at, block] : llvm::enumerate(analysis.blocks))
+          if (std::optional<std::pair<unsigned, unsigned>> interval =
+                  dfsIntervalOf(block)) {
+            dfsIn[at] = interval->first;
+            numbered.set(at);
+          }
+        for (unsigned index = 0, end = groups.size(); index < end; ++index) {
+          const UnwindTrackedGroup &group = groups[index];
+          if (group.skip || !group.deallocator)
+            continue;
+          const HeldBlocks &held = heldBlocks[index];
+          if (!held.usable) {
+            alwaysGroups.push_back(index);
+            continue;
+          }
+          for (unsigned at = 0, blockEnd = analysis.blocks.size();
+               at < blockEnd; ++at) {
+            if (held.dead.test(at) || !numbered.test(at))
+              continue;
+            if (dfsIn[at] < held.defIn || dfsIn[at] > held.defOut)
+              continue;
+            candidatesByBlock[at].push_back(index);
+          }
+        }
+      }
+
       for (auto &[marker, handler] : markers) {
         mlir::func::CallOp guarded =
             own::guardedCallAfterMarker(marker.getOperation());
         UnwindCleanup cleanup{marker, handler, marker.getOperation(), {}};
-        for (const UnwindTrackedGroup &group : groups) {
+        std::optional<unsigned> markerBlock =
+            analysis.indexOf(marker->getBlock());
+        llvm::ArrayRef<unsigned> blockGroups =
+            markerBlock ? llvm::ArrayRef<unsigned>(candidatesByBlock[*markerBlock])
+                        : llvm::ArrayRef<unsigned>();
+        std::size_t alwaysAt = 0, blockAt = 0;
+        while (alwaysAt < alwaysGroups.size() || blockAt < blockGroups.size()) {
+          unsigned groupIndex;
+          if (blockAt == blockGroups.size() ||
+              (alwaysAt < alwaysGroups.size() &&
+               alwaysGroups[alwaysAt] < blockGroups[blockAt]))
+            groupIndex = alwaysGroups[alwaysAt++];
+          else
+            groupIndex = blockGroups[blockAt++];
+          const UnwindTrackedGroup &group = groups[groupIndex];
           if (group.skip || !group.deallocator)
             continue;
           if (guarded &&
