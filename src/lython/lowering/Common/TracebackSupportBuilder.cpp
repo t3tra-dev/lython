@@ -496,24 +496,14 @@ void buildTracebackClear(SupportBuilder &b) {
 // its own chain) into a heap node referenced by the new exception's
 // __context__ slot; `raise ... from` records a __cause__ node the same way.
 //
-// Node layout (21 i64 words, 168 bytes):
-//   0      refcount (a node may be shared as both __context__ and __cause__)
-//   1..15  ExceptionParts payload (3 sections x alloc/aligned/offset/size/
-//          stride; owning reference to the exception object + message)
-//   16     TracebackFrame array (malloc'd snapshot; owns the name strings)
-//   17     frame count
-//   18     __cause__ node (0 = none)
-//   19     __context__ node (0 = none)
-//   20     __suppress_context__ flag
+// The layout is `exceptionChainNodeType` (SupportBuilder.h). It used to be 21
+// untyped i64 words, which meant the payload's three aligned pointers were
+// STORED AS INTEGERS and every reader turned them back into pointers to use
+// them -- the direction the memory model refuses.
 // ---------------------------------------------------------------------------
 
 constexpr std::int64_t kChainNodeBytes = 168;
 constexpr std::int64_t kFrameBytes = 40;
-
-mlir::Value nodeSlot(SupportBuilder &b, mlir::Value nodePtr,
-                     std::int64_t slot) {
-  return b.gepI64(nodePtr, b.iconst(slot));
-}
 
 // void release_chain_node(i64 node): drop one reference; at zero, release the
 // chained nodes, the traceback snapshot, and the exception payload.
@@ -544,7 +534,7 @@ void buildReleaseChainNode(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(alive);
   mlir::Value node = b.intToPtr(node64);
-  mlir::Value refcount = b.loadI64(nodeSlot(b, node, 0));
+  mlir::Value refcount = b.loadI64(nodeMember(b, node, kNodeRefcount));
   mlir::Value decremented =
       mlir::arith::SubIOp::create(b.builder, b.loc, refcount, b.iconst(1));
   mlir::Value stillShared =
@@ -555,20 +545,21 @@ void buildReleaseChainNode(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(decOnly);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, decremented,
-                              nodeSlot(b, node, 0), /*alignment=*/8);
+                              nodeMember(b, node, kNodeRefcount),
+                              /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(destroy);
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 18))});
+         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeCause))});
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 19))});
+         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeContext))});
   mlir::cf::BranchOp::create(b.builder, b.loc, freeHead,
                              mlir::ValueRange{b.iconst(0)});
 
   b.builder.setInsertionPointToEnd(freeHead);
   mlir::Value index = freeHead->getArgument(0);
-  mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
   mlir::Value framesDone =
       b.cmpi(mlir::arith::CmpIPredicate::sge, index, count);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, framesDone, freeDone,
@@ -576,7 +567,7 @@ void buildReleaseChainNode(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(freeOne);
-  mlir::Value framesPtr = b.intToPtr(b.loadI64(nodeSlot(b, node, 16)));
+  mlir::Value framesPtr = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
   mlir::Value frame = mlir::LLVM::GEPOp::create(
       b.builder, b.loc, b.ptr(), tracebackFrameType(b), framesPtr,
       mlir::ValueRange{index});
@@ -587,9 +578,14 @@ void buildReleaseChainNode(SupportBuilder &b) {
                              mlir::ValueRange{next});
 
   b.builder.setInsertionPointToEnd(freeDone);
-  b.call("free_raw_i64_ptr", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 16))});
-  mlir::Value headerWord = b.loadI64(nodeSlot(b, node, 2));
+  b.call("free", mlir::TypeRange{},
+         mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeFrames))});
+  mlir::Value header = b.loadPtrVal(nodePartsField(b, node, 0, 1));
+  // ⛔ The refcount helpers take a word because the reference they are handed
+  // may be TAGGED (an immediate), and a tagged reference is not a pointer at
+  // all. That narrowing is the honest direction; what must not happen is the
+  // other one, an integer widened back into a descriptor.
+  mlir::Value headerWord = b.ptrToInt(header);
   mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
                                   mlir::ValueRange{headerWord})
                                .front();
@@ -601,13 +597,13 @@ void buildReleaseChainNode(SupportBuilder &b) {
   b.call("release_exception_extras", mlir::TypeRange{},
          mlir::ValueRange{headerWord});
   b.call("release_unicode_raw", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 7)),
-                          b.loadI64(nodeSlot(b, node, 12))});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{headerWord});
+         mlir::ValueRange{b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 1, 1))),
+                          b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 2, 1)))});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{header});
   mlir::cf::BranchOp::create(b.builder, b.loc, freeNode, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(freeNode);
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{node64});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
@@ -726,10 +722,10 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(snap);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(1),
-                              nodeSlot(b, node, 0), /*alignment=*/8);
-  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, nodeSlot(b, node, 1),
-                               b.addrOf("g_current_parts"), b.iconst(120),
-                               /*isVolatile=*/false);
+                              nodeMember(b, node, kNodeRefcount),
+                              /*alignment=*/8);
+  storeExceptionParts(b, nodeMember(b, node, kNodePayload),
+                      loadExceptionParts(b, b.addrOf("g_current_parts")));
   mlir::Value size = loadTracebackSize(b);
   mlir::Value haveFrames =
       b.cmpi(mlir::arith::CmpIPredicate::sgt, size, b.iconst(0));
@@ -755,20 +751,22 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc, buffer,
                                  b.addrOf("g_traceback_stack"), bytes,
                                  /*isVolatile=*/false);
-    mlir::Value bufferWord =
-        mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), buffer);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, bufferWord,
-                                nodeSlot(b, node, 16), /*alignment=*/8);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, size, nodeSlot(b, node, 17),
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, buffer,
+                                nodeMember(b, node, kNodeFrames),
+                                /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, size,
+                                nodeMember(b, node, kNodeFrameCount),
                                 /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                                 b.addrOf("g_traceback_size"), /*alignment=*/8);
     // Both regions keep the builder-synthesized scf.yield terminators.
     b.builder.setInsertionPointToStart(&framesIf.getElseRegion().front());
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(),
+                                nodeMember(b, node, kNodeFrames),
+                                /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
-                                nodeSlot(b, node, 16), /*alignment=*/8);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
-                                nodeSlot(b, node, 17), /*alignment=*/8);
+                                nodeMember(b, node, kNodeFrameCount),
+                                /*alignment=*/8);
   }
   mlir::cf::BranchOp::create(b.builder, b.loc, chain, mlir::ValueRange{node});
 
@@ -777,13 +775,14 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
   mlir::Value zero = b.iconst(0);
   struct Slot {
     llvm::StringRef global;
-    std::int64_t slot;
+    std::int32_t member;
   };
-  for (Slot s : {Slot{"g_exc_cause_node", 18}, Slot{"g_exc_context_node", 19},
-                 Slot{"g_exc_suppress_context", 20}}) {
+  for (Slot s : {Slot{"g_exc_cause_node", kNodeCause},
+                 Slot{"g_exc_context_node", kNodeContext},
+                 Slot{"g_exc_suppress_context", kNodeSuppress}}) {
     mlir::Value global = b.addrOf(s.global);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(global),
-                                nodeSlot(b, chainNode, s.slot),
+                                nodeMember(b, chainNode, s.member),
                                 /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, zero, global,
                                 /*alignment=*/8);
@@ -796,9 +795,7 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 0, 1).getResult(),
       b.addrOf("g_current_exception"), /*alignment=*/4);
-  mlir::LLVM::MemsetOp::create(b.builder, b.loc, b.addrOf("g_current_parts"),
-                               b.iconst8(0), b.iconst(120),
-                               /*isVolatile=*/false);
+  clearExceptionParts(b, b.addrOf("g_current_parts"));
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
@@ -859,22 +856,21 @@ void buildSetCurrentCause(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(compare);
   mlir::Value contextNode = b.intToPtr(context64);
-  mlir::Value contextHeader = b.loadI64(nodeSlot(b, contextNode, 2));
-  mlir::Value causeHeader = mlir::LLVM::PtrToIntOp::create(
-      b.builder, b.loc, b.i64(), entry->getArgument(1));
+  mlir::Value contextHeader =
+      b.loadPtrVal(nodePartsField(b, contextNode, 0, 1));
   mlir::Value sameObject =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, contextHeader, causeHeader);
+      b.ptrEq(contextHeader, entry->getArgument(1));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, sameObject, share,
                                  mlir::ValueRange{}, fresh,
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(share);
-  mlir::Value refcount = b.loadI64(nodeSlot(b, contextNode, 0));
+  mlir::Value refcount = b.loadI64(nodeMember(b, contextNode, kNodeRefcount));
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::AddIOp::create(b.builder, b.loc, refcount, b.iconst(1))
           .getResult(),
-      nodeSlot(b, contextNode, 0), /*alignment=*/8);
+      nodeMember(b, contextNode, kNodeRefcount), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, context64, causeSlot,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
@@ -893,26 +889,24 @@ void buildSetCurrentCause(SupportBuilder &b) {
                                mlir::ValueRange{});
   }
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(1),
-                              nodeSlot(b, node, 0), /*alignment=*/8);
-  for (int argIndex = 0; argIndex < 15; ++argIndex) {
-    mlir::Value value = entry->getArgument(argIndex);
-    if (mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType()))
-      value =
-          mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), value);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, value,
-                                nodeSlot(b, node, 1 + argIndex),
-                                /*alignment=*/8);
-  }
-  for (std::int64_t slot : {16, 17, 18, 19, 20})
+                              nodeMember(b, node, kNodeRefcount),
+                              /*alignment=*/8);
+  for (std::int32_t section = 0; section < 3; ++section)
+    for (std::int32_t field = 0; field < 5; ++field)
+      mlir::LLVM::StoreOp::create(
+          b.builder, b.loc, entry->getArgument(section * 5 + field),
+          nodePartsField(b, node, section, field), /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(),
+                              nodeMember(b, node, kNodeFrames),
+                              /*alignment=*/8);
+  for (std::int32_t member :
+       {kNodeFrameCount, kNodeCause, kNodeContext, kNodeSuppress})
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
-                                nodeSlot(b, node, slot), /*alignment=*/8);
-  mlir::Value headerWord = mlir::LLVM::PtrToIntOp::create(
-      b.builder, b.loc, b.i64(), entry->getArgument(1));
-  mlir::Value messageWord = mlir::LLVM::PtrToIntOp::create(
-      b.builder, b.loc, b.i64(), entry->getArgument(6));
-  b.call("retain_storage_raw", mlir::TypeRange{}, mlir::ValueRange{headerWord});
+                                nodeMember(b, node, member), /*alignment=*/8);
   b.call("retain_storage_raw", mlir::TypeRange{},
-         mlir::ValueRange{messageWord});
+         mlir::ValueRange{b.ptrToInt(entry->getArgument(1))});
+  b.call("retain_storage_raw", mlir::TypeRange{},
+         mlir::ValueRange{b.ptrToInt(entry->getArgument(6))});
   mlir::Value nodeWord =
       mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), node);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, nodeWord, causeSlot,
@@ -2208,7 +2202,7 @@ void buildPrintChainNode(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(present);
   mlir::Value node = b.intToPtr(node64);
-  mlir::Value cause = b.loadI64(nodeSlot(b, node, 18));
+  mlir::Value cause = b.loadI64(nodeMember(b, node, kNodeCause));
   mlir::Value haveCause =
       b.cmpi(mlir::arith::CmpIPredicate::ne, cause, b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, haveCause, causeBlock,
@@ -2223,8 +2217,8 @@ void buildPrintChainNode(SupportBuilder &b) {
                              mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(contextCheck);
-  mlir::Value context = b.loadI64(nodeSlot(b, node, 19));
-  mlir::Value suppress = b.loadI64(nodeSlot(b, node, 20));
+  mlir::Value context = b.loadI64(nodeMember(b, node, kNodeContext));
+  mlir::Value suppress = b.loadI64(nodeMember(b, node, kNodeSuppress));
   mlir::Value haveContext =
       b.cmpi(mlir::arith::CmpIPredicate::ne, context, b.iconst(0));
   mlir::Value showContext = mlir::arith::AndIOp::create(
@@ -2242,17 +2236,16 @@ void buildPrintChainNode(SupportBuilder &b) {
                              mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(ownSection);
-  mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
-  mlir::Value aligned = b.intToPtr(b.loadI64(nodeSlot(b, node, 2)));
-  mlir::Value offset0 = b.loadI64(nodeSlot(b, node, 3));
-  mlir::Value stride0 = b.loadI64(nodeSlot(b, node, 5));
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
+  mlir::Value aligned = b.loadPtrVal(nodePartsField(b, node, 0, 1));
+  mlir::Value offset0 = b.loadI64(nodePartsField(b, node, 0, 2));
+  mlir::Value stride0 = b.loadI64(nodePartsField(b, node, 0, 4));
   mlir::Value classIndex = mlir::arith::AddIOp::create(
       b.builder, b.loc, offset0,
       mlir::arith::MulIOp::create(b.builder, b.loc, stride0, b.iconst(2))
           .getResult());
   mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
-  mlir::Value excWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
+  mlir::Value excWord = b.ptrToInt(aligned);
   // Chained exception groups keep CPython's group rendering: the group
   // header (when a traceback exists), the "| " gutter, and the member tree.
   mlir::Value chainMembers = b.call("exception_group_member_count", b.i64(),
@@ -2308,7 +2301,7 @@ void buildPrintChainNode(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(frameOne);
   mlir::Value top =
       mlir::arith::SubIOp::create(b.builder, b.loc, remaining, b.iconst(1));
-  mlir::Value frames = b.intToPtr(b.loadI64(nodeSlot(b, node, 16)));
+  mlir::Value frames = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
   mlir::Value frame = mlir::LLVM::GEPOp::create(
       b.builder, b.loc, b.ptr(), tracebackFrameType(b), frames,
       mlir::ValueRange{top});
@@ -2317,11 +2310,11 @@ void buildPrintChainNode(SupportBuilder &b) {
                              mlir::ValueRange{top});
 
   b.builder.setInsertionPointToEnd(summary);
-  mlir::Value msgHeader = b.intToPtr(b.loadI64(nodeSlot(b, node, 7)));
-  mlir::Value msgData = b.intToPtr(b.loadI64(nodeSlot(b, node, 12)));
-  mlir::Value msgOffset = b.loadI64(nodeSlot(b, node, 13));
-  mlir::Value msgLen = b.loadI64(nodeSlot(b, node, 14));
-  mlir::Value msgStride = b.loadI64(nodeSlot(b, node, 15));
+  mlir::Value msgHeader = b.loadPtrVal(nodePartsField(b, node, 1, 1));
+  mlir::Value msgData = b.loadPtrVal(nodePartsField(b, node, 2, 1));
+  mlir::Value msgOffset = b.loadI64(nodePartsField(b, node, 2, 2));
+  mlir::Value msgLen = b.loadI64(nodePartsField(b, node, 2, 3));
+  mlir::Value msgStride = b.loadI64(nodePartsField(b, node, 2, 4));
   b.call("print_exception_summary", mlir::TypeRange{},
          mlir::ValueRange{classId, excWord, msgHeader, msgData, msgOffset,
                           msgLen, msgStride});
@@ -2362,20 +2355,6 @@ constexpr std::int64_t kStarFrameBytes = 288;
 constexpr std::int64_t kStarCollectedBase = 4;
 constexpr std::int64_t kStarCollectedLimit = 32;
 
-// Local copies of RuntimeSupportBuilder's TU-private LLVM-level helpers (the
-// star functions live here for the chain-node/frame helpers instead).
-mlir::Type starMemRef1DType(SupportBuilder &b) {
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
-  return mlir::LLVM::LLVMStructType::getLiteral(
-      b.builder.getContext(), {b.ptr(), b.ptr(), b.i64(), arrayOne, arrayOne});
-}
-
-mlir::Type starBorrowPartsType(SupportBuilder &b) {
-  mlir::Type part = starMemRef1DType(b);
-  return mlir::LLVM::LLVMStructType::getLiteral(b.builder.getContext(),
-                                                {part, part, part});
-}
-
 mlir::LLVM::LLVMFuncOp starBeginLLVMFunction(SupportBuilder &b,
                                              llvm::StringRef name,
                                              mlir::Type result,
@@ -2406,13 +2385,6 @@ mlir::Value starFrameArg(mlir::LLVM::LLVMFuncOp fn) {
 mlir::Value starFrameSlot(SupportBuilder &b, mlir::Value frame,
                           std::int64_t slot) {
   return b.gepI64(b.intToPtr(frame), b.iconst(slot));
-}
-
-// Raw word address of g_current_parts[section][field] (five 8-byte fields
-// per section; struct layout is contiguous words).
-mlir::Value currentPartsWord(SupportBuilder &b, std::int64_t section,
-                             std::int64_t field) {
-  return b.gepI64(b.addrOf("g_current_parts"), b.iconst(section * 5 + field));
 }
 
 // void release_exception_storage_raw(i64 eh, i64 mh, i64 mb): one owned
@@ -2484,15 +2456,15 @@ void buildReleaseStarNode(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(shell);
   mlir::Value node = b.intToPtr(node64);
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 18))});
+         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeCause))});
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 19))});
+         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeContext))});
   mlir::cf::BranchOp::create(b.builder, b.loc, freeHead,
                              mlir::ValueRange{b.iconst(0)});
 
   b.builder.setInsertionPointToEnd(freeHead);
   mlir::Value index = freeHead->getArgument(0);
-  mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
   mlir::Value framesDone =
       b.cmpi(mlir::arith::CmpIPredicate::sge, index, count);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, framesDone, freeDone,
@@ -2500,7 +2472,7 @@ void buildReleaseStarNode(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(freeOne);
-  mlir::Value framesPtr = b.intToPtr(b.loadI64(nodeSlot(b, node, 16)));
+  mlir::Value framesPtr = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
   mlir::Value frame = mlir::LLVM::GEPOp::create(
       b.builder, b.loc, b.ptr(), tracebackFrameType(b), framesPtr,
       mlir::ValueRange{index});
@@ -2511,9 +2483,9 @@ void buildReleaseStarNode(SupportBuilder &b) {
                              mlir::ValueRange{next});
 
   b.builder.setInsertionPointToEnd(freeDone);
-  b.call("free_raw_i64_ptr", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 16))});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{node64});
+  b.call("free", mlir::TypeRange{},
+         mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeFrames))});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
@@ -2573,27 +2545,22 @@ void buildStarHasResidual(SupportBuilder &b) {
 // residual exception (requires one).
 void buildStarResidualParts(SupportBuilder &b) {
   auto fn = starBeginLLVMFunction(b, "LyEH_StarResidualParts",
-                                  starBorrowPartsType(b), {b.i64()});
+                                  exceptionBorrowPartsType(b), {b.i64()});
   mlir::Block *entry = fn.addEntryBlock(b.builder);
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
   auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
   mlir::Value result = mlir::LLVM::UndefOp::create(
-      b.builder, b.loc, starBorrowPartsType(b));
-  struct Section {
-    std::int64_t pointerSlot;
-    std::int64_t staticSize;
-    std::int64_t sizeSlot; // -1 = use staticSize
-  };
-  Section sections[3] = {{2, 3, -1}, {7, 2, -1}, {12, 0, 14}};
-  for (int section = 0; section < 3; ++section) {
-    mlir::Value pointer =
-        b.intToPtr(b.loadI64(nodeSlot(b, node, sections[section].pointerSlot)));
-    mlir::Value size =
-        sections[section].sizeSlot < 0
-            ? b.iconst(sections[section].staticSize)
-            : b.loadI64(nodeSlot(b, node, sections[section].sizeSlot));
+      b.builder, b.loc, exceptionBorrowPartsType(b));
+  // Sizes come from the contract, not the stored descriptor: the header
+  // sections are fixed-shape and the bytes section carries its length.
+  std::int64_t staticSizes[3] = {3, 2, -1};
+  for (std::int32_t section = 0; section < 3; ++section) {
+    mlir::Value pointer = b.loadPtrVal(nodePartsField(b, node, section, 1));
+    mlir::Value size = staticSizes[section] < 0
+                           ? b.loadI64(nodePartsField(b, node, section, 3))
+                           : b.iconst(staticSizes[section]);
     mlir::Value sizeArray = mlir::LLVM::InsertValueOp::create(
         b.builder, b.loc,
         mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
@@ -2603,7 +2570,7 @@ void buildStarResidualParts(SupportBuilder &b) {
         mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
         b.iconst(1), llvm::ArrayRef<std::int64_t>{0});
     mlir::Value descriptor =
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, starMemRef1DType(b));
+        mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
     descriptor = mlir::LLVM::InsertValueOp::create(
         b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{0});
     descriptor = mlir::LLVM::InsertValueOp::create(
@@ -2647,49 +2614,38 @@ void buildStarApplyMatch(SupportBuilder &b) {
 
   // Drop the frame's reference to the old residual payload.
   b.call("release_exception_storage_raw", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeSlot(b, node, 2)),
-                          b.loadI64(nodeSlot(b, node, 7)),
-                          b.loadI64(nodeSlot(b, node, 12))});
+         mlir::ValueRange{
+             b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 0, 1))),
+             b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 1, 1))),
+             b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 2, 1)))});
 
-  // Rest (descriptor words) into the node payload slots; absent rest zeroes
-  // them and clears the present flag.
+  // Rest into the node payload; absent rest zeroes it and clears the flag.
   mlir::Value hasRest = entry->getArgument(1);
   auto restIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
                                         hasRest, /*withElseRegion=*/true);
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&restIf.getThenRegion().front());
-    for (int section = 0; section < 3; ++section)
-      for (int field = 0; field < 5; ++field) {
-        mlir::Value word = entry->getArgument(17 + section * 5 + field);
-        if (field < 2)
-          word = mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(),
-                                                word);
+    for (std::int32_t section = 0; section < 3; ++section)
+      for (std::int32_t field = 0; field < 5; ++field)
         mlir::LLVM::StoreOp::create(
-            b.builder, b.loc, word,
-            nodeSlot(b, node, 1 + section * 5 + field), /*alignment=*/8);
-      }
+            b.builder, b.loc, entry->getArgument(17 + section * 5 + field),
+            nodePartsField(b, node, section, field), /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(1),
                                 starFrameSlot(b, frame, 1), /*alignment=*/8);
     b.builder.setInsertionPointToStart(&restIf.getElseRegion().front());
-    for (std::int64_t word = 1; word < 16; ++word)
-      mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
-                                  nodeSlot(b, node, word), /*alignment=*/8);
+    clearExceptionParts(b, nodeMember(b, node, kNodePayload));
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                                 starFrameSlot(b, frame, 1), /*alignment=*/8);
   }
 
   // Matched becomes the current exception.
-  for (int section = 0; section < 3; ++section)
-    for (int field = 0; field < 5; ++field) {
-      mlir::Value word = entry->getArgument(2 + section * 5 + field);
-      if (field < 2)
-        word =
-            mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), word);
-      mlir::LLVM::StoreOp::create(b.builder, b.loc, word,
-                                  currentPartsWord(b, section, field),
-                                  /*alignment=*/8);
-    }
+  mlir::Value parts = b.addrOf("g_current_parts");
+  for (std::int32_t section = 0; section < 3; ++section)
+    for (std::int32_t field = 0; field < 5; ++field)
+      mlir::LLVM::StoreOp::create(
+          b.builder, b.loc, entry->getArgument(2 + section * 5 + field),
+          partsField(b, parts, section, field), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
@@ -2697,8 +2653,8 @@ void buildStarApplyMatch(SupportBuilder &b) {
 
   // Fresh copy of the residual node's traceback (name strings duplicated:
   // the handler's discard consumes this copy, later slices reuse the node's).
-  mlir::Value count = b.loadI64(nodeSlot(b, node, 17));
-  mlir::Value framesPtr = b.intToPtr(b.loadI64(nodeSlot(b, node, 16)));
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
+  mlir::Value framesPtr = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
   mlir::Value countIndex = mlir::arith::IndexCastOp::create(
       b.builder, b.loc, b.builder.getIndexType(), count);
   mlir::Value zeroIndex =
@@ -2919,14 +2875,15 @@ void buildStarThrowCombined(SupportBuilder &b) {
       mlir::OpBuilder::InsertionGuard payloadGuard(b.builder);
       b.builder.setInsertionPointToStart(&payloadIf.getThenRegion().front());
       b.call("release_exception_storage_raw", mlir::TypeRange{},
-             mlir::ValueRange{b.loadI64(nodeSlot(b, node, 2)),
-                              b.loadI64(nodeSlot(b, node, 7)),
-                              b.loadI64(nodeSlot(b, node, 12))});
+             mlir::ValueRange{
+                 b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 0, 1))),
+                 b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 1, 1))),
+                 b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 2, 1)))});
     }
     // CPython gives the combined group no traceback of its own (its members
     // carry theirs); drop the residual node's snapshot instead of donating.
-    mlir::Value frames = b.loadI64(nodeSlot(b, node, 16));
-    mlir::Value frameCount = b.loadI64(nodeSlot(b, node, 17));
+    mlir::Value frames = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
+    mlir::Value frameCount = b.loadI64(nodeMember(b, node, kNodeFrameCount));
     mlir::Value frameCountIndex = mlir::arith::IndexCastOp::create(
         b.builder, b.loc, b.builder.getIndexType(), frameCount);
     mlir::Value zeroIdx =
@@ -2941,37 +2898,33 @@ void buildStarThrowCombined(SupportBuilder &b) {
       mlir::Value framePosition = mlir::arith::IndexCastOp::create(
           b.builder, b.loc, b.i64(), freeFramesLoop.getInductionVar());
       mlir::Value framePtr = mlir::LLVM::GEPOp::create(
-          b.builder, b.loc, b.ptr(), tracebackFrameType(b),
-          b.intToPtr(frames), mlir::ValueRange{framePosition});
+          b.builder, b.loc, b.ptr(), tracebackFrameType(b), frames,
+          mlir::ValueRange{framePosition});
       b.call("free_frame", mlir::TypeRange{}, mlir::ValueRange{framePtr});
     }
-    b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frames});
+    b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
     mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                                b.loadI64(nodeSlot(b, node, 18)),
+                                b.loadI64(nodeMember(b, node, kNodeCause)),
                                 b.addrOf("g_exc_cause_node"),
                                 /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                                b.loadI64(nodeSlot(b, node, 19)),
+                                b.loadI64(nodeMember(b, node, kNodeContext)),
                                 b.addrOf("g_exc_context_node"),
                                 /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                                b.loadI64(nodeSlot(b, node, 20)),
+                                b.loadI64(nodeMember(b, node, kNodeSuppress)),
                                 b.addrOf("g_exc_suppress_context"),
                                 /*alignment=*/8);
-    b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{node64});
+    b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
   }
 
   // Install the combined exception and throw.
-  for (int section = 0; section < 3; ++section)
-    for (int field = 0; field < 5; ++field) {
-      mlir::Value word = entry->getArgument(1 + section * 5 + field);
-      if (field < 2)
-        word =
-            mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), word);
-      mlir::LLVM::StoreOp::create(b.builder, b.loc, word,
-                                  currentPartsWord(b, section, field),
-                                  /*alignment=*/8);
-    }
+  mlir::Value parts = b.addrOf("g_current_parts");
+  for (std::int32_t section = 0; section < 3; ++section)
+    for (std::int32_t field = 0; field < 5; ++field)
+      mlir::LLVM::StoreOp::create(
+          b.builder, b.loc, entry->getArgument(1 + section * 5 + field),
+          partsField(b, parts, section, field), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),

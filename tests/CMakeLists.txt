@@ -186,6 +186,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
     "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
+    "DriverTest.ChainNodeReadersNeverRebuildAPointerFromWhatTheyRead"
     "DriverTest.RepeatedCompileIsStable"
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
 

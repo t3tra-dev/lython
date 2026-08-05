@@ -135,6 +135,12 @@ struct SupportBuilder {
   mlir::Value intToPtr(mlir::Value address) {
     return mlir::LLVM::IntToPtrOp::create(builder, loc, ptr(), address);
   }
+  // The narrowing direction: a reference handed to the refcount helpers, which
+  // accept a tagged immediate as readily as a pointer. Its inverse is not a
+  // pair with it -- see the note on `exceptionPartsType`.
+  mlir::Value ptrToInt(mlir::Value pointer) {
+    return mlir::LLVM::PtrToIntOp::create(builder, loc, i64(), pointer);
+  }
   // base[index] as an i64-element GEP (index in i64 units unless noted).
   mlir::Value gepI64(mlir::Value base, mlir::Value index) {
     return mlir::LLVM::GEPOp::create(builder, loc, ptr(), i64(), base,
@@ -263,6 +269,75 @@ struct SupportBuilder {
     mlir::func::ReturnOp::create(builder, loc, poison);
   }
 };
+
+// ---------------------------------------------------------------------------
+// The in-flight exception, and the node an interrupted one is parked in.
+//
+// An exception travels as THREE rank-1 memrefs -- the exception object's
+// header, its message's header, and the message's bytes. Two shapes of that
+// triple exist and the difference is only how a rank-1 shape is spelled:
+// `exceptionBorrowPartsType` is what a function returns (sizes and strides are
+// `[1 x i64]`, the descriptor layout MLIR's memref lowering produces), and
+// `exceptionPartsType` is what lives IN MEMORY (plain `i64`, since a stored
+// descriptor here is only ever rank 1).
+//
+// ⛔ Both spell the pointer members `!llvm.ptr`, and nothing may read them as
+// words. `extract_aligned_pointer_as_index` is where the memory model says
+// provenance is lost, and what comes back through an integer is outside the
+// model by its own statement -- so a descriptor reassembled from words is a
+// descriptor the model cannot talk about. Stored and loaded as a pointer it
+// stays the pointer the raise built, and the handler's view is the same
+// reference rather than a look-alike.
+//
+// Both files that build the EH runtime need these, so they live here instead
+// of being declared privately in each and drifting.
+// ---------------------------------------------------------------------------
+
+// {allocated, aligned, offset, size[1], stride[1]}.
+mlir::Type memRef1DType(SupportBuilder &b);
+mlir::Type exceptionBorrowPartsType(SupportBuilder &b);
+
+// {{allocated, aligned, offset, size, stride} x3}, 120 bytes.
+mlir::Type exceptionPartsType(SupportBuilder &b);
+
+// &parts[section][field], typed: fields 0 and 1 load as `!llvm.ptr`.
+mlir::Value partsField(SupportBuilder &b, mlir::Value parts,
+                       std::int32_t section, std::int32_t field);
+
+// The whole triple as one value, so a move is a load and a store rather than a
+// byte copy that erases which member was a pointer.
+mlir::Value loadExceptionParts(SupportBuilder &b, mlir::Value parts);
+void storeExceptionParts(SupportBuilder &b, mlir::Value parts,
+                         mlir::Value value);
+void clearExceptionParts(SupportBuilder &b, mlir::Value parts);
+
+// The heap node a raise moves an interrupted exception into (also the parking
+// spot for a suspended generator's token). Members, in order:
+//
+//   0 refcount    -- a node may be both __cause__ and __context__
+//   1 payload     -- ExceptionParts; an owning reference to object + message
+//   2 frames      -- TracebackFrame*, a malloc'd snapshot owning its names
+//   3 frameCount
+//   4 cause       -- node address, 0 = none
+//   5 context     -- node address, 0 = none
+//   6 suppress    -- __suppress_context__
+//
+// 8 + 120 + 8 + 8 + 8 + 8 + 8 = 168 bytes, which is what the malloc asks for.
+enum ChainNodeMember : std::int32_t {
+  kNodeRefcount = 0,
+  kNodePayload = 1,
+  kNodeFrames = 2,
+  kNodeFrameCount = 3,
+  kNodeCause = 4,
+  kNodeContext = 5,
+  kNodeSuppress = 6,
+};
+
+mlir::Type exceptionChainNodeType(SupportBuilder &b);
+mlir::Value nodeMember(SupportBuilder &b, mlir::Value node,
+                       std::int32_t member);
+mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
+                           std::int32_t section, std::int32_t field);
 
 // Emits the host-boundary cluster (raw write / exit status / argv / FILE*
 // and buffer wrappers, plus the OS/time cluster); implemented in

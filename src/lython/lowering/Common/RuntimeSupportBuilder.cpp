@@ -1199,49 +1199,6 @@ void buildReleaseBoxedPayloadArraySlotRaw(SupportBuilder &b) {
 }
 
 
-mlir::Type memRefPartsStruct(SupportBuilder &b, llvm::StringRef name) {
-  auto type = mlir::LLVM::LLVMStructType::getIdentified(
-      b.builder.getContext(), name);
-  if (type.getBody().empty())
-    (void)type.setBody({b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
-                       /*isPacked=*/false);
-  return type;
-}
-
-mlir::Type exceptionPartsType(SupportBuilder &b) {
-  auto type = mlir::LLVM::LLVMStructType::getIdentified(
-      b.builder.getContext(), "ExceptionParts");
-  if (type.getBody().empty())
-    (void)type.setBody({memRefPartsStruct(b, "I64MemRef"),
-                        memRefPartsStruct(b, "I64MemRef"),
-                        memRefPartsStruct(b, "I8MemRef")},
-                       /*isPacked=*/false);
-  return type;
-}
-
-mlir::Type memRef1DType(SupportBuilder &b) {
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
-  return mlir::LLVM::LLVMStructType::getLiteral(
-      b.builder.getContext(), {b.ptr(), b.ptr(), b.i64(), arrayOne, arrayOne});
-}
-
-mlir::Type exceptionBorrowPartsType(SupportBuilder &b) {
-  mlir::Type part = memRef1DType(b);
-  return mlir::LLVM::LLVMStructType::getLiteral(b.builder.getContext(),
-                                                {part, part, part});
-}
-
-// parts[0, section, field]
-mlir::Value partsField(SupportBuilder &b, mlir::Value parts,
-                       std::int32_t section, std::int32_t field) {
-  return mlir::LLVM::GEPOp::create(
-      b.builder, b.loc, b.ptr(), exceptionPartsType(b), parts,
-      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
-                                         mlir::LLVM::GEPArg(section),
-                                         mlir::LLVM::GEPArg(field)},
-      mlir::LLVM::GEPNoWrapFlags::inbounds);
-}
-
 void declareLLVMExternal(SupportBuilder &b, llvm::StringRef name,
                          mlir::Type result, llvm::ArrayRef<mlir::Type> inputs,
                          bool isVarArg = false) {
@@ -1276,31 +1233,15 @@ void declareEHSupport(SupportBuilder &b) {
   };
   boolGlobal("g_current_exception");
   boolGlobal("g_native_catch_active");
-  // ⛔ THE ROOT OF THE EH RUNTIME'S DISTANCE FROM `proof/`, recorded here
-  // because everything above it inherits the shape and the rewrite has to
-  // start here rather than at the top.
+  // The in-flight exception. `ExceptionParts` -- so the three descriptors are
+  // stored as descriptors and their pointer members round-trip as pointers.
   //
-  // `g_current_parts` holds the in-flight exception as THREE MEMREF
-  // DESCRIPTORS FLATTENED INTO WORDS -- 120 bytes, 15 words, five per
-  // descriptor. Every consumer therefore rebuilds a descriptor from words
-  // (`InsertValueOp`, eight sites in TracebackSupportBuilder alone), which is
-  // the direction the memory model refuses: `extract_aligned_pointer_as_index`
-  // is documented there as where provenance is lost, and turning the integer
-  // back into a pointer is outside the model by its own statement.
-  //
-  // What that costs, measured while trying to fix the layers above it:
-  //
-  //   * the except* frame cannot become a `memref` box, because
-  //     `LyEH_StarResidualParts` has to ASSEMBLE descriptors out of the node's
-  //     words and only an LLVM-level function can do that;
-  //   * so the three LLVM-level star functions cannot move to func level;
-  //   * so the frame's slots cannot become fields, though the model now has
-  //     `getField`/`setField` for exactly that.
-  //
-  // The order is the reverse of the one it looks like from the top: the chain
-  // node and this slot have to hold descriptors before anything built on them
-  // can. Making the frame a value (which it now is) was independent of this and
-  // is done; making it a BOX is not.
+  // ⛔ Do not reach into this global by word offset. It is 120 contiguous bytes
+  // and an `i64` view of it type-checks, which is how the star and chain-node
+  // paths used to read it; every such read has to turn the aligned pointer back
+  // into a pointer to be useful, and that is the direction the memory model
+  // refuses (`extract_aligned_pointer_as_index` is documented there as where
+  // provenance is lost). `partsField` gives the same slot with its real type.
   {
     auto parts = mlir::LLVM::GlobalOp::create(
         b.builder, b.loc, exceptionPartsType(b), /*isConstant=*/false,
@@ -1740,8 +1681,7 @@ void buildDiscardCurrentException(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 0, 1).getResult(),
       flagSlot, /*alignment=*/4);
-  mlir::LLVM::MemsetOp::create(b.builder, b.loc, parts, b.iconst8(0),
-                               b.iconst(120), /*isVolatile=*/false);
+  clearExceptionParts(b, parts);
   b.call("LyTraceback_Clear", mlir::TypeRange{}, {});
   mlir::Value contextSlot = b.addrOf("g_exc_context_node");
   mlir::Value context64 = b.loadI64(contextSlot);
@@ -1756,24 +1696,24 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   // members move back into the globals and only the shell is freed.
   b.builder.setInsertionPointToEnd(restore);
   mlir::Value node = b.intToPtr(context64);
-  auto nodeSlotAt = [&](std::int64_t slot) {
-    return b.gepI64(node, b.iconst(slot));
-  };
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(18)),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(nodeMember(b, node, kNodeCause)),
                               causeSlot, /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(19)),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(nodeMember(b, node, kNodeContext)),
                               contextSlot, /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(20)),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(nodeMember(b, node, kNodeSuppress)),
                               b.addrOf("g_exc_suppress_context"),
                               /*alignment=*/8);
-  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, parts, nodeSlotAt(1),
-                               b.iconst(120), /*isVolatile=*/false);
+  storeExceptionParts(b, parts,
+                      loadExceptionParts(b, nodeMember(b, node, kNodePayload)));
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       flagSlot, /*alignment=*/4);
-  mlir::Value frames64 = b.loadI64(nodeSlotAt(16));
-  mlir::Value count = b.loadI64(nodeSlotAt(17));
+  mlir::Value frames = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
   mlir::Value haveFrames =
       b.cmpi(mlir::arith::CmpIPredicate::sgt, count, b.iconst(0));
   auto framesIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
@@ -1784,14 +1724,16 @@ void buildDiscardCurrentException(SupportBuilder &b) {
     mlir::Value bytes =
         mlir::arith::MulIOp::create(b.builder, b.loc, count, b.iconst(40));
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc,
-                                 b.addrOf("g_traceback_stack"),
-                                 b.intToPtr(frames64), bytes,
+                                 b.addrOf("g_traceback_stack"), frames, bytes,
                                  /*isVolatile=*/false);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, count,
                                 b.addrOf("g_traceback_size"), /*alignment=*/8);
   }
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frames64});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{context64});
+  // free(), not free_raw_i64_ptr(): the null guard that wrapper exists for is
+  // free()'s own contract, and going through it would mean handing the node a
+  // word back.
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(finish);
@@ -1850,10 +1792,8 @@ void buildTakeCurrentDescriptor(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(take);
   b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
   mlir::Value parts = b.addrOf("g_current_parts");
-  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, entry->getArgument(0), parts,
-                               b.iconst(120), /*isVolatile=*/false);
-  mlir::LLVM::MemsetOp::create(b.builder, b.loc, parts, b.iconst8(0),
-                               b.iconst(120), /*isVolatile=*/false);
+  storeExceptionParts(b, entry->getArgument(0), loadExceptionParts(b, parts));
+  clearExceptionParts(b, parts);
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 0, 1).getResult(),
@@ -1958,26 +1898,25 @@ void buildUnstashException(SupportBuilder &b) {
                                  mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(restore);
   mlir::Value node = b.intToPtr(node64);
-  auto nodeSlotAt = [&](std::int64_t slot) {
-    return b.gepI64(node, b.iconst(slot));
-  };
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(18)),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(nodeMember(b, node, kNodeCause)),
                               b.addrOf("g_exc_cause_node"), /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(19)),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(nodeMember(b, node, kNodeContext)),
                               b.addrOf("g_exc_context_node"),
                               /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(nodeSlotAt(20)),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.loadI64(nodeMember(b, node, kNodeSuppress)),
                               b.addrOf("g_exc_suppress_context"),
                               /*alignment=*/8);
-  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, b.addrOf("g_current_parts"),
-                               nodeSlotAt(1), b.iconst(120),
-                               /*isVolatile=*/false);
+  storeExceptionParts(b, b.addrOf("g_current_parts"),
+                      loadExceptionParts(b, nodeMember(b, node, kNodePayload)));
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       b.addrOf("g_current_exception"), /*alignment=*/4);
-  mlir::Value frames64 = b.loadI64(nodeSlotAt(16));
-  mlir::Value count = b.loadI64(nodeSlotAt(17));
+  mlir::Value frames = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
+  mlir::Value count = b.loadI64(nodeMember(b, node, kNodeFrameCount));
   mlir::Value haveFrames =
       b.cmpi(mlir::arith::CmpIPredicate::sgt, count, b.iconst(0));
   auto framesIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
@@ -1988,14 +1927,13 @@ void buildUnstashException(SupportBuilder &b) {
     mlir::Value bytes =
         mlir::arith::MulIOp::create(b.builder, b.loc, count, b.iconst(40));
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc,
-                                 b.addrOf("g_traceback_stack"),
-                                 b.intToPtr(frames64), bytes,
+                                 b.addrOf("g_traceback_stack"), frames, bytes,
                                  /*isVolatile=*/false);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, count,
                                 b.addrOf("g_traceback_size"), /*alignment=*/8);
   }
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frames64});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{node64});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
@@ -2056,8 +1994,8 @@ void buildAdoptStashedAsContext(SupportBuilder &b) {
                                  mlir::ValueRange{current}, attach,
                                  mlir::ValueRange{slotPtr});
   b.builder.setInsertionPointToEnd(step);
-  mlir::Value nextSlot = b.gepI64(b.intToPtr(step->getArgument(0)),
-                                  b.iconst(19));
+  mlir::Value nextSlot =
+      nodeMember(b, b.intToPtr(step->getArgument(0)), kNodeContext);
   mlir::cf::BranchOp::create(b.builder, b.loc, walk,
                              mlir::ValueRange{nextSlot});
   b.builder.setInsertionPointToEnd(attach);
@@ -2327,6 +2265,102 @@ void buildRunPythonMain(SupportBuilder &b) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// The exception payload and the chain node (declared in SupportBuilder.h).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+mlir::Type memRefPartsStruct(SupportBuilder &b, llvm::StringRef name) {
+  auto type =
+      mlir::LLVM::LLVMStructType::getIdentified(b.builder.getContext(), name);
+  if (type.getBody().empty())
+    (void)type.setBody({b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+                       /*isPacked=*/false);
+  return type;
+}
+
+} // namespace
+
+mlir::Type memRef1DType(SupportBuilder &b) {
+  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
+  return mlir::LLVM::LLVMStructType::getLiteral(
+      b.builder.getContext(), {b.ptr(), b.ptr(), b.i64(), arrayOne, arrayOne});
+}
+
+mlir::Type exceptionBorrowPartsType(SupportBuilder &b) {
+  mlir::Type part = memRef1DType(b);
+  return mlir::LLVM::LLVMStructType::getLiteral(b.builder.getContext(),
+                                                {part, part, part});
+}
+
+mlir::Type exceptionPartsType(SupportBuilder &b) {
+  auto type = mlir::LLVM::LLVMStructType::getIdentified(b.builder.getContext(),
+                                                        "ExceptionParts");
+  if (type.getBody().empty())
+    (void)type.setBody({memRefPartsStruct(b, "I64MemRef"),
+                        memRefPartsStruct(b, "I64MemRef"),
+                        memRefPartsStruct(b, "I8MemRef")},
+                       /*isPacked=*/false);
+  return type;
+}
+
+mlir::Value partsField(SupportBuilder &b, mlir::Value parts,
+                       std::int32_t section, std::int32_t field) {
+  return mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), exceptionPartsType(b), parts,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
+                                         mlir::LLVM::GEPArg(section),
+                                         mlir::LLVM::GEPArg(field)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
+}
+
+mlir::Value loadExceptionParts(SupportBuilder &b, mlir::Value parts) {
+  return mlir::LLVM::LoadOp::create(b.builder, b.loc, exceptionPartsType(b),
+                                    parts, /*alignment=*/8);
+}
+
+void storeExceptionParts(SupportBuilder &b, mlir::Value parts,
+                         mlir::Value value) {
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, value, parts,
+                              /*alignment=*/8);
+}
+
+void clearExceptionParts(SupportBuilder &b, mlir::Value parts) {
+  storeExceptionParts(
+      b, parts,
+      mlir::LLVM::ZeroOp::create(b.builder, b.loc, exceptionPartsType(b)));
+}
+
+mlir::Type exceptionChainNodeType(SupportBuilder &b) {
+  auto type = mlir::LLVM::LLVMStructType::getIdentified(
+      b.builder.getContext(), "ExceptionChainNode");
+  if (type.getBody().empty())
+    (void)type.setBody({b.i64(), exceptionPartsType(b), b.ptr(), b.i64(),
+                        b.i64(), b.i64(), b.i64()},
+                       /*isPacked=*/false);
+  return type;
+}
+
+mlir::Value nodeMember(SupportBuilder &b, mlir::Value node,
+                       std::int32_t member) {
+  return mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), exceptionChainNodeType(b), node,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
+                                         mlir::LLVM::GEPArg(member)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
+}
+
+mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
+                           std::int32_t section, std::int32_t field) {
+  return mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), exceptionChainNodeType(b), node,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{
+          mlir::LLVM::GEPArg(0), mlir::LLVM::GEPArg(kNodePayload),
+          mlir::LLVM::GEPArg(section), mlir::LLVM::GEPArg(field)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
+}
 
 mlir::OwningOpRef<mlir::ModuleOp>
 buildNativeRuntimeSupportModule(mlir::MLIRContext &context,

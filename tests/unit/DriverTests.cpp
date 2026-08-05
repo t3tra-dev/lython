@@ -1,6 +1,8 @@
 #include "Driver.h"
 #include "DriverCodeGen.h"
 
+#include "Common/RuntimeLibrary.h"
+
 #include "embedded.h"
 
 #include "mlir/IR/MLIRContext.h"
@@ -551,6 +553,72 @@ TEST(DriverTest, GeneratorObjectArgumentIsReleasedByItsCreatorToo) {
       << " into the frame, but released " << rangesReleased
       << " -- the frame's retain and the creator's own handle are two "
          "references, and the drop finalizer discharges only one of them";
+}
+
+// A chain node's contents never become a pointer by way of an integer.
+//
+// The node parks an interrupted exception -- three memref descriptors, a
+// traceback snapshot, and the links to the rest of the chain. It used to be 21
+// untyped i64 words, so the three ALIGNED POINTERS were stored as integers and
+// every reader turned them back with an `inttoptr`. The memory model documents
+// `extract_aligned_pointer_as_index` as where provenance is lost and says what
+// comes back through an integer is outside it -- so those readers were building
+// descriptors the model has no sentence about.
+//
+// The assertion is not a count. It is that every `inttoptr` left in these
+// functions converts a FUNCTION ARGUMENT: the node's own address, which callers
+// still pass as a word. Nothing they READ becomes a pointer. That stays true
+// when the optimiser renumbers or reorders, and it goes false the moment a
+// reader goes back to `load i64` + `inttoptr` -- which is what the old shape
+// forced and what this is here to stop coming back.
+//
+// When the node address itself becomes a pointer, the remaining conversions go
+// too and this can be tightened to zero.
+TEST(DriverTest, ChainNodeReadersNeverRebuildAPointerFromWhatTheyRead) {
+  CompileResult result = compileSource("try:\n"
+                                       "    raise ValueError(\"outer\")\n"
+                                       "except ValueError as e:\n"
+                                       "    try:\n"
+                                       "        raise KeyError(\"inner\")\n"
+                                       "    except KeyError as k:\n"
+                                       "        print(k)\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  // The EH runtime is a separate module until this link, exactly as in
+  // `--emit-llvm` and the JIT; the link picks its support module by triple, so
+  // the target has to be settled first.
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      *result.verified.llvmModule,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+      *result.verified.llvmModule)));
+
+  // The node's readers: destruction, the traceback report, and the except*
+  // frame's residual drop.
+  for (const char *name :
+       {"release_chain_node", "print_chain_node", "release_star_node"}) {
+    const llvm::Function *fn = result.verified.llvmModule->getFunction(name);
+    ASSERT_NE(fn, nullptr)
+        << name << " is gone; this test no longer looks at anything";
+    for (const llvm::BasicBlock &block : *fn)
+      for (const llvm::Instruction &instruction : block) {
+        const auto *cast = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
+        if (!cast)
+          continue;
+        if (llvm::isa<llvm::Argument>(cast->getOperand(0)))
+          continue;
+        std::string described;
+        llvm::raw_string_ostream(described) << *cast;
+        ADD_FAILURE() << name
+                      << " rebuilds a pointer from a value it computed rather "
+                         "than from its node argument:"
+                      << described;
+      }
+  }
 }
 
 TEST(DriverTest, RepeatedCompileIsStable) {
