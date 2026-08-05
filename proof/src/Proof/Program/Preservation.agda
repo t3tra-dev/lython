@@ -222,11 +222,15 @@ private
 -- block id or the pending instructions, so quantifying over them here would
 -- leave them unsolvable at the call site.
 
-borrow-preserves : ∀ {t es m src dst o md} →
-  lookupVar es src ≡ just (bind o md) →
+-- Binding a name as BORROWED changes nothing the invariant is about, and the
+-- source binding is no part of the argument: the new name can never be the
+-- owned binding `backed` describes, which is the whole proof. `borrow` and
+-- `getField` differ only in where the object came from -- a name for one, a
+-- field site for the other -- so neither is mentioned here and both use this.
+borrowed-bind-preserves : ∀ {t es m anchor dst c} →
   WFES t es m →
-  WFES t (bindVar es dst (bind o (borrowed src))) m
-borrow-preserves {t = t} {es = es} {m = m} {src = src} {dst = dst} {o = o} look w =
+  WFES t (bindVar es dst (bind c (borrowed anchor))) m
+borrowed-bind-preserves {t = t} {es = es} {m = m} {anchor = src} {dst = dst} {c = o} w =
   wfs (rc w) bk
   where
     bk : ∀ y p → lookupVar (bindVar es dst (bind o (borrowed src))) y
@@ -589,47 +593,50 @@ module Dup
 -- the vacate could drop a count that was never there and `counted-exact` would
 -- fail on a rule that does nothing to the counter.
 
-module Move
-  {t : ThreadId} {es : Env} {m : Machine} {src dst : Var} {o : ObjId}
+-- The half that does not care WHERE the entity lands: vacate one site, occupy
+-- another, and the ghost count is unmoved. `move` lands it on a name's site and
+-- `setField` on a field's, and every field of the invariant below is proved the
+-- same way for both -- so it is proved once, over the destination SITE.
+module MoveCore
+  {t : ThreadId} {es : Env} {m : Machine} {src : Var} {o : ObjId}
+  (dsite : OwnerSite)
   (look  : lookupVar es src ≡ just (bind o owned))
-  (nodup : lookupVar (unbindVar es src) src ≡ nothing)
   (w     : WFES t es m)
   where
 
-  private
-    vacated : SiteMap
-    vacated = vacate (sites m) (siteOf t src)
+  vacated : SiteMap
+  vacated = vacate (sites m) (siteOf t src)
 
-    ss' : SiteMap
-    ss' = occupy vacated (siteOf t dst) o
+  ss' : SiteMap
+  ss' = occupy vacated dsite o
 
-    m' : Machine
-    m' = machine (heap m) (objects m) ss'
+  m' : Machine
+  m' = machine (heap m) (objects m) ss'
 
-    at-src : strongAt (sites m) (siteOf t src) ≡ just o
-    at-src = backed w src o look
+  at-src : strongAt (sites m) (siteOf t src) ≡ just o
+  at-src = backed w src o look
 
-    held : Holds (sites m) (siteOf t src) o
-    held = strongAt-holds (sites m) (siteOf t src) o at-src
+  held : Holds (sites m) (siteOf t src) o
+  held = strongAt-holds (sites m) (siteOf t src) o at-src
 
-    -- ⭐ The count does not move. One off, one on.
-    ghost-same : ∀ p → ghostRC m' p ≡ ghostRC m p
-    ghost-same p = go (sameObj o p) refl
-      where
-        go : (bb : Bool) → sameObj o p ≡ bb → ghostRC m' p ≡ ghostRC m p
-        go true  e rewrite same→eq o p e =
-          trans (occupy-same vacated (siteOf t dst) o)
-                (sym (vacate-holder (sites m) (siteOf t src) o at-src))
-        go false e =
-          trans (occupy-other vacated (siteOf t dst) o p e)
-                (vacate-holder-other (sites m) (siteOf t src) o p at-src e)
+  -- ⭐ The count does not move. One off, one on.
+  ghost-same : ∀ p → ghostRC m' p ≡ ghostRC m p
+  ghost-same p = go (sameObj o p) refl
+    where
+      go : (bb : Bool) → sameObj o p ≡ bb → ghostRC m' p ≡ ghostRC m p
+      go true  e rewrite same→eq o p e =
+        trans (occupy-same vacated dsite o)
+              (sym (vacate-holder (sites m) (siteOf t src) o at-src))
+      go false e =
+        trans (occupy-other vacated dsite o p e)
+              (vacate-holder-other (sites m) (siteOf t src) o p at-src e)
 
-  preserves : WFES t (bindVar (unbindVar es src) dst (bind o owned)) m'
-  preserves = wfs (record { counted-exact = ce
-                          ; live-positive = lp
-                          ; dead-unowned = du
-                          ; no-stale-owner = ns
-                          ; owned-storage-live = osl }) bk'
+  counts : WFRC m'
+  counts = record { counted-exact = ce
+                  ; live-positive = lp
+                  ; dead-unowned = du
+                  ; no-stale-owner = ns
+                  ; owned-storage-live = osl }
     where
       ce : ∀ p n → countOf m' p ≡ just (counted n) → lifeOf m' p ≡ just live →
            n ≡ ghostRC m' p
@@ -652,6 +659,20 @@ module Move
             Σ _ λ bb → (lookupBlock (heap m) (objAllocation p) ≡ just bb)
                      × (liveness bb ≡ blockLive)
       osl p pos = owned-storage-live (rc w) p (subst (0 <_) (ghost-same p) pos)
+
+module Move
+  {t : ThreadId} {es : Env} {m : Machine} {src dst : Var} {o : ObjId}
+  (look  : lookupVar es src ≡ just (bind o owned))
+  (nodup : lookupVar (unbindVar es src) src ≡ nothing)
+  (w     : WFES t es m)
+  where
+
+  private
+    open module Core = MoveCore {t} {es} {m} {src} {o} (siteOf t dst) look w
+
+  preserves : WFES t (bindVar (unbindVar es src) dst (bind o owned)) m'
+  preserves = wfs counts bk'
+    where
 
       -- Where the SSA premise is spent. Without it the source name could still
       -- be bound after the unbind -- a shadowed binding -- and would then be an
@@ -687,6 +708,49 @@ module Move
             trans (strongAt-cons-false (siteOf t dst) o vacated (siteOf t y)
                      (trans (sameSite-siteOf t dst y) e))
                   (inner (sameVar src y) refl (rest e))
+
+------------------------------------------------------------------------
+-- `setField`: the entity changes hands from a NAME to a FIELD.
+--
+-- Everything about the counter is `MoveCore`'s, unchanged: one site vacated,
+-- one occupied. What is left is smaller than `move`'s, because no name is bound
+-- -- a field site is not any name's site, so occupying it cannot disturb what
+-- `backed` says about names, and `sameSite (field′ _ _) (local _ _)` is `false`
+-- by construction rather than by a lemma.
+
+module SetField
+  {t : ThreadId} {es : Env} {m : Machine} {src : Var} {k : FieldId}
+  {p o : ObjId}
+  (look  : lookupVar es src ≡ just (bind o owned))
+  (nodup : lookupVar (unbindVar es src) src ≡ nothing)
+  (w     : WFES t es m)
+  where
+
+  private
+    open module Core = MoveCore {t} {es} {m} {src} {o} (field′ p k) look w
+
+  preserves : WFES t (unbindVar es src) m'
+  preserves = wfs counts bk'
+    where
+      bk' : ∀ y q → lookupVar (unbindVar es src) y ≡ just (bind q owned) →
+            strongAt ss' (siteOf t y) ≡ just q
+      bk' y q h =
+        trans (strongAt-cons-false (field′ p k) o vacated (siteOf t y) refl)
+              (inner (sameVar src y) refl)
+        where
+          -- The SSA premise, spent exactly as `move` spends it: without it the
+          -- source could still be bound after the unbind and would be an owned
+          -- name at the site the rule has just vacated.
+          inner : (bb : Bool) → sameVar src y ≡ bb →
+                  strongAt vacated (siteOf t y) ≡ just q
+          inner true e
+            with trans (sym (subst (λ z → lookupVar (unbindVar es src) z ≡ nothing)
+                                   (sameVar-sound src y e) nodup)) h
+          ...  | ()
+          inner false e =
+            trans (strongAt-vacate-other (sites m) (siteOf t src) (siteOf t y)
+                     (trans (sameSite-siteOf t src y) e))
+                  (backed w y q (trans (sym (unbindVar-other es src y e)) h))
 
 ------------------------------------------------------------------------
 -- `drop` = py.decref. Name, site and counter all go together.
@@ -995,7 +1059,9 @@ instr-preserves-WF (step-init look fresh alone)        w = Init.preserves look f
 instr-preserves-WF (step-move look nodup)              w = Move.preserves look nodup w
 instr-preserves-WF (step-dup look tbl alive)           w = Dup.preserves look tbl alive w
 instr-preserves-WF (step-drop look tbl alive nodup)    w = Drop.preserves look tbl alive nodup w
-instr-preserves-WF (step-borrow look)                  w = borrow-preserves look w
+instr-preserves-WF (step-borrow look)                  w = borrowed-bind-preserves w
+instr-preserves-WF (step-set-field _ look nodup _)     w = SetField.preserves look nodup w
+instr-preserves-WF (step-get-field _ _)                w = borrowed-bind-preserves w
 
 -- Every terminator is the same operation on the state -- move the operands into
 -- the parameters -- so all five constructors have one proof.

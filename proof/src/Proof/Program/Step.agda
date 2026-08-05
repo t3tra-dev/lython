@@ -36,7 +36,7 @@ open import Relation.Binary.PropositionalEquality using (_≡_; refl)
 open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; bumpUp; bumpDown)
-open import Proof.RC.OwnerSite using (OwnerSite; local; temp; ThreadId; SiteMap;
+open import Proof.RC.OwnerSite using (OwnerSite; local; field′; temp; ThreadId; SiteMap;
   strongAt; occupy; vacate; logicalRC; Holds)
 open import Proof.Memory.Heap using (Heap; Block; lookupBlock; generation;
   liveness)
@@ -238,6 +238,49 @@ data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
     lookupVar es src ≡ just (bind o md) →
     f ⊢ pstate t bid (borrow dst src ∷ rest) es m
       —→ᵢ pstate t bid rest (bindVar es dst (bind o (borrowed src))) m
+
+  -- ⭐ `setField` is `move` with a FIELD site as the destination.
+  --
+  -- That is the whole rule, and it is why no new vocabulary appears: the site
+  -- map already has `field′ p k`, `Proof.RC.Aggregate` already reads it as
+  -- "field k of p holds c", and `logicalRC` already counts it. A store is one
+  -- site vacated and one occupied, exactly as `move` is, so the count does not
+  -- change -- and `NameSiteCoherent` sees the name half drop and the field half
+  -- rise, which is why it had to be given a field half at all.
+  --
+  -- The field must be EMPTY. A store over an occupied field would leave the old
+  -- holder counted with nothing left to lower it -- the leak shape -- so the
+  -- rule makes it unrepresentable and the compiler has to emit the release
+  -- first, which is what its decref-on-replace already does.
+  --
+  -- The receiver may be borrowed: storing into a field of an object you do not
+  -- own is legal, and `md` says so by being unconstrained.
+  step-set-field :
+    ∀ {t bid rest es m recv src k p o md} →
+    lookupVar es recv ≡ just (bind p md) →
+    lookupVar es src ≡ just (bind o owned) →
+    lookupVar (unbindVar es src) src ≡ nothing →
+    strongAt (sites m) (field′ p k) ≡ nothing →
+    f ⊢ pstate t bid (setField recv k src ∷ rest) es m
+      —→ᵢ pstate t bid rest
+            (unbindVar es src)
+            (machine (heap m) (objects m)
+                     (occupy (vacate (sites m) (siteOf t src))
+                             (field′ p k) o))
+
+  -- ⭐ `getField` is `borrow` with a FIELD site as the source.
+  --
+  -- A read hands back a name for what the field holds, and the field goes on
+  -- holding it: no count moves, so nothing but the environment changes. The
+  -- anchor is the RECEIVER, which is what makes the borrow's lifetime
+  -- obligation the receiver's -- the container's slot is what keeps the
+  -- element alive, and a reader that wants to outlive it has to `dup`.
+  step-get-field :
+    ∀ {t bid rest es m recv dst k p c md} →
+    lookupVar es recv ≡ just (bind p md) →
+    strongAt (sites m) (field′ p k) ≡ just c →
+    f ⊢ pstate t bid (getField dst recv k ∷ rest) es m
+      —→ᵢ pstate t bid rest (bindVar es dst (bind c (borrowed recv))) m
 
 ------------------------------------------------------------------------
 -- ⭐ A block argument is a MOVE.

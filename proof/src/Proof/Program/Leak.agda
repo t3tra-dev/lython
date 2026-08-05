@@ -33,6 +33,7 @@ open import Data.Empty using (⊥; ⊥-elim)
 open import Data.List using (List; []; _∷_)
 open import Data.Maybe using (Maybe; just; nothing; maybe′)
 open import Data.Nat using (ℕ; zero; suc; _+_; _<_; s≤s; z≤n)
+open import Data.Nat.Properties using (+-suc)
 open import Data.Product using (_×_; _,_; Σ; proj₁; proj₂)
 open import Relation.Binary.PropositionalEquality
   using (_≡_; refl; sym; trans; cong; subst; subst₂)
@@ -40,7 +41,7 @@ open import Relation.Nullary using (¬_)
 
 open import Proof.RC.Object using (ObjId; sameObj; sameObj-sound; sameObj-refl)
 open import Proof.RC.OwnerSite using (OwnerSite; ThreadId; SiteMap; occupy; vacate;
-  fieldRC; isFieldSite; fieldRC-occupy-nonfield; fieldRC-vacate-nonfield;
+  fieldRC; isFieldSite; field′; fieldRC-occupy-nonfield; fieldRC-vacate-nonfield;
   strongAt; logicalRC; vacate-holder; vacate-holder-other)
 open import Proof.RC.Machine Sig using (Machine; machine; heap; objects; sites;
   ghostRC)
@@ -136,6 +137,18 @@ private
   bump-plus : ∀ (b : Bool) (n k : ℕ) → bump b n + k ≡ bump b (n + k)
   bump-plus true  n k = refl
   bump-plus false n k = refl
+
+  -- And the mirror, for the one rule that bumps the FIELD side instead:
+  -- `setField` takes a name off and puts a field on.
+  bump-plusʳ : ∀ (b : Bool) (n k : ℕ) → n + bump b k ≡ bump b (n + k)
+  bump-plusʳ true  n k = +-suc n k
+  bump-plusʳ false n k = refl
+
+  -- Occupying a FIELD site, in the shape the counts branch on. `true ∧ x`
+  -- reduces, so this is the same equation `logicalRC-occupy` is.
+  fieldRC-occupy-field : ∀ (ss : SiteMap) (q : ObjId) (k : ℕ) (o p : ObjId) →
+    fieldRC (occupy ss (field′ q k) o) p ≡ bump (sameObj o p) (fieldRC ss p)
+  fieldRC-occupy-field ss q k o p = refl
 
 -- Whether a binding contributes to an object's owned-name count. Named because
 -- it appears in every statement below and because it is the boolean the site
@@ -276,6 +289,20 @@ instr-preserves-coherence {s = pstate t bid _ es m}
 -- A borrow is not counted, so `bump false` on the name side and nothing at all
 -- on the site side. This is "a borrow costs nothing" read off the equation.
 instr-preserves-coherence (step-borrow _)                   w coh p = coh p
+-- ⭐ A store takes the name off and puts the FIELD on. The count does not move,
+-- and the two halves of the invariant swap exactly one hold between them --
+-- which is the whole reason the invariant has two halves.
+instr-preserves-coherence {s = pstate t bid _ es m}
+  (step-set-field {src = src} {k = k} {p = r} {o = o} _ look nodup _) w coh q =
+  trans (cong (ownedCount (unbindVar es src) q +_)
+              (fieldRC-occupy-field (vacate (sites m) (siteOf t src)) r k o q))
+  (trans (bump-plusʳ (sameObj o q) (ownedCount (unbindVar es src) q)
+                     (fieldRC (vacate (sites m) (siteOf t src)) q))
+         (cong (bump (sameObj o q))
+               (after-removal t es (sites m) src o look (backed w src o look)
+                              coh q)))
+-- A read binds a borrowed name and moves nothing.
+instr-preserves-coherence (step-get-field _ _)              w coh p = coh p
 
 ------------------------------------------------------------------------
 -- Block arguments.
