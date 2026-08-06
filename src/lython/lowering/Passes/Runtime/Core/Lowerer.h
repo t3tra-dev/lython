@@ -328,15 +328,22 @@ private:
   mlir::LogicalResult lowerGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerObjectGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerObjectGlobalSet(py::GlobalSetOp op);
+  // `cellType` is what the cell holds: `i64` for the bound flag, sizes and
+  // scalars, `!llvm.ptr` for the `_p<i>` slots. A pointer slot holding a
+  // pointer is the whole reason this takes a type -- see lowerObjectGlobalSet.
   mlir::LLVM::GlobalOp moduleObjectGlobalCell(mlir::Operation *op,
                                               llvm::StringRef name,
-                                              llvm::StringRef suffix);
-  mlir::func::FuncOp globalViewFunction(mlir::Operation *op,
-                                        mlir::Type element);
+                                              llvm::StringRef suffix,
+                                              mlir::Type cellType);
   mlir::Value loadObjectGlobalWord(mlir::Operation *op, llvm::StringRef name,
                                    llvm::StringRef suffix);
   void storeObjectGlobalWord(mlir::Operation *op, llvm::StringRef name,
                              llvm::StringRef suffix, mlir::Value word);
+  mlir::Value loadObjectGlobalPointer(mlir::Operation *op,
+                                      llvm::StringRef name,
+                                      llvm::StringRef suffix);
+  void storeObjectGlobalPointer(mlir::Operation *op, llvm::StringRef name,
+                                llvm::StringRef suffix, mlir::Value pointer);
   mlir::LogicalResult
   loadObjectGlobalValues(mlir::Operation *op, llvm::StringRef name,
                          llvm::ArrayRef<mlir::Type> valueTypes,
@@ -762,8 +769,14 @@ private:
   // Both take the iterator bundle by value: they bind results into
   // `valueBundles` (a DenseMap) mid-lowering, which invalidates references
   // into the map.
-  // Rank-1 memref view over a boxed pointer/size word pair (inline
-  // descriptor assembly; borrow-only).
+  // Rank-1 memref view over a payload (inline descriptor assembly;
+  // borrow-only). The pointer form is the assembly; the word form widens an
+  // integer first and is the one to count -- see BoxLayout.cpp.
+  static mlir::Value memrefFromBoxPointer(mlir::OpBuilder &builder,
+                                          mlir::Location loc,
+                                          mlir::Value pointer,
+                                          mlir::Value sizeWord,
+                                          mlir::MemRefType type);
   static mlir::Value memrefFromBoxWords(mlir::OpBuilder &builder,
                                         mlir::Location loc,
                                         mlir::Value pointerWord,

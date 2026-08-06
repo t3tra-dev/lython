@@ -188,6 +188,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
     "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
+    "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
     "DriverTest.RepeatedCompileIsStable"
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
 

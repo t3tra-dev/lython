@@ -679,6 +679,68 @@ TEST(DriverTest, EveryCallIntoTheEHRuntimeMatchesItsDefinition) {
   }
 }
 
+// A module global's pointer cell holds a pointer.
+//
+// A module-level object is parked in one i64 cell per stored word: a bound
+// flag, then a pointer and a size per physical memref. The pointer cell held
+// an INTEGER -- the store side reached it with
+// `memref.extract_aligned_pointer_as_index`, which the memory model documents
+// as where provenance is lost, and the read side widened it back through
+// `__ly_global_view_*`. Round-tripping an owning reference through an integer
+// on every read of a module-level list, dict or str.
+//
+// `__ly_global_view_*` itself stays: it exists so a MANIFEST body can obtain a
+// descriptor through a call rather than a cast, which this pipeline rejects in
+// its input. What changed is that the compiler's own path no longer needs it --
+// it holds a pointer, so it builds the view where it stands.
+TEST(DriverTest, AModuleGlobalsPointerCellHoldsAPointer) {
+  CompileResult result = compileSource("LABEL: str = \"module scope\"\n"
+                                       "\n"
+                                       "def read_global() -> int:\n"
+                                       "    return len(LABEL)\n"
+                                       "\n"
+                                       "print(read_global())\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+
+  unsigned pointerCells = 0;
+  for (const llvm::GlobalVariable &cell :
+       result.verified.llvmModule->globals()) {
+    llvm::StringRef name = cell.getName();
+    if (!name.starts_with("__ly_module_global_obj_"))
+      continue;
+    // `_p<i>`; the `_s<i>` sizes and the `_init` flag are genuinely words.
+    llvm::StringRef slot = name.rsplit('_').second;
+    if (!slot.starts_with("p"))
+      continue;
+    ++pointerCells;
+    if (cell.getValueType()->isPointerTy())
+      continue;
+    ADD_FAILURE() << name.str()
+                  << " does not hold a pointer, so every read of this global "
+                     "widens an address back into one";
+  }
+  // A str is two physical memrefs, so the program has two of these. Asserted
+  // so that a lowering change which stopped emitting cells at all would fail
+  // here rather than pass with nothing to check.
+  EXPECT_EQ(pointerCells, 2u);
+
+  const llvm::Function *reader =
+      result.verified.llvmModule->getFunction("read_global");
+  ASSERT_NE(reader, nullptr);
+  for (const llvm::BasicBlock &block : *reader)
+    for (const llvm::Instruction &instruction : block) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+      if (!call || !call->getCalledOperand())
+        continue;
+      llvm::StringRef callee = call->getCalledOperand()->getName();
+      if (!callee.starts_with("__ly_global_view_"))
+        continue;
+      ADD_FAILURE() << "reading a module global still goes through "
+                    << callee.str()
+                    << ", which takes the payload's address as a word";
+    }
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");

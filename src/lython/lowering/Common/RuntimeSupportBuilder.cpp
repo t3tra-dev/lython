@@ -2009,44 +2009,37 @@ void buildReleaseCurrentException(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// __ly_global_view_*(i64 ptr, i64 size): reassemble a rank-1 memref
-// descriptor from the raw pointer/size words a module-global object cell
-// stores (allocated == aligned, offset 0, stride 1 -- the runtime's
-// single-allocation entity convention). One wrapper per element type so the
-// func-level signature type-checks against the caller's memref world;
-// static shapes narrow through memref.cast at the call site.
-void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name) {
-  auto fn = beginLLVMFunction(b, name, memRef1DType(b), {b.i64(), b.i64()});
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+// __ly_global_view_*(i64 pointer_word, i64 size) -> memref<?xT>: a rank-1
+// view over a payload a WORD addresses (allocated == aligned, offset 0,
+// stride 1 -- the runtime's single-allocation entity convention). One per
+// element type because the result type differs; static shapes narrow through
+// memref.cast at the call site.
+//
+// ⛔ The integer argument is the point of the function and also what is wrong
+// with it. It exists so a MANIFEST body can get a descriptor through a call
+// rather than through a cast, which this pipeline rejects in its input
+// (Passes/Runtime/Passes/Lowering.cpp says why); the manifests that call it
+// hold a pointer WORD read out of a boxed element's payload slot, and widening
+// it is the direction the memory model refuses.
+//
+// The compiler's own module-global path used to come through here too and no
+// longer does -- its cell holds a pointer. What is left is the box slot, which
+// should hold one the same way; then the argument here becomes `!llvm.ptr` and
+// the widen goes with it.
+void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name,
+                             mlir::Type element) {
+  auto resultType =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, element);
+  auto fn = b.beginFunction(
+      name, b.builder.getFunctionType({b.i64(), b.i64()}, {resultType}));
+  mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
   mlir::Value pointer = b.intToPtr(entry->getArgument(0));
-  mlir::Value size = entry->getArgument(1);
-  mlir::Value zero = b.iconst(0);
-  mlir::Value one = b.iconst(1);
-  mlir::Value sizeArray = mlir::LLVM::InsertValueOp::create(
+  mlir::func::ReturnOp::create(
       b.builder, b.loc,
-      mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-      size, llvm::ArrayRef<std::int64_t>{0});
-  mlir::Value strideArray = mlir::LLVM::InsertValueOp::create(
-      b.builder, b.loc,
-      mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-      one, llvm::ArrayRef<std::int64_t>{0});
-  mlir::Value descriptor =
-      mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{0});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{1});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      b.builder, b.loc, descriptor, zero, llvm::ArrayRef<std::int64_t>{2});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      b.builder, b.loc, descriptor, sizeArray,
-      llvm::ArrayRef<std::int64_t>{3});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      b.builder, b.loc, descriptor, strideArray,
-      llvm::ArrayRef<std::int64_t>{4});
-  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{descriptor});
+      buildMemRef1D(b, resultType,
+                    MemRef1DParts{pointer, pointer, b.iconst(0),
+                                  entry->getArgument(1), b.iconst(1)}));
 }
 
 // i32 LyRunPythonMain(ptr entry): installs the stack guard, invokes the
@@ -2470,10 +2463,10 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildPrintBytes(support);
   buildHostSupport(support);
   buildOsSupport(support);
-  buildGlobalViewFunction(support, "__ly_global_view_i8");
-  buildGlobalViewFunction(support, "__ly_global_view_i32");
-  buildGlobalViewFunction(support, "__ly_global_view_i64");
-  buildGlobalViewFunction(support, "__ly_global_view_f64");
+  buildGlobalViewFunction(support, "__ly_global_view_i8", support.i8());
+  buildGlobalViewFunction(support, "__ly_global_view_i32", support.i32());
+  buildGlobalViewFunction(support, "__ly_global_view_i64", support.i64());
+  buildGlobalViewFunction(support, "__ly_global_view_f64", support.f64());
   buildReleasePayloadSlotPtr(support);
   buildReleaseExceptionExtras(support);
   buildReleaseBoxedPayloadRaw(support);

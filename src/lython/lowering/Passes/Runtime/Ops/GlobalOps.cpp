@@ -36,16 +36,14 @@ mlir::Type rankOneElementType(mlir::Type type) {
   return memref.getElementType();
 }
 
-llvm::StringRef globalViewSymbolFor(mlir::Type element) {
-  if (element.isInteger(8))
-    return "__ly_global_view_i8";
-  if (element.isInteger(32))
-    return "__ly_global_view_i32";
-  if (element.isInteger(64))
-    return "__ly_global_view_i64";
-  if (element.isF64())
-    return "__ly_global_view_f64";
-  return {};
+// MLIR's rank-1 memref descriptor, which only the store side's cast names.
+mlir::Type memrefDescriptorType(mlir::OpBuilder &builder) {
+  mlir::MLIRContext *context = builder.getContext();
+  auto ptr = mlir::LLVM::LLVMPointerType::get(context);
+  mlir::Type i64 = builder.getI64Type();
+  auto arrayOne = mlir::LLVM::LLVMArrayType::get(i64, 1);
+  return mlir::LLVM::LLVMStructType::getLiteral(
+      context, {ptr, ptr, i64, arrayOne, arrayOne});
 }
 
 } // namespace
@@ -58,44 +56,39 @@ llvm::StringRef globalViewSymbolFor(mlir::Type element) {
 mlir::LLVM::GlobalOp
 RuntimeBundleLowerer::moduleObjectGlobalCell(mlir::Operation *op,
                                              llvm::StringRef name,
-                                             llvm::StringRef suffix) {
+                                             llvm::StringRef suffix,
+                                             mlir::Type cellType) {
   std::string symbol =
       ("__ly_module_global_obj_" + name + "_" + suffix).str();
   if (auto existing = module.lookupSymbol<mlir::LLVM::GlobalOp>(symbol))
     return existing;
   mlir::OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
-  mlir::Type i64 = builder.getI64Type();
-  return mlir::LLVM::GlobalOp::create(
-      builder, module.getLoc(), i64, /*isConstant=*/false,
-      mlir::LLVM::Linkage::Internal, symbol, builder.getI64IntegerAttr(0),
+  if (!mlir::isa<mlir::LLVM::LLVMPointerType>(cellType))
+    return mlir::LLVM::GlobalOp::create(
+        builder, module.getLoc(), cellType, /*isConstant=*/false,
+        mlir::LLVM::Linkage::Internal, symbol, builder.getI64IntegerAttr(0),
+        /*alignment=*/8);
+  // A null pointer is not an integer attribute, so the initial value has to
+  // come from a body rather than from `getI64IntegerAttr(0)`.
+  auto global = mlir::LLVM::GlobalOp::create(
+      builder, module.getLoc(), cellType, /*isConstant=*/false,
+      mlir::LLVM::Linkage::Internal, symbol, mlir::Attribute(),
       /*alignment=*/8);
-}
-
-mlir::func::FuncOp
-RuntimeBundleLowerer::globalViewFunction(mlir::Operation *op,
-                                         mlir::Type element) {
-  llvm::StringRef symbol = globalViewSymbolFor(element);
-  if (symbol.empty())
-    return {};
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(symbol))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  mlir::Type i64 = builder.getI64Type();
-  auto resultType = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                          element);
-  auto fn = mlir::func::FuncOp::create(
-      builder, module.getLoc(), symbol,
-      builder.getFunctionType({i64, i64}, {resultType}));
-  fn.setPrivate();
-  return fn;
+  mlir::OpBuilder::InsertionGuard initGuard(builder);
+  builder.setInsertionPointToEnd(
+      builder.createBlock(&global.getInitializerRegion()));
+  mlir::LLVM::ReturnOp::create(
+      builder, module.getLoc(),
+      mlir::ValueRange{
+          mlir::LLVM::ZeroOp::create(builder, module.getLoc(), cellType)});
+  return global;
 }
 
 mlir::Value RuntimeBundleLowerer::loadObjectGlobalWord(
     mlir::Operation *op, llvm::StringRef name, llvm::StringRef suffix) {
-  mlir::LLVM::GlobalOp cell =
-      RuntimeBundleLowerer::moduleObjectGlobalCell(op, name, suffix);
+  mlir::LLVM::GlobalOp cell = RuntimeBundleLowerer::moduleObjectGlobalCell(
+      op, name, suffix, builder.getI64Type());
   mlir::Value address =
       mlir::LLVM::AddressOfOp::create(builder, op->getLoc(), cell);
   return mlir::LLVM::LoadOp::create(builder, op->getLoc(),
@@ -106,11 +99,33 @@ void RuntimeBundleLowerer::storeObjectGlobalWord(mlir::Operation *op,
                                                  llvm::StringRef name,
                                                  llvm::StringRef suffix,
                                                  mlir::Value word) {
-  mlir::LLVM::GlobalOp cell =
-      RuntimeBundleLowerer::moduleObjectGlobalCell(op, name, suffix);
+  mlir::LLVM::GlobalOp cell = RuntimeBundleLowerer::moduleObjectGlobalCell(
+      op, name, suffix, builder.getI64Type());
   mlir::Value address =
       mlir::LLVM::AddressOfOp::create(builder, op->getLoc(), cell);
   mlir::LLVM::StoreOp::create(builder, op->getLoc(), word, address);
+}
+
+mlir::Value RuntimeBundleLowerer::loadObjectGlobalPointer(
+    mlir::Operation *op, llvm::StringRef name, llvm::StringRef suffix) {
+  mlir::Type ptr = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  mlir::LLVM::GlobalOp cell =
+      RuntimeBundleLowerer::moduleObjectGlobalCell(op, name, suffix, ptr);
+  mlir::Value address =
+      mlir::LLVM::AddressOfOp::create(builder, op->getLoc(), cell);
+  return mlir::LLVM::LoadOp::create(builder, op->getLoc(), ptr, address);
+}
+
+void RuntimeBundleLowerer::storeObjectGlobalPointer(mlir::Operation *op,
+                                                    llvm::StringRef name,
+                                                    llvm::StringRef suffix,
+                                                    mlir::Value pointer) {
+  mlir::Type ptr = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  mlir::LLVM::GlobalOp cell =
+      RuntimeBundleLowerer::moduleObjectGlobalCell(op, name, suffix, ptr);
+  mlir::Value address =
+      mlir::LLVM::AddressOfOp::create(builder, op->getLoc(), cell);
+  mlir::LLVM::StoreOp::create(builder, op->getLoc(), pointer, address);
 }
 
 // Reassemble the physical value group of a module-global object from its
@@ -122,27 +137,20 @@ mlir::LogicalResult RuntimeBundleLowerer::loadObjectGlobalValues(
   mlir::Location loc = op->getLoc();
   for (auto [index, valueType] : llvm::enumerate(valueTypes)) {
     std::string slot = std::to_string(index);
-    if (mlir::Type element = rankOneElementType(valueType)) {
-      mlir::func::FuncOp view =
-          RuntimeBundleLowerer::globalViewFunction(op, element);
-      if (!view)
-        return op->emitError()
-               << "module global '" << name << "' value " << index
-               << " has unsupported element type " << valueType;
+    if (rankOneElementType(valueType)) {
+      // The cell holds the payload's aligned pointer, so the view is built
+      // from a pointer and never from an integer. This used to call
+      // `__ly_global_view_*`, which exists so a MANIFEST body can get a
+      // descriptor through a call instead of a cast (see
+      // Passes/Lowering.cpp); this side is the compiler's own and has no such
+      // constraint, so it assembles the descriptor where it stands.
       mlir::Value pointer =
-          RuntimeBundleLowerer::loadObjectGlobalWord(op, name, "p" + slot);
+          RuntimeBundleLowerer::loadObjectGlobalPointer(op, name, "p" + slot);
       mlir::Value size =
           RuntimeBundleLowerer::loadObjectGlobalWord(op, name, "s" + slot);
-      mlir::Value dynamic =
-          mlir::func::CallOp::create(builder, loc, view,
-                                     mlir::ValueRange{pointer, size})
-              .getResult(0);
-      auto memref = mlir::cast<mlir::MemRefType>(valueType);
-      mlir::Value value = dynamic;
-      if (memref.hasStaticShape())
-        value = mlir::memref::CastOp::create(builder, loc, valueType, dynamic)
-                    .getResult();
-      values.push_back(value);
+      values.push_back(RuntimeBundleLowerer::memrefFromBoxPointer(
+          builder, loc, pointer, size,
+          mlir::cast<mlir::MemRefType>(valueType)));
       continue;
     }
     mlir::Value word =
@@ -327,14 +335,22 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
                                                       *valueTypes))) {
     auto [newValue, valueType] = pair;
     std::string slot = std::to_string(index);
-    if (mlir::Type element = rankOneElementType(valueType)) {
-      mlir::Value pointerIndex =
-          mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
-                                                               newValue);
-      mlir::Value pointer = mlir::arith::IndexCastOp::create(
-          builder, loc, builder.getI64Type(), pointerIndex);
-      RuntimeBundleLowerer::storeObjectGlobalWord(op, op.getName(),
-                                                  "p" + slot, pointer);
+    if (rankOneElementType(valueType)) {
+      // ⛔ The descriptor's aligned member, NOT
+      // `memref.extract_aligned_pointer_as_index`. Both reach the pointer and
+      // only this one leaves it a pointer: the index op is documented in the
+      // memory model as where provenance is lost, and the cell it fed held an
+      // integer that the read side had to widen back. The cast is erased
+      // against the func-to-LLVM conversion's own inverse.
+      mlir::Value descriptor =
+          mlir::UnrealizedConversionCastOp::create(
+              builder, loc, mlir::TypeRange{memrefDescriptorType(builder)},
+              newValue)
+              .getResult(0);
+      mlir::Value pointer = mlir::LLVM::ExtractValueOp::create(
+          builder, loc, descriptor, llvm::ArrayRef<std::int64_t>{1});
+      RuntimeBundleLowerer::storeObjectGlobalPointer(op, op.getName(),
+                                                     "p" + slot, pointer);
       auto memref = mlir::cast<mlir::MemRefType>(valueType);
       mlir::Value size;
       if (memref.hasStaticShape()) {
