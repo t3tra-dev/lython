@@ -37,6 +37,7 @@ enum class TypeKind : unsigned {
   ExceptionCell,
   Traceback,
   Location,
+  ExceptStarFrame,
   Callable,
   Union,
   Object,
@@ -386,6 +387,32 @@ public:
   }
 };
 
+// The scratch structure one `except*` STATEMENT owns: the unmatched residual
+// between clauses and everything the clause bodies raised.
+//
+// A type of its own rather than the `i64` handle it was, because an `i64` says
+// the frame is a number. It is an identity, and the distinction is the memory
+// model's central one -- `extract_aligned_pointer_as_index` yields an identity
+// precisely so that an address does not read as an integer. Saying `i64` in the
+// dialect forced every runtime entry point to widen its argument back, which is
+// the direction the model refuses, once per function for eleven of them.
+//
+// It lowers to `!llvm.ptr`. The dialect does not say so and must not: `py` sits
+// above the physical world, which is why this is here beside `py.location`
+// rather than being spelled as a pointer at the source level.
+class ExceptStarFrameType
+    : public mlir::Type::TypeBase<ExceptStarFrameType, mlir::Type,
+                                  detail::SimpleTypeStorage> {
+public:
+  using Base::Base;
+  static constexpr ::llvm::StringLiteral name{"py.except_star_frame"};
+
+  static ExceptStarFrameType get(mlir::MLIRContext *ctx);
+  static bool kindof(unsigned kind) {
+    return kind == static_cast<unsigned>(TypeKind::ExceptStarFrame);
+  }
+};
+
 class LocationType : public mlir::Type::TypeBase<LocationType, mlir::Type,
                                                  detail::SimpleTypeStorage> {
 public:
@@ -519,6 +546,7 @@ bool isPyExceptionType(mlir::Type type);
 bool isPyExceptionCellType(mlir::Type type);
 bool isPyTracebackType(mlir::Type type);
 bool isPyLocationType(mlir::Type type);
+bool isPyExceptStarFrameType(mlir::Type type);
 bool isPyUnionType(mlir::Type type);
 bool isPyOverloadType(mlir::Type type);
 bool isPyContractNamed(mlir::Type type, llvm::StringRef name);

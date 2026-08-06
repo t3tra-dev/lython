@@ -77,6 +77,9 @@ def Py_UnionType : Type<CPred<"::py::isPyUnionType($_self)">, "py.union">;
 // are not expected to appear in typeshed.
 def Py_LocationType
     : Type<CPred<"::py::isPyLocationType($_self)">, "py.location">;
+def Py_ExceptStarFrameType
+    : Type<CPred<"::py::isPyExceptStarFrameType($_self)">,
+           "py.except_star_frame">;
 
 class Py_Op<string mnemonic, list<Trait> traits = []>
     : Op<Py_Dialect, mnemonic, traits>;
@@ -363,8 +366,8 @@ def Py_StarBeginOp : Py_Op<"except_star.begin", []> {
     memory model has no words for, since a descriptor cannot be stored. As a
     value the nesting is lexical, which is what it always was.
   }];
-  let results = (outs I64:$frame);
-  let assemblyFormat = "attr-dict";
+  let results = (outs Py_ExceptStarFrameType:$frame);
+  let assemblyFormat = "attr-dict `:` type($frame)";
 }
 
 def Py_ExceptStarMatchOp : Py_Op<"except_star.match", []> {
@@ -376,15 +379,15 @@ def Py_ExceptStarMatchOp : Py_Op<"except_star.match", []> {
     the clause body) and the rest replaces the frame residual; the result
     reports whether the clause body runs.
   }];
-  let arguments = (ins I64:$frame, TypeAttrOf<Py_TypeType>:$handler);
+  let arguments = (ins Py_ExceptStarFrameType:$frame, TypeAttrOf<Py_TypeType>:$handler);
   let results = (outs I1:$result);
-  let assemblyFormat = "$frame `,` $handler attr-dict";
+  let assemblyFormat = "$frame `:` type($frame) `,` $handler attr-dict";
 }
 
 def Py_StarCollectOp : Py_Op<"except_star.collect", []> {
   let summary = "Park an exception raised by a clause body in the star frame";
-  let arguments = (ins I64:$frame);
-  let assemblyFormat = "$frame attr-dict";
+  let arguments = (ins Py_ExceptStarFrameType:$frame);
+  let assemblyFormat = "$frame `:` type($frame) attr-dict";
 }
 
 def Py_StarBodyEndOp : Py_Op<"except_star.body_end", []> {
@@ -400,8 +403,8 @@ def Py_StarFinishOp : Py_Op<"except_star.finish", []> {
     collected exception rethrows as itself, anything else rethrows as a fresh
     exception group wrapping them all.
   }];
-  let arguments = (ins I64:$frame);
-  let assemblyFormat = "$frame attr-dict";
+  let arguments = (ins Py_ExceptStarFrameType:$frame);
+  let assemblyFormat = "$frame `:` type($frame) attr-dict";
 }
 
 def Py_ExceptCurrentValueOp : Py_Op<"except.current_value", []> {

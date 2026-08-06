@@ -756,9 +756,10 @@ TEST(DriverTest, AModuleGlobalsPointerCellHoldsAPointer) {
 // writes one, so nothing goes through the memref: callers hand over the cell's
 // ADDRESS, which the descriptor's aligned member supplies as a pointer.
 //
-// The except* frame stopped being 36 loose words at the same time, which is
-// how its dead `parent` slot came to light -- the frame became an SSA value
-// two commits earlier and nothing had read the word since.
+// The except* frame is a `!py.except_star_frame` rather than an `i64`, so its
+// eleven entry points have no integer to widen either. A dialect type saying
+// "number" about an identity is what forced that, and there was no way to fix
+// it below the dialect.
 TEST(DriverTest, AParkedExceptionIsReachedByPointer) {
   CompileResult result = compileSource("def gen() -> object:\n"
                                        "    try:\n"
@@ -804,25 +805,26 @@ TEST(DriverTest, AParkedExceptionIsReachedByPointer) {
       }
   }
 
-  // The except* functions still take the frame as a word, because that is the
-  // `py.except_star.begin` result type. Exactly one conversion each, and its
-  // operand is that argument -- anything else means a slot went back to
-  // holding an address.
+  // And the except* surface, which takes the frame. It is a
+  // `!py.except_star_frame` in the dialect and an `!llvm.ptr` after lowering,
+  // so nothing here has an integer to widen either -- these were one apiece
+  // for as long as the dialect said the frame was an `i64`.
   for (const char *name :
-       {"LyEH_StarCollect", "LyEH_StarPop", "LyEH_StarNodesPtr",
-        "LyEH_StarApplyMatch", "LyEH_StarThrowCombined",
-        "LyEH_StarResidualParts"}) {
+       {"LyEH_StarBegin", "LyEH_StarHasResidual", "LyEH_StarCollect",
+        "LyEH_StarCollectedCount", "LyEH_StarNodesPtr",
+        "LyEH_StarResidualParts", "LyEH_StarApplyMatch",
+        "LyEH_StarThrowCombined", "LyEH_StarDiscardSplit", "LyEH_StarPop",
+        "LyEH_StarRethrowResidual", "LyEH_StarRethrowSoleCollected",
+        "release_star_node", "__ly_exc_star_combine"}) {
     const llvm::Function *fn = result.verified.llvmModule->getFunction(name);
     ASSERT_NE(fn, nullptr) << name << " is gone";
     for (const llvm::BasicBlock &block : *fn)
       for (const llvm::Instruction &instruction : block) {
-        const auto *cast = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
-        if (!cast || llvm::isa<llvm::Argument>(cast->getOperand(0)))
+        if (!llvm::isa<llvm::IntToPtrInst>(&instruction))
           continue;
         std::string described;
-        llvm::raw_string_ostream(described) << *cast;
-        ADD_FAILURE() << name
-                      << " widens something other than its frame argument:"
+        llvm::raw_string_ostream(described) << instruction;
+        ADD_FAILURE() << name << " makes a pointer out of an integer:"
                       << described;
       }
   }

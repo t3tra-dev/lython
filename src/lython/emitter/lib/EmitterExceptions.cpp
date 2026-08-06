@@ -1823,7 +1823,7 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
     // that a global frame stack used to encode is just the CFG.
     mlir::OperationState beginState(loc(statement),
                                     py::StarBeginOp::getOperationName());
-    beginState.addTypes(builder.getI64Type());
+    beginState.addTypes(py::ExceptStarFrameType::get(builder.getContext()));
     mlir::Value starFrame =
         mlir::cast<py::StarBeginOp>(builder.create(beginState)).getFrame();
     mlir::cf::BranchOp::create(builder, loc(statement), checkBlocks.front());

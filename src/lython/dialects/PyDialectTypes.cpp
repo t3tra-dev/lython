@@ -245,6 +245,10 @@ LocationType LocationType::get(mlir::MLIRContext *ctx) {
   return Base::get(ctx, TypeKind::Location);
 }
 
+ExceptStarFrameType ExceptStarFrameType::get(mlir::MLIRContext *ctx) {
+  return Base::get(ctx, TypeKind::ExceptStarFrame);
+}
+
 CallableType CallableType::get(mlir::MLIRContext *ctx,
                                llvm::ArrayRef<mlir::Type> positional,
                                llvm::ArrayRef<mlir::Type> kwonly,
@@ -548,7 +552,7 @@ bool isPyContractType(mlir::Type type) {
       .Case<ContractType, ProtocolType, CallableType, UnionType, LiteralType,
             OverloadType, TypeType, SelfType, TypeVarType, ParamSpecType,
             TypeVarTupleType, UnpackType, ExceptionType, ExceptionCellType,
-            TracebackType, LocationType>(
+            TracebackType, LocationType, ExceptStarFrameType>(
           [](auto) { return true; })
       .Default([](mlir::Type) { return false; });
 }
@@ -598,6 +602,10 @@ bool isPyTracebackType(mlir::Type type) {
 }
 
 bool isPyLocationType(mlir::Type type) { return mlir::isa<LocationType>(type); }
+
+bool isPyExceptStarFrameType(mlir::Type type) {
+  return mlir::isa<ExceptStarFrameType>(type);
+}
 
 bool isPyUnionType(mlir::Type type) { return mlir::isa<UnionType>(type); }
 

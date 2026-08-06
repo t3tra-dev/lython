@@ -2361,7 +2361,7 @@ mlir::Value starFrameArg(mlir::func::FuncOp fn) {
 
 mlir::Value starFrameSlot(SupportBuilder &b, mlir::Value frame,
                           std::int32_t member) {
-  return starFrameMember(b, b.intToPtr(frame), member);
+  return starFrameMember(b, frame, member);
 }
 
 // void release_exception_storage_raw(i64 eh, i64 mh, i64 mb): one owned
@@ -2470,7 +2470,7 @@ void buildReleaseStarNode(SupportBuilder &b) {
 // void LyEH_StarBegin(): push a star frame parking the caught exception.
 void buildStarBegin(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarBegin",
-                            b.builder.getFunctionType({}, {b.i64()}));
+                            b.builder.getFunctionType({}, {b.ptr()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame =
@@ -2488,7 +2488,6 @@ void buildStarBegin(SupportBuilder &b) {
   mlir::LLVM::MemsetOp::create(b.builder, b.loc, frame, b.iconst8(0),
                                typeSizeBytes(b, starFrameType(b)),
                                /*isVolatile=*/false);
-  mlir::Value frameWord = b.ptrToInt(frame);
   b.call("LyEH_StashCurrentException", mlir::TypeRange{},
          mlir::ValueRange{starFrameMember(b, frame, kStarResidual)});
   mlir::Value node =
@@ -2499,14 +2498,14 @@ void buildStarBegin(SupportBuilder &b) {
   mlir::LLVM::StoreOp::create(b.builder, b.loc, presentWord,
                               starFrameMember(b, frame, kStarPresent),
                               /*alignment=*/8);
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{frameWord});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{frame});
 }
 
 // i1 LyEH_StarHasResidual(): whether the innermost frame still holds an
 // unmatched slice.
 void buildStarHasResidual(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarHasResidual",
-                            b.builder.getFunctionType({b.i64()}, {b.i1()}));
+                            b.builder.getFunctionType({b.ptr()}, {b.i1()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
@@ -2522,7 +2521,7 @@ void buildStarHasResidual(SupportBuilder &b) {
 void buildStarResidualParts(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "LyEH_StarResidualParts",
-      b.builder.getFunctionType({b.i64()}, exceptionTripleTypes(b.builder)));
+      b.builder.getFunctionType({b.ptr()}, exceptionTripleTypes(b.builder)));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
@@ -2551,7 +2550,7 @@ void buildStarResidualParts(SupportBuilder &b) {
 // dropped.
 void buildStarApplyMatch(SupportBuilder &b) {
   llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(b.builder);
-  llvm::SmallVector<mlir::Type, 8> inputs{b.i64(), b.i1()};
+  llvm::SmallVector<mlir::Type, 8> inputs{b.ptr(), b.i1()};
   inputs.append(triple.begin(), triple.end());
   inputs.append(triple.begin(), triple.end());
   auto fn = b.beginFunction("LyEH_StarApplyMatch",
@@ -2636,7 +2635,7 @@ void buildStarApplyMatch(SupportBuilder &b) {
 // body) in the frame's collected list.
 void buildStarCollect(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarCollect",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
@@ -2646,7 +2645,7 @@ void buildStarCollect(SupportBuilder &b) {
   mlir::cf::AssertOp::create(b.builder, b.loc, inRange,
                              "except* clause raise limit exceeded");
   b.call("LyEH_StashCurrentException", mlir::TypeRange{},
-         mlir::ValueRange{starClauseCell(b, b.intToPtr(frame), count)});
+         mlir::ValueRange{starClauseCell(b, frame, count)});
   mlir::Value next =
       mlir::arith::AddIOp::create(b.builder, b.loc, count, b.iconst(1));
   mlir::LLVM::StoreOp::create(b.builder, b.loc, next,
@@ -2657,7 +2656,7 @@ void buildStarCollect(SupportBuilder &b) {
 // i64 LyEH_StarCollectedCount() / i64 LyEH_StarNodesPtr(): finish inputs.
 void buildStarCollectedCount(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarCollectedCount",
-                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
+                            b.builder.getFunctionType({b.ptr()}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value count =
@@ -2667,7 +2666,7 @@ void buildStarCollectedCount(SupportBuilder &b) {
 
 void buildStarNodesPtr(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarNodesPtr",
-                            b.builder.getFunctionType({b.i64()}, {b.ptr()}));
+                            b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::func::ReturnOp::create(
@@ -2679,14 +2678,14 @@ void buildStarNodesPtr(SupportBuilder &b) {
 // is each caller's business; here the residual node is fully released).
 void buildStarPop(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarPop",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   b.call("release_star_node", mlir::TypeRange{},
          mlir::ValueRange{b.loadPtrVal(starFrameSlot(b, frame, kStarResidual)),
                           b.loadI64(starFrameSlot(b, frame, kStarPresent))});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -2714,13 +2713,13 @@ void buildStarThrowPending(SupportBuilder &b) {
 // slice rethrows with its original traceback and chain.
 void buildStarRethrowResidual(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarRethrowResidual",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   b.call("LyEH_UnstashException", mlir::TypeRange{},
          mlir::ValueRange{starFrameSlot(b, frame, kStarResidual)});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -2729,17 +2728,17 @@ void buildStarRethrowResidual(SupportBuilder &b) {
 // residual — that exception continues as itself (context intact).
 void buildStarRethrowSoleCollected(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarRethrowSoleCollected",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   b.call("LyEH_UnstashException", mlir::TypeRange{},
          mlir::ValueRange{
-             starClauseCell(b, b.intToPtr(frame), b.iconst(0))});
+             starClauseCell(b, frame, b.iconst(0))});
   b.call("release_star_node", mlir::TypeRange{},
          mlir::ValueRange{b.loadPtrVal(starFrameSlot(b, frame, kStarResidual)),
                           b.loadI64(starFrameSlot(b, frame, kStarPresent))});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -2750,7 +2749,7 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
 // member references to the group and die.
 void buildStarThrowCombined(SupportBuilder &b) {
   llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(b.builder);
-  llvm::SmallVector<mlir::Type, 4> inputs{b.i64()};
+  llvm::SmallVector<mlir::Type, 4> inputs{b.ptr()};
   inputs.append(triple.begin(), triple.end());
   auto fn = b.beginFunction("LyEH_StarThrowCombined",
                             b.builder.getFunctionType(inputs, {}));
@@ -2776,7 +2775,7 @@ void buildStarThrowCombined(SupportBuilder &b) {
         b.builder, b.loc, b.i64(), releaseLoop.getInductionVar());
     b.call("release_chain_node", mlir::TypeRange{},
            mlir::ValueRange{b.loadPtrVal(
-               starClauseCell(b, b.intToPtr(frame), position))});
+               starClauseCell(b, frame, position))});
   }
 
   // Residual node: its member reference moved into the group; its traceback
@@ -2848,7 +2847,7 @@ void buildStarThrowCombined(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       b.addrOf("g_current_exception"), /*alignment=*/4);
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{frame});
   // `star_throw_pending` does not return; the trailing return only satisfies
   // the verifier, which is why this is not `llvm.unreachable`.
   mlir::func::CallOp::create(b.builder, b.loc, "star_throw_pending",

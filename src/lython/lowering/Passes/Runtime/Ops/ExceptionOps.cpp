@@ -442,12 +442,21 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
 namespace {
 
 // Every star function but `begin` takes the frame; `begin` returns it.
+// `py.except_star.begin` yields a `!py.except_star_frame`, and this is where
+// that becomes physical: `!llvm.ptr`. It used to become an `i64`, so every one
+// of these eleven entry points opened by widening its argument back into a
+// pointer -- the direction the memory model refuses, forced by a dialect type
+// that called an identity a number.
+mlir::Type starFrameABIType(mlir::OpBuilder &builder) {
+  return mlir::LLVM::LLVMPointerType::get(builder.getContext());
+}
+
 mlir::func::FuncOp getOrCreateStarFrameFn(mlir::ModuleOp module,
                                           mlir::OpBuilder &builder,
                                           llvm::StringRef name) {
   return getOrCreatePrivateFunction(
       module, builder, name,
-      builder.getFunctionType({builder.getI64Type()}, {}));
+      builder.getFunctionType({starFrameABIType(builder)}, {}));
 }
 
 } // namespace
@@ -456,7 +465,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStarBegin(py::StarBeginOp op) {
   builder.setInsertionPoint(op);
   mlir::func::FuncOp begin = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarBegin",
-      builder.getFunctionType({}, {builder.getI64Type()}));
+      builder.getFunctionType({}, {starFrameABIType(builder)}));
   auto call = mlir::func::CallOp::create(builder, op.getLoc(), begin,
                                          mlir::ValueRange{});
   op.getResult().replaceAllUsesWith(call.getResult(0));
@@ -482,8 +491,9 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
   llvm::SmallVector<mlir::Type, 3> triple = py::runtime_library::exceptionTripleTypes(builder);
   mlir::func::FuncOp residualParts = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarResidualParts",
-      builder.getFunctionType({builder.getI64Type()}, triple));
-  llvm::SmallVector<mlir::Type, 8> applyInputs{builder.getI64Type(), builder.getI1Type()};
+      builder.getFunctionType({starFrameABIType(builder)}, triple));
+  llvm::SmallVector<mlir::Type, 8> applyInputs{starFrameABIType(builder),
+                                               builder.getI1Type()};
   applyInputs.append(triple.begin(), triple.end());
   applyInputs.append(triple.begin(), triple.end());
   mlir::func::FuncOp applyMatch = getOrCreatePrivateFunction(
@@ -491,7 +501,8 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
       builder.getFunctionType(applyInputs, {}));
   mlir::func::FuncOp hasResidual = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarHasResidual",
-      builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
+      builder.getFunctionType({starFrameABIType(builder)},
+                              {builder.getI1Type()}));
   mlir::func::FuncOp discardSplit = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarDiscardSplit",
       builder.getFunctionType(triple, {}));
@@ -588,19 +599,19 @@ RuntimeBundleLowerer::lowerStarFinish(py::StarFinishOp op) {
   mlir::Type i64 = builder.getI64Type();
   mlir::func::FuncOp collectedCount = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarCollectedCount",
-      builder.getFunctionType({builder.getI64Type()}, {i64}));
+      builder.getFunctionType({starFrameABIType(builder)}, {i64}));
   mlir::func::FuncOp hasResidual = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarHasResidual",
-      builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
+      builder.getFunctionType({starFrameABIType(builder)},
+                              {builder.getI1Type()}));
   mlir::func::FuncOp nodesPtr = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarNodesPtr",
-      builder.getFunctionType(
-          {builder.getI64Type()},
-          {mlir::LLVM::LLVMPointerType::get(builder.getContext())}));
+      builder.getFunctionType({starFrameABIType(builder)},
+                              {starFrameABIType(builder)}));
   mlir::func::FuncOp residualParts = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarResidualParts",
-      builder.getFunctionType({builder.getI64Type()}, triple));
-  llvm::SmallVector<mlir::Type, 4> throwInputs{builder.getI64Type()};
+      builder.getFunctionType({starFrameABIType(builder)}, triple));
+  llvm::SmallVector<mlir::Type, 4> throwInputs{starFrameABIType(builder)};
   throwInputs.append(triple.begin(), triple.end());
   mlir::func::FuncOp throwCombined = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarThrowCombined",

@@ -25,6 +25,7 @@ void PyDialect::initialize() {
   addTypes<ContractType, LiteralType, TypeVarType, ParamSpecType,
            TypeVarTupleType, UnpackType, InferVarType, TypeType, ProtocolType,
            ExceptionType, ExceptionCellType, TracebackType, LocationType,
+           ExceptStarFrameType,
            CallableType, UnionType, OverloadType, SelfType>();
 
   addOperations<
@@ -466,6 +467,8 @@ mlir::Type PyDialect::parseType(mlir::DialectAsmParser &parser) const {
     return ExceptionCellType::get(ctx);
   if (keyword == "traceback")
     return TracebackType::get(ctx);
+  if (keyword == "except_star_frame")
+    return ExceptStarFrameType::get(ctx);
   if (keyword == "location")
     return LocationType::get(ctx);
   parser.emitError(parser.getCurrentLocation(), "unknown py dialect type '")
@@ -585,6 +588,8 @@ void PyDialect::printType(mlir::Type type,
           [&](ExceptionCellType) { printer << "exception_cell"; })
       .Case<TracebackType>([&](TracebackType) { printer << "traceback"; })
       .Case<LocationType>([&](LocationType) { printer << "location"; })
+      .Case<ExceptStarFrameType>(
+          [&](ExceptStarFrameType) { printer << "except_star_frame"; })
       .Default(
           [&](mlir::Type) { llvm_unreachable("unknown py type to print"); });
 }
