@@ -318,8 +318,8 @@ void clearExceptionParts(SupportBuilder &b, mlir::Value parts);
 //   1 payload     -- ExceptionParts; an owning reference to object + message
 //   2 frames      -- TracebackFrame*, a malloc'd snapshot owning its names
 //   3 frameCount
-//   4 cause       -- node address, 0 = none
-//   5 context     -- node address, 0 = none
+//   4 cause       -- ExceptionChainNode*, null = none
+//   5 context     -- ExceptionChainNode*, null = none
 //   6 suppress    -- __suppress_context__
 //
 // 8 + 120 + 8 + 8 + 8 + 8 + 8 = 168 bytes, which is what the malloc asks for.

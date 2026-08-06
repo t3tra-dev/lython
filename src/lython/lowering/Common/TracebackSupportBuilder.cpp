@@ -64,16 +64,31 @@ void declareTracebackSupport(SupportBuilder &b) {
                                  "g_traceback_size",
                                  b.builder.getIntegerAttr(b.i64(), 0),
                                  /*alignment=*/8);
-    // Exception-chaining state: heap chain-node addresses (0 = none) for the
-    // in-flight exception's __context__ / __cause__, and its
-    // __suppress_context__ flag.
-    for (llvm::StringRef name :
-         {"g_exc_context_node", "g_exc_cause_node", "g_exc_suppress_context"})
-      mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
-                                   /*isConstant=*/false,
-                                   mlir::LLVM::Linkage::Internal, name,
-                                   b.builder.getIntegerAttr(b.i64(), 0),
-                                   /*alignment=*/8);
+    // Exception-chaining state: the in-flight exception's __context__ and
+    // __cause__ nodes (null = none), and its __suppress_context__ flag.
+    //
+    // The two node slots hold POINTERS. They are owner sites in the model's
+    // sense -- a global holding an owning reference -- and what a site holds is
+    // an identity, not a number that happens to be one.
+    for (llvm::StringRef name : {"g_exc_context_node", "g_exc_cause_node"}) {
+      auto global = mlir::LLVM::GlobalOp::create(
+          b.builder, b.loc, b.ptr(), /*isConstant=*/false,
+          mlir::LLVM::Linkage::Internal, name, mlir::Attribute(),
+          /*alignment=*/8);
+      mlir::OpBuilder::InsertionGuard initGuard(b.builder);
+      mlir::Block *init = b.builder.createBlock(&global.getInitializerRegion());
+      b.builder.setInsertionPointToEnd(init);
+      mlir::LLVM::ReturnOp::create(
+          b.builder, b.loc,
+          mlir::ValueRange{
+              mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr())});
+    }
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::Internal,
+                                 "g_exc_suppress_context",
+                                 b.builder.getIntegerAttr(b.i64(), 0),
+                                 /*alignment=*/8);
     // ExceptionGroup display margin: every stderr line the printers start
     // while this is >= 0 gets that many spaces plus "| " (CPython's group
     // traceback gutter). -1 = plain display.
@@ -505,11 +520,11 @@ void buildTracebackClear(SupportBuilder &b) {
 constexpr std::int64_t kChainNodeBytes = 168;
 constexpr std::int64_t kFrameBytes = 40;
 
-// void release_chain_node(i64 node): drop one reference; at zero, release the
+// void release_chain_node(ptr node): drop one reference; at zero, release the
 // chained nodes, the traceback snapshot, and the exception payload.
 void buildReleaseChainNode(SupportBuilder &b) {
   auto fn = b.beginFunction("release_chain_node",
-                            b.builder.getFunctionType({b.i64()}, {}),
+                            b.builder.getFunctionType({b.ptr()}, {}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -523,17 +538,15 @@ void buildReleaseChainNode(SupportBuilder &b) {
   mlir::Block *freePayload = b.builder.createBlock(&body);
   mlir::Block *freeNode = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
-  mlir::Value node64 = entry->getArgument(0);
+  mlir::Value node = entry->getArgument(0);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value isNull =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, node64, b.iconst(0));
+  mlir::Value isNull = b.ptrEq(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
                                  mlir::ValueRange{}, alive,
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(alive);
-  mlir::Value node = b.intToPtr(node64);
   mlir::Value refcount = b.loadI64(nodeMember(b, node, kNodeRefcount));
   mlir::Value decremented =
       mlir::arith::SubIOp::create(b.builder, b.loc, refcount, b.iconst(1));
@@ -551,9 +564,9 @@ void buildReleaseChainNode(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(destroy);
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeCause))});
+         mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeCause))});
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeContext))});
+         mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeContext))});
   mlir::cf::BranchOp::create(b.builder, b.loc, freeHead,
                              mlir::ValueRange{b.iconst(0)});
 
@@ -675,15 +688,14 @@ void buildReleaseCurrentChain(SupportBuilder &b) {
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value zero = b.iconst(0);
   for (llvm::StringRef name : {"g_exc_cause_node", "g_exc_context_node"}) {
     mlir::Value slot = b.addrOf(name);
     b.call("release_chain_node", mlir::TypeRange{},
-           mlir::ValueRange{b.loadI64(slot)});
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, zero, slot,
+           mlir::ValueRange{b.loadPtrVal(slot)});
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), slot,
                                 /*alignment=*/8);
   }
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, zero,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                               b.addrOf("g_exc_suppress_context"),
                               /*alignment=*/8);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -772,24 +784,25 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(chain);
   mlir::Value chainNode = chain->getArgument(0);
-  mlir::Value zero = b.iconst(0);
-  struct Slot {
-    llvm::StringRef global;
-    std::int32_t member;
-  };
-  for (Slot s : {Slot{"g_exc_cause_node", kNodeCause},
-                 Slot{"g_exc_context_node", kNodeContext},
-                 Slot{"g_exc_suppress_context", kNodeSuppress}}) {
-    mlir::Value global = b.addrOf(s.global);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(global),
-                                nodeMember(b, chainNode, s.member),
-                                /*alignment=*/8);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, zero, global,
+  for (llvm::StringRef name : {"g_exc_cause_node", "g_exc_context_node"}) {
+    mlir::Value global = b.addrOf(name);
+    mlir::LLVM::StoreOp::create(
+        b.builder, b.loc, b.loadPtrVal(global),
+        nodeMember(b, chainNode,
+                   name == "g_exc_cause_node" ? kNodeCause : kNodeContext),
+        /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), global,
                                 /*alignment=*/8);
   }
-  mlir::Value nodeWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), chainNode);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, nodeWord,
+  {
+    mlir::Value global = b.addrOf("g_exc_suppress_context");
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(global),
+                                nodeMember(b, chainNode, kNodeSuppress),
+                                /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), global,
+                                /*alignment=*/8);
+  }
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, chainNode,
                               b.addrOf("g_exc_context_node"), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
@@ -844,18 +857,16 @@ void buildSetCurrentCause(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value causeSlot = b.addrOf("g_exc_cause_node");
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(causeSlot)});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), causeSlot,
+         mlir::ValueRange{b.loadPtrVal(causeSlot)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), causeSlot,
                               /*alignment=*/8);
-  mlir::Value context64 = b.loadI64(b.addrOf("g_exc_context_node"));
-  mlir::Value contextMissing =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, context64, b.iconst(0));
+  mlir::Value contextNode = b.loadPtrVal(b.addrOf("g_exc_context_node"));
+  mlir::Value contextMissing = b.ptrEq(contextNode, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, contextMissing, fresh,
                                  mlir::ValueRange{}, compare,
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(compare);
-  mlir::Value contextNode = b.intToPtr(context64);
   mlir::Value contextHeader =
       b.loadPtrVal(nodePartsField(b, contextNode, 0, 1));
   mlir::Value sameObject =
@@ -871,7 +882,7 @@ void buildSetCurrentCause(SupportBuilder &b) {
       mlir::arith::AddIOp::create(b.builder, b.loc, refcount, b.iconst(1))
           .getResult(),
       nodeMember(b, contextNode, kNodeRefcount), /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, context64, causeSlot,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, contextNode, causeSlot,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
@@ -896,20 +907,17 @@ void buildSetCurrentCause(SupportBuilder &b) {
       mlir::LLVM::StoreOp::create(
           b.builder, b.loc, entry->getArgument(section * 5 + field),
           nodePartsField(b, node, section, field), /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(),
-                              nodeMember(b, node, kNodeFrames),
-                              /*alignment=*/8);
-  for (std::int32_t member :
-       {kNodeFrameCount, kNodeCause, kNodeContext, kNodeSuppress})
+  for (std::int32_t member : {kNodeFrames, kNodeCause, kNodeContext})
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(),
+                                nodeMember(b, node, member), /*alignment=*/8);
+  for (std::int32_t member : {kNodeFrameCount, kNodeSuppress})
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                                 nodeMember(b, node, member), /*alignment=*/8);
   b.call("retain_storage_raw", mlir::TypeRange{},
          mlir::ValueRange{b.ptrToInt(entry->getArgument(1))});
   b.call("retain_storage_raw", mlir::TypeRange{},
          mlir::ValueRange{b.ptrToInt(entry->getArgument(6))});
-  mlir::Value nodeWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), node);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, nodeWord, causeSlot,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, node, causeSlot,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
@@ -2171,12 +2179,12 @@ void buildPrintExceptionSummary(SupportBuilder &b) {
   emitBuffered(formattedUnknown.getResult());
 }
 
-// void print_chain_node(i64 node): one section of a chained-exception report:
+// void print_chain_node(ptr node): one section of a chained-exception report:
 // the node's own chain first (recursively), the matching separator, then its
 // traceback (when captured) and summary line.
 void buildPrintChainNode(SupportBuilder &b) {
   auto fn = b.beginFunction("print_chain_node",
-                            b.builder.getFunctionType({b.i64()}, {}),
+                            b.builder.getFunctionType({b.ptr()}, {}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -2191,20 +2199,17 @@ void buildPrintChainNode(SupportBuilder &b) {
   mlir::Block *frameOne = b.builder.createBlock(&body);
   mlir::Block *summary = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
-  mlir::Value node64 = entry->getArgument(0);
+  mlir::Value node = entry->getArgument(0);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value missing =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, node64, b.iconst(0));
+  mlir::Value missing = b.ptrEq(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, missing, done,
                                  mlir::ValueRange{}, present,
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(present);
-  mlir::Value node = b.intToPtr(node64);
-  mlir::Value cause = b.loadI64(nodeMember(b, node, kNodeCause));
-  mlir::Value haveCause =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, cause, b.iconst(0));
+  mlir::Value cause = b.loadPtrVal(nodeMember(b, node, kNodeCause));
+  mlir::Value haveCause = b.ptrNe(cause, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, haveCause, causeBlock,
                                  mlir::ValueRange{}, contextCheck,
                                  mlir::ValueRange{});
@@ -2217,10 +2222,9 @@ void buildPrintChainNode(SupportBuilder &b) {
                              mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(contextCheck);
-  mlir::Value context = b.loadI64(nodeMember(b, node, kNodeContext));
+  mlir::Value context = b.loadPtrVal(nodeMember(b, node, kNodeContext));
   mlir::Value suppress = b.loadI64(nodeMember(b, node, kNodeSuppress));
-  mlir::Value haveContext =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, context, b.iconst(0));
+  mlir::Value haveContext = b.ptrNe(context, b.nullPtr());
   mlir::Value showContext = mlir::arith::AndIOp::create(
       b.builder, b.loc, haveContext,
       b.cmpi(mlir::arith::CmpIPredicate::eq, suppress, b.iconst(0)));
@@ -2416,13 +2420,13 @@ void buildReleaseExceptionStorageRaw(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// void release_star_node(i64 node, i64 hasPayload): drop a star frame's
+// void release_star_node(ptr node, i64 hasPayload): drop a star frame's
 // residual node. With a live payload this is a plain chain-node release;
 // after the payload moved out only the shell (frames, chained nodes) is
 // left, and release_chain_node's payload release would touch a stale word.
 void buildReleaseStarNode(SupportBuilder &b) {
   auto fn = b.beginFunction("release_star_node",
-                            b.builder.getFunctionType({b.i64(), b.i64()}, {}),
+                            b.builder.getFunctionType({b.ptr(), b.i64()}, {}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -2434,11 +2438,10 @@ void buildReleaseStarNode(SupportBuilder &b) {
   mlir::Block *freeOne = b.builder.createBlock(&body);
   mlir::Block *freeDone = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
-  mlir::Value node64 = entry->getArgument(0);
+  mlir::Value node = entry->getArgument(0);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value isNull =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, node64, b.iconst(0));
+  mlir::Value isNull = b.ptrEq(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
                                  mlir::ValueRange{}, live, mlir::ValueRange{});
 
@@ -2450,15 +2453,14 @@ void buildReleaseStarNode(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(payload);
-  b.call("release_chain_node", mlir::TypeRange{}, mlir::ValueRange{node64});
+  b.call("release_chain_node", mlir::TypeRange{}, mlir::ValueRange{node});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(shell);
-  mlir::Value node = b.intToPtr(node64);
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeCause))});
+         mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeCause))});
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeContext))});
+         mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeContext))});
   mlir::cf::BranchOp::create(b.builder, b.loc, freeHead,
                              mlir::ValueRange{b.iconst(0)});
 
@@ -2747,7 +2749,7 @@ void buildStarPop(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   b.call("release_star_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(starFrameSlot(b, frame, 0)),
+         mlir::ValueRange{b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0))),
                           b.loadI64(starFrameSlot(b, frame, 1))});
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2805,7 +2807,7 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
   b.call("LyEH_UnstashException", mlir::TypeRange{},
          mlir::ValueRange{areaWord});
   b.call("release_star_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(starFrameSlot(b, frame, 0)),
+         mlir::ValueRange{b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0))),
                           b.loadI64(starFrameSlot(b, frame, 1))});
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
@@ -2851,7 +2853,7 @@ void buildStarThrowCombined(SupportBuilder &b) {
         b.builder, b.loc, b.iconst(kStarCollectedBase), position);
     b.call("release_chain_node", mlir::TypeRange{},
            mlir::ValueRange{
-               b.loadI64(b.gepI64(b.intToPtr(frame), slot))});
+               b.intToPtr(b.loadI64(b.gepI64(b.intToPtr(frame), slot)))});
   }
 
   // Residual node: its member reference moved into the group; its traceback
@@ -2904,11 +2906,11 @@ void buildStarThrowCombined(SupportBuilder &b) {
     }
     b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
     mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                                b.loadI64(nodeMember(b, node, kNodeCause)),
+                                b.loadPtrVal(nodeMember(b, node, kNodeCause)),
                                 b.addrOf("g_exc_cause_node"),
                                 /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                                b.loadI64(nodeMember(b, node, kNodeContext)),
+                                b.loadPtrVal(nodeMember(b, node, kNodeContext)),
                                 b.addrOf("g_exc_context_node"),
                                 /*alignment=*/8);
     mlir::LLVM::StoreOp::create(b.builder, b.loc,
@@ -2999,9 +3001,8 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   mlir::Block *finish = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value cause = b.loadI64(b.addrOf("g_exc_cause_node"));
-  mlir::Value haveCause =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, cause, b.iconst(0));
+  mlir::Value cause = b.loadPtrVal(b.addrOf("g_exc_cause_node"));
+  mlir::Value haveCause = b.ptrNe(cause, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, haveCause, causeBlock,
                                  mlir::ValueRange{}, contextCheck,
                                  mlir::ValueRange{});
@@ -3013,10 +3014,9 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   mlir::cf::BranchOp::create(b.builder, b.loc, header, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(contextCheck);
-  mlir::Value context = b.loadI64(b.addrOf("g_exc_context_node"));
+  mlir::Value context = b.loadPtrVal(b.addrOf("g_exc_context_node"));
   mlir::Value suppress = b.loadI64(b.addrOf("g_exc_suppress_context"));
-  mlir::Value haveContext =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, context, b.iconst(0));
+  mlir::Value haveContext = b.ptrNe(context, b.nullPtr());
   mlir::Value showContext = mlir::arith::AndIOp::create(
       b.builder, b.loc, haveContext,
       b.cmpi(mlir::arith::CmpIPredicate::eq, suppress, b.iconst(0)));

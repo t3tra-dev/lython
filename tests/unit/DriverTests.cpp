@@ -555,26 +555,28 @@ TEST(DriverTest, GeneratorObjectArgumentIsReleasedByItsCreatorToo) {
          "references, and the drop finalizer discharges only one of them";
 }
 
-// A chain node's contents never become a pointer by way of an integer.
+// The exception chain is walked with pointers, start to finish.
 //
-// The node parks an interrupted exception -- three memref descriptors, a
-// traceback snapshot, and the links to the rest of the chain. It used to be 21
-// untyped i64 words, so the three ALIGNED POINTERS were stored as integers and
-// every reader turned them back with an `inttoptr`. The memory model documents
-// `extract_aligned_pointer_as_index` as where provenance is lost and says what
-// comes back through an integer is outside it -- so those readers were building
-// descriptors the model has no sentence about.
+// A raise that interrupts the handling of another exception parks it in a heap
+// node. The node was 21 untyped i64 words and its address was a word too, so
+// the payload's three ALIGNED POINTERS were stored as integers, the links
+// between nodes were integers, and every reader turned them back with an
+// `inttoptr` before it could use them.
 //
-// The assertion is not a count. It is that every `inttoptr` left in these
-// functions converts a FUNCTION ARGUMENT: the node's own address, which callers
-// still pass as a word. Nothing they READ becomes a pointer. That stays true
-// when the optimiser renumbers or reorders, and it goes false the moment a
-// reader goes back to `load i64` + `inttoptr` -- which is what the old shape
-// forced and what this is here to stop coming back.
+// The memory model documents `extract_aligned_pointer_as_index` as where
+// provenance is lost and says what comes back through an integer is outside it
+// by its own statement -- so those readers were building descriptors, and
+// following links, that no judgment in `proof/` covers.
 //
-// When the node address itself becomes a pointer, the remaining conversions go
-// too and this can be tightened to zero.
-TEST(DriverTest, ChainNodeReadersNeverRebuildAPointerFromWhatTheyRead) {
+// The assertion is not a count: it is that these functions contain NO
+// integer-to-pointer conversion at all. They allocate nothing and receive the
+// node they work on, so there is no honest reason for one, and any that appears
+// means a slot went back to holding a word.
+//
+// Not asserted here, because they are a different slot's problem: the star
+// frame and the generator stash area still hold node addresses as words, so
+// `LyEH_StarResidualParts` and `LyEH_UnstashException` each still widen one.
+TEST(DriverTest, TheExceptionChainIsWalkedWithPointers) {
   CompileResult result = compileSource("try:\n"
                                        "    raise ValueError(\"outer\")\n"
                                        "except ValueError as e:\n"
@@ -597,25 +599,21 @@ TEST(DriverTest, ChainNodeReadersNeverRebuildAPointerFromWhatTheyRead) {
   ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
       *result.verified.llvmModule)));
 
-  // The node's readers: destruction, the traceback report, and the except*
-  // frame's residual drop.
+  // Destruction, the traceback report, the except* frame's residual drop, and
+  // the two that move the chain in and out of the process slot.
   for (const char *name :
-       {"release_chain_node", "print_chain_node", "release_star_node"}) {
+       {"release_chain_node", "print_chain_node", "release_star_node",
+        "LyEH_DiscardCurrentException", "LyEH_SetCurrentCause"}) {
     const llvm::Function *fn = result.verified.llvmModule->getFunction(name);
     ASSERT_NE(fn, nullptr)
         << name << " is gone; this test no longer looks at anything";
     for (const llvm::BasicBlock &block : *fn)
       for (const llvm::Instruction &instruction : block) {
-        const auto *cast = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
-        if (!cast)
-          continue;
-        if (llvm::isa<llvm::Argument>(cast->getOperand(0)))
+        if (!llvm::isa<llvm::IntToPtrInst>(&instruction))
           continue;
         std::string described;
-        llvm::raw_string_ostream(described) << *cast;
-        ADD_FAILURE() << name
-                      << " rebuilds a pointer from a value it computed rather "
-                         "than from its node argument:"
+        llvm::raw_string_ostream(described) << instruction;
+        ADD_FAILURE() << name << " makes a pointer out of an integer:"
                       << described;
       }
   }

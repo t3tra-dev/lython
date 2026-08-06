@@ -1643,8 +1643,8 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
   mlir::Value causeSlot = b.addrOf("g_exc_cause_node");
   b.call("release_chain_node", mlir::TypeRange{},
-         mlir::ValueRange{b.loadI64(causeSlot)});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), causeSlot,
+         mlir::ValueRange{b.loadPtrVal(causeSlot)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), causeSlot,
                               /*alignment=*/8);
   mlir::Value flagSlot = b.addrOf("g_current_exception");
   mlir::Value parts = b.addrOf("g_current_parts");
@@ -1684,9 +1684,8 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   clearExceptionParts(b, parts);
   b.call("LyTraceback_Clear", mlir::TypeRange{}, {});
   mlir::Value contextSlot = b.addrOf("g_exc_context_node");
-  mlir::Value context64 = b.loadI64(contextSlot);
-  mlir::Value haveContext =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, context64, b.iconst(0));
+  mlir::Value node = b.loadPtrVal(contextSlot);
+  mlir::Value haveContext = b.ptrNe(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, haveContext, restore,
                                  mlir::ValueRange{}, finish,
                                  mlir::ValueRange{});
@@ -1695,12 +1694,11 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   // one owner (only the discarded exception could have shared it), so its
   // members move back into the globals and only the shell is freed.
   b.builder.setInsertionPointToEnd(restore);
-  mlir::Value node = b.intToPtr(context64);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(nodeMember(b, node, kNodeCause)),
+                              b.loadPtrVal(nodeMember(b, node, kNodeCause)),
                               causeSlot, /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(nodeMember(b, node, kNodeContext)),
+                              b.loadPtrVal(nodeMember(b, node, kNodeContext)),
                               contextSlot, /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
                               b.loadI64(nodeMember(b, node, kNodeSuppress)),
@@ -1852,9 +1850,13 @@ void buildStashCurrentException(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(park);
   b.call("LyEH_StashCurrentAsContext", mlir::TypeRange{}, {});
   mlir::Value contextSlot = b.addrOf("g_exc_context_node");
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadI64(contextSlot),
-                              areaPtr, /*alignment=*/8);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), contextSlot,
+  // The area is a raw word inside generator storage, so the node's identity
+  // narrows to an address here and widens again in the unstash. That pair is
+  // the star frame's, not the chain's: it goes when the frame becomes a box.
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.ptrToInt(b.loadPtrVal(contextSlot)), areaPtr,
+                              /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), contextSlot,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(empty);
@@ -1899,10 +1901,10 @@ void buildUnstashException(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(restore);
   mlir::Value node = b.intToPtr(node64);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(nodeMember(b, node, kNodeCause)),
+                              b.loadPtrVal(nodeMember(b, node, kNodeCause)),
                               b.addrOf("g_exc_cause_node"), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.loadI64(nodeMember(b, node, kNodeContext)),
+                              b.loadPtrVal(nodeMember(b, node, kNodeContext)),
                               b.addrOf("g_exc_context_node"),
                               /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
@@ -1962,19 +1964,18 @@ void buildAdoptStashedAsContext(SupportBuilder &b) {
   mlir::Block *walk =
       b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
   mlir::Block *step =
-      b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+      b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
   mlir::Block *attach =
       b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
   mlir::Block *done = b.builder.createBlock(&body);
   mlir::Block *trap = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value areaPtr = b.intToPtr(entry->getArgument(0));
-  mlir::Value node64 = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(),
-                                                  areaPtr, /*alignment=*/8);
+  mlir::Value node = b.intToPtr(mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i64(), areaPtr, /*alignment=*/8));
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
                               /*alignment=*/8);
-  mlir::Value stashed =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, node64, b.iconst(0));
+  mlir::Value stashed = b.ptrNe(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, stashed, check,
                                  mlir::ValueRange{}, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(check);
@@ -1987,19 +1988,17 @@ void buildAdoptStashedAsContext(SupportBuilder &b) {
       mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(walk);
   mlir::Value slotPtr = walk->getArgument(0);
-  mlir::Value current = b.loadI64(slotPtr);
-  mlir::Value occupied =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, current, b.iconst(0));
+  mlir::Value current = b.loadPtrVal(slotPtr);
+  mlir::Value occupied = b.ptrNe(current, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, occupied, step,
                                  mlir::ValueRange{current}, attach,
                                  mlir::ValueRange{slotPtr});
   b.builder.setInsertionPointToEnd(step);
-  mlir::Value nextSlot =
-      nodeMember(b, b.intToPtr(step->getArgument(0)), kNodeContext);
+  mlir::Value nextSlot = nodeMember(b, step->getArgument(0), kNodeContext);
   mlir::cf::BranchOp::create(b.builder, b.loc, walk,
                              mlir::ValueRange{nextSlot});
   b.builder.setInsertionPointToEnd(attach);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, node64,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, node,
                               attach->getArgument(0), /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
@@ -2031,10 +2030,10 @@ void buildReleaseCurrentException(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(park);
   b.call("LyEH_StashCurrentAsContext", mlir::TypeRange{}, {});
   mlir::Value contextSlot = b.addrOf("g_exc_context_node");
-  mlir::Value node64 = b.loadI64(contextSlot);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), contextSlot,
+  mlir::Value node = b.loadPtrVal(contextSlot);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), contextSlot,
                               /*alignment=*/8);
-  b.call("release_chain_node", mlir::TypeRange{}, mlir::ValueRange{node64});
+  b.call("release_chain_node", mlir::TypeRange{}, mlir::ValueRange{node});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2338,7 +2337,7 @@ mlir::Type exceptionChainNodeType(SupportBuilder &b) {
       b.builder.getContext(), "ExceptionChainNode");
   if (type.getBody().empty())
     (void)type.setBody({b.i64(), exceptionPartsType(b), b.ptr(), b.i64(),
-                        b.i64(), b.i64(), b.i64()},
+                        b.ptr(), b.ptr(), b.i64()},
                        /*isPacked=*/false);
   return type;
 }
