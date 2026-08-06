@@ -1701,7 +1701,7 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   // free()'s own contract, and going through it would mean handing the node a
   // word back.
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
-  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
+  freeSoleChainNode(b, node, "LyEH_DiscardCurrentException");
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(finish);
@@ -1901,7 +1901,7 @@ void buildUnstashException(SupportBuilder &b) {
                                 b.addrOf("g_traceback_size"), /*alignment=*/8);
   }
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
-  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
+  freeSoleChainNode(b, node, "LyEH_UnstashException");
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), areaPtr,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
@@ -2353,6 +2353,16 @@ mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
   return mlir::UnrealizedConversionCastOp::create(
              b.builder, b.loc, mlir::TypeRange{memrefType}, descriptor)
       .getResult(0);
+}
+
+void freeSoleChainNode(SupportBuilder &b, mlir::Value node,
+                       llvm::StringRef site) {
+  mlir::Value refcount = b.loadI64(nodeMember(b, node, kNodeRefcount));
+  mlir::cf::AssertOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, refcount, b.iconst(1)),
+      ("chain node still shared at " + site).str());
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
 }
 
 mlir::Value typeSizeBytes(SupportBuilder &b, mlir::Type type) {

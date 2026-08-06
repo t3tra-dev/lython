@@ -340,6 +340,21 @@ mlir::Type exceptionChainNodeType(SupportBuilder &b);
 mlir::Value nodeMember(SupportBuilder &b, mlir::Value node,
                        std::int32_t member);
 
+// Free a chain node whose caller believes it is the last owner.
+//
+// The node has a refcount and `release_chain_node` honours it: decrement, and
+// destroy only at zero. Four callers do not go through it -- they move the
+// node's members out and free the shell -- and each was correct only at one
+// owner, a belief recorded in a comment and enforced nowhere. A second owner
+// would not have been a diagnosed failure; it would have been that owner
+// reading freed memory.
+//
+// The object refcount already has this check (`release_storage_raw_to_zero
+// observed non-positive refcount`). The node's had no counterpart, which is
+// the whole difference between a refcount and a number in a struct.
+void freeSoleChainNode(SupportBuilder &b, mlir::Value node,
+                       llvm::StringRef site);
+
 // ---------------------------------------------------------------------------
 // The stash cell: one slot holding a parked chain node, or null.
 //

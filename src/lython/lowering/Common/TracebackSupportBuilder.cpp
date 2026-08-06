@@ -2460,7 +2460,7 @@ void buildReleaseStarNode(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(freeDone);
   b.call("free", mlir::TypeRange{},
          mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeFrames))});
-  b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
+  freeSoleChainNode(b, node, "release_star_node");
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
@@ -2837,7 +2837,7 @@ void buildStarThrowCombined(SupportBuilder &b) {
                                 b.loadI64(nodeMember(b, node, kNodeSuppress)),
                                 b.addrOf("g_exc_suppress_context"),
                                 /*alignment=*/8);
-    b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
+    freeSoleChainNode(b, node, "LyEH_StarThrowCombined");
   }
 
   // Install the combined exception and throw.
