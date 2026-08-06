@@ -53,16 +53,27 @@ mlir::Value RuntimeBundleLowerer::memrefFromBoxPointer(mlir::OpBuilder &builder,
       .getResult(0);
 }
 
-// ⛔ Same view, from a WORD. Every use is a place the payload's address was
-// stored as an integer and has to be widened back, which the memory model
-// says produces something outside it: `extract_aligned_pointer_as_index` is
-// documented there as where provenance is lost.
+// Same view, from a WORD, because a boxed payload slot holds one.
 //
-// It is still correct for what it is used for -- a boxed element's payload
-// slot holds a word, and reading it is the only way to reach the payload. The
-// fix is not here; it is the slot, which should hold a pointer the way the
-// exception chain node's now does. Until then this is the meter: a call to
-// this is a launder, a call to `memrefFromBoxPointer` is not.
+// ⛔ Do not "fix" this the way the exception chain node and the module-global
+// cell were fixed. Those held a word by choice; a box cannot hold anything
+// else. A box is a `memref<16xi64>` (BoxLayout.h) and MLIR refuses a pointer
+// element type outright -- `memref<4x!llvm.ptr>` is "invalid memref element
+// type", checked, not assumed. Every reference a boxed object owns is an
+// address in an integer, and that is the memref dialect's constraint rather
+// than this compiler's decision.
+//
+// What makes it sound is not silence but `descFromAlignedPointer`
+// (Proof.MemRef.Dialect), which is the model's rule for exactly this: an
+// address may become a descriptor again given that the allocation is live and
+// the generation matches. Both obligations are discharged structurally --
+// liveness by the reference the slot owns, and the generation by there being no
+// `memref.realloc` anywhere in this compiler, so no allocation's generation can
+// change under a held word.
+//
+// So the remaining meter is not "is this called" but "is the slot's reference
+// still held", which is the affine-ownership verifier's question, not this
+// function's.
 mlir::Value RuntimeBundleLowerer::memrefFromBoxWords(mlir::OpBuilder &builder,
                                                      mlir::Location loc,
                                                      mlir::Value pointerWord,

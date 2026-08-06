@@ -6,6 +6,32 @@
 // support module (RuntimeSupportBuilder) and every lower* TU that probes or
 // rebuilds boxed payloads must agree on these offsets; they are defined only
 // here.
+//
+// ⛔ WHY THE POINTER WORDS ARE WORDS, since two other slots in this tree were
+// changed to hold real pointers and this one cannot be.
+//
+// A box is a `memref<16xi64>`, and a memref's element type cannot be a pointer:
+// MLIR rejects `memref<4x!llvm.ptr>` with "invalid memref element type"
+// (checked with mlir-opt, not assumed). `memref<4xindex>` is accepted and is
+// the same thing -- an integer. So an object graph cannot be built inside the
+// memref dialect at all: every reference a boxed object owns is an address in
+// an integer, and reading it back is `inttoptr` by construction. The exception
+// chain node and the module-global cell were different -- they were LLVM
+// globals and structs holding a word by choice, and they now hold pointers.
+//
+// This is governed rather than merely tolerated. `Proof.MemRef.Dialect` models
+// the trip out (`extractAlignedPointerAsIndex`, yielding an identity rather
+// than a number) and the trip back (`descFromAlignedPointer`), the second
+// premised on the allocation being live and its generation current. This
+// compiler discharges both structurally: the slot owns a retained reference,
+// and `memref.realloc` appears nowhere, so no generation moves under a held
+// word. `recovered-identity` is the theorem that what comes back names the same
+// object -- which is what `field′` in the refcount layer means by "holds".
+//
+// The 97 manifest signatures that spell `memref<16xi64>` are therefore not a
+// migration waiting to happen. Changing them would mean pushing LLVM struct
+// types through the manifest surface, and the reason to do it would have to be
+// something other than the pointer words.
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"

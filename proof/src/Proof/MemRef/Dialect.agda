@@ -235,9 +235,68 @@ record AlignedPointer : Set where
     ptrGeneration : Generation
     ptrByteOffset : ℕ
 
+open AlignedPointer public
+
 extractAlignedPointerAsIndex : ∀ {r} → Desc r → AlignedPointer
 extractAlignedPointerAsIndex d =
   alignedPtr (allocation d) (generation d) (alignedBase d)
+
+-- The way back, which the record above named as an obligation and the model
+-- then did not have. `AlignedPointer` said what a verified use MAY HOLD;
+-- nothing said what it may then do, so every use in the compiler was outside
+-- the model rather than governed by it -- and that is not a small corner. A
+-- `memref` cannot have a pointer element type (MLIR: "invalid memref element
+-- type"), so EVERY reference Lython's boxed objects store in a payload slot is
+-- an address in an `i64`, and reading one back is this op's inverse. Silence
+-- was not a prohibition; it was a gap, and the gap is where the compiler lives.
+--
+-- It is not free. The record's own note said the refinement to a machine
+-- address "has to prove the identity is still live at the point of use", and
+-- that is these three guards -- the same three `resolveIn` opens with, for the
+-- same reason and reported as the same faults. A pointer whose block was freed
+-- is `use-after-free`; one whose id was reused is `stale-generation`; the two
+-- are different mistakes and the enumeration exists to keep them apart.
+--
+-- Why NOT a fault of its own for "reconstituted from a stale pointer": it would
+-- name the same two states a second time, and a safety theorem that says which
+-- guarantee was broken is worth more than one that says where.
+--
+-- What comes back is a ROOT descriptor -- offset 0, unit stride, the caller's
+-- element type and count. It is not the descriptor that was taken apart: the
+-- sizes and strides did not survive the trip, because the op does not carry
+-- them. A caller that needs them has to know the shape statically, which is
+-- exactly the "contract → physical shape relation is static" the box layout
+-- relies on.
+descFromAlignedPointer : Heap → AlignedPointer → (τ : ElemTy) → (count : ℕ) →
+                         Result MemoryFault (Desc 1)
+descFromAlignedPointer h p τ count with lookupBlock h (ptrAllocation p)
+... | nothing = err no-such-allocation
+... | just b with generation b ≟ ptrGeneration p | liveness b
+...   | no  _ | _    = err stale-generation
+...   | yes _ | dead = err use-after-free
+...   | yes _ | live =
+        ok (desc (ptrAllocation p) (ptrGeneration p) (ptrByteOffset p)
+                 (+ 0) (count ∷ []) ((+ 1) ∷ []) τ (space b))
+
+-- Whenever the way back succeeds, what comes back names the SAME allocation and
+-- generation the pointer named.
+--
+-- This is the property the refcount layer's field sites assume without ever
+-- being in a position to state it: `field′ o k` says a slot HOLDS object `o`,
+-- and physically the slot holds an address. Without this, "holds `o`" and "holds
+-- the bytes an address led to" are two claims with nothing joining them, and
+-- `fieldRC`'s coherence would be counting one while the machine did the other.
+recovered-identity :
+  ∀ (h : Heap) (p : AlignedPointer) (τ : ElemTy) (count : ℕ) (d : Desc 1) →
+  descFromAlignedPointer h p τ count ≡ ok d →
+  (allocation d ≡ ptrAllocation p) × (generation d ≡ ptrGeneration p)
+recovered-identity h p τ count d eq with lookupBlock h (ptrAllocation p)
+recovered-identity h p τ count d () | nothing
+recovered-identity h p τ count d eq | just b
+  with generation b ≟ ptrGeneration p | liveness b
+recovered-identity h p τ count d () | just b | no  _ | _
+recovered-identity h p τ count d () | just b | yes _ | dead
+recovered-identity h p τ count d refl | just b | yes _ | live = refl , refl
 
 -- memref.prefetch : a hint. No memory effect, and in particular NOT a licence
 -- to touch memory that would fault -- MLIR requires the address be valid.
