@@ -517,7 +517,6 @@ void buildTracebackClear(SupportBuilder &b) {
 // them -- the direction the memory model refuses.
 // ---------------------------------------------------------------------------
 
-constexpr std::int64_t kChainNodeBytes = 168;
 constexpr std::int64_t kFrameBytes = 40;
 
 // void release_chain_node(ptr node): drop one reference; at zero, release the
@@ -726,7 +725,7 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(stash);
   b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
   mlir::Value node =
-      b.call("malloc", b.ptr(), mlir::ValueRange{b.iconst(kChainNodeBytes)})
+      b.call("malloc", b.ptr(), mlir::ValueRange{typeSizeBytes(b, exceptionChainNodeType(b))})
           .front();
   mlir::Value allocFailed = b.ptrEq(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, allocFailed, trap,
@@ -888,7 +887,7 @@ void buildSetCurrentCause(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(fresh);
   mlir::Value node =
-      b.call("malloc", b.ptr(), mlir::ValueRange{b.iconst(kChainNodeBytes)})
+      b.call("malloc", b.ptr(), mlir::ValueRange{typeSizeBytes(b, exceptionChainNodeType(b))})
           .front();
   mlir::Value allocFailed = b.ptrEq(node, b.nullPtr());
   auto trapIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
@@ -2346,18 +2345,9 @@ void buildPrintChainNode(SupportBuilder &b) {
 // chain into one node) and owns the unmatched residual between clauses plus
 // every exception a clause body raised.
 //
-// Frame layout (36 i64 words, 288 bytes):
-//   0      residual chain node (parks payload/tb/chain; 0 before begin)
-//   1      residual-present flag (the node outlives its payload: it stays as
-//          the traceback/chain donor after the last slice matched)
-//   2      collected count
-//   3      parent frame (0 = outermost)
-//   4..36  collected chain nodes (one per clause body that raised)
+// The layout is `starFrameType` (SupportBuilder.h), which also says what the
+// removed `parent` word was for.
 // ---------------------------------------------------------------------------
-
-constexpr std::int64_t kStarFrameBytes = 288;
-constexpr std::int64_t kStarCollectedBase = 4;
-constexpr std::int64_t kStarCollectedLimit = 32;
 
 // The frame is the first argument of every star function now. It used to be a
 // mutable global holding a raw pointer, with slot 3 linking the frames into a
@@ -2370,8 +2360,8 @@ mlir::Value starFrameArg(mlir::func::FuncOp fn) {
 }
 
 mlir::Value starFrameSlot(SupportBuilder &b, mlir::Value frame,
-                          std::int64_t slot) {
-  return b.gepI64(b.intToPtr(frame), b.iconst(slot));
+                          std::int32_t member) {
+  return starFrameMember(b, b.intToPtr(frame), member);
 }
 
 // void release_exception_storage_raw(i64 eh, i64 mh, i64 mb): one owned
@@ -2484,7 +2474,8 @@ void buildStarBegin(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame =
-      b.call("malloc", b.ptr(), mlir::ValueRange{b.iconst(kStarFrameBytes)})
+      b.call("malloc", b.ptr(),
+             mlir::ValueRange{typeSizeBytes(b, starFrameType(b))})
           .front();
   mlir::Value allocFailed = b.ptrEq(frame, b.nullPtr());
   mlir::cf::AssertOp::create(
@@ -2495,19 +2486,19 @@ void buildStarBegin(SupportBuilder &b) {
               .getResult()),
       "except* frame allocation failed");
   mlir::LLVM::MemsetOp::create(b.builder, b.loc, frame, b.iconst8(0),
-                               b.iconst(kStarFrameBytes),
+                               typeSizeBytes(b, starFrameType(b)),
                                /*isVolatile=*/false);
-  mlir::Value frameWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), frame);
+  mlir::Value frameWord = b.ptrToInt(frame);
   b.call("LyEH_StashCurrentException", mlir::TypeRange{},
-         mlir::ValueRange{frameWord});
-  mlir::Value node = b.loadI64(frame);
-  mlir::Value present = b.cmpi(mlir::arith::CmpIPredicate::ne, node,
-                               b.iconst(0));
+         mlir::ValueRange{starFrameMember(b, frame, kStarResidual)});
+  mlir::Value node =
+      b.loadPtrVal(starFrameMember(b, frame, kStarResidual));
+  mlir::Value present = b.ptrNe(node, b.nullPtr());
   mlir::Value presentWord = mlir::arith::ExtUIOp::create(
       b.builder, b.loc, b.i64(), present);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, presentWord,
-                              b.gepI64(frame, b.iconst(1)), /*alignment=*/8);
+                              starFrameMember(b, frame, kStarPresent),
+                              /*alignment=*/8);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{frameWord});
 }
 
@@ -2520,7 +2511,7 @@ void buildStarHasResidual(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   mlir::Value present =
-      b.loadI64(starFrameSlot(b, frame, 1));
+      b.loadI64(starFrameSlot(b, frame, kStarPresent));
   mlir::Value result =
       b.cmpi(mlir::arith::CmpIPredicate::ne, present, b.iconst(0));
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
@@ -2535,7 +2526,7 @@ void buildStarResidualParts(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
-  mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
+  mlir::Value node = b.loadPtrVal(starFrameSlot(b, frame, kStarResidual));
   llvm::SmallVector<mlir::Type, 3> types = exceptionTripleTypes(b.builder);
   llvm::SmallVector<mlir::Value, 3> results;
   // Sizes come from the contract, not the stored descriptor: the header
@@ -2568,7 +2559,7 @@ void buildStarApplyMatch(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
-  mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
+  mlir::Value node = b.loadPtrVal(starFrameSlot(b, frame, kStarResidual));
   mlir::Value payload = nodeMember(b, node, kNodePayload);
 
   // Drop the frame's reference to the old residual payload.
@@ -2587,11 +2578,11 @@ void buildStarApplyMatch(SupportBuilder &b) {
     b.builder.setInsertionPointToStart(&restIf.getThenRegion().front());
     storeExceptionTriple(b, payload, entry->getArguments().slice(5, 3));
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(1),
-                                starFrameSlot(b, frame, 1), /*alignment=*/8);
+                                starFrameSlot(b, frame, kStarPresent), /*alignment=*/8);
     b.builder.setInsertionPointToStart(&restIf.getElseRegion().front());
     clearExceptionParts(b, payload);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
-                                starFrameSlot(b, frame, 1), /*alignment=*/8);
+                                starFrameSlot(b, frame, kStarPresent), /*alignment=*/8);
   }
 
   // Matched becomes the current exception.
@@ -2649,22 +2640,17 @@ void buildStarCollect(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
-  mlir::Value count = b.loadI64(starFrameSlot(b, frame, 2));
+  mlir::Value count = b.loadI64(starFrameSlot(b, frame, kStarCollected));
   mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::slt, count,
-                               b.iconst(kStarCollectedLimit));
+                               b.iconst(kStarClauseLimit));
   mlir::cf::AssertOp::create(b.builder, b.loc, inRange,
                              "except* clause raise limit exceeded");
-  mlir::Value slot = mlir::arith::AddIOp::create(
-      b.builder, b.loc, b.iconst(kStarCollectedBase), count);
-  mlir::Value area = b.gepI64(b.intToPtr(frame), slot);
-  mlir::Value areaWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
   b.call("LyEH_StashCurrentException", mlir::TypeRange{},
-         mlir::ValueRange{areaWord});
+         mlir::ValueRange{starClauseCell(b, b.intToPtr(frame), count)});
   mlir::Value next =
       mlir::arith::AddIOp::create(b.builder, b.loc, count, b.iconst(1));
   mlir::LLVM::StoreOp::create(b.builder, b.loc, next,
-                              starFrameSlot(b, frame, 2), /*alignment=*/8);
+                              starFrameSlot(b, frame, kStarCollected), /*alignment=*/8);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -2674,19 +2660,19 @@ void buildStarCollectedCount(SupportBuilder &b) {
                             b.builder.getFunctionType({b.i64()}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value count = b.loadI64(starFrameSlot(b, starFrameArg(fn), 2));
+  mlir::Value count =
+      b.loadI64(starFrameSlot(b, starFrameArg(fn), kStarCollected));
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
 }
 
 void buildStarNodesPtr(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StarNodesPtr",
-                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
+                            b.builder.getFunctionType({b.i64()}, {b.ptr()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value base = starFrameSlot(b, starFrameArg(fn), kStarCollectedBase);
-  mlir::Value word =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), base);
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{word});
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{starFrameSlot(b, starFrameArg(fn), kStarClauses)});
 }
 
 // void star_pop_frame(): unlink and free the frame shell (payload handling
@@ -2698,8 +2684,8 @@ void buildStarPop(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   b.call("release_star_node", mlir::TypeRange{},
-         mlir::ValueRange{b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0))),
-                          b.loadI64(starFrameSlot(b, frame, 1))});
+         mlir::ValueRange{b.loadPtrVal(starFrameSlot(b, frame, kStarResidual)),
+                          b.loadI64(starFrameSlot(b, frame, kStarPresent))});
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -2732,11 +2718,8 @@ void buildStarRethrowResidual(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
-  mlir::Value area = starFrameSlot(b, frame, 0);
-  mlir::Value areaWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
   b.call("LyEH_UnstashException", mlir::TypeRange{},
-         mlir::ValueRange{areaWord});
+         mlir::ValueRange{starFrameSlot(b, frame, kStarResidual)});
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2750,14 +2733,12 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
-  mlir::Value area = starFrameSlot(b, frame, kStarCollectedBase);
-  mlir::Value areaWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), area);
   b.call("LyEH_UnstashException", mlir::TypeRange{},
-         mlir::ValueRange{areaWord});
+         mlir::ValueRange{
+             starClauseCell(b, b.intToPtr(frame), b.iconst(0))});
   b.call("release_star_node", mlir::TypeRange{},
-         mlir::ValueRange{b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0))),
-                          b.loadI64(starFrameSlot(b, frame, 1))});
+         mlir::ValueRange{b.loadPtrVal(starFrameSlot(b, frame, kStarResidual)),
+                          b.loadI64(starFrameSlot(b, frame, kStarPresent))});
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
   b.call("star_throw_pending", mlir::TypeRange{}, {});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2779,7 +2760,7 @@ void buildStarThrowCombined(SupportBuilder &b) {
 
   // Collected nodes: the combined group retained each member, so a plain
   // node release moves ownership to the group.
-  mlir::Value count = b.loadI64(starFrameSlot(b, frame, 2));
+  mlir::Value count = b.loadI64(starFrameSlot(b, frame, kStarCollected));
   mlir::Value countIndex = mlir::arith::IndexCastOp::create(
       b.builder, b.loc, b.builder.getIndexType(), count);
   mlir::Value zeroIndex =
@@ -2793,25 +2774,21 @@ void buildStarThrowCombined(SupportBuilder &b) {
     b.builder.setInsertionPointToStart(releaseLoop.getBody());
     mlir::Value position = mlir::arith::IndexCastOp::create(
         b.builder, b.loc, b.i64(), releaseLoop.getInductionVar());
-    mlir::Value slot = mlir::arith::AddIOp::create(
-        b.builder, b.loc, b.iconst(kStarCollectedBase), position);
     b.call("release_chain_node", mlir::TypeRange{},
-           mlir::ValueRange{
-               b.intToPtr(b.loadI64(b.gepI64(b.intToPtr(frame), slot)))});
+           mlir::ValueRange{b.loadPtrVal(
+               starClauseCell(b, b.intToPtr(frame), position))});
   }
 
   // Residual node: its member reference moved into the group; its traceback
   // and chain become the combined exception's, and the shell dies.
-  mlir::Value node64 = b.loadI64(starFrameSlot(b, frame, 0));
-  mlir::Value hasNode =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, node64, b.iconst(0));
+  mlir::Value node = b.loadPtrVal(starFrameSlot(b, frame, kStarResidual));
+  mlir::Value hasNode = b.ptrNe(node, b.nullPtr());
   auto nodeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
                                         hasNode, /*withElseRegion=*/false);
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&nodeIf.getThenRegion().front());
-    mlir::Value node = b.intToPtr(node64);
-    mlir::Value hadPayload = b.loadI64(starFrameSlot(b, frame, 1));
+    mlir::Value hadPayload = b.loadI64(starFrameSlot(b, frame, kStarPresent));
     mlir::Value payloadLive = b.cmpi(mlir::arith::CmpIPredicate::ne,
                                      hadPayload, b.iconst(0));
     auto payloadIf = mlir::scf::IfOp::create(

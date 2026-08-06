@@ -594,7 +594,9 @@ RuntimeBundleLowerer::lowerStarFinish(py::StarFinishOp op) {
       builder.getFunctionType({builder.getI64Type()}, {builder.getI1Type()}));
   mlir::func::FuncOp nodesPtr = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarNodesPtr",
-      builder.getFunctionType({builder.getI64Type()}, {i64}));
+      builder.getFunctionType(
+          {builder.getI64Type()},
+          {mlir::LLVM::LLVMPointerType::get(builder.getContext())}));
   mlir::func::FuncOp residualParts = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarResidualParts",
       builder.getFunctionType({builder.getI64Type()}, triple));

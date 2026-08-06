@@ -1797,20 +1797,20 @@ void buildTakeCurrentDescriptor(SupportBuilder &b) {
 // 48) for the suspended body's token, and in a resume driver's stack frame
 // for the resumer's own context.
 
-// void LyEH_StashCurrentException(i64 area): move the pending token (if
-// any) out of the process slot (parts + traceback + chain globals) into a
-// chain node parked in the area. Closes the native catch scope like any
-// other slot consumer.
+// void LyEH_StashCurrentException(ptr cell): move the pending token (if any)
+// out of the process slot (parts + traceback + chain globals) into a chain
+// node parked in the cell. Closes the native catch scope like any other slot
+// consumer.
 void buildStashCurrentException(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_StashCurrentException",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *park = b.builder.createBlock(&body);
   mlir::Block *empty = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value areaPtr = b.intToPtr(entry->getArgument(0));
+  mlir::Value areaPtr = entry->getArgument(0);
   mlir::Value pending = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
       /*alignment=*/4);
@@ -1823,14 +1823,13 @@ void buildStashCurrentException(SupportBuilder &b) {
   // The area is a raw word inside generator storage, so the node's identity
   // narrows to an address here and widens again in the unstash. That pair is
   // the star frame's, not the chain's: it goes when the frame becomes a box.
-  mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.ptrToInt(b.loadPtrVal(contextSlot)), areaPtr,
-                              /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.loadPtrVal(contextSlot),
+                              areaPtr, /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), contextSlot,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(empty);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), areaPtr,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
@@ -1846,7 +1845,7 @@ void buildStashCurrentException(SupportBuilder &b) {
 // cannot happen).
 void buildUnstashException(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_UnstashException",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *check = b.builder.createBlock(&body);
@@ -1854,11 +1853,9 @@ void buildUnstashException(SupportBuilder &b) {
   mlir::Block *done = b.builder.createBlock(&body);
   mlir::Block *trap = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value areaPtr = b.intToPtr(entry->getArgument(0));
-  mlir::Value node64 = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(),
-                                                  areaPtr, /*alignment=*/8);
-  mlir::Value stashed =
-      b.cmpi(mlir::arith::CmpIPredicate::ne, node64, b.iconst(0));
+  mlir::Value areaPtr = entry->getArgument(0);
+  mlir::Value node = b.loadPtrVal(areaPtr);
+  mlir::Value stashed = b.ptrNe(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, stashed, check,
                                  mlir::ValueRange{}, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(check);
@@ -1869,7 +1866,6 @@ void buildUnstashException(SupportBuilder &b) {
                                  mlir::ValueRange{}, restore,
                                  mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(restore);
-  mlir::Value node = b.intToPtr(node64);
   mlir::LLVM::StoreOp::create(b.builder, b.loc,
                               b.loadPtrVal(nodeMember(b, node, kNodeCause)),
                               b.addrOf("g_exc_cause_node"), /*alignment=*/8);
@@ -1906,7 +1902,7 @@ void buildUnstashException(SupportBuilder &b) {
   }
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{frames});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{node});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), areaPtr,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
@@ -1927,7 +1923,7 @@ void buildUnstashException(SupportBuilder &b) {
 // would strand the node in globals no raise path owns, so that is a trap.
 void buildAdoptStashedAsContext(SupportBuilder &b) {
   auto fn = b.beginFunction("LyEH_AdoptStashedAsContext",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *check = b.builder.createBlock(&body);
@@ -1940,10 +1936,9 @@ void buildAdoptStashedAsContext(SupportBuilder &b) {
   mlir::Block *done = b.builder.createBlock(&body);
   mlir::Block *trap = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value areaPtr = b.intToPtr(entry->getArgument(0));
-  mlir::Value node = b.intToPtr(mlir::LLVM::LoadOp::create(
-      b.builder, b.loc, b.i64(), areaPtr, /*alignment=*/8));
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), areaPtr,
+  mlir::Value areaPtr = entry->getArgument(0);
+  mlir::Value node = b.loadPtrVal(areaPtr);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), areaPtr,
                               /*alignment=*/8);
   mlir::Value stashed = b.ptrNe(node, b.nullPtr());
   mlir::cf::CondBranchOp::create(b.builder, b.loc, stashed, check,
@@ -2358,6 +2353,43 @@ mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
   return mlir::UnrealizedConversionCastOp::create(
              b.builder, b.loc, mlir::TypeRange{memrefType}, descriptor)
       .getResult(0);
+}
+
+mlir::Value typeSizeBytes(SupportBuilder &b, mlir::Type type) {
+  mlir::Value end = mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), type, b.nullPtr(),
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(1)});
+  return b.ptrToInt(end);
+}
+
+mlir::Type starFrameType(SupportBuilder &b) {
+  auto type = mlir::LLVM::LLVMStructType::getIdentified(b.builder.getContext(),
+                                                        "ExceptStarFrame");
+  if (type.getBody().empty())
+    (void)type.setBody(
+        {stashCellType(b), b.i64(), b.i64(),
+         mlir::LLVM::LLVMArrayType::get(stashCellType(b), kStarClauseLimit)},
+        /*isPacked=*/false);
+  return type;
+}
+
+mlir::Value starFrameMember(SupportBuilder &b, mlir::Value frame,
+                            std::int32_t member) {
+  return mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), starFrameType(b), frame,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
+                                         mlir::LLVM::GEPArg(member)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
+}
+
+mlir::Value starClauseCell(SupportBuilder &b, mlir::Value frame,
+                           mlir::Value index) {
+  return mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), starFrameType(b), frame,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(0),
+                                         mlir::LLVM::GEPArg(kStarClauses),
+                                         mlir::LLVM::GEPArg(index)},
+      mlir::LLVM::GEPNoWrapFlags::inbounds);
 }
 
 void storeExceptionTriple(SupportBuilder &b, mlir::Value parts,

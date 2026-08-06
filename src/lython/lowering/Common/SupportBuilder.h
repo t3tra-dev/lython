@@ -339,6 +339,55 @@ enum ChainNodeMember : std::int32_t {
 mlir::Type exceptionChainNodeType(SupportBuilder &b);
 mlir::Value nodeMember(SupportBuilder &b, mlir::Value node,
                        std::int32_t member);
+
+// ---------------------------------------------------------------------------
+// The stash cell: one slot holding a parked chain node, or null.
+//
+// Three functions own it -- `LyEH_StashCurrentException` fills it,
+// `LyEH_UnstashException` empties it, `LyEH_AdoptStashedAsContext` moves what
+// is in it -- and nothing else reads or writes one. That is why it can hold a
+// POINTER even where its bytes belong to a `memref<?xi64>`: a memref cannot
+// have a pointer element type, but nothing here goes through the memref. The
+// callers hand over the cell's address, not its contents.
+//
+// The two kinds of caller are a suspended generator (its storage, and a stack
+// slot for the resumer's context) and an except* frame (its residual, and one
+// per clause body that raised).
+inline mlir::Type stashCellType(SupportBuilder &b) { return b.ptr(); }
+
+// ---------------------------------------------------------------------------
+// The except* frame (PEP 654): the residual exception between clauses plus
+// everything the clause bodies raised, each parked as a chain node.
+//
+//   0 residual   -- stash cell; the caught exception, null before begin
+//   1 present    -- the node outlives its payload, staying on as the
+//                   traceback/chain donor after the last slice matched
+//   2 collected  -- how many of the array below are in use
+//   3 clauses[32]-- stash cells, one per clause body that raised
+//
+// A `parent` word used to sit between 2 and 3, linking frames into a stack.
+// The frame is an SSA value now, so nesting is lexical and the word had no
+// remaining reader.
+enum StarFrameMember : std::int32_t {
+  kStarResidual = 0,
+  kStarPresent = 1,
+  kStarCollected = 2,
+  kStarClauses = 3,
+};
+
+inline constexpr std::int64_t kStarClauseLimit = 32;
+
+// `sizeof(type)` as an i64, by the GEP-on-null trick MLIR gives no op for.
+// Written rather than a constant because both callers malloc exactly one of
+// these and a constant that drifts from the struct is a heap overrun.
+mlir::Value typeSizeBytes(SupportBuilder &b, mlir::Type type);
+
+mlir::Type starFrameType(SupportBuilder &b);
+mlir::Value starFrameMember(SupportBuilder &b, mlir::Value frame,
+                            std::int32_t member);
+// &frame->clauses[index]; the index is dynamic.
+mlir::Value starClauseCell(SupportBuilder &b, mlir::Value frame,
+                           mlir::Value index);
 mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
                            std::int32_t section, std::int32_t field);
 

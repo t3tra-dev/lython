@@ -1969,7 +1969,7 @@ module attributes {
   // chain-node exceptions (in raise order) followed by the residual. Member
   // references are retained here; the caller still releases the nodes (their
   // reference moves to the group, net one owner).
-  func.func private @__ly_exc_star_combine(%nodes_word: i64, %count: i64, %has_res: i1, %res_eh: memref<3xi64>, %res_mh: memref<2xi64>, %res_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_combine"} {
+  func.func private @__ly_exc_star_combine(%nodes_ptr: !llvm.ptr, %count: i64, %has_res: i1, %res_eh: memref<3xi64>, %res_mh: memref<2xi64>, %res_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "star_combine"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -1978,7 +1978,6 @@ module attributes {
     %group_id = arith.constant 102 : i64
     %base_group_id = arith.constant 101 : i64
     %payload_slot = arith.constant 3 : i64
-    %nodes_ptr = llvm.inttoptr %nodes_word : i64 to !llvm.ptr
     %res_inc = arith.extui %has_res : i1 to i64
     %total = arith.addi %count, %res_inc : i64
     %true_v = arith.constant true
@@ -1988,19 +1987,29 @@ module attributes {
     %c12 = arith.constant 12 : i64
     %c14 = arith.constant 14 : i64
 
-    // Borrowed member views out of a parked chain node (TracebackSupportBuilder
-    // layout: aligned pointers at words 2/7/12, message byte size at 14).
+    // Borrowed member views out of a parked chain node.
+    //
+    // DO NOT REORDER `ExceptionChainNode` WITHOUT CHANGING THESE. The offsets
+    // are that struct's (SupportBuilder.h), spelled here
+    // as word indices because a manifest body has no way to name a C++ struct.
+    // Nothing checks the two agree -- when the node stopped being 21 untyped
+    // words and became a struct, these kept working only because that change
+    // preserved every offset. A reordering would not fail to build; it would
+    // read the wrong field.
+    //
+    // The clause cells and the node's aligned members hold POINTERS, so they
+    // are loaded as pointers. The narrowing at the view calls is the one place
+    // left where an address becomes a word, and it is
+    // `__ly_global_view_*`'s signature that forces it.
     %count_index = arith.index_cast %count : i64 to index
 
     // ExceptionGroup unless any member falls outside Exception.
     %all_exc = scf.for %i = %c0 to %count_index step %c1 iter_args(%acc = %true_v) -> (i1) {
       %i64v = arith.index_cast %i : index to i64
-      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %node_word = llvm.load %node_slot : !llvm.ptr -> i64
-      %node_ptr = llvm.inttoptr %node_word : i64 to !llvm.ptr
+      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr
+      %node_ptr = llvm.load %node_slot : !llvm.ptr -> !llvm.ptr
       %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %eh_word = llvm.load %eh_slot : !llvm.ptr -> i64
-      %eh_ptr = llvm.inttoptr %eh_word : i64 to !llvm.ptr
+      %eh_ptr = llvm.load %eh_slot : !llvm.ptr -> !llvm.ptr
       %class_slot = llvm.getelementptr %eh_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_id = llvm.load %class_slot : !llvm.ptr -> i64
       %is_exc = func.call @LyEH_ClassIdMatches(%class_id, %exception_root) : (i64, i64) -> i1
@@ -2023,15 +2032,17 @@ module attributes {
     func.call @__ly_exc_ext_set(%wrap#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
     scf.for %i = %c0 to %count_index step %c1 {
       %i64v = arith.index_cast %i : index to i64
-      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %node_word = llvm.load %node_slot : !llvm.ptr -> i64
-      %node_ptr = llvm.inttoptr %node_word : i64 to !llvm.ptr
+      %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr
+      %node_ptr = llvm.load %node_slot : !llvm.ptr -> !llvm.ptr
       %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %eh_word = llvm.load %eh_slot : !llvm.ptr -> i64
+      %eh_aligned = llvm.load %eh_slot : !llvm.ptr -> !llvm.ptr
+      %eh_word = llvm.ptrtoint %eh_aligned : !llvm.ptr to i64
       %mh_slot = llvm.getelementptr %node_ptr[%c7] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %mh_word = llvm.load %mh_slot : !llvm.ptr -> i64
+      %mh_aligned = llvm.load %mh_slot : !llvm.ptr -> !llvm.ptr
+      %mh_word = llvm.ptrtoint %mh_aligned : !llvm.ptr to i64
       %mb_slot = llvm.getelementptr %node_ptr[%c12] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %mb_word = llvm.load %mb_slot : !llvm.ptr -> i64
+      %mb_aligned = llvm.load %mb_slot : !llvm.ptr -> !llvm.ptr
+      %mb_word = llvm.ptrtoint %mb_aligned : !llvm.ptr to i64
       %len_slot = llvm.getelementptr %node_ptr[%c14] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %mb_len = llvm.load %len_slot : !llvm.ptr -> i64
       %eh_dyn = func.call @__ly_global_view_i64(%eh_word, %c3) : (i64, i64) -> memref<?xi64>

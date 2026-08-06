@@ -1969,29 +1969,39 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   // area stashes the RESUMER's context while the body runs. Addresses are
   // raw i64 words into the respective allocations.
   mlir::Type i64Type = builder.getI64Type();
+  mlir::Type ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
   auto ehVoidFn = [&](llvm::StringRef name) {
     return getOrCreatePrivateFunction(
-        module, builder, name, builder.getFunctionType({i64Type}, {}));
+        module, builder, name, builder.getFunctionType({ptrType}, {}));
   };
   mlir::func::FuncOp stashFn = ehVoidFn("LyEH_StashCurrentException");
   mlir::func::FuncOp unstashFn = ehVoidFn("LyEH_UnstashException");
   mlir::func::FuncOp adoptStashFn = ehVoidFn("LyEH_AdoptStashedAsContext");
-  auto wordAddress = [&](mlir::Value memrefValue,
+  // ⛔ The descriptor's aligned member, NOT
+  // `memref.extract_aligned_pointer_as_index`. The stash cell holds a chain
+  // node POINTER, so the address of the cell has to arrive as a pointer too;
+  // the index op hands back an integer, which the memory model documents as
+  // where provenance is lost. The cast is erased against the func-to-LLVM
+  // conversion's own inverse.
+  auto cellAddress = [&](mlir::Value memrefValue,
                          unsigned wordOffset) -> mlir::Value {
-    mlir::Value pointerIndex =
-        mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
-                                                             memrefValue);
-    mlir::Value address =
-        mlir::arith::IndexCastOp::create(builder, loc, i64Type, pointerIndex)
-            .getResult();
+    auto arrayOne = mlir::LLVM::LLVMArrayType::get(i64Type, 1);
+    auto descriptorType = mlir::LLVM::LLVMStructType::getLiteral(
+        builder.getContext(),
+        {ptrType, ptrType, i64Type, arrayOne, arrayOne});
+    mlir::Value descriptor =
+        mlir::UnrealizedConversionCastOp::create(
+            builder, loc, mlir::TypeRange{descriptorType}, memrefValue)
+            .getResult(0);
+    mlir::Value aligned = mlir::LLVM::ExtractValueOp::create(
+        builder, loc, descriptor, llvm::ArrayRef<std::int64_t>{1});
     if (wordOffset == 0)
-      return address;
-    return mlir::arith::AddIOp::create(
-               builder, loc, address,
-               mlir::arith::ConstantIntOp::create(builder, loc,
-                                                  8 * wordOffset, 64)
-                   .getResult())
-        .getResult();
+      return aligned;
+    return mlir::LLVM::GEPOp::create(
+        builder, loc, ptrType, i64Type, aligned,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{
+            mlir::LLVM::GEPArg(static_cast<std::int32_t>(wordOffset))},
+        mlir::LLVM::GEPNoWrapFlags::inbounds);
   };
   mlir::Value outerArea =
       mlir::memref::AllocaOp::create(
@@ -2003,9 +2013,9 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
       builder, loc,
       mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult(),
       outerArea, outerFlagSlot);
-  mlir::Value outerAddress = wordAddress(outerArea, 0);
+  mlir::Value outerAddress = cellAddress(outerArea, 0);
   mlir::Value stashAddress =
-      wordAddress(generator, kGeneratorEHStashWordBase);
+      cellAddress(generator, kGeneratorEHStashWordBase);
 
   mlir::Value lifecycle =
       mlir::memref::LoadOp::create(builder, loc, generator, slotIndex(2))
@@ -2453,9 +2463,26 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   };
   // throw() may run inside the caller's exception handler: park the pending
   // token so the staging below finds the single TLS slot free.
+  // The stash cell holds a chain node POINTER, so its address arrives as a
+  // pointer -- see the note on `cellAddress` above.
+  auto alignedPointerOf = [&](mlir::Value memrefValue) -> mlir::Value {
+    mlir::Type ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+    mlir::Type i64Ty = builder.getI64Type();
+    auto arrayOne = mlir::LLVM::LLVMArrayType::get(i64Ty, 1);
+    auto descriptorType = mlir::LLVM::LLVMStructType::getLiteral(
+        builder.getContext(), {ptrType, ptrType, i64Ty, arrayOne, arrayOne});
+    mlir::Value descriptor =
+        mlir::UnrealizedConversionCastOp::create(
+            builder, loc, mlir::TypeRange{descriptorType}, memrefValue)
+            .getResult(0);
+    return mlir::LLVM::ExtractValueOp::create(
+        builder, loc, descriptor, llvm::ArrayRef<std::int64_t>{1});
+  };
   auto throwEHFn = [&](llvm::StringRef name) {
     return getOrCreatePrivateFunction(
-        module, builder, name, builder.getFunctionType({i64}, {}));
+        module, builder, name,
+        builder.getFunctionType(
+            {mlir::LLVM::LLVMPointerType::get(builder.getContext())}, {}));
   };
   mlir::func::FuncOp throwStashFn = throwEHFn("LyEH_StashCurrentException");
   mlir::func::FuncOp throwUnstashFn = throwEHFn("LyEH_UnstashException");
@@ -2465,15 +2492,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
       mlir::memref::AllocaOp::create(builder, loc,
                                      mlir::MemRefType::get({16}, i64))
           .getResult();
-  mlir::Value throwOuterPointer =
-      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
-                                                           throwOuterArea);
-  mlir::Value throwOuterAddress =
-      mlir::arith::IndexCastOp::create(builder, loc, i64, throwOuterPointer)
-          .getResult();
-  mlir::memref::StoreOp::create(
-      builder, loc, i64Const(0), throwOuterArea,
-      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::Value throwOuterAddress = alignedPointerOf(throwOuterArea);
   mlir::func::CallOp::create(builder, loc, throwStashFn,
                              mlir::ValueRange{throwOuterAddress});
   auto throwException = getOrCreatePrivateFunction(
@@ -2651,10 +2670,26 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
   // inside an except block, or the drop finalizer during unwinding); the
   // GeneratorExit staging below needs the single slot free, so the caller
   // context parks in a local stash for the duration.
-  mlir::Type closeI64 = builder.getI64Type();
+  // The stash cell holds a chain node POINTER, so its address arrives as a
+  // pointer -- see the note on `cellAddress` above.
+  auto alignedPointerOf = [&](mlir::Value memrefValue) -> mlir::Value {
+    mlir::Type ptrType = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+    mlir::Type i64Ty = builder.getI64Type();
+    auto arrayOne = mlir::LLVM::LLVMArrayType::get(i64Ty, 1);
+    auto descriptorType = mlir::LLVM::LLVMStructType::getLiteral(
+        builder.getContext(), {ptrType, ptrType, i64Ty, arrayOne, arrayOne});
+    mlir::Value descriptor =
+        mlir::UnrealizedConversionCastOp::create(
+            builder, loc, mlir::TypeRange{descriptorType}, memrefValue)
+            .getResult(0);
+    return mlir::LLVM::ExtractValueOp::create(
+        builder, loc, descriptor, llvm::ArrayRef<std::int64_t>{1});
+  };
   auto closeEHFn = [&](llvm::StringRef name) {
     return getOrCreatePrivateFunction(
-        module, builder, name, builder.getFunctionType({closeI64}, {}));
+        module, builder, name,
+        builder.getFunctionType(
+            {mlir::LLVM::LLVMPointerType::get(builder.getContext())}, {}));
   };
   mlir::func::FuncOp closeStashFn = closeEHFn("LyEH_StashCurrentException");
   mlir::func::FuncOp closeUnstashFn = closeEHFn("LyEH_UnstashException");
@@ -2665,18 +2700,9 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
       builder.getFunctionType({}, {}));
   mlir::Value closeOuterArea =
       mlir::memref::AllocaOp::create(
-          builder, loc, mlir::MemRefType::get({16}, closeI64))
+          builder, loc, mlir::MemRefType::get({16}, builder.getI64Type()))
           .getResult();
-  mlir::Value closeOuterPointer =
-      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
-                                                           closeOuterArea);
-  mlir::Value closeOuterAddress =
-      mlir::arith::IndexCastOp::create(builder, loc, closeI64,
-                                       closeOuterPointer)
-          .getResult();
-  mlir::memref::StoreOp::create(
-      builder, loc, i64Const(0), closeOuterArea,
-      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+  mlir::Value closeOuterAddress = alignedPointerOf(closeOuterArea);
   mlir::func::CallOp::create(builder, loc, closeStashFn,
                              mlir::ValueRange{closeOuterAddress});
 

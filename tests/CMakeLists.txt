@@ -189,6 +189,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
     "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
     "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
+    "DriverTest.AParkedExceptionIsReachedByPointer"
     "DriverTest.RepeatedCompileIsStable"
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
 

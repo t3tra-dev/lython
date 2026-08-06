@@ -741,6 +741,93 @@ TEST(DriverTest, AModuleGlobalsPointerCellHoldsAPointer) {
     }
 }
 
+// A parked exception is reached by pointer, not by address.
+//
+// The stash cell is one slot holding a chain node while its owner is not
+// running: a suspended generator's in-flight token, and an except* frame's
+// residual and one per clause body that raised. It held the node's ADDRESS,
+// and the cell's own address was passed as one too -- the generator side
+// reached it with `memref.extract_aligned_pointer_as_index`, which the memory
+// model documents as where provenance is lost.
+//
+// It holds a pointer now, and that is possible even though a generator's cell
+// lives inside a `memref<?xi64>` (a memref cannot have a pointer element type
+// -- see BoxLayout.h). Three functions own the cell and nothing else reads or
+// writes one, so nothing goes through the memref: callers hand over the cell's
+// ADDRESS, which the descriptor's aligned member supplies as a pointer.
+//
+// The except* frame stopped being 36 loose words at the same time, which is
+// how its dead `parent` slot came to light -- the frame became an SSA value
+// two commits earlier and nothing had read the word since.
+TEST(DriverTest, AParkedExceptionIsReachedByPointer) {
+  CompileResult result = compileSource("def gen() -> object:\n"
+                                       "    try:\n"
+                                       "        yield 1\n"
+                                       "    finally:\n"
+                                       "        pass\n"
+                                       "\n"
+                                       "for v in gen():\n"
+                                       "    print(v)\n"
+                                       "\n"
+                                       "try:\n"
+                                       "    raise ValueError(\"boom\")\n"
+                                       "except* ValueError as eg:\n"
+                                       "    print(len(eg.exceptions))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      *result.verified.llvmModule,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+      *result.verified.llvmModule)));
+
+  // The three that own a cell. They receive its address and touch nothing
+  // else that is not already a pointer, so there is no honest reason for a
+  // conversion in any of them.
+  for (const char *name :
+       {"LyEH_StashCurrentException", "LyEH_UnstashException",
+        "LyEH_AdoptStashedAsContext"}) {
+    const llvm::Function *fn = result.verified.llvmModule->getFunction(name);
+    ASSERT_NE(fn, nullptr) << name << " is gone";
+    for (const llvm::BasicBlock &block : *fn)
+      for (const llvm::Instruction &instruction : block) {
+        if (!llvm::isa<llvm::IntToPtrInst>(&instruction))
+          continue;
+        std::string described;
+        llvm::raw_string_ostream(described) << instruction;
+        ADD_FAILURE() << name << " makes a pointer out of an integer:"
+                      << described;
+      }
+  }
+
+  // The except* functions still take the frame as a word, because that is the
+  // `py.except_star.begin` result type. Exactly one conversion each, and its
+  // operand is that argument -- anything else means a slot went back to
+  // holding an address.
+  for (const char *name :
+       {"LyEH_StarCollect", "LyEH_StarPop", "LyEH_StarNodesPtr",
+        "LyEH_StarApplyMatch", "LyEH_StarThrowCombined",
+        "LyEH_StarResidualParts"}) {
+    const llvm::Function *fn = result.verified.llvmModule->getFunction(name);
+    ASSERT_NE(fn, nullptr) << name << " is gone";
+    for (const llvm::BasicBlock &block : *fn)
+      for (const llvm::Instruction &instruction : block) {
+        const auto *cast = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
+        if (!cast || llvm::isa<llvm::Argument>(cast->getOperand(0)))
+          continue;
+        std::string described;
+        llvm::raw_string_ostream(described) << *cast;
+        ADD_FAILURE() << name
+                      << " widens something other than its frame argument:"
+                      << described;
+      }
+  }
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");
