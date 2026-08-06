@@ -64,16 +64,17 @@ mlir::Value RuntimeBundleLowerer::memrefFromBoxPointer(mlir::OpBuilder &builder,
 // than this compiler's decision.
 //
 // What makes it sound is not silence but `descFromAlignedPointer`
-// (Proof.MemRef.Dialect), which is the model's rule for exactly this: an
-// address may become a descriptor again given that the allocation is live and
-// the generation matches. Both obligations are discharged structurally --
-// liveness by the reference the slot owns, and the generation by there being no
-// `memref.realloc` anywhere in this compiler, so no allocation's generation can
-// change under a held word.
+// (Proof.MemRef.Dialect), the model's rule for exactly this: an address may
+// become a descriptor again given that the allocation is live and the
+// generation matches. Neither obligation is left to a claim in a comment --
+// `Proof.RC.Address.site-address-recovers` discharges both from the refcount
+// invariant, so for as long as a site holds an object, this cannot produce a
+// dangling view and what it produces is that object.
 //
 // So the remaining meter is not "is this called" but "is the slot's reference
 // still held", which is the affine-ownership verifier's question, not this
-// function's.
+// function's -- and the theorem above is what makes that the only question
+// left.
 mlir::Value RuntimeBundleLowerer::memrefFromBoxWords(mlir::OpBuilder &builder,
                                                      mlir::Location loc,
                                                      mlir::Value pointerWord,

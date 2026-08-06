@@ -37,6 +37,7 @@ import Proof.RC.OwnerSite
 import Proof.RC.Machine
 import Proof.RC.Ops
 import Proof.RC.Invariant
+import Proof.RC.Address
 import Proof.RC.Properties
 import Proof.RC.Trace
 -- Machines that SATISFY the invariant. Without these `WFRC` is a record nobody
