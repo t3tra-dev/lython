@@ -2,6 +2,8 @@
 #include "DriverCodeGen.h"
 
 #include "Common/RuntimeLibrary.h"
+#include "Common/SupportBuilder.h"
+#include "Runtime/ABI/BoxLayout.h"
 
 #include "embedded.h"
 
@@ -14,6 +16,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -828,6 +832,99 @@ TEST(DriverTest, AParkedExceptionIsReachedByPointer) {
                       << described;
       }
   }
+}
+
+// The word offsets builtins.mlir reads are the ones the C++ structs have.
+//
+// A manifest body cannot name a C++ struct, so where one reaches into a
+// runtime structure it counts words: `__ly_exc_star_combine` reads a parked
+// chain node at words 2, 7, 12 and 14, and the payload-box helpers stride by
+// 16 and index from 4 and 9. Those numbers are a second copy of a layout whose
+// first copy is a `LLVMStructType` in the support builder, and nothing joined
+// them.
+//
+// It has already come close. The chain node was 21 untyped words until
+// recently and is a struct now; the manifest kept working only because that
+// change preserved every offset, which was intent and not a guarantee. A
+// reordering does not fail to build -- both sides compile, link, and read
+// different fields.
+//
+// So: compute the offsets from the type the compiler actually emits, and
+// compare them against the numbers the manifest is written around. The
+// duplication is the point -- a check restates the contract, which is what
+// makes it a check.
+TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
+  CompileResult result = compileSource("try:\n"
+                                       "    raise ValueError(\"boom\")\n"
+                                       "except* ValueError as eg:\n"
+                                       "    print(len(eg.exceptions))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      *result.verified.llvmModule,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+      *result.verified.llvmModule)));
+
+  const llvm::DataLayout &layout = result.verified.llvmModule->getDataLayout();
+  auto *node = llvm::StructType::getTypeByName(
+      result.verified.llvmModule->getContext(), "ExceptionChainNode");
+  ASSERT_NE(node, nullptr)
+      << "the chain node type is gone; builtins.mlir still reads its words";
+
+  // node -> payload -> section -> field, in bytes. The member index comes from
+  // the enum rather than a literal, so that reordering the struct reports a
+  // WORD mismatch -- the thing the manifest cares about -- instead of failing
+  // to find a struct where it expected one.
+  const unsigned payloadMember = py::runtime_library::kNodePayload;
+  auto *parts = llvm::dyn_cast<llvm::StructType>(
+      node->getElementType(payloadMember));
+  ASSERT_NE(parts, nullptr)
+      << "member " << payloadMember
+      << " of the chain node is not the payload any more, and builtins.mlir "
+         "still reads the payload's fields by word";
+  auto fieldWord = [&](unsigned section, unsigned field) -> std::uint64_t {
+    std::uint64_t offset =
+        layout.getStructLayout(node)->getElementOffset(payloadMember);
+    offset += layout.getStructLayout(parts)->getElementOffset(section);
+    auto *view = llvm::cast<llvm::StructType>(parts->getElementType(section));
+    offset += layout.getStructLayout(view)->getElementOffset(field);
+    return offset / 8;
+  };
+
+  struct Read {
+    const char *what;
+    unsigned section;
+    unsigned field;
+    std::uint64_t word;
+  };
+  // Field 1 is the descriptor's aligned pointer, field 3 its size.
+  const Read reads[] = {
+      {"the exception object", 0, 1, 2},
+      {"the message header", 1, 1, 7},
+      {"the message bytes", 2, 1, 12},
+      {"the message length", 2, 3, 14},
+  };
+  for (const Read &read : reads)
+    EXPECT_EQ(fieldWord(read.section, read.field), read.word)
+        << "__ly_exc_star_combine reads " << read.what << " at word "
+        << read.word << " of a chain node, and the struct now puts it at word "
+        << fieldWord(read.section, read.field);
+
+  // The payload box, whose layout the manifest strides through directly
+  // (`%c16`, and slots counted from the pointer and size bases).
+  EXPECT_EQ(py::lowering::box_abi::kWordsPerBox, 16)
+      << "__ly_exc_payload_store multiplies the slot index by 16";
+  EXPECT_EQ(py::lowering::box_abi::kPointerWordBase, 4)
+      << "the manifest's box helpers index pointer words from 4";
+  EXPECT_EQ(py::lowering::box_abi::kSizeWordBase, 9)
+      << "the manifest's box helpers index size words from 9";
+  EXPECT_EQ(py::lowering::box_abi::kOwnedFlagWord, 14)
+      << "the manifest's box helpers write the owned flag at word 14";
 }
 
 TEST(DriverTest, RepeatedCompileIsStable) {

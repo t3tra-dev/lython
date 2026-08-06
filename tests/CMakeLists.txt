@@ -190,6 +190,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
     "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
     "DriverTest.AParkedExceptionIsReachedByPointer"
+    "DriverTest.ManifestWordOffsetsMatchTheRuntimeStructs"
     "DriverTest.RepeatedCompileIsStable"
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
 
