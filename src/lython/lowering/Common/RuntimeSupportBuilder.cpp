@@ -1379,22 +1379,16 @@ void buildEndNativeCatchIfActive(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyEH_ThrowException(exception view words x5, message header x5, bytes x5):
-// stores the payload in the process slot, then throws the 1-byte C++ carrier.
-// A still-pending exception (a raise while another exception is handled that
-// did not go through the lowering's explicit stash — e.g. a runtime-internal
-// raise) becomes the new exception's implicit __context__.
+// LyEH_ThrowException(exception triple): stores the payload in the process
+// slot, then throws the 1-byte C++ carrier. A still-pending exception (a raise
+// while another exception is handled that did not go through the lowering's
+// explicit stash — e.g. a runtime-internal raise) becomes the new exception's
+// implicit __context__.
 void buildThrowException(SupportBuilder &b) {
-  llvm::SmallVector<mlir::Type, 15> inputs;
-  for (int section = 0; section < 3; ++section) {
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-  }
-  auto fn = beginLLVMFunction(b, "LyEH_ThrowException", {}, inputs);
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  auto fn = b.beginFunction(
+      "LyEH_ThrowException",
+      b.builder.getFunctionType(exceptionTripleTypes(b.builder), {}));
+  mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *stash = b.builder.createBlock(&body);
   mlir::Block *store = b.builder.createBlock(&body);
@@ -1402,19 +1396,14 @@ void buildThrowException(SupportBuilder &b) {
   mlir::Value flagSlot = b.addrOf("g_current_exception");
   mlir::Value pending = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i1(),
                                                    flagSlot, /*alignment=*/4);
-  mlir::LLVM::CondBrOp::create(b.builder, b.loc, pending, stash, store);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, pending, stash,
+                                 mlir::ValueRange{}, store,
+                                 mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(stash);
-  mlir::func::CallOp::create(b.builder, b.loc, "LyEH_StashCurrentAsContext",
-                             mlir::TypeRange{}, mlir::ValueRange{});
-  mlir::LLVM::BrOp::create(b.builder, b.loc, store);
+  b.call("LyEH_StashCurrentAsContext", mlir::TypeRange{}, {});
+  mlir::cf::BranchOp::create(b.builder, b.loc, store, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(store);
-  mlir::Value parts = b.addrOf("g_current_parts");
-  for (int section = 0; section < 3; ++section)
-    for (int field = 0; field < 5; ++field)
-      mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                                  entry->getArgument(section * 5 + field),
-                                  partsField(b, parts, section, field),
-                                  /*alignment=*/8);
+  storeExceptionTriple(b, b.addrOf("g_current_parts"), entry->getArguments());
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
@@ -1426,7 +1415,9 @@ void buildThrowException(SupportBuilder &b) {
       b.builder, b.loc, mlir::TypeRange{}, "__cxa_throw",
       mlir::ValueRange{carrier.getResult(),
                        b.addrOf("_ZTI17LyPythonException"), b.nullPtr()});
-  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+  // `__cxa_throw` does not return; the trailing return only satisfies the
+  // verifier, which is why this is not `llvm.unreachable`.
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
 // LyEH_BeginCatch(ptr exceptionObject): opens the __cxa catch scope for a
@@ -1461,12 +1452,15 @@ void buildBeginCatch(SupportBuilder &b) {
   emitLLVMTrap(b);
 }
 
-// ExceptionBorrowParts LyEH_BorrowCurrentException(): the stored payload as
-// three rank-1 memref descriptors (borrowed views).
+// (memref<3xi64>, memref<2xi64>, memref<?xi8>) LyEH_BorrowCurrentException():
+// the stored payload as three borrowed views. Unlike the star paths' views,
+// these carry the stored descriptor whole -- offset and stride included --
+// because there is nothing here to reconstruct them from.
 void buildBorrowCurrentException(SupportBuilder &b) {
-  auto fn = beginLLVMFunction(b, "LyEH_BorrowCurrentException",
-                              exceptionBorrowPartsType(b), {});
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  auto fn = b.beginFunction(
+      "LyEH_BorrowCurrentException",
+      b.builder.getFunctionType({}, exceptionTripleTypes(b.builder)));
+  mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *borrow = b.builder.createBlock(&body);
   mlir::Block *trap = b.builder.createBlock(&body);
@@ -1474,54 +1468,30 @@ void buildBorrowCurrentException(SupportBuilder &b) {
   mlir::Value pending = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
       /*alignment=*/4);
-  mlir::LLVM::CondBrOp::create(b.builder, b.loc, pending, borrow, trap);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, pending, borrow,
+                                 mlir::ValueRange{}, trap, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(borrow);
   mlir::Value parts = b.addrOf("g_current_parts");
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
-  mlir::Value result =
-      mlir::LLVM::UndefOp::create(b.builder, b.loc,
-                                  exceptionBorrowPartsType(b));
-  for (int section = 0; section < 3; ++section) {
-    mlir::Value alloc = b.loadPtrVal(partsField(b, parts, section, 0));
-    mlir::Value aligned = b.loadPtrVal(partsField(b, parts, section, 1));
-    mlir::Value offset = mlir::LLVM::LoadOp::create(
-        b.builder, b.loc, b.i64(), partsField(b, parts, section, 2),
-        /*alignment=*/8);
-    mlir::Value size = mlir::LLVM::LoadOp::create(
-        b.builder, b.loc, b.i64(), partsField(b, parts, section, 3),
-        /*alignment=*/8);
-    mlir::Value stride = mlir::LLVM::LoadOp::create(
-        b.builder, b.loc, b.i64(), partsField(b, parts, section, 4),
-        /*alignment=*/8);
-    mlir::Value sizeArray = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc,
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-        size, llvm::ArrayRef<std::int64_t>{0});
-    mlir::Value strideArray = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc,
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-        stride, llvm::ArrayRef<std::int64_t>{0});
-    mlir::Value descriptor =
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, alloc, llvm::ArrayRef<std::int64_t>{0});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, aligned, llvm::ArrayRef<std::int64_t>{1});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, offset, llvm::ArrayRef<std::int64_t>{2});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, sizeArray,
-        llvm::ArrayRef<std::int64_t>{3});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, strideArray,
-        llvm::ArrayRef<std::int64_t>{4});
-    result = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, result, descriptor,
-        llvm::ArrayRef<std::int64_t>{section});
-  }
-  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
+  llvm::SmallVector<mlir::Type, 3> types = exceptionTripleTypes(b.builder);
+  llvm::SmallVector<mlir::Value, 3> results;
+  for (std::int32_t section = 0; section < 3; ++section)
+    results.push_back(buildMemRef1D(
+        b, types[section],
+        MemRef1DParts{b.loadPtrVal(partsField(b, parts, section, 0)),
+                      b.loadPtrVal(partsField(b, parts, section, 1)),
+                      b.loadI64(partsField(b, parts, section, 2)),
+                      b.loadI64(partsField(b, parts, section, 3)),
+                      b.loadI64(partsField(b, parts, section, 4))}));
+  mlir::func::ReturnOp::create(b.builder, b.loc, results);
   b.builder.setInsertionPointToEnd(trap);
-  emitLLVMTrap(b);
+  // Three poison results, not one: `emitTrap` returns a single value.
+  mlir::func::CallOp::create(b.builder, b.loc, "abort", mlir::TypeRange{},
+                             mlir::ValueRange{});
+  llvm::SmallVector<mlir::Value, 3> poison;
+  for (mlir::Type type : types)
+    poison.push_back(mlir::ub::PoisonOp::create(b.builder, b.loc, type,
+                                                nullptr));
+  mlir::func::ReturnOp::create(b.builder, b.loc, poison);
 }
 
 void buildCurrentExceptionClassId(SupportBuilder &b) {
@@ -2288,12 +2258,6 @@ mlir::Type memRef1DType(SupportBuilder &b) {
       b.builder.getContext(), {b.ptr(), b.ptr(), b.i64(), arrayOne, arrayOne});
 }
 
-mlir::Type exceptionBorrowPartsType(SupportBuilder &b) {
-  mlir::Type part = memRef1DType(b);
-  return mlir::LLVM::LLVMStructType::getLiteral(b.builder.getContext(),
-                                                {part, part, part});
-}
-
 mlir::Type exceptionPartsType(SupportBuilder &b) {
   auto type = mlir::LLVM::LLVMStructType::getIdentified(b.builder.getContext(),
                                                         "ExceptionParts");
@@ -2359,6 +2323,61 @@ mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
           mlir::LLVM::GEPArg(0), mlir::LLVM::GEPArg(kNodePayload),
           mlir::LLVM::GEPArg(section), mlir::LLVM::GEPArg(field)},
       mlir::LLVM::GEPNoWrapFlags::inbounds);
+}
+
+MemRef1DParts explodeMemRef1D(SupportBuilder &b, mlir::Value memref) {
+  mlir::Value descriptor =
+      mlir::UnrealizedConversionCastOp::create(
+          b.builder, b.loc, mlir::TypeRange{memRef1DType(b)}, memref)
+          .getResult(0);
+  auto member = [&](std::initializer_list<std::int64_t> path) {
+    return mlir::LLVM::ExtractValueOp::create(
+        b.builder, b.loc, descriptor,
+        llvm::ArrayRef<std::int64_t>(path.begin(), path.size()))
+        .getResult();
+  };
+  return {member({0}), member({1}), member({2}), member({3, 0}),
+          member({4, 0})};
+}
+
+mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
+                          const MemRef1DParts &parts) {
+  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
+  auto wrap = [&](mlir::Value scalar) {
+    return mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc,
+        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
+        scalar, llvm::ArrayRef<std::int64_t>{0})
+        .getResult();
+  };
+  mlir::Value descriptor =
+      mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
+  auto set = [&](mlir::Value field, std::int64_t index) {
+    descriptor = mlir::LLVM::InsertValueOp::create(
+        b.builder, b.loc, descriptor, field,
+        llvm::ArrayRef<std::int64_t>{index});
+  };
+  set(parts.allocated, 0);
+  set(parts.aligned, 1);
+  set(parts.offset, 2);
+  set(wrap(parts.size), 3);
+  set(wrap(parts.stride), 4);
+  return mlir::UnrealizedConversionCastOp::create(
+             b.builder, b.loc, mlir::TypeRange{memrefType}, descriptor)
+      .getResult(0);
+}
+
+void storeExceptionTriple(SupportBuilder &b, mlir::Value parts,
+                          mlir::ValueRange triple) {
+  for (std::int32_t section = 0; section < 3; ++section) {
+    MemRef1DParts members = explodeMemRef1D(b, triple[section]);
+    mlir::Value fields[5] = {members.allocated, members.aligned,
+                             members.offset, members.size, members.stride};
+    for (std::int32_t field = 0; field < 5; ++field)
+      mlir::LLVM::StoreOp::create(b.builder, b.loc, fields[field],
+                                  partsField(b, parts, section, field),
+                                  /*alignment=*/8);
+  }
 }
 
 mlir::OwningOpRef<mlir::ModuleOp>

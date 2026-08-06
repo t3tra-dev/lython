@@ -1,3 +1,4 @@
+#include "Common/ExceptionABI.h"
 #include "Common/PythonSourceRange.h"
 #include "Runtime/Core/Lowerer.h"
 
@@ -449,12 +450,6 @@ mlir::func::FuncOp getOrCreateStarFrameFn(mlir::ModuleOp module,
       builder.getFunctionType({builder.getI64Type()}, {}));
 }
 
-llvm::SmallVector<mlir::Type, 3> exceptionTripleTypes(mlir::OpBuilder &b) {
-  return {mlir::MemRefType::get({3}, b.getI64Type()),
-          mlir::MemRefType::get({2}, b.getI64Type()),
-          mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.getI8Type())};
-}
-
 } // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerStarBegin(py::StarBeginOp op) {
@@ -484,7 +479,7 @@ RuntimeBundleLowerer::lowerExceptStarMatch(py::ExceptStarMatchOp op) {
   context->loadDialect<mlir::scf::SCFDialect>();
   mlir::Location loc = op.getLoc();
   builder.setInsertionPoint(op);
-  llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(builder);
+  llvm::SmallVector<mlir::Type, 3> triple = py::runtime_library::exceptionTripleTypes(builder);
   mlir::func::FuncOp residualParts = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarResidualParts",
       builder.getFunctionType({builder.getI64Type()}, triple));
@@ -589,7 +584,7 @@ RuntimeBundleLowerer::lowerStarFinish(py::StarFinishOp op) {
   context->loadDialect<mlir::scf::SCFDialect>();
   mlir::Location loc = op.getLoc();
   builder.setInsertionPoint(op);
-  llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(builder);
+  llvm::SmallVector<mlir::Type, 3> triple = py::runtime_library::exceptionTripleTypes(builder);
   mlir::Type i64 = builder.getI64Type();
   mlir::func::FuncOp collectedCount = getOrCreatePrivateFunction(
       module, builder, "LyEH_StarCollectedCount",

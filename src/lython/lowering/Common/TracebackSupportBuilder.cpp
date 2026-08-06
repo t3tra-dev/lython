@@ -2359,19 +2359,6 @@ constexpr std::int64_t kStarFrameBytes = 288;
 constexpr std::int64_t kStarCollectedBase = 4;
 constexpr std::int64_t kStarCollectedLimit = 32;
 
-mlir::LLVM::LLVMFuncOp starBeginLLVMFunction(SupportBuilder &b,
-                                             llvm::StringRef name,
-                                             mlir::Type result,
-                                             llvm::ArrayRef<mlir::Type> inputs) {
-  mlir::OpBuilder::InsertionGuard guard(b.builder);
-  b.builder.setInsertionPointToEnd(b.module.getBody());
-  mlir::Type resultType =
-      result ? result : mlir::LLVM::LLVMVoidType::get(b.builder.getContext());
-  return mlir::LLVM::LLVMFuncOp::create(
-      b.builder, b.loc, name,
-      mlir::LLVM::LLVMFunctionType::get(resultType, inputs, false));
-}
-
 // The frame is the first argument of every star function now. It used to be a
 // mutable global holding a raw pointer, with slot 3 linking the frames into a
 // stack -- neither of which the memory model can express, because a descriptor
@@ -2379,10 +2366,6 @@ mlir::LLVM::LLVMFuncOp starBeginLLVMFunction(SupportBuilder &b,
 // by the model's own statement. As a parameter the nesting is lexical, and
 // `except_star.begin` hands the value to the ops that need it.
 mlir::Value starFrameArg(mlir::func::FuncOp fn) {
-  return fn.getBody().front().getArgument(0);
-}
-
-mlir::Value starFrameArg(mlir::LLVM::LLVMFuncOp fn) {
   return fn.getBody().front().getArgument(0);
 }
 
@@ -2543,18 +2526,18 @@ void buildStarHasResidual(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
 }
 
-// ExceptionBorrowParts LyEH_StarResidualParts(): borrowed views of the
-// residual exception (requires one).
+// (memref<3xi64>, memref<2xi64>, memref<?xi8>) LyEH_StarResidualParts(i64
+// frame): borrowed views of the residual exception (requires one).
 void buildStarResidualParts(SupportBuilder &b) {
-  auto fn = starBeginLLVMFunction(b, "LyEH_StarResidualParts",
-                                  exceptionBorrowPartsType(b), {b.i64()});
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  auto fn = b.beginFunction(
+      "LyEH_StarResidualParts",
+      b.builder.getFunctionType({b.i64()}, exceptionTripleTypes(b.builder)));
+  mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
-  mlir::Value result = mlir::LLVM::UndefOp::create(
-      b.builder, b.loc, exceptionBorrowPartsType(b));
+  llvm::SmallVector<mlir::Type, 3> types = exceptionTripleTypes(b.builder);
+  llvm::SmallVector<mlir::Value, 3> results;
   // Sizes come from the contract, not the stored descriptor: the header
   // sections are fixed-shape and the bytes section carries its length.
   std::int64_t staticSizes[3] = {3, 2, -1};
@@ -2563,63 +2546,37 @@ void buildStarResidualParts(SupportBuilder &b) {
     mlir::Value size = staticSizes[section] < 0
                            ? b.loadI64(nodePartsField(b, node, section, 3))
                            : b.iconst(staticSizes[section]);
-    mlir::Value sizeArray = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc,
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-        size, llvm::ArrayRef<std::int64_t>{0});
-    mlir::Value strideArray = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc,
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-        b.iconst(1), llvm::ArrayRef<std::int64_t>{0});
-    mlir::Value descriptor =
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{0});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{1});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, b.iconst(0),
-        llvm::ArrayRef<std::int64_t>{2});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, sizeArray,
-        llvm::ArrayRef<std::int64_t>{3});
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, strideArray,
-        llvm::ArrayRef<std::int64_t>{4});
-    result = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, result, descriptor,
-        llvm::ArrayRef<std::int64_t>{section});
+    results.push_back(buildMemRef1D(b, types[section],
+                                    MemRef1DParts{pointer, pointer, b.iconst(0),
+                                                  size, b.iconst(1)}));
   }
-  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
+  mlir::func::ReturnOp::create(b.builder, b.loc, results);
 }
 
-// void LyEH_StarApplyMatch(i1 has_rest, matched x15, rest x15): a clause
-// matched. The matched slice becomes the current exception (fresh copy of
-// the residual node's traceback, no inherited chain), the rest replaces the
-// node's payload, and the frame's old payload reference is dropped.
+// void LyEH_StarApplyMatch(i64 frame, i1 has_rest, matched triple, rest
+// triple): a clause matched. The matched slice becomes the current exception
+// (fresh copy of the residual node's traceback, no inherited chain), the rest
+// replaces the node's payload, and the frame's old payload reference is
+// dropped.
 void buildStarApplyMatch(SupportBuilder &b) {
-  llvm::SmallVector<mlir::Type, 31> inputs;
-  inputs.push_back(b.i1());
-  for (int part = 0; part < 6; ++part) {
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-  }
-  inputs.insert(inputs.begin(), b.i64());
-  auto fn = starBeginLLVMFunction(b, "LyEH_StarApplyMatch", {}, inputs);
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(b.builder);
+  llvm::SmallVector<mlir::Type, 8> inputs{b.i64(), b.i1()};
+  inputs.append(triple.begin(), triple.end());
+  inputs.append(triple.begin(), triple.end());
+  auto fn = b.beginFunction("LyEH_StarApplyMatch",
+                            b.builder.getFunctionType(inputs, {}));
+  mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
   mlir::Value node = b.intToPtr(b.loadI64(starFrameSlot(b, frame, 0)));
+  mlir::Value payload = nodeMember(b, node, kNodePayload);
 
   // Drop the frame's reference to the old residual payload.
   b.call("release_exception_storage_raw", mlir::TypeRange{},
          mlir::ValueRange{
-             b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 0, 1))),
-             b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 1, 1))),
-             b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 2, 1)))});
+             b.ptrToInt(b.loadPtrVal(partsField(b, payload, 0, 1))),
+             b.ptrToInt(b.loadPtrVal(partsField(b, payload, 1, 1))),
+             b.ptrToInt(b.loadPtrVal(partsField(b, payload, 2, 1)))});
 
   // Rest into the node payload; absent rest zeroes it and clears the flag.
   mlir::Value hasRest = entry->getArgument(1);
@@ -2628,26 +2585,18 @@ void buildStarApplyMatch(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&restIf.getThenRegion().front());
-    for (std::int32_t section = 0; section < 3; ++section)
-      for (std::int32_t field = 0; field < 5; ++field)
-        mlir::LLVM::StoreOp::create(
-            b.builder, b.loc, entry->getArgument(17 + section * 5 + field),
-            nodePartsField(b, node, section, field), /*alignment=*/8);
+    storeExceptionTriple(b, payload, entry->getArguments().slice(5, 3));
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(1),
                                 starFrameSlot(b, frame, 1), /*alignment=*/8);
     b.builder.setInsertionPointToStart(&restIf.getElseRegion().front());
-    clearExceptionParts(b, nodeMember(b, node, kNodePayload));
+    clearExceptionParts(b, payload);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                                 starFrameSlot(b, frame, 1), /*alignment=*/8);
   }
 
   // Matched becomes the current exception.
-  mlir::Value parts = b.addrOf("g_current_parts");
-  for (std::int32_t section = 0; section < 3; ++section)
-    for (std::int32_t field = 0; field < 5; ++field)
-      mlir::LLVM::StoreOp::create(
-          b.builder, b.loc, entry->getArgument(2 + section * 5 + field),
-          partsField(b, parts, section, field), /*alignment=*/8);
+  storeExceptionTriple(b, b.addrOf("g_current_parts"),
+                       entry->getArguments().slice(2, 3));
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
@@ -2689,7 +2638,7 @@ void buildStarApplyMatch(SupportBuilder &b) {
   }
   mlir::LLVM::StoreOp::create(b.builder, b.loc, count,
                               b.addrOf("g_traceback_size"), /*alignment=*/8);
-  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
 // void LyEH_StarCollect(): park the pending exception (raised by a clause
@@ -2814,22 +2763,17 @@ void buildStarRethrowSoleCollected(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// void LyEH_StarThrowCombined(combined x15): several leftovers were wrapped
-// into a fresh group (star_combine). The residual node donates its traceback
-// and chain to the combined exception; collected nodes hand their member
-// references to the group and die.
+// void LyEH_StarThrowCombined(i64 frame, combined triple): several leftovers
+// were wrapped into a fresh group (star_combine). The residual node donates its
+// traceback and chain to the combined exception; collected nodes hand their
+// member references to the group and die.
 void buildStarThrowCombined(SupportBuilder &b) {
-  llvm::SmallVector<mlir::Type, 15> inputs;
-  for (int part = 0; part < 3; ++part) {
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-  }
-  inputs.insert(inputs.begin(), b.i64());
-  auto fn = starBeginLLVMFunction(b, "LyEH_StarThrowCombined", {}, inputs);
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  llvm::SmallVector<mlir::Type, 3> triple = exceptionTripleTypes(b.builder);
+  llvm::SmallVector<mlir::Type, 4> inputs{b.i64()};
+  inputs.append(triple.begin(), triple.end());
+  auto fn = b.beginFunction("LyEH_StarThrowCombined",
+                            b.builder.getFunctionType(inputs, {}));
+  mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value frame = starFrameArg(fn);
 
@@ -2921,24 +2865,22 @@ void buildStarThrowCombined(SupportBuilder &b) {
   }
 
   // Install the combined exception and throw.
-  mlir::Value parts = b.addrOf("g_current_parts");
-  for (std::int32_t section = 0; section < 3; ++section)
-    for (std::int32_t field = 0; field < 5; ++field)
-      mlir::LLVM::StoreOp::create(
-          b.builder, b.loc, entry->getArgument(1 + section * 5 + field),
-          partsField(b, parts, section, field), /*alignment=*/8);
+  storeExceptionTriple(b, b.addrOf("g_current_parts"),
+                       entry->getArguments().slice(1, 3));
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       b.addrOf("g_current_exception"), /*alignment=*/4);
   b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{frame});
+  // `star_throw_pending` does not return; the trailing return only satisfies
+  // the verifier, which is why this is not `llvm.unreachable`.
   mlir::func::CallOp::create(b.builder, b.loc, "star_throw_pending",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// void LyEH_StarDiscardSplit(triple x15): release a half that star_split
-// handed back and the clause did not install.
+// void LyEH_StarDiscardSplit(triple): release a half that star_split handed
+// back and the clause did not install.
 //
 // star_split owns BOTH halves it returns -- the matching leaf and the leftover
 // are each retained before they are yielded, because the assembler that takes
@@ -2953,25 +2895,17 @@ void buildStarThrowCombined(SupportBuilder &b) {
 // reference the enclosing residual group does take. One arm, two callers, and
 // only the caller knows which it is.
 void buildStarDiscardSplit(SupportBuilder &b) {
-  llvm::SmallVector<mlir::Type, 15> inputs;
-  for (int part = 0; part < 3; ++part) {
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.ptr());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-    inputs.push_back(b.i64());
-  }
-  auto fn = starBeginLLVMFunction(b, "LyEH_StarDiscardSplit", {}, inputs);
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  auto fn = b.beginFunction(
+      "LyEH_StarDiscardSplit",
+      b.builder.getFunctionType(exceptionTripleTypes(b.builder), {}));
+  mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  auto alignedWord = [&](int section) -> mlir::Value {
-    return mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(),
-                                          entry->getArgument(section * 5 + 1))
-        .getResult();
+  auto alignedWord = [&](int section) {
+    return b.ptrToInt(explodeMemRef1D(b, entry->getArgument(section)).aligned);
   };
   b.call("release_exception_storage_raw", mlir::TypeRange{},
          mlir::ValueRange{alignedWord(0), alignedWord(1), alignedWord(2)});
-  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
 // LyTraceback_PrintMessage(i64 class_id, i64 exc_ptr, ptr msg_header,

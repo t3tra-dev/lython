@@ -3,6 +3,8 @@
 // Shared facade for the native runtime support builders (RuntimeSupportBuilder
 // and TracebackSupportBuilder compose the same module).
 
+#include "Common/ExceptionABI.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -293,9 +295,10 @@ struct SupportBuilder {
 // of being declared privately in each and drifting.
 // ---------------------------------------------------------------------------
 
-// {allocated, aligned, offset, size[1], stride[1]}.
+// {allocated, aligned, offset, size[1], stride[1]} -- MLIR's own rank-1 memref
+// descriptor, which only the two bridge helpers at the bottom of this header
+// have any business naming.
 mlir::Type memRef1DType(SupportBuilder &b);
-mlir::Type exceptionBorrowPartsType(SupportBuilder &b);
 
 // {{allocated, aligned, offset, size, stride} x3}, 120 bytes.
 mlir::Type exceptionPartsType(SupportBuilder &b);
@@ -338,6 +341,43 @@ mlir::Value nodeMember(SupportBuilder &b, mlir::Value node,
                        std::int32_t member);
 mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
                            std::int32_t section, std::int32_t field);
+
+// ---------------------------------------------------------------------------
+// The exception triple in the memref world, and the bridge to the descriptor.
+//
+// This is the SAME triple as above, in the memref types the callers use --
+// `exceptionTripleTypes` (Common/ExceptionABI.h) is what a func-level runtime
+// entry point declares. The two helpers below take a value of one of those
+// types apart and put it back together.
+//
+// ⛔ The bridge is `unrealized_conversion_cast`, NOT
+// `extract_aligned_pointer_as_index`. Both get at the pointer inside a memref
+// and only one of them keeps it a pointer: the index op hands back an integer,
+// which the memory model documents as where provenance is lost. The cast is
+// erased against the func-to-LLVM conversion's own inverse cast by
+// `reconcile-unrealized-casts`, so nothing survives it at all.
+// ---------------------------------------------------------------------------
+
+// A rank-1 memref's descriptor members. `allocated` is the free()-able base and
+// `aligned` the one every access goes through; the runtime's entities are
+// single allocations, so the two coincide, but taking them apart separately is
+// what keeps that a fact about the data rather than an assumption here.
+struct MemRef1DParts {
+  mlir::Value allocated;
+  mlir::Value aligned;
+  mlir::Value offset;
+  mlir::Value size;
+  mlir::Value stride;
+};
+
+MemRef1DParts explodeMemRef1D(SupportBuilder &b, mlir::Value memref);
+mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
+                          const MemRef1DParts &parts);
+
+// Three memref values into an ExceptionParts region (the process slot, or a
+// chain node's payload -- `nodeMember(node, kNodePayload)` is one).
+void storeExceptionTriple(SupportBuilder &b, mlir::Value parts,
+                          mlir::ValueRange triple);
 
 // Emits the host-boundary cluster (raw write / exit status / argv / FILE*
 // and buffer wrappers, plus the OS/time cluster); implemented in

@@ -619,6 +619,66 @@ TEST(DriverTest, TheExceptionChainIsWalkedWithPointers) {
   }
 }
 
+// Every call into the EH runtime matches the definition it reaches.
+//
+// The exception triple crosses this boundary as three memrefs, and the two
+// sides are verified as MLIR SEPARATELY -- the call sites in the lowering pass
+// and the manifests, the definitions in the runtime support builder -- then
+// meet only after both are LLVM IR. Nothing there compares them: checked with
+// `opt -passes=verify`, which accepts a four-argument call to a two-parameter
+// definition and exits 0. A drift would link, run, and read its arguments off
+// the wrong registers.
+//
+// The types now come from one place (`Common/ExceptionABI.h`), which is what
+// makes a drift unlikely; this is what makes it visible. Both were needed --
+// before, the definitions hand-transcribed MLIR's descriptor layout, so the
+// two sides could disagree without either being edited, just by MLIR changing
+// what a memref lowers to.
+TEST(DriverTest, EveryCallIntoTheEHRuntimeMatchesItsDefinition) {
+  CompileResult result = compileSource("try:\n"
+                                       "    raise ValueError(\"boom\")\n"
+                                       "except* ValueError as eg:\n"
+                                       "    print(len(eg.exceptions))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+      *result.verified.llvmModule,
+      lython::driver::detectTensorLoweringTarget(
+          lython::driver::DriverOptions{}),
+      lython::driver::DriverOptions{}, diag)))
+      << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+      *result.verified.llvmModule)));
+
+  // The functions that carry an exception across the boundary. Named rather
+  // than discovered by prefix: a `LyEH_` symbol that stops being reachable
+  // should fail here, not quietly drop out of the check.
+  const char *carriers[] = {
+      "LyEH_ThrowException",    "LyEH_BorrowCurrentException",
+      "LyEH_StarResidualParts", "LyEH_StarApplyMatch",
+      "LyEH_StarThrowCombined", "LyEH_StarDiscardSplit"};
+  for (const char *name : carriers) {
+    llvm::Function *fn = result.verified.llvmModule->getFunction(name);
+    ASSERT_NE(fn, nullptr) << name << " is not in the linked module";
+    EXPECT_FALSE(fn->isDeclaration())
+        << name << " was never defined -- the runtime support module and the "
+                   "call sites disagree on its name";
+    for (const llvm::User *user : fn->users()) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(user);
+      // ⛔ `getCalledOperand()`, NOT `getCalledFunction()`. The latter returns
+      // null precisely when the call's signature disagrees with the callee's,
+      // which is the case this test exists for -- filtering on it skips the
+      // defect and passes. (Observed: 5 users, 0 of them "calls to fn".)
+      if (!call || call->getCalledOperand() != fn)
+        continue;
+      EXPECT_EQ(call->getFunctionType(), fn->getFunctionType())
+          << name << ": a call site's signature is not the definition's, so "
+                     "the two sides read different arguments";
+    }
+  }
+}
+
 TEST(DriverTest, RepeatedCompileIsStable) {
   for (int round = 0; round < 3; ++round) {
     CompileResult result = compileSource("print(40 + 2)\n");

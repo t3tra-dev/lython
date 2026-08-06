@@ -187,6 +187,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
+    "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
     "DriverTest.RepeatedCompileIsStable"
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
 
