@@ -241,12 +241,43 @@ readFunctionContract(mlir::func::FuncOp function) {
 
   contract.objectReleaseToZero = function->hasAttr(kObjectReleaseToZeroAttr);
 
+  // ⛔ The contract has to denote a step of the model, and these three cannot.
+  // Refused where contracts are PARSED, so that no reader has to cope with a
+  // combination the design has no reading for -- the earliest static boundary,
+  // which is where this compiler refuses what it cannot execute faithfully.
+  //
+  // The map at the top of Ownership.h is what makes them decidable: each
+  // attribute names a step, and a combination naming two incompatible ones, or
+  // none, is a contract about nothing.
   for (unsigned index : contract.releaseArgs.values) {
     if (contract.transferArgs.contains(index))
       return function.emitError()
              << "argument " << index
              << " cannot be both release_args and transfer_args";
   }
+
+  // `drop` and `callOut` both consume the caller's reference; `retain_args`
+  // says the caller KEEPS it and the callee takes one of its own, which is no
+  // step at all on the caller's side. An argument cannot be both kept and
+  // consumed.
+  for (unsigned index : contract.retainArgs.values) {
+    if (contract.transferArgs.contains(index))
+      return function.emitError()
+             << "argument " << index
+             << " cannot be both retain_args and transfer_args: the caller "
+                "cannot keep a reference it has handed over";
+    if (contract.releaseArgs.contains(index))
+      return function.emitError()
+             << "argument " << index
+             << " cannot be both retain_args and release_args: the caller "
+                "cannot keep a reference the callee has discharged";
+  }
+
+  // Why NOT also `owned_results` against `borrowed_results` here -- `callIn`
+  // binds an owned name and `borrow` a borrowed one, so a result that is both
+  // would be two instructions at one point: because
+  // `verifyFunctionOwnershipShape` already refuses it, with the function's
+  // location attached. Two sources for one rule is how they drift.
 
   return contract;
 }
