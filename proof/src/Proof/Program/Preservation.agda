@@ -597,15 +597,20 @@ module Dup
 -- another, and the ghost count is unmoved. `move` lands it on a name's site and
 -- `setField` on a field's, and every field of the invariant below is proved the
 -- same way for both -- so it is proved once, over the destination SITE.
+-- The SOURCE is a site rather than a name, for the same reason the destination
+-- already was. `look` only ever produced `at-src`, and a name is not the only
+-- thing that can hold: `callIn` takes its reference off `callee t c`, which no
+-- name is backed by.
 module MoveCore
-  {t : ThreadId} {es : Env} {m : Machine} {src : Var} {o : ObjId}
-  (dsite : OwnerSite)
-  (look  : lookupVar es src ≡ just (bind o owned))
-  (w     : WFES t es m)
+  {t : ThreadId} {es : Env} {m : Machine} {o : ObjId}
+  (ssite  : OwnerSite)
+  (dsite  : OwnerSite)
+  (at-src : strongAt (sites m) ssite ≡ just o)
+  (w      : WFES t es m)
   where
 
   vacated : SiteMap
-  vacated = vacate (sites m) (siteOf t src)
+  vacated = vacate (sites m) ssite
 
   ss' : SiteMap
   ss' = occupy vacated dsite o
@@ -613,11 +618,8 @@ module MoveCore
   m' : Machine
   m' = machine (heap m) (objects m) ss'
 
-  at-src : strongAt (sites m) (siteOf t src) ≡ just o
-  at-src = backed w src o look
-
-  held : Holds (sites m) (siteOf t src) o
-  held = strongAt-holds (sites m) (siteOf t src) o at-src
+  held : Holds (sites m) ssite o
+  held = strongAt-holds (sites m) ssite o at-src
 
   -- ⭐ The count does not move. One off, one on.
   ghost-same : ∀ p → ghostRC m' p ≡ ghostRC m p
@@ -626,10 +628,10 @@ module MoveCore
       go : (bb : Bool) → sameObj o p ≡ bb → ghostRC m' p ≡ ghostRC m p
       go true  e rewrite same→eq o p e =
         trans (occupy-same vacated dsite o)
-              (sym (vacate-holder (sites m) (siteOf t src) o at-src))
+              (sym (vacate-holder (sites m) ssite o at-src))
       go false e =
         trans (occupy-other vacated dsite o p e)
-              (vacate-holder-other (sites m) (siteOf t src) o p at-src e)
+              (vacate-holder-other (sites m) ssite o p at-src e)
 
   counts : WFRC m'
   counts = record { counted-exact = ce
@@ -651,9 +653,9 @@ module MoveCore
       ns : ∀ s p → Holds ss' s p →
            Σ _ λ bb → (lookupBlock (heap m) (objAllocation p) ≡ just bb)
                     × (generation bb ≡ objGeneration p)
-      ns s p holds-here      = no-stale-owner (rc w) (siteOf t src) o held
+      ns s p holds-here      = no-stale-owner (rc w) ssite o held
       ns s p (holds-there h) =
-        no-stale-owner (rc w) s p (holds-vacate (sites m) (siteOf t src) s p h)
+        no-stale-owner (rc w) s p (holds-vacate (sites m) ssite s p h)
 
       osl : ∀ p → 0 < ghostRC m' p →
             Σ _ λ bb → (lookupBlock (heap m) (objAllocation p) ≡ just bb)
@@ -668,7 +670,8 @@ module Move
   where
 
   private
-    open module Core = MoveCore {t} {es} {m} {src} {o} (siteOf t dst) look w
+    open module Core = MoveCore {t} {es} {m} {o} (siteOf t src) (siteOf t dst)
+                                 (backed w src o look) w
 
   preserves : WFES t (bindVar (unbindVar es src) dst (bind o owned)) m'
   preserves = wfs counts bk'
@@ -734,7 +737,8 @@ module MoveToSite
   where
 
   private
-    open module Core = MoveCore {t} {es} {m} {src} {o} dsite look w
+    open module Core = MoveCore {t} {es} {m} {o} (siteOf t src) dsite
+                                 (backed w src o look) w
 
   preserves : WFES t (unbindVar es src) m'
   preserves = wfs counts bk'
@@ -758,6 +762,48 @@ module MoveToSite
             trans (strongAt-vacate-other (sites m) (siteOf t src) (siteOf t y)
                      (trans (sameSite-siteOf t src y) e))
                   (backed w y q (trans (sym (unbindVar-other es src y e)) h))
+
+------------------------------------------------------------------------
+-- A site no name owns hands its entity TO a name.
+--
+-- The mirror of `MoveToSite`, and the reason `MoveCore` now takes a source
+-- site: there is no source name here to be `backed` by one. `callIn` is the
+-- only user, and the shape is `alloc`'s binding half over a vacated map rather
+-- than over `sites m` -- which costs exactly one extra step, because vacating a
+-- site no name owns cannot disturb what `backed` says about names.
+
+module MoveFromSite
+  {t : ThreadId} {es : Env} {m : Machine} {dst : Var} {o : ObjId}
+  (ssite   : OwnerSite)
+  (notName : ∀ y → sameSite ssite (siteOf t y) ≡ false)
+  (at-src  : strongAt (sites m) ssite ≡ just o)
+  (w       : WFES t es m)
+  where
+
+  private
+    open module Core = MoveCore {t} {es} {m} {o} ssite (siteOf t dst) at-src w
+
+  preserves : WFES t (bindVar es dst (bind o owned)) m'
+  preserves = wfs counts bk'
+    where
+      bk' : ∀ y q →
+            lookupVar (bindVar es dst (bind o owned)) y ≡ just (bind q owned) →
+            strongAt ss' (siteOf t y) ≡ just q
+      bk' y q h = go (sameVar dst y) refl
+        where
+          go : (bb : Bool) → sameVar dst y ≡ bb → strongAt ss' (siteOf t y) ≡ just q
+          go true e =
+            trans (strongAt-cons-true (siteOf t dst) o vacated (siteOf t y)
+                     (trans (sameSite-siteOf t dst y) e))
+                  (cong just (bind-obj (just-inj
+                     (trans (sym (lookupVar-cons-true dst (bind o owned) es y e)) h))))
+          go false e =
+            trans (strongAt-cons-false (siteOf t dst) o vacated (siteOf t y)
+                     (trans (sameSite-siteOf t dst y) e))
+            (trans (strongAt-vacate-other (sites m) ssite (siteOf t y) (notName y))
+                   (backed w y q
+                      (trans (sym (lookupVar-cons-false dst (bind o owned) es y e))
+                             h)))
 
 ------------------------------------------------------------------------
 -- `drop` = py.decref. Name, site and counter all go together.
@@ -1073,6 +1119,9 @@ instr-preserves-WF (step-set-field _ look nodup _)     w =
 -- site no name owns, which `setField` already was.
 instr-preserves-WF (step-call-out look nodup)         w =
   MoveToSite.preserves _ (λ _ → refl) look nodup w
+-- And the receiving half, which is the same move read backwards.
+instr-preserves-WF (step-call-in at-src)              w =
+  MoveFromSite.preserves _ (λ _ → refl) at-src w
 instr-preserves-WF (step-get-field _ _)                w = borrowed-bind-preserves w
 
 -- Every terminator is the same operation on the state -- move the operands into

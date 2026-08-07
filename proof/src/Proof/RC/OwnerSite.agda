@@ -330,6 +330,45 @@ unnamedRC-vacate-named ((t , p) ∷ ss) s o nf = go (sameSite t s) refl
       cong (λ n → if isUnnamedSite t ∧ sameObj p o then suc n else n)
            (unnamedRC-vacate-named ss s o nf)
 
+-- The unnamed half of `vacate-holder`, and its companion. `callIn` takes a hold
+-- off `callee t c`, which moves BOTH counts down together -- where `drop` moves
+-- the logical count and the name count and leaves this one alone.
+unnamedRC-vacate-holder :
+  ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+  isUnnamedSite s ≡ true → strongAt ss s ≡ just o →
+  unnamedRC ss o ≡ suc (unnamedRC (vacate ss s) o)
+unnamedRC-vacate-holder [] s o _ ()
+unnamedRC-vacate-holder ((u , p) ∷ ss) s o un held with sameSite u s in us
+... | true  = helper (just-inj held)
+  where
+    just-inj : ∀ {A : Set} {x y : A} → just x ≡ just y → x ≡ y
+    just-inj refl = refl
+    helper : p ≡ o → unnamedRC ((u , p) ∷ ss) o ≡ suc (unnamedRC ss o)
+    helper refl rewrite trans (sameSite-unnamed u s us) un | sameObj-refl p = refl
+... | false with isUnnamedSite u ∧ sameObj p o
+...   | true  = cong suc (unnamedRC-vacate-holder ss s o un held)
+...   | false = unnamedRC-vacate-holder ss s o un held
+
+unnamedRC-vacate-holder-other :
+  ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) →
+  strongAt ss s ≡ just o → sameObj o p ≡ false →
+  unnamedRC (vacate ss s) p ≡ unnamedRC ss p
+unnamedRC-vacate-holder-other [] s o p () _
+unnamedRC-vacate-holder-other ((u , q) ∷ ss) s o p held ne with sameSite u s
+... | true  = helper (just-inj held)
+  where
+    just-inj : ∀ {A : Set} {x y : A} → just x ≡ just y → x ≡ y
+    just-inj refl = refl
+    helper : q ≡ o → unnamedRC ss p ≡ unnamedRC ((u , q) ∷ ss) p
+    helper refl rewrite ne = go (isUnnamedSite u)
+      where go : ∀ bb → unnamedRC ss p ≡ (if bb ∧ false then suc (unnamedRC ss p)
+                                                        else unnamedRC ss p)
+            go true  = refl
+            go false = refl
+... | false with isUnnamedSite u ∧ sameObj q p
+...   | true  = cong suc (unnamedRC-vacate-holder-other ss s o p held ne)
+...   | false = unnamedRC-vacate-holder-other ss s o p held ne
+
 -- ⭐ Vacating a site that HOLDS the object drops the count by exactly one.
 --
 -- This is the lemma WFRC preservation for `drop` needs, and the reason the site

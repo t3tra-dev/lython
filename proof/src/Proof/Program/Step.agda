@@ -253,6 +253,27 @@ data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
             (machine (heap m) (objects m)
                      (occupy (vacate (sites m) (siteOf t src)) (callee t c) o))
 
+  -- ⭐ `callIn`: an owning reference arrives from a call.
+  --
+  -- The mirror of `callOut` and the same move: off `callee t c`, onto the
+  -- name's site. The premise is that the callee's site HOLDS it -- which is
+  -- what `ly.ownership.owned_results` promises and what a caller may not
+  -- assume of a contract that does not say so.
+  --
+  -- No counter movement, and that is the part worth stating. A first attempt at
+  -- this rule bumped, on the reasoning that a +1 result must raise something;
+  -- it must not. The callee raised the counter when it took the reference, and
+  -- the site it raised it for is the one this rule vacates. Bumping would count
+  -- the same hold twice.
+  step-call-in :
+    ∀ {t bid rest es m dst c o} →
+    strongAt (sites m) (callee t c) ≡ just o →
+    f ⊢ pstate t bid (callIn dst c ∷ rest) es m
+      —→ᵢ pstate t bid rest
+            (bindVar es dst (bind o owned))
+            (machine (heap m) (objects m)
+                     (occupy (vacate (sites m) (callee t c)) (siteOf t dst) o))
+
   -- `borrow`: a second NAME, no second owner site, no runtime operation. This
   -- is the rule that makes eliding a retain correct rather than merely cheaper.
   step-borrow :

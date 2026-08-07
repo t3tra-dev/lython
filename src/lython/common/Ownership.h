@@ -108,11 +108,12 @@ namespace py::ownership {
 //                                             count, not a class, which is why
 //                                             `alloc`'s ClassId is unread too
 //
-//   ⛔ ly.ownership.owned_results             STILL UNMAPPED. It is
-//                                             `callee -> local`, the mirror of
-//                                             `callOut`, and it needs
-//                                             `MoveCore` to take a source SITE
-//                                             where it takes a source NAME
+//   ly.ownership.owned_results                `callIn` -- `callee -> local`, the
+//                                             mirror of `callOut` and the same
+//                                             move. The counter does not shift:
+//                                             the callee raised it when it took
+//                                             the reference, and receiving is
+//                                             not a second retain
 //
 // This section used to say the model had no call and could bind none of these.
 // What it lacked was one place: an object returned +1 is counted by the callee
@@ -121,12 +122,16 @@ namespace py::ownership {
 // pre-state. `OwnerSite.callee` names the place, and with it a transfer is an
 // ordinary move.
 //
-// Two things had to be true at once for that to work, and neither was free.
-// `SetField`'s preservation proof generalised to any destination no name owns,
-// so `callOut` reuses it verbatim. And `fieldRC` -- the invariant's "held
-// somewhere a name cannot reach" term -- became `unnamedRC` over the complement
-// of `local`, because a term per site kind is a family that grows with the site
-// list.
+// Three generalisations paid for it, and each is an improvement on its own.
+// `MoveCore` takes a source SITE and a destination site, where it took a source
+// name -- `callIn` has no source name, and `look` only ever produced the site
+// fact anyway. `SetField` became `MoveToSite`, over any destination no name
+// owns. And `fieldRC` -- the invariant's "held somewhere a name cannot reach"
+// term -- became `unnamedRC` over the complement of `local`, because a term per
+// site kind is a family that grows with the site list.
+//
+// All six are mapped. The two that need no instruction say so and say why; the
+// one the model cannot check says that instead of pretending.
 // ===========================================================================
 
 inline constexpr llvm::StringLiteral kOwnedResultsAttr{

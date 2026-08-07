@@ -155,6 +155,7 @@ steps-preserve-heap (by-instr (step-move _ _))      = refl
 steps-preserve-heap (by-instr (step-dup _ _ _))     = refl
 steps-preserve-heap (by-instr (step-drop _ _ _ _))  = refl
 steps-preserve-heap (by-instr (step-call-out _ _))  = refl
+steps-preserve-heap (by-instr (step-call-in _))     = refl
 steps-preserve-heap (by-instr (step-borrow _))      = refl
 steps-preserve-heap (by-instr (step-set-field _ _ _ _)) = refl
 steps-preserve-heap (by-instr (step-get-field _ _))     = refl

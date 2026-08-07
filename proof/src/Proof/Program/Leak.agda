@@ -43,7 +43,8 @@ open import Proof.RC.Object using (ObjId; sameObj; sameObj-sound; sameObj-refl)
 open import Proof.RC.OwnerSite using (OwnerSite; ThreadId; SiteMap; occupy; vacate;
   unnamedRC; isUnnamedSite; field′; unnamedRC-occupy-named;
   unnamedRC-vacate-named;
-  strongAt; logicalRC; vacate-holder; vacate-holder-other; callee)
+  strongAt; logicalRC; vacate-holder; vacate-holder-other; callee;
+  unnamedRC-vacate-holder; unnamedRC-vacate-holder-other)
 open import Proof.RC.Machine Sig using (Machine; machine; heap; objects; sites;
   ghostRC)
 open import Proof.Program.Syntax using (Var; Function; Instr; params)
@@ -222,6 +223,19 @@ logicalRC-vacate ss s o held p = go (sameObj o p) refl
     go true  e rewrite e | same→eq o p e = vacate-holder ss s o held
     go false e rewrite e = sym (vacate-holder-other ss s o p held e)
 
+-- The unnamed half of `logicalRC-vacate`. Only a site no name owns moves this
+-- count, which is why it takes the premise the logical one does not.
+unnamedRC-vacate :
+  ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+  isUnnamedSite s ≡ true → strongAt ss s ≡ just o →
+  ∀ p → unnamedRC ss p ≡ bump (sameObj o p) (unnamedRC (vacate ss s) p)
+unnamedRC-vacate ss s o un held p = go (sameObj o p) refl
+  where
+    go : (bb : Bool) → sameObj o p ≡ bb →
+         unnamedRC ss p ≡ bump (sameObj o p) (unnamedRC (vacate ss s) p)
+    go true  e rewrite e | same→eq o p e = unnamedRC-vacate-holder ss s o un held
+    go false e rewrite e = sym (unnamedRC-vacate-holder-other ss s o p held e)
+
 ------------------------------------------------------------------------
 -- The rules.
 --
@@ -254,6 +268,23 @@ private
       (trans (cong (_+ unnamedRC ss p)
                    (sym (ownedCount-unbind es x (bind o owned) look p)))
              (trans (coh p) (logicalRC-vacate ss (siteOf t x) o held p)))))
+
+  -- ⭐ The dual of `after-removal`: a hold leaves the UNNAMED side instead of
+  -- the name side. `drop` takes one off the name half and the count; `callIn`
+  -- takes one off this half and the count, and the equation survives for the
+  -- same reason -- both sides fall together.
+  after-unnamed-removal :
+    ∀ (es : Env) (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+    isUnnamedSite s ≡ true → strongAt ss s ≡ just o →
+    (∀ p → ownedCount es p + unnamedRC ss p ≡ logicalRC ss p) →
+    ∀ p → ownedCount es p + unnamedRC (vacate ss s) p
+            ≡ logicalRC (vacate ss s) p
+  after-unnamed-removal es ss s o un held coh p =
+    bump-inj (sameObj o p) _ _
+      (trans (sym (bump-plusʳ (sameObj o p) (ownedCount es p)
+                              (unnamedRC (vacate ss s) p)))
+      (trans (cong (ownedCount es p +_) (sym (unnamedRC-vacate ss s o un held p)))
+             (trans (coh p) (logicalRC-vacate ss s o held p))))
 
 -- Occupying a NAME's site: one more owned name, one more site, and the field
 -- half untouched. Every rule that binds a name is this shape.
@@ -307,6 +338,14 @@ instr-preserves-coherence {s = pstate t bid _ es m}
                               coh q)))
 -- A read binds a borrowed name and moves nothing.
 instr-preserves-coherence (step-get-field _ _)              w coh p = coh p
+-- ⭐ And receiving: the hold comes off the unnamed side and onto a name. The
+-- exact reverse of `callOut`, discharged by the two halves separately -- the
+-- removal, then `keeps-fields`, which is what every rule that binds a name uses.
+instr-preserves-coherence {s = pstate t bid _ es m}
+  (step-call-in {dst = dst} {c = c} {o = o} at-src) w coh p =
+  keeps-fields t dst o (vacate (sites m) (callee t c)) (ownedCount es p) p
+               (after-unnamed-removal es (sites m) (callee t c) o refl at-src
+                                      coh p)
 -- ⭐ And a transfer at a call is the same swap `setField` is: the name side
 -- gives up a hold and the unnamed side takes it. Word for word `setField`'s
 -- proof with a different destination, which is what generalising `fieldRC`

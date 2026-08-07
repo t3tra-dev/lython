@@ -146,16 +146,16 @@ TEST(ModelCorrespondenceTest, EveryOwnershipAttributeHasARow) {
 // The map's claim about the model's size, checked against the model.
 //
 // This is the half that matters for what comes next. The map is written against
-// a specific instruction set, and the one attribute still unmapped --
-// `owned_results` -- is unmapped for a reason that stops being true the moment
-// a tenth constructor appears. Failing then is the intended way to be told.
+// a specific instruction set. Every attribute is mapped now, so a new
+// constructor means the map has a claim to re-examine rather than a gap to
+// fill -- and failing is still how it gets said.
 TEST(ModelCorrespondenceTest, TheModelHasTheStepsTheMapAssumes) {
   std::string syntax =
       readOrDie(LYTHON_SOURCE_DIR "/proof/src/Proof/Program/Syntax.agda");
 
-  EXPECT_EQ(constructorCount(syntax, "data Instr : Set where"), 9u)
+  EXPECT_EQ(constructorCount(syntax, "data Instr : Set where"), 10u)
       << "the model's instruction set changed; the map in common/Ownership.h "
-         "places the compiler's attributes against exactly the nine it had";
+         "places the compiler's attributes against exactly the ten it had";
   EXPECT_EQ(constructorCount(syntax, "data Term : Set where"), 5u)
       << "the model's terminators changed; the map explains that `invoke` is "
          "an unwind edge and not a call, which is a claim about this set";

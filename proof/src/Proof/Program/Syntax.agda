@@ -113,12 +113,18 @@ data Instr : Set where
   -- `alloc` and `init` are two instructions, and it keeps the step relation
   -- free of folds whose lemmas would then be load-bearing.
   --
-  -- ⛔ The other direction -- `ly.ownership.owned_results`, a reference
-  -- arriving +1 -- is NOT here. It is `callee -> local`, and it needs
-  -- `MoveCore` to take a source SITE where today it takes a source NAME. The
-  -- obstruction that made the boundary unstatable is gone; that generalisation
-  -- is what is left.
   callOut : Var → CallId → Instr
+
+  -- ⭐ And the other direction: `ly.ownership.owned_results`, a reference
+  -- ARRIVING +1.
+  --
+  -- `callee -> local`, the mirror of `callOut` and the same move. It reads as
+  -- the odd one -- a name becoming owned with no caller-side antecedent, which
+  -- no other instruction produces -- and it is not: the antecedent is the
+  -- callee's hold, and once the site list can name that, this is a move like
+  -- any other. The counter does not shift, which is right: the callee raised it
+  -- when it took its own reference, and receiving is not a second retain.
+  callIn : Var → CallId → Instr
 
 ------------------------------------------------------------------------
 -- Terminators.
