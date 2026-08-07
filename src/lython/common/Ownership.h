@@ -20,6 +20,102 @@
 
 namespace py::ownership {
 
+// ===========================================================================
+// THE OWNERSHIP VOCABULARY, AGAINST THE MODEL
+//
+// `proof/` is the design, and this is the only place that says how it maps
+// onto what the compiler reasons about. It is here rather than in a document
+// because a map nothing reads is prose, and prose does not fail a build --
+// `ModelCorrespondenceTest` reads the rows below and the declarations under
+// them and refuses a drift between the two.
+//
+// The measurement that prompted it: the whole connection between `proof/` and
+// this tree was eight comments. Three divergences found in one week -- the
+// exception chain node holding descriptors as words, a module global's cell
+// holding an address, the `except*` frame handle typed `i64` -- were each
+// found by a person reading code, and none produced a diagnostic.
+//
+// The model's vocabulary (`Proof.Program.Syntax`, complete):
+//
+//   alloc x c        storage and a name owning it. NO OBJECT YET -- no cell,
+//                    so no count and no life
+//   init x           the header write; storage a name owns becomes an object
+//   move x y         ownership transfers, source name gone, no runtime op
+//   dup x y          a second owning reference -- py.incref
+//   drop x           give up an owning reference -- py.decref
+//   borrow x y       a non-owning read, no runtime op
+//   getField x r k   read a field, binding a BORROWED name
+//   setField r k x   store an owning reference into a field
+//
+//   terminators: br, condBr, ret, invoke, unwind
+//
+// --- Maps to a modelled step ------------------------------------------------
+//
+//   ly.ownership.owned_local_object           alloc then init: it marks the op
+//                                             that produces an owned local
+//                                             object, which is that pair
+//   ly.ownership.owned_local_object_contract  the same pair; the contract the
+//                                             alloc's ClassId stands for
+//   ly.ownership.object_release_to_zero       drop at the last reference --
+//                                             the callee observes zero
+//   ly.ownership.reference_release            drop, with the operands naming
+//                                             WHICH reference. Proof.RC's
+//                                             site identity is that same
+//                                             distinction
+//   ly.ownership.aggregate_retain             setField -- a retain charged to
+//                                             a holder is a field of the
+//                                             parent taking a reference
+//                                             (Proof.RC.Aggregate.Field)
+//   ly.ownership.aggregate_release            releaseAggregate, which is
+//                                             releaseFields over the parent's
+//                                             fields
+//
+// --- Physical, not ownership ------------------------------------------------
+//
+//   ly.ownership.object_header                which memref carries the header.
+//                                             An ABI fact; the model's Desc
+//                                             has no header notion
+//   ly.ownership.aggregate_id                 an identity on a
+//                                             container-producing op
+//   ly.ownership.aggregate_parent             the same number on each
+//                                             absorbing retain, so a walk can
+//                                             find the holder
+//   ly.ownership.aggregate_id_next            the allocator for those ids
+//
+// The last three are how the compiler FINDS the parent. The model names it
+// directly -- `field′ p k` is indexed by the parent object -- so having no
+// counterpart is right rather than a gap.
+//
+// --- ⛔ No counterpart: the call boundary -----------------------------------
+//
+//   ly.ownership.owned_results                result i arrives +1
+//   ly.ownership.owned_result_contracts       the contracts of those results
+//   ly.ownership.borrowed_results             result i is borrowed, not owned
+//   ly.ownership.retain_args                  the callee retains argument i
+//   ly.ownership.release_args                 the callee releases argument i
+//   ly.ownership.transfer_args                argument i's reference moves to
+//                                             the callee
+//
+// SIX OF SIXTEEN, AND THE MODEL HAS NO CALL. Not an oversight in the reading:
+// `Proof.Program.Step` has thirteen rules and none is a call. `invoke` looks
+// like one and is not -- `step-invoke-normal` and `step-invoke-throw` only
+// moveArgs to a successor block, and the callee never appears in either
+// conclusion. It models the SHAPE a call with an unwind edge has, because that
+// is what makes a release placed on an unwind edge representable; it does not
+// model what a call does to ownership.
+//
+// So the model is intra-function. Everything it proves about WFRC,
+// counted-exact and the site map holds inside one body, and the transfer of an
+// owning reference ACROSS a call -- where most of this machinery lives, and
+// where every manifest contract is written -- is outside it.
+//
+// What that settles: a model-binding verifier can bind the six mapped
+// attributes today and refuse anything mapping to no step. It cannot bind the
+// call boundary, so the next extension to `proof/` is not a guess -- it is a
+// call step, with the callee's contract as its premise. Enforcing the
+// compiler's own convention against itself is what this replaces.
+// ===========================================================================
+
 inline constexpr llvm::StringLiteral kOwnedResultsAttr{
     "ly.ownership.owned_results"};
 inline constexpr llvm::StringLiteral kOwnedResultContractsAttr{

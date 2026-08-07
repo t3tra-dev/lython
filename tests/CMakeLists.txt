@@ -99,6 +99,7 @@ add_executable(lython_unit_tests
     unit/EntityHeaderPrefixTests.cpp
     unit/EvidenceVerifierTests.cpp
     unit/LayerManifestTests.cpp
+    unit/ModelCorrespondenceTests.cpp
     unit/ParserTests.cpp
     unit/RuntimeRaisePathTests.cpp
     unit/TypeInferenceTests.cpp
@@ -133,7 +134,10 @@ target_link_libraries(lython_unit_tests
 # and the test asserts the directory holds at least ten modules so a wrong value
 # fails loudly instead of passing on an empty scan.
 target_compile_definitions(lython_unit_tests PRIVATE
-    LYTHON_RUNTIME_MODULES_DIR="${CMAKE_SOURCE_DIR}/src/lython/runtime/modules")
+    LYTHON_RUNTIME_MODULES_DIR="${CMAKE_SOURCE_DIR}/src/lython/runtime/modules"
+    # ModelCorrespondenceTests reads common/Ownership.h and the model's
+    # syntax, comparing the tree against itself, so it needs the tree.
+    LYTHON_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_compile_options(lython_unit_tests PRIVATE -frtti)
 if(APPLE)
     target_link_options(lython_unit_tests
@@ -174,6 +178,7 @@ set(LYTHON_UNIT_PATTERNS_tables
     "UnicodeTablesTest.*")
 set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*"
+    "ModelCorrespondenceTest.*"
     "RuntimeRaisePathTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"

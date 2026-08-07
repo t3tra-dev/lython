@@ -12,6 +12,7 @@ __pycache__/
 .Python
 build/
 build-fuzz/
+build-rel/
 develop-eggs/
 dist/
 downloads/
