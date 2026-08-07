@@ -86,34 +86,47 @@ namespace py::ownership {
 // directly -- `field′ p k` is indexed by the parent object -- so having no
 // counterpart is right rather than a gap.
 //
-// --- ⛔ No counterpart: the call boundary -----------------------------------
+// --- The call boundary --------------------------------------------------
 //
-//   ly.ownership.owned_results                result i arrives +1
-//   ly.ownership.owned_result_contracts       the contracts of those results
-//   ly.ownership.borrowed_results             result i is borrowed, not owned
-//   ly.ownership.retain_args                  the callee retains argument i
-//   ly.ownership.release_args                 the callee releases argument i
-//   ly.ownership.transfer_args                argument i's reference moves to
-//                                             the callee
+//   ly.ownership.transfer_args                `callOut` -- the caller's name
+//                                             and site go and the counter does
+//                                             not move, a `move` whose
+//                                             destination is `OwnerSite.callee`
+//   ly.ownership.release_args                 `drop`
+//   ly.ownership.borrowed_results             `borrow`, from the argument it
+//                                             borrows from
+//   ly.ownership.retain_args                  NOTHING. The callee takes a
+//                                             reference of its own and the
+//                                             caller's state does not move --
+//                                             measured, not assumed: its only
+//                                             two readers collect
+//                                             unwind-ambiguous operands and
+//                                             check contract well-formedness
+//   ly.ownership.owned_result_contracts       a ClassId the model carries and
+//                                             cannot check. A `Cell` records
+//                                             life, count, backing and field
+//                                             count, not a class, which is why
+//                                             `alloc`'s ClassId is unread too
 //
-// SIX OF SIXTEEN, AND THE MODEL HAS NO CALL. Not an oversight in the reading:
-// `Proof.Program.Step` has thirteen rules and none is a call. `invoke` looks
-// like one and is not -- `step-invoke-normal` and `step-invoke-throw` only
-// moveArgs to a successor block, and the callee never appears in either
-// conclusion. It models the SHAPE a call with an unwind edge has, because that
-// is what makes a release placed on an unwind edge representable; it does not
-// model what a call does to ownership.
+//   ⛔ ly.ownership.owned_results             STILL UNMAPPED. It is
+//                                             `callee -> local`, the mirror of
+//                                             `callOut`, and it needs
+//                                             `MoveCore` to take a source SITE
+//                                             where it takes a source NAME
 //
-// So the model is intra-function. Everything it proves about WFRC,
-// counted-exact and the site map holds inside one body, and the transfer of an
-// owning reference ACROSS a call -- where most of this machinery lives, and
-// where every manifest contract is written -- is outside it.
+// This section used to say the model had no call and could bind none of these.
+// What it lacked was one place: an object returned +1 is counted by the callee
+// and held at no site the model had, so `counted-exact` was violated before any
+// caller-side rule could run -- and no premise on such a rule repairs a
+// pre-state. `OwnerSite.callee` names the place, and with it a transfer is an
+// ordinary move.
 //
-// What that settles: a model-binding verifier can bind the six mapped
-// attributes today and refuse anything mapping to no step. It cannot bind the
-// call boundary, so the next extension to `proof/` is not a guess -- it is a
-// call step, with the callee's contract as its premise. Enforcing the
-// compiler's own convention against itself is what this replaces.
+// Two things had to be true at once for that to work, and neither was free.
+// `SetField`'s preservation proof generalised to any destination no name owns,
+// so `callOut` reuses it verbatim. And `fieldRC` -- the invariant's "held
+// somewhere a name cannot reach" term -- became `unnamedRC` over the complement
+// of `local`, because a term per site kind is a family that grows with the site
+// list.
 // ===========================================================================
 
 inline constexpr llvm::StringLiteral kOwnedResultsAttr{

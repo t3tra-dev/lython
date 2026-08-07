@@ -28,7 +28,7 @@ open import Relation.Nullary using (Dec; yes; no; ¬_)
 open import Proof.RC.Object using (ObjId; obj; _≟-obj_; sameObj; sameObj-refl;
   sameObj-sound; ≡ᵇ-refl; ≡ᵇ-sound)
 
-ThreadId LocalSlot FieldId GlobalId QueueId Ticket TempId : Set
+ThreadId LocalSlot FieldId GlobalId QueueId Ticket TempId CallId : Set
 ThreadId  = ℕ
 LocalSlot = ℕ
 FieldId   = ℕ
@@ -36,6 +36,7 @@ GlobalId  = ℕ
 QueueId   = ℕ
 Ticket    = ℕ
 TempId    = ℕ
+CallId    = ℕ
 
 -- Every place an owning reference can be. The list is not decoration: an owner
 -- site the model forgets is a reference the count does not include, and the
@@ -50,6 +51,27 @@ data OwnerSite : Set where
   global : GlobalId → OwnerSite
   queue  : QueueId → Ticket → OwnerSite
   temp   : ThreadId → TempId → OwnerSite
+  -- ⭐ A reference held by an activation this trace does not step through.
+  --
+  -- Without it the model has no call, and that is not a small absence: six of
+  -- the compiler's sixteen ownership attributes describe the call boundary and
+  -- not one of them could be stated. The obstruction was exactly what this
+  -- list's opening sentence warns about. An object returned +1 is counted by
+  -- the callee and held at no site the model has, so `counted-exact` was
+  -- violated BEFORE the caller's rule ran -- and no premise on that rule can
+  -- repair a pre-state. The reference was not miscounted; it was in a place the
+  -- list forgot.
+  --
+  -- With the site both directions are ordinary moves and the counter never
+  -- moves with them: a transferred argument goes local -> callee. That is
+  -- `setField`'s lesson again -- a store was expressible only because `field′`
+  -- already named its destination.
+  --
+  -- Why NOT reuse `temp`, which would have cost no constructor: `temp` is the
+  -- CALLER's own in-flight reference, and the container-literal defects it
+  -- exists for are found by asking which temp is still occupied. Sharing it
+  -- would make an unreturned call and a dropped container write one report.
+  callee : ThreadId → CallId → OwnerSite
 
 _≟-site_ : (s t : OwnerSite) → Dec (s ≡ t)
 local t s   ≟-site local t' s'  with t ≟ t' | s ≟ s'
@@ -91,6 +113,20 @@ temp _ _    ≟-site local _ _  = no λ ()
 temp _ _    ≟-site field′ _ _ = no λ ()
 temp _ _    ≟-site global _   = no λ ()
 temp _ _    ≟-site queue _ _  = no λ ()
+callee t k  ≟-site callee t' k' with t ≟ t' | k ≟ k'
+... | yes refl | yes refl = yes refl
+... | no ¬p    | _        = no λ { refl → ¬p refl }
+... | _        | no ¬q    = no λ { refl → ¬q refl }
+local _ _   ≟-site callee _ _ = no λ ()
+field′ _ _  ≟-site callee _ _ = no λ ()
+global _    ≟-site callee _ _ = no λ ()
+queue _ _   ≟-site callee _ _ = no λ ()
+temp _ _    ≟-site callee _ _ = no λ ()
+callee _ _  ≟-site local _ _  = no λ ()
+callee _ _  ≟-site field′ _ _ = no λ ()
+callee _ _  ≟-site global _   = no λ ()
+callee _ _  ≟-site queue _ _  = no λ ()
+callee _ _  ≟-site temp _ _   = no λ ()
 
 ------------------------------------------------------------------------
 -- The site map: which object, if any, each occupied site holds.
@@ -112,6 +148,7 @@ sameSite (field′ o f) (field′ o' f') = sameObj o o' ∧ (f ≡ᵇ f')
 sameSite (global g)   (global g')    = g ≡ᵇ g'
 sameSite (queue q k)  (queue q' k')  = (q ≡ᵇ q') ∧ (k ≡ᵇ k')
 sameSite (temp t i)   (temp t' i')   = (t ≡ᵇ t') ∧ (i ≡ᵇ i')
+sameSite (callee t k) (callee t' k') = (t ≡ᵇ t') ∧ (k ≡ᵇ k')
 sameSite _            _              = false
 
 sameSite-refl : ∀ s → sameSite s s ≡ true
@@ -120,6 +157,7 @@ sameSite-refl (field′ o f) rewrite sameObj-refl o | ≡ᵇ-refl f = refl
 sameSite-refl (global g)   rewrite ≡ᵇ-refl g = refl
 sameSite-refl (queue q k)  rewrite ≡ᵇ-refl q | ≡ᵇ-refl k = refl
 sameSite-refl (temp t i)   rewrite ≡ᵇ-refl t | ≡ᵇ-refl i = refl
+sameSite-refl (callee t k) rewrite ≡ᵇ-refl t | ≡ᵇ-refl k = refl
 
 -- Reflection, as for `sameObj`. Needed as soon as a proof has to turn "the
 -- lookup matched here" into "this really is that site".
@@ -145,6 +183,11 @@ sameSite-sound (temp a i)   (temp b j)   e = go a b i j e
         go a b i j e with a ≡ᵇ b | ≡ᵇ-sound a b
         ... | true | f with i ≡ᵇ j | ≡ᵇ-sound i j
         ...   | true | g = cong₂ temp (f refl) (g refl)
+sameSite-sound (callee a i) (callee b j) e = go a b i j e
+  where go : ∀ a b i j → ((a ≡ᵇ b) ∧ (i ≡ᵇ j)) ≡ true → callee a i ≡ callee b j
+        go a b i j e with a ≡ᵇ b | ≡ᵇ-sound a b
+        ... | true | f with i ≡ᵇ j | ≡ᵇ-sound i j
+        ...   | true | g = cong₂ callee (f refl) (g refl)
 
 -- and the reverse direction, which is what turns a `false` into a disequality.
 sameSite-complete : ∀ {s t} → s ≡ t → sameSite s t ≡ true
@@ -188,21 +231,29 @@ logicalRC : SiteMap → ObjId → ℕ
 logicalRC []             _ = 0
 logicalRC ((_ , p) ∷ ss) o = if sameObj p o then suc (logicalRC ss o) else logicalRC ss o
 
--- ⭐ The same count, restricted to FIELD sites.
+-- ⭐ The same count, restricted to the sites NO NAME OWNS.
 --
--- `logicalRC` counts every owner site; a name holds some of them and a field
--- holds others. The coherence invariant needs the split, because a store moves
--- a hold from a name to a field and the name side alone then reads as a loss.
+-- `logicalRC` counts every owner site; a name holds some of them and something
+-- else holds the rest. The coherence invariant needs the split, because a step
+-- that moves a hold off a name and onto one of the others leaves the name side
+-- reading as a loss.
+--
+-- This was `fieldRC`, over `field′` alone, because `setField` was the only step
+-- that moved a hold that way. `callOut` is a second -- a transferred argument
+-- goes to `callee` -- and a third term in the invariant for every such site
+-- would be a family that grows with the site list. The complement of `local` is
+-- the property actually wanted: a hold is a name's, or it is not.
+--
 -- Nothing else about the model changes: this is `logicalRC` with one extra
 -- conjunct, over the same list, so its lemmas are the same lemmas.
-isFieldSite : OwnerSite → Bool
-isFieldSite (field′ _ _) = true
-isFieldSite _            = false
+isUnnamedSite : OwnerSite → Bool
+isUnnamedSite (local _ _) = false
+isUnnamedSite _           = true
 
-fieldRC : SiteMap → ObjId → ℕ
-fieldRC []             _ = 0
-fieldRC ((s , p) ∷ ss) o =
-  if isFieldSite s ∧ sameObj p o then suc (fieldRC ss o) else fieldRC ss o
+unnamedRC : SiteMap → ObjId → ℕ
+unnamedRC []             _ = 0
+unnamedRC ((s , p) ∷ ss) o =
+  if isUnnamedSite s ∧ sameObj p o then suc (unnamedRC ss o) else unnamedRC ss o
 
 ------------------------------------------------------------------------
 -- The three site operations, and what each does to the count.
@@ -227,50 +278,57 @@ occupy-other : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) → sameObj o p 
 -- what `logicalRC` branches on. Callers turn a disequality into it with
 -- `sameObj-sound` contraposed.
 occupy-other ss s o p ne rewrite ne = refl
-
--- What the site operations do to the FIELD half.
+-- What the site operations do to the UNNAMED half.
 --
--- Occupying or vacating a site that is not a field cannot move it, and that is
--- true by reduction rather than by induction for `occupy` -- the conjunct is
--- already `false`. `vacate` needs the induction, because the entry it removes
--- is somewhere in the list.
-fieldRC-occupy-nonfield : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) →
-                          isFieldSite s ≡ false →
-                          fieldRC (occupy ss s o) p ≡ fieldRC ss p
-fieldRC-occupy-nonfield ss s o p nf rewrite nf = refl
+-- Occupying or vacating a site a name owns cannot move it, and that is true by
+-- reduction rather than by induction for `occupy` -- the conjunct is already
+-- `false`. `vacate` needs the induction, because the entry it removes is
+-- somewhere in the list.
+unnamedRC-occupy-named : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) →
+                         isUnnamedSite s ≡ false →
+                         unnamedRC (occupy ss s o) p ≡ unnamedRC ss p
+unnamedRC-occupy-named ss s o p nf rewrite nf = refl
 
-fieldRC-occupy-field-same : ∀ (ss : SiteMap) (q : ObjId) (k : ℕ) (o : ObjId) →
-                            fieldRC (occupy ss (field′ q k) o) o ≡ suc (fieldRC ss o)
-fieldRC-occupy-field-same ss q k o rewrite sameObj-refl o = refl
+-- The destination is quantified now rather than being `field′ q k`, and that
+-- costs exactly one case split: `isUnnamedSite (field′ q k)` reduced to `true`
+-- on its own, and a variable does not, so `b ∧ false` has to be taken apart by
+-- hand.
+unnamedRC-occupy-same : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+                        isUnnamedSite s ≡ true →
+                        unnamedRC (occupy ss s o) o ≡ suc (unnamedRC ss o)
+unnamedRC-occupy-same ss s o un rewrite un | sameObj-refl o = refl
 
-fieldRC-occupy-field-other : ∀ (ss : SiteMap) (q : ObjId) (k : ℕ) (o p : ObjId) →
-                             sameObj o p ≡ false →
-                             fieldRC (occupy ss (field′ q k) o) p ≡ fieldRC ss p
-fieldRC-occupy-field-other ss q k o p ne rewrite ne = refl
+unnamedRC-occupy-other : ∀ (ss : SiteMap) (s : OwnerSite) (o p : ObjId) →
+                         sameObj o p ≡ false →
+                         unnamedRC (occupy ss s o) p ≡ unnamedRC ss p
+unnamedRC-occupy-other ss s o p ne with isUnnamedSite s
+... | true  rewrite ne = refl
+... | false = refl
 
 -- `sameSite` is true only between sites of the same constructor, so a site that
--- matches a non-field is a non-field. Stated over the boolean the counts branch
--- on, like every other lemma here.
-sameSite-field : ∀ (s t : OwnerSite) → sameSite s t ≡ true →
-                 isFieldSite s ≡ isFieldSite t
-sameSite-field (local _ _)  (local _ _)  _ = refl
-sameSite-field (field′ _ _) (field′ _ _) _ = refl
-sameSite-field (global _)   (global _)   _ = refl
-sameSite-field (queue _ _)  (queue _ _)  _ = refl
-sameSite-field (temp _ _)   (temp _ _)   _ = refl
+-- matches a name's is a name's. Stated over the boolean the counts branch on,
+-- like every other lemma here.
+sameSite-unnamed : ∀ (s t : OwnerSite) → sameSite s t ≡ true →
+                   isUnnamedSite s ≡ isUnnamedSite t
+sameSite-unnamed (local _ _)  (local _ _)  _ = refl
+sameSite-unnamed (field′ _ _) (field′ _ _) _ = refl
+sameSite-unnamed (global _)   (global _)   _ = refl
+sameSite-unnamed (queue _ _)  (queue _ _)  _ = refl
+sameSite-unnamed (temp _ _)   (temp _ _)   _ = refl
+sameSite-unnamed (callee _ _) (callee _ _) _ = refl
 
-fieldRC-vacate-nonfield : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
-                          isFieldSite s ≡ false →
-                          fieldRC (vacate ss s) o ≡ fieldRC ss o
-fieldRC-vacate-nonfield []             s o nf = refl
-fieldRC-vacate-nonfield ((t , p) ∷ ss) s o nf = go (sameSite t s) refl
+unnamedRC-vacate-named : ∀ (ss : SiteMap) (s : OwnerSite) (o : ObjId) →
+                         isUnnamedSite s ≡ false →
+                         unnamedRC (vacate ss s) o ≡ unnamedRC ss o
+unnamedRC-vacate-named []             s o nf = refl
+unnamedRC-vacate-named ((t , p) ∷ ss) s o nf = go (sameSite t s) refl
   where
     go : (bb : Bool) → sameSite t s ≡ bb →
-         fieldRC (vacate ((t , p) ∷ ss) s) o ≡ fieldRC ((t , p) ∷ ss) o
-    go true  e rewrite e | trans (sameSite-field t s e) nf = refl
+         unnamedRC (vacate ((t , p) ∷ ss) s) o ≡ unnamedRC ((t , p) ∷ ss) o
+    go true  e rewrite e | trans (sameSite-unnamed t s e) nf = refl
     go false e rewrite e =
-      cong (λ n → if isFieldSite t ∧ sameObj p o then suc n else n)
-           (fieldRC-vacate-nonfield ss s o nf)
+      cong (λ n → if isUnnamedSite t ∧ sameObj p o then suc n else n)
+           (unnamedRC-vacate-named ss s o nf)
 
 -- ⭐ Vacating a site that HOLDS the object drops the count by exactly one.
 --

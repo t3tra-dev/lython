@@ -29,11 +29,14 @@ open import Proof.RC.Object using (ObjId)
 -- An SSA name. Deliberately NOT an ObjId: the entire content of this layer is
 -- that the two are different, and that a program can hold several names for one
 -- entity.
-Var BlockId FieldId ClassId : Set
+Var BlockId FieldId ClassId CallId : Set
 Var     = ℕ
 BlockId = ℕ
 FieldId = ℕ
 ClassId = ℕ
+-- Which outstanding call. The same index `OwnerSite.callee` carries, so two
+-- calls in flight do not share a site.
+CallId  = ℕ
 
 _≟-var_ : (x y : Var) → Dec (x ≡ y)
 _≟-var_ = _≟_
@@ -84,6 +87,38 @@ data Instr : Set where
   -- Field access on a boxed object, at the object's own lane.
   getField : Var → Var → FieldId → Instr
   setField : Var → FieldId → Var → Instr
+
+  -- ⭐ An owning reference LEAVES this activation, at a call.
+  --
+  -- `ly.ownership.transfer_args`: the callee takes ownership, so the caller's
+  -- name and site go and the counter does not move. That is `setField` with a
+  -- different destination, expressible for the same reason -- `OwnerSite.callee`
+  -- names where the reference went.
+  --
+  -- Four of the six attributes describing a call need no instruction at all,
+  -- measured rather than assumed:
+  --
+  --   ly.ownership.retain_args      nothing happens to the caller. Its only two
+  --                                 readers collect unwind-ambiguous operands
+  --                                 and check contract well-formedness
+  --   ly.ownership.release_args     `drop`
+  --   ly.ownership.borrowed_results `borrow`, from the argument borrowed from
+  --   ly.ownership.owned_result_contracts  a ClassId this model carries and
+  --                                 cannot check -- a `Cell` records life,
+  --                                 count, backing and field count, not a
+  --                                 class, which is why `alloc`'s is unread too
+  --
+  -- Why NOT one `call` carrying a contract: a call's effects are per-argument
+  -- and independent, so a call with several is a SEQUENCE -- the same reason
+  -- `alloc` and `init` are two instructions, and it keeps the step relation
+  -- free of folds whose lemmas would then be load-bearing.
+  --
+  -- ⛔ The other direction -- `ly.ownership.owned_results`, a reference
+  -- arriving +1 -- is NOT here. It is `callee -> local`, and it needs
+  -- `MoveCore` to take a source SITE where today it takes a source NAME. The
+  -- obstruction that made the boundary unstatable is gone; that generalisation
+  -- is what is left.
+  callOut : Var → CallId → Instr
 
 ------------------------------------------------------------------------
 -- Terminators.

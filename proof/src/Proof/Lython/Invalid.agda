@@ -47,7 +47,8 @@ open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal)
 open import Proof.RC.OwnerSite using (OwnerSite; local; field′; global; queue; temp;
-  fieldRC;
+  callee;
+  unnamedRC;
   ThreadId; SiteMap; strongAt; logicalRC; Holds; holds-here; holds-there)
 open import Proof.RC.Machine Sig
 open import Proof.Program.Syntax using (Var)
@@ -70,6 +71,12 @@ open import Proof.Concurrent.Event using (Event; kind; footprint; modeOf;
 ownerThread : OwnerSite → Maybe ThreadId
 ownerThread (local t _) = just t
 ownerThread (temp  t _) = just t
+-- A synchronous call runs on the caller's thread, so a reference handed to a
+-- callee is still thread-local. `nothing` would err in the safe direction --
+-- every call would look like an escape and force an atomic on every argument --
+-- but it would be false, and `needsAtomic?` would report a sharing that cannot
+-- happen.
+ownerThread (callee t _) = just t
 ownerThread (field′ _ _) = nothing
 ownerThread (global _)   = nothing
 ownerThread (queue _ _)  = nothing
@@ -249,14 +256,19 @@ record Leaked (es : Env) (m : Machine) (o : ObjId) : Set where
     -- store a field holds the object and no name does, which is the shape of an
     -- element sitting in a list, and the parent's release is what vacates it.
     -- The two counts disagreeing is still the defect; the name side is just not
-    -- the whole of the holding side once fields can hold.
+    -- the whole of the holding side once anything else can hold.
+    --
+    -- Over EVERY site no name owns, not fields alone. It was `fieldRC` while
+    -- `setField` was the only step that put a hold somewhere a name could not
+    -- reach; a reference handed to a callee is another, and an object held by
+    -- an outstanding call is no more leaked than one held by a field.
     --
     -- ⛔ What this therefore does NOT call a leak is a CYCLE: two objects each
     -- held by a field of the other and named by nobody satisfy `still-owned`
     -- and `unnamed` but not this. That is not an oversight -- it is what a
     -- reference count cannot see, and CPython leaks it too without its cycle
     -- collector. It is a separate family and needs reachability, not counting.
-    unfielded   : fieldRC (sites m) o ≡ 0
+    unheld      : unnamedRC (sites m) o ≡ 0
 
 open Leaked public
 

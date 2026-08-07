@@ -710,24 +710,31 @@ module Move
                   (inner (sameVar src y) refl (rest e))
 
 ------------------------------------------------------------------------
--- `setField`: the entity changes hands from a NAME to a FIELD.
+-- A NAME's entity changes hands to a site no name owns.
 --
 -- Everything about the counter is `MoveCore`'s, unchanged: one site vacated,
 -- one occupied. What is left is smaller than `move`'s, because no name is bound
--- -- a field site is not any name's site, so occupying it cannot disturb what
--- `backed` says about names, and `sameSite (field′ _ _) (local _ _)` is `false`
--- by construction rather than by a lemma.
+-- -- the destination is not any name's site, so occupying it cannot disturb
+-- what `backed` says about names.
+--
+-- `notName` is that condition, and both users discharge it with `refl`: a
+-- destination headed by a different constructor than `local` gives
+-- `sameSite _ _ ≡ false` by construction rather than by a lemma. A parameter
+-- rather than a constructor test, because the two users -- `setField` into
+-- `field′ p k` and `callOut` into `callee t c` -- differ in nothing else, and
+-- writing the proof twice is how the second one drifts from the first.
 
-module SetField
-  {t : ThreadId} {es : Env} {m : Machine} {src : Var} {k : FieldId}
-  {p o : ObjId}
-  (look  : lookupVar es src ≡ just (bind o owned))
-  (nodup : lookupVar (unbindVar es src) src ≡ nothing)
-  (w     : WFES t es m)
+module MoveToSite
+  {t : ThreadId} {es : Env} {m : Machine} {src : Var} {o : ObjId}
+  (dsite   : OwnerSite)
+  (notName : ∀ y → sameSite dsite (siteOf t y) ≡ false)
+  (look    : lookupVar es src ≡ just (bind o owned))
+  (nodup   : lookupVar (unbindVar es src) src ≡ nothing)
+  (w       : WFES t es m)
   where
 
   private
-    open module Core = MoveCore {t} {es} {m} {src} {o} (field′ p k) look w
+    open module Core = MoveCore {t} {es} {m} {src} {o} dsite look w
 
   preserves : WFES t (unbindVar es src) m'
   preserves = wfs counts bk'
@@ -735,7 +742,7 @@ module SetField
       bk' : ∀ y q → lookupVar (unbindVar es src) y ≡ just (bind q owned) →
             strongAt ss' (siteOf t y) ≡ just q
       bk' y q h =
-        trans (strongAt-cons-false (field′ p k) o vacated (siteOf t y) refl)
+        trans (strongAt-cons-false dsite o vacated (siteOf t y) (notName y))
               (inner (sameVar src y) refl)
         where
           -- The SSA premise, spent exactly as `move` spends it: without it the
@@ -1060,7 +1067,12 @@ instr-preserves-WF (step-move look nodup)              w = Move.preserves look n
 instr-preserves-WF (step-dup look tbl alive)           w = Dup.preserves look tbl alive w
 instr-preserves-WF (step-drop look tbl alive nodup)    w = Drop.preserves look tbl alive nodup w
 instr-preserves-WF (step-borrow look)                  w = borrowed-bind-preserves w
-instr-preserves-WF (step-set-field _ look nodup _)     w = SetField.preserves look nodup w
+instr-preserves-WF (step-set-field _ look nodup _)     w =
+  MoveToSite.preserves _ (λ _ → refl) look nodup w
+-- The transfer half of a call boundary, and the whole of its proof: a move to a
+-- site no name owns, which `setField` already was.
+instr-preserves-WF (step-call-out look nodup)         w =
+  MoveToSite.preserves _ (λ _ → refl) look nodup w
 instr-preserves-WF (step-get-field _ _)                w = borrowed-bind-preserves w
 
 -- Every terminator is the same operation on the state -- move the operands into

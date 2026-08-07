@@ -16,8 +16,9 @@
 // every attribute is ACCOUNTED FOR, not that the accounting is right. Only a
 // person can decide that `aggregate_retain` is `setField`. What a machine can
 // refuse is a seventeenth attribute with no row, and a model that grows a step
-// while the block still claims the old count -- which is how the call step,
-// when it lands, forces the map to be revisited rather than quietly diverge.
+// while the block still claims the old count. That second half has already
+// earned itself once: `callOut` landed, `Instr` went from eight to nine, and
+// this is what said the map had to be revisited.
 
 #include "gtest/gtest.h"
 
@@ -144,18 +145,17 @@ TEST(ModelCorrespondenceTest, EveryOwnershipAttributeHasARow) {
 
 // The map's claim about the model's size, checked against the model.
 //
-// This is the half that matters for what comes next. The map says the call
-// boundary has no counterpart BECAUSE the model has no call, and that is a
-// statement about a specific number of constructors. When a call step lands,
-// this fails -- which is the intended way to be told that six attributes are
-// now bindable.
+// This is the half that matters for what comes next. The map is written against
+// a specific instruction set, and the one attribute still unmapped --
+// `owned_results` -- is unmapped for a reason that stops being true the moment
+// a tenth constructor appears. Failing then is the intended way to be told.
 TEST(ModelCorrespondenceTest, TheModelHasTheStepsTheMapAssumes) {
   std::string syntax =
       readOrDie(LYTHON_SOURCE_DIR "/proof/src/Proof/Program/Syntax.agda");
 
-  EXPECT_EQ(constructorCount(syntax, "data Instr : Set where"), 8u)
+  EXPECT_EQ(constructorCount(syntax, "data Instr : Set where"), 9u)
       << "the model's instruction set changed; the map in common/Ownership.h "
-         "places the compiler's attributes against exactly the eight it had";
+         "places the compiler's attributes against exactly the nine it had";
   EXPECT_EQ(constructorCount(syntax, "data Term : Set where"), 5u)
       << "the model's terminators changed; the map explains that `invoke` is "
          "an unwind edge and not a call, which is a claim about this set";

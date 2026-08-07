@@ -27,7 +27,7 @@ open import Proof.RC.Object using (ObjId; Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; sameObj; sameObj-refl; sameObj-sound;
   ≡ᵇ-refl; ≡ᵇ-sound; ≡ᵇ-sym)
 open import Proof.RC.OwnerSite using (OwnerSite; SiteMap; ThreadId; sameSite;
-  fieldRC;
+  unnamedRC;
   sameSite-false; sameSite-refl; sameSite-sound; sameSite-sym;
   Holds; holds-here; holds-there; holds-positive; logicalRC)
 open import Proof.RC.Machine Sig
@@ -378,7 +378,7 @@ zero? (suc _) = false
 -- soundness and completeness stop being about the same predicate.
 leaked? : Env → Machine → ObjId → Bool
 leaked? es m o = positive? (ghostRC m o) ∧ zero? (ownedCount es o)
-                                         ∧ zero? (fieldRC (sites m) o)
+                                         ∧ zero? (unnamedRC (sites m) o)
 
 private
   positive?-sound : ∀ n → positive? n ≡ true → 0 < n
@@ -402,14 +402,14 @@ leaked?-sound es m o rep with ∧-true rep
 ... | (gp , rest) with ∧-true rest
 ...   | (on , fz) = leaked (positive?-sound (ghostRC m o) gp)
                            (zero?-sound (ownedCount es o) on)
-                           (zero?-sound (fieldRC (sites m) o) fz)
+                           (zero?-sound (unnamedRC (sites m) o) fz)
 
 leaked?-complete : ∀ (es : Env) (m : Machine) (o : ObjId) →
                    Leaked es m o → leaked? es m o ≡ true
 leaked?-complete es m o lk
   rewrite positive?-complete (ghostRC m o) (still-owned lk)
         | zero?-complete (ownedCount es o) (unnamed lk)
-        | zero?-complete (fieldRC (sites m) o) (unfielded lk) = refl
+        | zero?-complete (unnamedRC (sites m) o) (unheld lk) = refl
 
 -- ⭐ The form a pass uses: if the check is silent at every object the pass
 -- touched, nothing was leaked there.

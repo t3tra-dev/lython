@@ -35,7 +35,8 @@ open import Proof.Concurrent.Event
 open import Proof.RC.Object using (ObjId)
 open import Proof.Program.Env using (entityOf; lookupVar; mode; entity; isOwned)
 open import Proof.Program.Syntax
-  using (Var; Instr; alloc; init; move; dup; drop; borrow; getField; setField)
+  using (Var; Instr; alloc; init; move; dup; drop; borrow; getField;
+         setField; callOut)
 
 ------------------------------------------------------------------------
 -- ⭐ The event an instruction performs.
@@ -112,6 +113,9 @@ instrEvent t pol (move _ _)       es = nothing
 instrEvent t pol (borrow _ _)     es = nothing
 instrEvent t pol (getField _ src k) es = fieldEventFor t reads  es src k
 instrEvent t pol (setField dst k _) es = fieldEventFor t writes es dst k
+-- `callOut` is a move: one site vacated, one occupied, no byte touched and no
+-- counter changed. `move` is `nothing` for the same reason.
+instrEvent t pol (callOut _ _)    es = nothing
 
 -- The event of the instruction a thread is about to run. A thread at a
 -- terminator has none.

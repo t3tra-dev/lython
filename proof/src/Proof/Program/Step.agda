@@ -37,7 +37,7 @@ open import Proof.RC.Object using (ObjId; obj; objAllocation; objGeneration;
   Life; live; finalizing; dead;
   RuntimeCount; counted; immortal; bumpUp; bumpDown)
 open import Proof.RC.OwnerSite using (OwnerSite; local; field′; temp; ThreadId; SiteMap;
-  strongAt; occupy; vacate; logicalRC; Holds)
+  strongAt; occupy; vacate; logicalRC; Holds; callee)
 open import Proof.Memory.Heap using (Heap; Block; lookupBlock; generation;
   liveness)
   renaming (live to blockLive)
@@ -230,6 +230,28 @@ data _⊢_—→ᵢ_ (f : Function) : PState → PState → Set where
             (unbindVar es x)
             (machine (heap m) (stepDownAt (objects m) o)
                      (vacate (sites m) (siteOf t x)))
+
+  -- ⭐ `callOut`: an owning reference leaves this activation at a call.
+  --
+  -- `move`, with `callee t c` as the destination. There is nothing else to it,
+  -- and that IS the result: `ly.ownership.transfer_args` looked unstatable
+  -- until the site list gained the place the reference goes. Vacating without a
+  -- destination breaks `counted-exact`; lowering the counter instead models a
+  -- transfer as a release, which it is not -- the machine's counter does not
+  -- move when ownership changes hands.
+  --
+  -- The SSA premise is `move`'s and is spent the same way: without it the
+  -- source could still be bound after the unbind, and would be an owned name at
+  -- a site this rule has just vacated.
+  step-call-out :
+    ∀ {t bid rest es m src c o} →
+    lookupVar es src ≡ just (bind o owned) →
+    lookupVar (unbindVar es src) src ≡ nothing →
+    f ⊢ pstate t bid (callOut src c ∷ rest) es m
+      —→ᵢ pstate t bid rest
+            (unbindVar es src)
+            (machine (heap m) (objects m)
+                     (occupy (vacate (sites m) (siteOf t src)) (callee t c) o))
 
   -- `borrow`: a second NAME, no second owner site, no runtime operation. This
   -- is the rule that makes eliding a retain correct rather than merely cheaper.
