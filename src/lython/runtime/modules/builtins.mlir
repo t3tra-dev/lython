@@ -1428,7 +1428,8 @@ module attributes {
   ^dealloc:
     %header_ptr_index = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
     %header_word = arith.index_cast %header_ptr_index : index to i64
-    func.call @release_exception_extras(%header_word) : (i64) -> ()
+    %header_ptr = llvm.inttoptr %header_word : i64 to !llvm.ptr
+    func.call @release_exception_extras(%header_ptr) : (!llvm.ptr) -> ()
     func.call @LyUnicode_DecRef(%message_header) : (memref<2xi64>) -> ()
     memref.dealloc %header : memref<3xi64>
     cf.br ^done
@@ -2094,7 +2095,7 @@ module attributes {
   // Native support (RuntimeSupportBuilder): extended-word release for the
   // deallocator, raw view rebuilders for the payload boxes, and the taxonomy
   // subtree matcher for the group-aware paths.
-  func.func private @release_exception_extras(%header_word: i64)
+  func.func private @release_exception_extras(%header_ptr: !llvm.ptr)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   func.func private @free_raw_i64_ptr(%address: i64)
   // Rebuild a rank-1 memref over the payload a raw pointer word addresses

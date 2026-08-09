@@ -689,29 +689,31 @@ void buildRetainStorageRaw(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// Shared shape: release a single-allocation storage rooted at `address`,
+// Shared shape: release a single-allocation storage rooted at a POINTER,
 // freeing it if the refcount hit zero. `release_unicode_raw`'s second argument
 // (an interior bytes view) needs no separate free.
 void buildReleaseSingleAllocation(SupportBuilder &b, llvm::StringRef name,
                                   bool twoArgs) {
-  llvm::SmallVector<mlir::Type, 2> inputs = {b.i64()};
+  llvm::SmallVector<mlir::Type, 2> inputs = {b.ptr()};
   if (twoArgs)
-    inputs.push_back(b.i64());
+    inputs.push_back(b.ptr());
   auto fn = b.beginFunction(name, b.builder.getFunctionType(inputs, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *freeBlock = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
+  // The one narrowing this path takes: the tag check needs a word because a
+  // tagged reference is an immediate, not an address. Everything after it is
+  // known to be a real allocation, so the pointer carries on unbroken.
   auto becameZero = mlir::func::CallOp::create(
       b.builder, b.loc, "release_storage_raw_to_zero", b.i1(),
-      mlir::ValueRange{entry->getArgument(0)});
+      mlir::ValueRange{b.ptrToInt(entry->getArgument(0))});
   mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero.getResult(0),
                                  freeBlock, mlir::ValueRange{}, done,
                                  mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(freeBlock);
-  mlir::func::CallOp::create(b.builder, b.loc, "free_raw_i64_ptr",
-                             mlir::TypeRange{},
+  mlir::func::CallOp::create(b.builder, b.loc, "free", mlir::TypeRange{},
                              mlir::ValueRange{entry->getArgument(0)});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
@@ -1541,11 +1543,11 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
 // share one implementation.
 void buildReleaseExceptionExtras(SupportBuilder &b) {
   auto fn = b.beginFunction("release_exception_extras",
-                            b.builder.getFunctionType({b.i64()}, {}),
+                            b.builder.getFunctionType({b.ptr()}, {}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value header = b.intToPtr(entry->getArgument(0));
+  mlir::Value header = entry->getArgument(0);
   for (std::int64_t word : {std::int64_t(3), std::int64_t(4)}) {
     mlir::Value slotPtr = b.gepI64(header, b.iconst(word));
     mlir::Value block64 = b.loadI64(slotPtr);
@@ -1582,7 +1584,7 @@ void buildReleaseExceptionExtras(SupportBuilder &b) {
         b.call("release_payload_slot_ptr", mlir::TypeRange{},
                mlir::ValueRange{boxPtr});
       }
-      b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{block64});
+      b.call("free", mlir::TypeRange{}, mlir::ValueRange{blockPtr});
       mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0), slotPtr,
                                   /*alignment=*/8);
     }
@@ -1636,15 +1638,11 @@ void buildDiscardCurrentException(SupportBuilder &b) {
                                  mlir::ValueRange{}, clear,
                                  mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(freeBlocks);
-  mlir::Value headerWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageHeader);
-  mlir::Value bytesWord =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageBytes);
   b.call("release_exception_extras", mlir::TypeRange{},
-         mlir::ValueRange{exceptionWord});
+         mlir::ValueRange{exceptionAligned});
   b.call("release_unicode_raw", mlir::TypeRange{},
-         mlir::ValueRange{headerWord, bytesWord});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{exceptionWord});
+         mlir::ValueRange{messageHeader, messageBytes});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{exceptionAligned});
   mlir::cf::BranchOp::create(b.builder, b.loc, clear, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(clear);
   mlir::LLVM::StoreOp::create(
@@ -2144,12 +2142,9 @@ void buildRunPythonMain(SupportBuilder &b) {
   // read now because the descriptor's storage is an alloca the exit paths still
   // read from, and taking them once keeps the three paths spelling the same
   // thing.
-  mlir::Value takenHeader =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), aligned);
-  mlir::Value takenMessageHeader =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageHeader);
-  mlir::Value takenMessageData =
-      mlir::LLVM::PtrToIntOp::create(b.builder, b.loc, b.i64(), messageData);
+  mlir::Value takenHeader = aligned;
+  mlir::Value takenMessageHeader = messageHeader;
+  mlir::Value takenMessageData = messageData;
   auto releaseTaken = [&]() {
     mlir::func::CallOp::create(
         b.builder, b.loc, "release_taken_exception", mlir::TypeRange{},

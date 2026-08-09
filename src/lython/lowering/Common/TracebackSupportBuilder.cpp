@@ -593,10 +593,13 @@ void buildReleaseChainNode(SupportBuilder &b) {
   b.call("free", mlir::TypeRange{},
          mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeFrames))});
   mlir::Value header = b.loadPtrVal(nodePartsField(b, node, 0, 1));
-  // ⛔ The refcount helpers take a word because the reference they are handed
-  // may be TAGGED (an immediate), and a tagged reference is not a pointer at
-  // all. That narrowing is the honest direction; what must not happen is the
-  // other one, an integer widened back into a descriptor.
+  // ⛔ `release_storage_raw_to_zero` takes a word because the reference it is
+  // handed may be TAGGED (an immediate), and a tagged reference is not a
+  // pointer at all. Narrowing for that check is the honest direction and it is
+  // the only narrowing left here: the rest of this path carries the pointer,
+  // because the other direction -- an integer widened back into something a
+  // free() dereferences -- is what this comment forbade while the helpers
+  // underneath were still doing it.
   mlir::Value headerWord = b.ptrToInt(header);
   mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
                                   mlir::ValueRange{headerWord})
@@ -607,10 +610,10 @@ void buildReleaseChainNode(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(freePayload);
   b.call("release_exception_extras", mlir::TypeRange{},
-         mlir::ValueRange{headerWord});
+         mlir::ValueRange{header});
   b.call("release_unicode_raw", mlir::TypeRange{},
-         mlir::ValueRange{b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 1, 1))),
-                          b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 2, 1)))});
+         mlir::ValueRange{b.loadPtrVal(nodePartsField(b, node, 1, 1)),
+                          b.loadPtrVal(nodePartsField(b, node, 2, 1))});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{header});
   mlir::cf::BranchOp::create(b.builder, b.loc, freeNode, mlir::ValueRange{});
 
@@ -622,8 +625,8 @@ void buildReleaseChainNode(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// void release_taken_exception(i64 header, i64 msgHeader, i64 msgData): drop the
-// reference `LyEH_TakeCurrentDescriptor` handed to its caller.
+// void release_taken_exception(ptr header, ptr msgHeader, ptr msgData): drop
+// the reference `LyEH_TakeCurrentDescriptor` handed to its caller.
 //
 // "Take" is a transfer: the runtime's in-flight slot gives up its reference and
 // the caller owns one. `LyRunPythonMain` is the only caller, and it printed the
@@ -643,18 +646,21 @@ void buildReleaseChainNode(SupportBuilder &b) {
 void buildReleaseTakenException(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "release_taken_exception",
-      b.builder.getFunctionType({b.i64(), b.i64(), b.i64()}, {}),
+      b.builder.getFunctionType({b.ptr(), b.ptr(), b.ptr()}, {}),
       /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *alive = b.builder.createBlock(&body);
   mlir::Block *freePayload = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
-  mlir::Value headerWord = entry->getArgument(0);
+  mlir::Value header = entry->getArgument(0);
   mlir::Value msgHeader = entry->getArgument(1);
   mlir::Value msgData = entry->getArgument(2);
 
   b.builder.setInsertionPointToEnd(entry);
+  // The tag check is the one place this path needs a word (a tagged reference
+  // is an immediate, not an address); the free below keeps the pointer.
+  mlir::Value headerWord = b.ptrToInt(header);
   mlir::Value isNull =
       b.cmpi(mlir::arith::CmpIPredicate::eq, headerWord, b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
@@ -670,10 +676,10 @@ void buildReleaseTakenException(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(freePayload);
   b.call("release_exception_extras", mlir::TypeRange{},
-         mlir::ValueRange{headerWord});
+         mlir::ValueRange{header});
   b.call("release_unicode_raw", mlir::TypeRange{},
          mlir::ValueRange{msgHeader, msgData});
-  b.call("free_raw_i64_ptr", mlir::TypeRange{}, mlir::ValueRange{headerWord});
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{header});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(done);
@@ -2364,19 +2370,19 @@ mlir::Value starFrameSlot(SupportBuilder &b, mlir::Value frame,
   return starFrameMember(b, frame, member);
 }
 
-// void release_exception_storage_raw(i64 eh, i64 mh, i64 mb): one owned
+// void release_exception_storage_raw(ptr eh, ptr mh, ptr mb): one owned
 // exception reference by raw pointers (the star frame paths hold exceptions
 // outside memref descriptors).
 void buildReleaseExceptionStorageRaw(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "release_exception_storage_raw",
-      b.builder.getFunctionType({b.i64(), b.i64(), b.i64()}, {}),
+      b.builder.getFunctionType({b.ptr(), b.ptr(), b.ptr()}, {}),
       /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value becameZero =
       b.call("release_storage_raw_to_zero", b.i1(),
-             mlir::ValueRange{entry->getArgument(0)})
+             mlir::ValueRange{b.ptrToInt(entry->getArgument(0))})
           .front();
   auto freeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
                                         becameZero, /*withElseRegion=*/false);
@@ -2387,7 +2393,7 @@ void buildReleaseExceptionStorageRaw(SupportBuilder &b) {
            mlir::ValueRange{entry->getArgument(0)});
     b.call("release_unicode_raw", mlir::TypeRange{},
            mlir::ValueRange{entry->getArgument(1), entry->getArgument(2)});
-    b.call("free_raw_i64_ptr", mlir::TypeRange{},
+    b.call("free", mlir::TypeRange{},
            mlir::ValueRange{entry->getArgument(0)});
   }
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -2564,9 +2570,9 @@ void buildStarApplyMatch(SupportBuilder &b) {
   // Drop the frame's reference to the old residual payload.
   b.call("release_exception_storage_raw", mlir::TypeRange{},
          mlir::ValueRange{
-             b.ptrToInt(b.loadPtrVal(partsField(b, payload, 0, 1))),
-             b.ptrToInt(b.loadPtrVal(partsField(b, payload, 1, 1))),
-             b.ptrToInt(b.loadPtrVal(partsField(b, payload, 2, 1)))});
+             b.loadPtrVal(partsField(b, payload, 0, 1)),
+             b.loadPtrVal(partsField(b, payload, 1, 1)),
+             b.loadPtrVal(partsField(b, payload, 2, 1))});
 
   // Rest into the node payload; absent rest zeroes it and clears the flag.
   mlir::Value hasRest = entry->getArgument(1);
@@ -2798,9 +2804,9 @@ void buildStarThrowCombined(SupportBuilder &b) {
       b.builder.setInsertionPointToStart(&payloadIf.getThenRegion().front());
       b.call("release_exception_storage_raw", mlir::TypeRange{},
              mlir::ValueRange{
-                 b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 0, 1))),
-                 b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 1, 1))),
-                 b.ptrToInt(b.loadPtrVal(nodePartsField(b, node, 2, 1)))});
+                 b.loadPtrVal(nodePartsField(b, node, 0, 1)),
+                 b.loadPtrVal(nodePartsField(b, node, 1, 1)),
+                 b.loadPtrVal(nodePartsField(b, node, 2, 1))});
     }
     // CPython gives the combined group no traceback of its own (its members
     // carry theirs); drop the residual node's snapshot instead of donating.
@@ -2876,11 +2882,11 @@ void buildStarDiscardSplit(SupportBuilder &b) {
       b.builder.getFunctionType(exceptionTripleTypes(b.builder), {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  auto alignedWord = [&](int section) {
-    return b.ptrToInt(explodeMemRef1D(b, entry->getArgument(section)).aligned);
+  auto aligned = [&](int section) {
+    return explodeMemRef1D(b, entry->getArgument(section)).aligned;
   };
   b.call("release_exception_storage_raw", mlir::TypeRange{},
-         mlir::ValueRange{alignedWord(0), alignedWord(1), alignedWord(2)});
+         mlir::ValueRange{aligned(0), aligned(1), aligned(2)});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
