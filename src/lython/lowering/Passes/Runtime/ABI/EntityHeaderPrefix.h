@@ -130,10 +130,19 @@ inline bool prefixIsInitializedAtDefinition(mlir::Value handle) {
   // ⭐ An ownership marker answers this question directly.
   //
   // `ly.ownership.owned_local_object` is emitted only once the entity is
-  // COMPLETE -- the boxing path in `ABI/RuntimeABI.cpp` stores the prefix words
-  // and takes the payload retain BEFORE rooting the value in the marker, and
-  // `Ops/GetItemOps.cpp` emits its retain before rooting. So at the marker the
-  // prefix is written, which is exactly what this predicate is asked.
+  // COMPLETE, so at the marker the prefix is written, which is exactly what
+  // this predicate is asked. That is `proof/`'s
+  // `no-dup-in-the-initialisation-window`, and it holds here because
+  // `verifyInitialisationWindowIn` refuses any marker the word-0 store does
+  // not dominate.
+  //
+  // Why NOT justify it by listing the producers, as this said until the gate
+  // existed: it named the boxing path in `ABI/RuntimeABI.cpp` and
+  // `Ops/GetItemOps.cpp`, two of the three sites that mint the attribute. The
+  // missing one, `Core/ObjectBundles.cpp`, is the one that marks ordinary
+  // entities -- the common case this predicate is asked about. Its ordering
+  // was in fact correct, so the conclusion held; an argument that omits a
+  // third of its cases just cannot be what holds it up.
   //
   // Why NOT let `handleProvenanceRoot` decide it: that walk deliberately
   // follows identity-shaped casts, so it walks straight THROUGH the marker to
