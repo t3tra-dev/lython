@@ -89,7 +89,8 @@ mlir::LogicalResult verifyFunctionOwnershipShape(mlir::func::FuncOp function) {
 
   auto verifyObjectArg = [&](unsigned index,
                              llvm::StringRef attrName) -> mlir::LogicalResult {
-    if (!own::isObjectHeaderLikeType(function.getFunctionType().getInput(index)))
+    if (!own::isObjectHeaderLikeType(
+            function.getFunctionType().getInput(index)))
       return function.emitError() << attrName << " argument " << index
                                   << " must be an object-header-like memref";
     if (!function.getArgAttr(index, own::kObjectHeaderAttr))
@@ -100,9 +101,8 @@ mlir::LogicalResult verifyFunctionOwnershipShape(mlir::func::FuncOp function) {
 
   auto verifyConcreteConsumerArg =
       [&](unsigned index, llvm::StringRef attrName) -> mlir::LogicalResult {
-    auto manifestContract =
-        function->getAttrOfType<mlir::StringAttr>(
-            contracts::kManifestContractAttr);
+    auto manifestContract = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestContractAttr);
     if (!manifestContract || manifestContract.getValue() != "builtins.object")
       return mlir::success();
     if (!isRawObjectHeaderABI(function.getFunctionType().getInput(index)))
@@ -120,15 +120,13 @@ mlir::LogicalResult verifyFunctionOwnershipShape(mlir::func::FuncOp function) {
   for (unsigned index : contract->releaseArgs.values) {
     if (mlir::failed(verifyObjectArg(index, own::kReleaseArgsAttr)))
       return mlir::failure();
-    if (mlir::failed(
-            verifyConcreteConsumerArg(index, own::kReleaseArgsAttr)))
+    if (mlir::failed(verifyConcreteConsumerArg(index, own::kReleaseArgsAttr)))
       return mlir::failure();
   }
   for (unsigned index : contract->transferArgs.values) {
     if (mlir::failed(verifyObjectArg(index, own::kTransferArgsAttr)))
       return mlir::failure();
-    if (mlir::failed(
-            verifyConcreteConsumerArg(index, own::kTransferArgsAttr)))
+    if (mlir::failed(verifyConcreteConsumerArg(index, own::kTransferArgsAttr)))
       return mlir::failure();
   }
 
@@ -158,12 +156,11 @@ mlir::LogicalResult verifyOperationOwnershipShape(mlir::Operation *op) {
     if (op->hasAttr(own::kOwnedLocalObjectContractAttr) &&
         !mlir::isa<mlir::StringAttr>(
             op->getAttr(own::kOwnedLocalObjectContractAttr)))
-      return op->emitError()
-             << own::kOwnedLocalObjectContractAttr
-             << " must be a string attribute";
+      return op->emitError() << own::kOwnedLocalObjectContractAttr
+                             << " must be a string attribute";
   } else if (op->hasAttr(own::kOwnedLocalObjectContractAttr)) {
-    return op->emitError() << own::kOwnedLocalObjectContractAttr
-                           << " requires " << own::kOwnedLocalObjectAttr;
+    return op->emitError() << own::kOwnedLocalObjectContractAttr << " requires "
+                           << own::kOwnedLocalObjectAttr;
   }
 
   auto aggregate = own::readAggregateOwnershipMarker(op);
@@ -230,9 +227,9 @@ public:
 // ⭐ ONE OWNED TOKEN PER SSA VALUE.
 //
 // `ly.ownership.owned_local_object` marks a value the FRAME owns and must
-// release. `refcount-insertion` emits one release per marked VALUE, however many
-// times it is marked -- so two tokens on one value are two retains against one
-// release, which is a leak.
+// release. `refcount-insertion` emits one release per marked VALUE, however
+// many times it is marked -- so two tokens on one value are two retains against
+// one release, which is a leak.
 //
 // That was assumed by the consumer and enforced nowhere until an unbounded leak
 // came out of it: reading one container slot twice reconstructs the same handle
@@ -246,24 +243,25 @@ public:
 // tuple, 69 roots / 14656 B for a seventy-element one, and saturating, which is
 // what a per-value map looks like from the outside.
 //
-// The invariant is `proof/`'s `WFES.backed` -- every owned name occupies its OWN
-// site -- and the model had it before the leak was measured. A state invariant
-// belongs in a phase gate, not in the memory of whoever next mints a token: this
-// runs between the pass that mints tokens and the pass that consumes them.
+// The invariant is `proof/`'s `WFES.backed` -- every owned name occupies its
+// OWN site -- and the model had it before the leak was measured. A state
+// invariant belongs in a phase gate, not in the memory of whoever next mints a
+// token: this runs between the pass that mints tokens and the pass that
+// consumes them.
 //
 // ⛔ DOMINANCE, not mere co-occurrence. Two markers on one value in mutually
 // exclusive blocks are FINE: exactly one retain executes, and one release is
 // emitted, so the counts balance. Rejecting those would refuse correct IR. The
-// defect is two tokens on a path that runs both, which is exactly "one dominates
-// the other" -- so that is the condition tested.
+// defect is two tokens on a path that runs both, which is exactly "one
+// dominates the other" -- so that is the condition tested.
 //
 // This check found three duplicate-token goldens the producer fix had missed,
 // two of which were leaking (`cross_exception_field_box_slot` 9 roots / 1120 B,
-// `sequence_literal_source_move_frequency` 3 roots / 192 B) and one of which was
-// benign because an enum member is an immortal singleton. All three came from one
-// producer comparing against the wrong reference point; the check is what made
-// them visible rather than a guess about where else to look.
-// ⭐ A frame does not own what it did not acquire.
+// `sequence_literal_source_move_frequency` 3 roots / 192 B) and one of which
+// was benign because an enum member is an immortal singleton. All three came
+// from one producer comparing against the wrong reference point; the check is
+// what made them visible rather than a guess about where else to look. ⭐ A
+// frame does not own what it did not acquire.
 //
 // `proof/`'s `WFES.backed` says every owned name occupies its OWN site. The
 // uniqueness check beside this one reads that at the consumer -- two tokens for
@@ -284,7 +282,8 @@ public:
 // programs that the leak gate and ASan both say are clean -- an incomplete
 // classifier refusing valid IR, which is worse than the gap it closes. With the
 // shared predicate the count over all 297 golden cases is zero.
-mlir::LogicalResult verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
+mlir::LogicalResult
+verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
   own::AliasAnalysis aliases;
   aliases.build(function);
   mlir::LogicalResult result = mlir::success();
@@ -319,13 +318,14 @@ mlir::LogicalResult verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) 
     // `dup`: a retain minted this token.
     if (own::ownedLocalMarkerIsRetainRooted(token, aliases))
       return;
-    result = token->emitError()
-             << own::kOwnedLocalObjectAttr
-             << " marks a value this frame never acquired: it is not a fresh "
-                "allocation, not a call result the contract declares owned, and "
-                "no retain roots it. A value read out of a slot is BORROWED -- "
-                "the slot still holds it -- so the release this token earns "
-                "would discharge a reference the frame does not have";
+    result =
+        token->emitError()
+        << own::kOwnedLocalObjectAttr
+        << " marks a value this frame never acquired: it is not a fresh "
+           "allocation, not a call result the contract declares owned, and "
+           "no retain roots it. A value read out of a slot is BORROWED -- "
+           "the slot still holds it -- so the release this token earns "
+           "would discharge a reference the frame does not have";
   });
   return result;
 }
@@ -354,14 +354,95 @@ mlir::LogicalResult verifyOwnedTokenUniquenessIn(mlir::func::FuncOp function) {
              << " marks a value this frame already owns; the earlier token at "
              << first->getLoc()
              << " dominates this one, so both retains run and only one release "
-                "is emitted. A re-read of an entity the frame owns is a borrow: "
+                "is emitted. A re-read of an entity the frame owns is a "
+                "borrow: "
                 "reuse the existing token instead of minting a second";
     }
   }
   return mlir::success();
 }
 
+// The PUBLISHING store, which is the earliest write to word 0 -- a later write
+// is a re-initialisation, and picking one of those off the use list (whose
+// order is not program order) reports every well-formed window as a violation.
+// When no single write dominates the rest, the window has no identifiable
+// close and this declines to judge it rather than guessing.
+std::optional<mlir::Operation *>
+refcountWordStoreFor(mlir::Value box, mlir::DominanceInfo &dominance) {
+  llvm::SmallVector<mlir::Operation *, 4> writes;
+  for (mlir::Operation *user : box.getUsers()) {
+    auto store = mlir::dyn_cast<mlir::memref::StoreOp>(user);
+    if (!store || store.getMemRef() != box || store.getIndices().size() != 1)
+      continue;
+    mlir::Operation *slot = store.getIndices().front().getDefiningOp();
+    if (!slot)
+      continue;
+    auto index = slot->getAttrOfType<mlir::IntegerAttr>("value");
+    if (index && index.getValue().getSExtValue() == 0)
+      writes.push_back(store.getOperation());
+  }
+  for (mlir::Operation *candidate : writes) {
+    bool first = true;
+    for (mlir::Operation *other : writes)
+      if (other != candidate && !dominance.properlyDominates(candidate, other))
+        first = false;
+    if (first)
+      return candidate;
+  }
+  return std::nullopt;
+}
+
+// ⭐ Nothing counts a reference before the object exists.
+//
+// `proof/`'s `no-dup-in-the-initialisation-window`: while
+// `lookupObj (objects m) o` is `nothing` -- between the allocation and the
+// store that publishes the header -- `dup` cannot step. The compiler had a
+// predicate for this, `entity_header::prefixIsInitializedAtDefinition`, with
+// exactly one reader: `borrowEdgeRetainIsSpellable`. That asks whether a retain
+// can be SPELLED on one edge kind. The theorem is about whether any counting
+// operation may RUN, on every allocation.
+//
+// Only the dup half is checkable here, and this is the phase where it is
+// checkable at all: the token exists from runtime-lowering, and releases are
+// not emitted until phase 10. `no-drop-in-the-initialisation-window` therefore
+// has no gate -- said plainly rather than implied by the name.
+mlir::LogicalResult verifyInitialisationWindowIn(mlir::func::FuncOp function) {
+  mlir::DominanceInfo dominance(function);
+  mlir::LogicalResult result = mlir::success();
+  function.walk([&](mlir::Operation *marker) {
+    if (!marker->hasAttr(own::kOwnedLocalObjectAttr))
+      return mlir::WalkResult::advance();
+    // A marker ON an allocation is the model's `alloc` handing back an owned
+    // binding, not a `dup` -- and `memref.alloc()` takes no operands, so it
+    // falls out here rather than needing to be named as an exception.
+    for (mlir::Value operand : marker->getOperands()) {
+      auto alloc = operand.getDefiningOp<mlir::memref::AllocOp>();
+      if (!alloc)
+        continue;
+      std::optional<mlir::Operation *> published =
+          refcountWordStoreFor(alloc.getResult(), dominance);
+      if (!published || dominance.dominates(*published, marker))
+        continue;
+      result =
+          marker->emitError()
+          << own::kOwnedLocalObjectAttr
+          << " mints a frame reference before the header it counts is "
+             "published; the refcount word is stored at "
+          << (*published)->getLoc()
+          << ", which does not dominate this token. Inside the initialisation "
+             "window the object does not yet exist to be counted, so the "
+             "matching release discharges a count that was never established";
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return result;
+}
+
 mlir::LogicalResult verifyOwnedTokenUniquenessImpl(mlir::ModuleOp module) {
+  if (mlir::failed(
+          walkVerify<mlir::func::FuncOp>(module, verifyInitialisationWindowIn)))
+    return mlir::failure();
   if (mlir::failed(walkVerify<mlir::func::FuncOp>(
           module, verifyOwnedTokensAreAcquiredIn)))
     return mlir::failure();
