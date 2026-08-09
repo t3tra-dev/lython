@@ -1,5 +1,6 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/Core/OwnedLocalMarker.h"
 #include "Runtime/Evidence/Callable.h"
 #include "Runtime/ABI/BoxLayout.h"
 
@@ -212,23 +213,18 @@ bool valueIsOwnedLocalToken(const RuntimeValue &value,
 }
 
 // Mark an element as a frame-owned local, so the ordinary owned-result
-// machinery releases it. An identity cast erased at reconciliation; the
-// attribute is the whole content. Assumes the insertion point is already set.
+// machinery releases it. Assumes the insertion point is already set.
 //
-// This is the ONLY place the marker is written, which is the point of splitting
-// it out: "take a reference" and "record that the frame holds one" are two
-// operations, and a caller needs to be able to ask for the second alone.
+// The point of splitting it out is that "take a reference" and "record that
+// the frame holds one" are two operations, and a caller needs to be able to
+// ask for the second alone. It used to claim to be the only place the marker
+// is written; there were three. `Core/OwnedLocalMarker.h` is now that place,
+// and this is one of its callers.
 RuntimeValue rootAsOwnedLocal(mlir::OpBuilder &builder, mlir::Location loc,
                               const RuntimeValue &value,
                               llvm::StringRef contract) {
-  llvm::SmallVector<mlir::Type, 4> resultTypes;
-  for (mlir::Value physical : value.values)
-    resultTypes.push_back(physical.getType());
-  auto rooted = mlir::UnrealizedConversionCastOp::create(
-      builder, loc, resultTypes, value.values);
-  rooted->setAttr(ownership::kOwnedLocalObjectAttr, builder.getUnitAttr());
-  rooted->setAttr(ownership::kOwnedLocalObjectContractAttr,
-                  builder.getStringAttr(contract));
+  mlir::UnrealizedConversionCastOp rooted =
+      mintOwnedLocalMarker(builder, loc, value.values, contract);
   RuntimeValue out = value;
   out.values.assign(rooted.getResults().begin(), rooted.getResults().end());
   return out;

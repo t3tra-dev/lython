@@ -23,8 +23,10 @@
 #include "gtest/gtest.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -57,9 +59,9 @@ llvm::StringRef attributeOn(llvm::StringRef line) {
   if (at == llvm::StringRef::npos)
     return {};
   std::size_t end = at + prefix.size();
-  while (end < line.size() &&
-         (std::isalnum(static_cast<unsigned char>(line[end])) ||
-          line[end] == '_'))
+  while (
+      end < line.size() &&
+      (std::isalnum(static_cast<unsigned char>(line[end])) || line[end] == '_'))
     ++end;
   if (end == at + prefix.size())
     return {};
@@ -159,4 +161,50 @@ TEST(ModelCorrespondenceTest, TheModelHasTheStepsTheMapAssumes) {
   EXPECT_EQ(constructorCount(syntax, "data Term : Set where"), 5u)
       << "the model's terminators changed; the map explains that `invoke` is "
          "an unwind edge and not a call, which is a claim about this set";
+}
+
+// The mint-site count, which is the other thing the comments kept getting
+// wrong.
+//
+// `ABI/EntityHeaderPrefix.h` justified a predicate by describing two producers
+// of `ly.ownership.owned_local_object`; `Ops/GetItemOps.cpp` called itself the
+// only one. There were three, and both conclusions happened to survive it.
+// They are one now, and `Core/OwnedLocalMarker.h` says so -- a claim that
+// needs a machine behind it, since the two it replaces did not have one.
+//
+// It matters to the gate and not just to tidiness:
+// `verifyInitialisationWindowIn` reads a marker as the model's `dup` and tells
+// it apart from `alloc` by its being a rooting cast. A fourth producer that
+// marked something else would leave that domain without any test noticing.
+TEST(ModelCorrespondenceTest, TheOwnedLocalMarkerHasOneMintSite) {
+  const llvm::StringRef mint =
+      "src/lython/lowering/Passes/Runtime/Core/OwnedLocalMarker.h";
+  llvm::SmallVector<std::string, 4> writers;
+  std::error_code error;
+  for (llvm::sys::fs::recursive_directory_iterator
+           entry(LYTHON_SOURCE_DIR "/src/lython", error),
+       end;
+       entry != end && !error; entry.increment(error)) {
+    llvm::StringRef path = entry->path();
+    if (!path.ends_with(".cpp") && !path.ends_with(".h"))
+      continue;
+    for (llvm::StringRef line : linesOf(readOrDie(path.str()))) {
+      if (!line.contains("setAttr("))
+        continue;
+      if (!line.contains("kOwnedLocalObjectAttr") &&
+          !line.contains("\"ly.ownership.owned_local_object\""))
+        continue;
+      if (path.contains(mint))
+        continue;
+      writers.push_back(path.str());
+    }
+  }
+
+  EXPECT_TRUE(writers.empty())
+      << "the frame-ownership marker is written outside " << mint.str() << ": "
+      << llvm::join(writers, ", ")
+      << ". Call mintOwnedLocalMarker instead. The gate that reads this "
+         "attribute distinguishes the model's `dup` from its `alloc` by the "
+         "marker being a rooting cast, and a producer that marks anything "
+         "else drops out of what it can judge.";
 }

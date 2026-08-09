@@ -1,6 +1,8 @@
 #include "Ownership.h"
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/Core/OwnedLocalMarker.h"
+
 #include "Runtime/ABI/BoxLayout.h"
 
 #include "PyProtocols.h"
@@ -902,12 +904,9 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
   // it), so it neither causes nor hides those.
   mlir::Value boxRoot = box;
   if (retainPayload) {
-    auto rooted = mlir::UnrealizedConversionCastOp::create(
-        builder, loc, mlir::TypeRange{box.getType()}, mlir::ValueRange{box});
-    rooted->setAttr(own::kOwnedLocalObjectAttr, builder.getUnitAttr());
-    rooted->setAttr(own::kOwnedLocalObjectContractAttr,
-                    builder.getStringAttr("builtins.object"));
-    boxRoot = rooted.getResult(0);
+    boxRoot = mintOwnedLocalMarker(builder, loc, mlir::ValueRange{box},
+                                   "builtins.object")
+                  .getResult(0);
   }
 
   RuntimeBundle boxed = RuntimeBundle::object(

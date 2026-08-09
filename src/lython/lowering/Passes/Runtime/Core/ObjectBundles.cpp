@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/Core/OwnedLocalMarker.h"
+
 namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::validateObjectShape(
@@ -77,17 +79,9 @@ RuntimeBundleLowerer::markOwnedLocalObjectBundle(mlir::Operation *op,
     ownedLocalObjectMarkers.erase(existing);
   }
 
-  llvm::SmallVector<mlir::Type, 8> types;
-  types.reserve(bundle.objectValue.values.size());
-  for (mlir::Value value : bundle.objectValue.values)
-    types.push_back(value.getType());
-
   builder.setInsertionPoint(op);
-  auto marker = mlir::UnrealizedConversionCastOp::create(
-      builder, op->getLoc(), types, bundle.objectValue.values);
-  marker->setAttr(ownership::kOwnedLocalObjectAttr, builder.getUnitAttr());
-  marker->setAttr(ownership::kOwnedLocalObjectContractAttr,
-                  builder.getStringAttr(contractName));
+  mlir::UnrealizedConversionCastOp marker = mintOwnedLocalMarker(
+      builder, op->getLoc(), bundle.objectValue.values, contractName);
   ownedLocalObjectMarkers[logicalValue] = marker;
   return mlir::success();
 }
