@@ -263,6 +263,73 @@ public:
 // benign because an enum member is an immortal singleton. All three came from one
 // producer comparing against the wrong reference point; the check is what made
 // them visible rather than a guess about where else to look.
+// ⭐ A frame does not own what it did not acquire.
+//
+// `proof/`'s `WFES.backed` says every owned name occupies its OWN site. The
+// uniqueness check beside this one reads that at the consumer -- two tokens for
+// one site. This reads it at the producer: a token is a claim to a site, and a
+// step that occupies one is `alloc`+`init`, `dup`, or `callIn`. `getField` is
+// not among them -- it binds a BORROWED name and occupies nothing -- so a token
+// on a value that only came out of a slot is a name owning something it never
+// took, and the release it earns is an over-release rather than a leak.
+//
+// The three justifications are exactly those three steps, and the third is
+// asked through `ownedLocalMarkerIsRetainRooted` rather than by inspection:
+// that predicate is already shared by the release placer and the affine
+// verifier so they cannot disagree about which token a release discharges, and
+// a fourth reading of the same question is how they would.
+//
+// ⛔ Calibrated before it was a gate, and the calibration mattered. A
+// hand-rolled walk over retain operands reported 2766 unbacked tokens across 78
+// programs that the leak gate and ASan both say are clean -- an incomplete
+// classifier refusing valid IR, which is worse than the gap it closes. With the
+// shared predicate the count over all 297 golden cases is zero.
+mlir::LogicalResult verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
+  own::AliasAnalysis aliases;
+  aliases.build(function);
+  mlir::LogicalResult result = mlir::success();
+  function.walk([&](mlir::Operation *token) {
+    if (!token->hasAttr(own::kOwnedLocalObjectAttr) ||
+        token->getNumOperands() == 0)
+      return;
+    // Back through the identity casts to what defines the marked value.
+    mlir::Value root = token->getOperand(0);
+    while (auto cast = root.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() == 0)
+        break;
+      root = cast->getOperand(0);
+    }
+    mlir::Operation *def = root.getDefiningOp();
+    // `alloc` + `init`: the frame made the storage, so it owns the object.
+    if (def && mlir::isa<mlir::memref::AllocOp>(def))
+      return;
+    // `callIn`: the callee's contract handed over a +1.
+    if (auto call = def ? mlir::dyn_cast<mlir::func::CallOp>(def)
+                        : mlir::func::CallOp()) {
+      auto callee = function->getParentOfType<mlir::ModuleOp>()
+                        .lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+      if (callee) {
+        auto contract = own::readFunctionContract(callee);
+        if (mlir::succeeded(contract) &&
+            contract->ownedResults.contains(
+                mlir::cast<mlir::OpResult>(root).getResultNumber()))
+          return;
+      }
+    }
+    // `dup`: a retain minted this token.
+    if (own::ownedLocalMarkerIsRetainRooted(token, aliases))
+      return;
+    result = token->emitError()
+             << own::kOwnedLocalObjectAttr
+             << " marks a value this frame never acquired: it is not a fresh "
+                "allocation, not a call result the contract declares owned, and "
+                "no retain roots it. A value read out of a slot is BORROWED -- "
+                "the slot still holds it -- so the release this token earns "
+                "would discharge a reference the frame does not have";
+  });
+  return result;
+}
+
 mlir::LogicalResult verifyOwnedTokenUniquenessIn(mlir::func::FuncOp function) {
   llvm::SmallVector<mlir::Operation *, 8> tokens;
   function.walk([&](mlir::Operation *op) {
@@ -295,6 +362,9 @@ mlir::LogicalResult verifyOwnedTokenUniquenessIn(mlir::func::FuncOp function) {
 }
 
 mlir::LogicalResult verifyOwnedTokenUniquenessImpl(mlir::ModuleOp module) {
+  if (mlir::failed(walkVerify<mlir::func::FuncOp>(
+          module, verifyOwnedTokensAreAcquiredIn)))
+    return mlir::failure();
   return walkVerify<mlir::func::FuncOp>(module, verifyOwnedTokenUniquenessIn);
 }
 
