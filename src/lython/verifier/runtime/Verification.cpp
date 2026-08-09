@@ -423,13 +423,21 @@ mlir::LogicalResult verifyInitialisationWindowIn(mlir::func::FuncOp function) {
     //
     // What that leaves unjudged, since a number is the only honest form of
     // this: over the first 110 golden programs the gate reaches 560 windows
-    // out of 2605 rooting casts. Of the rest, 105 name a value defined by a
-    // `func.call` or an `scf.if` -- an entity someone else finished, whose
-    // window is not in this function -- and 4099 operands root at an
-    // `llvm.insertvalue`, a hand-built descriptor whose allocation is not a
-    // memref op at all. Those are invisible to any check that reasons in
-    // memref terms, and they are the same hand-built descriptors this campaign
-    // has been removing elsewhere.
+    // out of 2605 rooting casts. 105 markers name a `func.call` or `scf.if`
+    // result -- an entity someone else finished, whose window is not in this
+    // function. The other 4099 operands root at an `llvm.insertvalue`: the
+    // borrow->own path, where `memrefFromBoxPointer` assembles a view over a
+    // payload the box already addresses, and the allocation belongs to the
+    // boxed element rather than to this frame.
+    //
+    // ⛔ Why NOT read that number as descriptors left to remove, which is what
+    // it was first written down as: `ABI/BoxLayout.cpp` says outright that this
+    // one stays. A box is a `memref<16xi64>` and MLIR refuses a pointer element
+    // type, so every reference a boxed object owns is an address in an integer
+    // -- the dialect's constraint, not a shortcut. Its soundness comes from
+    // `Proof.MemRef.Dialect.descFromAlignedPointer` with the premises
+    // discharged by `Proof.RC.Address.site-address-recovers`, so what is
+    // outside this gate is covered by a theorem rather than pending work.
     if (!mlir::isa<mlir::UnrealizedConversionCastOp>(marker))
       return mlir::WalkResult::advance();
     for (mlir::Value operand : marker->getOperands()) {
