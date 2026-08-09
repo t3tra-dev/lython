@@ -572,16 +572,16 @@ void buildFreeRawI64Ptr(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// i1 release_storage_raw_to_zero(i64 address): atomically decrement the
+// i1 release_storage_raw_to_zero(ptr storage): atomically decrement the
 // refcount word at address; return whether it dropped to zero. Skips null,
 // tagged (odd), and immortal (INT64_MAX) storages.
 void buildReleaseStorageRawToZero(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "release_storage_raw_to_zero",
-      b.builder.getFunctionType({b.i64()}, {b.i1()}));
+      b.builder.getFunctionType({b.ptr()}, {b.i1()}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
-  mlir::Value address = entry->getArgument(0);
+  mlir::Value storage = entry->getArgument(0);
 
   mlir::Block *tagCheck = b.builder.createBlock(&body);
   mlir::Block *probe = b.builder.createBlock(&body);
@@ -595,6 +595,13 @@ void buildReleaseStorageRawToZero(SupportBuilder &b) {
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, b.i1(), 0);
 
   b.builder.setInsertionPointToEnd(entry);
+  // ⛔ Narrowed HERE and only here: null and the odd-tag test are questions
+  // about the bit pattern, and a tagged reference is an immediate rather than
+  // an address. The pointer itself is what the load and the atomic use, so a
+  // reference that IS an allocation reaches memory with its provenance intact
+  // -- widening the word back, which this did, threw that away at the one
+  // access every owned object passes through.
+  mlir::Value address = b.ptrToInt(storage);
   mlir::Value isNull = b.cmpi(mlir::arith::CmpIPredicate::eq, address, zero);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
                                  mlir::ValueRange{}, tagCheck,
@@ -608,8 +615,7 @@ void buildReleaseStorageRawToZero(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(probe);
-  mlir::Value pointer = b.intToPtr(address);
-  mlir::Value observed = b.loadI64(pointer);
+  mlir::Value observed = b.loadI64(storage);
   mlir::Value preImmortal =
       b.cmpi(mlir::arith::CmpIPredicate::eq, observed, immortal);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, preImmortal, done,
@@ -623,7 +629,7 @@ void buildReleaseStorageRawToZero(SupportBuilder &b) {
       b.builder, b.loc, observedPositive,
       "release_storage_raw_to_zero observed non-positive refcount");
   mlir::Value previous = mlir::LLVM::AtomicRMWOp::create(
-      b.builder, b.loc, mlir::LLVM::AtomicBinOp::sub, pointer, one,
+      b.builder, b.loc, mlir::LLVM::AtomicBinOp::sub, storage, one,
       mlir::LLVM::AtomicOrdering::acq_rel);
   mlir::Value previousPositive =
       b.cmpi(mlir::arith::CmpIPredicate::sgt, previous, zero);
@@ -638,15 +644,15 @@ void buildReleaseStorageRawToZero(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, falseVal);
 }
 
-// void retain_storage_raw(i64 address): atomically increment the refcount
-// word at address. Mirror of release_storage_raw_to_zero: skips null, tagged
+// void retain_storage_raw(ptr storage): atomically increment the refcount
+// word it points at. Mirror of release_storage_raw_to_zero: skips null, tagged
 // (odd), and immortal (INT64_MAX) storages.
 void buildRetainStorageRaw(SupportBuilder &b) {
   auto fn = b.beginFunction("retain_storage_raw",
-                            b.builder.getFunctionType({b.i64()}, {}));
+                            b.builder.getFunctionType({b.ptr()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
-  mlir::Value address = entry->getArgument(0);
+  mlir::Value storage = entry->getArgument(0);
 
   mlir::Block *tagCheck = b.builder.createBlock(&body);
   mlir::Block *probe = b.builder.createBlock(&body);
@@ -658,6 +664,13 @@ void buildRetainStorageRaw(SupportBuilder &b) {
   mlir::Value immortal = b.iconst(9223372036854775807LL);
 
   b.builder.setInsertionPointToEnd(entry);
+  // ⛔ Narrowed HERE and only here: null and the odd-tag test are questions
+  // about the bit pattern, and a tagged reference is an immediate rather than
+  // an address. The pointer itself is what the load and the atomic use, so a
+  // reference that IS an allocation reaches memory with its provenance intact
+  // -- widening the word back, which this did, threw that away at the one
+  // access every owned object passes through.
+  mlir::Value address = b.ptrToInt(storage);
   mlir::Value isNull = b.cmpi(mlir::arith::CmpIPredicate::eq, address, zero);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
                                  mlir::ValueRange{}, tagCheck,
@@ -671,8 +684,7 @@ void buildRetainStorageRaw(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(probe);
-  mlir::Value pointer = b.intToPtr(address);
-  mlir::Value observed = b.loadI64(pointer);
+  mlir::Value observed = b.loadI64(storage);
   mlir::Value preImmortal =
       b.cmpi(mlir::arith::CmpIPredicate::eq, observed, immortal);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, preImmortal, done,
@@ -681,7 +693,7 @@ void buildRetainStorageRaw(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(bump);
   mlir::LLVM::AtomicRMWOp::create(b.builder, b.loc,
-                                  mlir::LLVM::AtomicBinOp::add, pointer, one,
+                                  mlir::LLVM::AtomicBinOp::add, storage, one,
                                   mlir::LLVM::AtomicOrdering::acq_rel);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
@@ -708,7 +720,7 @@ void buildReleaseSingleAllocation(SupportBuilder &b, llvm::StringRef name,
   // known to be a real allocation, so the pointer carries on unbroken.
   auto becameZero = mlir::func::CallOp::create(
       b.builder, b.loc, "release_storage_raw_to_zero", b.i1(),
-      mlir::ValueRange{b.ptrToInt(entry->getArgument(0))});
+      mlir::ValueRange{entry->getArgument(0)});
   mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero.getResult(0),
                                  freeBlock, mlir::ValueRange{}, done,
                                  mlir::ValueRange{});
@@ -1629,10 +1641,8 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   mlir::Value exceptionAligned = b.loadPtrVal(partsField(b, parts, 0, 1));
   mlir::Value messageHeader = b.loadPtrVal(partsField(b, parts, 1, 1));
   mlir::Value messageBytes = b.loadPtrVal(partsField(b, parts, 2, 1));
-  mlir::Value exceptionWord = mlir::LLVM::PtrToIntOp::create(
-      b.builder, b.loc, b.i64(), exceptionAligned);
   mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
-                                  mlir::ValueRange{exceptionWord})
+                                  mlir::ValueRange{exceptionAligned})
                                .front();
   mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero, freeBlocks,
                                  mlir::ValueRange{}, clear,

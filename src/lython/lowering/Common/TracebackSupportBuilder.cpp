@@ -593,16 +593,8 @@ void buildReleaseChainNode(SupportBuilder &b) {
   b.call("free", mlir::TypeRange{},
          mlir::ValueRange{b.loadPtrVal(nodeMember(b, node, kNodeFrames))});
   mlir::Value header = b.loadPtrVal(nodePartsField(b, node, 0, 1));
-  // ⛔ `release_storage_raw_to_zero` takes a word because the reference it is
-  // handed may be TAGGED (an immediate), and a tagged reference is not a
-  // pointer at all. Narrowing for that check is the honest direction and it is
-  // the only narrowing left here: the rest of this path carries the pointer,
-  // because the other direction -- an integer widened back into something a
-  // free() dereferences -- is what this comment forbade while the helpers
-  // underneath were still doing it.
-  mlir::Value headerWord = b.ptrToInt(header);
   mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
-                                  mlir::ValueRange{headerWord})
+                                  mlir::ValueRange{header})
                                .front();
   mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero, freePayload,
                                  mlir::ValueRange{}, freeNode,
@@ -658,18 +650,15 @@ void buildReleaseTakenException(SupportBuilder &b) {
   mlir::Value msgData = entry->getArgument(2);
 
   b.builder.setInsertionPointToEnd(entry);
-  // The tag check is the one place this path needs a word (a tagged reference
-  // is an immediate, not an address); the free below keeps the pointer.
-  mlir::Value headerWord = b.ptrToInt(header);
-  mlir::Value isNull =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, headerWord, b.iconst(0));
+  mlir::Value isNull = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                              b.ptrToInt(header), b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isNull, done,
                                  mlir::ValueRange{}, alive,
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(alive);
   mlir::Value becameZero = b.call("release_storage_raw_to_zero", b.i1(),
-                                  mlir::ValueRange{headerWord})
+                                  mlir::ValueRange{header})
                                .front();
   mlir::cf::CondBranchOp::create(b.builder, b.loc, becameZero, freePayload,
                                  mlir::ValueRange{}, done, mlir::ValueRange{});
@@ -919,9 +908,9 @@ void buildSetCurrentCause(SupportBuilder &b) {
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                                 nodeMember(b, node, member), /*alignment=*/8);
   b.call("retain_storage_raw", mlir::TypeRange{},
-         mlir::ValueRange{b.ptrToInt(entry->getArgument(1))});
+         mlir::ValueRange{entry->getArgument(1)});
   b.call("retain_storage_raw", mlir::TypeRange{},
-         mlir::ValueRange{b.ptrToInt(entry->getArgument(6))});
+         mlir::ValueRange{entry->getArgument(6)});
   mlir::LLVM::StoreOp::create(b.builder, b.loc, node, causeSlot,
                               /*alignment=*/8);
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
@@ -2382,7 +2371,7 @@ void buildReleaseExceptionStorageRaw(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value becameZero =
       b.call("release_storage_raw_to_zero", b.i1(),
-             mlir::ValueRange{b.ptrToInt(entry->getArgument(0))})
+             mlir::ValueRange{entry->getArgument(0)})
           .front();
   auto freeIf = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
                                         becameZero, /*withElseRegion=*/false);
