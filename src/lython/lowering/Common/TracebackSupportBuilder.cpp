@@ -1463,11 +1463,11 @@ void buildWritePrefix(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// i64 exception_group_member_count(i64 excPtr): the member-block count of an
+// i64 exception_group_member_count(ptr exc): the member-block count of an
 // exception's extended word 3 (0 for a plain exception or a null pointer).
 void buildExceptionGroupMemberCount(SupportBuilder &b) {
   auto fn = b.beginFunction("exception_group_member_count",
-                            b.builder.getFunctionType({b.i64()}, {b.i64()}),
+                            b.builder.getFunctionType({b.ptr()}, {b.i64()}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -1476,12 +1476,12 @@ void buildExceptionGroupMemberCount(SupportBuilder &b) {
   mlir::Block *zero = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value excNull = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                               entry->getArgument(0), b.iconst(0));
+                               b.ptrToInt(entry->getArgument(0)), b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, excNull, zero,
                                  mlir::ValueRange{}, load, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(load);
-  mlir::Value blockWord = b.loadI64(
-      b.gepI64(b.intToPtr(entry->getArgument(0)), b.iconst(3)));
+  mlir::Value blockWord =
+      b.loadI64(b.gepI64(entry->getArgument(0), b.iconst(3)));
   mlir::Value blockNull =
       b.cmpi(mlir::arith::CmpIPredicate::eq, blockWord, b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, blockNull, zero,
@@ -1498,13 +1498,13 @@ void buildExceptionGroupMemberCount(SupportBuilder &b) {
                                mlir::ValueRange{b.iconst(0)});
 }
 
-// void print_group_members(i64 excPtr, i64 margin): CPython's numbered member
+// void print_group_members(ptr exc, i64 margin): CPython's numbered member
 // sections for an exception group, recursing into nested groups two spaces
 // deeper. The member summaries reuse print_exception_summary through the
 // prefix gutter.
 void buildPrintGroupMembers(SupportBuilder &b) {
   auto fn = b.beginFunction("print_group_members",
-                            b.builder.getFunctionType({b.i64(), b.i64()}, {}),
+                            b.builder.getFunctionType({b.ptr(), b.i64()}, {}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -1525,8 +1525,8 @@ void buildPrintGroupMembers(SupportBuilder &b) {
   mlir::Value stderrFd = b.iconst32(2);
   mlir::Value childMargin =
       mlir::arith::AddIOp::create(b.builder, b.loc, margin, b.iconst(2));
-  mlir::Value blockWord = b.loadI64(
-      b.gepI64(b.intToPtr(entry->getArgument(0)), b.iconst(3)));
+  mlir::Value blockWord =
+      b.loadI64(b.gepI64(entry->getArgument(0), b.iconst(3)));
   mlir::Value blockPtr = b.intToPtr(blockWord);
   auto bufferType = mlir::LLVM::LLVMArrayType::get(b.i8(), 128);
   mlir::Value bufferSlot = mlir::LLVM::AllocaOp::create(
@@ -1559,11 +1559,16 @@ void buildPrintGroupMembers(SupportBuilder &b) {
         mlir::arith::AddIOp::create(b.builder, b.loc, boxWords, b.iconst(1));
     mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);
     mlir::Value ehWord = b.loadI64(b.gepI64(boxPtr, b.iconst(4)));
+    // ⛔ Widened here and not carried in as a pointer: a member slot is a box
+    // word, so this is the boundary the box layout imposes rather than a
+    // pointer being thrown away and rebuilt (BoxLayout.cpp records why a box
+    // cannot hold one).
+    mlir::Value ehPtr = b.intToPtr(ehWord);
     mlir::Value mhWord = b.loadI64(b.gepI64(boxPtr, b.iconst(5)));
     mlir::Value mbWord = b.loadI64(b.gepI64(boxPtr, b.iconst(6)));
     mlir::Value mbLen = b.loadI64(b.gepI64(boxPtr, b.iconst(11)));
     mlir::Value classId =
-        b.loadI64(b.gepI64(b.intToPtr(ehWord), b.iconst(2)));
+        b.loadI64(b.gepI64(ehPtr, b.iconst(2)));
 
     // Separator: the first section carries the parent connector ("+-+" at
     // the parent margin), later sections sit at the member margin.
@@ -1598,13 +1603,13 @@ void buildPrintGroupMembers(SupportBuilder &b) {
     mlir::LLVM::StoreOp::create(b.builder, b.loc, childMargin, prefixSlot,
                                 /*alignment=*/8);
     b.call("print_exception_summary", mlir::TypeRange{},
-           mlir::ValueRange{classId, ehWord, b.intToPtr(mhWord),
+           mlir::ValueRange{classId, ehPtr, b.intToPtr(mhWord),
                             b.intToPtr(mbWord), b.iconst(0), mbLen,
                             b.iconst(1)});
     mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1), prefixSlot,
                                 /*alignment=*/8);
     mlir::Value memberCount = b.call("exception_group_member_count", b.i64(),
-                                     mlir::ValueRange{ehWord})
+                                     mlir::ValueRange{ehPtr})
                                   .front();
     mlir::Value nested =
         b.cmpi(mlir::arith::CmpIPredicate::sgt, memberCount, b.iconst(0));
@@ -1615,7 +1620,7 @@ void buildPrintGroupMembers(SupportBuilder &b) {
       mlir::OpBuilder::InsertionGuard nestedGuard(b.builder);
       b.builder.setInsertionPointToStart(&nestedIf.getThenRegion().front());
       b.call("print_group_members", mlir::TypeRange{},
-             mlir::ValueRange{ehWord, childMargin});
+             mlir::ValueRange{ehPtr, childMargin});
     }
   }
   b.call("write_spaces", mlir::TypeRange{},
@@ -2000,16 +2005,16 @@ void buildUtf8MessageCStr(SupportBuilder &b) {
   b.emitTrap(b.ptr());
 }
 
-// void print_exception_summary(i64 class_id, i64 exc_ptr, ptr msg_header,
+// void print_exception_summary(i64 class_id, ptr exc, ptr msg_header,
 // message view): the final "Class: message" line (or the class-only /
 // invalid / unknown forms). The message is re-encoded from code units to
 // UTF-8 for display. An exception group appends CPython's
-// " (N sub-exception[s])" count read through exc_ptr (0 = no payload known).
+// " (N sub-exception[s])" count read through `exc` (null = no payload known).
 void buildPrintExceptionSummary(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "print_exception_summary",
       b.builder.getFunctionType(
-          {b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+          {b.i64(), b.ptr(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
           {}),
       /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
@@ -2243,11 +2248,10 @@ void buildPrintChainNode(SupportBuilder &b) {
       mlir::arith::MulIOp::create(b.builder, b.loc, stride0, b.iconst(2))
           .getResult());
   mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
-  mlir::Value excWord = b.ptrToInt(aligned);
   // Chained exception groups keep CPython's group rendering: the group
   // header (when a traceback exists), the "| " gutter, and the member tree.
   mlir::Value chainMembers = b.call("exception_group_member_count", b.i64(),
-                                    mlir::ValueRange{excWord})
+                                    mlir::ValueRange{aligned})
                                  .front();
   mlir::Value chainIsGroupClass =
       b.call("LyEH_ClassIdMatches", b.i1(),
@@ -2314,7 +2318,7 @@ void buildPrintChainNode(SupportBuilder &b) {
   mlir::Value msgLen = b.loadI64(nodePartsField(b, node, 2, 3));
   mlir::Value msgStride = b.loadI64(nodePartsField(b, node, 2, 4));
   b.call("print_exception_summary", mlir::TypeRange{},
-         mlir::ValueRange{classId, excWord, msgHeader, msgData, msgOffset,
+         mlir::ValueRange{classId, aligned, msgHeader, msgData, msgOffset,
                           msgLen, msgStride});
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(-1),
                               b.addrOf("g_tb_prefix_spaces"),
@@ -2326,7 +2330,7 @@ void buildPrintChainNode(SupportBuilder &b) {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&membersIf.getThenRegion().front());
     b.call("print_group_members", mlir::TypeRange{},
-           mlir::ValueRange{excWord, b.iconst(2)});
+           mlir::ValueRange{aligned, b.iconst(2)});
   }
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
@@ -2879,7 +2883,7 @@ void buildStarDiscardSplit(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyTraceback_PrintMessage(i64 class_id, i64 exc_ptr, ptr msg_header,
+// LyTraceback_PrintMessage(i64 class_id, ptr exc, ptr msg_header,
 // message view): chained sections (cause/context, innermost first) + header
 // + frames (most recent last, printed from the top of the stack downwards)
 // + summary line, on stderr. An exception group renders CPython's group
@@ -2889,7 +2893,7 @@ void buildTracebackPrintMessage(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "LyTraceback_PrintMessage",
       b.builder.getFunctionType(
-          {b.i64(), b.i64(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
+          {b.i64(), b.ptr(), b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64()},
           {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
