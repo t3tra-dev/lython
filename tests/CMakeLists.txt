@@ -100,6 +100,7 @@ add_executable(lython_unit_tests
     unit/EvidenceVerifierTests.cpp
     unit/LayerManifestTests.cpp
     unit/ModelCorrespondenceTests.cpp
+    unit/SoleProducerTests.cpp
     unit/ParserTests.cpp
     unit/RuntimeRaisePathTests.cpp
     unit/TypeInferenceTests.cpp
@@ -179,6 +180,7 @@ set(LYTHON_UNIT_PATTERNS_tables
 set(LYTHON_UNIT_PATTERNS_meta
     "LayerManifestTest.*"
     "ModelCorrespondenceTest.*"
+    "SoleProducerTest.*"
     "RuntimeRaisePathTest.*")
 set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"

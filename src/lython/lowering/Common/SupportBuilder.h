@@ -4,6 +4,7 @@
 // and TracebackSupportBuilder compose the same module).
 
 #include "Common/ExceptionABI.h"
+#include "Common/MemRef1D.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -17,6 +18,13 @@
 #include <string>
 
 namespace py::runtime_library {
+
+// The rank-1 descriptor vocabulary is shared with the passes (Common/MemRef1D.h
+// says why); these are the names this layer spells it with.
+using py::lowering::MemRef1DParts;
+using py::lowering::buildMemRef1D;
+using py::lowering::explodeMemRef1D;
+using py::lowering::memRef1DDescriptorType;
 
 // The host boundary is otherwise target-independent (portable libc calls at
 // the fopen/fwrite altitude). Three things about the OS cluster cannot be:
@@ -422,18 +430,8 @@ mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
 // `reconcile-unrealized-casts`, so nothing survives it at all.
 // ---------------------------------------------------------------------------
 
-// A rank-1 memref's descriptor members. `allocated` is the free()-able base and
-// `aligned` the one every access goes through; the runtime's entities are
-// single allocations, so the two coincide, but taking them apart separately is
-// what keeps that a fact about the data rather than an assumption here.
-struct MemRef1DParts {
-  mlir::Value allocated;
-  mlir::Value aligned;
-  mlir::Value offset;
-  mlir::Value size;
-  mlir::Value stride;
-};
-
+// `MemRef1DParts` and the assembly itself live in Common/MemRef1D.h, shared
+// with the box path in the passes. These are the `SupportBuilder &` spellings.
 MemRef1DParts explodeMemRef1D(SupportBuilder &b, mlir::Value memref);
 mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
                           const MemRef1DParts &parts);

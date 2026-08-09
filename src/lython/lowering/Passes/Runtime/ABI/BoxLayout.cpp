@@ -1,56 +1,43 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Common/MemRef1D.h"
+
 #include "Runtime/ABI/BoxLayout.h"
 
 namespace py::lowering {
 
 // Rank-1 memref over a payload a POINTER already addresses. The contract →
-// physical shape relation is static, so the descriptor is assembled inline
-// (llvm.insertvalue chain reconciled with the memref world by the standard
-// unrealized-cast materialization). Borrow-only: the result aliases storage
-// owned by the boxed element.
+// physical shape relation is static, so the descriptor is assembled from
+// constants; `Common/MemRef1D.h` does the assembling, shared with the runtime
+// support builders. Borrow-only: the result aliases storage owned by the boxed
+// element.
 //
-// This is the one place a descriptor is built in the lowering passes. Callers
-// that hold a pointer come here; the word entry point below is the same thing
-// with a launder in front of it, and keeping them apart is what makes the
-// launder countable.
+// Callers that hold a pointer come here; the word entry point below is the same
+// thing with a launder in front of it, and keeping them apart is what makes the
+// launder countable. What this is NOT any more is the only place a descriptor
+// is built -- it said that until `buildMemRef1D` arrived for the exception
+// triple and quietly falsified it.
+//
+// A box is a single allocation, so allocated and aligned are the same pointer
+// and the offset is zero; `MemRef1DParts` keeps those separate fields precisely
+// so that stays a statement about boxes rather than a shape baked into the
+// assembler.
 mlir::Value RuntimeBundleLowerer::memrefFromBoxPointer(mlir::OpBuilder &builder,
                                                        mlir::Location loc,
                                                        mlir::Value pointer,
                                                        mlir::Value sizeWord,
                                                        mlir::MemRefType type) {
-  mlir::MLIRContext *context = builder.getContext();
-  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
-  mlir::Type i64 = builder.getI64Type();
-  auto arrayType = mlir::LLVM::LLVMArrayType::get(i64, 1);
-  auto descriptorType = mlir::LLVM::LLVMStructType::getLiteral(
-      context, {ptrType, ptrType, i64, arrayType, arrayType});
-  mlir::Value zero =
-      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
-  mlir::Value one =
-      mlir::arith::ConstantIntOp::create(builder, loc, 1, 64).getResult();
-  mlir::Value size =
-      type.hasStaticShape()
-          ? mlir::arith::ConstantIntOp::create(builder, loc,
-                                               type.getDimSize(0), 64)
-                .getResult()
-          : sizeWord;
-  mlir::Value descriptor =
-      mlir::LLVM::UndefOp::create(builder, loc, descriptorType);
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      builder, loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{0});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      builder, loc, descriptor, pointer, llvm::ArrayRef<std::int64_t>{1});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      builder, loc, descriptor, zero, llvm::ArrayRef<std::int64_t>{2});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      builder, loc, descriptor, size, llvm::ArrayRef<std::int64_t>{3, 0});
-  descriptor = mlir::LLVM::InsertValueOp::create(
-      builder, loc, descriptor, one, llvm::ArrayRef<std::int64_t>{4, 0});
-  return mlir::UnrealizedConversionCastOp::create(builder, loc,
-                                                  mlir::TypeRange{type},
-                                                  descriptor)
-      .getResult(0);
+  auto word = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
+        .getResult();
+  };
+  MemRef1DParts parts;
+  parts.allocated = pointer;
+  parts.aligned = pointer;
+  parts.offset = word(0);
+  parts.size = type.hasStaticShape() ? word(type.getDimSize(0)) : sizeWord;
+  parts.stride = word(1);
+  return buildMemRef1D(builder, loc, type, parts);
 }
 
 // Same view, from a WORD, because a boxed payload slot holds one.

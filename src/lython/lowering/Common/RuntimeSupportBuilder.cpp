@@ -2241,9 +2241,7 @@ mlir::Type memRefPartsStruct(SupportBuilder &b, llvm::StringRef name) {
 } // namespace
 
 mlir::Type memRef1DType(SupportBuilder &b) {
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
-  return mlir::LLVM::LLVMStructType::getLiteral(
-      b.builder.getContext(), {b.ptr(), b.ptr(), b.i64(), arrayOne, arrayOne});
+  return memRef1DDescriptorType(b.builder.getContext());
 }
 
 mlir::Type exceptionPartsType(SupportBuilder &b) {
@@ -2314,45 +2312,12 @@ mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
 }
 
 MemRef1DParts explodeMemRef1D(SupportBuilder &b, mlir::Value memref) {
-  mlir::Value descriptor =
-      mlir::UnrealizedConversionCastOp::create(
-          b.builder, b.loc, mlir::TypeRange{memRef1DType(b)}, memref)
-          .getResult(0);
-  auto member = [&](std::initializer_list<std::int64_t> path) {
-    return mlir::LLVM::ExtractValueOp::create(
-        b.builder, b.loc, descriptor,
-        llvm::ArrayRef<std::int64_t>(path.begin(), path.size()))
-        .getResult();
-  };
-  return {member({0}), member({1}), member({2}), member({3, 0}),
-          member({4, 0})};
+  return explodeMemRef1D(b.builder, b.loc, memref);
 }
 
 mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
                           const MemRef1DParts &parts) {
-  auto arrayOne = mlir::LLVM::LLVMArrayType::get(b.i64(), 1);
-  auto wrap = [&](mlir::Value scalar) {
-    return mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc,
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, arrayOne).getResult(),
-        scalar, llvm::ArrayRef<std::int64_t>{0})
-        .getResult();
-  };
-  mlir::Value descriptor =
-      mlir::LLVM::UndefOp::create(b.builder, b.loc, memRef1DType(b));
-  auto set = [&](mlir::Value field, std::int64_t index) {
-    descriptor = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, descriptor, field,
-        llvm::ArrayRef<std::int64_t>{index});
-  };
-  set(parts.allocated, 0);
-  set(parts.aligned, 1);
-  set(parts.offset, 2);
-  set(wrap(parts.size), 3);
-  set(wrap(parts.stride), 4);
-  return mlir::UnrealizedConversionCastOp::create(
-             b.builder, b.loc, mlir::TypeRange{memrefType}, descriptor)
-      .getResult(0);
+  return buildMemRef1D(b.builder, b.loc, memrefType, parts);
 }
 
 void freeSoleChainNode(SupportBuilder &b, mlir::Value node,
