@@ -2546,6 +2546,32 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       continue;
     }
 
+    // ⛔ KNOWN DEFECT, recorded where the fix goes. A consuming use ends this
+    // group: the transfer IS the discharge, so nothing is released at the
+    // exits. That is right when the call is the value's last use and wrong
+    // when it is not, and the compiler currently refuses the second case
+    // instead of handling it:
+    //
+    //     msg = "boom"
+    //     e = ValueError(msg)     # LyValueError_Init transfer_args = [0, 3]
+    //     print(msg)              # error: ... is used after release
+    //
+    // Valid Python, refused. The affine verifier is not wrong -- the name
+    // really was moved away. What is missing is that a `move` whose source
+    // has later uses should have been a `dup` first: retain before the call,
+    // release at the real end of life. Container and attribute stores get
+    // this right already, through `aggregate_retain`; only the exception
+    // constructors transfer.
+    //
+    // Why NOT fix it in the manifest by making the message `retain_args`,
+    // which is what CPython's BaseException_init does and is the obvious
+    // move: it was tried, and `RuntimeRaisePathTest.NoOwnedObjectIsHeldAcross
+    // ARaise` plus `leak.dict_build` refused it within one run. Retaining
+    // leaves the CALLER holding an owned reference across the raise, and the
+    // unwind path does not release it -- 43 bytes, every raise. The transfer
+    // contract is load-bearing for exactly the case with no later use, which
+    // is `raise`. So the repair belongs here, conditioned on there being a
+    // later use, and not in the contract.
     bool canReleaseAtExits = true;
     for (mlir::Value result : group.values) {
       llvm::SmallVector<mlir::Value, 8> equivalentValues;
