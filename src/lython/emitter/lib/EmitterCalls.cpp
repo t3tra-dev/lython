@@ -1028,8 +1028,30 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     mlir::Type strType = types.contract("builtins.str");
     auto stringify = [&](const parser::Node *argNode) -> std::optional<Value> {
       mlir::Type argumentType = types.widenLiteral(types.inferExpr(argNode));
+      // ⭐ Ask the inference, and if it does not know, ask the value.
+      //
+      //     print(max("a", "b"), 1)      # printed 'b' 1; CPython prints b 1
+      //
+      // `max` over two arguments is folded by this file into a comparison and
+      // a select, so what it emits is a `str`. The general inference does not
+      // model that fold and answers `builtins.object`, which sent a string
+      // that was already a string down the repr path -- and repr of a str
+      // quotes it. Single-argument print was unaffected because it renders
+      // through a different path, which is why `print(max(...))` was right and
+      // `print(max(...), 1)` was not.
+      //
+      // ⛔ Why NOT teach `inferExpr` about the fold: the fold is a rewrite this
+      // file performs, so the inference would have to duplicate it to agree.
+      // The emitted value already carries the answer.
       if (argumentType == strType)
         return coerceValue(emitExpr(argNode), strType, expr);
+      if (argumentType == types.contract("builtins.object")) {
+        mlir::OpBuilder::InsertPoint before = builder.saveInsertionPoint();
+        Value emitted = emitExpr(argNode);
+        if (types.widenLiteral(emitted.type) == strType)
+          return coerceValue(emitted, strType, expr);
+        builder.restoreInsertionPoint(before);
+      }
       if (std::optional<MethodBinding> method =
               lookupClassMethod(argumentType, "__str__")) {
         Value argument = emitExpr(argNode);
