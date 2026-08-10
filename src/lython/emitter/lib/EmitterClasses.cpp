@@ -548,6 +548,29 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
   }
 }
 
+// ⛔ KNOWN DEFECT: which body a method call reaches is decided from the STATIC
+// receiver type, so an override behind a base-typed reference is never
+// reached.
+//
+//     class A:
+//         def name(self) -> str: return "A"
+//     class B(A):
+//         def name(self) -> str: return "B"
+//     def show(a: A) -> None: print(a.name())
+//     show(B())                                  # prints "A"; CPython "B"
+//
+// Also `a: A = B()`, and `list[A]` holding a `B`. A call on `B` itself, or on
+// a base no subclass overrides, is correct. Nothing is diagnosed.
+//
+// Why NOT refuse when the receiver's class has an overriding subclass, which
+// is the shape the fix wants and is statically decidable from `classMros` and
+// `classMethodBindings`: tried, and it refuses `class_mro` and `class_super`.
+// A base method's own body calls `self.who()` with `self` typed as the base,
+// and that call IS resolved correctly -- `emitInlineMethodCall` specialises
+// the body into each concrete call site, so the inlined copy binds `who` to
+// the receiver's real class. The two look identical here: a `self` that will
+// be specialised and a parameter that cannot be. The refusal has to be made
+// at a point that knows which of the two it has, not at the binding.
 std::optional<MethodBinding>
 ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
                                  llvm::StringRef methodName) const {
