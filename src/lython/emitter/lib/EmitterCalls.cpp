@@ -1199,6 +1199,39 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
   // (`min(a, b)` keeps `a` on ties, matching CPython's first-minimal
   // rule). The non-selected operand's edge gets its release from the
   // partial-forward placement.
+  // ⭐ More than two operands fold left, the way CPython's builtin_max walks
+  // its argument tuple: `max(a, b, c)` is `max(max(a, b), c)`.
+  //
+  // Without this the call fell out of the reducer path entirely and the name
+  // was reported UNRESOLVED -- "unresolved name 'max'" for a builtin that
+  // works with two arguments, which points away from the actual limit. Written
+  // as a rewrite onto the two-operand fold rather than as a third arm, so
+  // there is one comparison lowering however many operands arrive.
+  if (reducerArgs && reducerArgs->size() > 2 &&
+      (!reducerKeywords || reducerKeywords->empty()) &&
+      (reducer == "max" || reducer == "min")) {
+    const parser::Field *calleeField = parser::findField(expr, "func");
+    parser::NodePtr calleeShared =
+        calleeField && std::holds_alternative<parser::NodePtr>(calleeField->value)
+            ? std::get<parser::NodePtr>(calleeField->value)
+            : nullptr;
+    bool allPresent = calleeShared != nullptr;
+    for (const parser::NodePtr &argument : *reducerArgs)
+      allPresent = allPresent && argument && argument->kind != "Starred";
+    if (allPresent) {
+      parser::NodePtr folded = reducerArgs->front();
+      for (std::size_t index = 1; index < reducerArgs->size(); ++index) {
+        parser::NodePtr pair = parser::makeNode("Call", expr.range);
+        parser::addField(*pair, "func", calleeShared);
+        parser::addField(*pair, "args",
+                         std::vector<parser::NodePtr>{
+                             folded, (*reducerArgs)[index]});
+        parser::addField(*pair, "keywords", std::vector<parser::NodePtr>{});
+        folded = std::move(pair);
+      }
+      return emitExpr(folded.get());
+    }
+  }
   if (reducerArgs && reducerArgs->size() == 2 && reducerArgs->front() &&
       (*reducerArgs)[1] && (!reducerKeywords || reducerKeywords->empty()) &&
       (reducer == "max" || reducer == "min")) {
@@ -1432,7 +1465,18 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       values.erase(element);
     return result;
   }
-  if (reducerArgs && reducerArgs->size() == 1 && reducerArgs->front() &&
+  // ⭐ `sum(xs, start)` seeds the accumulator with `start` instead of 0, which
+  // is all CPython's builtin_sum does with its second argument.
+  //
+  // Without it the two-argument call left the reducer path and the name came
+  // back UNRESOLVED -- "unresolved name 'sum'" for a builtin whose
+  // one-argument form works, a message about the wrong thing entirely.
+  bool sumHasStart = reducer == "sum" && reducerArgs &&
+                     reducerArgs->size() == 2 && (*reducerArgs)[1] &&
+                     (*reducerArgs)[1]->kind != "Starred" &&
+                     (!reducerKeywords || reducerKeywords->empty());
+  if (reducerArgs && reducerArgs->front() &&
+      (reducerArgs->size() == 1 || sumHasStart) &&
       (!reducerKeywords || reducerKeywords->empty()) &&
       (reducer == "sum" || reducer == "any" || reducer == "all")) {
     std::string tmp =
@@ -1440,11 +1484,17 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     std::string element = "__" + reducer.str() + "el" +
                           std::to_string(listCompCounter);
     if (reducer == "sum") {
+      if (sumHasStart) {
+        Value seed = emitExpr((*reducerArgs)[1].get());
+        values[tmp] = seed;
+        types.bindSymbol(tmp, seed.type);
+      } else {
       mlir::Type zeroType = types.literal("0");
       auto zero = py::IntConstantOp::create(builder, loc(expr), zeroType,
                                             builder.getStringAttr("0"));
       values[tmp] = Value{zero.getResult(), zeroType};
       types.bindSymbol(tmp, zeroType);
+      }
     } else {
       bool initial = reducer == "all";
       mlir::Type initType = types.literal(initial ? "True" : "False");
