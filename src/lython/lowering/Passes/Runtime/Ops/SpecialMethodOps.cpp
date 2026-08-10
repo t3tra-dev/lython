@@ -397,6 +397,24 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
 // has to be fixed first; the read-back repair cannot be judged until the
 // baseline is clean.
 //
+// Localised, for whoever picks it up. It is a store into the LAST element of
+// the outer list -- index 1 of two, index 2 of three; index 1 of three is
+// clean -- and the IR says which release goes astray. Both shapes allocate
+// three inner lists and emit three `LyList_DecRef`s, but the clean one
+// releases each of the three once, while the leaking one releases the
+// setitem's receiver twice and the first inner list never:
+//
+//     clean:   DecRef %0  DecRef %21  DecRef %43    (three distinct)
+//     leaking: DecRef %0  DecRef %21  DecRef %42    with %42 released again
+//                                                   at the exit beside %43
+//
+// and the leaking one carries one `Ly_IncRef` the clean one does not, emitted
+// immediately before that release so the pair cancels -- leaving the outer
+// list's slot holding a reference nobody counted. Both come out of
+// `refcount-insertion` (`runtime-lowering` emits eight retains for both
+// programs; the pass makes it ten for both), so the placement differs, not
+// the count.
+//
 // So the values are reachable and the ledger is what resists. The entry is not
 // a description the parent keeps beside a reference; it IS how the reference is
 // held, and every republication so far has been read as a second owner. The
