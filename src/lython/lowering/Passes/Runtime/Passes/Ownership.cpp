@@ -2563,6 +2563,26 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     // this right already, through `aggregate_retain`; only the exception
     // constructors transfer.
     //
+    // The same shape appears at the yield boundary, found by the same audit
+    // and recorded here because it is the same missing rule rather than a
+    // second one. A value crossing a yield is transferred to the resumer
+    // (AffineOwnership.cpp, "Generator frames"), so yielding one local twice
+    // hands away what was already handed away:
+    //
+    //     def gen() -> Iterator[str]:
+    //         a = "a"
+    //         yield a
+    //         yield a       # ... is returned with 1 additional retained
+    //                       # ownership token(s)
+    //
+    // Bisected: once is fine, two DISTINCT locals are fine, `int` is fine
+    // (not refcounted), and `while i < 3: yield a` fails -- a loop yielding a
+    // loop-invariant value, which is not an exotic generator. Whether one fix
+    // covers both boundaries is NOT established: the yield transfer is the
+    // resume clone's `owned_results` contract and may not reach this decision
+    // at all. What is established is that the rule missing in both places is
+    // the same one.
+    //
     // Why NOT fix it in the manifest by making the message `retain_args`,
     // which is what CPython's BaseException_init does and is the obvious
     // move: it was tried, and `RuntimeRaisePathTest.NoOwnedObjectIsHeldAcross
