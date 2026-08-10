@@ -320,24 +320,25 @@ mlir::FailureOr<mlir::Value> buildRetainHeaderView(mlir::OpBuilder &builder,
   return mlir::failure();
 }
 
+// Take a reference immediately before `anchor`. Two callers: a borrowed value
+// on its way out through a return, and a transfer whose source is read after
+// the call -- the same operation, so the same body.
 mlir::LogicalResult insertRetain(mlir::func::FuncOp retain,
-                                 mlir::func::ReturnOp returnOp,
-                                 mlir::Value header) {
+                                 mlir::Operation *anchor, mlir::Value header) {
   if (!retain)
-    return returnOp.emitError()
-           << "borrowed object return requires a runtime retain primitive";
+    return anchor->emitError()
+           << "taking a reference here requires a runtime retain primitive";
   if (retain.getFunctionType().getNumInputs() != 1)
     return retain.emitError()
            << "runtime retain primitive must accept one object header";
 
-  mlir::OpBuilder builder(returnOp);
+  mlir::OpBuilder builder(anchor);
   mlir::FailureOr<mlir::Value> headerView = buildRetainHeaderView(
-      builder, returnOp.getLoc(), header, retain.getFunctionType().getInput(0));
+      builder, anchor->getLoc(), header, retain.getFunctionType().getInput(0));
   if (mlir::failed(headerView))
-    return returnOp.emitError()
-           << "cannot build object retain view for borrowed return";
+    return anchor->emitError() << "cannot build object retain view";
 
-  mlir::func::CallOp::create(builder, returnOp.getLoc(), retain, *headerView);
+  mlir::func::CallOp::create(builder, anchor->getLoc(), retain, *headerView);
   return mlir::success();
 }
 
@@ -411,7 +412,7 @@ mlir::LogicalResult insertBorrowedReturnRetains(
             static_cast<unsigned>(deallocator->inputTypes.size()));
         if (own::valueGroupEqualsEntryArgumentGroup(function, group) ||
             valueGroupDerivedFromEntryArguments(function, group, aliases)) {
-          if (mlir::failed(insertRetain(retain, returnOp, group.front()))) {
+          if (mlir::failed(insertRetain(retain, returnOp.getOperation(), group.front()))) {
             result = mlir::failure();
             return;
           }
@@ -1356,7 +1357,45 @@ bool releaseOwnedGroupByLiveness(
   //
   // Failure direction if this ever drops a use it should have kept: one release
   // fewer, which is a leak. The behaviour it replaces was one release more.
+  // ⭐ The consume that is NOT this value's death, and therefore needs the
+  // folded retain put back.
+  //
+  // A `transfer_args` contract is CPython's borrow-and-incref with the pair
+  // folded away: the callee stores a reference, the caller drops its own, and
+  // when the call is the last use both cancel. Sound exactly then. Where the
+  // caller reads the value afterwards -- `e = ValueError(msg); print(msg)`,
+  // valid Python -- the fold has to come undone, or the read is refused as a
+  // use after release.
+  //
+  // ⛔ Why NOT decline the whole arm and let another one handle it, which was
+  // the first attempt: no other arm claims these groups. The trace showed
+  // `none.consumed-or-forwarded` and nothing placed a release at all --
+  // 52-156 B in `leak.dict_literal_source_move_frequency`,
+  // `leak.sequence_literal_source_move_frequency` and
+  // `leak.loop_iterator_element_into_container_literal`. The arm that keeps
+  // the group is the one that has to take the reference.
+  llvm::SmallVector<mlir::Operation *, 4> unfoldRetainBefore;
+  auto readFollowsConsumeInBlock = [&](mlir::Operation *consume) {
+    for (mlir::Value name : group.values) {
+      llvm::SmallVector<mlir::Value, 8> names;
+      aliases.namesOf(name, names);
+      for (mlir::Value candidate : names)
+        for (mlir::OpOperand &use : candidate.getUses()) {
+          mlir::Operation *reader = use.getOwner();
+          if (reader == selfOp || reader == consume ||
+              reader->getBlock() != consume->getBlock() ||
+              !consume->isBeforeInBlock(reader))
+            continue;
+          if (consumingUseEndsThisToken(use, candidate))
+            continue;
+          return true;
+        }
+    }
+    return false;
+  };
+
   llvm::SmallVector<mlir::Operation *, 4> consumeSites;
+  llvm::SmallVector<mlir::Operation *, 4> consumingOps;
   for (mlir::Value result : group.values) {
     llvm::SmallVector<mlir::Value, 8> equivalents;
     aliases.namesOf(result, equivalents);
@@ -1365,11 +1404,46 @@ bool releaseOwnedGroupByLiveness(
         if (use.getOwner() == selfOp)
           continue;
         if (consumingUseEndsThisToken(use, equivalent)) {
-          groupHasConsumingCall = true;
-          if (!llvm::is_contained(consumeSites, use.getOwner()))
-            consumeSites.push_back(use.getOwner());
+          if (!llvm::is_contained(consumingOps, use.getOwner()))
+            consumingOps.push_back(use.getOwner());
         }
       }
+  }
+  // One reference in hand, one taken away per consume, one more needed if
+  // anything still reads the value after the last of them. So the count to
+  // reach is `consumes + (reads after the last ? 1 : 0)`, and the retains to
+  // insert are that minus the one already held -- which is a retain before
+  // every consume except the last, plus one before the last when reads follow
+  // it. Writing it as the general count rather than as the single-consume case
+  // is what makes `a = ValueError(msg); b = ValueError(msg)` fall out instead
+  // of needing its own arm.
+  {
+    bool sameBlock = true;
+    for (mlir::Operation *op : consumingOps)
+      if (op->getBlock() != consumingOps.front()->getBlock())
+        sameBlock = false;
+    if (!sameBlock) {
+      // ⛔ Ordering across blocks is a reachability question, not
+      // `isBeforeInBlock`. Keep the old reading -- every consume a death --
+      // so an unhandled shape stays a refusal rather than becoming a guess.
+      for (mlir::Operation *op : consumingOps) {
+        groupHasConsumingCall = true;
+        consumeSites.push_back(op);
+      }
+    } else if (!consumingOps.empty()) {
+      llvm::sort(consumingOps, [](mlir::Operation *a, mlir::Operation *b) {
+        return a->isBeforeInBlock(b);
+      });
+      mlir::Operation *last = consumingOps.back();
+      for (unsigned index = 0; index + 1 < consumingOps.size(); ++index)
+        unfoldRetainBefore.push_back(consumingOps[index]);
+      if (readFollowsConsumeInBlock(last)) {
+        unfoldRetainBefore.push_back(last);
+      } else {
+        groupHasConsumingCall = true;
+        consumeSites.push_back(last);
+      }
+    }
   }
   auto useFollowsAConsume = [&](mlir::Operation *user) {
     if (consumeSites.empty() || !selfOp)
@@ -1468,6 +1542,11 @@ bool releaseOwnedGroupByLiveness(
             return false;
           if (user->getBlock()->getParent() != region)
             return false;
+          if (llvm::is_contained(unfoldRetainBefore, user)) {
+            lastUse[user->getBlock()] =
+                latestUserInBlock(lastUse[user->getBlock()], user);
+            continue;
+          }
           consumedBlocks.insert(user->getBlock());
           lastUse[user->getBlock()] =
               latestUserInBlock(lastUse[user->getBlock()], user);
@@ -1713,6 +1792,14 @@ bool releaseOwnedGroupByLiveness(
     if (!releaseOnTerminatorEdge(edge.first, edge.second, group, loc,
                                  ownsReference))
       return false;
+  for (mlir::Operation *consume : unfoldRetainBefore) {
+    mlir::ModuleOp module = consume->getParentOfType<mlir::ModuleOp>();
+    if (mlir::failed(insertRetain(
+            module ? module.lookupSymbol<mlir::func::FuncOp>("Ly_IncRef")
+                   : mlir::func::FuncOp(),
+            consume, group.values.front())))
+      return false;
+  }
   return true;
 }
 
