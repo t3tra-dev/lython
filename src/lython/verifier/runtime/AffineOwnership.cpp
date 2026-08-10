@@ -2663,6 +2663,23 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             // was meant to answer keeps its reference. int lists leak the
             // same way from three elements up; two-element int lists are
             // clean, which is why the smallest reproducer is a str list.
+            //
+            // Traced to the emission, for whoever takes it. The loop body ends
+            // with three ops on the same entity:
+            //
+            //     %56 = select %cond, %51, %42          ; the next iteration's
+            //     Ly_IncRef(%56) {block-arg-merge-borrow}
+            //     Ly_IncRef(%42)                         ; edge retain
+            //     LyUnicode_DecRef(%42) {..:py.decref}
+            //     cf.br ^bb4(%56, ...)                   ; %42 is ^bb4's arg
+            //
+            // The last two cancel, so the block looks balanced; the merge
+            // borrow on `%56` is what has no discharge. The edge retain is
+            // added because `emitterLaneIncrefInBlock` looks for a retain
+            // labelled `":py.incref"` to credit as the transfer, and the one
+            // standing there carries no label -- this pass emitted it, not the
+            // emitter. So the credit search misses a retain that is already
+            // paying, and the borrow is charged a second time.
             // A merge borrow after the release is the loop edge re-pinning a
             // name this path has already given up: it is neither a
             // resurrection nor an outstanding borrow to discharge, because
