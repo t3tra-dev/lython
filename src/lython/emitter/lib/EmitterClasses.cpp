@@ -1548,6 +1548,29 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         parser::addField(*assign, "value", synthName(field, range));
         body.push_back(std::move(assign));
       }
+      // ⭐ CPython's dataclass `__init__` ends by calling `__post_init__` when
+      // the class defines one (`dataclasses._process_class` appends exactly
+      // this call). Without it the hook was never reached and nothing said so:
+      //
+      //     @dataclass
+      //     class P:
+      //         x: int
+      //         def __post_init__(self) -> None: print("ran")
+      //     P(1)      # printed nothing; CPython prints "ran"
+      //
+      // Emitted as a call statement on the synthesized body so it goes through
+      // the ordinary method dispatch, the way the field assignments above go
+      // through ordinary assignment.
+      if (userDefines("__post_init__")) {
+        parser::NodePtr hook = parser::makeNode("Call", range);
+        parser::addField(*hook, "func",
+                         synthSelfAttr("self", "__post_init__", range));
+        parser::addField(*hook, "args", std::vector<parser::NodePtr>{});
+        parser::addField(*hook, "keywords", std::vector<parser::NodePtr>{});
+        parser::NodePtr statement = parser::makeNode("Expr", range);
+        parser::addField(*statement, "value", std::move(hook));
+        body.push_back(std::move(statement));
+      }
       if (body.empty())
         body.push_back(parser::makeNode("Pass", range));
       sig.resultType = types.none();
