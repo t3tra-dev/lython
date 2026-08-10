@@ -47,6 +47,29 @@ module attributes {
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
 
+  // math domain errors. CPython's math_1 checks the operand (and errno) and
+  // raises ValueError("math domain error"); returning the IEEE nan/-inf the
+  // hardware produces is the one thing it does not do.
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %offset: index, %length: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.initializer = "from_bytes"}
+  func.func private @LyValueError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 53 : i64, ly.runtime.contract = "builtins.ValueError", ly.runtime.initializer = "__new__"}
+  func.func private @LyValueError_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.ValueError", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
+  func.func private @LyValueError_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.ValueError", ly.runtime.primitive = "raise"}
+
+  memref.global "private" constant @__ly_math_domain_msg : memref<17xi8> = dense<[109, 97, 116, 104, 32, 100, 111, 109, 97, 105, 110, 32, 101, 114, 114, 111, 114]>
+
+  func.func private @__ly_math_domain_error() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 17 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_domain_msg : memref<17xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<17xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
   func.func @LyMath_Floor(%header: memref<3xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.floor", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_floor", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
     %floored = math.floor %value : f64
@@ -73,6 +96,15 @@ module attributes {
 
   func.func @LyMath_Sqrt(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.sqrt", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_sqrt", ly.runtime.result_contract = "builtins.float"} {
     %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %zero = arith.constant 0.0 : f64
+    %negative = arith.cmpf olt, %value, %zero : f64
+    cf.cond_br %negative, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_domain_error() : () -> ()
+    cf.br ^ok
+
+  ^ok:
     %root = math.sqrt %value : f64
     %out_header = func.call @LyFloat_FromF64(%root) : (f64) -> memref<3xi64>
     func.return %out_header : memref<3xi64>
@@ -90,6 +122,17 @@ module attributes {
   // which would need an overloaded contract; write log(x) / log(b) for that.
   func.func @LyMath_Log(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.log", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_log", ly.runtime.result_contract = "builtins.float"} {
     %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    // CPython's math_1 rejects the whole non-positive domain: log(0.0) is a
+    // domain error there, not the -inf the hardware returns.
+    %zero = arith.constant 0.0 : f64
+    %nonpositive = arith.cmpf ole, %value, %zero : f64
+    cf.cond_br %nonpositive, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_domain_error() : () -> ()
+    cf.br ^ok
+
+  ^ok:
     %result = math.log %value : f64
     %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
     func.return %out_header : memref<3xi64>
