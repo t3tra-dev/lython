@@ -384,6 +384,19 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
 //   - the same, copying only the sequence evidence onto the entry the parent
 //     already holds                                  -> 52 B / 41 B
 //
+// AND THE 52 B WAS ALREADY THERE. Measured on the unmodified compiler:
+//
+//     grid: list[list[int]] = [[1, 2], [3, 4]]
+//     grid[1][0] = 9          # 52 B, no read of the value at all
+//
+// `grid[0][0] = 9` does not leak, nor does a one-element outer list, nor
+// indexing without a store -- it is a store into an inner list at a NON-ZERO
+// outer index, and it leaks with `inner = grid[1]` written out too. So the
+// five repair attempts above were each landing on top of a leak they did not
+// cause, and the figures that looked like their cost were partly this. That
+// has to be fixed first; the read-back repair cannot be judged until the
+// baseline is clean.
+//
 // So the values are reachable and the ledger is what resists. The entry is not
 // a description the parent keeps beside a reference; it IS how the reference is
 // held, and every republication so far has been read as a second owner. The
