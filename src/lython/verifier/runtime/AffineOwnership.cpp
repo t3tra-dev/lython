@@ -2652,6 +2652,17 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             // element (`n = n + 1`) is clean. That is why this golden is not
             // in the leak gate -- the value it pins is right, and the leak it
             // exposes is separate and open.
+            //
+            // Localised, for whoever takes it: `refcount-insertion` emits one
+            // retain MORE for the conditional shape than for the
+            // unconditional one (4 vs 3 on a two-element str list) while both
+            // emit five releases. The extra one carries no ownership
+            // attribute and sits immediately before an
+            // `aggregate_release = "...:py.decref"` of a different value, so
+            // the pair reads as balanced locally while the merge borrow it
+            // was meant to answer keeps its reference. int lists leak the
+            // same way from three elements up; two-element int lists are
+            // clean, which is why the smallest reproducer is a str list.
             // A merge borrow after the release is the loop edge re-pinning a
             // name this path has already given up: it is neither a
             // resurrection nor an outstanding borrow to discharge, because
