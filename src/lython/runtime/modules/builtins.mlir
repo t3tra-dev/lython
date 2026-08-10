@@ -15065,8 +15065,33 @@ module attributes {
     cf.cond_br %multiply_first, ^up, ^down
 
   ^up:
+    // Scaling can MANUFACTURE a tie the original number does not have:
+    // 2.675 is really 2.67499999999999982, but 2.675 * 100 rounds to exactly
+    // 267.5, and half-to-even on a midpoint goes up -- 2.68 where CPython
+    // says 2.67. When the scaled value lands on a midpoint, the sign of the
+    // multiply's own rounding error says which side x was really on, and
+    // `fma(x, scale, -scaled)` is that error exactly. Only a real tie (error
+    // zero) goes to even, which is what CPython's decimal path decides too.
     %scaled_up = arith.mulf %x, %scale : f64
-    %rounded_up = math.roundeven %scaled_up : f64
+    %floor_up = math.floor %scaled_up : f64
+    %frac_up = arith.subf %scaled_up, %floor_up : f64
+    %half = arith.constant 0.5 : f64
+    %is_tie = arith.cmpf oeq, %frac_up, %half : f64
+    %neg_scaled = arith.negf %scaled_up : f64
+    %residual = math.fma %x, %scale, %neg_scaled : f64
+    %below_mid = arith.cmpf olt, %residual, %zero : f64
+    %above_mid = arith.cmpf ogt, %residual, %zero : f64
+    %one_f = arith.constant 1.0 : f64
+    %ceil_up = arith.addf %floor_up, %one_f : f64
+    %tie_pick2 = arith.select %below_mid, %floor_up, %ceil_up : f64
+    // roundeven already answers every real tie correctly, INCLUDING the sign
+    // of a zero result (round(-0.5) is -0.0). Only a manufactured tie -- the
+    // multiply's residual is non-zero -- needs the override, so the exact
+    // case keeps roundeven's answer rather than a reconstructed one.
+    %even_up = math.roundeven %scaled_up : f64
+    %manufactured = arith.ori %below_mid, %above_mid : i1
+    %override = arith.andi %is_tie, %manufactured : i1
+    %rounded_up = arith.select %override, %tie_pick2, %even_up : f64
     %result_up = arith.divf %rounded_up, %scale : f64
     func.return %result_up : f64
 
