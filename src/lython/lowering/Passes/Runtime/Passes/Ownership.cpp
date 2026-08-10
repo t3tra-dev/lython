@@ -1422,6 +1422,16 @@ bool releaseOwnedGroupByLiveness(
           // takes a retain in the loop body, and the block after the loop
           // releases the merged value once. The missing release is on the
           // rebinding path, not at the loop exit.
+          //
+          // Pairing a release with this retain was then tried at both places
+          // it can go, and neither works: before the forwarding branch, and
+          // immediately after the consume. Both give "released owned resource
+          // ... is used after release", because the value is READ between the
+          // consume and the branch -- which is the reason the retain is there.
+          // So the reference this unfold takes is genuinely live to the end of
+          // the block and genuinely handed on, and the discharge has to be at
+          // the merge argument's own death rather than anywhere in this block.
+          // That is the destination group's business, not this one's.
           return true;
         }
     }
