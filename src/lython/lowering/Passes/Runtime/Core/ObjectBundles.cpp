@@ -219,6 +219,28 @@ RuntimeBundleLowerer::materializeObjectBundleForStorage(
     result.objectValue = *materialized;
   }
 
+  // ⛔ KNOWN DEFECT: assigning to an Optional field is refused, at this check.
+  //
+  //     class N:
+  //         def __init__(self) -> None:
+  //             self.v: Optional[str] = None
+  //     n.v = "set"      # attribute value ABI has 2 values, but storage
+  //                      # expects 3
+  //
+  // The slot is a union -- a tag plus the widest member's lanes -- and a `str`
+  // is two lanes arriving as itself. Every assignment fails: `= None`, an int
+  // into `Optional[int]`, and one written inside `__init__`. Reading such a
+  // field works; only the store is refused.
+  //
+  // Why NOT widen here with `appendUnionRuntimeValues`, which is the existing
+  // spelling of that conversion and does clear this check (measured, and
+  // 570/570 stays green): the program still does not compile. It advances to
+  // "released owned resource from @LyLong_FromI64 is used after release", and
+  // giving the widened value the member's borrowed ownership instead of a
+  // fresh owner does not change that. The widening is necessary and not
+  // sufficient -- the store also has to hand the slot the member's reference,
+  // which `replaceAggregateSlot` cannot do while the value it is handed is a
+  // union it did not build.
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, storageContract, purpose);
   if (mlir::failed(expectedTypes))
