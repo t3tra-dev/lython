@@ -408,13 +408,24 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
 //
 // Why NOT drop `int` from the storage-backed set in `EmitterClasses.cpp`, so
 // these globals take `lowerObjectGlobalSet` like every other contract, which
-// is the shape the fix wants: the runtime's own modules use int globals as
-// raw slots -- `stackguard_support.py` keeps a file descriptor and a function
-// POINTER in `g_stderr` and `g_write_file` -- and those stop resolving,
-// 31 errors before the tree even builds. Making the cell arbitrary-precision
-// has to keep a native slot for the internal modules that mean a machine
-// word, so it is a change to what those modules declare, not only to this
-// path.
+// is the shape the fix wants: `stackguard_support.py` keeps function POINTERS
+// and a file descriptor in int globals and reads them from a signal handler
+// that may not allocate -- the "signal-safe channel" the collector's own
+// comment names. Those uses stop resolving without a native slot.
+//
+// Measured, so the next attempt starts from the real boundary:
+//
+//   - the breakage is EXACTLY 31 errors in that ONE file. Nothing else in the
+//     tree needs the native cell: `io.py`'s SEEK_* and `posixpath.py`'s
+//     _S_IF* are small constants an arbitrary-precision cell serves fine, and
+//     every other `: int =` under `runtime/lib` is a local, not a global.
+//   - so the exemption wants to be per-module, and `moduleName` cannot carry
+//     it: the runtime's own modules are emitted as `__main__` too, so the
+//     collector cannot tell them apart by name.
+//
+// What is missing is a way for a module to declare that a global is a machine
+// word rather than a Python int -- which is a new spelling, not a repair to
+// this path.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
   if (!value)
