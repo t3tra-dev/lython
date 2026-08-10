@@ -370,14 +370,26 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
 // Flat lists and dict values are unaffected -- they have no outer description
 // to go stale.
 //
-// Why NOT demote the outer container when the receiver came from a `GetItemOp`,
-// which is the shape the fix wants: tried twice and both leak. Clearing the
-// parent's element evidence loses 52 B, and so does copying the one element
-// that was read and clearing only its contents. `sequenceElementBundles` is
-// where the elements' references are BOOKED as well as described, so there is
-// no clearing that keeps the ledger. The repair has to be a write-back of the
-// post-store inner bundle into the parent's slot, the way the field path does
-// it, not a demotion.
+// Why NOT repair the outer container when the receiver came from a `GetItemOp`:
+// five attempts, every one of them leaks. `sequenceElementBundles` books the
+// elements' references as well as describing them, and nothing tried keeps both
+// halves:
+//
+//   - clear the parent's element evidence            -> 52 B
+//   - clear only the element that was read           -> 52 B
+//   - replace that element with the post-store bundle -> 93 B (and correct
+//     values: 9, 7 and "z" all print right, walking the chain to the root
+//     handles three levels too)
+//   - the same, carrying the slot's ownership label over  -> 93 B
+//   - the same, copying only the sequence evidence onto the entry the parent
+//     already holds                                  -> 52 B / 41 B
+//
+// So the values are reachable and the ledger is what resists. The entry is not
+// a description the parent keeps beside a reference; it IS how the reference is
+// held, and every republication so far has been read as a second owner. The
+// next attempt should change who releases the slot, not what the slot says --
+// or move the element cache out of the ownership ledger so the two can be
+// written independently.
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
       op.getOperation(), op.getContainer());
