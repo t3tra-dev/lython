@@ -431,6 +431,26 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
 // or move the element cache out of the ownership ledger so the two can be
 // written independently.
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
+  // ⭐ A store through a name for a container ELEMENT ages the container it
+  // came out of, whichever name the store is written through.
+  //
+  //     data: list[dict[str, int]] = [{"n": 1}]
+  //     first: dict[str, int] = data[0]
+  //     first["n"] = 5
+  //     print(data[0]["n"])      # printed 1; CPython prints 5
+  //
+  // Reading through `first` was already right, so the store landed; the outer
+  // list just kept describing element 0 as it was before. Same shape as the
+  // one `demoteMutableContainerArgumentEvidence` handles for a value handed to
+  // a callee -- there the boundary is the call, here it is the alias -- so the
+  // repair is the same walk to the root.
+  for (mlir::Value outer = op.getContainer(); outer;) {
+    auto read = outer.getDefiningOp<py::GetItemOp>();
+    if (!read)
+      break;
+    outer = read.getContainer();
+    RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(outer);
+  }
   RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
       op.getOperation(), op.getContainer());
   RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
