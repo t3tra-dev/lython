@@ -2452,6 +2452,25 @@ Value ModuleEmitter::emitInlineMethodBody(
   mlir::cf::BranchOp::create(builder, loc(anchor), bodyBlock);
   builder.setInsertionPointToStart(bodyBlock);
   inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
+  // ⭐ The inlined body's return type, for the statements that ask for it
+  // rather than for the context stack.
+  //
+  //     class C:
+  //         def m(self) -> int:
+  //             try:
+  //                 return 1
+  //             finally:
+  //                 print("f")
+  //     print(C().m())        # printed None; CPython prints 1
+  //
+  // `emitTry` decides whether a value can be returned through its completion
+  // machinery by reading `currentReturnType`, which the inliner never set --
+  // so inside every inlined method it read the ENCLOSING function's type, and
+  // for a `-> None` caller that disabled the value path and left the return
+  // yielding nothing. The same method as a free function was always correct,
+  // because there the ordinary emission sets it.
+  mlir::Type enclosingReturnType = currentReturnType;
+  currentReturnType = resultType;
   bool pushedSuperContext = bindDescriptorReceiver &&
                             method.kind == "instance" &&
                             !method.definingClass.empty() &&
@@ -2462,6 +2481,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   methodsBeingInlined.push_back(method.method);
   emitStatements(body);
   methodsBeingInlined.pop_back();
+  currentReturnType = enclosingReturnType;
   if (pushedSuperContext)
     superContexts.pop_back();
   inlineReturnContexts.pop_back();
