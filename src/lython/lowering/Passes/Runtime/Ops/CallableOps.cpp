@@ -996,8 +996,33 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // rebind; it has one now, because the re-description is published through the
     // slot (`rebindMutatedContainer`) and a field chain has a slot. Still refused
     // across a block boundary, where the values would not dominate the join.
+    // ⛔ Evidence read back out of a CONTAINER is a snapshot, not a running
+    // account. `g[0]` rebuilds the inner list's description from the outer
+    // list's element map every time, and the map still holds what the literal
+    // put there -- so a second append to the same inner list sees the same
+    // one-element description as the first and stores at the same index:
+    //
+    //     g: list[list[int]] = [[1]]
+    //     g[0].append(9)
+    //     g[0].append(8)
+    //     print(g[0])      # abort in repr; CPython prints [1, 9, 8]
+    //
+    // The 8 overwrote the 9 and the length reached 3, leaving a slot nobody
+    // wrote -- a garbage read, an `Ly_IncRef` abort, or `[1, 8, None]` from
+    // the AOT path. The evidence tier can only be trusted where the walk sees
+    // every mutation of the receiver, and a receiver it re-derives per read is
+    // not that. The runtime arm loads the length and stores there.
+    // ⛔ Subscript reads only. A FIELD read is the same snapshot in principle
+    // -- `b.inner` rebuilds from the owner's field map -- and routing those
+    // here too fixes `b.xs.append` twice but breaks a golden and still leaves
+    // the alias shape wrong, so the field path keeps its own write-back
+    // (`writeBackFieldAlias`) instead.
+    bool receiverIsContainerElement =
+        !structuralMutation &&
+        op.getCallable().getDefiningOp<py::GetItemOp>() != nullptr;
     bool interiorViewWithoutEvidence =
-        !structuralMutation && !receiver.sequenceEvidenceBacked &&
+        !structuralMutation &&
+        (!receiver.sequenceEvidenceBacked || receiverIsContainerElement) &&
         !RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
             op.getOperation(), receiver);
     if ((structuralMutation && !receiver.sequenceEvidenceBacked) ||

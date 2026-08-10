@@ -510,6 +510,9 @@ set(LYTHON_LEAK_GATE_CASES
     # A list two field hops down: the write-back that repairs the chain must
     # republish the description without republishing the slot's reference.
     nested_field_list_append
+    # Repeated appends through a container element: the runtime arm the
+    # receiver now takes must retain each stored box exactly once.
+    append_through_container_element
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
