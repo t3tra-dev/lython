@@ -2633,73 +2633,21 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       continue;
     }
 
-    // ⛔ KNOWN DEFECT, recorded where the fix goes. A consuming use ends this
-    // group: the transfer IS the discharge, so nothing is released at the
-    // exits. That is right when the call is the value's last use and wrong
-    // when it is not, and the compiler currently refuses the second case
-    // instead of handling it:
+    // ⛔ Why NOT undo the transfer fold here, which reads like the place for
+    // it: this arm never claims the groups it would apply to.
+    // `releaseOwnedGroupByLiveness` takes them first, and that is where the
+    // fold and its undoing both live. Handing the group down to this one
+    // instead leaks -- 52-156 B in `leak.dict_literal_source_move_frequency`,
+    // `leak.sequence_literal_source_move_frequency` and
+    // `leak.loop_iterator_element_into_container_literal` -- because nothing
+    // here claims it either: the trace reads `none.consumed-or-forwarded` and
+    // no release is placed at all.
     //
-    //     msg = "boom"
-    //     e = ValueError(msg)     # LyValueError_Init transfer_args = [0, 3]
-    //     print(msg)              # error: ... is used after release
-    //
-    // Valid Python, refused. The affine verifier is not wrong -- the name
-    // really was moved away. What is missing is that a `move` whose source
-    // has later uses should have been a `dup` first: retain before the call,
-    // release at the real end of life. Container and attribute stores get
-    // this right already, through `aggregate_retain`; only the exception
-    // constructors transfer.
-    //
-    // The same shape appears at the yield boundary, found by the same audit
-    // and recorded here because it is the same missing rule rather than a
-    // second one. A value crossing a yield is transferred to the resumer
-    // (AffineOwnership.cpp, "Generator frames"), so yielding one local twice
-    // hands away what was already handed away:
-    //
-    //     def gen() -> Iterator[str]:
-    //         a = "a"
-    //         yield a
-    //         yield a       # ... is returned with 1 additional retained
-    //                       # ownership token(s)
-    //
-    // Bisected: once is fine, two DISTINCT locals are fine, `int` is fine
-    // (not refcounted), and `while i < 3: yield a` fails -- a loop yielding a
-    // loop-invariant value, which is not an exotic generator. Whether one fix
-    // covers both boundaries is NOT established: the yield transfer is the
-    // resume clone's `owned_results` contract and may not reach this decision
-    // at all. What is established is that the rule missing in both places is
-    // the same one.
-    //
-    // Where the fold actually lives, established by attempting the repair:
-    // NOT here. `releaseOwnedGroupByLiveness` claims these groups first, and
-    // its `consumeIsDeath` branch treats a consuming use as the end of the
-    // value's life without asking whether anything reads it afterwards. That
-    // is the fold. Two things were measured trying to undo it there:
-    //
-    //   - Declining that arm on a read-after-consume, so the group falls
-    //     through to this function, leaks. Nothing here claims it either --
-    //     the trace shows `none.consumed-or-forwarded` and no release is
-    //     placed at all. 52-156 B in `leak.dict_literal_source_move_frequency`,
-    //     `leak.sequence_literal_source_move_frequency` and
-    //     `leak.loop_iterator_element_into_container_literal`.
-    //   - Restricting the decline to a single consuming use does not change
-    //     that; those three have one consumer each.
-    //
-    // So the retain has to be inserted by the arm that keeps the group, not by
-    // handing the group to an arm that drops it. That is a change inside
-    // `releaseOwnedGroupByLiveness`: on a read-after-consume, retain before
-    // the consume and let the ordinary liveness placement put the release at
-    // the true last use, instead of marking the block consumed.
-    //
-    // Why NOT fix it in the manifest by making the message `retain_args`,
-    // which is what CPython's BaseException_init does and is the obvious
-    // move: it was tried, and `RuntimeRaisePathTest.NoOwnedObjectIsHeldAcross
-    // ARaise` plus `leak.dict_build` refused it within one run. Retaining
-    // leaves the CALLER holding an owned reference across the raise, and the
-    // unwind path does not release it -- 43 bytes, every raise. The transfer
-    // contract is load-bearing for exactly the case with no later use, which
-    // is `raise`. So the repair belongs here, conditioned on there being a
-    // later use, and not in the contract.
+    // What remains unhandled anywhere is the same shape at the YIELD
+    // boundary. `yield a; yield a` is refused, because a value crossing a
+    // yield is transferred to the resumer through the resume clone's
+    // `owned_results` and never reaches either arm. `while i < 3: yield a`
+    // fails too, which is a loop yielding a loop-invariant value.
     bool canReleaseAtExits = true;
     for (mlir::Value result : group.values) {
       llvm::SmallVector<mlir::Value, 8> equivalentValues;
