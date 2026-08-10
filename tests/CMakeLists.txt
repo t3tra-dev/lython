@@ -500,6 +500,10 @@ set(LYTHON_LEAK_GATE_CASES
     # A dict value grown through the runtime tier: the append takes a
     # reference for the slot it writes, and nothing else counts that slot.
     dict_value_list_append
+    # Optional fields defaulting to None: the dead value standing in for the
+    # absent previous value must own nothing, and only a leak check can say
+    # that it also releases nothing it should have kept.
+    optional_field_default_none
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

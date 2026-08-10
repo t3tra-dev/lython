@@ -1109,6 +1109,38 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
     values.push_back(*value);
   }
 
+  // ⭐ A dead union has to name a member that owns nothing.
+  //
+  // The tag is lane 0 and every other lane is a zeroed placeholder, so leaving
+  // the tag at 0 says "member 0 is live" -- for `Optional[int]` that is the
+  // `int`, and the aggregate walk then released a header nobody had written:
+  //
+  //     class Node:
+  //         def __init__(self) -> None:
+  //             self.next: Optional[int] = None
+  //     Node()                      # Ly_DecRef observed non-positive refcount
+  //
+  // A member with no lanes carries nothing to release or retain, which is
+  // exactly what a dead value is, so the tag names one of those when the union
+  // has one. `NoneType` is that member for every `Optional`.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(contract)) {
+    for (auto [memberIndex, member] :
+         llvm::enumerate(unionType.getMemberTypes())) {
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, member, purpose);
+      if (mlir::failed(memberTypes))
+        return mlir::failure();
+      if (!memberTypes->empty())
+        continue;
+      if (!values.empty() && mlir::isa<mlir::IntegerType>(values.front().getType()))
+        values.front() = mlir::arith::ConstantIntOp::create(
+                             builder, op->getLoc(),
+                             static_cast<std::int64_t>(memberIndex), 64)
+                             .getResult();
+      break;
+    }
+  }
+
   if (!values.empty() && storage == DeadObjectStorage::OwningHeap)
     initializeObjectHeader(builder, op->getLoc(), values.front(),
                            /*refcount=*/1, /*classId=*/0);
