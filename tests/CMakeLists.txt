@@ -507,6 +507,9 @@ set(LYTHON_LEAK_GATE_CASES
     # None inside containers: the class-0 arm hands the box straight to the
     # object fallback, which returns an owned str like every other arm.
     none_inside_containers
+    # A list two field hops down: the write-back that repairs the chain must
+    # republish the description without republishing the slot's reference.
+    nested_field_list_append
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

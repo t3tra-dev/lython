@@ -444,7 +444,17 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
             op, ownerBundle.objectValue.values[*offset], updatedField,
             updatedField.fieldAliasName)))
       return mlir::failure();
+    RuntimeBundle boxedOwnerView = ownerBundle;
     valueBundles[updatedField.fieldAliasOwner] = std::move(ownerBundle);
+    // The box POINTER does not move, but the owner's cached bundle for this
+    // field just changed, and an owner that is ITSELF a field of something
+    // else has that stale copy one level up. `t.mid.leaves.append` twice read
+    // `t`'s cached `mid` the second time and grew a list described by the
+    // first append.
+    if (boxedOwnerView.fieldAliasOwner &&
+        !boxedOwnerView.fieldAliasName.empty() &&
+        boxedOwnerView.fieldAliasOwner != updatedField.fieldAliasOwner)
+      return RuntimeBundleLowerer::writeBackFieldAlias(op, boxedOwnerView);
     return mlir::success();
   }
 
