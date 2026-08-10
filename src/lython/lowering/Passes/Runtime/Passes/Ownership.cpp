@@ -2583,6 +2583,27 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     // at all. What is established is that the rule missing in both places is
     // the same one.
     //
+    // Where the fold actually lives, established by attempting the repair:
+    // NOT here. `releaseOwnedGroupByLiveness` claims these groups first, and
+    // its `consumeIsDeath` branch treats a consuming use as the end of the
+    // value's life without asking whether anything reads it afterwards. That
+    // is the fold. Two things were measured trying to undo it there:
+    //
+    //   - Declining that arm on a read-after-consume, so the group falls
+    //     through to this function, leaks. Nothing here claims it either --
+    //     the trace shows `none.consumed-or-forwarded` and no release is
+    //     placed at all. 52-156 B in `leak.dict_literal_source_move_frequency`,
+    //     `leak.sequence_literal_source_move_frequency` and
+    //     `leak.loop_iterator_element_into_container_literal`.
+    //   - Restricting the decline to a single consuming use does not change
+    //     that; those three have one consumer each.
+    //
+    // So the retain has to be inserted by the arm that keeps the group, not by
+    // handing the group to an arm that drops it. That is a change inside
+    // `releaseOwnedGroupByLiveness`: on a read-after-consume, retain before
+    // the consume and let the ordinary liveness placement put the release at
+    // the true last use, instead of marking the block consumed.
+    //
     // Why NOT fix it in the manifest by making the message `retain_args`,
     // which is what CPython's BaseException_init does and is the obvious
     // move: it was tried, and `RuntimeRaisePathTest.NoOwnedObjectIsHeldAcross
