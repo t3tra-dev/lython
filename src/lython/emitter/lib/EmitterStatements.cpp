@@ -115,14 +115,38 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                                                "malformed augmented assignment"});
       return;
     }
-    // `d |= other` on dicts is CPython's in-place __ior__ — it must mutate
-    // the existing object (aliases observe the update), so it rewrites to
-    // d.update(other) instead of the fresh-dict `d = d | other` BinOp.
-    if (op->kind == "BitOr" && isDictTypedExpr(target.get())) {
+    // ⭐ An augmented assignment whose operator has an in-place dunder must
+    // MUTATE the object, not rebind the name: every other alias observes it.
+    //
+    //     a: list[int] = [1, 2]
+    //     b: list[int] = a
+    //     b += [3]
+    //     print(a)      # printed [1, 2]; CPython prints [1, 2, 3]
+    //
+    // Desugaring to `b = b + [3]` builds a fresh list, so the mutation was
+    // invisible through `a` -- and through the caller when the target was a
+    // parameter. CPython's `list.__iadd__` is `extend`, and `dict.__ior__` is
+    // `update`; the dict case was already rewritten this way, so this is the
+    // same rule stated once for both rather than a second special case.
+    struct InPlaceRewrite {
+      llvm::StringRef opKind;
+      llvm::StringRef contract;
+      llvm::StringRef method;
+    };
+    static constexpr InPlaceRewrite kInPlaceRewrites[] = {
+        {"BitOr", "builtins.dict", "update"},
+        {"Add", "builtins.list", "extend"},
+    };
+    llvm::StringRef inPlaceMethod;
+    for (const InPlaceRewrite &rewrite : kInPlaceRewrites)
+      if (op->kind == rewrite.opKind &&
+          exprHasContract(target.get(), rewrite.contract))
+        inPlaceMethod = rewrite.method;
+    if (!inPlaceMethod.empty()) {
       parser::NodePtr updateAttr =
           parser::makeNode("Attribute", statement.range);
       parser::addField(*updateAttr, "value", target);
-      parser::addField(*updateAttr, "attr", std::string("update"));
+      parser::addField(*updateAttr, "attr", std::string(inPlaceMethod));
       parser::NodePtr updateCall = parser::makeNode("Call", statement.range);
       parser::addField(*updateCall, "func", std::move(updateAttr));
       parser::addField(*updateCall, "args",

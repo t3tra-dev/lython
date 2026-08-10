@@ -1020,11 +1020,16 @@ NodePtr methodCallNode(NodePtr receiver, const char *method,
 } // namespace
 
 bool ModuleEmitter::isDictTypedExpr(const parser::Node *expr) {
+  return exprHasContract(expr, "builtins.dict");
+}
+
+bool ModuleEmitter::exprHasContract(const parser::Node *expr,
+                                    llvm::StringRef contractName) {
   if (!expr)
     return false;
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(
       types.widenLiteral(types.inferExpr(expr)));
-  return contract && contract.getContractName() == "builtins.dict";
+  return contract && contract.getContractName() == contractName;
 }
 
 std::optional<Value>

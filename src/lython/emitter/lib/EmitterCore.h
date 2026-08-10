@@ -330,6 +330,7 @@ private:
   // dict method sugar (EmitterIterators.cpp): get(k) / setdefault / popitem
   // / dict.fromkeys compose over existing dict primitives.
   bool isDictTypedExpr(const parser::Node *expr);
+  bool exprHasContract(const parser::Node *expr, llvm::StringRef contractName);
   std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
                                               const parser::Node *calleeNode);
   // `x in d.keys()/values()/items()` and `len(d.keys())` rewrite against the
