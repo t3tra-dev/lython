@@ -564,13 +564,27 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
 //
 // Why NOT refuse when the receiver's class has an overriding subclass, which
 // is the shape the fix wants and is statically decidable from `classMros` and
-// `classMethodBindings`: tried, and it refuses `class_mro` and `class_super`.
+// `classMethodBindings`: tried three times, and it refuses `class_mro` and
+// `class_super` every time.
+//
 // A base method's own body calls `self.who()` with `self` typed as the base,
-// and that call IS resolved correctly -- `emitInlineMethodCall` specialises
+// and that call IS resolved correctly -- `emitInlineMethodBody` specialises
 // the body into each concrete call site, so the inlined copy binds `who` to
-// the receiver's real class. The two look identical here: a `self` that will
-// be specialised and a parameter that cannot be. The refusal has to be made
-// at a point that knows which of the two it has, not at the binding.
+// the receiver's real class. A specialisable `self` and an unresolvable
+// base-typed parameter are the same type at the binding.
+//
+// Two ways to tell them apart were measured and neither is enough:
+//
+//   - gate on `methodsBeingInlined` being empty, so only calls outside an
+//     inlining are refused. Still refuses both goldens.
+//   - additionally exempt a receiver spelled `super()`, since `class_super`
+//     chains `Left.tag` -> `Right.tag` through the MRO rather than through a
+//     type. Still refuses both: by the time the call is emitted the `super()`
+//     receiver no longer looks like a `Call` node to the AST test.
+//
+// So the distinguishing fact is not in the receiver's syntax or in a depth
+// counter. It is whether the receiver VALUE has a known dynamic class at this
+// site, which is what the inliner knows and does not record.
 std::optional<MethodBinding>
 ModuleEmitter::lookupClassMethod(mlir::Type receiverType,
                                  llvm::StringRef methodName) const {
