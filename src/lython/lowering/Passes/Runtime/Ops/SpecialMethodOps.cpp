@@ -415,6 +415,15 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
 // programs; the pass makes it ten for both), so the placement differs, not
 // the count.
 //
+// Attempted, and it made things worse. The move is recorded where the literal
+// absorbs the source (`Core/CollectionPayload.cpp`), the frame token is minted
+// afterwards by `Ops/GetItemOps.cpp`, and suppressing that token's release
+// when the value was already absorbed took the leak from 52 B to 8420 B --
+// the same token is what releases the value on the paths where the literal
+// did NOT take it over, so suppressing it unconditionally drops those too.
+// The condition has to distinguish the absorbed reference from the token's
+// other duties, which the moved-value set alone does not.
+//
 // So the values are reachable and the ledger is what resists. The entry is not
 // a description the parent keeps beside a reference; it IS how the reference is
 // held, and every republication so far has been read as a second owner. The
