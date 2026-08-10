@@ -393,6 +393,28 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
   return mlir::success();
 }
 
+// ⛔ KNOWN DEFECT: a module-level `int` global is a 64-bit cell, and CPython's
+// int is arbitrary precision.
+//
+//     a: int = 3037000500
+//     a = a * a
+//     print(a)      # -9223372036709301616; CPython 9223372037000250000
+//
+// Nothing is diagnosed. The multiply is not at fault -- it detects the
+// overflow with `mulsi_extended` and produces a real `LyLong_Mul` result --
+// but the store below unboxes that back through `unbox.i64` because the cell
+// is an `i64`. The same code inside a function is correct: a local int is not
+// a cell.
+//
+// Why NOT drop `int` from the storage-backed set in `EmitterClasses.cpp`, so
+// these globals take `lowerObjectGlobalSet` like every other contract, which
+// is the shape the fix wants: the runtime's own modules use int globals as
+// raw slots -- `stackguard_support.py` keeps a file descriptor and a function
+// POINTER in `g_stderr` and `g_write_file` -- and those stop resolving,
+// 31 errors before the tree even builds. Making the cell arbitrary-precision
+// has to keep a native slot for the internal modules that mean a machine
+// word, so it is a change to what those modules declare, not only to this
+// path.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
   if (!value)
