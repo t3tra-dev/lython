@@ -1443,6 +1443,19 @@ bool releaseOwnedGroupByLiveness(
           // not add a discharge for a second reference the group holds. So the
           // fourth attempt has to give the merge argument a second death, not
           // relabel its first one.
+          //
+          // That was the fourth attempt, and it overshoots: emitting an extra
+          // release beside the existing one, at the function's returns, gives
+          // "released or transferred more than once on one CFG path".
+          // Together with the third -- one release, 81 B short -- that
+          // brackets the answer: on the paths this reaches, one discharge is
+          // too few and two are too many, so the count is PATH-DEPENDENT. The
+          // rebinding path needs the second and the fall-through path does
+          // not, which is exactly the shape `releaseOwnedGroupByLiveness`
+          // computes for a group and cannot express for two references of one
+          // group. The repair is a second GROUP for the unfolded reference,
+          // tracked and released on its own, not a second release for this
+          // one.
           return true;
         }
     }
