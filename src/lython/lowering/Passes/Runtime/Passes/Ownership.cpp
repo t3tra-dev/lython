@@ -1432,6 +1432,17 @@ bool releaseOwnedGroupByLiveness(
           // the block and genuinely handed on, and the discharge has to be at
           // the merge argument's own death rather than anywhere in this block.
           // That is the destination group's business, not this one's.
+          //
+          // And that was tried too. The destination's release is placed with
+          // `ownsReference=false` on the reasoning that a merge argument's
+          // token is LENT (see the comment at that call). Flipping it to
+          // `true` when a predecessor carries an unlabelled retain -- the
+          // unfold's signature -- changes the label and not the count: the
+          // block still emits four `LyUnicode_DecRef`s and still leaks 81 B.
+          // `releaseOwnedGroupByLiveness` decides WHERE a group dies; it does
+          // not add a discharge for a second reference the group holds. So the
+          // fourth attempt has to give the merge argument a second death, not
+          // relabel its first one.
           return true;
         }
     }
