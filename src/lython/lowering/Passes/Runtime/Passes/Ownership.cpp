@@ -1406,9 +1406,22 @@ bool releaseOwnedGroupByLiveness(
           // Why NOT skip terminators outright, which is what the shape
           // suggests: measured, and both reproducers then fail to compile.
           // Some terminators ARE the later use this unfold exists for -- a
-          // return of the still-owned value among them -- so the condition has
-          // to separate a handover to a merge argument from a terminator that
-          // consumes, which the use alone does not say.
+          // return of the still-owned value among them.
+          //
+          // Nor is it enough to skip only the branches that forward the value
+          // to a merge argument (`branchForwardsGroupToBlockArgument`, which
+          // answers exactly that question): measured too, and the programs
+          // then fail with "released owned resource ... is used after
+          // release". So the retain is NOT simply spurious -- something reads
+          // the value after the consume and needs it alive.
+          //
+          // What the leak scales with says where the imbalance is. It is not
+          // per iteration: a two- and a three-element list both leak 81 B and
+          // a four-element one leaks 122 B, which tracks the number of times
+          // the CONDITION held and the element was rebound. Each of those
+          // takes a retain in the loop body, and the block after the loop
+          // releases the merged value once. The missing release is on the
+          // rebinding path, not at the loop exit.
           return true;
         }
     }
