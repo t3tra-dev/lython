@@ -2631,7 +2631,37 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             // legal. Charging it to a parent instead would let the holder's
             // release cancel it, so it stays a plain retain here even when it
             // carries a parent link.
-            ++state.retained;
+            //
+            // ⛔ Except a merge borrow, which the Owned arm below already
+            // counts separately for the same reason: it is the loop edge's
+            // own pin, not a new reference, and it recurs every iteration.
+            // Counting it here made `state.retained` -- part of the visited
+            // key -- climb without bound, so the fixpoint never closed:
+            //
+            //     lo: int = 0
+            //     for x in [4, -2, 9]:
+            //         if x < lo:
+            //             lo = x
+            //
+            // reached retained=1818 and hit the 20000-state cap. The comment
+            // on that cap says a rise in it must be read as a possible masked
+            // finding rather than a limit; this is the same shape it names,
+            // and it was masking one: with the walk converging, the program
+            // compiles and LEAKS 52 B whenever the rebound name is the loop
+            // ELEMENT (`lo = x`), while an accumulator that never takes the
+            // element (`n = n + 1`) is clean. That is why this golden is not
+            // in the leak gate -- the value it pins is right, and the leak it
+            // exposes is separate and open.
+            // A merge borrow after the release is the loop edge re-pinning a
+            // name this path has already given up: it is neither a
+            // resurrection nor an outstanding borrow to discharge, because
+            // the release that would cancel it (`callConsumesStaleValue`
+            // above) is behind us on this path. Counting it in EITHER
+            // component makes that component climb once per iteration, and
+            // both are part of the visited key -- retained=1818 first, then
+            // borrowed=1818 when only the retain side was excluded.
+            if (!isBlockArgMergeBorrowRetain(call))
+              ++state.retained;
           }
         } else if (state.token == AffineTokenState::Owned && consumes) {
           if (std::optional<llvm::SmallVector<mlir::Value, 4>> replacement =
