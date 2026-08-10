@@ -1,0 +1,6 @@
+42
+-7
+invalid literal for int() with base 10: 'abc'
+invalid literal for int() with base 10: ''
+invalid literal for int() with base 10: '1 2'
+invalid literal for int() with base 10: "a'b"

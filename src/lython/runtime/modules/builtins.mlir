@@ -5792,7 +5792,7 @@ module attributes {
   memref.global "private" constant @__ly_long_msg_int_too_large : memref<51xi8> = dense<[105, 110, 116, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 99, 111, 110, 118, 101, 114, 116, 32, 116, 111, 32, 97, 32, 110, 97, 116, 105, 118, 101, 32, 54, 52, 45, 98, 105, 116, 32, 105, 110, 116, 101, 103, 101, 114]>
   // "invalid literal for int() with base 10" (CPython appends the repr of the
   // input; message concatenation needs the str-track's formatting work)
-  memref.global "private" constant @__ly_long_msg_invalid_int_literal : memref<38xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 108, 105, 116, 101, 114, 97, 108, 32, 102, 111, 114, 32, 105, 110, 116, 40, 41, 32, 119, 105, 116, 104, 32, 98, 97, 115, 101, 32, 49, 48]>
+  memref.global "private" constant @__ly_long_msg_invalid_int_literal_prefix : memref<40xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 108, 105, 116, 101, 114, 97, 108, 32, 102, 111, 114, 32, 105, 110, 116, 40, 41, 32, 119, 105, 116, 104, 32, 98, 97, 115, 101, 32, 49, 48, 58, 32]>
   // "int ** negative int is rejected: the static result type is int; use float(base) ** exponent"
   memref.global "private" constant @__ly_long_msg_pow_negative_exponent : memref<91xi8> = dense<[105, 110, 116, 32, 42, 42, 32, 110, 101, 103, 97, 116, 105, 118, 101, 32, 105, 110, 116, 32, 105, 115, 32, 114, 101, 106, 101, 99, 116, 101, 100, 58, 32, 116, 104, 101, 32, 115, 116, 97, 116, 105, 99, 32, 114, 101, 115, 117, 108, 116, 32, 116, 121, 112, 101, 32, 105, 115, 32, 105, 110, 116, 59, 32, 117, 115, 101, 32, 102, 108, 111, 97, 116, 40, 98, 97, 115, 101, 41, 32, 42, 42, 32, 101, 120, 112, 111, 110, 101, 110, 116]>
   // "shift count too large"
@@ -6586,12 +6586,25 @@ module attributes {
     func.return
   }
 
-  func.func private @__ly_long_raise_invalid_literal() {
+  // CPython appends the repr of the offending input:
+  //   ValueError: invalid literal for int() with base 10: 'abc'
+  // The prefix alone left the caller unable to tell WHICH string failed, which
+  // is the whole content of the message. The concatenation the older comment
+  // said was unavailable is `LyUnicode_Concat`, right here in this manifest.
+  func.func private @__ly_long_raise_invalid_literal(%subject_header: memref<2xi64> {ly.ownership.object_header}, %subject_bytes: memref<?xi8>) {
     %class_id = arith.constant 53 : i64
-    %length = arith.constant 38 : i64
-    %message_static = memref.get_global @__ly_long_msg_invalid_int_literal : memref<38xi8>
-    %message = memref.cast %message_static : memref<38xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    %start = arith.constant 0 : index
+    %prefix_length = arith.constant 40 : i64
+    %prefix_static = memref.get_global @__ly_long_msg_invalid_int_literal_prefix : memref<40xi8>
+    %prefix_bytes = memref.cast %prefix_static : memref<40xi8> to memref<?xi8>
+    %prefix_h, %prefix_b = func.call @LyUnicode_FromBytes(%prefix_bytes, %start, %prefix_length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %quoted_h, %quoted_b = func.call @LyUnicode_Repr(%subject_header, %subject_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %full_h, %full_b = func.call @LyUnicode_Concat(%prefix_h, %prefix_b, %quoted_h, %quoted_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%prefix_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%quoted_h) : (memref<2xi64>) -> ()
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %full_h, %full_b) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
@@ -8022,7 +8035,7 @@ module attributes {
     cf.cond_br %no_content, ^invalid_early, ^signed
 
   ^invalid_early:
-    func.call @__ly_long_raise_invalid_literal() : () -> ()
+    func.call @__ly_long_raise_invalid_literal(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
     %eh, %em, %ed = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %eh, %em, %ed : memref<2xi64>, memref<2xi64>, memref<?xi32>
 
@@ -8111,7 +8124,7 @@ module attributes {
 
   ^invalid_parsed:
     func.call @LyLong_DecRef(%h) : (memref<2xi64>) -> ()
-    func.call @__ly_long_raise_invalid_literal() : () -> ()
+    func.call @__ly_long_raise_invalid_literal(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
     %ph, %pm, %pd = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %ph, %pm, %pd : memref<2xi64>, memref<2xi64>, memref<?xi32>
 
