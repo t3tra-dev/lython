@@ -1388,6 +1388,27 @@ bool releaseOwnedGroupByLiveness(
             continue;
           if (consumingUseEndsThisToken(use, candidate))
             continue;
+          // ⛔ KNOWN DEFECT: a TERMINATOR forwarding the value counts as a
+          // later use here, and for a loop back-edge that is wrong -- the
+          // branch hands the value over, the destination argument gets its own
+          // token from the merge-borrow retain on that edge, and the retain
+          // this unfold then inserts has nothing to discharge it:
+          //
+          //     lo: int = 0
+          //     for x in [4, -2, 9]:
+          //         if x < lo:
+          //             lo = x
+          //
+          // leaks 52 B, and the str form 81 B. The emitted block reads
+          // balanced because the inserted retain sits directly before an
+          // unrelated `py.decref` of the same name.
+          //
+          // Why NOT skip terminators outright, which is what the shape
+          // suggests: measured, and both reproducers then fail to compile.
+          // Some terminators ARE the later use this unfold exists for -- a
+          // return of the still-owned value among them -- so the condition has
+          // to separate a handover to a merge argument from a terminator that
+          // consumes, which the use alone does not say.
           return true;
         }
     }
