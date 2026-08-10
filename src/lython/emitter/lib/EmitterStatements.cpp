@@ -177,6 +177,33 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       }
       py::RaiseOp::create(builder, loc(statement), value.value, cause,
                           fromNone);
+    } else if (exceptHandlerDepth == 0) {
+      // ⭐ A bare `raise` outside every handler has nothing to re-raise.
+      //
+      // CPython raises `RuntimeError: No active exception to reraise`; this
+      // compiler emitted `py.raise.current`, whose runtime arm for an empty
+      // slot is a trap -- `raise` on its own aborted with no output. Deciding
+      // it HERE and not in the lowering is forced: `py.try`'s regions are
+      // flattened before the lowering sees the op, so by then the parent chain
+      // is just `func.func`, and a handler re-raise looks identical to this.
+      //
+      // Whether a handler is running is a question about where the statement
+      // sits, which is exactly what this walk knows. A handler that already
+      // completed does not count, matching CPython: `try/except/pass` then
+      // `raise` raises there too.
+      parser::NodePtr message = parser::makeNode("Constant", statement.range);
+      parser::addField(*message, "value",
+                       std::string("No active exception to reraise"));
+      parser::NodePtr callee = parser::makeNode("Name", statement.range);
+      parser::addField(*callee, "id", std::string("RuntimeError"));
+      parser::NodePtr call = parser::makeNode("Call", statement.range);
+      parser::addField(*call, "func", std::move(callee));
+      parser::addField(*call, "args",
+                       std::vector<parser::NodePtr>{std::move(message)});
+      parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+      parser::NodePtr synthesized = parser::makeNode("Raise", statement.range);
+      parser::addField(*synthesized, "exc", std::move(call));
+      emitStatement(*synthesized);
     } else {
       py::RaiseCurrentOp::create(builder, loc(statement));
     }

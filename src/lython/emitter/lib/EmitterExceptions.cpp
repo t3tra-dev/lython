@@ -1152,7 +1152,9 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           if (supportsLoopControlThroughFinally)
             loopControlContexts.push_back(
                 LoopControlContext{exceptBreakBlock, exceptContinueBlock});
+          ++exceptHandlerDepth;
           emitStatements(ast::nodeList(handler, "body"));
+          --exceptHandlerDepth;
           if (supportsLoopControlThroughFinally)
             loopControlContexts.pop_back();
           if (exceptReturnBlock)
@@ -1879,7 +1881,9 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
           builder.setInsertionPointToStart(innerBody);
           {
             ScopedEmitterScope bodyScope(values, types);
+            ++exceptHandlerDepth;
             emitStatements(ast::nodeList(handler, "body"));
+            --exceptHandlerDepth;
           }
           terminateOpenRegionBlocks<py::TryYieldOp>(builder, loc(handler),
                                                     innerTry.getTryRegion());

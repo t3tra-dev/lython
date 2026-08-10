@@ -746,6 +746,11 @@ private:
   llvm::StringMap<llvm::SmallVector<std::string, 4>> classBaseNames;
   // C3 linearization per class (self first, canonical contract names).
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classMros;
+  // How many except handler bodies enclose the statement being emitted. A bare
+  // `raise` re-raises what a handler caught, so at zero there is nothing to
+  // re-raise -- the question the lowering cannot ask, because `py.try`'s
+  // regions are gone by then.
+  unsigned exceptHandlerDepth = 0;
   // Fields declared by the class body itself (classFieldOrders holds the
   // MRO-merged instance layout).
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classOwnFieldOrders;
