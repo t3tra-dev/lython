@@ -875,6 +875,42 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
         py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), bit);
     return Value{pyBool.getResult(), types.boolType()};
   }
+  // ⭐ A generated `__eq__` compares fields; CPython's compares CLASSES first.
+  //
+  //     @dataclass
+  //     class A: x: int
+  //     @dataclass
+  //     class B: x: int
+  //     A(1) == B(1)      # printed True; CPython prints False
+  //
+  // `dataclasses` opens its `__eq__` with `if other.__class__ is
+  // self.__class__`, returning `NotImplemented` otherwise -- so `==` between
+  // unrelated classes, and between a base and its subclass, is False. The
+  // synthesized body here has no such guard, and its `other` parameter is
+  // typed as the class itself, so the field comparison ran on operands of two
+  // different classes and answered on the fields alone.
+  //
+  // Folded at the comparison instead of guarding inside the body: both classes
+  // are known here, which is the whole question, and CPython's answer for a
+  // class mismatch is a constant.
+  if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
+    auto lhsContract =
+        mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(lhs.type));
+    auto rhsContract =
+        mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(rhs.type));
+    if (lhsContract && rhsContract && lhsContract != rhsContract &&
+        lookupClassMethod(lhs.type, "__eq__") &&
+        lookupClassMethod(rhs.type, "__eq__"))
+    {
+      mlir::Value bit = mlir::arith::ConstantIntOp::create(
+                            builder, loc(expr),
+                            ast::isOperator(op, "NotEq") ? 1 : 0, 1)
+                            .getResult();
+      auto pyBool = py::CastFromPrimOp::create(builder, loc(expr),
+                                               types.boolType(), bit);
+      return Value{pyBool.getResult(), types.boolType()};
+    }
+  }
   if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot")) {
     // CPython's object.__ne__ negates whatever __eq__ RESOLVED to, so a class
     // that supplies only __eq__ (a user definition, a dataclass or an enum)
