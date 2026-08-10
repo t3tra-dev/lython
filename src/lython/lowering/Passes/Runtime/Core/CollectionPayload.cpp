@@ -262,8 +262,29 @@ void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
     // Copy: demotion writes into valueBundles and would invalidate `pack`.
     llvm::SmallVector<mlir::Value, 8> operands(pack->aggregateOperands.begin(),
                                                pack->aggregateOperands.end());
-    for (mlir::Value operand : operands)
+    for (mlir::Value operand : operands) {
       demoteMutableContainerEvidenceFor(operand);
+      // ⭐ And the container it came OUT of, whose element map still describes
+      // it as the callee found it.
+      //
+      //     def grow(v: list[int]) -> None: v.append(2)
+      //     data: list[list[int]] = [[1]]
+      //     grow(data[0])
+      //     print(data[0][1])      # IndexError; CPython prints 2
+      //
+      // `len(data[0])` was already right -- the runtime length grew -- so only
+      // the subscript READ was stale, answered from the outer list's cached
+      // one-element description of the inner one. Demoting the argument alone
+      // does not reach that copy. Binding the element to a local first was
+      // correct, because then the local is what the walk tracks.
+      for (mlir::Value outer = operand; outer;) {
+        auto read = outer.getDefiningOp<py::GetItemOp>();
+        if (!read)
+          break;
+        outer = read.getContainer();
+        demoteMutableContainerEvidenceFor(outer);
+      }
+    }
   };
   demotePack(op.getPosargs());
   demotePack(op.getKwvalues());
