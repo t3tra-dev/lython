@@ -15004,9 +15004,26 @@ module attributes {
   }
 
   // Scale, round-half-to-even, unscale. CPython uses _Py_dg_dtoa for a
-  // correctly-rounded decimal result; this reproduces it for the magnitudes
-  // where 10**|n| is exact in binary64 and passes nan/inf and out-of-range
-  // exponents through unchanged, as float___round___impl does.
+  // correctly-rounded DECIMAL result; this is the binary approximation of it,
+  // and passes nan/inf and out-of-range exponents through unchanged as
+  // float___round___impl does.
+  //
+  // KNOWN DEFECT, and the reason the deviation is not just "for large
+  // magnitudes": this comment used to claim the two agree wherever 10**|n| is
+  // exact in binary64. They do not. `round(2.675, 2)` returns 2.68 where
+  // CPython returns 2.67, and 100 is exact.
+  //
+  // 2.675 is really 2.67499999999999982, so the decimal answer is 2.67. But
+  // 2.675 * 100 rounds to exactly 267.5 in binary64, and half-to-even on a
+  // value that IS the midpoint goes up. The scaling manufactured a tie that
+  // the original number does not have. `round(-2.675, 2)` is wrong the same
+  // way; `round(x)` with no ndigits is unaffected, since nothing is scaled.
+  //
+  // The fix CPython's own path suggests is a decimal round-trip -- format to
+  // `ndigits` places and parse back, which was measured to agree with CPython
+  // on every probe including the ties, the negatives and 1e16. `snprintf` and
+  // `strtod` are the pieces, and both live in the support builders rather
+  // than in this manifest, so it is a layering change and not an edit here.
   func.func private @__ly_float_round_ndigits(%x: f64, %ndigits: i64) -> f64 {
     %zero = arith.constant 0.0 : f64
     %ten = arith.constant 10.0 : f64
