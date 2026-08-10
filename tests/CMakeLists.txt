@@ -504,6 +504,9 @@ set(LYTHON_LEAK_GATE_CASES
     # absent previous value must own nothing, and only a leak check can say
     # that it also releases nothing it should have kept.
     optional_field_default_none
+    # None inside containers: the class-0 arm hands the box straight to the
+    # object fallback, which returns an owned str like every other arm.
+    none_inside_containers
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

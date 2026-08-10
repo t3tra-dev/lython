@@ -1529,6 +1529,23 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
   // layout (slot words (4+i, 9+i) hold physical value i), so every selected
   // function must take only rank-1 memrefs and share the hook's callee result
   // shape (no per-type special-casing).
+  // ⛔ Class 0 is not a class, it is the box's "no class" reading, and the
+  // arguments a dispatch entry gets are rebuilt from the box's handle words --
+  // slot word 4 is a POINTER to the entity. A box with no class has nothing
+  // there, so an entry for 0 receives a null and dereferences it:
+  //
+  //     print([None])        # SIGSEGV in LyObject_BoxedRepr, reading box[1]
+  //                          # off address 0
+  //
+  // `builtins.object`'s methods take the BOX rather than an entity behind it,
+  // which is why they alone break the reconstruction. The str hook already
+  // knew this and said it as a name -- "LyObject_BoxedStr must not join" --
+  // so the repr hook, which never had that line, drove straight into it. Said
+  // as the class id instead, both are covered and neither needs naming.
+  auto dispatchable = [](std::int64_t classId) { return classId != 0; };
+  // The class-0 candidate is not dropped, it is moved to the end: it takes the
+  // BOX, so it is the arm that can answer when nothing else does.
+  mlir::func::FuncOp objectFallback;
   auto conforms = [&](mlir::func::FuncOp function) {
     mlir::FunctionType type = function.getFunctionType();
     if (type.getNumResults() != calleeResultTypes.size() ||
@@ -1562,7 +1579,14 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     // Conformance decides before the id is consumed: a non-conforming
     // candidate (e.g. bool's primitive-i1 __repr__) must not shadow a
     // conforming boxed one for the same class.
-    if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
+    if (!classId || !conforms(function))
+      return;
+    if (!dispatchable(*classId)) {
+      if (!objectFallback && function.getFunctionType().getNumInputs() == 1)
+        objectFallback = function;
+      return;
+    }
+    if (!seenIds.insert(*classId).second)
       return;
     entries.push_back(HookEntry{*classId, function});
   });
@@ -1625,7 +1649,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
             RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
         if (!classId || !seenIds.insert(*classId).second)
           return;
-        entries.push_back(HookEntry{*classId, baseCallee});
+        if (dispatchable(*classId))
+          entries.push_back(HookEntry{*classId, baseCallee});
       });
     }
   }
@@ -1700,6 +1725,51 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       }
       mlir::func::CallOp call =
           mlir::func::CallOp::create(builder, loc, callee, operands);
+      llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
+                                                   call.getResults().end());
+      hitResults.push_back(
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1));
+      mlir::func::ReturnOp::create(builder, loc, hitResults);
+    }
+    check = next;
+  }
+  if (objectFallback) {
+    // ⭐ Class 0 answered by the box itself.
+    //
+    // Every other arm rebuilds its operand from the box's handle words, where
+    // slot word 4 points at the entity. A box with no class has no entity
+    // there, so that reconstruction hands a null to a function that reads it
+    // -- `print([None])` was a SIGSEGV inside `LyObject_BoxedRepr`. The
+    // `builtins.object` methods want the box, and the box is exactly what this
+    // hook was passed.
+    //
+    // ⛔ Class 0 only, not a universal fallback: `LyObject_BoxedRepr` calls
+    // this hook for any OTHER class id, so answering everything here would
+    // make the two call each other without end. An unmatched class still
+    // misses, which is what its caller's assert is for.
+    mlir::Block *handle = hook.addBlock();
+    mlir::Block *next = hook.addBlock();
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(check);
+      mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+      mlir::Value matches = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, classValue, zero);
+      mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
+                                     mlir::ValueRange{}, next,
+                                     mlir::ValueRange{});
+    }
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(handle);
+      auto boxType = mlir::cast<mlir::MemRefType>(
+          objectFallback.getFunctionType().getInput(0));
+      mlir::Value size = mlir::arith::ConstantIntOp::create(
+          builder, loc, boxType.getDimSize(0), 64);
+      mlir::Value box = RuntimeBundleLowerer::memrefFromBoxPointer(
+          builder, loc, hook.getArgument(0), size, boxType);
+      mlir::func::CallOp call =
+          mlir::func::CallOp::create(builder, loc, objectFallback, box);
       llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
                                                    call.getResults().end());
       hitResults.push_back(
@@ -1786,12 +1856,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
           [](mlir::func::FuncOp function) {
             auto method = function->getAttrOfType<mlir::StringAttr>(
                 contracts::kManifestMethodAttr);
-            if (!method || method.getValue() != "__str__")
-              return false;
-            // The object-level fallback itself must not join the dispatch
-            // (class 0 handles are the None/plain-object fallback path).
-            return mlir::SymbolTable::getSymbolName(function).getValue() !=
-                   "LyObject_BoxedStr";
+            return method && method.getValue() == "__str__";
           },
           {strHeader, strBytes}, /*shareExceptionSubclasses=*/false,
           /*sourceClassMethodName=*/"__str__")))
