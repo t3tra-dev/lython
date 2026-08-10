@@ -497,6 +497,9 @@ set(LYTHON_LEAK_GATE_CASES
     # retain restoring the caller's reference has to be matched by exactly one
     # release, and a golden cannot see the difference between one and none.
     exception_message_reused
+    # A dict value grown through the runtime tier: the append takes a
+    # reference for the slot it writes, and nothing else counts that slot.
+    dict_value_list_append
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

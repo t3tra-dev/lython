@@ -997,8 +997,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // slot (`rebindMutatedContainer`) and a field chain has a slot. Still refused
     // across a block boundary, where the values would not dominate the join.
     bool interiorViewWithoutEvidence =
-        !structuralMutation && receiver.fieldAliasOwner &&
-        !receiver.sequenceEvidenceBacked &&
+        !structuralMutation && !receiver.sequenceEvidenceBacked &&
         !RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
             op.getOperation(), receiver);
     if ((structuralMutation && !receiver.sequenceEvidenceBacked) ||
