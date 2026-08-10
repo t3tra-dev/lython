@@ -312,6 +312,25 @@ RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(py::CallOp op,
     }
   }
 
+  // ⭐ None renders statically: it has no lanes, so there is no receiver to
+  // hand a `__repr__`, and there is nothing to ask -- every None is "None".
+  //
+  //     print(None)   # types.NoneType runtime object has no physical header
+  //                   # value
+  //
+  // The diagnostic named the ABI rather than the answer, and `str(None)`
+  // already folds to the same four bytes, so this is that fold reached from
+  // print's conversion instead of from `str`.
+  if (printable.contractName() == "types.NoneType" &&
+      symbol.builtinSinkContract == "builtins.str") {
+    builder.setInsertionPoint(op);
+    RuntimeBundle rendered;
+    if (mlir::failed(
+            RuntimeBundleLowerer::materializeStringObject(op, "None", rendered)))
+      return mlir::failure();
+    printable = std::move(rendered);
+  }
+
   if (printable.contractName() != symbol.builtinSinkContract) {
     RuntimeBundle rendered;
     mlir::FailureOr<bool> sourceRepr =
