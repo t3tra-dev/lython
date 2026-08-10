@@ -354,6 +354,30 @@ bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
   return true;
 }
 
+// ⛔ KNOWN DEFECT: a container read out of another container keeps that other
+// one's description of it.
+//
+//     grid: list[list[int]] = [[1, 2], [3, 4]]
+//     grid[1][0] = 9
+//     print(grid)          # [[1, 2], [9, 4]] -- the write landed
+//     print(grid[1][0])    # 3                -- the read did not see it
+//
+// The store below updates the element evidence of the container it stores INTO
+// -- here the inner list. The outer list still holds the inner list's pre-store
+// description in `sequenceElementBundles`, and the next `grid[1]` is answered
+// from that. A FIELD receiver has a write-back for exactly this
+// (`fieldAliasOwner`, a few lines down); an element receiver has no such link.
+// Flat lists and dict values are unaffected -- they have no outer description
+// to go stale.
+//
+// Why NOT demote the outer container when the receiver came from a `GetItemOp`,
+// which is the shape the fix wants: tried twice and both leak. Clearing the
+// parent's element evidence loses 52 B, and so does copying the one element
+// that was read and clearing only its contents. `sequenceElementBundles` is
+// where the elements' references are BOOKED as well as described, so there is
+// no clearing that keeps the ledger. The repair has to be a write-back of the
+// post-store inner bundle into the parent's slot, the way the field path does
+// it, not a demotion.
 mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
       op.getOperation(), op.getContainer());
