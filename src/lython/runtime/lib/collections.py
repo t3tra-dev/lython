@@ -20,6 +20,11 @@ semantics:
   - == compares counts with missing keys treated as zero (CPython 3.10+)
   - total() sums the counts
 Deviations from CPython, pending language surface:
+  - keys()/values()/items() return LISTS, not views: `odict_keys([...])` has
+    no repr here and no live-view semantics, because no dict-view type exists
+    in this language surface at all -- `dict.keys()` is not a method either,
+    only a shape `len()` and `for` recognise. A view class would be a new
+    type, not a repair to this file.
   - keys are str only (typeshed's Counter is generic)
   - Counter()/update()/subtract() seed from a list of keys; the
     mapping/kwargs constructor forms are not provided

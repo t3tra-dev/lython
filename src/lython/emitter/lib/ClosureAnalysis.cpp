@@ -357,6 +357,20 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
     for (const std::string &capture : lexicalCaptureNames(*inner))
       readByNested.insert(capture);
   llvm::StringMap<unsigned> assignments;
+  // ⭐ A PARAMETER arrives already bound, so one assignment in the body is its
+  // SECOND binding. Counting only the body's missed it:
+  //
+  //     def make(n: int) -> Callable[[], int]:
+  //         def get() -> int: return n
+  //         n = n * 2
+  //         return get
+  //     print(make(5)())      # printed 5; CPython prints 10
+  {
+    llvm::StringSet<> parameters;
+    collectParameterNames(ast::node(callable, "args"), parameters);
+    for (const auto &entry : parameters)
+      ++assignments[entry.getKey()];
+  }
   if (const auto *body = ast::nodeList(callable, "body"))
     countNameAssignments(body, assignments);
   for (const auto &entry : readByNested)

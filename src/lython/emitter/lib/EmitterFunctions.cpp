@@ -364,8 +364,26 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
           logicalIndex >= entry->getNumArguments())
         break;
       llvm::StringRef name = ast::nameSpelling(*argument);
-      values[name] = Value{entry->getArgument(logicalIndex),
-                           sig.positionalTypes[logicalIndex]};
+      Value bound{entry->getArgument(logicalIndex),
+                  sig.positionalTypes[logicalIndex]};
+      // ⛔ KNOWN DEFECT: a boxed PARAMETER gets no cell, so a nested function
+      // reading a parameter the body then rebinds captures the entry value:
+      //
+      //     def make(n: int) -> None:
+      //         def get() -> int: return n
+      //         n = n * 2
+      //         print(get())      # printed 5; CPython prints 10
+      //
+      // The boxing predicate knows about it (`nonlocalBoxedNames` counts the
+      // parameter as a prior binding, so one assignment in the body is the
+      // second). Creating the cell HERE is the obvious repair and was
+      // measured: the cell is built, but the nested function then refers to it
+      // directly -- "'py.binding.ref' op using value defined outside the
+      // region" -- because the capture that routes a cell into a nested body
+      // is wired for a cell the BODY created, not one that exists at entry.
+      // The same shape with a local instead of a parameter works, which is
+      // where to look.
+      values[name] = bound;
       types.bindSymbol(name, sig.positionalTypes[logicalIndex]);
     }
     if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs")) {
