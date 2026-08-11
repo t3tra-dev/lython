@@ -708,6 +708,37 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   }
   if (target.kind == "Tuple" || target.kind == "List") {
     if (const auto *elts = ast::nodeList(target, "elts")) {
+      // ⭐ An unpacking target is answered element by element, so a target
+      // this walk cannot answer has to stop it. Both of these used to be
+      // SILENT:
+      //
+      //     a, *rest = [1, 2, 3, 4]     # rest kept its previous value
+      //     a, b = (1, 2, 3)            # printed 1 2; CPython raises
+      //
+      // A starred target has no index to read -- it takes however many are
+      // left -- so the loop below simply skipped it and whatever `rest` had
+      // been bound to before stayed. Where the name did not exist yet the
+      // program was refused, which is why this only ever showed up when the
+      // target was pre-declared.
+      for (const parser::NodePtr &elt : *elts)
+        if (elt && elt->kind == "Starred") {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, elt->range.start,
+              "starred assignment target is not supported: it takes a "
+              "statically unknown number of elements"});
+          return;
+        }
+      // ⛔ KNOWN DEFECT, deliberately not repaired here: the COUNT is not
+      // checked, so `a, b = (1, 2, 3)` prints 1 2 where CPython raises
+      // ValueError, and so do a list source and a str source. The obvious
+      // check does not fit: a tuple whose members share a type collapses to
+      // `tuple[int]` (TypeSystem.cpp, `uniform`), so the arity is not in the
+      // type for exactly the common case, and a list carries its length in
+      // the object rather than the type. Measured: a check on the type alone
+      // catches only heterogeneous tuples and fires wrongly on `a, b = (1, 2)`
+      // -- it took out two working programs before it caught anything. What
+      // this needs is a length check against the object, which is a runtime
+      // raise this walk has no way to emit.
       for (auto [index, elt] : llvm::enumerate(*elts)) {
         Value indexValue{py::IntConstantOp::create(
                              builder, loc(*elt),

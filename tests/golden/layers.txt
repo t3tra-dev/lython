@@ -85,3 +85,4 @@ errors/optional_unnarrowed_object_position lower
 errors/ownership_owned_temp_two_returns lower
 errors/type_object_call_via_value lower
 errors/len_takes_no_keyword_arguments emit
+errors/starred_assignment_target emit
