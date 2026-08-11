@@ -538,6 +538,8 @@ set(LYTHON_LEAK_GATE_CASES
     in_place_operators_and_loop_targets
     # The hash remap boxes one int; the domain message concatenates two strs.
     hash_sentinel_and_math_domain_text
+    # __post_init__ now runs for the subclass too, on an object it mutates.
+    inherited_post_init_and_cross_class_equality
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

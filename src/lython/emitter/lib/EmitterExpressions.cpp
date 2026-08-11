@@ -900,9 +900,30 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
         mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(lhs.type));
     auto rhsContract =
         mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(rhs.type));
+    // ⛔ ONLY when both sides carry the SYNTHESIZED dataclass `__eq__`. The
+    // fold reasoned that two distinct classes compare unequal because each
+    // has its own `__eq__` -- which says nothing about what that `__eq__`
+    // answers. Two shapes it got wrong:
+    //
+    //     class A(NamedTuple): v: int
+    //     class B(NamedTuple): v: int
+    //     print(A(1) == B(1))      # printed False; CPython prints True
+    //
+    //     class X:
+    //         def __eq__(self, o: object) -> bool: return True
+    //     class Y:
+    //         def __eq__(self, o: object) -> bool: return True
+    //     print(X() == Y())        # printed False; CPython prints True
+    //
+    // A NamedTuple's `__eq__` is tuple's and compares by contents across
+    // classes; a hand-written one answers whatever it likes. Only the
+    // synthesized dataclass comparison has the class guard the fold assumes,
+    // so only that one may be folded.
+    auto classGuardedEq = [&](py::ContractType contract) {
+      return classesWithClassGuardedEq.contains(contract.getContractName());
+    };
     if (lhsContract && rhsContract && lhsContract != rhsContract &&
-        lookupClassMethod(lhs.type, "__eq__") &&
-        lookupClassMethod(rhs.type, "__eq__"))
+        classGuardedEq(lhsContract) && classGuardedEq(rhsContract))
     {
       mlir::Value bit = mlir::arith::ConstantIntOp::create(
                             builder, loc(expr),

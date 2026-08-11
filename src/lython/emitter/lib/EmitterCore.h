@@ -268,6 +268,10 @@ private:
   parser::NodePtr enumMemberListNode(const EnumInfo &info,
                                      parser::SourceRange range) const;
   llvm::StringMap<EnumInfo> enumClasses;
+  // Classes whose `__eq__` is the SYNTHESIZED dataclass one, which answers
+  // False for any other class. Only those may have a cross-class comparison
+  // folded to a constant (EmitterExpressions.cpp).
+  llvm::StringSet<> classesWithClassGuardedEq;
 
   void emitStatements(const std::vector<parser::NodePtr> *statements,
                       bool skipDeclarations = false);

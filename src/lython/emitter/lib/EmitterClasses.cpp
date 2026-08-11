@@ -1629,10 +1629,24 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                 "' follows default argument in dataclass field order"});
       }
     }
+    // ⭐ Through the MRO, not the class's own dict. `@dataclass class C(B)`
+    // that declares nothing INHERITS B's `__post_init__`, and CPython's
+    // generated __init__ calls it (it tests hasattr on the instance). Asking
+    // only what this class declares dropped the call silently -- `C().a`
+    // printed the default instead of what __post_init__ set.
+    //
+    // The synthesis decisions above it read the same way: a subclass that
+    // inherits `__init__`/`__repr__`/`__eq__` should not have one synthesized
+    // over it either, which is what `dataclasses` does by checking the class
+    // dict of the class it is decorating... so those three stay OWN-DICT and
+    // only the hasattr-shaped question moves to the MRO.
     auto userDefines = [&](llvm::StringRef method) {
       auto ownMethods = classMethodBindings.find(contractName);
       return ownMethods != classMethodBindings.end() &&
              ownMethods->second.count(method);
+    };
+    auto inheritsOrDefines = [&](llvm::StringRef method) {
+      return resolveMroMethod(contractName, method).has_value();
     };
     parser::SourceRange range = classDef.range;
     auto registerSynthesized = [&](parser::NodePtr fn,
@@ -1698,7 +1712,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // Emitted as a call statement on the synthesized body so it goes through
       // the ordinary method dispatch, the way the field assignments above go
       // through ordinary assignment.
-      if (userDefines("__post_init__")) {
+      if (inheritsOrDefines("__post_init__")) {
         parser::NodePtr hook = parser::makeNode("Call", range);
         parser::addField(*hook, "func",
                          synthSelfAttr("self", "__post_init__", range));
@@ -1795,6 +1809,14 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                                            {std::move(returnNode)}, range),
                           std::move(sig));
     }
+    // A SYNTHESIZED dataclass `__eq__` compares only against its own class and
+    // answers False for any other -- which is what lets the comparison of two
+    // distinct classes fold to a constant. A NamedTuple's does not: it is
+    // tuple's, which compares by contents across classes. Recording which
+    // classes got the guarded one is what keeps that fold honest; a
+    // hand-written `__eq__` is not in the set and gets called.
+    if (dataclassEq && !userDefines("__eq__") && !isNamedTuple)
+      classesWithClassGuardedEq.insert(contractName);
     if (dataclassEq && !userDefines("__eq__")) {
       parser::NodePtr expr;
       llvm::SmallVector<parser::NodePtr, 8> comparisons;
