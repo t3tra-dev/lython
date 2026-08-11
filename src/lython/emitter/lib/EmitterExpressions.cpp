@@ -64,6 +64,19 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return {py::NoneOp::create(builder, builder.getUnknownLoc(), types.none())
                 .getResult(),
             types.none()};
+  // ⭐ A subexpression a desugaring must EMIT ONCE and reference twice. The
+  // AST has no spelling for an already-emitted value, so a rewrite that puts
+  // one subtree in two places -- `a[f()] += 1` becomes a load and a store of
+  // `a[f()]` -- ran its side effects twice and stored at the second index.
+  if (expr->kind == "LyValueRef") {
+    const parser::Field *slot = parser::findField(*expr, "slot");
+    if (slot && std::holds_alternative<std::int64_t>(slot->value)) {
+      auto index = static_cast<std::size_t>(std::get<std::int64_t>(slot->value));
+      if (index < pendingValueRefs.size())
+        return pendingValueRefs[index];
+    }
+    return emitNone(*expr);
+  }
   if (expr->kind == "Constant")
     return emitConstant(*expr);
   if (expr->kind == "Name") {

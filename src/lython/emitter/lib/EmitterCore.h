@@ -858,6 +858,10 @@ private:
     bool async = false;
   };
   llvm::SmallVector<PendingWithItem, 4> pendingWithItems;
+  // Values a desugaring emitted once and refers to through a synthesized
+  // `LyValueRef` node, so the two places that need the subexpression share
+  // one evaluation (EmitterExpressions.cpp).
+  llvm::SmallVector<Value, 4> pendingValueRefs;
   llvm::SmallVector<InlineReturnContext, 4> inlineReturnContexts;
   llvm::SmallVector<LoopControlContext, 4> loopControlContexts;
   // Innermost = the class method body currently being emitted (inline or

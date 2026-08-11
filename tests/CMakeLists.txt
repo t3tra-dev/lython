@@ -550,6 +550,8 @@ set(LYTHON_LEAK_GATE_CASES
     round_decimal_round_trip
     # Every argument is held live until the last one is rendered.
     print_evaluates_then_renders
+    # The shared subexpression is emitted once and released once.
+    augmented_assignment_evaluates_once
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

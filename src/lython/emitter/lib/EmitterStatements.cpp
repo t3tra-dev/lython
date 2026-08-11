@@ -1,4 +1,6 @@
 #include "EmitterCore.h"
+
+#include "llvm/ADT/ScopeExit.h"
 #include "EmitterOps.h" // IWYU pragma: keep
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -141,6 +143,74 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     parser::NodePtr target = sharedSubtree("target");
     parser::NodePtr op = sharedSubtree("op");
     parser::NodePtr rhs = sharedSubtree("value");
+    // ⭐ The target subtree is used TWICE below -- once as the left operand of
+    // the rewritten binary op and once as the store target -- so anything in
+    // it with a side effect ran twice, and the store landed wherever the
+    // SECOND evaluation pointed:
+    //
+    //     a: list[int] = [0, 0, 0]
+    //     a[f()] += 1        # f() called twice; stored [0, 0, 1]
+    //                        # CPython calls it once and stores [0, 1, 0]
+    //
+    // The receiver, the index and a slice's bounds are each emitted once here
+    // and referenced from both places through a `LyValueRef`. A Name target
+    // needs none of this -- re-reading a name has no effect -- which is why
+    // the defect only ever showed through a subscript or an attribute.
+    std::size_t valueRefStart = pendingValueRefs.size();
+    auto shareSubexpression = [&](parser::NodePtr &slotNode) {
+      if (!slotNode)
+        return;
+      Value evaluated = emitExpr(slotNode.get());
+      parser::NodePtr ref = parser::makeNode("LyValueRef", statement.range);
+      parser::addField(*ref, "slot",
+                       static_cast<std::int64_t>(pendingValueRefs.size()));
+      pendingValueRefs.push_back(evaluated);
+      slotNode = std::move(ref);
+    };
+    auto shareField = [&](parser::Node &node, llvm::StringRef name) {
+      parser::Field *field = parser::findField(node, name);
+      if (!field || !std::holds_alternative<parser::NodePtr>(field->value))
+        return;
+      parser::NodePtr child = std::get<parser::NodePtr>(field->value);
+      shareSubexpression(child);
+      field->value = std::move(child);
+    };
+    if (target && (target->kind == "Subscript" || target->kind == "Attribute")) {
+      parser::NodePtr shared = parser::makeNode(target->kind, target->range);
+      for (const parser::Field &field : target->fields)
+        parser::addField(*shared, field.name, field.value);
+      const parser::Node *targetSlice =
+          shared->kind == "Subscript" ? ast::node(*shared, "slice") : nullptr;
+      bool sliceTarget = targetSlice && targetSlice->kind == "Slice";
+      // ⛔ A SLICE target keeps its receiver as written. The slice-assignment
+      // path requires a named local -- it rebinds the local to the resized
+      // list -- and handing it a `LyValueRef` refuses the program outright.
+      // A slice receiver is re-read, which is a second evaluation this does
+      // not remove; the BOUNDS, which are where an index expression usually
+      // sits, are shared.
+      if (!sliceTarget)
+        shareField(*shared, "value");
+      if (shared->kind == "Subscript") {
+        const parser::Node *slice = ast::node(*shared, "slice");
+        if (slice && slice->kind == "Slice") {
+          parser::NodePtr sliceCopy =
+              parser::makeNode("Slice", slice->range);
+          for (const parser::Field &field : slice->fields)
+            parser::addField(*sliceCopy, field.name, field.value);
+          shareField(*sliceCopy, "lower");
+          shareField(*sliceCopy, "upper");
+          shareField(*sliceCopy, "step");
+          parser::Field *sliceField = parser::findField(*shared, "slice");
+          if (sliceField)
+            sliceField->value = std::move(sliceCopy);
+        } else {
+          shareField(*shared, "slice");
+        }
+      }
+      target = std::move(shared);
+    }
+    auto releaseValueRefs = llvm::make_scope_exit(
+        [&] { pendingValueRefs.resize(valueRefStart); });
     if (!target || !op || !rhs) {
       diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
                                                statement.range.start,
