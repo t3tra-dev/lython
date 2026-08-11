@@ -323,6 +323,7 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
 
     unsigned actualIndex = static_cast<unsigned>(actualSources.size());
     actualSources.push_back(source);
+    actualSourceValues.push_back(kwValues->aggregateOperands[index]);
     keywords.push_back(
         PlannedKeywordArgument{std::move(*keyword), actualIndex,
                                kwValues->aggregateOperands[index].getType()});
@@ -393,8 +394,12 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
     RuntimeBundle bundle;
     llvm::SmallVector<RuntimeValue, 8> values;
     llvm::SmallVector<std::string, 8> keys;
+    llvm::SmallVector<const RuntimeBundle *, 8> valueBundlesForKwargs;
+    llvm::SmallVector<mlir::Value, 8> valueSources;
     values.reserve(plan->kwargActuals.size());
     keys.reserve(plan->kwargActuals.size());
+    valueBundlesForKwargs.reserve(plan->kwargActuals.size());
+    valueSources.reserve(plan->kwargActuals.size());
     for (unsigned actualIndex : plan->kwargActuals) {
       auto keyword =
           llvm::find_if(keywords, [&](const PlannedKeywordArgument &candidate) {
@@ -410,10 +415,12 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
                << " must be a lowered object bundle";
       keys.push_back(keyword->name);
       values.push_back(actualSources[actualIndex]->objectValue);
+      valueBundlesForKwargs.push_back(actualSources[actualIndex]);
+      valueSources.push_back(actualSourceValues[actualIndex]);
     }
-    if (mlir::failed(materializeArityObject(op, kwargValueType,
-                                            plan->kwargActuals.size(), bundle,
-                                            values, keys)))
+    if (mlir::failed(materializeArityObject(
+            op, kwargValueType, plan->kwargActuals.size(), bundle, values, keys,
+            valueBundlesForKwargs, valueSources)))
       return mlir::failure();
     materializedDefaults.push_back(std::move(bundle));
     sources.push_back(&materializedDefaults.back());
@@ -700,16 +707,6 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
   // needs a real object no lane can stand in for. An object handed to a callee
   // has to describe itself; the lanes are a shortcut on top of that, not the
   // carrier.
-  if (keys.empty() && !elementBundles.empty()) {
-    llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> shared;
-    shared.reserve(elementBundles.size());
-    for (const RuntimeBundle *element : elementBundles)
-      shared.push_back(std::make_shared<RuntimeBundle>(*element));
-    bundle.sequenceElementBundles.append(shared.begin(), shared.end());
-    if (mlir::failed(RuntimeBundleLowerer::initializeSequencePayload(
-            op, bundle, shared, logicalSources)))
-      return mlir::failure();
-  }
   if (!keys.empty()) {
     if (keys.size() != elements.size())
       return op->emitError() << "mapping evidence key/value count mismatch for "
@@ -723,6 +720,47 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
     bundle.sequenceElements.clear();
     bundle.mappingCapacity =
         RuntimeBundleLowerer::collectionInitialCapacity(keys.size());
+  }
+  if (!elementBundles.empty()) {
+    llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> shared;
+    shared.reserve(elementBundles.size());
+    for (const RuntimeBundle *element : elementBundles)
+      shared.push_back(std::make_shared<RuntimeBundle>(*element));
+    if (keys.empty()) {
+      bundle.sequenceElementBundles.append(shared.begin(), shared.end());
+      if (mlir::failed(RuntimeBundleLowerer::initializeSequencePayload(
+              op, bundle, shared, logicalSources)))
+        return mlir::failure();
+    } else {
+      // The **kwargs instance. The keys are the keyword names, which exist
+      // only as C++ strings here, so they are materialized the way a dict
+      // literal's static keys are -- with no logical source, since nothing in
+      // the program produced them.
+      if (keys.size() != shared.size())
+        return op->emitError()
+               << "mapping payload key/value count mismatch for "
+               << contractName;
+      llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> keyBundles;
+      llvm::SmallVector<mlir::Value, 8> keySources;
+      keyBundles.reserve(keys.size());
+      keySources.reserve(keys.size());
+      builder.setInsertionPoint(op);
+      for (const std::string &key : keys) {
+        RuntimeBundle materialized;
+        if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(
+                op, key, materialized)))
+          return mlir::failure();
+        materialized.literalText = key;
+        keyBundles.push_back(
+            std::make_shared<RuntimeBundle>(std::move(materialized)));
+        keySources.push_back(mlir::Value{});
+      }
+      bundle.mappingKeyBundles.append(keyBundles.begin(), keyBundles.end());
+      bundle.mappingValueBundles.append(shared.begin(), shared.end());
+      if (mlir::failed(RuntimeBundleLowerer::initializeDictPayload(
+              op, bundle, keyBundles, shared, keySources, logicalSources)))
+        return mlir::failure();
+    }
   }
   return mlir::success();
 }
