@@ -1,0 +1,6 @@
+[Base()]
+[Overrides()]
+[Base()]
+[Base(), Base(), Overrides()]
+Base()
+stringy

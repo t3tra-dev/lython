@@ -115,6 +115,38 @@ RuntimeBundleLowerer::classMethodSymbol(py::ClassOp classOp,
     if (methodName && symbol && methodName.getValue() == name)
       return symbol.getValue().str();
   }
+  // ⭐ Then the bases, the way attribute lookup does.
+  //
+  //     class Base:
+  //         def __repr__(self) -> str: return "Base()"
+  //     class Kid(Base): pass
+  //     print([Kid()])
+  //
+  // aborted with "repr: boxed element has no conforming __repr__". `Kid`
+  // declares no methods of its own, so the boxed-method dispatch had no entry
+  // for its class id and the container's repr found nothing to call --
+  // `repr(Kid())` written directly was fine, because that path resolves
+  // through the emitter's MRO walk rather than through this one.
+  //
+  // The manifest's exception subclasses already had a rescue for the same gap
+  // (`shareExceptionSubclasses`, which hands them BaseException's callee);
+  // this is that rule for source classes, stated where the lookup happens
+  // instead of as a second special case at the call site.
+  auto baseNames = classOp->getAttrOfType<mlir::ArrayAttr>("base_names");
+  if (!baseNames)
+    return std::nullopt;
+  for (mlir::Attribute baseAttr : baseNames) {
+    auto baseName = mlir::dyn_cast<mlir::StringAttr>(baseAttr);
+    if (!baseName)
+      continue;
+    py::ClassOp base = RuntimeBundleLowerer::classForContract(
+        runtimeContractType(classOp->getContext(), baseName.getValue()));
+    if (!base || base == classOp)
+      continue;
+    if (std::optional<std::string> inherited =
+            RuntimeBundleLowerer::classMethodSymbol(base, name))
+      return inherited;
+  }
   return std::nullopt;
 }
 
