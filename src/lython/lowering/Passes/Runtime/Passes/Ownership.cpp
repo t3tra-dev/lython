@@ -2139,8 +2139,8 @@ bool borrowEdgeRetainIsSpellable(mlir::Value header,
 bool insertOwnedValueReleasesByLiveness(
     FuncContractCache &contracts, mlir::func::CallOp call,
     const own::ResourceGroup &group, own::AliasAnalysis &aliases,
-    const own::ReferenceMap &references,
-    bool ownsReference) {
+    const own::ReferenceMap &references, bool ownsReference,
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
   static bool consumeIsDeathDisabled = [] {
     auto value = llvm::sys::Process::GetEnv(
         "LYTHON_ABLATE_CONSUME_IS_DEATH_CALL_RESULTS");
@@ -2149,7 +2149,8 @@ bool insertOwnedValueReleasesByLiveness(
   return releaseOwnedGroupByLiveness(contracts, call.getOperation(),
                                      call->getBlock(), call.getLoc(), group,
                                      aliases, references, ownsReference,
-                                     /*consumeIsDeath=*/!consumeIsDeathDisabled);
+                                     /*consumeIsDeath=*/!consumeIsDeathDisabled,
+                                     deallocators);
 }
 
 // If `terminator` forwards every value of `group` to arguments of a single
@@ -2803,7 +2804,8 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
 
     if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases,
                                            references,
-                                           /*ownsReference=*/true)) {
+                                           /*ownsReference=*/true,
+                                           deallocators)) {
       tracePlacement("liveness", call, group);
       continue;
     }

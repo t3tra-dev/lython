@@ -528,6 +528,8 @@ set(LYTHON_LEAK_GATE_CASES
     with_statement_on_a_python_class
     # The **kwargs dict retains its keys and its values.
     kwarg_dict_holds_its_arguments
+    # A loop element released on the edges the early return does not take.
+    return_from_inside_a_loop
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
