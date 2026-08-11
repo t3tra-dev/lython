@@ -256,8 +256,13 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
 
   llvm::SmallVector<mlir::Type, 8> positionalTypes;
   llvm::SmallVector<const RuntimeBundle *, 8> actualSources;
+  // The SSA value each actual came from, parallel to `actualSources`. Null for
+  // an element taken out of a starred operand, which has no operand of its own
+  // -- the same convention `lowerPack` uses for a key it minted itself.
+  llvm::SmallVector<mlir::Value, 8> actualSourceValues;
   positionalTypes.reserve(posargs->aggregateOperands.size());
   actualSources.reserve(posargs->aggregateOperands.size());
+  actualSourceValues.reserve(posargs->aggregateOperands.size());
   for (auto [index, operand] : llvm::enumerate(posargs->aggregateOperands)) {
     const RuntimeBundle *source = RuntimeBundleLowerer::bundleFor(operand);
     if (!source)
@@ -281,11 +286,13 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
             RuntimeBundle::object(element.contract, element.values));
         positionalTypes.push_back(element.contract);
         actualSources.push_back(&materializedDefaults.back());
+        actualSourceValues.push_back(mlir::Value{});
       }
       continue;
     }
     positionalTypes.push_back(operand.getType());
     actualSources.push_back(source);
+    actualSourceValues.push_back(operand);
   }
 
   const RuntimeBundle *kwNames =
@@ -355,7 +362,11 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
                             << " has no vararg runtime value type";
     RuntimeBundle bundle;
     llvm::SmallVector<RuntimeValue, 8> elements;
+    llvm::SmallVector<const RuntimeBundle *, 8> elementBundles;
+    llvm::SmallVector<mlir::Value, 8> elementSources;
     elements.reserve(plan->varargActuals.size());
+    elementBundles.reserve(plan->varargActuals.size());
+    elementSources.reserve(plan->varargActuals.size());
     for (unsigned actualIndex : plan->varargActuals) {
       if (actualIndex >= actualSources.size() ||
           actualSources[actualIndex]->kind != RuntimeBundle::Kind::Object)
@@ -363,9 +374,12 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
                << "*args source for function target " << targetName
                << " must be a lowered object bundle";
       elements.push_back(actualSources[actualIndex]->objectValue);
+      elementBundles.push_back(actualSources[actualIndex]);
+      elementSources.push_back(actualSourceValues[actualIndex]);
     }
     if (mlir::failed(materializeArityObject(
-            op, varargValueType, plan->varargActuals.size(), bundle, elements)))
+            op, varargValueType, plan->varargActuals.size(), bundle, elements,
+            /*keys=*/{}, elementBundles, elementSources)))
       return mlir::failure();
     materializedDefaults.push_back(std::move(bundle));
     sources.push_back(&materializedDefaults.back());
@@ -604,7 +618,9 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultArgument(
 mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
     mlir::Operation *op, mlir::Type contract, std::uint64_t arity,
     RuntimeBundle &bundle, mlir::ArrayRef<RuntimeValue> elements,
-    llvm::ArrayRef<std::string> keys) {
+    llvm::ArrayRef<std::string> keys,
+    llvm::ArrayRef<const RuntimeBundle *> elementBundles,
+    llvm::ArrayRef<mlir::Value> logicalSources) {
   std::string contractName = runtimeContractName(contract);
   if (contractName.empty())
     return op->emitError() << "variadic callable aggregate has no concrete "
@@ -662,6 +678,38 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeArityObject(
       RuntimeBundleLowerer::collectionInitialCapacity(arity);
   bundle.sequenceElements.append(elements.begin(), elements.end());
   bundle.mappingKeys.append(keys.begin(), keys.end());
+  // ⭐ The object exists now and is EMPTY -- `__new__` takes an arity and
+  // nothing else. Until this store the elements lived only in the bundle's
+  // evidence, and the hidden per-element lanes of the aggregate evidence ABI
+  // were the only way a callee could reach them. That ABI is established only
+  // when the callee SUBSCRIPTS the tuple or forwards it (CallableAggregate.cpp
+  // scans for exactly those two), so every other consumer read uninitialized
+  // memory:
+  //
+  //     def f(*args: int) -> None:
+  //         for a in args:
+  //             print(a)
+  //     f(1, 2)          # printed nothing, or garbage, or aborted in Ly_IncRef
+  //
+  // `len(args)` was right the whole time, which is what made this look like a
+  // partial feature rather than a wrong answer -- the length is the one thing
+  // `__new__` was told.
+  //
+  // ⛔ Do NOT repair this by widening the scan in CallableAggregate.cpp. The
+  // consumers to enumerate are every operation on a tuple, and `print(args)`
+  // needs a real object no lane can stand in for. An object handed to a callee
+  // has to describe itself; the lanes are a shortcut on top of that, not the
+  // carrier.
+  if (keys.empty() && !elementBundles.empty()) {
+    llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> shared;
+    shared.reserve(elementBundles.size());
+    for (const RuntimeBundle *element : elementBundles)
+      shared.push_back(std::make_shared<RuntimeBundle>(*element));
+    bundle.sequenceElementBundles.append(shared.begin(), shared.end());
+    if (mlir::failed(RuntimeBundleLowerer::initializeSequencePayload(
+            op, bundle, shared, logicalSources)))
+      return mlir::failure();
+  }
   if (!keys.empty()) {
     if (keys.size() != elements.size())
       return op->emitError() << "mapping evidence key/value count mismatch for "

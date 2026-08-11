@@ -522,6 +522,8 @@ set(LYTHON_LEAK_GATE_CASES
     # An element read out of a container is an alias; both records book the
     # same object's reference.
     mutable_element_read_out_of_a_container
+    # The *args tuple now retains what it holds; it has to release it too.
+    vararg_tuple_holds_its_arguments
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

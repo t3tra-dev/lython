@@ -1324,7 +1324,10 @@ private:
   materializeArityObject(mlir::Operation *op, mlir::Type contract,
                          std::uint64_t arity, RuntimeBundle &bundle,
                          mlir::ArrayRef<RuntimeValue> elements = {},
-                         llvm::ArrayRef<std::string> keys = {});
+                         llvm::ArrayRef<std::string> keys = {},
+                         llvm::ArrayRef<const RuntimeBundle *> elementBundles =
+                             {},
+                         llvm::ArrayRef<mlir::Value> logicalSources = {});
   std::optional<std::string> keywordNameFromValue(mlir::Value value) const;
   mlir::LogicalResult lowerReceiverMethodResult(
       mlir::Operation *op, mlir::Value receiverValue, mlir::Value resultValue,
