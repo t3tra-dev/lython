@@ -437,6 +437,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
 
   builder.setInsertionPoint(op);
   mlir::Value raw;
+  // ⛔ KNOWN DEFECT: this reads the fast lane's WORD without asking its VALID
+  // flag, and an invalid word is whatever the speculative computation left
+  // behind. Two silent wrong answers come out of it:
+  //
+  //     def f(a: int) -> int: return a + 1
+  //     C: int = 0
+  //     for i in range(3, 4):
+  //         C = f(i)
+  //     print(C)                              # printed 1; CPython prints 4
+  //
+  //     a: int = 9223372036854775807 + 1
+  //     print(a)      # printed the wrapped negative; CPython prints the bignum
+  //
+  // `primitiveI64LaneKnownValid` is the question every other reader of this
+  // lane asks, and asking it here is one line -- but it sends the store down
+  // the unbox path below, and THAT does not build: the boxed value the unbox
+  // reads then "reaches function exit without release", which stops the
+  // runtime library's own stackguard_support from compiling. Measured, twice:
+  // pinning the boxed value's liveness at the store
+  // (`pinProbeOperandLiveness`) does not move it either.
+  //
+  // So the repair is not here. Whoever takes it should start with why the
+  // release placement cannot find a death point for a value whose only use is
+  // an unbox immediately before a store.
   if (value->primitiveI64 && value->primitiveI64->value) {
     raw = value->primitiveI64->value;
   } else {
