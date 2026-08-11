@@ -92,6 +92,35 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
       valueBundles[op.getCallable()] = std::move(demoted);
       callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
     }
+    // ⛔ KNOWN DEFECT reached from here, and the largest wrong-answer cluster
+    // left in the audit corpus (21 probes):
+    //
+    //     a: list[int] = [1]
+    //     holder: list[list[int]] = [a]
+    //     holder[0].append(2)
+    //     a.append(3)
+    //     print(a)      # printed [1, 3, None]; CPython prints [1, 2, 3]
+    //
+    // A container ABSORBED into another object's slot has two records of its
+    // contents -- the holder's copy and the source binding's own -- and they
+    // disagree about where the end of the list is. The append through the
+    // holder's element takes the runtime arm below and writes at the LOADED
+    // length; the later append through `a` takes the evidence arm and writes
+    // at the compile-time element count. One overwrites the other and leaves a
+    // hole, which repr then walks ("boxed element has no conforming
+    // __repr__", SIGABRT).
+    //
+    // The obvious general repair -- a post-dispatch hook in `lowerPyOp`
+    // symmetric with `demoteCrossBlockContainerOperandEvidence`, dropping the
+    // contents evidence of whatever an op put INTO a slot -- was written and
+    // MEASURED THREE WAYS: over pack/setitem/attrset (146 tests down), over
+    // container packs only (145), and over container packs whose source
+    // survives the absorption (145, and it still leaves one probe wrong). It
+    // aborts at runtime, so the source's evidence is load-bearing for
+    // something past the absorption, not merely stale.
+    //
+    // The next attempt should find out WHAT reads it after the pack rather
+    // than another place to drop it.
     // A list reached outside the storage's defining block is already in
     // runtime mode by the time any lowering runs -- the dispatch demotes it
     // (`demoteCrossBlockContainerOperandEvidence`). This is where the list
