@@ -1104,6 +1104,26 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       return std::nullopt;
     };
     bool allConverted = true;
+    // ⛔ KNOWN DEFECT: a multi-argument print whose arguments include one that
+    // SPLITS its block does not compile.
+    //
+    //     print(sum(xs), 1)
+    //     print("a", [x for x in [1, 2]])
+    //     print(min(ys), 1)
+    //
+    // all fail with "operation with block successors must terminate its parent
+    // block", emitted from this stage. A reducer or comprehension lowers to a
+    // loop, so the block this join is being written into stops being the
+    // current block partway through. Each of these prints correctly on its
+    // own, which is what makes it read as a multi-argument problem.
+    //
+    // Why NOT hoist every `stringify` above the joins, which is the obvious
+    // ordering fix: measured, and the three still fail the same way. The
+    // conversion itself is not what lands in the wrong block -- the pieces are
+    // produced fine -- so the stale insertion point is inside `stringify`'s
+    // own emission, not between the calls. Whoever takes this should start by
+    // re-establishing the builder's insertion point after each argument rather
+    // than by reordering the loop.
     Value joined;
     for (auto [index, argument] : llvm::enumerate(*printArgs)) {
       std::optional<Value> piece = stringify(argument.get());
