@@ -168,6 +168,12 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     static constexpr InPlaceRewrite kInPlaceRewrites[] = {
         {"BitOr", "builtins.dict", "update"},
         {"Add", "builtins.list", "extend"},
+        // set's four, which were missing and silently rebound a fresh set:
+        // `a |= {9}` left every alias of `a` holding the old one.
+        {"BitOr", "builtins.set", "update"},
+        {"Sub", "builtins.set", "difference_update"},
+        {"BitAnd", "builtins.set", "intersection_update"},
+        {"BitXor", "builtins.set", "symmetric_difference_update"},
     };
     llvm::StringRef inPlaceMethod;
     for (const InPlaceRewrite &rewrite : kInPlaceRewrites)
@@ -189,6 +195,51 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           parser::makeNode("Expr", statement.range);
       parser::addField(*updateStatement, "value", std::move(updateCall));
       emitStatement(*updateStatement);
+      return;
+    }
+    // ⭐ A user class that defines the IN-PLACE dunder gets it. CPython tries
+    // `__iadd__` before `__add__` and REBINDS the result, so a class defining
+    // both silently ran the wrong one:
+    //
+    //     class M:
+    //         def __add__(self, o): return M(1)
+    //         def __iadd__(self, o): return M(2)
+    //     x = M(0); x += M(0)
+    //     print(x.v)      # printed 1; CPython prints 2
+    //
+    // The table above is the same rule for the manifest containers, whose
+    // in-place dunder is spelled as a named method; this is the source-class
+    // half, and both end in "call it, then bind the target".
+    static constexpr struct {
+        llvm::StringRef opKind;
+        llvm::StringRef method;
+    } kInPlaceDunders[] = {
+        {"Add", "__iadd__"},       {"Sub", "__isub__"},
+        {"Mult", "__imul__"},      {"Div", "__itruediv__"},
+        {"FloorDiv", "__ifloordiv__"}, {"Mod", "__imod__"},
+        {"Pow", "__ipow__"},       {"LShift", "__ilshift__"},
+        {"RShift", "__irshift__"}, {"BitAnd", "__iand__"},
+        {"BitOr", "__ior__"},      {"BitXor", "__ixor__"},
+        {"MatMult", "__imatmul__"},
+    };
+    for (const auto &entry : kInPlaceDunders) {
+      if (op->kind != entry.opKind)
+        continue;
+      mlir::Type targetType = types.inferExpr(target.get());
+      std::optional<MethodBinding> inPlace =
+          lookupClassMethod(targetType, entry.method);
+      if (!inPlace || !inPlace->method)
+        break;
+      parser::NodePtr attribute =
+          parser::makeNode("Attribute", statement.range);
+      parser::addField(*attribute, "value", target);
+      parser::addField(*attribute, "attr", std::string(entry.method));
+      parser::NodePtr call = parser::makeNode("Call", statement.range);
+      parser::addField(*call, "func", std::move(attribute));
+      parser::addField(*call, "args", std::vector<parser::NodePtr>{rhs});
+      parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+      Value updated = emitExpr(call.get());
+      emitAssignTarget(*target, updated);
       return;
     }
     parser::NodePtr binop = parser::makeNode("BinOp", statement.range);
@@ -516,6 +567,31 @@ void ModuleEmitter::emitSliceMutation(const parser::Node &target,
 void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   if (target.kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(target);
+    // ⭐ `global X` where X is not a global this walk can WRITE. Only
+    // storage-backed (annotated int) module globals get a cell, so a
+    // container global fell through to the local binding below and the write
+    // was a silent no-op:
+    //
+    //     X: list[int] = [1]
+    //     def f() -> None:
+    //         global X
+    //         X = [2]
+    //     f(); print(X)      # printed [1]; CPython prints [2]
+    //
+    // Refused rather than made to work: the cell a container global would
+    // need does not exist, and the declaration is an explicit statement that
+    // this assignment is not a local one -- so binding a local is the one
+    // answer it cannot have.
+    if (!atModuleScope && currentGlobalDecls.count(name) &&
+        !moduleGlobals.count(name)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, target.range.start,
+          "'global " + name.str() +
+              "' names a module global this compiler does not give storage "
+              "to, so the assignment cannot reach it; only an annotated "
+              "int-typed module global is writable from a function"});
+      return;
+    }
     if (isModuleGlobalWrite(name)) {
       mlir::Type type = moduleGlobals.lookup(name);
       Value coerced = coerceValue(value, type, target);

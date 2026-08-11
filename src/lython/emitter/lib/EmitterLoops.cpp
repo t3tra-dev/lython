@@ -93,6 +93,15 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     llvm::SmallVectorImpl<mlir::Value> &initialValues) {
   llvm::StringSet<> assignedInBody;
   collectAssignedNames(ast::nodeList(statement, "body"), assignedInBody);
+  // ⭐ The loop TARGET is rebound once per iteration too, and CPython leaves
+  // it bound after the loop. It is not a body statement, so this scan never
+  // saw it and the post-loop read got the pre-loop value (`i = -1; for i in
+  // range(1): pass; print(i)` printed -1 where CPython prints 0). A name the
+  // loop introduces is filtered out below by not being in `values` yet, which
+  // is the right answer for it as well: with zero iterations CPython has
+  // nothing bound there either.
+  if (const parser::Node *target = ast::node(statement, "target"))
+    collectAssignedNameTargets(target, assignedInBody);
   // A walrus in a while condition rebinds per iteration exactly like a body
   // assignment (the field is absent on for/async-for statements).
   if (const parser::Node *test = ast::node(statement, "test"))
@@ -498,11 +507,25 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   // release the replaced header value on the back-edge to keep ownership
   // balanced. Combining carried locals with break/continue is not yet
   // supported (break/continue would need to forward the carried values too).
+  // ⭐ A for target that ALREADY EXISTS is a loop-carried local like any
+  // other. CPython leaves the target bound after the loop; excluding every
+  // target name from the carried set left the post-loop read seeing the
+  // pre-loop value:
+  //
+  //     i = -1
+  //     for i in range(1):
+  //         pass
+  //     print(i)      # printed -1; CPython prints 0
+  //
+  // A name the loop INTRODUCES stays excluded: with zero iterations CPython
+  // has nothing bound there either (NameError), and this walk has no value to
+  // carry, so the post-loop read keeps its present refusal rather than
+  // inventing one.
   llvm::StringSet<> targetNames;
-  collectAssignedNameTargets(ast::node(statement, "target"), targetNames);
   llvm::SmallVector<mlir::Value, 4> carriedInitial;
   llvm::SmallVector<CarriedLoopLocal, 4> carried =
-      collectCarriedLoopLocals(statement, &targetNames, carriedInitial);
+      collectCarriedLoopLocals(statement, /*excludedNames=*/nullptr,
+                               carriedInitial);
 
   Value iterable = emitExpr(ast::node(statement, "iter"));
   CallInferenceResult iterInference =

@@ -1199,6 +1199,19 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     // own emission, not between the calls. Whoever takes this should start by
     // re-establishing the builder's insertion point after each argument rather
     // than by reordering the loop.
+    // ⛔ KNOWN DEFECT, second one in this loop: the arguments are RENDERED as
+    // they are evaluated, so a mutation performed by a later argument is
+    // invisible to an earlier one's rendering.
+    //
+    //     a: list[int] = [1, 2]
+    //     print(a, a.pop())      # printed [1, 2] 2; CPython prints [1] 2
+    //
+    // CPython evaluates every argument first and calls str() on each
+    // afterwards, so the earlier argument renders the list the pop already
+    // shortened. Fixing it means splitting `stringify` into "evaluate" and
+    // "render", which the arms above cannot do as written: three of them
+    // choose the renderer from the argument's STATIC type before emitting it,
+    // and one of them emits speculatively and rewinds.
     Value joined;
     for (auto [index, argument] : llvm::enumerate(*printArgs)) {
       std::optional<Value> piece = stringify(argument.get());

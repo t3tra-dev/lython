@@ -534,6 +534,8 @@ set(LYTHON_LEAK_GATE_CASES
     mutate_a_parameter_then_return_it
     # The container's reference and the returned one are two, not one.
     store_into_a_container_then_return_it
+    # In-place set ops mutate one object; the loop target outlives the loop.
+    in_place_operators_and_loop_targets
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
