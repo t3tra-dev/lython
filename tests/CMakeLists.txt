@@ -532,6 +532,8 @@ set(LYTHON_LEAK_GATE_CASES
     return_from_inside_a_loop
     # A retain on the entry edge of a loop-carried merge, released once.
     mutate_a_parameter_then_return_it
+    # The container's reference and the returned one are two, not one.
+    store_into_a_container_then_return_it
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

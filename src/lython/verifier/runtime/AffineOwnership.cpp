@@ -426,6 +426,12 @@ struct AffinePathState {
   // this walk needs the retain to justify the reader's later release; dropping it
   // refused 39 golden cases that compile today.
   llvm::SmallVector<std::int64_t, 2> slotParents;
+  // Of `retained`, the ones a slot-absorption retain parked in a container
+  // whose identity this walk could not name. They belong to the holder, so the
+  // owned-return rule must not read them as tokens the return failed to spend
+  // -- the named ones are already out of `retained` and in `slotParents`.
+  // Last on purpose: the positional aggregate initializers above stay valid.
+  unsigned parkedUnnamed = 0;
 };
 
 struct BorrowedEntryResource {
@@ -465,6 +471,7 @@ bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
   own::reportEntityRootParity("samePathState", lhs.group, rhs.group);
   return lhs.block == rhs.block && lhs.start == rhs.start &&
          lhs.token == rhs.token && lhs.retained == rhs.retained &&
+         lhs.parkedUnnamed == rhs.parkedUnnamed &&
          lhs.borrowed == rhs.borrowed &&
          lhs.exceptional == rhs.exceptional &&
          lhs.slotParents == rhs.slotParents &&
@@ -501,7 +508,7 @@ std::size_t dedupBucket(llvm::hash_code code) {
 std::size_t pathStateDedupKey(const AffinePathState &state) {
   llvm::hash_code code = llvm::hash_combine(
       state.block, state.start, static_cast<int>(state.token), state.retained,
-      state.borrowed, state.exceptional,
+      state.parkedUnnamed, state.borrowed, state.exceptional,
       llvm::hash_combine_range(state.slotParents.begin(),
                                state.slotParents.end()));
   // Hashing the whole lane list would break the equal-implies-same-hash
@@ -1307,6 +1314,18 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
   AffineTokenState token = AffineTokenState::Owned;
   unsigned retained = 0;
+  // Of those, the ones PARKED IN A CONTAINER by a slot-absorption retain. They
+  // keep the object alive exactly like a plain retain -- so every rule that
+  // asks "is anything still holding this" keeps counting them -- but they
+  // belong to the holder, not to this frame, so the owned-return rule below
+  // must not read them as tokens the return failed to spend. The CFG walk
+  // splits the same two pools (`slotParents` vs `retained`); this walk had one.
+  // A retain that hands the token to a container rather than to this frame.
+  auto slotAbsorption = [](mlir::func::CallOp call) {
+    return call->hasAttr(own::kAggregateRetainAttr) &&
+           !isBlockArgMergeBorrowRetain(call);
+  };
+  unsigned parked = 0;
   llvm::SmallVector<mlir::Value, 4> group = resource.values;
   for (mlir::Operation *op : users) {
     if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
@@ -1321,11 +1340,24 @@ verifyStraightLineResource(FuncContractCache &contracts,
                  << " result " << resource.resultOffset
                  << " reaches function exit without release, transfer, or "
                     "owned return";
-        if (retained != 0)
+        // ⭐ Storing a value into a container and returning the same value is
+        // balanced: the container holds its own reference and the return
+        // transfers the frame's.
+        //
+        //     def f(n: int, memo: dict[int, int]) -> int:
+        //         v = n * 2
+        //         memo[n] = v
+        //         return v
+        //
+        // was refused -- "returned with 1 additional retained ownership
+        // token" -- because the slot's retain was counted against the return.
+        // A memoized fib is the shape this was found on.
+        if (retained > parked)
           return ret.emitError()
                  << "owned resource from " << resource.producerLabel
                  << " result " << resource.resultOffset << " is returned with "
-                 << retained << " additional retained ownership token(s)";
+                 << (retained - parked)
+                 << " additional retained ownership token(s)";
         return mlir::success();
       }
       if (uses) {
@@ -1364,6 +1396,8 @@ verifyStraightLineResource(FuncContractCache &contracts,
                    << " is released or transferred more than once on one CFG "
                       "path";
           --retained;
+          if (parked > retained)
+            parked = retained;
           continue;
         }
         if ((groupContainsOperand(op, group, aliases) ||
@@ -1373,8 +1407,11 @@ verifyStraightLineResource(FuncContractCache &contracts,
                  << "released owned resource from " << resource.producerLabel
                  << " is used after release (by call to '" << call.getCallee()
                  << "')";
-        if (retains)
+        if (retains) {
           ++retained;
+          if (slotAbsorption(call))
+            ++parked;
+        }
         continue;
       }
 
@@ -1388,8 +1425,11 @@ verifyStraightLineResource(FuncContractCache &contracts,
         }
         token = AffineTokenState::Released;
       }
-      if (token == AffineTokenState::Owned && retains)
+      if (token == AffineTokenState::Owned && retains) {
         ++retained;
+        if (slotAbsorption(call))
+          ++parked;
+      }
       continue;
     }
 
@@ -2255,9 +2295,11 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     // Why that order: a plain retain has no other discharge on this path, while
     // a parked one still has the holder's release ahead of it.
     auto spendOutstanding = [&state] {
-      if (state.retained > 0)
+      if (state.retained > 0) {
         --state.retained;
-      else if (!state.slotParents.empty())
+        if (state.parkedUnnamed > state.retained)
+          state.parkedUnnamed = state.retained;
+      } else if (!state.slotParents.empty())
         state.slotParents.pop_back();
     };
     // ⚠️ THIS EXIT IS NOT A SAFE-SIDE FAILURE, and reading it as one cost a day
@@ -2359,11 +2401,25 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                    << " result " << resource.resultOffset
                    << " reaches function exit without release, transfer, or "
                       "owned return";
-          if (state.retained != 0)
+          // ⭐ `parkedUnnamed`, not zero: storing a value into a container
+          // and returning the same value is balanced -- the container holds
+          // its own reference and the return transfers the frame's.
+          //
+          //     def f(n: int, memo: dict[int, int]) -> int:
+          //         v = n * 2
+          //         memo[n] = v
+          //         return v
+          //
+          // A memoized fib is the shape this was found on. The named parked
+          // tokens never reach `retained`; only the ones whose holder this
+          // walk could not name fall through to it, and those are the ones
+          // subtracted here.
+          if (state.retained > state.parkedUnnamed)
             return ret.emitError()
                    << "owned resource from " << resource.producerLabel
                    << " result " << resource.resultOffset
-                   << " is returned with " << state.retained
+                   << " is returned with "
+                   << (state.retained - state.parkedUnnamed)
                    << " additional retained ownership token(s)";
           break;
         }
@@ -2425,6 +2481,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               // the container that holds them is unaffected by a union-tag
               // branch on the element.
               next.slotParents = state.slotParents;
+              next.parkedUnnamed = state.parkedUnnamed;
               worklist.push_back(std::move(next));
             }
             op = nullptr;
@@ -2596,9 +2653,11 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         bool slotAbsorptionRetain = retains &&
                                     call->hasAttr(own::kAggregateRetainAttr) &&
                                     !isBlockArgMergeBorrowRetain(call);
+        bool parkedWithoutAName = false;
         if (slotAbsorptionRetain) {
           slotParent = walk.slotRetainParent(call);
           slotAbsorptionRetain = slotParent.has_value();
+          parkedWithoutAName = !slotAbsorptionRetain;
         }
         // The DISCHARGE. Checked for every call, not only ones mentioning the
         // tracked group: the container's release names the CONTAINER, and a
@@ -2733,8 +2792,15 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             if (!llvm::is_contained(state.slotParents, *slotParent))
               state.slotParents.push_back(*slotParent);
           }
-          else
+          else {
             ++state.retained;
+            // Parked in a holder this walk cannot name. It stays in
+            // `retained` -- it really does keep the object alive, and every
+            // rule that asks that question must keep seeing it -- but it is
+            // the holder's, so the owned-return rule subtracts it.
+            if (parkedWithoutAName)
+              ++state.parkedUnnamed;
+          }
         }
         const OwnershipWalkCache::RaiseFacts &raise = walk.raiseFacts(call);
         if (raise.raiseLike) {
@@ -2929,6 +2995,9 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       // group/stale/previous/views they need no rename across the edge: the
       // container is the same allocation on both sides of it.
       next.slotParents = std::move(nextSlotParents);
+      // Same reasoning as slotParents: the holder is the same allocation on
+      // both sides of the edge, so the charge crosses it unrenamed.
+      next.parkedUnnamed = std::min(state.parkedUnnamed, nextRetained);
       next.trail = state.trail;
       worklist.push_back(std::move(next));
     }
