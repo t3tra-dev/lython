@@ -376,6 +376,32 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   // ⭐ Already owned by this frame: borrow the existing token, take no second
   // reference. See `existingOwnedLocalToken` for why a second one leaks.
   //
+  // ⛔ KNOWN DEFECT, and this is the predicate that decides it. The marker
+  // says the frame owns the element; it does NOT say the frame still owns it.
+  // A literal that MOVED its token into a container leaves the marker behind,
+  // so a later read borrows a token the container now owns:
+  //
+  //     def f() -> list[int]:
+  //         xs: list[list[int]] = [[1, 2]]
+  //         return xs[0]      # "released owned resource ... is used by
+  //                           #  function return"
+  //
+  // Returning an element of a container built in the SAME frame is the whole
+  // shape; a parameter (`def f(xs): return xs[0]`) is fine, and so is an int
+  // or a str element, which have no token to move. It is the read side of the
+  // same accounting the `initializeSequencePayload` note describes from the
+  // write side ("three releases for two references") -- the same *args and
+  // **kwargs shapes (`return args[0]`, `return kwargs["a"]`) land here too.
+  //
+  // Four repairs measured, none right. The three in that note, plus: clearing
+  // `kOwnedLocalObjectAttr` from the marker at the move, so this predicate
+  // stops seeing a token the frame gave away. Measured -- the refusal did not
+  // move AND two goldens broke (enum_desugar, cross_enum_generic_handler), so
+  // the marker is load-bearing for something past the move as well.
+  //
+  // The next attempt still needs what that note asks for: WHICH bundle the
+  // later mint reads. Suppressing a release is not it.
+  //
   // The value may already BE the token rather than have one beside it, which is
   // the cheaper question and so the one asked first (`valueIsOwnedLocalToken`).
   if (valueIsOwnedLocalToken(value, contract))
