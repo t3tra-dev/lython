@@ -540,6 +540,8 @@ set(LYTHON_LEAK_GATE_CASES
     hash_sentinel_and_math_domain_text
     # __post_init__ now runs for the subclass too, on an object it mutates.
     inherited_post_init_and_cross_class_equality
+    # A boxed cell per captured local, released once.
+    closure_sees_later_writes_and_dynamic_index
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

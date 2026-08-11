@@ -261,6 +261,57 @@ lexicalCaptureNames(const parser::Node &callable) {
   return captures;
 }
 
+namespace {
+// How many times each name is ASSIGNED directly in this statement list,
+// counting only bindings of the enclosing scope itself -- a nested function's
+// own assignments bind its own locals.
+void countNameAssignments(const std::vector<parser::NodePtr> *statements,
+                          llvm::StringMap<unsigned> &counts);
+
+void countNameAssignments(const parser::Node *node,
+                          llvm::StringMap<unsigned> &counts) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  if (node->kind == "Assign" || node->kind == "AnnAssign" ||
+      node->kind == "AugAssign" || node->kind == "NamedExpr") {
+    llvm::StringSet<> targets;
+    if (const parser::Node *target = ast::node(*node, "target"))
+      collectTargetNames(target, targets);
+    if (const auto *targetList = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targetList)
+        collectTargetNames(target.get(), targets);
+    for (const auto &entry : targets)
+      ++counts[entry.getKey()];
+  }
+  if (node->kind == "For" || node->kind == "AsyncFor")
+    if (const parser::Node *target = ast::node(*node, "target")) {
+      llvm::StringSet<> targets;
+      collectTargetNames(target, targets);
+      // A loop target is rebound every trip, which is more than once.
+      for (const auto &entry : targets)
+        counts[entry.getKey()] += 2;
+    }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value))
+      countNameAssignments(child->get(), counts);
+    else if (const auto *children =
+                 std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      countNameAssignments(children, counts);
+  }
+}
+
+void countNameAssignments(const std::vector<parser::NodePtr> *statements,
+                          llvm::StringMap<unsigned> &counts) {
+  if (!statements)
+    return;
+  for (const parser::NodePtr &statement : *statements)
+    countNameAssignments(statement.get(), counts);
+}
+} // namespace
+
 llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
   llvm::StringSet<> locals;
   collectFunctionLocalNames(callable, locals);
@@ -283,6 +334,34 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
   llvm::StringSet<> boxed;
   for (const auto &entry : needed)
     if (locals.contains(entry.getKey()))
+      boxed.insert(entry.getKey());
+
+  // ⭐ A name a nested function READS is a cell in CPython too, not just one
+  // it declares `nonlocal`. Capturing it by value at the def site made the
+  // enclosing scope's later writes invisible:
+  //
+  //     def run() -> None:
+  //         n: int = 1
+  //         def show() -> None:
+  //             print(n)
+  //         n = 2
+  //         show()      # printed 1; CPython prints 2
+  //
+  // Boxed only when the enclosing scope assigns it MORE THAN ONCE: with a
+  // single binding the cell and the copy hold the same thing forever, and
+  // boxing every captured name would put a cell behind every read-only
+  // capture in the program.
+  llvm::SmallVector<const parser::Node *, 4> readers = nested;
+  llvm::StringSet<> readByNested;
+  for (const parser::Node *inner : readers)
+    for (const std::string &capture : lexicalCaptureNames(*inner))
+      readByNested.insert(capture);
+  llvm::StringMap<unsigned> assignments;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    countNameAssignments(body, assignments);
+  for (const auto &entry : readByNested)
+    if (locals.contains(entry.getKey()) &&
+        assignments.lookup(entry.getKey()) > 1)
       boxed.insert(entry.getKey());
   return boxed;
 }

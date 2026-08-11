@@ -1494,6 +1494,9 @@ private:
   mlir::OpBuilder builder;
   RuntimeManifestIndex manifest;
   llvm::DenseMap<mlir::Value, RuntimeBundle> valueBundles;
+  // Contracts whose runtime layout is being expanded right now. A layout that
+  // re-enters itself has no finite expansion (CallableABI.cpp).
+  mutable llvm::DenseSet<mlir::Type> expandingContracts;
   llvm::DenseMap<mlir::Value, mlir::Operation *> ownedLocalObjectMarkers;
   llvm::StringMap<ReturnedValueSummary> returnedValueSummaries;
   llvm::StringMap<ReturnedCallableSummary> returnedCallableSummaries;

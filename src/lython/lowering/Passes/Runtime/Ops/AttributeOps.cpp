@@ -1221,6 +1221,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   if (mlir::failed(header))
     return mlir::failure();
 
+  // Every sibling lowering in this file sets the insertion point first; this
+  // one did not, so it emitted wherever the builder happened to point. When
+  // the test is the FIRST py op in its function there is nowhere sensible,
+  // and the operands came out detached: `def f(a: A) -> bool: return
+  // isinstance(a, B)` failed with "operation's operand is unlinked".
+  builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
   mlir::Value storage = *header;
   mlir::Type dynamicHeaderType =

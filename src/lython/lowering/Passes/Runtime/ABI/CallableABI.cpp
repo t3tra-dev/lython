@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "llvm/ADT/ScopeExit.h"
+
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace py::lowering {
@@ -171,6 +173,21 @@ RuntimeBundleLowerer::classFieldContractTypes(py::ClassOp classOp) const {
 mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
 RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
                                            llvm::StringRef purpose) const {
+  // ⭐ A layout cannot contain itself. A union-typed field stays INLINE (see
+  // `classFieldStoredBoxed`), so a class reachable from its own field through
+  // one -- `nxt: Optional["Node"]`, the shape every linked structure is
+  // written in -- expanded forever and the COMPILER died with SIGILL and not
+  // one byte of diagnostic. A crash with no message is the worst answer a
+  // compiler can give, so the cycle is reported where it is entered.
+  //
+  // `nxt: "Node"` is boxed and works, which is what the message points at.
+  if (!expandingContracts.insert(type).second)
+    return op->emitError()
+           << "class layout for " << type
+           << " contains itself through a union-typed field, which is stored "
+              "inline and so has no finite layout; give the field the class "
+              "type itself (stored as a reference) instead of a union with it";
+  auto expanding = llvm::make_scope_exit([&] { expandingContracts.erase(type); });
   if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
     llvm::SmallVector<mlir::Type, 8> types{mlir::IntegerType::get(context, 64)};
     for (mlir::Type member : unionType.getMemberTypes()) {

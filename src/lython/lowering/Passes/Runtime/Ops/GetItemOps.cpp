@@ -927,11 +927,6 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
   if (!container.sequenceIndices.empty())
     return false;
 
-  std::optional<RuntimeSymbol> unbox =
-      manifest.primitive(index.contractName(), "unbox.i64");
-  if (!unbox)
-    return false;
-
   builder.setInsertionPoint(op);
   std::optional<RuntimeSymbol> lenMethod =
       manifest.method(container.contractName(), "__len__");
@@ -954,17 +949,21 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
     return mlir::failure();
   }
 
-  mlir::func::CallOp indexCall = RuntimeBundleLowerer::createRuntimeCall(
-      op.getLoc(), *unbox, index.physicalValues());
-  if (indexCall.getNumResults() != 1 ||
-      !indexCall.getResult(0).getType().isInteger(64)) {
-    unbox->function.emitError()
-        << "index unbox.i64 primitive must return one i64";
+  // ⭐ Through the shared reader, not a second call to the unbox primitive.
+  // This site called it with the index bundle's physical values whatever they
+  // were, and an index whose lanes do not match the primitive's arity crashed
+  // the compiler -- `i: int = 0; print([1][i])` failed with "'func.call' op
+  // incorrect number of operands for callee". `rawSequenceIndexValue` is the
+  // same question three other sites already ask, and it answers a literal and
+  // a primitive-i64 lane before reaching for the primitive at all.
+  mlir::FailureOr<mlir::Value> dynamicIndex =
+      RuntimeBundleLowerer::rawSequenceIndexValue(op.getOperation(),
+                                                  op.getIndex(), index);
+  if (mlir::failed(dynamicIndex))
     return mlir::failure();
-  }
 
   mlir::Location loc = op.getLoc();
-  mlir::Value rawRuntimeIndex = indexCall.getResult(0);
+  mlir::Value rawRuntimeIndex = *dynamicIndex;
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   mlir::Value runtimeSize = lenCall.getResult(0);
   mlir::Value isNegative = mlir::arith::CmpIOp::create(
