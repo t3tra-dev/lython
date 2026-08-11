@@ -1509,6 +1509,24 @@ bool releaseOwnedGroupByLiveness(
           // What it lacks is any record that some predecessors hand it two
           // references and others one, which has to be written down when the
           // unfold retains rather than inferred from placement afterwards.
+          //
+          // Eighth attempt did exactly that: mark the forwarding terminator
+          // when the unfold retains, and have the destination group emit a
+          // second discharge for edges carrying the mark. Both placements for
+          // that discharge fail the same way -- before the branch, and at the
+          // destination block's entry -- with "used after release" on the
+          // ORIGINAL producer rather than on any value this pass introduced.
+          //
+          // Which is the finding: the retained reference and the lent one are
+          // the same SSA value, so any release written for one is a release of
+          // the other. Recording the count on the edge does not separate them,
+          // because the count was never the missing information -- the two
+          // references are indistinguishable at every point a release could go.
+          // Separating them needs the retained value to be a distinct SSA
+          // value that survives the edge, which is a change to what the
+          // terminator carries (a second operand, a second block argument),
+          // not to where a release is placed. Every attempt so far has been
+          // the latter.
           return true;
         }
     }
