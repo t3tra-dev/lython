@@ -79,6 +79,38 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         }
       }
     }
+    // ⭐ A store into a declared field knows what type it wants, so the value
+    // is emitted against it.
+    //
+    //     class Acc:
+    //         xs: list[int]
+    //         def __init__(self) -> None:
+    //             self.xs = []
+    //
+    //     attribute value 'list[object]' is not assignable to field
+    //     'list[int]'
+    //
+    // An empty literal has nothing to infer an element type from and comes out
+    // as `list[object]`. Writing the annotation inline (`self.xs: list[int] =
+    // []`) already works, because AnnAssign passes its annotation down as the
+    // expected type -- this is the same expectation, read from the field the
+    // target names instead of from an annotation beside it. Same for `{}` into
+    // a declared `dict[K, V]`.
+    if (!emittedWithContext && rhs) {
+      if (const auto *targets = ast::nodeList(statement, "targets"))
+        if (targets->size() == 1 && targets->front() &&
+            targets->front()->kind == "Attribute")
+          if (const parser::Node *object =
+                  ast::node(*targets->front(), "value"))
+            if (auto attr = ast::string(*targets->front(), "attr")) {
+              mlir::Type objectType = types.inferExpr(object);
+              if (std::optional<mlir::Type> fieldType =
+                      lookupClassField(objectType, *attr)) {
+                value = emitExprExpected(rhs, *fieldType);
+                emittedWithContext = true;
+              }
+            }
+    }
     if (!emittedWithContext)
       value = emitExpr(rhs);
     if (const auto *targets = ast::nodeList(statement, "targets"))
