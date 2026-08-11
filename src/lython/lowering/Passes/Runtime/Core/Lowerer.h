@@ -830,20 +830,17 @@ private:
   mlir::LogicalResult generateBoxedLtHook();
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
-  // True when the mutation op sits in a different block than the one defining
-  // the container's physical storage (SpecialMethodOps.cpp).
-  static bool
-  mutationCrossesStorageDefiningBlock(mlir::Operation *op,
-                                      const RuntimeBundle &bundle);
-  // Drops a dict's compile-time mapping evidence before a mutation emitted
-  // outside the storage's defining block (SpecialMethodOps.cpp).
-  bool demoteDictEvidenceForCrossBlockMutation(mlir::Operation *op,
-                                               mlir::Value containerValue);
-  // List instance of the same rule: drops a list's compile-time sequence
-  // evidence before a mutation emitted outside the storage's defining block
-  // (SpecialMethodOps.cpp).
-  bool demoteListEvidenceForCrossBlockMutation(mlir::Operation *op,
-                                               mlir::Value containerValue);
+  // True when `op` sits in a different block than the one defining the
+  // container's physical storage (SpecialMethodOps.cpp).
+  static bool crossesStorageDefiningBlock(mlir::Operation *op,
+                                          const RuntimeBundle &bundle);
+  // Drops a mutable container's compile-time contents evidence at an op the
+  // walk cannot answer from it, and mirrors the drop into a field-alias
+  // owner's cache (SpecialMethodOps.cpp).
+  bool demoteCrossBlockContainerEvidence(mlir::Operation *op,
+                                         mlir::Value containerValue);
+  // Applies the rule above to every operand of `op` (SpecialMethodOps.cpp).
+  void demoteCrossBlockContainerOperandEvidence(mlir::Operation *op);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
   //
   // Suspension lane ABI (rfc/stdlib-semantics.md R3): a lane is one logical

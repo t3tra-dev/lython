@@ -269,11 +269,11 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::rawSequenceIndexValue(
          << " has no statically unboxable integer value";
 }
 
-// True when `op` mutates a container whose physical storage was defined in a
-// DIFFERENT block. Evidence recorded at such a mutation names SSA values that
-// join-dominated uses cannot reference, and a merge keeps only one
-// predecessor's version — so the evidence tier is unusable there.
-bool RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
+// True when `op` sits in a DIFFERENT block than the one defining the
+// container's physical storage. Evidence recorded in the defining block names
+// SSA values that join-dominated uses cannot reference, and a merge keeps only
+// one predecessor's version — so the evidence tier is unusable there.
+bool RuntimeBundleLowerer::crossesStorageDefiningBlock(
     mlir::Operation *op, const RuntimeBundle &bundle) {
   if (bundle.physicalValues().empty())
     return false;
@@ -287,71 +287,79 @@ bool RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
   return defBlock && defBlock != op->getBlock();
 }
 
-// Compile-time dict evidence may only be extended in the block that defines
-// the dict's storage: an evidence update inside a branch would record
-// payload SSA values that later (join-dominated) uses cannot reference.
-// Demoting to runtime-mode keeps the physical payload authoritative — the
-// same truth the evidence mirrored — so conditional mutations lower through
-// the runtime probes instead.
-bool RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
+// Compile-time contents evidence describes a mutable container AS OF THE BLOCK
+// THAT DEFINES ITS STORAGE, so it may only be consulted there. The physical
+// payload stays authoritative everywhere else — the same truth the evidence
+// mirrored — and every other block reads and writes through it.
+//
+// ⭐ This used to fire at MUTATIONS only, one variant per container kind, and
+// the walk's own order made that unsound. A read is lowered before a store
+// that appears after it in the block, and a back edge makes that store run
+// FIRST:
+//
+//     xs: list[int] = [0]
+//     for i in range(4):
+//         xs[0] += 1
+//     print(xs[0])      # printed 1; CPython prints 4
+//
+// Every iteration answered `xs[0]` from the literal's element map and stored
+// `0 + 1`; the stores could not see each other. Demoting at the store was too
+// late for the read in the same iteration. `d["a"] += "x"` accumulated one
+// character for the same reason, and with a computed index the retain and the
+// release landed on different objects -- a string reached count zero while
+// still referenced and the next retain aborted with "Ly_IncRef observed
+// non-positive refcount".
+//
+// Asking instead where the op IS makes the answer independent of walk order,
+// so a back edge cannot smuggle a mutation past a read. It also removes the
+// need to know which ops mutate: the two callers that did know disagreed
+// (the dict variant never mirrored a field alias), and any op the enumeration
+// missed was a silent wrong answer rather than a slower one.
+//
+// Only a mutable container, and only one whose payload exists: a tuple's
+// contents cannot change, and for an evidence-only container the evidence is
+// the sole description of its contents, so dropping it would lose them.
+//
+// ⛔ Why NOT writeBackFieldAlias for the field-alias mirror: the writeback
+// re-roots the owner's owned-local marker at this op, and a root created
+// inside a branch is itself the non-dominating value this demotion removes.
+bool RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(
     mlir::Operation *op, mlir::Value containerValue) {
   RuntimeBundle *bundle = nullptr;
   if (auto found = valueBundles.find(containerValue);
       found != valueBundles.end())
     bundle = &found->second;
   if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
-      bundle->contractName() != "builtins.dict" ||
-      !RuntimeBundleLowerer::containerHasRuntimePayload(*bundle) ||
-      (!bundle->mappingEvidenceBacked && bundle->mappingKeys.empty()))
+      !RuntimeBundleLowerer::isMutableContainerContractName(
+          bundle->contractName()) ||
+      !RuntimeBundleLowerer::containerHasRuntimePayload(*bundle))
     return false;
-  if (!RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(op, *bundle))
+  bool describesContents =
+      bundle->sequenceEvidenceBacked || !bundle->sequenceElements.empty() ||
+      bundle->mappingEvidenceBacked || !bundle->mappingKeys.empty();
+  if (!describesContents)
     return false;
-  bundle->mappingEvidenceBacked = false;
-  bundle->mappingKeys.clear();
-  bundle->mappingKeyBundles.clear();
-  bundle->mappingValues.clear();
-  bundle->mappingValueBundles.clear();
-  bundle->mappingPresent.clear();
-  return true;
-}
-
-// List instance of the dict rule above. The demotion is mirrored into the
-// field-alias owner's fieldBundles entry (when the list is a field view) by
-// direct map update, NOT through writeBackFieldAlias: the writeback re-roots
-// the owner's owned-local marker at this op, and a root created inside the
-// branch would itself be the non-dominating value this demotion removes.
-bool RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
-    mlir::Operation *op, mlir::Value containerValue) {
-  RuntimeBundle *bundle = nullptr;
-  if (auto found = valueBundles.find(containerValue);
-      found != valueBundles.end())
-    bundle = &found->second;
-  if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
-      bundle->contractName() != "builtins.list" ||
-      !RuntimeBundleLowerer::containerHasRuntimePayload(*bundle) ||
-      (!bundle->sequenceEvidenceBacked && bundle->sequenceElements.empty()))
+  if (!RuntimeBundleLowerer::crossesStorageDefiningBlock(op, *bundle))
     return false;
-  if (!RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(op, *bundle))
-    return false;
-  bundle->sequenceEvidenceBacked = false;
-  bundle->sequenceElements.clear();
-  bundle->sequenceElementBundles.clear();
-  bundle->sequenceIndices.clear();
+  RuntimeBundleLowerer::demoteMutableContainerEvidence(*bundle);
   if (bundle->fieldAliasOwner && !bundle->fieldAliasName.empty()) {
     if (auto owner = valueBundles.find(bundle->fieldAliasOwner);
         owner != valueBundles.end()) {
       auto entry = owner->second.fieldBundles.find(bundle->fieldAliasName);
       if (entry != owner->second.fieldBundles.end() && entry->second) {
         auto demoted = std::make_shared<RuntimeBundle>(*entry->second);
-        demoted->sequenceEvidenceBacked = false;
-        demoted->sequenceElements.clear();
-        demoted->sequenceElementBundles.clear();
-        demoted->sequenceIndices.clear();
+        RuntimeBundleLowerer::demoteMutableContainerEvidence(*demoted);
         entry->second = std::move(demoted);
       }
     }
   }
   return true;
+}
+
+void RuntimeBundleLowerer::demoteCrossBlockContainerOperandEvidence(
+    mlir::Operation *op) {
+  for (mlir::Value operand : op->getOperands())
+    RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(op, operand);
 }
 
 // ⛔ KNOWN DEFECT: a container read out of another container keeps that other
@@ -451,10 +459,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
     outer = read.getContainer();
     RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(outer);
   }
-  RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
-      op.getOperation(), op.getContainer());
-  RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
-      op.getOperation(), op.getContainer());
+  RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(op.getOperation(),
+                                                          op.getContainer());
   llvm::SmallVector<mlir::Value, 3> inputs{op.getContainer(), op.getIndex(),
                                            op.getValue()};
   llvm::SmallVector<const RuntimeBundle *, 3> sources;
@@ -797,10 +803,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
-  RuntimeBundleLowerer::demoteDictEvidenceForCrossBlockMutation(
-      op.getOperation(), op.getContainer());
-  RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
-      op.getOperation(), op.getContainer());
+  RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(op.getOperation(),
+                                                          op.getContainer());
   llvm::SmallVector<mlir::Value, 2> inputs{op.getContainer(), op.getIndex()};
   llvm::SmallVector<const RuntimeBundle *, 2> sources;
   if (mlir::failed(collectObjectSources(

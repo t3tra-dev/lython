@@ -772,33 +772,18 @@ mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::selectEvidenceObjectMiss(
 mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
     py::GetItemOp op, const RuntimeBundle &container,
     const RuntimeBundle &index) {
-  // ⛔ KNOWN DEFECT: this answers a read from evidence that describes the
-  // container as of its DEFINITION, so a store in another block is invisible
-  // to a later read.
+  // This answers a read from evidence that describes the container as of its
+  // DEFINITION. That is sound only where the walk has seen every store, which
+  // for a mutable container is the block defining its storage and nowhere
+  // else -- `demoteCrossBlockContainerEvidence` has already emptied the
+  // element map by the time this runs anywhere else, so the check below is
+  // what declines the read.
   //
-  //     xs: list[int] = [0]
-  //     for i in range(4):
-  //         xs[0] += 1
-  //     print(xs[0])      # prints 1; CPython prints 4
-  //
-  // Every iteration computes `0 + 1` and stores it; the stores cannot see each
-  // other. `while` behaves the same, `list[str]` accumulates one character,
-  // and with two slots and a computed index the retain and release land on
-  // different objects -- a string reaches count zero while still referenced
-  // and the next retain aborts with "Ly_IncRef observed non-positive
-  // refcount". Spelling it `v = xs[0]; xs[0] = v + 1` is correct by accident:
-  // the local makes the emitter thread the list through a block argument,
-  // which puts this evidence out of reach. A list returned from a function is
-  // correct for the same reason -- no evidence for that SSA value.
-  //
-  // Why NOT gate this on `mutationCrossesStorageDefiningBlock`, the existing
-  // spelling of "the walk no longer sees every mutation in order" that the
-  // append path already consults: measured, and the read then has nowhere to
-  // go -- "runtime manifest has no builtins.list.__getitem__ method". Unlike
-  // append, which has a runtime arm to fall back to, the evidence IS the only
-  // read path for a list element. So the repair is not a gate here; either the
-  // manifest grows the accessor this would need, or the evidence has to be
-  // invalidated at the back edge by whoever owns the container's bundle.
+  // ⛔ Do not restore the gate that was tried here instead. Returning false
+  // from this function leaves the bundle still claiming to be evidence-backed,
+  // and the read then has nowhere to go -- "runtime manifest has no
+  // builtins.list.__getitem__ method". The invalidation has to happen to the
+  // BUNDLE, which is why it lives with the container and not with the read.
   if (container.sequenceElements.empty())
     return false;
 

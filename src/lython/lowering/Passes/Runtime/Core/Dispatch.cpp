@@ -6,6 +6,13 @@
 namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
+  // Before anything reads a bundle: a mutable container's contents evidence
+  // describes it as of the block that defines its storage, so outside that
+  // block the physical payload is the only authority. Doing this here rather
+  // than at the ops that mutate is what makes it independent of walk order --
+  // a store after a read in the block still runs before it across a back edge
+  // (`demoteCrossBlockContainerEvidence` in SpecialMethodOps.cpp).
+  RuntimeBundleLowerer::demoteCrossBlockContainerOperandEvidence(op);
   return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(op)
       .Case<py::ClassOp>([&](auto classOp) {
         erase.push_back(classOp.getOperation());

@@ -92,21 +92,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
       valueBundles[op.getCallable()] = std::move(demoted);
       callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
     }
-    // A list mutator reached outside the storage's defining block would
-    // record evidence (payload boxes, element values) that join-dominated
-    // uses cannot reference — and the merge would keep only the first
-    // predecessor's evidence, silently mis-executing the other arm. Demote
-    // to runtime mode first so the mutation lowers through the physical
-    // payload, which both arms share.
-    if (methodName == "append" || methodName == "insert" ||
-        methodName == "remove" || methodName == "pop" ||
-        methodName == "sort" || methodName == "reverse" ||
-        methodName == "extend" || methodName == "clear" ||
-        methodName == "__setslice__" || methodName == "__delslice__") {
-      if (RuntimeBundleLowerer::demoteListEvidenceForCrossBlockMutation(
-              op.getOperation(), op.getCallable()))
-        callable = RuntimeBundleLowerer::bundleFor(op.getCallable());
-    }
+    // A list reached outside the storage's defining block is already in
+    // runtime mode by the time any lowering runs -- the dispatch demotes it
+    // (`demoteCrossBlockContainerOperandEvidence`). This is where the list
+    // half of that rule used to live, as a list of the ten method names that
+    // mutate; the enumeration is gone because being wrong about it was a
+    // silent wrong answer, not a missed optimisation.
     // Same rule for evidence-backed lists meeting a mutator with no
     // evidence tier: the payload is authoritative after the mutation.
     if (callable->kind == RuntimeBundle::Kind::Object &&
@@ -1023,7 +1014,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     bool interiorViewWithoutEvidence =
         !structuralMutation &&
         (!receiver.sequenceEvidenceBacked || receiverIsContainerElement) &&
-        !RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
+        !RuntimeBundleLowerer::crossesStorageDefiningBlock(
             op.getOperation(), receiver);
     if ((structuralMutation && !receiver.sequenceEvidenceBacked) ||
         interiorViewWithoutEvidence) {
@@ -1132,7 +1123,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // the join. Rebinding is not available either (no `ly.structural_mutation`
     // local to reassign), so reject loudly rather than mis-execute. A
     // same-block field mutation is unaffected and keeps the evidence path.
-    if (RuntimeBundleLowerer::mutationCrossesStorageDefiningBlock(
+    if (RuntimeBundleLowerer::crossesStorageDefiningBlock(
             op.getOperation(), receiver))
       return op.emitError()
              << "list." << methodName
