@@ -2208,6 +2208,31 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
   initial.views = resource.views;
   worklist.push_back(std::move(initial));
 
+  // ⛔ KNOWN DEFECT reached through this cap, and the cap is the symptom rather
+  // than the cause. A CONDITIONAL REBIND together with an APPEND in the same
+  // loop grows `retained` by one per explored trip, so no state ever repeats
+  // and the walk runs to the cap instead of converging:
+  //
+  //     xs = [3, 1, 4]
+  //     best = xs[0]
+  //     out: list[int] = []
+  //     for v in xs:
+  //         if v > best:
+  //             best = v
+  //         out.append(v)      # cap fires at retained=2858
+  //
+  // Reduced both ways: drop the `if` and it compiles, drop the append and it
+  // compiles, and the count is the same (2858, 2859) whether the list has one
+  // element or three -- so this is a runaway walk, not a size the cap is too
+  // small for. It is the conditional-rebind family: the retained reference and
+  // the lent one are ONE SSA value, so no release can discharge one without
+  // discharging the other, and each trip adds an obligation the walk cannot
+  // spend. Separating them needs the terminator to carry a second operand.
+  //
+  // Reporting it as an exploration limit is the honest thing this walk can say
+  // today -- it does not know the difference between "too big" and "diverging"
+  // -- but a reader arriving here from the message should know it is the
+  // second one.
   constexpr unsigned kMaxAffineStates = 20000;
   while (!worklist.empty()) {
     AffinePathState state = worklist.pop_back_val();
