@@ -38,6 +38,27 @@ def closure_reads_a_single_binding() -> None:
     show()
 
 
+def closure_over_a_rebound_parameter(n: int) -> None:
+    # A parameter arrives already bound, so the assignment path -- which makes
+    # a cell on a name's FIRST binding -- never made one for it, and the
+    # nested function captured the entry value.
+    def get() -> int:
+        return n
+
+    n = n * 2
+    print(get())
+    n = n + 1
+    print(get())
+
+
+def returns_a_closure_over_a_parameter(n: int) -> int:
+    def get() -> int:
+        return n
+
+    n = n * 3
+    return get()
+
+
 def counter() -> None:
     n = 0
 
@@ -66,6 +87,8 @@ def main() -> None:
     closure_sees_later_write()
     closure_reads_a_single_binding()
     counter()
+    closure_over_a_rebound_parameter(5)
+    print(returns_a_closure_over_a_parameter(2))
     print(runtime_isinstance(B()), runtime_isinstance(A()))
     dynamic_index()
 

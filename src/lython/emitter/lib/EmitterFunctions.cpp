@@ -435,6 +435,31 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   }
 
   builder.setInsertionPointToStart(entry);
+  // ⭐ A boxed PARAMETER gets its cell HERE, where the builder is finally
+  // inside the entry block. The assignment path creates a cell on a name's
+  // FIRST binding and a parameter is already bound when the body starts, so
+  // without this a nested function reading a parameter the body then rebinds
+  // captured the entry value:
+  //
+  //     def make(n: int) -> None:
+  //         def get() -> int: return n
+  //         n = n * 2
+  //         print(get())      # printed 5; CPython prints 10
+  //
+  // ⛔ NOT at the parameter-binding loop above, which is where it belongs by
+  // subject: the builder is not in this function's body yet there, so the
+  // cell's ops were emitted at module scope reading the entry block argument
+  // -- "'py.binding.ref' op using value defined outside the region".
+  for (const auto &boxed : currentBoxedLocals) {
+    auto bound = values.find(boxed.getKey());
+    if (bound == values.end())
+      continue;
+    if (!mlir::isa<mlir::BlockArgument>(bound->second.value))
+      continue;
+    Value cell = emitCellAlloc(callable, bound->second);
+    values[boxed.getKey()] = cell;
+    types.bindSymbol(boxed.getKey(), cellContentType(cell.type));
+  }
   if (preboundTypeObjectName && preboundTypeObject) {
     mlir::Type classType = types.typeObject(preboundTypeObject);
     auto typeObject = py::TypeObjectOp::create(builder, loc(callable),
