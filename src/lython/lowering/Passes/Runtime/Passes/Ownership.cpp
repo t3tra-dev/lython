@@ -1491,6 +1491,24 @@ bool releaseOwnedGroupByLiveness(
           // what actually conflict, and that is the knot to cut next: the edge
           // needs one name for its borrow accounting and another for the
           // second reference, and today there is only one value to name.
+          //
+          // The seventh attempt cut exactly there -- marker for the second
+          // reference, terminator left naming the original -- and it fails
+          // with the SAME diagnostic as the sixth. So the conflict is not
+          // about which operand the branch carries. The new group's release
+          // lands at its last use inside the block, which precedes the branch
+          // either way, so the merge argument is fed a value whose count that
+          // release has already dropped. Any resource rooted in the loop body
+          // has this shape: its death is computed within the block, and the
+          // block is not where a loop-carried reference dies.
+          //
+          // That rules out attempts one through seven as a family -- every one
+          // of them places or re-places a discharge somewhere in the body. The
+          // only group whose liveness spans the back edge is the merge
+          // argument's own, and it already gets a release for the lent half.
+          // What it lacks is any record that some predecessors hand it two
+          // references and others one, which has to be written down when the
+          // unfold retains rather than inferred from placement afterwards.
           return true;
         }
     }
