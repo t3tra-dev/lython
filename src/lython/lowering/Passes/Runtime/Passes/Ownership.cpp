@@ -1456,6 +1456,22 @@ bool releaseOwnedGroupByLiveness(
           // group. The repair is a second GROUP for the unfolded reference,
           // tracked and released on its own, not a second release for this
           // one.
+          //
+          // Fifth attempt, at the other end: mark the forwarding block
+          // CONSUMED in the scan above, so the ordinary liveness placement
+          // puts a release after the last read. Traced to confirm it runs --
+          // the branch is recognised as forwarding -- and the leak is
+          // unchanged at 81 B, because `consumedBlocks` records where a
+          // group's ONE token dies and the block already had that mark from
+          // the consume itself. Marking it twice adds nothing.
+          //
+          // Every attempt so far has tried to make one group account for two
+          // references. It cannot: the group's death set, its release
+          // placement and its `ownsReference` label are all single-token
+          // notions. The unfolded reference needs to enter
+          // `collectOwnedLocalObjectGroups` (or the equivalent) as a resource
+          // of its own, with the retain as its producer -- then the existing
+          // machinery places its release without any of this special-casing.
           return true;
         }
     }
