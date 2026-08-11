@@ -437,54 +437,48 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
 
   builder.setInsertionPoint(op);
   mlir::Value raw;
-  // ⛔ KNOWN DEFECT: this reads the fast lane's WORD without asking its VALID
-  // flag, and an invalid word is whatever the speculative computation left
-  // behind. Two silent wrong answers come out of it:
+  // The WORD is only the value when its VALID flag is a compile-time true.
+  // A runtime flag means the callee's speculative i64 lane is a placeholder --
+  // `range`'s element carries `valid = arith.constant false` -- and storing it
+  // printed the dummy 0 for `COUNT = add(COUNT, i)` in a loop.
   //
-  //     def f(a: int) -> int: return a + 1
-  //     C: int = 0
-  //     for i in range(3, 4):
-  //         C = f(i)
-  //     print(C)                              # printed 1; CPython prints 4
+  // Why NOT keep the word and prove validity later: there is nothing to prove.
+  // The lane is invalid BY CONSTRUCTION on the boxed path, and the boxed
+  // payload is the only authority. Asking the flag is the same question
+  // `AttributeOps`, `GetItemOps` and `SpecialMethodOps` ask of this lane.
   //
-  //     a: int = 9223372036854775807 + 1
-  //     print(a)      # printed the wrapped negative; CPython prints the bignum
-  //
-  // `primitiveI64LaneKnownValid` is the question every other reader of this
-  // lane asks, and asking it here is one line -- but it sends the store down
-  // the unbox path below, and THAT does not build: the boxed value the unbox
-  // reads then "reaches function exit without release", which stops the
-  // runtime library's own stackguard_support from compiling. Measured, twice:
-  // pinning the boxed value's liveness at the store
-  // (`pinProbeOperandLiveness`) does not move it either.
-  //
-  // Releasing the boxed value at the store does not work either, measured as
-  // the third attempt: the value is usually a LIVE LOCAL (`g_msg = msgbuf`,
-  // where `msgbuf` is read again), so the release is an over-release and the
-  // failure only moves to the next global store in the same function.
-  //
-  // So the repair is not here. Whoever takes it should start with why the
-  // release placement cannot find a death point for a value whose only use is
-  // an unbox immediately before a store -- every function it fails in has EH
-  // edges and an early return, which is the shape to reproduce first.
-  //
-  // The cluster this leaves is the largest one in the audit corpus: 14 probes,
-  // all "an int global written from a CALL RESULT inside a loop", all printing
-  // the callee's dummy 0. Straight-line writes and in-loop writes that are not
-  // call results are correct, which is what pins it to the lane's validity.
-  if (value->primitiveI64 && value->primitiveI64->value) {
+  // Why this could not be asked before: the unbox path it falls to needs a
+  // release for the boxed value it reads, and the placement could not find one
+  // when the box is produced inside the prim/boxed dispatch's `scf.if` and the
+  // store sits in a later block (`g_limit = limit` in stackguard_support,
+  // behind `if limit == 0: return`). That was a hole in
+  // `insertOwnedResultReleases`, not in this file -- it refused ordinary
+  // `t = a + b; if c: print(t)` too -- and is repaired by
+  // `liftGroupToEnclosingRegionOp` (Passes/Ownership.cpp).
+  std::optional<RuntimeSymbol> unbox =
+      manifest.primitive(value->contractName(), "unbox.i64");
+  bool boxedIsReachable =
+      unbox &&
+      unbox->function.getNumArguments() == value->physicalValues().size();
+  if (primitiveI64LaneKnownValid(value->primitiveI64)) {
     raw = value->primitiveI64->value;
-  } else {
-    std::optional<RuntimeSymbol> unbox =
-        manifest.primitive(value->contractName(), "unbox.i64");
-    if (!unbox ||
-        unbox->function.getNumArguments() != value->physicalValues().size())
-      return op.emitError() << "module global assignment value "
-                            << value->contractName()
-                            << " has no unbox.i64 primitive";
+  } else if (boxedIsReachable) {
     mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
         op.getLoc(), *unbox, value->physicalValues());
     raw = unboxCall.getResult(0);
+  } else if (value->primitiveI64 && value->primitiveI64->value) {
+    // No boxed payload to read instead: a primitive-i64 clone lane carries
+    // only the (value, valid) pair, so the lane IS the sole carrier and a
+    // runtime flag is no reason to refuse it. Demanding the unbox here took
+    // out three goldens whose global is assigned from exactly that shape
+    // ("module global assignment value builtins.int has no unbox.i64
+    // primitive"); the flag only chooses between two carriers when there are
+    // two.
+    raw = value->primitiveI64->value;
+  } else {
+    return op.emitError() << "module global assignment value "
+                          << value->contractName()
+                          << " has no unbox.i64 primitive";
   }
   mlir::Value address =
       mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);

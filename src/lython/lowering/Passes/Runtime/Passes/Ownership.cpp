@@ -1116,13 +1116,13 @@ delayPastUnwindingCallSites(mlir::Operation *insertAfter,
 // successor entry needs no edge split); anything else is left to the caller and
 // re-checked by the affine ownership verifier. Returns true when handled.
 bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
-                                      mlir::func::CallOp call,
+                                      mlir::Operation *owner,
                                       const own::ResourceGroup &group,
                                       own::AliasAnalysis &aliases,
                                       bool ownsReference) {
   if (!group.deallocator || group.condition)
     return false;
-  mlir::Block *defBlock = call->getBlock();
+  mlir::Block *defBlock = owner->getBlock();
   if (!defBlock)
     return false;
   mlir::Operation *terminator = defBlock->getTerminator();
@@ -1149,7 +1149,7 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
     for (mlir::Value equivalent : equivalents) {
       for (mlir::OpOperand &use : equivalent.getUses()) {
         mlir::Operation *user = use.getOwner();
-        if (user == call.getOperation() || user == terminator)
+        if (user == owner || user == terminator)
           continue;
         if (ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                   aliases))
@@ -1221,13 +1221,13 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
       unwindDeathDelayEnabled() ? &entryReleaseHandlerIds : nullptr;
 
   for (mlir::Block *successor : successors) {
-    mlir::OpBuilder builder(call.getContext());
+    mlir::OpBuilder builder(owner->getContext());
     if (mlir::Operation *last = lastUser[successor])
       builder.setInsertionPointAfter(
           unwindIds ? delayPastUnwindingCallSites(last, unwindIds) : last);
     else
       builder.setInsertionPointToStart(successor);
-    emitGroupRelease(builder, call.getLoc(), group, group.values,
+    emitGroupRelease(builder, owner->getLoc(), group, group.values,
                      ownsReference);
   }
   return true;
@@ -2160,7 +2160,7 @@ bool borrowEdgeRetainIsSpellable(mlir::Value header,
 // never a released-twice one -- which is the only direction an ablation switch
 // over release placement may fail in.
 bool insertOwnedValueReleasesByLiveness(
-    FuncContractCache &contracts, mlir::func::CallOp call,
+    FuncContractCache &contracts, mlir::Operation *owner,
     const own::ResourceGroup &group, own::AliasAnalysis &aliases,
     const own::ReferenceMap &references, bool ownsReference,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
@@ -2169,9 +2169,9 @@ bool insertOwnedValueReleasesByLiveness(
         "LYTHON_ABLATE_CONSUME_IS_DEATH_CALL_RESULTS");
     return value && !value->empty() && *value != "0";
   }();
-  return releaseOwnedGroupByLiveness(contracts, call.getOperation(),
-                                     call->getBlock(), call.getLoc(), group,
-                                     aliases, references, ownsReference,
+  return releaseOwnedGroupByLiveness(contracts, owner, owner->getBlock(),
+                                     owner->getLoc(), group, aliases,
+                                     references, ownsReference,
                                      /*consumeIsDeath=*/!consumeIsDeathDisabled,
                                      deallocators);
 }
@@ -2766,6 +2766,78 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
   return mlir::success();
 }
 
+// The operation that NAMES this group where the CFG can see it, rewriting the
+// group's lanes to match. Returns `call` unchanged when there is nothing to
+// lift.
+//
+// A call inside a region op has no name outside that region: what the rest of
+// the function holds is the region OP's results. The prim/boxed dispatch makes
+// that the ordinary shape of a boxed int -- `t = a + b` boxes inside the
+// `scf.if` arms and yields the box out -- so "where does this entity die" has
+// to be asked about the `scf.if`, not about the `LyLong_FromI64` inside it.
+//
+// Why NOT leave it to `findReleaseInsertion`, which already re-asks itself
+// about the region op: it is the ONLY strategy that does, and it answers only
+// for uses in the region op's own block. One branch between the arithmetic and
+// the use puts a use elsewhere, it declines, and the three strategies behind it
+// were then handed a block INSIDE the region -- where `scf.yield` has no CFG
+// successors and no `func.return` is reachable. Two decline on that; the third
+// collects zero dominated returns, reports success and places NOTHING. Measured
+// on the shipped binary: `t = a - b; if a > 0: print(t)` is REFUSED with "owned
+// resource from @LyLong_FromI64 result 0 reaches function exit without
+// release", and so are `+`, `*`, a `while`, a `for`, a merge-block use, a
+// `return t`, and the same shape at module level. The early return the handover
+// note pointed at is incidental -- any branch does it.
+//
+// Why NOT lift before `findReleaseInsertion` as well: its interior walk can
+// REFUSE (a consuming use in the region, a use nested deeper), and lifting
+// first would skip that refusal instead of answering it.
+//
+// The lanes must do NOTHING in their region but leave it. A lane with another
+// use in there was already claimed by that use, and a release written for the
+// lifted name would be a second one -- the one direction this may not fail in.
+mlir::Operation *liftGroupToEnclosingRegionOp(own::ResourceGroup &group,
+                                              mlir::func::CallOp call,
+                                              own::AliasAnalysis &aliases) {
+  mlir::Operation *owner = call.getOperation();
+  while (mlir::Block *block = owner->getBlock()) {
+    if (block->empty())
+      break;
+    mlir::Operation *terminator = &block->back();
+    // An intra-region `cf.br` is not the region's exit; only a return-like
+    // terminator maps its operands onto the parent op's results.
+    if (terminator->getNumSuccessors() != 0)
+      break;
+    std::optional<llvm::SmallVector<mlir::Value, 4>> lanes =
+        mapRegionTerminatorGroupToParentResults(terminator, group.values,
+                                                aliases);
+    if (!lanes)
+      break;
+    if (!llvm::all_of(group.values, [&](mlir::Value lane) {
+          return lane.hasOneUse() &&
+                 lane.use_begin()->getOwner() == terminator;
+        }))
+      break;
+    llvm::SmallVector<mlir::Value, 4> views;
+    if (!group.views.empty()) {
+      // A view that stays behind has uses this walk cannot see, and a release
+      // placed without them is premature -- same rule as `forwardedViews` in
+      // `insertOwnedBlockArgumentReleases`.
+      std::optional<llvm::SmallVector<mlir::Value, 4>> mappedViews =
+          mapRegionTerminatorGroupToParentResults(terminator, group.views,
+                                                  aliases);
+      if (!mappedViews)
+        break;
+      views.assign(mappedViews->begin(), mappedViews->end());
+    }
+    group.values.assign(lanes->begin(), lanes->end());
+    group.views.assign(views.begin(), views.end());
+    group.root = own::entityRootOf(group.values);
+    owner = terminator->getParentRegion()->getParentOp();
+  }
+  return owner;
+}
+
 mlir::LogicalResult
 insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
                           FuncContractCache &contracts,
@@ -2806,6 +2878,10 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       continue;
     }
 
+    // Everything below asks a CFG question, so everything below has to be given
+    // the CFG's name for the entity rather than the call's.
+    mlir::Operation *owner = liftGroupToEnclosingRegionOp(group, call, aliases);
+
     // ⛔ Why NOT delete this one too, the way `conditional` went: it is not
     // dead, only rare. 142 placements over 297 programs (0.11%), and removing
     // it leaves 42 of the 61 affected programs BYTE-IDENTICAL -- the fallback
@@ -2819,13 +2895,13 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     // would change codegen on 19 programs with no test able to see a regression,
     // which is the silent direction. `conditional` was deletable because it
     // placed NOTHING; this one places, and what it places is unverified.
-    if (insertImmediateSuccessorReleases(contracts, call, group, aliases,
+    if (insertImmediateSuccessorReleases(contracts, owner, group, aliases,
                                          /*ownsReference=*/true)) {
       tracePlacement("immediate-successor", call, group);
       continue;
     }
 
-    if (insertOwnedValueReleasesByLiveness(contracts, call, group, aliases,
+    if (insertOwnedValueReleasesByLiveness(contracts, owner, group, aliases,
                                            references,
                                            /*ownsReference=*/true,
                                            deallocators)) {
@@ -2861,7 +2937,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
       for (mlir::Value equivalent : equivalentValues) {
         for (mlir::OpOperand &use : equivalent.getUses()) {
           mlir::Operation *user = use.getOwner();
-          if (user == call.getOperation())
+          if (user == owner)
             continue;
           if (user->getParentOfType<mlir::func::FuncOp>() != function ||
               ownershipConsumingUseInvalidatesGroup(contracts, use,
@@ -2886,7 +2962,7 @@ insertOwnedResultReleases(mlir::ModuleOp module, mlir::func::CallOp call,
     mlir::DominanceInfo dominance(function);
     llvm::SmallVector<mlir::func::ReturnOp, 4> returns;
     function.walk([&](mlir::func::ReturnOp returnOp) {
-      if (dominance.dominates(call.getOperation(), returnOp.getOperation()))
+      if (dominance.dominates(owner, returnOp.getOperation()))
         returns.push_back(returnOp);
     });
     for (mlir::func::ReturnOp returnOp : returns) {

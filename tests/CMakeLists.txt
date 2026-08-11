@@ -544,6 +544,8 @@ set(LYTHON_LEAK_GATE_CASES
     closure_sees_later_writes_and_dynamic_index
     # Mixed arithmetic boxes a promoted float per operand.
     numeric_tower_and_module_dunders
+    # The lifted release must fire once per boxed temporary, on every edge.
+    owned_temp_across_a_branch
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

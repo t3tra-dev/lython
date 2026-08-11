@@ -1015,10 +1015,21 @@ bool ModuleEmitter::isExceptionContractType(mlir::Type type) const {
   auto contractType = mlir::dyn_cast<py::ContractType>(type);
   if (!contractType)
     return false;
-  llvm::StringRef leaf = contractType.getContractName().rsplit('.').second;
-  if (leaf.empty())
-    leaf = contractType.getContractName();
-  if (py::exceptions::findByName(leaf) != nullptr)
+  // ⛔ The builtin exception TABLE is consulted for BUILTIN contracts only, so
+  // the leaf of a dotted name and never a bare one. A source class may be
+  // written with the same name --
+  //
+  //     class ConnectionError:
+  //         def __repr__(self) -> str: return "CE-repr"
+  //     print(str(ConnectionError()))
+  //
+  // -- and taking it for the builtin gave it the taxonomy's str/repr split,
+  // which it does not have: `str(x)` was refused with "runtime manifest has no
+  // ConnectionError.__str__ method". A user class that really IS an exception
+  // reaches the manifest-subclass walk below, which asks about the hierarchy
+  // rather than about the spelling.
+  auto [qualifier, leaf] = contractType.getContractName().rsplit('.');
+  if (!leaf.empty() && py::exceptions::findByName(leaf) != nullptr)
     return true;
   // User exception classes share the taxonomy's str/repr semantics (str is
   // the message, repr is ClassName(...)): the manifest-subclass walk is the
