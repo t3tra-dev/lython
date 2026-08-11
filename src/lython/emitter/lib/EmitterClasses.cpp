@@ -422,6 +422,38 @@ ModuleEmitter::resolveMroMethod(llvm::StringRef receiverClass,
   return std::nullopt;
 }
 
+// A subclass of `receiverClass` declares `methodName` of its own.
+//
+// ⭐ Inlining answers a method call from the receiver's STATIC class, and that
+// is only the right answer when no subclass can be behind the reference:
+//
+//     class A:
+//         def v(self) -> int: return 1
+//     class B(A):
+//         def v(self) -> int: return 2
+//     xs: list[A] = [A(), B()]
+//     print([a.v() for a in xs])      # printed [1, 1]; CPython prints [1, 2]
+//
+// `a: A = B()` and a parameter typed `A` did the same. A concrete receiver
+// (`B().v()`) was always right, and so was a subclass that does not override.
+// This project resolves statically or refuses; it has no dynamic dispatch to
+// fall back to, so the call is refused at the earliest boundary that can see
+// the hierarchy rather than silently running the base's body.
+bool ModuleEmitter::subclassOverridesMethod(llvm::StringRef receiverClass,
+                                            llvm::StringRef methodName) const {
+  for (const auto &entry : classMros) {
+    if (entry.getKey() == receiverClass)
+      continue;
+    if (!llvm::is_contained(entry.getValue(), receiverClass))
+      continue;
+    auto methods = classMethodBindings.find(entry.getKey());
+    if (methods != classMethodBindings.end() &&
+        methods->second.count(methodName))
+      return true;
+  }
+  return false;
+}
+
 bool ModuleEmitter::isExceptionBackedClass(llvm::StringRef className) const {
   for (const std::string &cls : classMro(className))
     if (!classMros.count(cls) && taxonomyEntryForContract(cls))

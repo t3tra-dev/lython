@@ -102,6 +102,11 @@ private:
   // True when the class (by contract name) linearizes onto a manifest
   // exception class (its instances use the runtime exception representation).
   bool isExceptionBackedClass(llvm::StringRef className) const;
+  // True when a subclass of `receiverClass` declares `methodName` itself, so
+  // the static class is not enough to say which body a call runs
+  // (EmitterClasses.cpp).
+  bool subclassOverridesMethod(llvm::StringRef receiverClass,
+                               llvm::StringRef methodName) const;
   // True when `type` is a SOURCE class whose linearization provides
   // `methodName` only through builtins.object — i.e. it inherits object's
   // default. The question is not "does the method resolve" (since the class's

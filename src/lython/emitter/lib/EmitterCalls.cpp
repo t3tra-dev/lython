@@ -458,6 +458,52 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (const parser::Node *receiverNode = ast::node(*calleeNode, "value")) {
       if (auto methodName = ast::string(*calleeNode, "attr")) {
         Value receiver = emitExpr(receiverNode);
+        // ⛔ NOT through a `super(...)` view. `super(Left, Both()).tag()` names
+        // the class to start the MRO after, so the base's body is the answer
+        // the program ASKED for, not a guess this walk made from a static
+        // type. Refusing it took out class_super and class_mro, which is how
+        // the same over-broad refusal failed the first three times it was
+        // tried.
+        bool throughSuper = receiverNode->kind == "Call" && [&] {
+          const parser::Node *callee = ast::node(*receiverNode, "func");
+          return callee && callee->kind == "Name" &&
+                 ast::nameSpelling(*callee) == "super";
+        }();
+        // A CONSTRUCTED receiver names its class exactly, so no subclass can
+        // be behind it -- `Left().tag()` is Left's `tag` however many
+        // subclasses override it, and so is `x = Left()` followed by
+        // `x.tag()`. Without this the refusal takes out every hierarchy that
+        // has an override at all, which is what it did to class_super and
+        // class_mro.
+        //
+        // Asked of the SSA VALUE rather than of the receiver expression: the
+        // value is the construction itself for both spellings, while the
+        // expression is a Call in one and a Name in the other. It also
+        // answers correctly for everything that is NOT exact with no
+        // bookkeeping -- an upcast (`a: A = B()`) is a different op, a
+        // loop-carried or joined binding is a block argument, and a field or
+        // element read is a load. No tracking means no stale entry, which
+        // matters because a stale one would read as exact and put the silent
+        // wrong answer back.
+        mlir::Operation *receiverDefinition = receiver.value.getDefiningOp();
+        bool exactlyConstructed =
+            receiverDefinition &&
+            mlir::isa<py::NewOp, py::InitOp>(receiverDefinition);
+        if (auto contract =
+                mlir::dyn_cast_if_present<py::ContractType>(receiver.type))
+          if (!throughSuper && !exactlyConstructed &&
+              subclassOverridesMethod(contract.getContractName(),
+                                      *methodName) &&
+              lookupClassMethod(receiver.type, *methodName)) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, calleeNode->range.start,
+                "'" + std::string(*methodName) +
+                    "' is overridden by a subclass of '" +
+                    contract.getContractName().str() +
+                    "', so this call cannot be resolved from the static type "
+                    "of the receiver"});
+            return emitNone(expr);
+          }
         if (std::optional<MethodBinding> method =
                 lookupClassMethod(receiver.type, *methodName)) {
           // A generator method is routed through the bound function object for
