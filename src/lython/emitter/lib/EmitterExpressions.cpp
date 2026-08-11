@@ -545,6 +545,16 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
     return *complexResult;
   mlir::Type left = types.widenLiteral(lhs.type);
   mlir::Type right = types.widenLiteral(rhs.type);
+  // ⛔ KNOWN DEFECT: `True + 1` is refused -- "builtins.bool.__add__ is
+  // declared by the standard-library contract but has no implementation".
+  // bool IS an int in CPython and inherits int's arithmetic; here the bool
+  // contract declares the operators (typeshed shows what it inherits) and
+  // implements none. Promoting the operand the way int -> float is promoted
+  // below is the obvious repair and does NOT work: `coerceValue` to int
+  // produces a bundle with bool's single value where the int ABI expects
+  // three, which took out `float_floordiv_mod_round` with "runtime bundle for
+  // builtins.int has 1 values, but ABI expects 3". The promotion needs the
+  // boxing `emitFloatFromInt` does for the rung above, not a coercion.
   mlir::Type result = types.join({left, right});
   if (left == types.strType() && right == types.strType()) {
     result = types.strType();

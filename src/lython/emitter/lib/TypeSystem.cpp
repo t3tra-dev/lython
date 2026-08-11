@@ -3183,6 +3183,18 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
                                                        std::nullopt},
                                  true,
                                  {}};
+    // ⛔ KNOWN DEFECT reached through this message: an int argument is refused
+    // where a float parameter is declared.
+    //
+    //     def f(x: float) -> float: return x * 2
+    //     print(f(3))      # refused; CPython prints 6.0
+    //
+    // PEP 484 makes int acceptable for float, and CPython's tower converts at
+    // the boundary. `emitBinary` now promotes the same pair for operators, so
+    // the relation is already spelled once -- what is missing here is both
+    // halves at once: this check has to ACCEPT the argument and the call site
+    // has to CONVERT it, and accepting without converting hands the callee an
+    // int where its ABI expects a float's lanes.
     return unresolvedCallable(
         calleeType, "call arguments do not match the Callable contract");
   }
