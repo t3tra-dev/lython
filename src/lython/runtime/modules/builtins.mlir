@@ -15010,109 +15010,193 @@ module attributes {
 
   func.func @LyFloat_RoundNdigits(%header: memref<3xi64> {ly.ownership.object_header}, %ndigits_header: memref<2xi64> {ly.ownership.object_header}, %ndigits_meta: memref<2xi64>, %ndigits_digits: memref<?xi32>) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__round__", ly.runtime.result_contract = "builtins.float"} {
     %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
-    %ndigits = func.call @LyLong_AsI64(%ndigits_header, %ndigits_meta, %ndigits_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    // WHY NOT LyLong_AsI64: it raises on a wider value, which is right for
+    // int(x) and wrong here. float___round___impl reads ndigits with
+    // PyNumber_AsSsize_t(o_ndigits, NULL), and the NULL says CLIP rather than
+    // raise, so round(1.5, 10**30) is round(1.5, SSIZE_MAX) -- 1.5 -- and the
+    // NDIGITS_MAX/MIN guards below turn every clipped value into a passthrough.
+    %ndigits_fits = func.call @__ly_long_view_fits_i64(%ndigits_meta, %ndigits_digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    %ndigits_exact = func.call @__ly_long_view_as_i64(%ndigits_meta, %ndigits_digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    %ndigits_sign_slot = arith.constant 0 : index
+    %ndigits_zero = arith.constant 0 : i64
+    %ndigits_sign = memref.load %ndigits_meta[%ndigits_sign_slot] : memref<2xi64>
+    %ndigits_negative = arith.cmpi slt, %ndigits_sign, %ndigits_zero : i64
+    %ndigits_max = arith.constant 9223372036854775807 : i64
+    %ndigits_min = arith.constant -9223372036854775808 : i64
+    %ndigits_clipped = arith.select %ndigits_negative, %ndigits_min, %ndigits_max : i64
+    %ndigits = arith.select %ndigits_fits, %ndigits_exact, %ndigits_clipped : i64
     %rounded = func.call @__ly_float_round_ndigits(%value, %ndigits) : (f64, i64) -> f64
     %out_header = func.call @LyFloat_FromF64(%rounded) : (f64) -> memref<3xi64>
     func.return %out_header : memref<3xi64>
   }
 
-  // Scale, round-half-to-even, unscale. CPython uses _Py_dg_dtoa for a
-  // correctly-rounded DECIMAL result; this is the binary approximation of it,
-  // and passes nan/inf and out-of-range exponents through unchanged as
-  // float___round___impl does.
+  // CPython's float___round___impl + double_round (Objects/floatobject.c,
+  // Python/pystrtod.c): round the value to a DECIMAL string with `ndigits`
+  // places, then parse that string back. Both halves already exist here --
+  // @__ly_dtoa_counted with fixed_mode IS _Py_dg_dtoa mode 3 (it is what
+  // format(x, '.Nf') calls), and the parse is the one direction libc does
+  // correctly-roundedly on every host this targets.
   //
-  // KNOWN DEFECT, and the reason the deviation is not just "for large
-  // magnitudes": this comment used to claim the two agree wherever 10**|n| is
-  // exact in binary64. They do not. `round(2.675, 2)` returns 2.68 where
-  // CPython returns 2.67, and 100 is exact.
+  // WHY NOT keep scaling by 10**ndigits: the multiply commits to a digit
+  // before the rounding rule is consulted, and that is one cause with three
+  // symptoms. It manufactures ties the number does not have (2.675 * 100 IS
+  // 267.5 in binary64, so half-to-even went up to 2.68 where CPython says
+  // 2.67 -- the fma-residual override this block used to carry existed only
+  // to paper over that one shape). It loses the last digit wherever
+  // x * 10**n / 10**n is not the identity (round(234743633112.0, 8) gave
+  // 234743633112.00003). And it overflows at exponents CPython never reaches
+  // (round(1e300, 15) gave inf). No guard on the binary path removes them;
+  // the decimal round-trip removes all three, and the residual override with
+  // them.
   //
-  // 2.675 is really 2.67499999999999982, so the decimal answer is 2.67. But
-  // 2.675 * 100 rounds to exactly 267.5 in binary64, and half-to-even on a
-  // value that IS the midpoint goes up. The scaling manufactured a tie that
-  // the original number does not have. `round(-2.675, 2)` is wrong the same
-  // way; `round(x)` with no ndigits is unaffected, since nothing is scaled.
-  //
-  // The fix CPython's own path suggests is a decimal round-trip -- format to
-  // `ndigits` places and parse back, which was measured to agree with CPython
-  // on every probe including the ties, the negatives and 1e16. `snprintf` and
-  // `strtod` are the pieces, and both live in the support builders rather
-  // than in this manifest, so it is a layering change and not an edit here.
+  // WHY NOT snprintf for the text, as the earlier note here proposed:
+  // "%s0%se%d" is variadic and func.func cannot express varargs, and the
+  // digits are already in hand from the dtoa above. The emitted text carries
+  // no radix character, so LC_NUMERIC cannot reach strtod either.
+  memref.global "private" constant @__ly_float_msg_round_overflow : memref<36xi8> = dense<[114, 111, 117, 110, 100, 101, 100, 32, 118, 97, 108, 117, 101, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 114, 101, 112, 114, 101, 115, 101, 110, 116]>
+
+  func.func private @__ly_float_raise_round_overflow() {
+    %class_id = arith.constant 104 : i64
+    %length = arith.constant 36 : i64
+    %message_static = memref.get_global @__ly_float_msg_round_overflow : memref<36xi8>
+    %message = memref.cast %message_static : memref<36xi8> to memref<?xi8>
+    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  func.func private @strtod(%text: !llvm.ptr, %end: !llvm.ptr) -> f64
+
   func.func private @__ly_float_round_ndigits(%x: f64, %ndigits: i64) -> f64 {
-    %zero = arith.constant 0.0 : f64
-    %ten = arith.constant 10.0 : f64
+    %zero_f = arith.constant 0.0 : f64
     %inf = arith.constant 0x7FF0000000000000 : f64
     %zero64 = arith.constant 0 : i64
-    %neg_one = arith.constant -1 : i64
-    %hi_digits = arith.constant 308 : i64
-    %lo_digits = arith.constant -308 : i64
+    %ten = arith.constant 10 : i64
+    %hundred = arith.constant 100 : i64
+    %ascii_zero = arith.constant 48 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %ch_minus = arith.constant 45 : i8
+    %ch_zero = arith.constant 48 : i8
+    %ch_e = arith.constant 101 : i8
+    %ch_nul = arith.constant 0 : i8
 
     %is_nan = arith.cmpf uno, %x, %x : f64
     %abs_x = math.absf %x : f64
     %is_inf = arith.cmpf oeq, %abs_x, %inf : f64
-    %special = arith.ori %is_nan, %is_inf : i1
+    %is_zero = arith.cmpf oeq, %abs_x, %zero_f : f64
+    // NDIGITS_MAX = (DBL_MANT_DIG - DBL_MIN_EXP) * 0.30103 == 323: past it the
+    // cutoff sits below the last bit of every double, so x rounds to itself.
+    // Zero is excluded here because @__ly_dtoa_counted estimates its first
+    // digit with log10, which has no answer at 0; CPython's dtoa special-cases
+    // it to the same passthrough.
+    %hi_digits = arith.constant 323 : i64
     %above = arith.cmpi sgt, %ndigits, %hi_digits : i64
-    %below = arith.cmpi slt, %ndigits, %lo_digits : i64
-    %extreme = arith.ori %above, %below : i1
-    %passthrough = arith.ori %special, %extreme : i1
-    cf.cond_br %passthrough, ^pass, ^scale
+    %special = arith.ori %is_nan, %is_inf : i1
+    %special_or_zero = arith.ori %special, %is_zero : i1
+    %passthrough = arith.ori %special_or_zero, %above : i1
+    cf.cond_br %passthrough, ^pass, ^check_low
 
   ^pass:
     func.return %x : f64
 
-  ^scale:
-    %negative = arith.cmpi slt, %ndigits, %zero64 : i64
-    %flipped = arith.subi %zero64, %ndigits : i64
-    %magnitude = arith.select %negative, %flipped, %ndigits : i64
-    %magnitude_f = arith.uitofp %magnitude : i64 to f64
-    %scale = math.powf %ten, %magnitude_f : f64
-    %scale_nan = arith.cmpf uno, %scale, %scale : f64
-    %scale_abs = math.absf %scale : f64
-    %scale_inf = arith.cmpf oeq, %scale_abs, %inf : f64
-    %scale_zero = arith.cmpf oeq, %scale, %zero : f64
-    %scale_bad = arith.ori %scale_nan, %scale_inf : i1
-    %scale_unusable = arith.ori %scale_bad, %scale_zero : i1
-    cf.cond_br %scale_unusable, ^pass, ^direction
+  ^check_low:
+    // NDIGITS_MIN = -(DBL_MAX_EXP + 1) * 0.30103 == -308: below it every
+    // finite x is under half the cutoff, so the answer is a zero that keeps
+    // x's sign -- `0.0 * x`, as float___round___impl writes it. Returning x
+    // here (what this function used to do) is the same defect at the other
+    // end of the range.
+    %lo_digits = arith.constant -308 : i64
+    %below = arith.cmpi slt, %ndigits, %lo_digits : i64
+    cf.cond_br %below, ^to_zero, ^decimal
 
-  ^direction:
-    %multiply_first = arith.cmpi sgt, %ndigits, %neg_one : i64
-    cf.cond_br %multiply_first, ^up, ^down
+  ^to_zero:
+    %signed_zero = arith.mulf %zero_f, %x : f64
+    func.return %signed_zero : f64
 
-  ^up:
-    // Scaling can MANUFACTURE a tie the original number does not have:
-    // 2.675 is really 2.67499999999999982, but 2.675 * 100 rounds to exactly
-    // 267.5, and half-to-even on a midpoint goes up -- 2.68 where CPython
-    // says 2.67. When the scaled value lands on a midpoint, the sign of the
-    // multiply's own rounding error says which side x was really on, and
-    // `fma(x, scale, -scaled)` is that error exactly. Only a real tie (error
-    // zero) goes to even, which is what CPython's decimal path decides too.
-    %scaled_up = arith.mulf %x, %scale : f64
-    %floor_up = math.floor %scaled_up : f64
-    %frac_up = arith.subf %scaled_up, %floor_up : f64
-    %half = arith.constant 0.5 : f64
-    %is_tie = arith.cmpf oeq, %frac_up, %half : f64
-    %neg_scaled = arith.negf %scaled_up : f64
-    %residual = math.fma %x, %scale, %neg_scaled : f64
-    %below_mid = arith.cmpf olt, %residual, %zero : f64
-    %above_mid = arith.cmpf ogt, %residual, %zero : f64
-    %one_f = arith.constant 1.0 : f64
-    %ceil_up = arith.addf %floor_up, %one_f : f64
-    %tie_pick2 = arith.select %below_mid, %floor_up, %ceil_up : f64
-    // roundeven already answers every real tie correctly, INCLUDING the sign
-    // of a zero result (round(-0.5) is -0.0). Only a manufactured tie -- the
-    // multiply's residual is non-zero -- needs the override, so the exact
-    // case keeps roundeven's answer rather than a reconstructed one.
-    %even_up = math.roundeven %scaled_up : f64
-    %manufactured = arith.ori %below_mid, %above_mid : i1
-    %override = arith.andi %is_tie, %manufactured : i1
-    %rounded_up = arith.select %override, %tie_pick2, %even_up : f64
-    %result_up = arith.divf %rounded_up, %scale : f64
-    func.return %result_up : f64
+  ^decimal:
+    // 800 bytes matches the format path's digit buffer. The reachable bound
+    // is decpt + ndigits <= 309 + 323, and the exact expansion runs out well
+    // before that, so the cap inside @__ly_dtoa_counted is never the limit.
+    %digit_store = memref.alloca() : memref<800xi8>
+    %digits = memref.cast %digit_store : memref<800xi8> to memref<?xi8>
+    %dt:2 = func.call @__ly_dtoa_counted(%abs_x, %true, %ndigits, %digits) : (f64, i1, i64, memref<?xi8>) -> (i64, i64)
 
-  ^down:
-    %scaled_down = arith.divf %x, %scale : f64
-    %rounded_down = math.roundeven %scaled_down : f64
-    %result_down = arith.mulf %rounded_down, %scale : f64
-    func.return %result_down : f64
+    // "[-]0<digits>e[-]<three digits>" is CPython's "%s0%se%d" with the
+    // exponent zero-padded: |decpt - count| <= 323 on every path that gets
+    // here, and strtod does not care about the width. A zero result arrives
+    // as count == 0 and needs no special case: "-0e-002" parses to -0.0.
+    %text_store = memref.alloca() : memref<800xi8>
+    %bits = arith.bitcast %x : f64 to i64
+    %negative = arith.cmpi slt, %bits, %zero64 : i64
+    %after_sign = scf.if %negative -> (index) {
+      memref.store %ch_minus, %text_store[%c0] : memref<800xi8>
+      scf.yield %c1 : index
+    } else {
+      scf.yield %c0 : index
+    }
+    memref.store %ch_zero, %text_store[%after_sign] : memref<800xi8>
+    %after_zero = arith.addi %after_sign, %c1 : index
+    %count_idx = arith.index_cast %dt#0 : i64 to index
+    %after_digits = scf.for %i = %c0 to %count_idx step %c1 iter_args(%p = %after_zero) -> (index) {
+      %ch = memref.load %digits[%i] : memref<?xi8>
+      memref.store %ch, %text_store[%p] : memref<800xi8>
+      %np = arith.addi %p, %c1 : index
+      scf.yield %np : index
+    }
+    memref.store %ch_e, %text_store[%after_digits] : memref<800xi8>
+    %after_e = arith.addi %after_digits, %c1 : index
+    %exp10 = arith.subi %dt#1, %dt#0 : i64
+    %exp_neg = arith.cmpi slt, %exp10, %zero64 : i64
+    %exp_flip = arith.subi %zero64, %exp10 : i64
+    %exp_abs = arith.select %exp_neg, %exp_flip, %exp10 : i64
+    %exp_start = scf.if %exp_neg -> (index) {
+      memref.store %ch_minus, %text_store[%after_e] : memref<800xi8>
+      %np = arith.addi %after_e, %c1 : index
+      scf.yield %np : index
+    } else {
+      scf.yield %after_e : index
+    }
+    %huns = arith.divui %exp_abs, %hundred : i64
+    %rest = arith.remui %exp_abs, %hundred : i64
+    %tens = arith.divui %rest, %ten : i64
+    %ones = arith.remui %rest, %ten : i64
+    %huns_i = arith.addi %huns, %ascii_zero : i64
+    %huns_ch = arith.trunci %huns_i : i64 to i8
+    memref.store %huns_ch, %text_store[%exp_start] : memref<800xi8>
+    %tens_at = arith.addi %exp_start, %c1 : index
+    %tens_i = arith.addi %tens, %ascii_zero : i64
+    %tens_ch = arith.trunci %tens_i : i64 to i8
+    memref.store %tens_ch, %text_store[%tens_at] : memref<800xi8>
+    %ones_at = arith.addi %tens_at, %c1 : index
+    %ones_i = arith.addi %ones, %ascii_zero : i64
+    %ones_ch = arith.trunci %ones_i : i64 to i8
+    memref.store %ones_ch, %text_store[%ones_at] : memref<800xi8>
+    %nul_at = arith.addi %ones_at, %c1 : index
+    memref.store %ch_nul, %text_store[%nul_at] : memref<800xi8>
+
+    %text_index = memref.extract_aligned_pointer_as_index %text_store : memref<800xi8> -> index
+    %text_word = arith.index_cast %text_index : index to i64
+    %text_ptr = llvm.inttoptr %text_word : i64 to !llvm.ptr
+    %null_ptr = llvm.inttoptr %zero64 : i64 to !llvm.ptr
+    %parsed = func.call @strtod(%text_ptr, %null_ptr) : (!llvm.ptr, !llvm.ptr) -> f64
+
+    // CPython raises on `errno == ERANGE && fabs(rounded) >= 1.0`. WHY NOT
+    // read errno: it needs a per-platform accessor (__error / __errno_location)
+    // and the test is exactly equivalent without it -- the text handed to
+    // strtod is a finite decimal, so an infinity out of it can only be the
+    // overflow that condition names. ERANGE on underflow stays invisible here
+    // the same way it does in CPython.
+    %parsed_abs = math.absf %parsed : f64
+    %overflowed = arith.cmpf oeq, %parsed_abs, %inf : f64
+    cf.cond_br %overflowed, ^too_large, ^done
+
+  ^too_large:
+    func.call @__ly_float_raise_round_overflow() : () -> ()
+    cf.br ^done
+
+  ^done:
+    func.return %parsed : f64
   }
 
   // float ** float via libm pow (CPython float_pow also defers to C pow).

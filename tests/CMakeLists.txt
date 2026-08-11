@@ -546,6 +546,8 @@ set(LYTHON_LEAK_GATE_CASES
     numeric_tower_and_module_dunders
     # The lifted release must fire once per boxed temporary, on every edge.
     owned_temp_across_a_branch
+    # The decimal round-trip allocates a digit buffer per call.
+    round_decimal_round_trip
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
