@@ -45,6 +45,55 @@ bool callHasNoArguments(const parser::Node &expr) {
   return (!args || args->empty()) && (!keywords || keywords->empty());
 }
 
+// A builtin fast-path's arguments in parameter order, keywords bound to
+// `parameters` -- or nothing, which sends the call down the generic path that
+// already refuses what CPython raises TypeError for.
+//
+// ⭐ Every fast path above declines when a keyword appears; two forgot, and
+// both silently DROPPED it. `round(2.567, ndigits=1)` printed 3 where CPython
+// prints 2.6, and `len([1], bogus=2)` printed 1 where CPython raises. A
+// dropped argument is the one failure a `!keywords->empty()` guard cannot
+// have, so the two that need to look at names come here instead of each
+// growing its own reading of the keyword list.
+//
+// `positionalOnly` is CPython's `/`: `len(obj, /)` accepts no keyword at all,
+// while `round(number, ndigits=None)` accepts both by name.
+std::optional<llvm::SmallVector<const parser::Node *, 4>>
+bindBuiltinArguments(const parser::Node &expr,
+                     llvm::ArrayRef<llvm::StringRef> parameters,
+                     unsigned positionalOnly) {
+  llvm::SmallVector<const parser::Node *, 4> bound(parameters.size(), nullptr);
+  const auto *args = ast::nodeList(expr, "args");
+  unsigned positional = args ? static_cast<unsigned>(args->size()) : 0;
+  if (positional > parameters.size())
+    return std::nullopt;
+  for (unsigned index = 0; index < positional; ++index)
+    bound[index] = (*args)[index].get();
+  if (const auto *keywords = ast::nodeList(expr, "keywords"))
+    for (const parser::NodePtr &keyword : *keywords) {
+      std::optional<std::string_view> name = ast::string(*keyword, "arg");
+      // `**kwargs` has no name; nothing static can be said about what it binds.
+      if (!name)
+        return std::nullopt;
+      const auto *found = llvm::find(parameters, llvm::StringRef(*name));
+      if (found == parameters.end())
+        return std::nullopt;
+      auto index = static_cast<unsigned>(found - parameters.begin());
+      if (index < positionalOnly || bound[index])
+        return std::nullopt;
+      bound[index] = ast::node(*keyword, "value");
+      if (!bound[index])
+        return std::nullopt;
+    }
+  // A gap means an unfilled parameter before a filled one (`round(ndigits=1)`),
+  // which is a missing argument rather than a shorter call.
+  while (!bound.empty() && !bound.back())
+    bound.pop_back();
+  if (llvm::is_contained(bound, nullptr))
+    return std::nullopt;
+  return bound;
+}
+
 std::optional<llvm::StringRef> contractName(mlir::Type type) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
   if (!contract)
@@ -1617,11 +1666,13 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "len" || programBindsName("len"))
     return std::nullopt;
-  const auto *args = ast::nodeList(expr, "args");
-  if (args && args->size() == 1) {
+  static constexpr llvm::StringRef kParameters[] = {"obj"};
+  std::optional<llvm::SmallVector<const parser::Node *, 4>> bound =
+      bindBuiltinArguments(expr, kParameters, /*positionalOnly=*/1);
+  if (bound && bound->size() == 1) {
     // len(d.keys()/values()/items()) measures the dict itself — the views
     // have no runtime object.
-    const parser::Node *argNode = args->front().get();
+    const parser::Node *argNode = bound->front();
     if (argNode && argNode->kind == "Call") {
       const parser::Node *viewCallee = ast::node(*argNode, "func");
       const auto *viewArgs = ast::nodeList(*argNode, "args");
@@ -1821,19 +1872,26 @@ ModuleEmitter::tryEmitRoundCall(const parser::Node &expr,
   if (!calleeNode || calleeNode->kind != "Name" ||
       ast::nameSpelling(*calleeNode) != "round" || programBindsName("round"))
     return std::nullopt;
-  const auto *args = ast::nodeList(expr, "args");
-  if (args && (args->size() == 1 || args->size() == 2)) {
+  static constexpr llvm::StringRef kParameters[] = {"number", "ndigits"};
+  std::optional<llvm::SmallVector<const parser::Node *, 4>> bound =
+      bindBuiltinArguments(expr, kParameters, /*positionalOnly=*/0);
+  if (bound && !bound->empty()) {
     llvm::SmallVector<mlir::Value, 2> inputs;
     llvm::SmallVector<mlir::Type, 1> extraTypes;
-    Value receiver = emitExpr(args->front().get());
+    // `ndigits=None` IS the default (CPython's signature spells it that way),
+    // so it means "no second argument" rather than an argument of type None --
+    // which is what the __round__ contract would otherwise be asked to accept.
+    bool explicitDigits =
+        bound->size() == 2 && !((*bound)[1]->kind == "Constant" &&
+                                ast::isNoneField(*(*bound)[1], "value"));
+    Value receiver = emitExpr(bound->front());
     // round(int) is the identity (CPython); skipping the runtime call also
     // keeps the manifest __round__ contract at a fixed two-argument arity.
-    if (args->size() == 1 &&
-        types.widenLiteral(receiver.type) == types.intType())
+    if (!explicitDigits && types.widenLiteral(receiver.type) == types.intType())
       return coerceValue(receiver, types.intType(), expr);
     inputs.push_back(receiver.value);
-    if (args->size() == 2) {
-      Value ndigits = emitExpr((*args)[1].get());
+    if (explicitDigits) {
+      Value ndigits = emitExpr((*bound)[1]);
       inputs.push_back(ndigits.value);
       extraTypes.push_back(ndigits.type);
     }
