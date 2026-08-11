@@ -107,6 +107,13 @@ private:
   // (EmitterClasses.cpp).
   bool subclassOverridesMethod(llvm::StringRef receiverClass,
                                llvm::StringRef methodName) const;
+  // The same question about a class-level BINDING rather than a method
+  // (EmitterClasses.cpp).
+  bool subclassShadowsAttribute(llvm::StringRef receiverClass,
+                                llvm::StringRef attributeName) const;
+  bool subclassRedeclares(const llvm::StringMap<llvm::StringSet<>> &declarations,
+                          llvm::StringRef receiverClass,
+                          llvm::StringRef name) const;
   // The one gate every method dispatch goes through: emits the diagnostic and
   // returns true when the receiver's static class cannot answer the call
   // (EmitterClasses.cpp).
@@ -768,6 +775,7 @@ private:
   // depend on where in the file it is asked.
   llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredClassBases;
   llvm::StringMap<llvm::StringSet<>> declaredClassMethods;
+  llvm::StringMap<llvm::StringSet<>> declaredClassAttributes;
   // How many except handler bodies enclose the statement being emitted. A bare
   // `raise` re-raises what a handler caught, so at zero there is nothing to
   // re-raise -- the question the lowering cannot ask, because `py.try`'s

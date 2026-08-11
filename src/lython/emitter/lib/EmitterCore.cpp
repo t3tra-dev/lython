@@ -144,12 +144,32 @@ void ModuleEmitter::collectTopLevelBindings() {
           if (base && base->kind == "Name")
             bases.push_back(std::string(ast::nameSpelling(*base)));
       auto &methods = declaredClassMethods[*name];
+      auto &attributes = declaredClassAttributes[*name];
       if (const auto *classBody = ast::nodeList(*statement, "body"))
-        for (const parser::NodePtr &member : *classBody)
-          if (member && (member->kind == "FunctionDef" ||
-                         member->kind == "AsyncFunctionDef"))
+        for (const parser::NodePtr &member : *classBody) {
+          if (!member)
+            continue;
+          if (member->kind == "FunctionDef" ||
+              member->kind == "AsyncFunctionDef") {
             if (auto methodName = ast::string(*member, "name"))
               methods.insert(*methodName);
+            continue;
+          }
+          // A class-level binding is shadowed by a subclass exactly the way a
+          // method is overridden, and reading it through a base-typed
+          // reference is the same unresolvable dispatch.
+          if (member->kind == "AnnAssign") {
+            if (const parser::Node *target = ast::node(*member, "target"))
+              if (target->kind == "Name")
+                attributes.insert(ast::nameSpelling(*target));
+            continue;
+          }
+          if (member->kind == "Assign")
+            if (const auto *targets = ast::nodeList(*member, "targets"))
+              for (const parser::NodePtr &target : *targets)
+                if (target && target->kind == "Name")
+                  attributes.insert(ast::nameSpelling(*target));
+        }
       continue;
     }
     moduleFunctionNames.insert(*name);

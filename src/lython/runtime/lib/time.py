@@ -66,25 +66,30 @@ class struct_time:
         self.tm_gmtoff: int = _time.field(seconds, utc, 9)
 
 
-def localtime(seconds: int = -1) -> struct_time:
+# CPython's default is `seconds=None`. An Optional parameter is not accepted at
+# a call site here yet ("static type ... is not callable"), and a module-level
+# constant is not visible in a default expression, so "now" is spelled inline as
+# the one int no clock can produce. It used to be ANY negative value, which made
+# every pre-1970 timestamp mean "now": `gmtime(-1)` returned the current year
+# instead of 1969.
+def localtime(seconds: int = -9223372036854775808) -> struct_time:
     """Convert seconds since the Epoch to a struct_time in local time.
 
-    A negative `seconds` (the default) means "now", which is how this stands
-    in for CPython's `seconds=None`.
+    Omitting `seconds` means "now", as `seconds=None` does in CPython.
     """
     when = seconds
-    if when < 0:
+    if when == -9223372036854775808:
         when = time_ns() // 1000000000
     return struct_time(when, 0)
 
 
-def gmtime(seconds: int = -1) -> struct_time:
+def gmtime(seconds: int = -9223372036854775808) -> struct_time:
     """Convert seconds since the Epoch to a struct_time in UTC.
 
-    A negative `seconds` (the default) means "now".
+    Omitting `seconds` means "now"; see localtime.
     """
     when = seconds
-    if when < 0:
+    if when == -9223372036854775808:
         when = time_ns() // 1000000000
     return struct_time(when, 1)
 

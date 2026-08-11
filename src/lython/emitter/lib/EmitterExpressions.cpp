@@ -1256,6 +1256,22 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       receiverInstance = typeObject.getInstanceType();
     if (auto contract =
             mlir::dyn_cast_if_present<py::ContractType>(receiverInstance)) {
+      // ⭐ A class attribute a subclass redeclares is read from the DEFINING
+      // class's cell, so a base-typed receiver got the base's value:
+      //
+      //     class A: kind: int = 1
+      //     class B(A): kind: int = 2
+      //     x: A = B()
+      //     print(x.kind)      # printed 1; CPython prints 2
+      //
+      // The same unresolvable dispatch the method gate refuses, reached
+      // through a binding instead of a call, so it goes through the same gate
+      // -- including its exemptions for a constructed receiver and for `self`
+      // inside a standalone method body.
+      if (subclassShadowsAttribute(contract.getContractName(), *attr) &&
+          refuseUnresolvableDispatch(expr, object, *attr,
+                                     ast::node(expr, "value")))
+        return emitNone(expr);
       if (std::optional<std::pair<llvm::StringRef, mlir::Type>> slot =
               resolveClassAttrSlot(contract.getContractName(), *attr)) {
         std::string cellName =

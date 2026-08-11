@@ -20,6 +20,14 @@ class C(B):
     pass
 
 
+class Shadowed:
+    kind: int = 1
+
+
+class ShadowedSub(Shadowed):
+    kind: int = 2
+
+
 class Plain:
     def w(self) -> int:
         return 5
@@ -105,6 +113,9 @@ def main() -> None:
     for x in [B(), B()]:
         print(x.v())
     protocols_on_exact_receivers()
+    print(Shadowed().kind, ShadowedSub().kind)
+    s = Shadowed()
+    print(s.kind)
 
 
 main()

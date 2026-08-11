@@ -5,6 +5,8 @@
 # next line was refused. There is no dynamic dispatch to fall back to, so all
 # of them are refused where the hierarchy is visible.
 class A:
+    kind: int = 1
+
     def v(self) -> int:
         return 1
 
@@ -29,6 +31,8 @@ class A:
 
 
 class B(A):
+    kind: int = 2
+
     def v(self) -> int:
         return 2
 
@@ -60,3 +64,4 @@ print(a + 1)
 print(a[0])
 print(repr(a))
 print(a.size)
+print(a.kind)

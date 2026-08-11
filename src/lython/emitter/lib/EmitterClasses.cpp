@@ -487,9 +487,16 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
       if (argument.getArgNumber() == 0 && argument.getOwner() &&
           argument.getOwner()->isEntryBlock())
         return false;
-  if (!subclassOverridesMethod(contract.getContractName(), methodName))
+  // Either kind of redeclaration: a method the subclass overrides, or a
+  // class-level binding it shadows. Both are read from the defining class
+  // through a base-typed receiver.
+  bool redeclared =
+      subclassOverridesMethod(contract.getContractName(), methodName) ||
+      subclassShadowsAttribute(contract.getContractName(), methodName);
+  if (!redeclared)
     return false;
-  if (!lookupClassMethod(receiver.type, methodName))
+  if (!lookupClassMethod(receiver.type, methodName) &&
+      !lookupClassStaticAttr(receiver.type, methodName))
     return false;
   diagnostics.push_back(parser::Diagnostic{
       parser::Severity::Error, anchor.range.start,
@@ -502,6 +509,18 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
 
 bool ModuleEmitter::subclassOverridesMethod(llvm::StringRef receiverClass,
                                             llvm::StringRef methodName) const {
+  return subclassRedeclares(declaredClassMethods, receiverClass, methodName);
+}
+
+bool ModuleEmitter::subclassShadowsAttribute(
+    llvm::StringRef receiverClass, llvm::StringRef attributeName) const {
+  return subclassRedeclares(declaredClassAttributes, receiverClass,
+                            attributeName);
+}
+
+bool ModuleEmitter::subclassRedeclares(
+    const llvm::StringMap<llvm::StringSet<>> &declarations,
+    llvm::StringRef receiverClass, llvm::StringRef name) const {
   // Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
   // class emission fills: the answer must not depend on where in the file the
   // question is asked (`collectTopLevelBindings`).
@@ -545,9 +564,8 @@ bool ModuleEmitter::subclassOverridesMethod(llvm::StringRef receiverClass,
     for (llvm::StringRef cls : reachable) {
       if (cls == receiverClass || receiverAncestors.contains(cls))
         continue;
-      auto declared = declaredClassMethods.find(cls);
-      if (declared != declaredClassMethods.end() &&
-          declared->second.contains(methodName))
+      auto declared = declarations.find(cls);
+      if (declared != declarations.end() && declared->second.contains(name))
         return true;
     }
   }
