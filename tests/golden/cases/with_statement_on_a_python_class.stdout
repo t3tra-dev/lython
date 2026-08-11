@@ -45,3 +45,12 @@ enter a
 enter boom
 exit a
 caught v
+enter suppressing
+exit sees False
+continues after the with
+enter reporting
+exit sees False
+caught v
+enter suppressing
+body
+exit sees True

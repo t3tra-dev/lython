@@ -90,3 +90,4 @@ errors/override_inherited_from_a_mixin emit
 errors/override_reached_before_the_subclass emit
 errors/global_declaration_without_storage emit
 errors/self_referential_union_field lower
+errors/exit_reads_the_exception_class emit

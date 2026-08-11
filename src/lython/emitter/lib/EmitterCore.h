@@ -400,6 +400,11 @@ private:
   void emitTryStar(const parser::Node &statement);
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
+  // The exception arm's tail: suppress on a truthy __exit__, rethrow
+  // otherwise. Null on the normal-path cleanup, which has no decision to take.
+  void emitWithExitDecision(const parser::Node &anchor, const Value *suppress);
+  void refuseUnrepresentableExitArguments(const parser::Node &anchor,
+                                          const MethodBinding &exit);
   void emitWithEnter(const parser::Node &item, bool async);
 
   mlir::Value emitValueDiamond(mlir::Location location, mlir::Value condition,

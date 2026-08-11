@@ -22,6 +22,27 @@ class Ctx:
         return False
 
 
+class Suppressing:
+    def __enter__(self) -> None:
+        print("enter suppressing")
+
+    def __exit__(self, t: object, v: object, tb: object) -> bool:
+        # CPython hands the LIVE exception here and a truthy return suppresses
+        # it. Both used to be untrue: the triple was always (None, None, None)
+        # and the result was discarded.
+        print("exit sees", v is None)
+        return True
+
+
+class Reporting:
+    def __enter__(self) -> None:
+        print("enter reporting")
+
+    def __exit__(self, t: object, v: object, tb: object) -> bool:
+        print("exit sees", v is None)
+        return False
+
+
 class Boom:
     def __enter__(self) -> str:
         print("enter boom")
@@ -113,6 +134,25 @@ def second_enter_raises() -> None:
         print("caught", e)
 
 
+def suppressed() -> None:
+    with Suppressing():
+        raise ValueError("swallowed")
+    print("continues after the with")
+
+
+def not_suppressed() -> None:
+    try:
+        with Reporting():
+            raise ValueError("v")
+    except ValueError as e:
+        print("caught", e)
+
+
+def suppressor_on_the_clean_path() -> None:
+    with Suppressing():
+        print("body")
+
+
 def main() -> None:
     simple()
     nested()
@@ -125,6 +165,9 @@ def main() -> None:
     print(handled_inside_then_return())
     two_items()
     second_enter_raises()
+    suppressed()
+    not_suppressed()
+    suppressor_on_the_clean_path()
 
 
 main()
