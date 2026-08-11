@@ -388,7 +388,18 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   //
   // Returning an element of a container built in the SAME frame is the whole
   // shape; a parameter (`def f(xs): return xs[0]`) is fine, and so is an int
-  // or a str element, which have no token to move. It is the read side of the
+  // or a str element, which have no token to move. Returning the ITERATION
+  // element lands here too, with the other half of the message --
+  //
+  //     def f(xs: list[int]) -> int:
+  //         for x in xs:
+  //             return x
+  //         return -1
+  //     # "owned resource from builtin.unrealized_conversion_cast reaches
+  //     #  function exit without release, transfer, or owned return"
+  //
+  // -- and `break` in the same position is fine, so it is the return that the
+  // marker's group cannot be matched against, not the loop. It is the read side of the
   // same accounting the `initializeSequencePayload` note describes from the
   // write side ("three releases for two references") -- the same *args and
   // **kwargs shapes (`return args[0]`, `return kwargs["a"]`) land here too.
