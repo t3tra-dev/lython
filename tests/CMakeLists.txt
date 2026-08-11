@@ -519,6 +519,9 @@ set(LYTHON_LEAK_GATE_CASES
     # A container mutated across a back edge: the computed-index form used to
     # retain and release different objects.
     container_mutated_across_a_back_edge
+    # An element read out of a container is an alias; both records book the
+    # same object's reference.
+    mutable_element_read_out_of_a_container
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

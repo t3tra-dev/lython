@@ -550,6 +550,27 @@ mlir::LogicalResult RuntimeBundleLowerer::bindOwnedEvidenceValue(
 mlir::LogicalResult RuntimeBundleLowerer::bindRetainedEvidenceBundle(
     mlir::Operation *op, mlir::Value resultValue, RuntimeBundle bundle,
     const RuntimeBundle *container) {
+  // Reading a mutable container OUT of another one hands out an ALIAS, and
+  // the copy taken here and the parent's cached description are then two
+  // records of one object that no longer track each other.
+  //
+  //     t: list[list[int]] = [[1, 2]]
+  //     t[0].append(3)
+  //     a = t[0]
+  //     a.append(4)
+  //     print(a)      # printed [1, 2, 4, None]; CPython prints [1, 2, 3, 4]
+  //
+  // The first append grew the object; the parent still described the element
+  // as two long, so `a` appended at index 2 -- over the 3 -- and set the
+  // length to 4, leaving index 3 never written. A tuple parent did the same
+  // and then aborted in repr on the unwritten slot.
+  //
+  // So contents evidence does not cross the read; the payload does. Both
+  // records then answer from the object, which is the only thing that can be
+  // shared. Only for a container that HAS a payload -- for an evidence-only
+  // one the evidence is the sole description of its contents.
+  if (RuntimeBundleLowerer::containerHasRuntimePayload(bundle))
+    RuntimeBundleLowerer::demoteMutableContainerEvidence(bundle);
   RuntimeValue element{bundle.objectValue.contract,
                        llvm::SmallVector<mlir::Value, 4>(
                            bundle.physicalValues().begin(),

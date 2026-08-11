@@ -1076,27 +1076,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
               op, updatedRuntime, required, "list append")))
         return mlir::failure();
 
-      // ⛔ KNOWN DEFECT, one level deeper than this records. The re-description
-      // lands on the receiver VALUE, and a one-level chain is fine because the
-      // next `m.leaves` reads the slot again. A two-level chain stops at a
-      // cache instead:
+      // The re-description lands on the receiver VALUE. That used to be wrong
+      // one level deeper -- `t.mid.leaves.append(1); t.mid.leaves.append(2)`
+      // grew a list the second `t.mid` load described from `t`'s pre-append
+      // cache -- and it is now handled where the cache is READ rather than
+      // here: `bindRetainedEvidenceBundle` does not let contents evidence
+      // cross the read at all, so both records answer from the object.
       //
-      //     t.mid.leaves.append(1)
-      //     t.mid.leaves.append(2)
-      //     print(t.mid.leaves[1])      # garbage; CPython prints 2
-      //
-      // The second `t.mid` load takes `t`'s cached bundle for `mid`, which
-      // still carries the pre-append `leaves`, so the second append grows a
-      // list described by the first append's payload and length. One append is
-      // correct, `m = t.mid` first is correct, and one level is correct.
-      //
-      // Why NOT drop the cached field evidence along the chain, which is what
-      // the shape suggests: tried, and it turns the wrong answer into an abort
+      // ⛔ That is NOT the same as dropping the cached field bundle along the
+      // chain, which was tried here and turned the wrong answer into an abort
       // (`Ly_IncRef observed non-positive refcount`) and a SIGBUS. The field
       // bundle is not only a description, it is where the slot's owned
       // reference is booked; dropping it loses the bookkeeping with the
-      // staleness. The re-description has to be PUBLISHED up the chain, not
-      // deleted from it.
+      // staleness. What travels is the payload, and what stops is the
+      // description of the contents.
       //
       // A rebind names the re-description under the local's new SSA value; an
       // interior view has no local, so the receiver VALUE learns it instead.
