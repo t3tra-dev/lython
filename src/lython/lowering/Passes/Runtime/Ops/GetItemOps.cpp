@@ -300,6 +300,22 @@ bool valueIsFrameOwnedProduct(mlir::ModuleOp module, mlir::Value value,
 // is already in the IR: the question is answered by LOOKING, not by predicting.
 // Any such release anywhere in the function declines the borrow, which is the
 // conservative direction (a token is minted, as before).
+// CPython names the type in an index error: "list index out of range",
+// "tuple index out of range", "string index out of range". `bytes` is the odd
+// one out -- bytearray_getitem and bytes_item say plain "index out of range" --
+// so this follows the interpreter rather than regularising it.
+llvm::StringRef indexOutOfRangeMessage(llvm::StringRef contractName) {
+  if (contractName == "builtins.list")
+    return "list index out of range";
+  if (contractName == "builtins.tuple")
+    return "tuple index out of range";
+  if (contractName == "builtins.str")
+    return "string index out of range";
+  if (contractName == "builtins.bytes" || contractName == "builtins.bytearray")
+    return "index out of range";
+  return "sequence index out of range";
+}
+
 bool frameKeepsOwnedSourceOf(mlir::ModuleOp module, mlir::Operation *op,
                              const RuntimeValue &value) {
   if (value.values.empty())
@@ -818,7 +834,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
           RuntimeBundleLowerer::selectEvidenceObjectMiss(
               op, op.getResult(), container.sequenceElements,
               "sequence __getitem__", "builtins.IndexError",
-              "sequence index out of range");
+              indexOutOfRangeMessage(container.contractName()));
       if (mlir::failed(selected))
         return mlir::failure();
       if (mlir::failed(bindSelectedEvidenceObjectResult(op, op.getResult(),
@@ -837,7 +853,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
           RuntimeBundleLowerer::selectEvidenceObjectMiss(
               op, op.getResult(), container.sequenceElements,
               "sequence __getitem__", "builtins.IndexError",
-              "sequence index out of range");
+              indexOutOfRangeMessage(container.contractName()));
       if (mlir::failed(selected))
         return mlir::failure();
       if (mlir::failed(bindSelectedEvidenceObjectResult(op, op.getResult(),
@@ -938,7 +954,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
       RuntimeBundleLowerer::selectEvidenceObjectByMatch(
           op, op.getResult(), container.sequenceElements, matches,
           "sequence __getitem__", "builtins.IndexError",
-          "sequence index out of range");
+          indexOutOfRangeMessage(container.contractName()));
   if (mlir::failed(selected))
     return mlir::failure();
 
@@ -1236,8 +1252,9 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   {
     mlir::OpBuilder::InsertionGuard insertionGuard(builder);
     builder.setInsertionPointToStart(&guard.getThenRegion().front());
-    if (mlir::failed(emitRuntimeException(op, "builtins.IndexError",
-                                          "sequence index out of range")))
+    if (mlir::failed(emitRuntimeException(
+            op, "builtins.IndexError",
+            indexOutOfRangeMessage(container.contractName()))))
       return mlir::failure();
   }
   builder.setInsertionPointAfter(guard);
