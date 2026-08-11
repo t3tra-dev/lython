@@ -29,7 +29,11 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
                                  enterInference.awaitableType},
                            enterInference.awaitResult);
       } else if (std::optional<MethodBinding> method =
-                     lookupClassMethod(contextValue.type, "__enter__")) {
+                     (refuseUnresolvableDispatch(*item, contextValue,
+                                                 "__enter__")
+                          ? std::nullopt
+                          : lookupClassMethod(contextValue.type,
+                                              "__enter__"))) {
         // ⭐ A context manager written in Python. `py.enter` is answered from
         // the runtime manifest, so a user class reached the lowering and was
         // refused there -- "runtime manifest has no Ctx.__enter__ method" --
@@ -129,7 +133,9 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
 
   // The `__enter__` instance of the same rule; see emitWith.
   if (std::optional<MethodBinding> method =
-          lookupClassMethod(cleanup.manager.type, "__exit__")) {
+          (refuseUnresolvableDispatch(anchor, cleanup.manager, "__exit__")
+               ? std::nullopt
+               : lookupClassMethod(cleanup.manager.type, "__exit__"))) {
     (void)emitInlineOperatorCall(anchor, cleanup.manager, *method,
                                  {none, none, none});
     return;

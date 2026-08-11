@@ -846,7 +846,9 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   }
   if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
     if (std::optional<MethodBinding> method =
-            lookupClassMethod(rhs.type, "__contains__")) {
+            (refuseUnresolvableDispatch(expr, rhs, "__contains__")
+                 ? std::nullopt
+                 : lookupClassMethod(rhs.type, "__contains__"))) {
       Value membership = emitInlineOperatorCall(expr, rhs, *method, {lhs});
       if (ast::isOperator(op, "In"))
         return membership;
@@ -1066,7 +1068,9 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
     return emitSliceSubscript(expr, container, *sliceNode);
   Value index = emitExpr(ast::node(expr, "slice"));
   if (std::optional<MethodBinding> method =
-          lookupClassMethod(container.type, "__getitem__"))
+          (refuseUnresolvableDispatch(expr, container, "__getitem__")
+               ? std::nullopt
+               : lookupClassMethod(container.type, "__getitem__")))
     return emitInlineOperatorCall(expr, container, *method, {index});
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
       container.type, "__getitem__", {index.type});
@@ -1203,6 +1207,11 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (std::optional<MethodBinding> property =
           lookupClassMethod(object.type, *attr);
       property && property->kind == "property") {
+    // A getter is a method, and reading `a.v` through a base-typed `a` is the
+    // same unresolvable dispatch as calling `a.v()` would be.
+    if (refuseUnresolvableDispatch(expr, object, *attr,
+                                   ast::node(expr, "value")))
+      return emitNone(expr);
     if (mlir::isa<py::TypeType>(object.type)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
@@ -2216,7 +2225,9 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
   // implementation to dispatch to, because "the truth of an erased object" is
   // not a runtime question — it is answered by the static class.
   if (std::optional<MethodBinding> truth =
-          lookupClassMethod(widened, "__bool__")) {
+          (refuseUnresolvableDispatch(anchor, value, "__bool__")
+               ? std::nullopt
+               : lookupClassMethod(widened, "__bool__"))) {
     llvm::StringMap<Value> emptyKeywords;
     Value receiver = emitDescriptorReceiver(anchor, value, *truth);
     Value result =
@@ -2225,7 +2236,9 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
     return emitBoolValue(result, anchor);
   }
   if (std::optional<MethodBinding> length =
-          lookupClassMethod(widened, "__len__")) {
+          (refuseUnresolvableDispatch(anchor, value, "__len__")
+               ? std::nullopt
+               : lookupClassMethod(widened, "__len__"))) {
     llvm::StringMap<Value> emptyKeywords;
     Value receiver = emitDescriptorReceiver(anchor, value, *length);
     Value count = emitInlineMethodBody(anchor, receiver,

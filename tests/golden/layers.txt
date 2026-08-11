@@ -87,3 +87,5 @@ errors/type_object_call_via_value lower
 errors/len_takes_no_keyword_arguments emit
 errors/starred_assignment_target emit
 errors/override_behind_a_base_typed_receiver emit
+errors/override_inherited_from_a_mixin emit
+errors/override_reached_before_the_subclass emit

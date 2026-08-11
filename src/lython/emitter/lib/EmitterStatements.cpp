@@ -391,7 +391,9 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
       Value container = emitExpr(ast::node(*target, "value"));
       Value index = emitExpr(ast::node(*target, "slice"));
       if (std::optional<MethodBinding> method =
-              lookupClassMethod(container.type, "__delitem__")) {
+              (refuseUnresolvableDispatch(*target, container, "__delitem__")
+                   ? std::nullopt
+                   : lookupClassMethod(container.type, "__delitem__"))) {
         emitInlineOperatorCall(*target, container, *method, {index});
         continue;
       }
@@ -680,7 +682,9 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     }
     Value index = emitExpr(ast::node(target, "slice"));
     if (std::optional<MethodBinding> method =
-            lookupClassMethod(container.type, "__setitem__")) {
+            (refuseUnresolvableDispatch(target, container, "__setitem__")
+                 ? std::nullopt
+                 : lookupClassMethod(container.type, "__setitem__"))) {
       emitInlineOperatorCall(target, container, *method, {index, value});
       return;
     }

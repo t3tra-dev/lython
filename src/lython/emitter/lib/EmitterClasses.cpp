@@ -439,17 +439,117 @@ ModuleEmitter::resolveMroMethod(llvm::StringRef receiverClass,
 // This project resolves statically or refuses; it has no dynamic dispatch to
 // fall back to, so the call is refused at the earliest boundary that can see
 // the hierarchy rather than silently running the base's body.
+// ⭐ ONE gate for every dispatch, because there are a dozen of them.
+//
+// The guard started at the `x.m()` call site alone, and every other way to
+// reach a method walked past it -- `len(a)`, `a == b`, `a + b`, `a[i]`,
+// `if a:`, `repr(a)`, `with a:`, `for x in a:` all bound the base's body on a
+// base-typed receiver while `a.__len__()` on the next line was refused. Eleven
+// dunders were measured silently wrong. A predicate with one caller and a
+// dozen bypasses is not a guard, so this is the question and the refusal
+// together, and the sites ask it rather than re-deriving it.
+//
+// `receiverNode` may be null: an operator has operands, not a receiver
+// expression. Only the `super(...)` exemption needs the syntax; the other two
+// are properties of the value.
+bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
+                                               Value receiver,
+                                               llvm::StringRef methodName,
+                                               const parser::Node *receiverNode,
+                                               bool throughSuper) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+  if (!contract)
+    return false;
+  if (throughSuper)
+    return false;
+  if (receiverNode && receiverNode->kind == "Call") {
+    const parser::Node *callee = ast::node(*receiverNode, "func");
+    if (callee && callee->kind == "Name" &&
+        llvm::StringRef(ast::nameSpelling(*callee)) == "super")
+      return false;
+  }
+  // A CONSTRUCTED receiver names its class exactly, so no subclass can be
+  // behind it. Asked of the SSA VALUE, not the expression: the value is the
+  // construction for both `Left().tag()` and `x = Left(); x.tag()`, and
+  // everything that is not exact answers correctly with no bookkeeping -- an
+  // upcast is a different op, a joined binding is a block argument, a field or
+  // element read is a load.
+  if (mlir::Operation *definition = receiver.value.getDefiningOp())
+    if (mlir::isa<py::NewOp, py::InitOp>(definition))
+      return false;
+  // `self` in the STANDALONE copy of a method body. Every real call inlines
+  // the body with `self` bound to the actual receiver, so this guard never
+  // fires there; the standalone copy is the one place `self` carries the
+  // defining class, and refusing it takes out a program whose every call site
+  // is exact.
+  if (!superContexts.empty())
+    if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(receiver.value))
+      if (argument.getArgNumber() == 0 && argument.getOwner() &&
+          argument.getOwner()->isEntryBlock())
+        return false;
+  if (!subclassOverridesMethod(contract.getContractName(), methodName))
+    return false;
+  if (!lookupClassMethod(receiver.type, methodName))
+    return false;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      "'" + std::string(methodName) + "' is overridden by a subclass of '" +
+          contract.getContractName().str() +
+          "', so this call cannot be resolved from the static type of the "
+          "receiver"});
+  return true;
+}
+
 bool ModuleEmitter::subclassOverridesMethod(llvm::StringRef receiverClass,
                                             llvm::StringRef methodName) const {
-  for (const auto &entry : classMros) {
-    if (entry.getKey() == receiverClass)
+  // Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
+  // class emission fills: the answer must not depend on where in the file the
+  // question is asked (`collectTopLevelBindings`).
+  auto ancestors = [&](llvm::StringRef cls, llvm::StringSet<> &out) {
+    llvm::SmallVector<llvm::StringRef, 8> worklist{cls};
+    while (!worklist.empty()) {
+      llvm::StringRef current = worklist.pop_back_val();
+      auto bases = declaredClassBases.find(current);
+      if (bases == declaredClassBases.end())
+        continue;
+      for (const std::string &base : bases->second)
+        if (out.insert(base).second)
+          worklist.push_back(base);
+    }
+  };
+
+  llvm::StringSet<> receiverAncestors;
+  ancestors(receiverClass, receiverAncestors);
+
+  for (const auto &entry : declaredClassBases) {
+    llvm::StringRef candidate = entry.getKey();
+    if (candidate == receiverClass)
       continue;
-    if (!llvm::is_contained(entry.getValue(), receiverClass))
+    llvm::StringSet<> candidateAncestors;
+    ancestors(candidate, candidateAncestors);
+    if (!candidateAncestors.contains(receiverClass))
       continue;
-    auto methods = classMethodBindings.find(entry.getKey());
-    if (methods != classMethodBindings.end() &&
-        methods->second.count(methodName))
-      return true;
+    // ⭐ A declaration the subclass reaches WITHOUT going through the receiver
+    // class is an override, whether the subclass wrote it or inherited it from
+    // a mixin. Testing only what the subclass declares itself missed
+    // `class B(M, A): pass` -- B declares nothing, resolves `v` to M's, and
+    // the base's body was inlined for it.
+    //
+    // The receiver's own ancestors are excluded because a declaration there is
+    // what the receiver already resolves to, not a competitor. Conservative in
+    // a diamond, which is the direction that refuses rather than the direction
+    // that mis-executes.
+    llvm::SmallVector<llvm::StringRef, 8> reachable{candidate};
+    for (const auto &ancestor : candidateAncestors)
+      reachable.push_back(ancestor.getKey());
+    for (llvm::StringRef cls : reachable) {
+      if (cls == receiverClass || receiverAncestors.contains(cls))
+        continue;
+      auto declared = declaredClassMethods.find(cls);
+      if (declared != declaredClassMethods.end() &&
+          declared->second.contains(methodName))
+        return true;
+    }
   }
   return false;
 }

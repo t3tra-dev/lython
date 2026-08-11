@@ -131,6 +131,25 @@ void ModuleEmitter::collectTopLevelBindings() {
       continue;
     if (!isFunction) {
       moduleClassNames.insert(*name);
+      // ⭐ The hierarchy, recorded BEFORE anything is emitted. The maps the
+      // class emission fills are built as each ClassDef is reached, so a
+      // question asked from a function body above a subclass got the answer
+      // "no subclass" and the override guard let a silent wrong dispatch
+      // through -- moving `class B` up flipped the same program to a refusal.
+      // Whether a hierarchy has an override is a property of the module, not
+      // of where in it the question is asked.
+      auto &bases = declaredClassBases[*name];
+      if (const auto *baseNodes = ast::nodeList(*statement, "bases"))
+        for (const parser::NodePtr &base : *baseNodes)
+          if (base && base->kind == "Name")
+            bases.push_back(std::string(ast::nameSpelling(*base)));
+      auto &methods = declaredClassMethods[*name];
+      if (const auto *classBody = ast::nodeList(*statement, "body"))
+        for (const parser::NodePtr &member : *classBody)
+          if (member && (member->kind == "FunctionDef" ||
+                         member->kind == "AsyncFunctionDef"))
+            if (auto methodName = ast::string(*member, "name"))
+              methods.insert(*methodName);
       continue;
     }
     moduleFunctionNames.insert(*name);

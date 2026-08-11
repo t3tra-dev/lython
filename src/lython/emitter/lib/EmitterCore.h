@@ -107,6 +107,13 @@ private:
   // (EmitterClasses.cpp).
   bool subclassOverridesMethod(llvm::StringRef receiverClass,
                                llvm::StringRef methodName) const;
+  // The one gate every method dispatch goes through: emits the diagnostic and
+  // returns true when the receiver's static class cannot answer the call
+  // (EmitterClasses.cpp).
+  bool refuseUnresolvableDispatch(const parser::Node &anchor, Value receiver,
+                                  llvm::StringRef methodName,
+                                  const parser::Node *receiverNode = nullptr,
+                                  bool throughSuper = false);
   // True when `type` is a SOURCE class whose linearization provides
   // `methodName` only through builtins.object — i.e. it inherits object's
   // default. The question is not "does the method resolve" (since the class's
@@ -751,6 +758,11 @@ private:
   llvm::StringMap<llvm::SmallVector<std::string, 4>> classBaseNames;
   // C3 linearization per class (self first, canonical contract names).
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classMros;
+  // The module's class hierarchy as WRITTEN, filled by collectTopLevelBindings
+  // before any emission, so that "does a subclass override this" does not
+  // depend on where in the file it is asked.
+  llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredClassBases;
+  llvm::StringMap<llvm::StringSet<>> declaredClassMethods;
   // How many except handler bodies enclose the statement being emitted. A bare
   // `raise` re-raises what a handler caught, so at zero there is nothing to
   // re-raise -- the question the lowering cannot ask, because `py.try`'s

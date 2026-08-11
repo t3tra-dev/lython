@@ -458,52 +458,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (const parser::Node *receiverNode = ast::node(*calleeNode, "value")) {
       if (auto methodName = ast::string(*calleeNode, "attr")) {
         Value receiver = emitExpr(receiverNode);
-        // ⛔ NOT through a `super(...)` view. `super(Left, Both()).tag()` names
-        // the class to start the MRO after, so the base's body is the answer
-        // the program ASKED for, not a guess this walk made from a static
-        // type. Refusing it took out class_super and class_mro, which is how
-        // the same over-broad refusal failed the first three times it was
-        // tried.
-        bool throughSuper = receiverNode->kind == "Call" && [&] {
-          const parser::Node *callee = ast::node(*receiverNode, "func");
-          return callee && callee->kind == "Name" &&
-                 ast::nameSpelling(*callee) == "super";
-        }();
-        // A CONSTRUCTED receiver names its class exactly, so no subclass can
-        // be behind it -- `Left().tag()` is Left's `tag` however many
-        // subclasses override it, and so is `x = Left()` followed by
-        // `x.tag()`. Without this the refusal takes out every hierarchy that
-        // has an override at all, which is what it did to class_super and
-        // class_mro.
-        //
-        // Asked of the SSA VALUE rather than of the receiver expression: the
-        // value is the construction itself for both spellings, while the
-        // expression is a Call in one and a Name in the other. It also
-        // answers correctly for everything that is NOT exact with no
-        // bookkeeping -- an upcast (`a: A = B()`) is a different op, a
-        // loop-carried or joined binding is a block argument, and a field or
-        // element read is a load. No tracking means no stale entry, which
-        // matters because a stale one would read as exact and put the silent
-        // wrong answer back.
-        mlir::Operation *receiverDefinition = receiver.value.getDefiningOp();
-        bool exactlyConstructed =
-            receiverDefinition &&
-            mlir::isa<py::NewOp, py::InitOp>(receiverDefinition);
-        if (auto contract =
-                mlir::dyn_cast_if_present<py::ContractType>(receiver.type))
-          if (!throughSuper && !exactlyConstructed &&
-              subclassOverridesMethod(contract.getContractName(),
-                                      *methodName) &&
-              lookupClassMethod(receiver.type, *methodName)) {
-            diagnostics.push_back(parser::Diagnostic{
-                parser::Severity::Error, calleeNode->range.start,
-                "'" + std::string(*methodName) +
-                    "' is overridden by a subclass of '" +
-                    contract.getContractName().str() +
-                    "', so this call cannot be resolved from the static type "
-                    "of the receiver"});
-            return emitNone(expr);
-          }
+        if (refuseUnresolvableDispatch(*calleeNode, receiver, *methodName,
+                                       receiverNode))
+          return emitNone(expr);
         if (std::optional<MethodBinding> method =
                 lookupClassMethod(receiver.type, *methodName)) {
           // A generator method is routed through the bound function object for
@@ -1000,6 +957,8 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     if (std::optional<MethodBinding> method =
             lookupClassMethod(argumentType, "__str__")) {
       Value argument = emitExpr(strArgs->front().get());
+      if (refuseUnresolvableDispatch(expr, argument, "__str__"))
+        return emitNone(expr);
       llvm::StringMap<Value> emptyKeywords;
       Value descriptorReceiver =
           emitDescriptorReceiver(expr, argument, *method);
@@ -1167,6 +1126,8 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       if (std::optional<MethodBinding> method =
               lookupClassMethod(argumentType, "__str__")) {
         Value argument = emitExpr(argNode);
+        if (refuseUnresolvableDispatch(expr, argument, "__str__"))
+          return emitNone(expr);
         llvm::StringMap<Value> emptyKeywords;
         Value receiver = emitDescriptorReceiver(expr, argument, *method);
         return emitInlineMethodBody(expr, receiver,
@@ -1197,6 +1158,8 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       if (std::optional<MethodBinding> method =
               lookupClassMethod(argumentType, "__repr__")) {
         Value argument = emitExpr(argNode);
+        if (refuseUnresolvableDispatch(expr, argument, "__repr__"))
+          return emitNone(expr);
         llvm::StringMap<Value> emptyKeywords;
         Value receiver = emitDescriptorReceiver(expr, argument, *method);
         return emitInlineMethodBody(expr, receiver,
@@ -1736,6 +1699,8 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
       }
     }
     Value input = emitExpr(argNode);
+    if (refuseUnresolvableDispatch(expr, input, "__len__"))
+      return emitNone(expr);
     if (std::optional<MethodBinding> method =
             lookupClassMethod(input.type, "__len__"))
       return emitInlineOperatorCall(expr, input, *method, {});
@@ -1905,6 +1870,8 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
   if (!lookupClassMethod(argType, "__hash__"))
     return std::nullopt;
   Value input = emitExpr(args->front().get());
+  if (refuseUnresolvableDispatch(expr, input, "__hash__"))
+    return emitNone(expr);
   std::optional<MethodBinding> method =
       lookupClassMethod(input.type, "__hash__");
   if (!method)
@@ -2001,6 +1968,12 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
     if (sourceMethod) {
       // Source-class method: inline the method body.
       Value argument = emitExpr(args->front().get());
+      if (refuseUnresolvableDispatch(
+              expr, argument,
+              name == "print" && lookupClassMethod(argumentType, "__str__")
+                  ? "__str__"
+                  : "__repr__"))
+        return emitNone(expr);
       llvm::StringMap<Value> emptyKeywords;
       Value descriptorReceiver =
           emitDescriptorReceiver(expr, argument, *sourceMethod);
@@ -2074,6 +2047,8 @@ ModuleEmitter::emitInheritedObjectStr(const parser::Node &anchor,
   mlir::Type widened = types.widenLiteral(receiver.type);
   if (!inheritsObjectDefaultDunder(widened, "__str__"))
     return std::nullopt;
+  if (refuseUnresolvableDispatch(anchor, receiver, "__repr__"))
+    return emitNone(anchor);
   if (std::optional<MethodBinding> repr =
           lookupClassMethod(widened, "__repr__")) {
     llvm::StringMap<Value> emptyKeywords;
@@ -2105,6 +2080,8 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   // text is a compile-time constant anyway.
   if (valueType == types.none())
     return emitStrLiteralPiece(anchor, "None");
+  if (refuseUnresolvableDispatch(anchor, value, "__str__"))
+    return emitNone(anchor);
   if (std::optional<MethodBinding> method =
           lookupClassMethod(valueType, "__str__")) {
     llvm::StringMap<Value> emptyKeywords;
@@ -2117,6 +2094,8 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   // (CPython object.__str__ delegates to type(x).__repr__); the manifest
   // evidence below would instead resolve the generic object formatter,
   // which cannot see source methods.
+  if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
+    return emitNone(anchor);
   if (std::optional<MethodBinding> method =
           lookupClassMethod(valueType, "__repr__")) {
     llvm::StringMap<Value> emptyKeywords;
@@ -2151,6 +2130,8 @@ ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
   if (valueType == types.none())
     return emitStrLiteralPiece(anchor, "None");
   std::optional<Value> repr;
+  if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
+    return emitNone(anchor);
   if (std::optional<MethodBinding> method =
           lookupClassMethod(valueType, "__repr__")) {
     llvm::StringMap<Value> emptyKeywords;
@@ -2193,6 +2174,8 @@ Value ModuleEmitter::emitFormatValue(const parser::Node &anchor, Value value,
                                      bool specKnownEmpty) {
   mlir::Type strType = types.contract("builtins.str");
   mlir::Type valueType = types.widenLiteral(value.type);
+  if (refuseUnresolvableDispatch(anchor, value, "__format__"))
+    return emitNone(anchor);
   if (std::optional<MethodBinding> method =
           lookupClassMethod(valueType, "__format__")) {
     Value specValue =
