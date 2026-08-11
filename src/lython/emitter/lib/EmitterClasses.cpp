@@ -2541,9 +2541,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   builder.setInsertionPointToEnd(entryBlock);
   mlir::cf::BranchOp::create(builder, loc(anchor), bodyBlock);
   builder.setInsertionPointToStart(bodyBlock);
-  inlineReturnContexts.push_back(InlineReturnContext{
-      continuation, resultType, /*carryResult=*/true,
-      activeWithCleanups.size()});
+  inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
   // ⭐ The inlined body's return type, for the statements that ask for it
   // rather than for the context stack.
   //

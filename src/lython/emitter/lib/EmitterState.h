@@ -53,10 +53,6 @@ struct InlineReturnContext {
   mlir::Block *target = nullptr;
   mlir::Type resultType;
   bool carryResult = true;
-  // How many `with` cleanups were already pending when this body started. A
-  // `return` inside an inlined body leaves THAT body, not the enclosing
-  // function, so it may only run the cleanups the body itself opened.
-  std::size_t withCleanupWatermark = 0;
 };
 
 // One loop-carried local: a pre-existing local reassigned in a loop body,

@@ -56,13 +56,54 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
       activeWithCleanups.push_back(WithCleanup{contextValue, async});
     }
   }
-  emitStatements(ast::nodeList(statement, "body"));
-
-  if (!insertionBlockTerminated(builder)) {
-    for (std::size_t index = activeWithCleanups.size(); index > cleanupStart;
-         --index)
-      emitWithCleanup(statement, activeWithCleanups[index - 1]);
+  // ⭐ The block runs inside an implicit try/finally, which is what `with`
+  // MEANS -- CPython's compiler builds the same thing. Emitting the cleanup
+  // only where the body falls through left the exception path with no
+  // __exit__ at all:
+  //
+  //     try:
+  //         with Ctx():
+  //             raise ValueError("v")
+  //     except ValueError:
+  //         ...          # printed enter/caught; CPython prints
+  //                      # enter/exit/caught
+  //
+  // Routing it through `emitTry` rather than adding an unwind edge here is
+  // what makes return, break, continue and the raise all one path: that
+  // machinery already answers every one of them, and it answered none of them
+  // for `with` before. Return/break/continue used to be handled by a separate
+  // scan of the active cleanups at each of those statements -- three sites
+  // that are gone with it, along with the watermark that kept an inlined
+  // body's return from running the caller's.
+  //
+  // ⛔ Why NOT desugar into `mgr.__exit__(None, None, None)` as an AST call:
+  // the manager is an already-emitted SSA value, and a manifest manager (a
+  // file) does not answer __exit__ through attribute access at all. The
+  // synthesized statement carries an INDEX into the cleanup stack instead,
+  // which is the one thing an AST node can hold about a value.
+  //
+  // ⚠️ What this still does not do: `with A() as a, B() as b` enters both
+  // managers before either try opens, so a raise inside B's __enter__ does
+  // not run A's __exit__. That was true before this too.
+  std::vector<parser::NodePtr> nested(
+      ast::nodeList(statement, "body")
+          ? *ast::nodeList(statement, "body")
+          : std::vector<parser::NodePtr>{});
+  for (std::size_t index = activeWithCleanups.size(); index > cleanupStart;
+       --index) {
+    parser::NodePtr cleanup =
+        parser::makeNode("LyWithCleanup", statement.range);
+    parser::addField(*cleanup, "slot",
+                     static_cast<std::int64_t>(index - 1));
+    parser::NodePtr guarded = parser::makeNode("Try", statement.range);
+    parser::addField(*guarded, "body", std::move(nested));
+    parser::addField(*guarded, "handlers", std::vector<parser::NodePtr>{});
+    parser::addField(*guarded, "orelse", std::vector<parser::NodePtr>{});
+    parser::addField(*guarded, "finalbody",
+                     std::vector<parser::NodePtr>{std::move(cleanup)});
+    nested = std::vector<parser::NodePtr>{std::move(guarded)};
   }
+  emitStatements(&nested);
   activeWithCleanups.resize(cleanupStart);
 }
 
@@ -101,33 +142,6 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
   py::ExitOp::create(builder, loc(anchor), types.boolType(), "__exit__",
                      callProtocolFor(exitInference), cleanup.manager.value,
                      none.value, none.value, none.value, mlir::UnitAttr());
-}
-
-// ⭐ Only the cleanups this scope opened. A `return` inside an INLINED method
-// body leaves that body, not the enclosing function, so the `with` blocks
-// around the call site are still live and must not be torn down:
-//
-//     class Ctx:
-//         def __exit__(self, a, b, c) -> bool:
-//             return False
-//     with Ctx():
-//         ...
-//
-// The first thing `__exit__`'s inlined body does is return, which ran the
-// cleanup that was inlining it -- "recursive class method call is not
-// supported (__exit__ -> __exit__)". Any inlined method called inside a
-// `with` block had the same shape; `__exit__` is only the one that closes the
-// cycle into itself.
-std::size_t ModuleEmitter::currentWithCleanupWatermark() const {
-  return inlineReturnContexts.empty()
-             ? 0
-             : inlineReturnContexts.back().withCleanupWatermark;
-}
-
-void ModuleEmitter::emitActiveCleanups(const parser::Node &anchor) {
-  std::size_t watermark = currentWithCleanupWatermark();
-  for (std::size_t index = activeWithCleanups.size(); index > watermark; --index)
-    emitWithCleanup(anchor, activeWithCleanups[index - 1]);
 }
 
 } // namespace lython::emitter

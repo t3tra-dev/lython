@@ -205,6 +205,17 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     emitWhile(statement);
   } else if (statement.kind == "AsyncFor") {
     emitAsyncFor(statement);
+  } else if (statement.kind == "LyWithCleanup") {
+    // Synthesized by emitWith: the `finally` body of the implicit try that
+    // wraps a `with` block. It carries an index into `activeWithCleanups`
+    // rather than an expression, because the manager is an already-emitted
+    // SSA value and there is no spelling for one in the AST.
+    const parser::Field *slot = parser::findField(statement, "slot");
+    if (slot && std::holds_alternative<std::int64_t>(slot->value)) {
+      auto index = static_cast<std::size_t>(std::get<std::int64_t>(slot->value));
+      if (index < activeWithCleanups.size())
+        emitWithCleanup(statement, activeWithCleanups[index]);
+    }
   } else if (statement.kind == "With") {
     emitWith(statement, false);
   } else if (statement.kind == "AsyncWith") {
@@ -277,7 +288,6 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                       : emitExpr(returnValue);
     if (!inlineReturnContexts.empty()) {
       InlineReturnContext &ctx = inlineReturnContexts.back();
-      emitActiveCleanups(statement);
       if (ctx.carryResult) {
         Value result = ctx.resultType
                            ? coerceValue(value, ctx.resultType, statement)
@@ -291,7 +301,6 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     }
     if (currentReturnType) {
       Value result = coerceValue(value, currentReturnType, statement);
-      emitActiveCleanups(statement);
       mlir::func::ReturnOp::create(builder, loc(statement), result.value);
     }
   } else if (statement.kind == "Break") {
@@ -302,7 +311,6 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           "break outside a supported loop is not implemented yet"});
       return;
     }
-    emitActiveCleanups(statement);
     const LoopControlContext &loop = loopControlContexts.back();
     mlir::cf::BranchOp::create(
         builder, loc(statement), loop.breakTarget,
@@ -315,7 +323,6 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           "continue outside a supported loop is not implemented yet"});
       return;
     }
-    emitActiveCleanups(statement);
     const LoopControlContext &loop = loopControlContexts.back();
     mlir::cf::BranchOp::create(
         builder, loc(statement), loop.continueTarget,

@@ -50,11 +50,55 @@ def loop_inside() -> None:
             print("i", Plain().value() + i)
 
 
+def raises_inside() -> None:
+    try:
+        with Ctx("a"):
+            raise ValueError("v")
+    except ValueError as e:
+        print("caught", e)
+
+
+def early_return() -> int:
+    with Ctx("a"):
+        return 1
+    return 0
+
+
+def break_out() -> None:
+    for i in range(3):
+        with Ctx("a"):
+            if i == 1:
+                break
+            print("body", i)
+
+
+def continue_out() -> None:
+    for i in range(3):
+        with Ctx("a"):
+            if i == 1:
+                continue
+            print("body", i)
+
+
+def handled_inside_then_return() -> int:
+    with Ctx("a"):
+        try:
+            raise ValueError("v")
+        except ValueError:
+            return 7
+    return 0
+
+
 def main() -> None:
     simple()
     nested()
     other_method_inside()
     loop_inside()
+    raises_inside()
+    print(early_return())
+    break_out()
+    continue_out()
+    print(handled_inside_then_return())
 
 
 main()
