@@ -922,6 +922,10 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // @dataclass: init/repr/eq synthesize below (default True); frozen/order
   // are accepted only as explicit False.
   bool isDataclass = false;
+  // A NamedTuple is hashable -- it inherits tuple's __hash__ -- while a plain
+  // dataclass is not (CPython sets __hash__ to None when eq is synthesized and
+  // frozen is not). Only the first gets one below.
+  bool isNamedTuple = false;
   bool dataclassInit = true;
   bool dataclassRepr = true;
   bool dataclassEq = true;
@@ -1003,6 +1007,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                             : llvm::StringRef(qualified);
       if (decoratorLeafName(spelling) == "NamedTuple") {
         isDataclass = true;
+        isNamedTuple = true;
         continue;
       }
       if (!qualified.empty()) {
@@ -1609,6 +1614,54 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
           synthFunctionDef("__repr__", {"self"}, {},
                            {std::move(returnNode)}, range),
           std::move(sig));
+    }
+    // ⭐ A NamedTuple is hashable, so it can be a dict key.
+    //
+    //     class Key(NamedTuple):
+    //         row: int
+    //     d: dict[Key, str] = {}
+    //     d[Key(0)] = "origin"
+    //     print(d[Key(0)])      # KeyError; CPython prints origin
+    //
+    // Equality was already right -- `Key(0) == Key(0)` is True -- and the
+    // runtime dict probes by hash first, so two equal keys landed in different
+    // buckets. CPython's namedtuple inherits tuple.__hash__, which combines
+    // the fields; a plain dataclass gets `__hash__ = None` instead, which is
+    // why this is gated on the NamedTuple marker rather than on `isDataclass`.
+    //
+    // Written as `hash(self.f0) ^ hash(self.f1) ^ ...` over the synthesized
+    // AST, so it goes through the ordinary hash dispatch for each field rather
+    // than needing a new primitive. It is not tuple's exact algorithm, and
+    // does not need to be: Python only requires that equal objects hash equal.
+    if (isNamedTuple && !userDefines("__hash__") && !order.empty()) {
+      parser::NodePtr folded;
+      for (const std::string &field : order) {
+        parser::NodePtr call = parser::makeNode("Call", range);
+        parser::addField(*call, "func", synthName("hash", range));
+        parser::addField(*call, "args",
+                         std::vector<parser::NodePtr>{
+                             synthSelfAttr("self", field, range)});
+        parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+        if (!folded) {
+          folded = std::move(call);
+          continue;
+        }
+        parser::NodePtr combined = parser::makeNode("BinOp", range);
+        parser::addField(*combined, "left", std::move(folded));
+        parser::addField(*combined, "op", parser::makeNode("BitXor", range));
+        parser::addField(*combined, "right", std::move(call));
+        folded = std::move(combined);
+      }
+      parser::NodePtr returnNode = parser::makeNode("Return", range);
+      parser::addField(*returnNode, "value", std::move(folded));
+      FunctionSignature sig;
+      sig.positionalNames.push_back("self");
+      sig.positionalTypes.push_back(types.contract(contractName));
+      sig.positionalDefaults.push_back(false);
+      sig.resultType = types.intType();
+      registerSynthesized(synthFunctionDef("__hash__", {"self"}, {},
+                                           {std::move(returnNode)}, range),
+                          std::move(sig));
     }
     if (dataclassEq && !userDefines("__eq__")) {
       parser::NodePtr expr;
