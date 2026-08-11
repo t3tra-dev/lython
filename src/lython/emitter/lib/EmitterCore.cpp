@@ -15,7 +15,7 @@
 
 #include <utility>
 
-#include "PyDialect.h.inc"
+#include "EmitterPyOps.h"
 
 namespace lython::emitter {
 
@@ -99,6 +99,25 @@ EmitResult ModuleEmitter::emit() {
   mlir::Block *entry = main.addEntryBlock();
   builder.setInsertionPointToStart(entry);
   atModuleScope = true;
+  // ⭐ The module dunders, which are compile-time constants here. A program
+  // compiled by `lyc` IS the main module, so `__name__` is "__main__" and
+  // `if __name__ == "__main__":` -- the most common line in Python -- folds
+  // to a taken branch. It used to be refused: "unresolved name '__name__'".
+  //
+  // `__file__` is the source this walk was handed. `__doc__` is not bound:
+  // it is the module's docstring, which this walk does not keep, and a wrong
+  // constant is worse than an unresolved name.
+  auto bindModuleDunder = [&](llvm::StringRef name, llvm::StringRef text) {
+    mlir::Type literalType = types.literal(("\"" + text + "\"").str());
+    auto constant = py::StrConstantOp::create(builder, loc(moduleNode),
+                                              literalType,
+                                              builder.getStringAttr(text));
+    Value value{constant.getResult(), literalType};
+    values[name] = value;
+    types.bindSymbol(name, literalType);
+  };
+  bindModuleDunder("__name__", "__main__");
+  bindModuleDunder("__file__", sourceName);
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;
   if (!insertionBlockTerminated(builder))

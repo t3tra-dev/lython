@@ -19909,6 +19909,20 @@ module attributes {
     func.return %length : i64
   }
 
+  // The set contract declares __bool__, so `if s:` dispatched to it and the
+  // lowering refused -- "runtime manifest has no builtins.set.__bool__
+  // method". list and dict have no declaration and fall to __len__, which is
+  // why theirs worked. Implemented rather than the declaration removed: a set
+  // IS falsy when empty and typeshed says the method exists, so the missing
+  // half was the implementation.
+  func.func @LySet_Bool(%self: memref<11xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.set", ly.runtime.method = "__bool__"} {
+    %length_slot = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %length = memref.load %self[%length_slot] : memref<11xi64>
+    %non_empty = arith.cmpi ne, %length, %zero : i64
+    func.return %non_empty : i1
+  }
+
   // Runtime set insert with a boxed element (any hashable class; raises
   // TypeError for unhashable elements). The caller retained the box; a
   // duplicate element consumes it here. Void and non-transferring: the growth

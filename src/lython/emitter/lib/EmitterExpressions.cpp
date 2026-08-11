@@ -557,6 +557,29 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
   } else if (left == types.intType() && right == types.intType()) {
     result = types.intType();
   }
+  // ⭐ CPython's numeric tower, at the OPERANDS and not only at the result.
+  // The promotion above answered `int + float` with `builtins.float` and then
+  // dispatched on the unpromoted int, which has no `__add__` taking a float:
+  //
+  //     print(1 + 2.0)
+  //     # static type builtins.int does not provide manifest method '__add__'
+  //
+  // Every mixed arithmetic and every mixed comparison was refused, including
+  // `1 / 2` -- CPython's answer there is 0.5, which is float division of two
+  // promoted operands. In CPython the promotion happens because int.__add__
+  // returns NotImplemented and float.__radd__ converts; the conversion is the
+  // same one, decided statically here because both types are known.
+  //
+  // ⛔ Only when the two operands DISAGREE. `int / int` also answers float,
+  // but CPython computes it by scaling the two integers rather than by
+  // converting each to a double first, so `10**400 / 10**399` is 10.0 where
+  // converting the operands raises OverflowError -- which is what promoting
+  // on the RESULT type did to `int_float_conversion`. The int/int true
+  // division already has that path; what was missing is only the mixed pair.
+  if (left == types.intType() && right == types.floatType())
+    lhs = emitFloatFromInt(expr, lhs);
+  else if (left == types.floatType() && right == types.intType())
+    rhs = emitFloatFromInt(expr, rhs);
   if (ast::isOperator(op, "Sub"))
     return emitBinarySpecial<py::SubOp>(expr, "__sub__", lhs, rhs, result);
   if (ast::isOperator(op, "Mult"))
