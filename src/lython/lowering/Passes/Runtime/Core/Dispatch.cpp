@@ -13,6 +13,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
   // a store after a read in the block still runs before it across a back edge
   // (`demoteCrossBlockContainerEvidence` in SpecialMethodOps.cpp).
   RuntimeBundleLowerer::demoteCrossBlockContainerOperandEvidence(op);
+  // A store into a slot gives the stored container a second holder; the pack
+  // path records the same thing for a literal.
+  RuntimeBundleLowerer::markAbsorbedContainerAsShared(op);
   return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(op)
       .Case<py::ClassOp>([&](auto classOp) {
         erase.push_back(classOp.getOperation());

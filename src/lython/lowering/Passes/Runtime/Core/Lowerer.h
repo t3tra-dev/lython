@@ -841,6 +841,9 @@ private:
                                          mlir::Value containerValue);
   // Applies the rule above to every operand of `op` (SpecialMethodOps.cpp).
   void demoteCrossBlockContainerOperandEvidence(mlir::Operation *op);
+  // Records that a value this op stored into a slot is now shared with a
+  // holder (SpecialMethodOps.cpp).
+  void markAbsorbedContainerAsShared(mlir::Operation *op);
   // Loop-body generator state-machine transform (GeneratorStateMachine.cpp).
   //
   // Suspension lane ABI (rfc/stdlib-semantics.md R3): a lane is one logical

@@ -87,6 +87,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
     return mlir::success();
   }
 
+  // ⭐ Mark every mutable container this literal ABSORBS. It now has a second
+  // holder that can mutate it, so its own mutations may no longer take the
+  // evidence arm; the evidence itself stays, because a READ through it is
+  // still right and dropping it aborts at runtime (measured three ways, see
+  // `sharedWithHolder`).
+  auto markAbsorbedContainers = [&](mlir::ValueRange values) {
+    for (mlir::Value value : values) {
+      auto found = valueBundles.find(value);
+      if (found == valueBundles.end())
+        continue;
+      RuntimeBundle &element = found->second;
+      if (element.kind != RuntimeBundle::Kind::Object ||
+          !RuntimeBundleLowerer::isMutableContainerContractName(
+              element.contractName()))
+        continue;
+      element.sharedWithHolder = true;
+    }
+  };
+  markAbsorbedContainers(op.getValues());
+
   llvm::SmallVector<RuntimeValue, 8> elements;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> elementBundles;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> dictKeyBundles;

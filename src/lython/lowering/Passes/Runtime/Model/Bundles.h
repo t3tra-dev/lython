@@ -226,6 +226,19 @@ struct RuntimeBundle {
   // runtime-mode sequences (e.g. loop-carried lists), whose length and
   // contents are only known to the runtime.
   bool sequenceEvidenceBacked = false;
+  // ⭐ This container has been put INTO another one, so a second holder can
+  // mutate it and the runtime length can move without this walk seeing it.
+  // The evidence stays -- it is still the right answer for a READ, and
+  // dropping it aborts at runtime -- but a MUTATION may no longer take the
+  // evidence arm, which stores at the compile-time element count while
+  // reading the runtime length word for the new length. The two disagreed:
+  //
+  //     a: list[int] = [1]
+  //     holder: list[list[int]] = [a]
+  //     holder[0].append(2)      # runtime arm: stores at the loaded length
+  //     a.append(3)              # evidence arm: stored at the element count
+  //     print(a)                 # [1, 3, None]; CPython [1, 2, 3]
+  bool sharedWithHolder = false;
   llvm::SmallVector<std::string, 8> mappingKeys;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> mappingKeyBundles;
   llvm::SmallVector<RuntimeValue, 8> mappingValues;

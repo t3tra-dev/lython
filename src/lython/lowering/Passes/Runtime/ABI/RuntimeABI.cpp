@@ -726,6 +726,9 @@ RuntimeBundle RuntimeBundle::typeObject(mlir::Type typeContract,
 }
 
 void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
+  // Sharing is a property of the OBJECT, so it travels with every rebinding
+  // of it -- a rebind that dropped it would put the evidence arm back.
+  sharedWithHolder = sharedWithHolder || source.sharedWithHolder;
   fieldAliasOwner = source.fieldAliasOwner;
   fieldAliasName = source.fieldAliasName;
   binding = source.binding;

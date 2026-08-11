@@ -1045,7 +1045,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         (!receiver.sequenceEvidenceBacked || receiverIsContainerElement) &&
         !RuntimeBundleLowerer::crossesStorageDefiningBlock(
             op.getOperation(), receiver);
-    if ((structuralMutation && !receiver.sequenceEvidenceBacked) ||
+    if ((structuralMutation &&
+         (!receiver.sequenceEvidenceBacked || receiver.sharedWithHolder)) ||
         interiorViewWithoutEvidence) {
       // Runtime-mode list (e.g. loop-carried): contents are only known to the
       // runtime, so mutate through the runtime representation. The rebind

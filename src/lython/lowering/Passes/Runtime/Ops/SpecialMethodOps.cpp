@@ -362,6 +362,35 @@ void RuntimeBundleLowerer::demoteCrossBlockContainerOperandEvidence(
     RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(op, operand);
 }
 
+// ⭐ A mutable container this op puts INTO a slot now has a second holder that
+// can mutate it, so its own mutations may no longer take the evidence arm --
+// which stores at the compile-time element count while taking the new length
+// from the runtime word. See `sharedWithHolder`.
+//
+// ⛔ Only MARKED, never demoted. Dropping the contents evidence here was
+// written and measured three ways (over pack/setitem/attrset, over container
+// packs, over container packs whose source survives) and takes 145-146 tests
+// down each time, aborting at runtime: the evidence is still the right answer
+// for a READ, and something past the absorption depends on it.
+void RuntimeBundleLowerer::markAbsorbedContainerAsShared(mlir::Operation *op) {
+  mlir::Value absorbed;
+  if (auto setItem = mlir::dyn_cast<py::SetItemOp>(op))
+    absorbed = setItem.getValue();
+  else if (auto attrSet = mlir::dyn_cast<py::AttrSetOp>(op))
+    absorbed = attrSet.getValue();
+  else
+    return;
+  auto found = valueBundles.find(absorbed);
+  if (found == valueBundles.end())
+    return;
+  RuntimeBundle &bundle = found->second;
+  if (bundle.kind != RuntimeBundle::Kind::Object ||
+      !RuntimeBundleLowerer::isMutableContainerContractName(
+          bundle.contractName()))
+    return;
+  bundle.sharedWithHolder = true;
+}
+
 // ⛔ KNOWN DEFECT: a container read out of another container keeps that other
 // one's description of it.
 //
@@ -519,6 +548,22 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
                 op, updated, position, *payload)))
           return mlir::failure();
+        // ⛔ KNOWN DEFECT: replacing a list element LEAKS the old one.
+        //
+        //     holder: list[list[int]] = [[9]]
+        //     holder[0] = [7]      # 3 allocations, 8316 B, per execution
+        //
+        // `replaceAggregateSlot` above does release the slot's reference, and
+        // the same shape with a NAMED value on the right leaks identically, so
+        // it is the replaced element's OTHER reference -- the one the nested
+        // literal `[9]` kept when its token did not move into the outer
+        // literal. That is the teardown-accounting defect the
+        // `valueIsConsumedOnlyBy` note in CollectionPayload.cpp records, seen
+        // from the store side. Measured on the pre-session binary too: same
+        // three allocations, so it predates this work.
+        //
+        // Moving the NEW value's token here was tried and changes nothing --
+        // the leak is on the old side, not the new.
         RuntimeBundle stored =
             payload->withObjectOwnership(ownership::logicalOwnershipKind(
                 payload->objectValue.contract, /*ownsObject=*/false));
