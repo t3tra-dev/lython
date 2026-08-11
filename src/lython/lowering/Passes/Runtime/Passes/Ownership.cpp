@@ -1472,6 +1472,25 @@ bool releaseOwnedGroupByLiveness(
           // `collectOwnedLocalObjectGroups` (or the equivalent) as a resource
           // of its own, with the retain as its producer -- then the existing
           // machinery places its release without any of this special-casing.
+          //
+          // Sixth attempt, which is that: mint a marker on the retained value
+          // right after the retain, rewriting the uses below it, so
+          // `collect-local-objects` -- which runs AFTER this stage -- picks the
+          // reference up as a resource with the retain as its producer. It
+          // fails with "released owned resource from
+          // builtin.unrealized_conversion_cast is used after release": the new
+          // group dies at its own last use inside the block, but the branch
+          // below still forwards the ORIGINAL value, so the merge argument
+          // then names something this group has released.
+          //
+          // So the second resource must be rooted such that the forwarding
+          // branch carries IT rather than the original -- i.e. the rewrite has
+          // to include the terminator operand, which is the one use the fifth
+          // attempt showed must keep naming the pre-retain value for the
+          // merge-borrow bookkeeping to line up. Those two requirements are
+          // what actually conflict, and that is the knot to cut next: the edge
+          // needs one name for its borrow accounting and another for the
+          // second reference, and today there is only one value to name.
           return true;
         }
     }
