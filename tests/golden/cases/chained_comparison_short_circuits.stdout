@@ -1,0 +1,12 @@
+False 0
+eval middle
+True 1
+eval middle
+False 1
+eval middle
+False 1
+eval b
+eval c
+True 2
+True False False
+True True True True

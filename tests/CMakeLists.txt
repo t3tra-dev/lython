@@ -554,6 +554,8 @@ set(LYTHON_LEAK_GATE_CASES
     augmented_assignment_evaluates_once
     # The hash builds a tuple per call; the reverse sort mutates in place.
     namedtuple_hash_and_reverse_stability
+    # A captured middle operand is released once, on the arm that made it.
+    chained_comparison_short_circuits
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

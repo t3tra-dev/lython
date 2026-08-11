@@ -1,4 +1,6 @@
 #include "EmitterCore.h"
+
+#include "llvm/ADT/ScopeExit.h"
 #include "EmitterOps.h" // IWYU pragma: keep
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -68,6 +70,19 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   // AST has no spelling for an already-emitted value, so a rewrite that puts
   // one subtree in two places -- `a[f()] += 1` becomes a load and a store of
   // `a[f()]` -- ran its side effects twice and stored at the second index.
+  // The other half: emit the child ONCE, remember it in the slot, and hand it
+  // back. A rewrite that needs a subexpression in two places wraps the first
+  // occurrence in this and the rest in `LyValueRef`.
+  if (expr->kind == "LyValueCapture") {
+    const parser::Field *slot = parser::findField(*expr, "slot");
+    Value value = emitExpr(ast::node(*expr, "value"));
+    if (slot && std::holds_alternative<std::int64_t>(slot->value)) {
+      auto index = static_cast<std::size_t>(std::get<std::int64_t>(slot->value));
+      if (index < pendingValueRefs.size())
+        pendingValueRefs[index] = value;
+    }
+    return value;
+  }
   if (expr->kind == "LyValueRef") {
     const parser::Field *slot = parser::findField(*expr, "slot");
     if (slot && std::holds_alternative<std::int64_t>(slot->value)) {
@@ -750,11 +765,74 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   // one pair and the lhs of the next. Only the first pair used to be emitted,
   // so `48 <= ord(c) <= 57` silently answered `48 <= ord(c)`.
   //
-  // Why not desugar to `a op b and b op c` and reuse the short-circuiting
-  // BoolOp path: that AST rewrite duplicates the middle operand, and
-  // evaluating it twice breaks the once-only guarantee that CPython does make
-  // — a stronger property than not evaluating the trailing comparators at all.
-  // So the pairs are emitted eagerly and their truth bits ANDed.
+  // ⭐ It is also SHORT-CIRCUITING: `1 > 2 > s()` never calls `s`. The pairs
+  // used to be emitted eagerly and their truth bits ANDed, because the AST
+  // rewrite to `a op b and b op c` duplicates the middle operand and would
+  // evaluate it twice -- a worse break than not short-circuiting.
+  //
+  // Both properties are available now that a rewrite can name an
+  // already-emitted value: each middle operand is emitted ONCE inside the
+  // pair that first needs it (`LyValueCapture`) and referred to from the next
+  // pair (`LyValueRef`), and the pairs go through the existing
+  // short-circuiting BoolOp path.
+  if (comparators->size() > 1 && ops && ops->size() == comparators->size()) {
+    std::size_t refStart = pendingValueRefs.size();
+    pendingValueRefs.resize(refStart + comparators->size() - 1);
+    auto releaseRefs = llvm::make_scope_exit(
+        [&] { pendingValueRefs.resize(refStart); });
+    auto refNode = [&](std::size_t slot) {
+      parser::NodePtr node = parser::makeNode("LyValueRef", expr.range);
+      parser::addField(*node, "slot", static_cast<std::int64_t>(slot));
+      return node;
+    };
+    const parser::Field *leftField = parser::findField(expr, "left");
+    parser::NodePtr leftNode =
+        leftField && std::holds_alternative<parser::NodePtr>(leftField->value)
+            ? std::get<parser::NodePtr>(leftField->value)
+            : nullptr;
+    // ⛔ RIGHT-nested, not left. A capture is an SSA value defined in the arm
+    // that made it, and a left-nested `((p1 and p2) and p3)` puts p3 after the
+    // merge -- where p2's capture does not dominate it ("operand #0 does not
+    // dominate this use" on any four-operand chain). Right-nesting emits each
+    // pair INSIDE the arm of the one before it, which is also the shape the
+    // evaluation order describes.
+    llvm::SmallVector<parser::NodePtr, 4> pairs;
+    for (std::size_t index = 0; index < comparators->size(); ++index) {
+      parser::NodePtr pair = parser::makeNode("Compare", expr.range);
+      parser::addField(*pair, "left",
+                       index == 0 ? leftNode : refNode(refStart + index - 1));
+      parser::NodePtr rhs = (*comparators)[index];
+      if (index + 1 < comparators->size()) {
+        parser::NodePtr capture =
+            parser::makeNode("LyValueCapture", expr.range);
+        parser::addField(*capture, "slot",
+                         static_cast<std::int64_t>(refStart + index));
+        parser::addField(*capture, "value", std::move(rhs));
+        rhs = std::move(capture);
+      }
+      parser::addField(*pair, "comparators",
+                       std::vector<parser::NodePtr>{std::move(rhs)});
+      parser::addField(*pair, "ops",
+                       std::vector<parser::NodePtr>{(*ops)[index]});
+      pairs.push_back(std::move(pair));
+    }
+    parser::NodePtr conjunction;
+    for (std::size_t back = pairs.size(); back > 0; --back) {
+      parser::NodePtr pair = std::move(pairs[back - 1]);
+      if (!conjunction) {
+        conjunction = std::move(pair);
+        continue;
+      }
+      parser::NodePtr both = parser::makeNode("BoolOp", expr.range);
+      parser::addField(*both, "op", parser::makeNode("And", expr.range));
+      parser::addField(*both, "values",
+                       std::vector<parser::NodePtr>{std::move(pair),
+                                                    std::move(conjunction)});
+      conjunction = std::move(both);
+    }
+    if (conjunction)
+      return emitExpr(conjunction.get());
+  }
   Value result{};
   for (std::size_t index = 0; index < comparators->size(); ++index) {
     Value rhs = emitExpr((*comparators)[index].get());
