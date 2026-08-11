@@ -1046,11 +1046,28 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       if (argumentType == strType)
         return coerceValue(emitExpr(argNode), strType, expr);
       if (argumentType == types.contract("builtins.object")) {
+        // ⛔ Rewinding is only sound while the emission stayed in one block.
+        //
+        //     print(sum(xs), 1)
+        //     print("a", [x for x in [1, 2]])
+        //
+        // A reducer or a comprehension lowers to a loop, so `emitExpr` SPLITS
+        // the block: the saved point then names a block that now ends in a
+        // terminator, and restoring it wrote the rest of the print there --
+        // "operation with block successors must terminate its parent block".
+        // Each printed fine alone, which is what made it look like a
+        // multi-argument problem.
+        //
+        // The rewind exists only to undo a speculative emission, so it is
+        // skipped when there is nothing safe to rewind TO; the emitted value
+        // is then rendered from where the walk actually stands.
+        mlir::Block *beforeBlock = builder.getInsertionBlock();
         mlir::OpBuilder::InsertPoint before = builder.saveInsertionPoint();
         Value emitted = emitExpr(argNode);
         if (types.widenLiteral(emitted.type) == strType)
           return coerceValue(emitted, strType, expr);
-        builder.restoreInsertionPoint(before);
+        if (builder.getInsertionBlock() == beforeBlock)
+          builder.restoreInsertionPoint(before);
       }
       if (std::optional<MethodBinding> method =
               lookupClassMethod(argumentType, "__str__")) {
