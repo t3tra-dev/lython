@@ -2005,6 +2005,19 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
     // outranks __repr__ here, and an exception subclass without its own
     // __str__ must fall to the sink's ancestor __str__ (the message form)
     // rather than inline a source __repr__ (the ClassName(...) form).
+    // ⭐ Asked BEFORE the source lookup, because a subclass may be the only
+    // class that declares the method: `class A: pass` / `class B(A): __repr__`
+    // resolves nothing on A, fell through to the manifest repr, and printed
+    // `<__main__.A object at 0x...>` where CPython prints B's.
+    if (auto argumentContract =
+            mlir::dyn_cast_if_present<py::ContractType>(argumentType)) {
+      llvm::StringRef wanted = name == "print" ? "__str__" : "__repr__";
+      if (subclassOverridesMethod(argumentContract.getContractName(), wanted)) {
+        Value argument = emitExpr(args->front().get());
+        if (refuseUnresolvableDispatch(expr, argument, wanted))
+          return emitNone(expr);
+      }
+    }
     std::optional<MethodBinding> sourceMethod;
     if (name == "print")
       sourceMethod = lookupClassMethod(argumentType, "__str__");

@@ -458,9 +458,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   // pinning the boxed value's liveness at the store
   // (`pinProbeOperandLiveness`) does not move it either.
   //
+  // Releasing the boxed value at the store does not work either, measured as
+  // the third attempt: the value is usually a LIVE LOCAL (`g_msg = msgbuf`,
+  // where `msgbuf` is read again), so the release is an over-release and the
+  // failure only moves to the next global store in the same function.
+  //
   // So the repair is not here. Whoever takes it should start with why the
   // release placement cannot find a death point for a value whose only use is
-  // an unbox immediately before a store.
+  // an unbox immediately before a store -- every function it fails in has EH
+  // edges and an early return, which is the shape to reproduce first.
+  //
+  // The cluster this leaves is the largest one in the audit corpus: 14 probes,
+  // all "an int global written from a CALL RESULT inside a loop", all printing
+  // the callee's dummy 0. Straight-line writes and in-loop writes that are not
+  // call results are correct, which is what pins it to the lane's validity.
   if (value->primitiveI64 && value->primitiveI64->value) {
     raw = value->primitiveI64->value;
   } else {

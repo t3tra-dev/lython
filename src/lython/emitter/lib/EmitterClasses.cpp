@@ -495,9 +495,13 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
       subclassShadowsAttribute(contract.getContractName(), methodName);
   if (!redeclared)
     return false;
-  if (!lookupClassMethod(receiver.type, methodName) &&
-      !lookupClassStaticAttr(receiver.type, methodName))
-    return false;
+  // ⛔ NOT gated on the name resolving ON THE RECEIVER. A subclass may be the
+  // only class that declares it -- `class A: pass` / `class B(A): __repr__` --
+  // and `repr(a)` on a base-typed `a` then ran object's repr and printed
+  // `<__main__.A object at 0x...>` where CPython prints B's. That a subclass
+  // declares it is the whole evidence the dispatch is real; requiring the base
+  // to declare it too made the gate blind to exactly the case where the
+  // subclass introduces the method.
   diagnostics.push_back(parser::Diagnostic{
       parser::Severity::Error, anchor.range.start,
       "'" + std::string(methodName) + "' is overridden by a subclass of '" +

@@ -65,3 +65,18 @@ print(a[0])
 print(repr(a))
 print(a.size)
 print(a.kind)
+
+
+# The subclass may be the ONLY class that declares it: nothing resolves on the
+# base, and the manifest's object repr answered instead of B's.
+class Bare:
+    pass
+
+
+class BareSub(Bare):
+    def __repr__(self) -> str:
+        return "BareSub!"
+
+
+b: Bare = BareSub()
+print(repr(b))
