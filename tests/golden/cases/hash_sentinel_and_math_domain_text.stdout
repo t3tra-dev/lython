@@ -1,7 +1,8 @@
-2.0
-0.0
-1.0
-0.0
+-2
+7
+-123456789
+-2 7
 expected a nonnegative input, got -1.0
 expected a positive input, got 0.0
-expected a positive input, got -1.0
+expected a positive input, got -2.5
+2.0 0.0

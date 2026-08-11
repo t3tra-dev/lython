@@ -50,23 +50,48 @@ module attributes {
   // math domain errors. CPython's math_1 checks the operand (and errno) and
   // raises ValueError("math domain error"); returning the IEEE nan/-inf the
   // hardware produces is the one thing it does not do.
+  func.func private @LyFloat_Repr(%header: memref<3xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"}
+  func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %offset: index, %length: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.initializer = "from_bytes"}
   func.func private @LyValueError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 53 : i64, ly.runtime.contract = "builtins.ValueError", ly.runtime.initializer = "__new__"}
   func.func private @LyValueError_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.ValueError", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyValueError_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.ValueError", ly.runtime.primitive = "raise"}
 
-  memref.global "private" constant @__ly_math_domain_msg : memref<17xi8> = dense<[109, 97, 116, 104, 32, 100, 111, 109, 97, 105, 110, 32, 101, 114, 114, 111, 114]>
+  // CPython 3.14 replaced the one generic "math domain error" with a
+  // per-function message that names the constraint and interpolates the
+  // operand (gh-101410): sqrt says "expected a nonnegative input, got -1.0"
+  // and log says "expected a positive input, got 0.0". The message is a
+  // documented behaviour of these functions, so it is built the same way --
+  // prefix, then the operand's repr -- rather than approximated.
+  memref.global "private" constant @__ly_math_nonnegative_msg : memref<34xi8> = dense<[101, 120, 112, 101, 99, 116, 101, 100, 32, 97, 32, 110, 111, 110, 110, 101, 103, 97, 116, 105, 118, 101, 32, 105, 110, 112, 117, 116, 44, 32, 103, 111, 116, 32]>
+  memref.global "private" constant @__ly_math_positive_msg : memref<31xi8> = dense<[101, 120, 112, 101, 99, 116, 101, 100, 32, 97, 32, 112, 111, 115, 105, 116, 105, 118, 101, 32, 105, 110, 112, 117, 116, 44, 32, 103, 111, 116, 32]>
 
-  func.func private @__ly_math_domain_error() {
+  func.func private @__ly_math_domain_raise(%prefix_bytes: memref<?xi8>, %prefix_len: i64, %value: f64) {
     %c0 = arith.constant 0 : index
-    %len = arith.constant 17 : i64
     %class_id = arith.constant 53 : i64
-    %msg_ref = memref.get_global @__ly_math_domain_msg : memref<17xi8>
-    %msg_dyn = memref.cast %msg_ref : memref<17xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %ph, %pb = func.call @LyUnicode_FromBytes(%prefix_bytes, %c0, %prefix_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %value_header = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+    %vh, %vb = func.call @LyFloat_Repr(%value_header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @LyUnicode_Concat(%ph, %pb, %vh, %vb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  func.func private @__ly_math_nonnegative_error(%value: f64) {
+    %c34 = arith.constant 34 : i64
+    %msg_ref = memref.get_global @__ly_math_nonnegative_msg : memref<34xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<34xi8> to memref<?xi8>
+    func.call @__ly_math_domain_raise(%msg_dyn, %c34, %value) : (memref<?xi8>, i64, f64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_math_positive_error(%value: f64) {
+    %c31 = arith.constant 31 : i64
+    %msg_ref = memref.get_global @__ly_math_positive_msg : memref<31xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<31xi8> to memref<?xi8>
+    func.call @__ly_math_domain_raise(%msg_dyn, %c31, %value) : (memref<?xi8>, i64, f64) -> ()
     func.return
   }
 
@@ -101,7 +126,7 @@ module attributes {
     cf.cond_br %negative, ^domain, ^ok
 
   ^domain:
-    func.call @__ly_math_domain_error() : () -> ()
+    func.call @__ly_math_nonnegative_error(%value) : (f64) -> ()
     cf.br ^ok
 
   ^ok:
@@ -129,7 +154,7 @@ module attributes {
     cf.cond_br %nonpositive, ^domain, ^ok
 
   ^domain:
-    func.call @__ly_math_domain_error() : () -> ()
+    func.call @__ly_math_positive_error(%value) : (f64) -> ()
     cf.br ^ok
 
   ^ok:

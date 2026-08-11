@@ -1889,7 +1889,42 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
       lookupClassMethod(input.type, "__hash__");
   if (!method)
     return std::nullopt;
-  return emitInlineOperatorCall(expr, input, *method, {});
+  Value hashed = emitInlineOperatorCall(expr, input, *method, {});
+  // ⭐ CPython never lets a hash be -1: that value is its "error" sentinel, so
+  // `Py_hash_t` -1 is remapped to -2 on the way out of `__hash__`
+  // (Objects/object.c, PyObject_Hash). A class whose `__hash__` returns -1
+  // printed -1 here. Only the source-class path needs it -- the manifest
+  // hashes already answer through the runtime, which does the remap.
+  mlir::Type intType = types.intType();
+  Value hashedInt = coerceValue(hashed, intType, expr);
+  // ⛔ Done on the PRIMITIVE lane, not with two `builtins.int` constants and
+  // an object select: those are owned values, both of them live from before
+  // the comparison, and one is dead on either branch -- the affine-ownership
+  // verifier refused `hash_abs_overload` for exactly that ("still owned when
+  // a call to 'LyComplex_FromParts' may unwind"). An `arith.constant` has no
+  // reference to account for.
+  mlir::Type i64Type = builder.getI64Type();
+  mlir::Value raw =
+      py::CastToPrimOp::create(builder, loc(expr), i64Type, hashedInt.value,
+                               builder.getStringAttr("exact"))
+          .getResult();
+  mlir::Value sentinel =
+      mlir::arith::ConstantIntOp::create(builder, loc(expr), -1, 64)
+          .getResult();
+  mlir::Value replacement =
+      mlir::arith::ConstantIntOp::create(builder, loc(expr), -2, 64)
+          .getResult();
+  mlir::Value isSentinel =
+      mlir::arith::CmpIOp::create(builder, loc(expr),
+                                  mlir::arith::CmpIPredicate::eq, raw, sentinel)
+          .getResult();
+  mlir::Value picked = mlir::arith::SelectOp::create(builder, loc(expr),
+                                                     isSentinel, replacement,
+                                                     raw)
+                           .getResult();
+  auto boxed =
+      py::CastFromPrimOp::create(builder, loc(expr), intType, picked);
+  return Value{boxed.getResult(), intType};
 }
 
 std::optional<Value>
