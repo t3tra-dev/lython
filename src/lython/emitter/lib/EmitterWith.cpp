@@ -28,6 +28,16 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
                            Value{enter.getResult(),
                                  enterInference.awaitableType},
                            enterInference.awaitResult);
+      } else if (std::optional<MethodBinding> method =
+                     lookupClassMethod(contextValue.type, "__enter__")) {
+        // ⭐ A context manager written in Python. `py.enter` is answered from
+        // the runtime manifest, so a user class reached the lowering and was
+        // refused there -- "runtime manifest has no Ctx.__enter__ method" --
+        // for the plainest `with` in the language. Every other dunder on a
+        // user class is inlined at this layer (`__len__`, `__getitem__`,
+        // `__eq__`); `__enter__` and `__exit__` were the two that were not,
+        // and the manifest op is right only for a manager the manifest knows.
+        entered = emitInlineOperatorCall(*item, contextValue, *method, {});
       } else {
         CallInferenceResult enterInference =
             types.inferMethodCallWithEvidence(contextValue.type, "__enter__",
@@ -76,6 +86,14 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
     return;
   }
 
+  // The `__enter__` instance of the same rule; see emitWith.
+  if (std::optional<MethodBinding> method =
+          lookupClassMethod(cleanup.manager.type, "__exit__")) {
+    (void)emitInlineOperatorCall(anchor, cleanup.manager, *method,
+                                 {none, none, none});
+    return;
+  }
+
   CallInferenceResult exitInference = types.inferMethodCallWithEvidence(
       cleanup.manager.type, "__exit__", {none.type, none.type, none.type});
   if (!requireStaticEvidence(anchor, exitInference))
@@ -85,9 +103,31 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
                      none.value, none.value, none.value, mlir::UnitAttr());
 }
 
+// ⭐ Only the cleanups this scope opened. A `return` inside an INLINED method
+// body leaves that body, not the enclosing function, so the `with` blocks
+// around the call site are still live and must not be torn down:
+//
+//     class Ctx:
+//         def __exit__(self, a, b, c) -> bool:
+//             return False
+//     with Ctx():
+//         ...
+//
+// The first thing `__exit__`'s inlined body does is return, which ran the
+// cleanup that was inlining it -- "recursive class method call is not
+// supported (__exit__ -> __exit__)". Any inlined method called inside a
+// `with` block had the same shape; `__exit__` is only the one that closes the
+// cycle into itself.
+std::size_t ModuleEmitter::currentWithCleanupWatermark() const {
+  return inlineReturnContexts.empty()
+             ? 0
+             : inlineReturnContexts.back().withCleanupWatermark;
+}
+
 void ModuleEmitter::emitActiveCleanups(const parser::Node &anchor) {
-  for (const WithCleanup &cleanup : llvm::reverse(activeWithCleanups))
-    emitWithCleanup(anchor, cleanup);
+  std::size_t watermark = currentWithCleanupWatermark();
+  for (std::size_t index = activeWithCleanups.size(); index > watermark; --index)
+    emitWithCleanup(anchor, activeWithCleanups[index - 1]);
 }
 
 } // namespace lython::emitter

@@ -524,6 +524,8 @@ set(LYTHON_LEAK_GATE_CASES
     mutable_element_read_out_of_a_container
     # The *args tuple now retains what it holds; it has to release it too.
     vararg_tuple_holds_its_arguments
+    # An inlined __enter__/__exit__ pair around a body that allocates.
+    with_statement_on_a_python_class
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

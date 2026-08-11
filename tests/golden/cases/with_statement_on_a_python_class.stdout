@@ -1,0 +1,16 @@
+enter a
+body a
+exit a
+enter a
+enter b
+body a b
+exit b
+exit a
+enter a
+value 7
+still inside
+exit a
+enter a
+i 7
+i 8
+exit a

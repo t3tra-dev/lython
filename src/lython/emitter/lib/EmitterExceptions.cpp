@@ -864,7 +864,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       if (tryReturnBlock)
         inlineReturnContexts.push_back(
             InlineReturnContext{tryReturnBlock, currentReturnType,
-                                supportsValueReturnThroughFinally});
+                                supportsValueReturnThroughFinally,
+                                currentWithCleanupWatermark()});
       if (supportsLoopControlThroughFinally)
         loopControlContexts.push_back(
             LoopControlContext{tryBreakBlock, tryContinueBlock});
@@ -1148,7 +1149,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           if (exceptReturnBlock)
             inlineReturnContexts.push_back(
                 InlineReturnContext{exceptReturnBlock, currentReturnType,
-                                    supportsValueReturnThroughFinally});
+                                    supportsValueReturnThroughFinally,
+                                    currentWithCleanupWatermark()});
           if (supportsLoopControlThroughFinally)
             loopControlContexts.push_back(
                 LoopControlContext{exceptBreakBlock, exceptContinueBlock});
@@ -1380,7 +1382,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       if (finallyReturnBlock)
         inlineReturnContexts.push_back(
             InlineReturnContext{finallyReturnBlock, currentReturnType,
-                                supportsValueReturnThroughFinally});
+                                supportsValueReturnThroughFinally,
+                                currentWithCleanupWatermark()});
       if (finallyBreakBlock)
         loopControlContexts.push_back(
             LoopControlContext{finallyBreakBlock, finallyContinueBlock});

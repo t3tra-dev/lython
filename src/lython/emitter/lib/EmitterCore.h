@@ -378,6 +378,9 @@ private:
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
   void emitActiveCleanups(const parser::Node &anchor);
+  // The `with` cleanups pending when the innermost inlined body started; a
+  // try/finally inside one inherits it rather than resetting to zero.
+  std::size_t currentWithCleanupWatermark() const;
 
   mlir::Value emitValueDiamond(mlir::Location location, mlir::Value condition,
                                mlir::Type resultType,
