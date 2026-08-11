@@ -350,9 +350,10 @@ bool valueAliasesEntryArgument(mlir::Value value, mlir::Block &entry,
   return false;
 }
 
-bool valueDerivedFromEntryArgument(mlir::Value value, mlir::Block &entry,
-                                   own::AliasAnalysis &aliases,
-                                   unsigned depth = 0) {
+bool valueDerivedFromEntryArgument(
+    mlir::Value value, mlir::Block &entry, own::AliasAnalysis &aliases,
+    unsigned depth = 0,
+    llvm::SmallPtrSetImpl<void *> *pending = nullptr) {
   if (!value || depth > 8)
     return false;
   if (valueAliasesEntryArgument(value, entry, aliases))
@@ -360,9 +361,9 @@ bool valueDerivedFromEntryArgument(mlir::Value value, mlir::Block &entry,
 
   if (auto select = value.getDefiningOp<mlir::arith::SelectOp>())
     return valueDerivedFromEntryArgument(select.getTrueValue(), entry, aliases,
-                                         depth + 1) &&
+                                         depth + 1, pending) &&
            valueDerivedFromEntryArgument(select.getFalseValue(), entry, aliases,
-                                         depth + 1);
+                                         depth + 1, pending);
 
   // ⭐ A merge is the other way branches join, and the answer is the same
   // question asked of every incoming edge.
@@ -378,10 +379,32 @@ bool valueDerivedFromEntryArgument(mlir::Value value, mlir::Block &entry,
   // join through a BLOCK ARGUMENT, so the walk stopped, no retain went in, and
   // the verifier then found the borrow returned as owned. The `if` and the
   // conditional-expression spellings failed alike.
+  //
+  // ⭐ A LOOP-CARRIED merge names itself on its back edge, and that edge
+  // introduces no source of its own -- the answer is whatever the other edges
+  // say.
+  //
+  //     def sort(xs: list[int]) -> list[int]:
+  //         for i in range(len(xs)):
+  //             xs[i] = xs[i] + 1
+  //         return xs
+  //
+  // was refused for the same reason the clamp was, one step further along:
+  // mutating the list rebinds it, so `xs` becomes a block argument whose
+  // predecessors are the entry edge (the parameter) and the back edge (itself).
+  // Recursing into the back edge asks the same question again and runs out of
+  // depth, so a plain in-place sort could not return the list it sorted. Only
+  // the mutating spelling: reading the parameter in a loop and returning it was
+  // always fine, because then nothing rebinds it.
   if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
     mlir::Block *owner = argument.getOwner();
     if (owner == &entry || owner->hasNoPredecessors())
       return false;
+    llvm::SmallPtrSet<void *, 4> owned;
+    if (!pending)
+      pending = &owned;
+    if (!pending->insert(value.getAsOpaquePointer()).second)
+      return true;
     unsigned index = argument.getArgNumber();
     for (mlir::Block *pred : owner->getPredecessors()) {
       auto branch =
@@ -397,7 +420,7 @@ bool valueDerivedFromEntryArgument(mlir::Value value, mlir::Block &entry,
         if (index >= operands.size() || !operands[index])
           return false;
         if (!valueDerivedFromEntryArgument(operands[index], entry, aliases,
-                                           depth + 1))
+                                           depth + 1, pending))
           return false;
         reaches = true;
       }
