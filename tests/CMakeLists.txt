@@ -548,6 +548,8 @@ set(LYTHON_LEAK_GATE_CASES
     owned_temp_across_a_branch
     # The decimal round-trip allocates a digit buffer per call.
     round_decimal_round_trip
+    # Every argument is held live until the last one is rendered.
+    print_evaluates_then_renders
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

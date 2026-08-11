@@ -1091,141 +1091,47 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         plainArguments = false;
   if (plainArguments) {
     mlir::Type strType = types.contract("builtins.str");
-    auto stringify = [&](const parser::Node *argNode) -> std::optional<Value> {
-      mlir::Type argumentType = types.widenLiteral(types.inferExpr(argNode));
-      // ⭐ Ask the inference, and if it does not know, ask the value.
-      //
-      //     print(max("a", "b"), 1)      # printed 'b' 1; CPython prints b 1
-      //
-      // `max` over two arguments is folded by this file into a comparison and
-      // a select, so what it emits is a `str`. The general inference does not
-      // model that fold and answers `builtins.object`, which sent a string
-      // that was already a string down the repr path -- and repr of a str
-      // quotes it. Single-argument print was unaffected because it renders
-      // through a different path, which is why `print(max(...))` was right and
-      // `print(max(...), 1)` was not.
-      //
-      // ⛔ Why NOT teach `inferExpr` about the fold: the fold is a rewrite this
-      // file performs, so the inference would have to duplicate it to agree.
-      // The emitted value already carries the answer.
-      if (argumentType == strType)
-        return coerceValue(emitExpr(argNode), strType, expr);
-      if (argumentType == types.contract("builtins.object")) {
-        // ⛔ Rewinding is only sound while the emission stayed in one block.
-        //
-        //     print(sum(xs), 1)
-        //     print("a", [x for x in [1, 2]])
-        //
-        // A reducer or a comprehension lowers to a loop, so `emitExpr` SPLITS
-        // the block: the saved point then names a block that now ends in a
-        // terminator, and restoring it wrote the rest of the print there --
-        // "operation with block successors must terminate its parent block".
-        // Each printed fine alone, which is what made it look like a
-        // multi-argument problem.
-        //
-        // The rewind exists only to undo a speculative emission, so it is
-        // skipped when there is nothing safe to rewind TO; the emitted value
-        // is then rendered from where the walk actually stands.
-        mlir::Block *beforeBlock = builder.getInsertionBlock();
-        mlir::OpBuilder::InsertPoint before = builder.saveInsertionPoint();
-        Value emitted = emitExpr(argNode);
-        if (types.widenLiteral(emitted.type) == strType)
-          return coerceValue(emitted, strType, expr);
-        if (builder.getInsertionBlock() == beforeBlock)
-          builder.restoreInsertionPoint(before);
-      }
-      if (std::optional<MethodBinding> method =
-              lookupClassMethod(argumentType, "__str__")) {
-        Value argument = emitExpr(argNode);
-        if (refuseUnresolvableDispatch(expr, argument, "__str__"))
-          return emitNone(expr);
-        llvm::StringMap<Value> emptyKeywords;
-        Value receiver = emitDescriptorReceiver(expr, argument, *method);
-        return emitInlineMethodBody(expr, receiver,
-                                    methodBindingBindsReceiver(*method),
-                                    *method, {}, emptyKeywords);
-      }
-      // CPython print() renders via str(). The only builtin contracts where
-      // str(x) != repr(x) are str itself (handled above) and the exception
-      // taxonomy (str is the message, repr is ClassName(...)); inference
-      // alone over-accepts __str__ for containers whose manifest only
-      // implements __repr__, so gate on the taxonomy.
-      if (CallInferenceResult inference =
-              isExceptionContractType(argumentType)
-                  ? types.inferMethodCallWithEvidence(argumentType, "__str__",
-                                                      {})
-                  : CallInferenceResult()) {
-        Value argument = coerceValue(emitExpr(argNode), argumentType, expr);
-        auto op = py::StrOp::create(
-            builder, loc(expr), strType,
-            mlir::FlatSymbolRefAttr::get(&context, "__str__"),
-            mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
-        return Value{op.getResult(), strType};
-      }
-      // A source class without __str__ stringifies through its own __repr__
-      // (object.__str__ delegates to type(x).__repr__); the manifest
-      // evidence below cannot see source methods and would fall to the
-      // address-based default repr.
-      if (std::optional<MethodBinding> method =
-              lookupClassMethod(argumentType, "__repr__")) {
-        Value argument = emitExpr(argNode);
-        if (refuseUnresolvableDispatch(expr, argument, "__repr__"))
-          return emitNone(expr);
-        llvm::StringMap<Value> emptyKeywords;
-        Value receiver = emitDescriptorReceiver(expr, argument, *method);
-        return emitInlineMethodBody(expr, receiver,
-                                    methodBindingBindsReceiver(*method),
-                                    *method, {}, emptyKeywords);
-      }
-      if (CallInferenceResult inference =
-              types.inferMethodCallWithEvidence(argumentType, "__repr__",
-                                                {})) {
-        Value argument = coerceValue(emitExpr(argNode), argumentType, expr);
-        auto op = py::ReprOp::create(
-            builder, loc(expr), strType,
-            mlir::FlatSymbolRefAttr::get(&context, "__repr__"),
-            mlir::TypeAttr::get(callProtocolFor(inference)), argument.value);
-        return Value{op.getResult(), strType};
-      }
-      return std::nullopt;
-    };
-    bool allConverted = true;
-    // ⛔ KNOWN DEFECT: a multi-argument print whose arguments include one that
-    // SPLITS its block does not compile.
-    //
-    //     print(sum(xs), 1)
-    //     print("a", [x for x in [1, 2]])
-    //     print(min(ys), 1)
-    //
-    // all fail with "operation with block successors must terminate its parent
-    // block", emitted from this stage. A reducer or comprehension lowers to a
-    // loop, so the block this join is being written into stops being the
-    // current block partway through. Each of these prints correctly on its
-    // own, which is what makes it read as a multi-argument problem.
-    //
-    // Why NOT hoist every `stringify` above the joins, which is the obvious
-    // ordering fix: measured, and the three still fail the same way. The
-    // conversion itself is not what lands in the wrong block -- the pieces are
-    // produced fine -- so the stale insertion point is inside `stringify`'s
-    // own emission, not between the calls. Whoever takes this should start by
-    // re-establishing the builder's insertion point after each argument rather
-    // than by reordering the loop.
-    // ⛔ KNOWN DEFECT, second one in this loop: the arguments are RENDERED as
-    // they are evaluated, so a mutation performed by a later argument is
-    // invisible to an earlier one's rendering.
+    // ⭐ Evaluate every argument, THEN render the values, because that is the
+    // order CPython runs in: builtin_print_impl is handed an already-built
+    // argument tuple and only then calls str() on each element.
     //
     //     a: list[int] = [1, 2]
     //     print(a, a.pop())      # printed [1, 2] 2; CPython prints [1] 2
     //
-    // CPython evaluates every argument first and calls str() on each
-    // afterwards, so the earlier argument renders the list the pop already
-    // shortened. Fixing it means splitting `stringify` into "evaluate" and
-    // "render", which the arms above cannot do as written: three of them
-    // choose the renderer from the argument's STATIC type before emitting it,
-    // and one of them emits speculatively and rewinds.
+    // Rendering as the walk evaluated showed the first argument a list the
+    // second had not shortened yet -- and the same for a source class, whose
+    // `__str__` ran before the later argument mutated what that body reads.
+    //
+    // ⛔ Why NOT keep a `stringify` that picks the renderer from the
+    // argument's STATIC type, which is what stood here: the pick has to
+    // happen before the value exists, so the one case inference cannot answer
+    // (it says `builtins.object` for the max/min fold this file performs and
+    // does not model) emitted the argument speculatively and rewound the
+    // builder when the guess was wrong. A rewind moves the insertion point;
+    // it does not erase what it rewinds past, so the arms behind it emitted
+    // the argument a SECOND time -- `print(max(f(), g()), 0)` ran f and g
+    // twice, and `print(max(f(), 3), 0)` left the orphaned literal for the
+    // ownership verifier to report as "reaches function exit without
+    // release". Asking the value deletes the guess, the rewind, and with it
+    // the restore into a block that a reducer or a comprehension has since
+    // given a terminator ("operation with block successors must terminate its
+    // parent block").
+    //
+    // ⛔ Why NOT a renderer local to print: `emitStringifyValue` is this same
+    // ladder over a value, already shared by f-strings, format() and %s, and
+    // the two copies had drifted -- the copy here could not render `None`
+    // ("types.NoneType runtime object has no physical header value") and
+    // asked the subclass-override gate only about `__repr__`, so a base-typed
+    // receiver whose subclass overrides `__str__` rendered the base's
+    // `__repr__` here while `f"{x!s}"` refused it.
+    llvm::SmallVector<Value, 4> evaluated;
+    evaluated.reserve(printArgs->size());
+    for (const parser::NodePtr &argument : *printArgs)
+      evaluated.push_back(emitExpr(argument.get()));
+    bool allConverted = true;
     Value joined;
-    for (auto [index, argument] : llvm::enumerate(*printArgs)) {
-      std::optional<Value> piece = stringify(argument.get());
+    for (auto [index, value] : llvm::enumerate(evaluated)) {
+      std::optional<Value> piece = emitStringifyValue(expr, value);
       if (!piece) {
         allConverted = false;
         break;
@@ -2162,6 +2068,37 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
                                 methodBindingBindsReceiver(*method), *method,
                                 {}, emptyKeywords);
   }
+  // ⭐ An EXCEPTION is the one builtin whose str and repr differ: str is the
+  // message, repr is `ClassName('message')`. Falling to __repr__ below gave
+  // f-strings, format() and %s the repr:
+  //
+  //     e = ValueError("plain")
+  //     print(f"{e}")      # printed ValueError('plain'); CPython prints plain
+  //
+  // `tryEmitStrCall` already answers this for the `str(e)` spelling, through
+  // the same `isExceptionContractType` question; this is the other spelling
+  // reaching the same answer rather than a second rule.
+  //
+  // ⛔ Why NOT after the source-class __repr__ below, where this stood: an
+  // exception subclass that declares only __repr__ still INHERITS
+  // BaseException.__str__, so `class E(ValueError)` with a `__repr__` and no
+  // `__str__` printed E-repr for `f"{e}"` where CPython prints the message.
+  // Reaching the taxonomy first is also what keeps the __repr__ override gate
+  // away from exceptions, which never render through __repr__ here: a
+  // base-typed exception whose subclass declares __repr__ was refused for a
+  // dispatch this ladder does not make. The __str__ gate above still stands,
+  // and it is the one that has to, because a subclass __str__ DOES win.
+  if (isExceptionContractType(valueType)) {
+    if (CallInferenceResult strInference =
+            types.inferMethodCallWithEvidence(valueType, "__str__", {})) {
+      Value receiver = coerceValue(value, valueType, anchor);
+      auto op = py::StrOp::create(
+          builder, loc(anchor), strType,
+          mlir::FlatSymbolRefAttr::get(&context, "__str__"),
+          mlir::TypeAttr::get(callProtocolFor(strInference)), receiver.value);
+      return Value{op.getResult(), strType};
+    }
+  }
   // A source class without __str__ stringifies through its own __repr__
   // (CPython object.__str__ delegates to type(x).__repr__); the manifest
   // evidence below would instead resolve the generic object formatter,
@@ -2175,27 +2112,6 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
     return emitInlineMethodBody(anchor, receiver,
                                 methodBindingBindsReceiver(*method), *method,
                                 {}, emptyKeywords);
-  }
-  // ⭐ An EXCEPTION is the one builtin whose str and repr differ: str is the
-  // message, repr is `ClassName('message')`. Falling to __repr__ below gave
-  // f-strings, format() and %s the repr:
-  //
-  //     e = ValueError("plain")
-  //     print(f"{e}")      # printed ValueError('plain'); CPython prints plain
-  //
-  // `tryEmitStrCall` already answers this for the `str(e)` spelling, through
-  // the same `isExceptionContractType` question; this is the other spelling
-  // reaching the same answer rather than a second rule.
-  if (isExceptionContractType(valueType)) {
-    if (CallInferenceResult strInference =
-            types.inferMethodCallWithEvidence(valueType, "__str__", {})) {
-      Value receiver = coerceValue(value, valueType, anchor);
-      auto op = py::StrOp::create(
-          builder, loc(anchor), strType,
-          mlir::FlatSymbolRefAttr::get(&context, "__str__"),
-          mlir::TypeAttr::get(callProtocolFor(strInference)), receiver.value);
-      return Value{op.getResult(), strType};
-    }
   }
   // Non-str builtins render via __repr__ (str(x) == repr(x) for every
   // non-str builtin; __str__ evidence resolves for containers through the
