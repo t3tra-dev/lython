@@ -36,3 +36,12 @@ exit a
 enter a
 exit a
 7
+enter a
+enter b
+body a b
+exit b
+exit a
+enter a
+enter boom
+exit a
+caught v

@@ -2152,6 +2152,27 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
                                 methodBindingBindsReceiver(*method), *method,
                                 {}, emptyKeywords);
   }
+  // ⭐ An EXCEPTION is the one builtin whose str and repr differ: str is the
+  // message, repr is `ClassName('message')`. Falling to __repr__ below gave
+  // f-strings, format() and %s the repr:
+  //
+  //     e = ValueError("plain")
+  //     print(f"{e}")      # printed ValueError('plain'); CPython prints plain
+  //
+  // `tryEmitStrCall` already answers this for the `str(e)` spelling, through
+  // the same `isExceptionContractType` question; this is the other spelling
+  // reaching the same answer rather than a second rule.
+  if (isExceptionContractType(valueType)) {
+    if (CallInferenceResult strInference =
+            types.inferMethodCallWithEvidence(valueType, "__str__", {})) {
+      Value receiver = coerceValue(value, valueType, anchor);
+      auto op = py::StrOp::create(
+          builder, loc(anchor), strType,
+          mlir::FlatSymbolRefAttr::get(&context, "__str__"),
+          mlir::TypeAttr::get(callProtocolFor(strInference)), receiver.value);
+      return Value{op.getResult(), strType};
+    }
+  }
   // Non-str builtins render via __repr__ (str(x) == repr(x) for every
   // non-str builtin; __str__ evidence resolves for containers through the
   // object contract but the manifest only implements their __repr__).

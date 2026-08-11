@@ -6,3 +6,4 @@ expected a nonnegative input, got -1.0
 expected a positive input, got 0.0
 expected a positive input, got -2.5
 2.0 0.0
+plain plain ValueError('plain') plain

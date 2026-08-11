@@ -256,6 +256,16 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     emitWhile(statement);
   } else if (statement.kind == "AsyncFor") {
     emitAsyncFor(statement);
+  } else if (statement.kind == "LyWithEnter") {
+    // Synthesized by emitWith: evaluate one manager and call its __enter__,
+    // inside the try that guards the managers entered before it.
+    const parser::Field *slot = parser::findField(statement, "slot");
+    if (slot && std::holds_alternative<std::int64_t>(slot->value)) {
+      auto index = static_cast<std::size_t>(std::get<std::int64_t>(slot->value));
+      if (index < pendingWithItems.size() && pendingWithItems[index].item)
+        emitWithEnter(*pendingWithItems[index].item,
+                      pendingWithItems[index].async);
+    }
   } else if (statement.kind == "LyWithCleanup") {
     // Synthesized by emitWith: the `finally` body of the implicit try that
     // wraps a `with` block. It carries an index into `activeWithCleanups`

@@ -42,6 +42,10 @@ def main() -> None:
     except ValueError as e:
         print(e)
     print(math.sqrt(4.0), math.log(1.0))
+    # An exception stringifies to its MESSAGE in every str position; only
+    # repr() gives the ClassName('...') form.
+    e = ValueError("plain")
+    print(f"{e}", str(e), repr(e), "{}".format(e))
 
 
 main()

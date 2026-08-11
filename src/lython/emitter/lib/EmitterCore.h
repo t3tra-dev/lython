@@ -393,6 +393,7 @@ private:
   void emitTryStar(const parser::Node &statement);
   void emitWith(const parser::Node &statement, bool async);
   void emitWithCleanup(const parser::Node &anchor, const WithCleanup &cleanup);
+  void emitWithEnter(const parser::Node &item, bool async);
 
   mlir::Value emitValueDiamond(mlir::Location location, mlir::Value condition,
                                mlir::Type resultType,
@@ -836,6 +837,14 @@ private:
   llvm::DenseMap<mlir::Type, mlir::Type> cellClassContracts;
   unsigned cellClassCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
+  // The `with` items whose enters have been scheduled but not yet emitted:
+  // a synthesized LyWithEnter statement names one by index, because the try
+  // that guards it has to be opened before it runs.
+  struct PendingWithItem {
+    const parser::Node *item = nullptr;
+    bool async = false;
+  };
+  llvm::SmallVector<PendingWithItem, 4> pendingWithItems;
   llvm::SmallVector<InlineReturnContext, 4> inlineReturnContexts;
   llvm::SmallVector<LoopControlContext, 4> loopControlContexts;
   // Innermost = the class method body currently being emitted (inline or

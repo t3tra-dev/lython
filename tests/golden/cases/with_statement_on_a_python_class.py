@@ -22,6 +22,16 @@ class Ctx:
         return False
 
 
+class Boom:
+    def __enter__(self) -> str:
+        print("enter boom")
+        raise ValueError("v")
+
+    def __exit__(self, a: object, b: object, c: object) -> bool:
+        print("exit boom")
+        return False
+
+
 class Plain:
     def value(self) -> int:
         return 7
@@ -89,6 +99,20 @@ def handled_inside_then_return() -> int:
     return 0
 
 
+def two_items() -> None:
+    with Ctx("a") as a, Ctx("b") as b:
+        print("body", a, b)
+
+
+def second_enter_raises() -> None:
+    # CPython enters A, opens A's try, THEN enters B -- so A's __exit__ runs.
+    try:
+        with Ctx("a"), Boom():
+            print("unreachable")
+    except ValueError as e:
+        print("caught", e)
+
+
 def main() -> None:
     simple()
     nested()
@@ -99,6 +123,8 @@ def main() -> None:
     break_out()
     continue_out()
     print(handled_inside_then_return())
+    two_items()
+    second_enter_raises()
 
 
 main()
