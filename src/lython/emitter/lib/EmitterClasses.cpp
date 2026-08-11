@@ -1797,31 +1797,31 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     // the fields; a plain dataclass gets `__hash__ = None` instead, which is
     // why this is gated on the NamedTuple marker rather than on `isDataclass`.
     //
-    // Written as `hash(self.f0) ^ hash(self.f1) ^ ...` over the synthesized
-    // AST, so it goes through the ordinary hash dispatch for each field rather
-    // than needing a new primitive. It is not tuple's exact algorithm, and
-    // does not need to be: Python only requires that equal objects hash equal.
+    // ⭐ `hash((self.f0, self.f1, ...))` -- tuple's own hash, which is what
+    // CPython's namedtuple inherits. It used to be an XOR fold of the fields'
+    // hashes, on the reasoning that Python only requires equal objects to hash
+    // equal. They ARE equal: a NamedTuple compares equal to a plain tuple with
+    // the same contents, so `hash(P(3)) == hash((3,))` must hold and did not.
+    // A dict keyed by tuples then missed a NamedTuple key that compares equal
+    // to one already in it.
+    //
+    // Why NOT a new primitive: the tuple this builds hashes through the same
+    // manifest `tuple.__hash__` any other tuple does, so the two answers are
+    // the same by construction rather than by agreement.
     if (isNamedTuple && !userDefines("__hash__") && !order.empty()) {
-      parser::NodePtr folded;
-      for (const std::string &field : order) {
-        parser::NodePtr call = parser::makeNode("Call", range);
-        parser::addField(*call, "func", synthName("hash", range));
-        parser::addField(*call, "args",
-                         std::vector<parser::NodePtr>{
-                             synthSelfAttr("self", field, range)});
-        parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
-        if (!folded) {
-          folded = std::move(call);
-          continue;
-        }
-        parser::NodePtr combined = parser::makeNode("BinOp", range);
-        parser::addField(*combined, "left", std::move(folded));
-        parser::addField(*combined, "op", parser::makeNode("BitXor", range));
-        parser::addField(*combined, "right", std::move(call));
-        folded = std::move(combined);
-      }
+      std::vector<parser::NodePtr> elements;
+      elements.reserve(order.size());
+      for (const std::string &field : order)
+        elements.push_back(synthSelfAttr("self", field, range));
+      parser::NodePtr tuple = parser::makeNode("Tuple", range);
+      parser::addField(*tuple, "elts", std::move(elements));
+      parser::NodePtr call = parser::makeNode("Call", range);
+      parser::addField(*call, "func", synthName("hash", range));
+      parser::addField(*call, "args",
+                       std::vector<parser::NodePtr>{std::move(tuple)});
+      parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
       parser::NodePtr returnNode = parser::makeNode("Return", range);
-      parser::addField(*returnNode, "value", std::move(folded));
+      parser::addField(*returnNode, "value", std::move(call));
       FunctionSignature sig;
       sig.positionalNames.push_back("self");
       sig.positionalTypes.push_back(types.contract(contractName));

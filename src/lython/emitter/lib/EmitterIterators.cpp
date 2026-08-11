@@ -1322,14 +1322,32 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
                                 std::move(copyComp), range));
     }
   }
-  if (!key && !reverse) {
-    emitStatement(*[&] {
+  if (!key) {
+    // ⭐ CPython's own shape for a keyless reverse: `L.reverse(); L.sort();
+    // L.reverse()`. The decorate-sort-undecorate below breaks ties with the
+    // index, and that only helps when the two keys compare EQUAL -- for a
+    // class whose `__lt__` answers False both ways the elements are neither
+    // less nor equal, so the sort leaves them in input order and the backward
+    // undecorate then swapped them:
+    //
+    //     class T:
+    //         def __lt__(self, other: "T") -> bool: return False
+    //     sorted([T("a"), T("b")], reverse=True)[0]   # was b; CPython gives a
+    //
+    // Reversing around a stable ascending sort needs no tie-break at all,
+    // which is why CPython does it that way.
+    auto call = [&](const char *method) {
       NodePtr statement = parser::makeNode("Expr", range);
-      parser::addField(*statement, "value",
-                       methodCallNode(nameNode(listName, range), "sort", {},
-                                      range));
-      return statement;
-    }());
+      parser::addField(
+          *statement, "value",
+          methodCallNode(nameNode(listName, range), method, {}, range));
+      emitStatement(*statement);
+    };
+    if (reverse)
+      call("reverse");
+    call("sort");
+    if (reverse)
+      call("reverse");
     return listName;
   }
 
