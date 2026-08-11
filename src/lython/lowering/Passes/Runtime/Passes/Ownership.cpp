@@ -358,13 +358,55 @@ bool valueDerivedFromEntryArgument(mlir::Value value, mlir::Block &entry,
   if (valueAliasesEntryArgument(value, entry, aliases))
     return true;
 
-  auto select = value.getDefiningOp<mlir::arith::SelectOp>();
-  if (!select)
-    return false;
-  return valueDerivedFromEntryArgument(select.getTrueValue(), entry, aliases,
-                                       depth + 1) &&
-         valueDerivedFromEntryArgument(select.getFalseValue(), entry, aliases,
-                                       depth + 1);
+  if (auto select = value.getDefiningOp<mlir::arith::SelectOp>())
+    return valueDerivedFromEntryArgument(select.getTrueValue(), entry, aliases,
+                                         depth + 1) &&
+           valueDerivedFromEntryArgument(select.getFalseValue(), entry, aliases,
+                                         depth + 1);
+
+  // ⭐ A merge is the other way branches join, and the answer is the same
+  // question asked of every incoming edge.
+  //
+  //     def clamp(x: int, lo: int, hi: int) -> int:
+  //         if x < lo: return lo
+  //         if x > hi: return hi
+  //         return x
+  //
+  // was refused -- "borrowed entry argument 0 of @clamp is returned as owned
+  // without a dominating retain" -- because this walk followed `arith.select`
+  // and nothing else. Two candidates fold to a select and were fine; three
+  // join through a BLOCK ARGUMENT, so the walk stopped, no retain went in, and
+  // the verifier then found the borrow returned as owned. The `if` and the
+  // conditional-expression spellings failed alike.
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    mlir::Block *owner = argument.getOwner();
+    if (owner == &entry || owner->hasNoPredecessors())
+      return false;
+    unsigned index = argument.getArgNumber();
+    for (mlir::Block *pred : owner->getPredecessors()) {
+      auto branch =
+          mlir::dyn_cast<mlir::BranchOpInterface>(pred->getTerminator());
+      if (!branch)
+        return false;
+      bool reaches = false;
+      for (unsigned successor = 0, end = pred->getTerminator()->getNumSuccessors();
+           successor < end; ++successor) {
+        if (pred->getTerminator()->getSuccessor(successor) != owner)
+          continue;
+        mlir::SuccessorOperands operands = branch.getSuccessorOperands(successor);
+        if (index >= operands.size() || !operands[index])
+          return false;
+        if (!valueDerivedFromEntryArgument(operands[index], entry, aliases,
+                                           depth + 1))
+          return false;
+        reaches = true;
+      }
+      if (!reaches)
+        return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 bool valueGroupDerivedFromEntryArguments(mlir::func::FuncOp function,

@@ -513,6 +513,9 @@ set(LYTHON_LEAK_GATE_CASES
     # Repeated appends through a container element: the runtime arm the
     # receiver now takes must retain each stored box exactly once.
     append_through_container_element
+    # Returning one of several borrowed arguments: the retain the walk now
+    # inserts on the merge must be matched by exactly one release.
+    return_one_of_several_arguments
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
