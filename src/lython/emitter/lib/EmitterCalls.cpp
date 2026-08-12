@@ -1726,12 +1726,41 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         return {};
       const parser::Node *target = ast::node(*gen, "target");
       const parser::Node *iter = ast::node(*gen, "iter");
-      if (!target || target->kind != "Name" || !iter)
+      if (!target || !iter)
         return {};
       mlir::Type elementType = iterationElement(iter);
       if (!elementType)
         return {};
-      types.bindLocalSymbol(ast::nameSpelling(*target), elementType);
+      if (target->kind == "Name") {
+        types.bindLocalSymbol(ast::nameSpelling(*target), elementType);
+        continue;
+      }
+      // ⭐ A TUPLE target binds member-wise, the way the loop does. Without
+      // it the element type came back empty and `max(a + b for a, b in
+      // pairs)` was refused for an element type it could not see -- while
+      // the loop and the list comprehension over the same pairs both bind.
+      if (target->kind != "Tuple" && target->kind != "List")
+        return {};
+      const auto *names = ast::nodeList(*target, "elts");
+      auto elementContract =
+          mlir::dyn_cast_if_present<py::ContractType>(elementType);
+      if (!names || names->empty() || !elementContract ||
+          elementContract.getContractName() != "builtins.tuple")
+        return {};
+      llvm::ArrayRef<mlir::Type> members = elementContract.getArguments();
+      for (auto [position, name] : llvm::enumerate(*names)) {
+        if (!name || name->kind != "Name" || members.empty())
+          return {};
+        // A uniform `tuple[T]` gives every position the same member.
+        mlir::Type memberType =
+            members.size() == 1 ? members.front()
+                                : (position < members.size()
+                                       ? members[position]
+                                       : mlir::Type());
+        if (!memberType)
+          return {};
+        types.bindLocalSymbol(ast::nameSpelling(*name), memberType);
+      }
     }
     return types.widenLiteral(types.inferExpr(
         std::get<parser::NodePtr>(eltField->value).get()));

@@ -369,7 +369,7 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
   struct GenEntry {
     parser::NodePtr target;
     parser::NodePtr iter;
-    std::string targetName;
+    llvm::SmallVector<std::string, 2> targetNames;
     llvm::SmallVector<parser::NodePtr, 2> filters;
   };
   llvm::SmallVector<GenEntry, 2> chain;
@@ -388,9 +388,33 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
     GenEntry entry;
     entry.target = std::get<parser::NodePtr>(targetField->value);
     entry.iter = std::get<parser::NodePtr>(iterField->value);
-    if (!entry.target || entry.target->kind != "Name" || !entry.iter)
-      return reject("generator expression target must be a simple name");
-    entry.targetName = std::string(ast::nameSpelling(*entry.target));
+    // ⭐ A TUPLE target is what emitFor already binds -- `for a, b in zip(..)`
+    // is an ordinary loop -- so the fusion only has to know which names to
+    // scope. Rejecting it here made `sum(a * b for a, b in zip(xs, ys))`
+    // "generator expression target must be a simple name" while the list
+    // comprehension spelling of the same thing worked.
+    if (!entry.target || !entry.iter)
+      return reject("malformed generator expression");
+    auto appendTargetName = [&](const parser::Node *node, auto &&self) -> bool {
+      if (!node)
+        return false;
+      if (node->kind == "Name") {
+        entry.targetNames.push_back(std::string(ast::nameSpelling(*node)));
+        return true;
+      }
+      if (node->kind != "Tuple" && node->kind != "List")
+        return false;
+      const auto *elts = ast::nodeList(*node, "elts");
+      if (!elts || elts->empty())
+        return false;
+      for (const parser::NodePtr &elt : *elts)
+        if (!self(elt.get(), self))
+          return false;
+      return true;
+    };
+    if (!appendTargetName(entry.target.get(), appendTargetName))
+      return reject("generator expression target must be a name or a tuple "
+                    "of names");
     if (const auto *ifs = ast::nodeList(*generator, "ifs"))
       entry.filters.append(ifs->begin(), ifs->end());
     chain.push_back(std::move(entry));
@@ -437,12 +461,13 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
 
   llvm::SmallVector<std::pair<std::string, std::optional<Value>>, 2>
       priorTargets;
-  for (const GenEntry &entry : chain) {
-    std::optional<Value> prior;
-    if (auto found = values.find(entry.targetName); found != values.end())
-      prior = found->second;
-    priorTargets.push_back({entry.targetName, prior});
-  }
+  for (const GenEntry &entry : chain)
+    for (const std::string &name : entry.targetNames) {
+      std::optional<Value> prior;
+      if (auto found = values.find(name); found != values.end())
+        prior = found->second;
+      priorTargets.push_back({name, prior});
+    }
   emitFor(*current.front());
   for (auto &[name, prior] : priorTargets) {
     if (prior)
