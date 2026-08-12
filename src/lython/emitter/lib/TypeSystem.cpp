@@ -445,6 +445,13 @@ generatorSendTypeFromAnnotation(const TypeSystem &types, mlir::Type annotation,
 // manifest uses for dict.items()'s `tuple[$K, $V]` and starred call
 // arguments). Literal-index `__getitem__` resolves positional tuples to the
 // indexed member's type, so heterogeneous elements never need a union.
+// iter/reversed/filter/enumerate/zip/map as VALUES: the emitter turns each
+// into a synthesized generator, and this is that generator's contract.
+// nullptr means "not one of these, or not a form this can type" -- the
+// caller falls through to the ordinary callee lookup.
+mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
+                                const std::vector<parser::NodePtr> *args);
+
 mlir::Type tupleOfMembers(const TypeSystem &types,
                           llvm::ArrayRef<mlir::Type> members) {
   if (members.empty())
@@ -988,6 +995,96 @@ bool bindManifestModuleCallableExports(TypeSystem &types,
         canonical, contract);
   }
   return handled;
+}
+
+mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
+                                const std::vector<parser::NodePtr> *args) {
+  // Iterator, not types.GeneratorType: the synthesized generator IS a
+  // GeneratorType, but a generator value that crosses a function return
+  // loses the frame target its manifest __next__ needs ("runtime manifest
+  // has no types.GeneratorType.__next__ method"), while the protocol
+  // spelling is the one a caller can consume -- and it is what the working
+  // annotated form of this same code says.
+  auto generatorOf = [&](mlir::Type yielded) -> mlir::Type {
+    if (!yielded)
+      return {};
+    return types.protocol("Iterator", {yielded});
+  };
+  auto positional = [&](unsigned index) -> const parser::Node * {
+    if (!args || index >= args->size() || !(*args)[index] ||
+        (*args)[index]->kind == "Starred")
+      return nullptr;
+    return (*args)[index].get();
+  };
+  unsigned count = args ? static_cast<unsigned>(args->size()) : 0;
+
+  if (name == "iter" && count == 1) {
+    const parser::Node *source = positional(0);
+    if (!source)
+      return {};
+    // iter(gen) is gen: an object that already answers __next__ comes back
+    // unchanged, which is what the emitter does too.
+    mlir::Type sourceType = types.widenLiteral(types.inferExpr(source));
+    if (types.inferMethodCallWithEvidence(sourceType, "__next__", {}))
+      return sourceType;
+    return generatorOf(types.iterationElementType(source));
+  }
+  if ((name == "reversed" || name == "filter") &&
+      count == (name == "filter" ? 2u : 1u)) {
+    const parser::Node *source = positional(name == "filter" ? 1 : 0);
+    return source ? generatorOf(types.iterationElementType(source))
+                  : mlir::Type();
+  }
+  if (name == "enumerate" && (count == 1 || count == 2)) {
+    const parser::Node *source = positional(0);
+    if (!source)
+      return {};
+    mlir::Type element = types.iterationElementType(source);
+    if (!element)
+      return {};
+    return generatorOf(
+        tupleOfMembers(types, {types.contract("builtins.int"), element}));
+  }
+  if (name == "zip" && count >= 2) {
+    llvm::SmallVector<mlir::Type, 4> elements;
+    for (unsigned index = 0; index < count; ++index) {
+      const parser::Node *source = positional(index);
+      if (!source)
+        return {};
+      mlir::Type element = types.iterationElementType(source);
+      if (!element)
+        return {};
+      elements.push_back(element);
+    }
+    return generatorOf(tupleOfMembers(types, elements));
+  }
+  if (name == "map" && count == 2) {
+    const parser::Node *callee = positional(0);
+    const parser::Node *source = positional(1);
+    if (!callee || !source)
+      return {};
+    mlir::Type element = types.iterationElementType(source);
+    if (!element)
+      return {};
+    // A lambda's own parameter is unannotated, so its type comes from the
+    // sequence being mapped -- the same expectation the emitter distributes
+    // when it inlines the body. Without it `map(lambda v: v * 2, xs)` inside
+    // an unannotated method typed as object, and the object-typed result met
+    // the real generator at the ABI as "bundle has 5 values, expects 1".
+    if (callee->kind == "Lambda") {
+      py::CallableType expected = py::CallableType::get(
+          &types.getContext(), {element}, {}, {}, {}, {});
+      FunctionSignature lambdaSig =
+          types.functionSignature(*callee, std::nullopt, expected);
+      return generatorOf(types.widenLiteral(lambdaSig.resultType));
+    }
+    auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+        types.widenLiteral(types.inferExpr(callee)));
+    if (!callable || callable.getResultTypes().size() != 1)
+      return {};
+    return generatorOf(callable.getResultTypes().front());
+  }
+  return {};
 }
 
 } // namespace
@@ -2686,6 +2783,17 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (mlir::Type element =
                 iterationElementType(reducerArgs->front().get()))
           return element;
+      // The lazy-iterator builtins are the same story one step further:
+      // the emitter synthesizes a generator function for each of them, so
+      // the type exists only once that function is emitted. A walk that ran
+      // first -- an unannotated `def __iter__(self): return iter(self.items)`
+      // -- read the callee as builtins.object and reported "is not callable",
+      // naming the compiler's position rather than the program's. The yield
+      // channel comes from iterationElementType, the same walk the fold
+      // itself uses; send and return are None because a synthesized
+      // generator has neither.
+      if (mlir::Type lazy = lazyIteratorCallType(*this, reducer, reducerArgs))
+        return lazy;
       if ((reducer == "max" || reducer == "min") && reducerArgs &&
           reducerArgs->size() > 1) {
         llvm::SmallVector<mlir::Type, 4> operands;
