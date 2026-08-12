@@ -44,3 +44,8 @@ True
 ['a', 'b'] ['a', 'b']
 b'ab' b'ab' b'ab'
 ab ab
+True True
+False False
+True False
+True True
+True ['once']

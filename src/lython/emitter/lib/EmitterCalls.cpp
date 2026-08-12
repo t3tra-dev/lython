@@ -7,6 +7,8 @@
 #include "PyProtocols.h"
 
 #include "AstAccess.h"
+
+#include "llvm/ADT/ScopeExit.h"
 #include "EmitterOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -283,6 +285,83 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         rewritten->fields.push_back(*keywords);
       return emitCall(*rewritten);
     }
+
+  // ⭐ `s.startswith((a, b))` is `s.startswith(a) or s.startswith(b)`, which
+  // is what CPython's C loop over the tuple computes. The tuple form was
+  // "builtins.str does not provide manifest method 'startswith'" -- the
+  // manifest declares the str parameter, and there is no second
+  // implementation to declare: the answer is a disjunction of the one that
+  // exists.
+  //
+  // The receiver is emitted ONCE (captured in the first disjunct, named by
+  // the rest), and the disjunction is RIGHT-nested for the same reason the
+  // comparison chain is: a capture is defined in the arm that made it, so a
+  // left-nested tree puts later arms where it does not dominate them.
+  if (calleeNode && calleeNode->kind == "Attribute") {
+    llvm::StringRef affix = ast::string(*calleeNode, "attr").value_or("");
+    const auto *affixArgs = ast::nodeList(expr, "args");
+    const auto *affixKeywords = ast::nodeList(expr, "keywords");
+    const parser::Node *tupleArg =
+        affixArgs && !affixArgs->empty() ? affixArgs->front().get() : nullptr;
+    if ((affix == "startswith" || affix == "endswith") && tupleArg &&
+        tupleArg->kind == "Tuple" && affixArgs->size() <= 3 &&
+        (!affixKeywords || affixKeywords->empty())) {
+      const auto *elts = ast::nodeList(*tupleArg, "elts");
+      const parser::Field *receiverField =
+          parser::findField(*calleeNode, "value");
+      if (elts && receiverField &&
+          std::holds_alternative<parser::NodePtr>(receiverField->value)) {
+        if (elts->empty()) {
+          auto constant = py::BoolConstantOp::create(
+              builder, loc(expr), types.literal("False"),
+              builder.getBoolAttr(false));
+          return Value{constant.getResult(), types.literal("False")};
+        }
+        parser::NodePtr receiver =
+            std::get<parser::NodePtr>(receiverField->value);
+        std::string subject =
+            "__lyaffix" + std::to_string(++listCompCounter);
+        auto affixCall = [&](std::size_t index) {
+          parser::NodePtr self = parser::makeNode("Name", expr.range);
+          parser::addField(*self, "id", subject);
+          parser::NodePtr attribute =
+              parser::makeNode("Attribute", calleeNode->range);
+          parser::addField(*attribute, "value", std::move(self));
+          parser::addField(*attribute, "attr", affix.str());
+          std::vector<parser::NodePtr> callArgs{(*elts)[index]};
+          for (std::size_t rest = 1; rest < affixArgs->size(); ++rest)
+            callArgs.push_back((*affixArgs)[rest]);
+          parser::NodePtr call = parser::makeNode("Call", expr.range);
+          parser::addField(*call, "func", std::move(attribute));
+          parser::addField(*call, "args", std::move(callArgs));
+          parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+          return call;
+        };
+        parser::NodePtr folded = affixCall(elts->size() - 1);
+        for (std::size_t index = elts->size() - 1; index > 0; --index) {
+          parser::NodePtr disjunction = parser::makeNode("BoolOp", expr.range);
+          parser::addField(*disjunction, "op",
+                           parser::makeNode("Or", expr.range));
+          parser::addField(*disjunction, "values",
+                           std::vector<parser::NodePtr>{affixCall(index - 1),
+                                                        std::move(folded)});
+          folded = std::move(disjunction);
+        }
+        parser::NodePtr target = parser::makeNode("Name", expr.range);
+        parser::addField(*target, "id", subject);
+        parser::NodePtr bind = parser::makeNode("Assign", expr.range);
+        parser::addField(*bind, "targets",
+                         std::vector<parser::NodePtr>{std::move(target)});
+        parser::addField(*bind, "value", receiver);
+        Value result = emitNone(expr);
+        runWithScratchNames({subject}, [&] {
+          emitStatement(*bind);
+          result = emitExpr(folded.get());
+        });
+        return result;
+      }
+    }
+  }
 
   // ⭐ Two argument spellings that ARE the no-argument one, folded where
   // CPython's own C dispatch folds them: `s.split(None)` is the whitespace

@@ -53,3 +53,25 @@ def defaulted_arguments() -> None:
 
 
 defaulted_arguments()
+
+
+# `s.startswith((a, b))` is `s.startswith(a) or s.startswith(b)`, which is
+# what CPython's C loop over the tuple computes. The tuple form was "does not
+# provide manifest method 'startswith'": the manifest declares the str
+# parameter, and there is no second implementation to declare -- the answer is
+# a disjunction of the one that exists. The receiver is evaluated once.
+def affix_tuples() -> None:
+    print("Hello".startswith(("He", "x")), "Hello".startswith(("x", "He")))
+    print("Hello".startswith(("a", "b")), "Hello".startswith(()))
+    print("Hello".endswith(("lo", "x")), "Hello".endswith(("x", "y")))
+    print("Hello".startswith(("e", "H"), 1), "Hello".endswith(("l", "e"), 0, 4))
+    calls: list[str] = []
+
+    def subject() -> str:
+        calls.append("once")
+        return "abc"
+
+    print(subject().startswith(("z", "ab")), calls)
+
+
+affix_tuples()
