@@ -1,3 +1,4 @@
+# differential: skip sys.hexversion carries the reference build's patch level
 import sys
 
 # Target-independent manifest constants (runtime/modules/sys.mlir).
