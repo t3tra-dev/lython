@@ -587,6 +587,27 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
   // three, which took out `float_floordiv_mod_round` with "runtime bundle for
   // builtins.int has 1 values, but ABI expects 3". The promotion needs the
   // boxing `emitFloatFromInt` does for the rung above, not a coercion.
+  // ⭐ int * sequence is sequence * int. CPython gets there by returning
+  // NotImplemented from int.__mul__ and running the sequence's __rmul__,
+  // which for str/list/tuple/bytes IS __mul__ with the operands swapped --
+  // so the swap is the whole of the reflected operation for these four, and
+  // it is decidable here because both types are known. `2 * "ab"` was
+  // "builtins.int does not provide manifest method '__mul__'" while
+  // `"ab" * 2` worked.
+  //
+  // ⛔ Not a general reflected-dunder search: that one has to try the left
+  // operand, observe NotImplemented, and try the right -- a runtime protocol
+  // this compiler does not have. These four are the cases where the reflected
+  // method is the same method, so no protocol is needed to know the answer.
+  if (ast::isOperator(op, "Mult") && left == types.intType()) {
+    static constexpr llvm::StringLiteral kRepeatable[] = {
+        "builtins.str", "builtins.list", "builtins.tuple", "builtins.bytes"};
+    if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(right))
+      if (llvm::is_contained(kRepeatable, contract.getContractName())) {
+        std::swap(lhs, rhs);
+        std::swap(left, right);
+      }
+  }
   mlir::Type result = types.join({left, right});
   if (left == types.strType() && right == types.strType()) {
     result = types.strType();
