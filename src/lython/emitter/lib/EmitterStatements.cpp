@@ -946,4 +946,93 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   }
 }
 
+// The runtime half of `a, b = xs`: CPython's UNPACK_SEQUENCE raises when the
+// source length is not the target arity, and this walk unpacks by index, so
+// a longer source silently dropped its tail and a shorter one read past the
+// end. The arity is not in the type for the common case -- a tuple whose
+// members share a type collapses to `tuple[T]` (TypeSystem.cpp, `uniform`)
+// and a list carries its length in the object -- so the check has to be a
+// length comparison against the object.
+//
+// ⛔ Why NOT a static refusal when the arity IS in the type (a heterogeneous
+// tuple): `try: a, b = t; except ValueError:` is legal Python, and the
+// runtime raise it expects is what this emits. The static case only skips
+// the comparison it can already answer.
+//
+// CPython's two messages differ in one detail that is decided statically:
+// the tuple/list fast paths in ceval report what they got, the generic
+// iterator path does not know it ("too many values to unpack (expected 2)"
+// for a str source, "(expected 2, got 3)" for a list).
+void ModuleEmitter::emitUnpackArityCheck(const parser::Node &target,
+                                         Value source, std::size_t expected) {
+  mlir::Type sourceType = types.widenLiteral(source.type);
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(sourceType))
+    if (contract.getContractName() == "builtins.tuple" &&
+        contract.getArguments().size() > 1 &&
+        contract.getArguments().size() == expected)
+      return;
+  if (!types.inferMethodCallWithEvidence(sourceType, "__len__", {}))
+    return;
+
+  bool reportsCount = false;
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(sourceType))
+    reportsCount = contract.getContractName() == "builtins.tuple" ||
+                   contract.getContractName() == "builtins.list";
+
+  parser::SourceRange range = target.range;
+  unsigned serial = ++listCompCounter;
+  std::string sourceName = "__lyunpack" + std::to_string(serial) + "_s";
+  std::string lengthName = "__lyunpack" + std::to_string(serial) + "_n";
+  std::string expectedText = std::to_string(expected);
+
+  auto message = [&](const char *prefix) {
+    parser::NodePtr text = synth::strConstant(std::string(prefix) +
+                                      " values to unpack (expected " +
+                                      expectedText + ", got ",
+                                  range);
+    parser::NodePtr count = synth::call(synth::name("str", range),
+                             {synth::name(lengthName, range)}, range);
+    return synth::binOp(synth::binOp(std::move(text), "Add", std::move(count), range),
+                     "Add", synth::strConstant(")", range), range);
+  };
+  auto raiseNode = [&](parser::NodePtr text) {
+    parser::NodePtr node = synth::raiseStmt(synth::call(synth::name("ValueError", range),
+                              {std::move(text)}, range), range);
+    return node;
+  };
+
+  parser::NodePtr tooMany =
+      reportsCount ? message("too many")
+                   : synth::strConstant("too many values to unpack (expected " +
+                                        expectedText + ")",
+                                    range);
+  parser::NodePtr overLong = synth::ifStmt(
+      synth::compare(synth::name(lengthName, range), "Gt",
+                  synth::intConstant(static_cast<std::int64_t>(expected), range),
+                  range),
+      {raiseNode(std::move(tooMany))}, {}, range);
+  parser::NodePtr tooFew = synth::ifStmt(
+      synth::compare(synth::name(lengthName, range), "Lt",
+                  synth::intConstant(static_cast<std::int64_t>(expected), range),
+                  range),
+      {raiseNode(message("not enough"))}, {}, range);
+
+  std::vector<parser::NodePtr> guarded;
+  guarded.push_back(std::move(overLong));
+  guarded.push_back(std::move(tooFew));
+  parser::NodePtr check = synth::ifStmt(
+      synth::compare(synth::name(lengthName, range), "NotEq",
+                  synth::intConstant(static_cast<std::int64_t>(expected), range),
+                  range),
+      std::move(guarded), {}, range);
+
+  runWithScratchNames({sourceName, lengthName}, [&] {
+    values[sourceName] = source;
+    emitStatement(*synth::assign(synth::name(lengthName, range),
+                              synth::lenCall(synth::name(sourceName, range), range),
+                              range));
+    emitStatement(*check);
+  });
+}
+
 } // namespace lython::emitter

@@ -325,8 +325,8 @@ private:
   // in both loop and value position.
   bool hasIndexWalkableEvidence(mlir::Type type);
   bool hasIndexableEvidence(const parser::Node *expr);
-  // `a, b = xs`: the length comparison CPython's UNPACK_SEQUENCE makes,
-  // emitted next to the AST-synthesis helpers it needs (EmitterIterators.cpp).
+  // `a, b = xs`: the length comparison CPython's UNPACK_SEQUENCE makes
+  // (EmitterStatements.cpp, beside the assignment target walk it guards).
   void emitUnpackArityCheck(const parser::Node &target, Value source,
                             std::size_t expected);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,
