@@ -1,0 +1,13 @@
+{1, 2, 3}
+set()
+frozenset({1, 2})
+frozenset()
+[{1}, {2}]
+{1: {2}}
+{1, 2} {1, 2}
+range(0, 3)
+range(1, 5)
+range(1, 10, 2)
+range(5, 1, -1)
+[range(0, 2)]
+range(0, 3) frozenset({1})

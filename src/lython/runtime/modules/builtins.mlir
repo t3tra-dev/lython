@@ -19215,6 +19215,10 @@ module attributes {
   memref.global "private" constant @__ly_repr_lbrace : memref<1xi8> = dense<123>
   memref.global "private" constant @__ly_repr_rbrace : memref<1xi8> = dense<125>
   memref.global "private" constant @__ly_repr_colon : memref<2xi8> = dense<[58, 32]>
+  memref.global "private" constant @__ly_repr_set_empty : memref<5xi8> = dense<[115, 101, 116, 40, 41]>
+  memref.global "private" constant @__ly_repr_frozenset_open : memref<11xi8> = dense<[102, 114, 111, 122, 101, 110, 115, 101, 116, 40, 123]>
+  memref.global "private" constant @__ly_repr_frozenset_empty : memref<11xi8> = dense<[102, 114, 111, 122, 101, 110, 115, 101, 116, 40, 41]>
+  memref.global "private" constant @__ly_repr_range_open : memref<6xi8> = dense<[114, 97, 110, 103, 101, 40]>
 
   // list.__repr__: `[e0, e1, ...]`, each element repr'd through the uniform
   // boxed-method hook. Intermediate strs are released explicitly (Concat
@@ -19456,6 +19460,174 @@ module attributes {
     %out_h, %out_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %clh, %clb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%clh) : (memref<2xi64>) -> ()
+    func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
+  }
+
+  // set.__repr__ / frozenset.__repr__: `{e0, e1, ...}`, `set()` and
+  // `frozenset()` for the empty ones, the same uniform element dispatch as
+  // LyList_Repr. Without these, `print({1, 2})` reached the lowering as
+  // "runtime manifest has no builtins.set.__repr__ method" and a set nested
+  // in a printed container aborted the process, while frozenset fell back to
+  // the address form `<frozenset object at 0x...>`.
+  //
+  // Deviation, noted: the elements come out in the table's own order (which
+  // is insertion order for a set this compiler builds), not CPython's hash
+  // order. The two agree for the small ints a reader is most likely to
+  // print, and nothing else can be matched without adopting CPython's table.
+  func.func private @__ly_set_repr_body(%len: i64, %items_ptr: !llvm.ptr, %open_h: memref<2xi64> {ly.ownership.object_header}, %open_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.transfer_args = [2]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c0_i64 = arith.constant 0 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c2_i64 = arith.constant 2 : i64
+    %c16_i64 = arith.constant 16 : i64
+    %len_idx = arith.index_cast %len : i64 to index
+    %loop:2 = scf.for %i = %c0 to %len_idx step %c1 iter_args(%rh = %open_h, %rb = %open_b) -> (memref<2xi64>, memref<?xi8>) {
+      %i_i64 = arith.index_cast %i : index to i64
+      %is_pos = arith.cmpi sgt, %i_i64, %c0_i64 : i64
+      %sep:2 = scf.if %is_pos -> (memref<2xi64>, memref<?xi8>) {
+        %sep_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
+        %sep_dyn = memref.cast %sep_ref : memref<2xi8> to memref<?xi8>
+        %sh, %sb = func.call @LyUnicode_FromBytes(%sep_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %ch, %cb = func.call @LyUnicode_Concat(%rh, %rb, %sh, %sb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%rh) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%sh) : (memref<2xi64>) -> ()
+        scf.yield %ch, %cb : memref<2xi64>, memref<?xi8>
+      } else {
+        scf.yield %rh, %rb : memref<2xi64>, memref<?xi8>
+      }
+      %off = arith.muli %i_i64, %c16_i64 : i64
+      %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+      cf.assert %ok, "repr: boxed element has no conforming __repr__"
+      %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%erh) : (memref<2xi64>) -> ()
+      scf.yield %nh, %nb : memref<2xi64>, memref<?xi8>
+    }
+    %close_ref = memref.get_global @__ly_repr_rbrace : memref<1xi8>
+    %close_dyn = memref.cast %close_ref : memref<1xi8> to memref<?xi8>
+    %clh, %clb = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %out_h, %out_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %clh, %clb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%clh) : (memref<2xi64>) -> ()
+    func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LySet_Repr(%self: memref<11xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1_i64 = arith.constant 1 : i64
+    %c5_i64 = arith.constant 5 : i64
+    %zero = arith.constant 0 : i64
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<11xi64>
+    %empty = arith.cmpi eq, %len, %zero : i64
+    %result:2 = scf.if %empty -> (memref<2xi64>, memref<?xi8>) {
+      %e_ref = memref.get_global @__ly_repr_set_empty : memref<5xi8>
+      %e_dyn = memref.cast %e_ref : memref<5xi8> to memref<?xi8>
+      %eh, %eb = func.call @LyUnicode_FromBytes(%e_dyn, %c0, %c5_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %eh, %eb : memref<2xi64>, memref<?xi8>
+    } else {
+      %open_ref = memref.get_global @__ly_repr_lbrace : memref<1xi8>
+      %open_dyn = memref.cast %open_ref : memref<1xi8> to memref<?xi8>
+      %oh, %ob = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %items = func.call @__ly_set_items(%self) : (memref<11xi64>) -> memref<?xi64>
+      %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+      %items_i64 = arith.index_cast %items_idx : index to i64
+      %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+      %body:2 = func.call @__ly_set_repr_body(%len, %items_ptr, %oh, %ob) : (i64, !llvm.ptr, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %body#0, %body#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyFrozenSet_Repr(%self: memref<13xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1_i64 = arith.constant 1 : i64
+    %c11_i64 = arith.constant 11 : i64
+    %zero = arith.constant 0 : i64
+    %length_slot = arith.constant 2 : index
+    %len = memref.load %self[%length_slot] : memref<13xi64>
+    %empty = arith.cmpi eq, %len, %zero : i64
+    %result:2 = scf.if %empty -> (memref<2xi64>, memref<?xi8>) {
+      %e_ref = memref.get_global @__ly_repr_frozenset_empty : memref<11xi8>
+      %e_dyn = memref.cast %e_ref : memref<11xi8> to memref<?xi8>
+      %eh, %eb = func.call @LyUnicode_FromBytes(%e_dyn, %c0, %c11_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %eh, %eb : memref<2xi64>, memref<?xi8>
+    } else {
+      %open_ref = memref.get_global @__ly_repr_frozenset_open : memref<11xi8>
+      %open_dyn = memref.cast %open_ref : memref<11xi8> to memref<?xi8>
+      %oh, %ob = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c11_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %items = func.call @__ly_frozenset_items(%self) : (memref<13xi64>) -> memref<?xi64>
+      %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+      %items_i64 = arith.index_cast %items_idx : index to i64
+      %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+      %body:2 = func.call @__ly_set_repr_body(%len, %items_ptr, %oh, %ob) : (i64, !llvm.ptr, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      %rp_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
+      %rp_dyn = memref.cast %rp_ref : memref<1xi8> to memref<?xi8>
+      %rph, %rpb = func.call @LyUnicode_FromBytes(%rp_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %out_h, %out_b = func.call @LyUnicode_Concat(%body#0, %body#1, %rph, %rpb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%body#0) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%rph) : (memref<2xi64>) -> ()
+      scf.yield %out_h, %out_b : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // range.__repr__: `range(stop)` is still spelled `range(0, 3)` -- CPython
+  // prints the normalized triple and drops only a step of 1. The address form
+  // this fell back to told the reader nothing.
+  func.func @LyRange_Repr(%self: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1_i64 = arith.constant 1 : i64
+    %c2_i64 = arith.constant 2 : i64
+    %c6_i64 = arith.constant 6 : i64
+    %one = arith.constant 1 : i64
+    %start_slot = arith.constant 2 : index
+    %stop_slot = arith.constant 3 : index
+    %step_slot = arith.constant 4 : index
+    %start = memref.load %self[%start_slot] : memref<5xi64>
+    %stop = memref.load %self[%stop_slot] : memref<5xi64>
+    %step = memref.load %self[%step_slot] : memref<5xi64>
+    %open_ref = memref.get_global @__ly_repr_range_open : memref<6xi8>
+    %open_dyn = memref.cast %open_ref : memref<6xi8> to memref<?xi8>
+    %oh, %ob = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c6_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %sh0, %sb0 = func.call @LyUnicode_FromI64(%start) : (i64) -> (memref<2xi64>, memref<?xi8>)
+    %a_h, %a_b = func.call @LyUnicode_Concat(%oh, %ob, %sh0, %sb0) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%oh) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%sh0) : (memref<2xi64>) -> ()
+    %comma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
+    %comma_dyn = memref.cast %comma_ref : memref<2xi8> to memref<?xi8>
+    %ch0, %cb0 = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %ch0, %cb0) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%a_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%ch0) : (memref<2xi64>) -> ()
+    %sh1, %sb1 = func.call @LyUnicode_FromI64(%stop) : (i64) -> (memref<2xi64>, memref<?xi8>)
+    %c_h, %c_b = func.call @LyUnicode_Concat(%b_h, %b_b, %sh1, %sb1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%b_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%sh1) : (memref<2xi64>) -> ()
+    %unit_step = arith.cmpi eq, %step, %one : i64
+    %d:2 = scf.if %unit_step -> (memref<2xi64>, memref<?xi8>) {
+      scf.yield %c_h, %c_b : memref<2xi64>, memref<?xi8>
+    } else {
+      %ch1, %cb1 = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %e_h, %e_b = func.call @LyUnicode_Concat(%c_h, %c_b, %ch1, %cb1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%c_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%ch1) : (memref<2xi64>) -> ()
+      %sh2, %sb2 = func.call @LyUnicode_FromI64(%step) : (i64) -> (memref<2xi64>, memref<?xi8>)
+      %f_h, %f_b = func.call @LyUnicode_Concat(%e_h, %e_b, %sh2, %sb2) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%e_h) : (memref<2xi64>) -> ()
+      func.call @LyUnicode_DecRef(%sh2) : (memref<2xi64>) -> ()
+      scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
+    }
+    %rp_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
+    %rp_dyn = memref.cast %rp_ref : memref<1xi8> to memref<?xi8>
+    %rph, %rpb = func.call @LyUnicode_FromBytes(%rp_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %out_h, %out_b = func.call @LyUnicode_Concat(%d#0, %d#1, %rph, %rpb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%d#0) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%rph) : (memref<2xi64>) -> ()
     func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
   }
 
