@@ -528,21 +528,40 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
                                carriedInitial);
 
   Value iterable = emitExpr(ast::node(statement, "iter"));
-  CallInferenceResult iterInference =
-      types.inferMethodCallWithEvidence(iterable.type, "__iter__", {});
-  if (!requireStaticEvidence(statement, iterInference))
-    return;
-  mlir::Type iteratorType = iterInference.resultType;
+  // ⭐ A SOURCE class's __iter__ is called, not looked up in the manifest.
+  // py.iter resolves its target against the runtime manifest, so
+  // `for v in Box(...)` over a class that defines __iter__ died in the
+  // lowering as "runtime manifest has no Box.__iter__ method" -- while
+  // __len__, __getitem__ and __contains__ on the same class all worked, and
+  // so did `async for` over a class's __aiter__, which is this same shape
+  // twelve hundred lines down.
+  Value concreteIterable = stripLocalProtocolView(iterable);
+  Value methodIterable = concreteIterable.value ? concreteIterable : iterable;
+  Value iteratorValue;
+  mlir::Type iteratorType;
+  if (std::optional<MethodBinding> sourceIter =
+          lookupClassMethod(methodIterable.type, "__iter__")) {
+    iteratorValue = emitInlineMethodCall(statement, methodIterable, *sourceIter);
+    iteratorType = iteratorValue.type;
+  } else {
+    CallInferenceResult iterInference =
+        types.inferMethodCallWithEvidence(iterable.type, "__iter__", {});
+    if (!requireStaticEvidence(statement, iterInference))
+      return;
+    iteratorType = iterInference.resultType;
+    mlir::UnitAttr returnedSelf = iteratorType == iterable.type
+                                      ? builder.getUnitAttr()
+                                      : mlir::UnitAttr();
+    auto iterator = py::IterOp::create(
+        builder, loc(statement), iteratorType, "__iter__",
+        callProtocolFor(iterInference), iterable.value, returnedSelf);
+    iteratorValue = Value{iterator.getResult(), iteratorType};
+  }
   CallInferenceResult nextInference =
       types.inferMethodCallWithEvidence(iteratorType, "__next__", {});
   if (!requireStaticEvidence(statement, nextInference))
     return;
   mlir::Type elem = nextInference.resultType;
-  mlir::UnitAttr returnedSelf =
-      iteratorType == iterable.type ? builder.getUnitAttr() : mlir::UnitAttr();
-  auto iterator = py::IterOp::create(builder, loc(statement), iteratorType,
-                                     "__iter__", callProtocolFor(iterInference),
-                                     iterable.value, returnedSelf);
 
   mlir::Block *entry = builder.getInsertionBlock();
   mlir::Region *region = entry->getParent();
@@ -589,7 +608,7 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   mlir::Location nextLoc = iterLocNode ? loc(*iterLocNode) : loc(statement);
   auto next = py::NextOp::create(
       builder, nextLoc, elem, builder.getI1Type(), iteratorType,
-      "__next__", callProtocolFor(nextInference), iterator.getResult());
+      "__next__", callProtocolFor(nextInference), iteratorValue.value);
   mlir::Block *exhaustedTarget = elseBlock ? elseBlock : afterBlock;
   mlir::cf::CondBranchOp::create(builder, loc(statement), next.getValid(),
                                  bodyBlock, mlir::ValueRange{},
