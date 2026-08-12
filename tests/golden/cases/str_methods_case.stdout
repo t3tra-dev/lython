@@ -40,3 +40,7 @@ False
 True
 False
 True
+['a', 'b', 'c'] ['a', 'b', 'c']
+['a', 'b'] ['a', 'b']
+b'ab' b'ab' b'ab'
+ab ab

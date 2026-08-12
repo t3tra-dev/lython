@@ -284,6 +284,38 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       return emitCall(*rewritten);
     }
 
+  // ⭐ Two argument spellings that ARE the no-argument one, folded where
+  // CPython's own C dispatch folds them: `s.split(None)` is the whitespace
+  // split (sep=None IS the default), and `s.encode("utf-8")` is the default
+  // encoding. Both were "does not provide manifest method" for a method the
+  // no-argument spelling right next to them resolves. A non-literal argument
+  // is left alone -- the fold is only for what is decidable here.
+  if (calleeNode && calleeNode->kind == "Attribute") {
+    llvm::StringRef method = ast::string(*calleeNode, "attr").value_or("");
+    const auto *args = ast::nodeList(expr, "args");
+    const auto *keywords = ast::nodeList(expr, "keywords");
+    bool single = args && args->size() == 1 && args->front() &&
+                  (!keywords || keywords->empty());
+    bool defaulted = false;
+    if (single && (method == "split" || method == "rsplit"))
+      defaulted = args->front()->kind == "Constant" &&
+                  ast::isNoneField(*args->front(), "value");
+    if (single && (method == "encode" || method == "decode"))
+      if (args->front()->kind == "Constant")
+        if (std::optional<llvm::StringRef> encoding =
+                ast::string(*args->front(), "value"))
+          defaulted = encoding->equals_insensitive("utf-8") ||
+                      encoding->equals_insensitive("utf8");
+    if (defaulted) {
+      parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+      if (const parser::Field *func = parser::findField(expr, "func"))
+        rewritten->fields.push_back(*func);
+      parser::addField(*rewritten, "args", std::vector<parser::NodePtr>{});
+      parser::addField(*rewritten, "keywords", std::vector<parser::NodePtr>{});
+      return emitCall(*rewritten);
+    }
+  }
+
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))

@@ -40,3 +40,16 @@ print("San Serriffe".isalpha())
 print("SanSerriffe".isalpha())
 print("hello\n".isprintable())
 print("hello".isprintable())
+
+
+# Two argument spellings that ARE the no-argument one, and were refused for a
+# method the no-argument spelling right next to them resolves: sep=None IS
+# split's default (the whitespace split), and "utf-8" IS encode's.
+def defaulted_arguments() -> None:
+    print("a b  c".split(None), "a b  c".split())
+    print(" a b ".rsplit(None), " a b ".rsplit())
+    print("ab".encode("utf-8"), "ab".encode("UTF-8"), "ab".encode())
+    print(b"ab".decode("utf-8"), b"ab".decode())
+
+
+defaulted_arguments()
