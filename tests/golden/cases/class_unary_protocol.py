@@ -41,6 +41,9 @@ class Vec:
     def __reversed__(self) -> Iterator[int]:
         return iter([self.x, self.x + 1])
 
+    def __divmod__(self, other: int) -> int:
+        return self.x // other
+
 
 def main() -> None:
     v = Vec(3)
@@ -52,6 +55,7 @@ def main() -> None:
     print((-(-v)).x)
     # the one-argument builtins whose whole job is to call a dunder
     print(int(v), float(v), round(v), list(reversed(v)))
+    print(divmod(v, 2), divmod(7, 3))
 
 
 main()

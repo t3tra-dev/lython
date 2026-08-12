@@ -530,6 +530,36 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       }
   }
 
+  // ⭐ `divmod(x, y)` on a SOURCE class calls its __divmod__, for the same
+  // reason the one-argument builtins above call theirs: the builtin is a
+  // manifest free function with numeric overloads, and a user class reached
+  // it as "!py.callable<[int, int], ...> is not callable with these
+  // arguments". Two arguments, so the receiver is the first and the rest are
+  // the method's.
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "divmod" &&
+      !programBindsName("divmod")) {
+    const auto *divArgs = ast::nodeList(expr, "args");
+    const auto *divKeywords = ast::nodeList(expr, "keywords");
+    if (divArgs && divArgs->size() == 2 && divArgs->front() &&
+        (*divArgs)[1] && divArgs->front()->kind != "Starred" &&
+        (*divArgs)[1]->kind != "Starred" &&
+        (!divKeywords || divKeywords->empty())) {
+      mlir::Type receiverType =
+          types.widenLiteral(types.inferExpr(divArgs->front().get()));
+      if (std::optional<MethodBinding> sourceDivmod =
+              lookupClassMethod(receiverType, "__divmod__")) {
+        Value receiver = emitExpr(divArgs->front().get());
+        llvm::SmallVector<Value, 1> rest{emitExpr((*divArgs)[1].get())};
+        llvm::StringMap<Value> noKeywords;
+        return emitInlineMethodBody(
+            expr, emitDescriptorReceiver(expr, receiver, *sourceDivmod),
+            methodBindingBindsReceiver(*sourceDivmod), *sourceDivmod, rest,
+            noKeywords);
+      }
+    }
+  }
+
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))
