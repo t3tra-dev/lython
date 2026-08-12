@@ -387,6 +387,32 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
       }
       return mlir::success();
     }
+    // ⛔ KNOWN DEFECT, measured and not repaired here: a for-loop inside a
+    // generator lands on this branch.
+    //
+    //     def g(n: int) -> Iterator[int]:
+    //         for i in range(n):
+    //             yield i          # this error
+    //
+    // and so does a for-loop that merely PRECEDES a yield in the same body,
+    // and `for x in <list>` (which stops one step earlier, at
+    // "protocol-typed receiver ... has no concrete runtime method evidence
+    // for __next__"). A while-loop over the same counter works, and so does
+    // `for c in <str>` -- str has a concrete iterator contract where list
+    // relies on evidence the frame does not carry.
+    //
+    // What was established: the yielded value is the resume clone's split
+    // block argument (arg#0 of the yield's block), its physical pair IS on
+    // the edge -- `cf.cond_br %valid, %element, %raw, %true, %iter` -- and
+    // the block signature has (logical int, i64, i1) in place. The bundle
+    // registered for that argument is nevertheless an EMPTY int object
+    // bundle: no physicals, no primitive pair. It is not the provisional
+    // bundle lowerControlFlowBlockArgument builds (that one sets the pair for
+    // an int lane in a primitive-i64 clone, and its early-return path never
+    // fires here), and not the evidence merge in
+    // spliceControlFlowBlockArgumentEdges (which was instrumented and never
+    // reached for this argument). Whatever registers it is a third writer,
+    // and finding it is where this stopped.
     if (!bundle.primitiveI64)
       return op.emitError()
              << "generator int yield lane has neither physical values nor "
