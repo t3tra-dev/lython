@@ -1961,6 +1961,85 @@ parser::Diagnostics TypeSystem::takeAnnotationDiagnostics() {
   return drained;
 }
 
+// The element an iteration over `node` yields: a generator expression infers
+// its element expression under progressively bound chain targets (like a
+// comprehension), a plain iterable goes through __iter__/__next__.
+//
+// ⭐ Shared by the reducer folds in the emitter and by the INFERENCE of those
+// same builtins, so the two cannot answer differently. They did: the emitter
+// folded `max(sum(r) for r in rows)` and the inference had nothing to say
+// about the inner `sum(r)`, so the outer fold was refused for an element type
+// it could not see.
+mlir::Type TypeSystem::iterationElementType(const parser::Node *arg) const {
+  if (!arg)
+    return {};
+  auto iterationElement = [&](const parser::Node *iterable) -> mlir::Type {
+    mlir::Type iterableType = inferExpr(iterable);
+    if (!iterableType)
+      return {};
+    CallInferenceResult iterInference = inferMethodCallWithEvidence(
+        widenLiteral(iterableType), "__iter__", {});
+    if (!iterInference)
+      return {};
+    CallInferenceResult nextInference = inferMethodCallWithEvidence(
+        iterInference.resultType, "__next__", {});
+    if (!nextInference)
+      return {};
+    return widenLiteral(nextInference.resultType);
+  };
+  if (arg->kind != "GeneratorExp")
+    return iterationElement(arg);
+  const parser::Field *eltField = parser::findField(*arg, "elt");
+  const auto *gens = ast::nodeList(*arg, "generators");
+  if (!eltField ||
+      !std::holds_alternative<parser::NodePtr>(eltField->value) || !gens)
+    return {};
+  auto scope = pushScope();
+  for (const parser::NodePtr &gen : *gens) {
+    if (!gen)
+      return {};
+    const parser::Node *target = ast::node(*gen, "target");
+    const parser::Node *iter = ast::node(*gen, "iter");
+    if (!target || !iter)
+      return {};
+    mlir::Type elementType = iterationElement(iter);
+    if (!elementType)
+      return {};
+    if (target->kind == "Name") {
+      bindLocalSymbol(ast::nameSpelling(*target), elementType);
+      continue;
+    }
+    // ⭐ A TUPLE target binds member-wise, the way the loop does. Without
+    // it the element type came back empty and `max(a + b for a, b in
+    // pairs)` was refused for an element type it could not see -- while
+    // the loop and the list comprehension over the same pairs both bind.
+    if (target->kind != "Tuple" && target->kind != "List")
+      return {};
+    const auto *names = ast::nodeList(*target, "elts");
+    auto elementContract =
+        mlir::dyn_cast_if_present<py::ContractType>(elementType);
+    if (!names || names->empty() || !elementContract ||
+        elementContract.getContractName() != "builtins.tuple")
+      return {};
+    llvm::ArrayRef<mlir::Type> members = elementContract.getArguments();
+    for (auto [position, name] : llvm::enumerate(*names)) {
+      if (!name || name->kind != "Name" || members.empty())
+        return {};
+      // A uniform `tuple[T]` gives every position the same member.
+      mlir::Type memberType =
+          members.size() == 1 ? members.front()
+                              : (position < members.size()
+                                     ? members[position]
+                                     : mlir::Type());
+      if (!memberType)
+        return {};
+      bindLocalSymbol(ast::nameSpelling(*name), memberType);
+    }
+  }
+  return widenLiteral(inferExpr(
+      std::get<parser::NodePtr>(eltField->value).get()));
+}
+
 mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
   if (!node)
     return object();
@@ -2587,6 +2666,41 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (std::optional<PrimitiveTypeSpec> primitive =
             primitiveTypeSpecFromSubscript(callee, *this))
       return primitive->type;
+
+    // ⭐ The reducers the EMITTER folds are typed here, by the same walk the
+    // fold uses to find its element type. Without it the inference had
+    // nothing to say about them, so a reducer over a reducer --
+    // `max(sum(r) for r in rows)` -- was refused for an element type it could
+    // not see, while `max(len(r) for r in rows)` (a manifest function) was
+    // fine.
+    if (callee && callee->kind == "Name") {
+      llvm::StringRef reducer = ast::nameSpelling(*callee);
+      const auto *reducerArgs = ast::nodeList(*node, "args");
+      bool oneArgument = reducerArgs && reducerArgs->size() == 1 &&
+                         reducerArgs->front() &&
+                         reducerArgs->front()->kind != "Starred";
+      if ((reducer == "any" || reducer == "all") && oneArgument)
+        return boolType();
+      if ((reducer == "sum" || reducer == "max" || reducer == "min") &&
+          oneArgument)
+        if (mlir::Type element =
+                iterationElementType(reducerArgs->front().get()))
+          return element;
+      if ((reducer == "max" || reducer == "min") && reducerArgs &&
+          reducerArgs->size() > 1) {
+        llvm::SmallVector<mlir::Type, 4> operands;
+        for (const parser::NodePtr &argument : *reducerArgs) {
+          if (!argument || argument->kind == "Starred")
+            return object();
+          mlir::Type operandType = widenLiteral(lenientRecurse(argument.get()));
+          if (!operandType)
+            return object();
+          operands.push_back(operandType);
+        }
+        if (mlir::Type merged = join(operands))
+          return merged;
+      }
+    }
 
     llvm::SmallVector<mlir::Type, 8> positional;
     if (const auto *args = ast::nodeList(*node, "args")) {

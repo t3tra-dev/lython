@@ -79,3 +79,19 @@ def tuples() -> None:
 
 
 tuples()
+
+
+# A reducer over a reducer: the fold is in the emitter and the INFERENCE had
+# nothing to say about it, so `max(sum(r) for r in rows)` was refused for an
+# element type it could not see -- while `max(len(r) for r in rows)`, whose
+# inner call is a manifest function, was fine. Both sides now use the same
+# walk to answer what an iteration yields.
+def nested() -> None:
+    rows = [[1, 2], [3, 4]]
+    print(sum(sum(r) for r in rows), max(sum(r) for r in rows))
+    print(max(max(r) for r in rows), min(min(r) for r in rows))
+    print(max(len(r) for r in rows), any(sum(r) > 5 for r in rows))
+    print([sum(r) for r in rows], sorted(max(r) for r in rows))
+
+
+nested()

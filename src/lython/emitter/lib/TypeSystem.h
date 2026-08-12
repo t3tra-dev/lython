@@ -310,6 +310,9 @@ public:
   // references whose text is not a simple name). Drained once by the
   // emitter when it assembles its result.
   parser::Diagnostics takeAnnotationDiagnostics();
+  // The element an iteration over `node` yields (a generator expression or a
+  // plain iterable); null when it cannot be seen.
+  mlir::Type iterationElementType(const parser::Node *node) const;
   mlir::Type inferExpr(const parser::Node *node) const;
   mlir::Type inferExpr(const parser::Node *node,
                        const ExprInferenceContext &ctx) const;
