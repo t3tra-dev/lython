@@ -55,3 +55,30 @@ print(limit())
 rebind()
 print(describe())
 print(origin_sum())
+
+
+# Why execution: a module-scope name bound ONCE to a literal is not a cell --
+# it re-emits the literal at every reference -- so only running it shows the
+# function reads the same value the module does. `N = 5` was "unresolved name
+# 'N'" from inside a function while `N: int = 5` worked; CPython does not
+# distinguish the two spellings.
+UNANNOTATED_INT = 42
+UNANNOTATED_STR = "plain"
+UNANNOTATED_FLOAT = 0.25
+UNANNOTATED_BOOL = False
+
+
+def read_literals() -> str:
+    return (
+        str(UNANNOTATED_INT)
+        + " "
+        + UNANNOTATED_STR
+        + " "
+        + str(UNANNOTATED_FLOAT)
+        + " "
+        + str(UNANNOTATED_BOOL)
+    )
+
+
+print(read_literals())
+print(UNANNOTATED_INT, UNANNOTATED_STR, UNANNOTATED_FLOAT, UNANNOTATED_BOOL)

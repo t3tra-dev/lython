@@ -2129,6 +2129,37 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     moduleGlobals[name] = annotated;
     types.bindSymbol(name, annotated);
   }
+
+  // A plain `NAME = <literal>` is not a global CELL -- module-scope names
+  // stay value-bound, which is why a container one is not visible from a
+  // function -- but a name the module binds ONCE to a literal has nothing to
+  // go stale against, so its references re-emit the literal. Reading
+  // `N = 5` from a function was "unresolved name 'N'" while `N: int = 5`
+  // worked, and CPython does not distinguish the two spellings.
+  //
+  // ⛔ Why NOT make it a storage cell like the annotated form: an int cell is
+  // an UNBOXED i64 (the async-signal-safe channel), so a module `fact = 1`
+  // grown past 2**63 by module-scope arithmetic would raise
+  // "int too large to convert to a native 64-bit integer" where it prints
+  // the value today. Measured: 4 goldens, one of them exactly that
+  // factorial. A literal bound once has no such arithmetic on it.
+  llvm::StringSet<> boundOnce = singleAssignmentNames(moduleNode);
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Assign")
+      continue;
+    const auto *targets = ast::nodeList(*statement, "targets");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name")
+      continue;
+    const parser::Node *value = ast::node(*statement, "value");
+    if (!value || value->kind != "Constant" ||
+        ast::isNoneField(*value, "value"))
+      continue;
+    llvm::StringRef name = ast::nameSpelling(*targets->front());
+    if (!boundOnce.contains(name) || moduleGlobals.count(name))
+      continue;
+    moduleConstantBindings[name] = value;
+  }
 }
 
 bool ModuleEmitter::isModuleGlobalRead(llvm::StringRef name) const {

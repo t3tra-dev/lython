@@ -18,6 +18,11 @@ lexicalCaptureNames(const parser::Node &callable);
 // must be promoted to shared cells (R6).
 llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable);
 
+// Names bound exactly once directly in `scope`'s own statement list, counting
+// a loop target as more than once. Used at module scope to tell a constant
+// apart from a name the module rebinds.
+llvm::StringSet<> singleAssignmentNames(const parser::Node &scope);
+
 std::string sanitizedSymbolPart(llvm::StringRef text);
 
 } // namespace lython::emitter

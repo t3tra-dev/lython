@@ -110,6 +110,9 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
                                         builder.getStringAttr(name));
       return {op.getResult(), type};
     }
+    if (auto literal = moduleConstantBindings.find(name);
+        literal != moduleConstantBindings.end())
+      return emitConstant(*literal->second);
     auto primitiveConstant = primitiveConstants.find(name);
     if (primitiveConstant != primitiveConstants.end())
       return emitPrimitiveConstant(*expr, primitiveConstant->second);

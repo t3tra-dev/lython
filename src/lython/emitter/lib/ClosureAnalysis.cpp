@@ -380,6 +380,16 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
   return boxed;
 }
 
+llvm::StringSet<> singleAssignmentNames(const parser::Node &scope) {
+  llvm::StringMap<unsigned> counts;
+  countNameAssignments(ast::nodeList(scope, "body"), counts);
+  llvm::StringSet<> once;
+  for (const auto &entry : counts)
+    if (entry.getValue() == 1)
+      once.insert(entry.getKey());
+  return once;
+}
+
 std::string sanitizedSymbolPart(llvm::StringRef text) {
   std::string result;
   result.reserve(text.size());

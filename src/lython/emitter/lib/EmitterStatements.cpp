@@ -895,17 +895,12 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
               "statically unknown number of elements"});
           return;
         }
-      // ⛔ KNOWN DEFECT, deliberately not repaired here: the COUNT is not
-      // checked, so `a, b = (1, 2, 3)` prints 1 2 where CPython raises
-      // ValueError, and so do a list source and a str source. The obvious
-      // check does not fit: a tuple whose members share a type collapses to
-      // `tuple[int]` (TypeSystem.cpp, `uniform`), so the arity is not in the
-      // type for exactly the common case, and a list carries its length in
-      // the object rather than the type. Measured: a check on the type alone
-      // catches only heterogeneous tuples and fires wrongly on `a, b = (1, 2)`
-      // -- it took out two working programs before it caught anything. What
-      // this needs is a length check against the object, which is a runtime
-      // raise this walk has no way to emit.
+      // The count IS checked, against the object: a check on the type alone
+      // catches only heterogeneous tuples (a tuple whose members share a type
+      // collapses to `tuple[T]`, and a list carries its length in the object),
+      // so it fired wrongly on `a, b = (1, 2)` and took out two working
+      // programs before it caught anything.
+      emitUnpackArityCheck(target, value, elts->size());
       for (auto [index, elt] : llvm::enumerate(*elts)) {
         Value indexValue{py::IntConstantOp::create(
                              builder, loc(*elt),

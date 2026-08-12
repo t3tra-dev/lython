@@ -325,6 +325,10 @@ private:
   // in both loop and value position.
   bool hasIndexWalkableEvidence(mlir::Type type);
   bool hasIndexableEvidence(const parser::Node *expr);
+  // `a, b = xs`: the length comparison CPython's UNPACK_SEQUENCE makes,
+  // emitted next to the AST-synthesis helpers it needs (EmitterIterators.cpp).
+  void emitUnpackArityCheck(const parser::Node &target, Value source,
+                            std::size_t expected);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,
                            llvm::function_ref<void()> emit);
   // Value form: enumerate/zip/map/filter/reversed/iter as first-class lazy
@@ -811,6 +815,10 @@ private:
   // are async-signal-safe (see py.global.get/set); referenced from any scope,
   // written from module scope or a `global NAME` declaration in a function.
   llvm::StringMap<mlir::Type> moduleGlobals;
+  // Module-scope names bound exactly once to a literal: not cells, but their
+  // references re-emit the literal, so a function body can read them
+  // (collectModuleGlobals). The node is owned by the parse tree.
+  llvm::StringMap<const parser::Node *> moduleConstantBindings;
   // Names declared `global` in the function currently being emitted (writes
   // to them target the module global instead of a new local). Saved/restored
   // around each callable body.
