@@ -566,6 +566,13 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     // expansion, so the two sides are not appended in the same order. The
     // same shape with the yield INSIDE the loop, and the same loop in a
     // non-generator function, are both fine.
+    //
+    // ⛔ Why NOT skip an edge whose operand type disagrees with the argument
+    // and let the deferral retry it: the index is not merely early, it is
+    // wrong for that edge, so the retry never finds a match and the same
+    // program stops one message later ("logical branch operand index is
+    // outside the predecessor operand list"). The fix has to make the two
+    // sides agree, not to search harder for the operand.
     mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
