@@ -47,6 +47,17 @@ def both_arms(s: str | None) -> str:
     return s
 
 
+# The conditional expression is the same fact with no statement to hang it
+# on: each arm sees what its side of the test proves.
+def picked(n: int | None) -> int:
+    return (0 if n is None else n) + 1
+
+
+def kept(n: int | None) -> int:
+    m = n if n is not None else 0
+    return m + 1
+
+
 def main() -> None:
     print(scalar(), scalar(9))
     print(text(), text("x"))
@@ -55,6 +66,7 @@ def main() -> None:
     print(both_arms(None), both_arms("x"))
     # the mutable default is not shared between calls
     print(items(), items())
+    print(picked(None), picked(9), kept(None), kept(9))
 
 
 main()

@@ -307,21 +307,58 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // to the runtime bundle machinery and the affine ownership verifier).
     const parser::Node *bodyNode = ast::node(*expr, "body");
     const parser::Node *elseNode = ast::node(*expr, "orelse");
-    // Widen literal arms to their contracts before joining: CPython types
-    // `"a" if c else "b"` as `str`, and a contract-typed merge argument
-    // avoids literal-union runtime representations.
-    mlir::Type resultType =
-        types.join({types.widenLiteral(types.inferExpr(bodyNode)),
-                    types.widenLiteral(types.inferExpr(elseNode))});
-    mlir::Value condition =
-        emitBoolValue(emitExpr(ast::node(*expr, "test")), *expr);
+    const parser::Node *testNode = ast::node(*expr, "test");
+    // ⭐ Each arm sees the narrowing its side of the test proves, the same
+    // fact the if STATEMENT applies to its branches. Without it
+    // `n if n is not None else 0` typed the kept arm `int | None` and the
+    // join stayed a union -- the one spelling of the Optional idiom that has
+    // no statement to hang the narrowing on.
+    std::optional<BranchTypeNarrowing> narrowing =
+        testNode ? optionalBranchTypeNarrowing(*testNode, types, module)
+                 : std::nullopt;
+    auto armType = [&](const parser::Node *arm, bool conditionIsTrue) {
+      if (!narrowing)
+        return types.widenLiteral(types.inferExpr(arm));
+      mlir::Type narrowed =
+          conditionIsTrue ? narrowing->trueType : narrowing->falseType;
+      if (!narrowed)
+        return types.widenLiteral(types.inferExpr(arm));
+      auto scope = types.pushScope();
+      types.bindLocalSymbol(narrowing->name, narrowed);
+      return types.widenLiteral(types.inferExpr(arm));
+    };
+    mlir::Type resultType = types.join(
+        {armType(bodyNode, /*conditionIsTrue=*/true),
+         armType(elseNode, /*conditionIsTrue=*/false)});
+    mlir::Value condition = emitBoolValue(emitExpr(testNode), *expr);
 
+    auto emitArm = [&](const parser::Node *arm, bool conditionIsTrue) {
+      if (!narrowing)
+        return coerceValue(emitExpr(arm), resultType, *expr).value;
+      mlir::Type narrowed =
+          conditionIsTrue ? narrowing->trueType : narrowing->falseType;
+      auto found = values.find(narrowing->name);
+      if (!narrowed || found == values.end() ||
+          !mlir::isa<py::UnionType>(found->second.value.getType()) ||
+          !mlir::cast<py::UnionType>(found->second.value.getType())
+               .hasMember(narrowed))
+        return coerceValue(emitExpr(arm), resultType, *expr).value;
+      Value saved = found->second;
+      std::optional<mlir::Type> savedSymbol = types.lookupSymbol(narrowing->name);
+      auto unwrap = py::UnionUnwrapOp::create(builder, loc(*expr), narrowed,
+                                              saved.value);
+      found->second = Value{unwrap.getResult(), narrowed};
+      types.bindSymbol(narrowing->name, narrowed);
+      mlir::Value armValue = coerceValue(emitExpr(arm), resultType, *expr).value;
+      values[narrowing->name] = saved;
+      if (savedSymbol)
+        types.bindSymbol(narrowing->name, *savedSymbol);
+      return armValue;
+    };
     mlir::Value result = emitValueDiamond(
         loc(*expr), condition, resultType,
-        [&] { return coerceValue(emitExpr(bodyNode), resultType, *expr).value; },
-        [&] {
-          return coerceValue(emitExpr(elseNode), resultType, *expr).value;
-        });
+        [&] { return emitArm(bodyNode, /*conditionIsTrue=*/true); },
+        [&] { return emitArm(elseNode, /*conditionIsTrue=*/false); });
     return {result, resultType};
   }
   if (expr->kind == "BoolOp") {
