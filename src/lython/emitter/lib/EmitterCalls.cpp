@@ -484,6 +484,31 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
+  // ⭐ `abs(x)` on a SOURCE class calls its __abs__. The builtin is a manifest
+  // free function with numeric overloads, so a user class reached it as
+  // "static type !py.overload<...> is not callable with these arguments" --
+  // while the unary operators next to it dispatch the class's own dunder.
+  if (calleeNode && calleeNode->kind == "Name" &&
+      ast::nameSpelling(*calleeNode) == "abs" && !programBindsName("abs")) {
+    const auto *absArgs = ast::nodeList(expr, "args");
+    const auto *absKeywords = ast::nodeList(expr, "keywords");
+    if (absArgs && absArgs->size() == 1 && absArgs->front() &&
+        absArgs->front()->kind != "Starred" &&
+        (!absKeywords || absKeywords->empty())) {
+      mlir::Type argumentType =
+          types.widenLiteral(types.inferExpr(absArgs->front().get()));
+      if (std::optional<MethodBinding> sourceAbs =
+              lookupClassMethod(argumentType, "__abs__")) {
+        Value receiver = emitExpr(absArgs->front().get());
+        llvm::StringMap<Value> noKeywords;
+        return emitInlineMethodBody(
+            expr, emitDescriptorReceiver(expr, receiver, *sourceAbs),
+            methodBindingBindsReceiver(*sourceAbs), *sourceAbs, {},
+            noKeywords);
+      }
+    }
+  }
+
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))

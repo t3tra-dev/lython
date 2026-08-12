@@ -544,6 +544,21 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
   if (types.widenLiteral(operand.type) == types.contract("builtins.complex") &&
       (ast::isOperator(op, "USub") || ast::isOperator(op, "UAdd")))
     result = types.contract("builtins.complex");
+  // ⭐ A SOURCE class's unary dunder is called, not looked up in the manifest.
+  // py.neg/py.pos/py.invert resolve their target against the runtime
+  // manifest, so `-v` over a class that defines __neg__ died in the lowering
+  // as "runtime manifest has no V.__neg__ method" -- while __len__ and
+  // __bool__ on the same class both dispatch. This is the same repair the
+  // for-loop's __iter__ needed.
+  for (auto [unaryOp, method] :
+       {std::pair<const char *, const char *>{"USub", "__neg__"},
+        {"UAdd", "__pos__"},
+        {"Invert", "__invert__"},
+        {"Abs", "__abs__"}})
+    if (ast::isOperator(op, unaryOp))
+      if (std::optional<MethodBinding> sourceUnary =
+              lookupClassMethod(operand.type, method))
+        return emitInlineMethodCall(expr, operand, *sourceUnary);
   if (ast::isOperator(op, "USub"))
     return emitUnarySpecial<py::NegOp>(expr, "__neg__", operand, result);
   if (ast::isOperator(op, "UAdd"))
