@@ -89,3 +89,19 @@ def bound_arguments() -> None:
 
 
 bound_arguments()
+
+
+# A keyword spelling of a positional argument is rewritten to the position
+# CPython's own signature gives it: the manifest names a str parameter across
+# TWO physical values (sep_header, sep_bytes), so a keyword could never match
+# one by name. find/index/center/startswith are positional-only in CPython
+# too, and their refusal here is the same answer.
+def keyword_arguments() -> None:
+    print("a,b,c".split(sep=","), "a,b,c".split(",", maxsplit=1))
+    print("a,b,c".rsplit(sep=","), "a,b,c".rsplit(",", maxsplit=1))
+    print("aa".replace("a", "b", count=1), "aa".replace("a", "b"))
+    print("a\nb".splitlines(keepends=True), "a\nb".splitlines())
+    print("a".encode(encoding="utf-8"), b"a".decode(encoding="utf-8"))
+
+
+keyword_arguments()

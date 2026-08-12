@@ -288,6 +288,82 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       return emitCall(*rewritten);
     }
 
+  // ⭐ A keyword spelling of a positional method argument is rewritten to the
+  // position CPython's own signature gives it. `"a,b".split(sep=",")` and
+  // `"aa".replace("a", "b", count=1)` are both accepted there and were
+  // "builtins.str does not provide manifest method 'split' / 'replace'" here
+  // -- the manifest names a str parameter across TWO physical values
+  // (sep_header, sep_bytes), so a keyword can never match one by name.
+  //
+  // The table is CPython's argument clinic for the handful of methods that
+  // accept keywords at all: find/index/center/startswith and the rest are
+  // positional-only THERE too, and their refusal here is the same answer.
+  // Binding runs through the same bindBuiltinArguments the builtin fast paths
+  // use, so a gap (`split(maxsplit=1)`, which names no separator) stays
+  // refused rather than being invented.
+  if (calleeNode && calleeNode->kind == "Attribute")
+    if (const auto *methodKeywords = ast::nodeList(expr, "keywords");
+        methodKeywords && !methodKeywords->empty()) {
+      struct MethodParameters {
+        llvm::StringLiteral method;
+        llvm::ArrayRef<llvm::StringRef> names;
+        unsigned positionalOnly;
+      };
+      static const llvm::StringRef kSplitNames[] = {"sep", "maxsplit"};
+      static const llvm::StringRef kReplaceNames[] = {"old", "new", "count"};
+      static const llvm::StringRef kSplitlinesNames[] = {"keepends"};
+      static const llvm::StringRef kCodecNames[] = {"encoding", "errors"};
+      static const MethodParameters kMethodParameters[] = {
+          {llvm::StringLiteral("split"), kSplitNames, 0},
+          {llvm::StringLiteral("rsplit"), kSplitNames, 0},
+          {llvm::StringLiteral("replace"), kReplaceNames, 2},
+          {llvm::StringLiteral("splitlines"), kSplitlinesNames, 0},
+          {llvm::StringLiteral("encode"), kCodecNames, 0},
+          {llvm::StringLiteral("decode"), kCodecNames, 0},
+      };
+      llvm::StringRef methodName =
+          ast::string(*calleeNode, "attr").value_or("");
+      for (const MethodParameters &entry : kMethodParameters) {
+        if (methodName != entry.method)
+          continue;
+        std::optional<llvm::SmallVector<const parser::Node *, 4>> bound =
+            bindBuiltinArguments(expr, entry.names, entry.positionalOnly);
+        if (!bound)
+          break;
+        std::vector<parser::NodePtr> positional;
+        const auto *originalArgs = ast::nodeList(expr, "args");
+        bool recovered = true;
+        for (const parser::Node *argument : *bound) {
+          parser::NodePtr shared;
+          if (originalArgs)
+            for (const parser::NodePtr &candidate : *originalArgs)
+              if (candidate.get() == argument)
+                shared = candidate;
+          if (!shared)
+            for (const parser::NodePtr &keyword : *methodKeywords)
+              if (const parser::Field *value =
+                      parser::findField(*keyword, "value");
+                  value && std::holds_alternative<parser::NodePtr>(value->value) &&
+                  std::get<parser::NodePtr>(value->value).get() == argument)
+                shared = std::get<parser::NodePtr>(value->value);
+          if (!shared) {
+            recovered = false;
+            break;
+          }
+          positional.push_back(std::move(shared));
+        }
+        if (!recovered)
+          break;
+        parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+        if (const parser::Field *func = parser::findField(expr, "func"))
+          rewritten->fields.push_back(*func);
+        parser::addField(*rewritten, "args", std::move(positional));
+        parser::addField(*rewritten, "keywords",
+                         std::vector<parser::NodePtr>{});
+        return emitCall(*rewritten);
+      }
+    }
+
   // ⭐ A method argument that is a CALL the inference cannot type is bound
   // first. `"x".translate(str.maketrans("l", "L"))` was "str.translate
   // requires a dict table" while the same call through a temporary --
