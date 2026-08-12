@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -20,6 +21,18 @@
 
 namespace lython::emitter {
 namespace {
+
+// Positional parameters with no annotation: the synthesized dataclass and
+// record constructors take their types from the field declarations, not from
+// the AST.
+llvm::SmallVector<synth::Param, 8> toSynthParams(
+    llvm::ArrayRef<std::string> names) {
+  llvm::SmallVector<synth::Param, 8> params;
+  for (const std::string &name : names)
+    params.push_back(synth::Param{name, nullptr});
+  return params;
+}
+
 
 mlir::Attribute sourceExprAttr(mlir::Builder &builder,
                                const parser::Node *node) {
@@ -255,74 +268,12 @@ llvm::StringSet<> classPropertyNames(const parser::Node &classDef) {
 
 // --- synthesized-AST builders (dataclass methods) ---
 
-parser::NodePtr synthName(llvm::StringRef id, parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Name", range);
-  parser::addField(*node, "id", std::string(id));
-  return node;
-}
 
-parser::NodePtr synthSelfAttr(llvm::StringRef self, llvm::StringRef attr,
-                              parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Attribute", range);
-  parser::addField(*node, "value", synthName(self, range));
-  parser::addField(*node, "attr", std::string(attr));
-  return node;
-}
 
-parser::NodePtr synthStrConstant(llvm::StringRef text,
-                                 parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", std::string(text));
-  return node;
-}
 
-parser::NodePtr synthAdd(parser::NodePtr lhs, parser::NodePtr rhs,
-                         parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("BinOp", range);
-  parser::NodePtr op = parser::makeNode("Add", range);
-  parser::addField(*node, "left", std::move(lhs));
-  parser::addField(*node, "op", std::move(op));
-  parser::addField(*node, "right", std::move(rhs));
-  return node;
-}
 
-parser::NodePtr synthReprCall(parser::NodePtr argument,
-                              parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Call", range);
-  parser::addField(*node, "func", synthName("repr", range));
-  parser::addField(*node, "args", std::vector<parser::NodePtr>{argument});
-  parser::addField(*node, "keywords", std::vector<parser::NodePtr>{});
-  return node;
-}
 
-parser::NodePtr synthArg(llvm::StringRef name, parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("arg", range);
-  parser::addField(*node, "arg", std::string(name));
-  return node;
-}
 
-parser::NodePtr
-synthFunctionDef(llvm::StringRef name, llvm::ArrayRef<std::string> paramNames,
-                 std::vector<parser::NodePtr> defaults,
-                 std::vector<parser::NodePtr> body,
-                 parser::SourceRange range) {
-  parser::NodePtr arguments = parser::makeNode("arguments", range);
-  std::vector<parser::NodePtr> args;
-  for (const std::string &param : paramNames)
-    args.push_back(synthArg(param, range));
-  parser::addField(*arguments, "posonlyargs", std::vector<parser::NodePtr>{});
-  parser::addField(*arguments, "args", std::move(args));
-  parser::addField(*arguments, "kwonlyargs", std::vector<parser::NodePtr>{});
-  parser::addField(*arguments, "kw_defaults", std::vector<parser::NodePtr>{});
-  parser::addField(*arguments, "defaults", std::move(defaults));
-
-  parser::NodePtr node = parser::makeNode("FunctionDef", range);
-  parser::addField(*node, "name", std::string(name));
-  parser::addField(*node, "args", std::move(arguments));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "decorator_list", std::vector<parser::NodePtr>{});
-  return node;
-}
 
 } // namespace
 
@@ -1717,8 +1668,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         parser::NodePtr assign = parser::makeNode("Assign", range);
         parser::addField(*assign, "targets",
                          std::vector<parser::NodePtr>{
-                             synthSelfAttr("self", field, range)});
-        parser::addField(*assign, "value", synthName(field, range));
+                             synth::selfAttribute("self", field, range)});
+        parser::addField(*assign, "value", synth::name(field, range));
         body.push_back(std::move(assign));
       }
       // ⭐ CPython's dataclass `__init__` ends by calling `__post_init__` when
@@ -1737,7 +1688,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       if (inheritsOrDefines("__post_init__")) {
         parser::NodePtr hook = parser::makeNode("Call", range);
         parser::addField(*hook, "func",
-                         synthSelfAttr("self", "__post_init__", range));
+                         synth::selfAttribute("self", "__post_init__", range));
         parser::addField(*hook, "args", std::vector<parser::NodePtr>{});
         parser::addField(*hook, "keywords", std::vector<parser::NodePtr>{});
         parser::NodePtr statement = parser::makeNode("Expr", range);
@@ -1748,8 +1699,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         body.push_back(parser::makeNode("Pass", range));
       sig.resultType = types.none();
       registerSynthesized(
-          synthFunctionDef("__init__", paramNames, std::move(defaults),
-                           std::move(body), range),
+          synth::functionDef("__init__", toSynthParams(paramNames), std::move(defaults),
+                           std::move(body), nullptr,
+                       llvm::ArrayRef<llvm::StringRef>{}, range),
           std::move(sig));
     }
     if (dataclassRepr && !userDefines("__repr__")) {
@@ -1757,19 +1709,19 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
           py::contracts::displayClassNameForContract(contractName);
       parser::NodePtr expr;
       if (order.empty()) {
-        expr = synthStrConstant(className + "()", range);
+        expr = synth::strConstant(className + "()", range);
       } else {
-        expr = synthStrConstant(className + "(", range);
+        expr = synth::strConstant(className + "(", range);
         for (auto [index, field] : llvm::enumerate(order)) {
           std::string label = (index ? ", " : "") + field + "=";
-          expr = synthAdd(std::move(expr), synthStrConstant(label, range),
+          expr = synth::binOp(std::move(expr), "Add", synth::strConstant(label, range),
                           range);
-          expr = synthAdd(
-              std::move(expr),
-              synthReprCall(synthSelfAttr("self", field, range), range),
+          expr = synth::binOp(
+              std::move(expr), "Add",
+              synth::reprCall(synth::selfAttribute("self", field, range), range),
               range);
         }
-        expr = synthAdd(std::move(expr), synthStrConstant(")", range), range);
+        expr = synth::binOp(std::move(expr), "Add", synth::strConstant(")", range), range);
       }
       parser::NodePtr returnNode = parser::makeNode("Return", range);
       parser::addField(*returnNode, "value", std::move(expr));
@@ -1779,8 +1731,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       sig.positionalDefaults.push_back(false);
       sig.resultType = types.strType();
       registerSynthesized(
-          synthFunctionDef("__repr__", {"self"}, {},
-                           {std::move(returnNode)}, range),
+          synth::functionDef("__repr__", toSynthParams({"self"}), {},
+                           {std::move(returnNode)}, nullptr,
+                       llvm::ArrayRef<llvm::StringRef>{}, range),
           std::move(sig));
     }
     // ⭐ A NamedTuple is hashable, so it can be a dict key.
@@ -1826,19 +1779,20 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       lenSig.positionalTypes.push_back(types.contract(contractName));
       lenSig.positionalDefaults.push_back(false);
       lenSig.resultType = types.intType();
-      registerSynthesized(synthFunctionDef("__len__", {"self"}, {},
-                                           {std::move(returnCount)}, range),
+      registerSynthesized(synth::functionDef("__len__", toSynthParams({"self"}), {},
+                                           {std::move(returnCount)}, nullptr,
+                       llvm::ArrayRef<llvm::StringRef>{}, range),
                           std::move(lenSig));
     }
     if (isNamedTuple && !userDefines("__hash__") && !order.empty()) {
       std::vector<parser::NodePtr> elements;
       elements.reserve(order.size());
       for (const std::string &field : order)
-        elements.push_back(synthSelfAttr("self", field, range));
+        elements.push_back(synth::selfAttribute("self", field, range));
       parser::NodePtr tuple = parser::makeNode("Tuple", range);
       parser::addField(*tuple, "elts", std::move(elements));
       parser::NodePtr call = parser::makeNode("Call", range);
-      parser::addField(*call, "func", synthName("hash", range));
+      parser::addField(*call, "func", synth::name("hash", range));
       parser::addField(*call, "args",
                        std::vector<parser::NodePtr>{std::move(tuple)});
       parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
@@ -1849,8 +1803,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       sig.positionalTypes.push_back(types.contract(contractName));
       sig.positionalDefaults.push_back(false);
       sig.resultType = types.intType();
-      registerSynthesized(synthFunctionDef("__hash__", {"self"}, {},
-                                           {std::move(returnNode)}, range),
+      registerSynthesized(synth::functionDef("__hash__", toSynthParams({"self"}), {},
+                                           {std::move(returnNode)}, nullptr,
+                       llvm::ArrayRef<llvm::StringRef>{}, range),
                           std::move(sig));
     }
     // A SYNTHESIZED dataclass `__eq__` compares only against its own class and
@@ -1866,13 +1821,13 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       llvm::SmallVector<parser::NodePtr, 8> comparisons;
       for (const std::string &field : order) {
         parser::NodePtr compare = parser::makeNode("Compare", range);
-        parser::addField(*compare, "left", synthSelfAttr("self", field, range));
+        parser::addField(*compare, "left", synth::selfAttribute("self", field, range));
         parser::addField(*compare, "ops",
                          std::vector<parser::NodePtr>{
                              parser::makeNode("Eq", range)});
         parser::addField(*compare, "comparators",
                          std::vector<parser::NodePtr>{
-                             synthSelfAttr("other", field, range)});
+                             synth::selfAttribute("other", field, range)});
         comparisons.push_back(std::move(compare));
       }
       if (comparisons.empty()) {
@@ -1897,8 +1852,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       sig.positionalDefaults.append({false, false});
       sig.resultType = types.boolType();
       registerSynthesized(
-          synthFunctionDef("__eq__", {"self", "other"}, {},
-                           {std::move(returnNode)}, range),
+          synth::functionDef("__eq__", toSynthParams({"self", "other"}), {},
+                           {std::move(returnNode)}, nullptr,
+                       llvm::ArrayRef<llvm::StringRef>{}, range),
           std::move(sig));
     }
   }

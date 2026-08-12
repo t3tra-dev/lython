@@ -3,6 +3,8 @@
 #include "EmitterSupport.h"
 #include "PyProtocols.h"
 
+#include "AstSynth.h"
+
 #include "AstAccess.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -27,99 +29,17 @@ namespace {
 
 using parser::NodePtr;
 
-NodePtr nameNode(const std::string &id, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Name", range);
-  parser::addField(*node, "id", id);
-  return node;
-}
 
-NodePtr intConstant(std::int64_t value, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", value);
-  return node;
-}
 
-NodePtr assignNode(NodePtr target, NodePtr value, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Assign", range);
-  parser::addField(*node, "targets", std::vector<NodePtr>{std::move(target)});
-  parser::addField(*node, "value", std::move(value));
-  return node;
-}
 
-NodePtr tupleNode(std::vector<NodePtr> elts, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Tuple", range);
-  parser::addField(*node, "elts", std::move(elts));
-  return node;
-}
 
-NodePtr subscriptNode(NodePtr value, NodePtr slice,
-                      parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Subscript", range);
-  parser::addField(*node, "value", std::move(value));
-  parser::addField(*node, "slice", std::move(slice));
-  return node;
-}
 
-NodePtr binOpNode(NodePtr left, const char *opKind, NodePtr right,
-                  parser::SourceRange range) {
-  NodePtr op = parser::makeNode(opKind, range);
-  NodePtr node = parser::makeNode("BinOp", range);
-  parser::addField(*node, "left", std::move(left));
-  parser::addField(*node, "op", std::move(op));
-  parser::addField(*node, "right", std::move(right));
-  return node;
-}
 
-NodePtr compareNode(NodePtr left, const char *opKind, NodePtr right,
-                    parser::SourceRange range) {
-  NodePtr op = parser::makeNode(opKind, range);
-  NodePtr node = parser::makeNode("Compare", range);
-  parser::addField(*node, "left", std::move(left));
-  parser::addField(*node, "ops", std::vector<NodePtr>{std::move(op)});
-  parser::addField(*node, "comparators", std::vector<NodePtr>{std::move(right)});
-  return node;
-}
 
-NodePtr callNode(NodePtr func, std::vector<NodePtr> args,
-                 parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Call", range);
-  parser::addField(*node, "func", std::move(func));
-  parser::addField(*node, "args", std::move(args));
-  parser::addField(*node, "keywords", std::vector<NodePtr>{});
-  return node;
-}
 
-NodePtr lenCall(NodePtr value, parser::SourceRange range) {
-  return callNode(nameNode("len", range), {std::move(value)}, range);
-}
 
-NodePtr forNode(NodePtr target, NodePtr iter, std::vector<NodePtr> body,
-                std::vector<NodePtr> orelse, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("For", range);
-  parser::addField(*node, "target", std::move(target));
-  parser::addField(*node, "iter", std::move(iter));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "orelse", std::move(orelse));
-  return node;
-}
 
-NodePtr whileNode(NodePtr test, std::vector<NodePtr> body,
-                  std::vector<NodePtr> orelse, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("While", range);
-  parser::addField(*node, "test", std::move(test));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "orelse", std::move(orelse));
-  return node;
-}
 
-NodePtr ifNode(NodePtr test, std::vector<NodePtr> body,
-               parser::SourceRange range) {
-  NodePtr node = parser::makeNode("If", range);
-  parser::addField(*node, "test", std::move(test));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "orelse", std::vector<NodePtr>{});
-  return node;
-}
 
 // Bind TARGET to per-iteration components. A tuple pattern of matching
 // arity decomposes into component assignments — no tuple object exists, so
@@ -142,21 +62,21 @@ void appendTargetBinding(const NodePtr &target,
           simple = false;
       if (simple) {
         for (auto [index, elt] : llvm::enumerate(*elts))
-          body.push_back(assignNode(elt, components[index], range));
+          body.push_back(synth::assign(elt, components[index], range));
         return;
       }
     }
   }
   for (unsigned index : snapshotIndices) {
-    NodePtr snapshot = nameNode(snapshotName, range);
-    body.push_back(assignNode(
+    NodePtr snapshot = synth::name(snapshotName, range);
+    body.push_back(synth::assign(
         snapshot,
-        binOpNode(components[index], "Add", intConstant(0, range), range),
+        synth::binOp(components[index], "Add", synth::intConstant(0, range), range),
         range));
     components[index] = snapshot;
   }
   body.push_back(
-      assignNode(target, tupleNode(std::move(components), range), range));
+      synth::assign(target, synth::tuple(std::move(components), range), range));
 }
 
 // The original loop pieces every rewrite reuses.
@@ -269,7 +189,7 @@ bool ModuleEmitter::buildLazyCall(const parser::Node &statement,
                                   std::vector<NodePtr> &prologue,
                                   NodePtr &out) {
   if (callable.callee) {
-    out = callNode(callable.callee, std::move(arguments), statement.range);
+    out = synth::call(callable.callee, std::move(arguments), statement.range);
     return true;
   }
   if (callable.lambdaParams.size() != arguments.size()) {
@@ -279,7 +199,7 @@ bool ModuleEmitter::buildLazyCall(const parser::Node &statement,
     return false;
   }
   for (auto [index, param] : llvm::enumerate(callable.lambdaParams))
-    prologue.push_back(assignNode(nameNode(param, statement.range),
+    prologue.push_back(synth::assign(synth::name(param, statement.range),
                                   arguments[index], statement.range));
   out = callable.lambdaBody;
   return true;
@@ -382,7 +302,7 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
       return false;
 
     if (*attr == "keys") {
-      emitFor(*forNode(parts->target, receiver, parts->body, parts->orelse,
+      emitFor(*synth::forStmt(parts->target, receiver, parts->body, parts->orelse,
                        range));
       return true;
     }
@@ -393,21 +313,21 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     std::string keyName = scratch("k");
     bool needsTemp = receiver->kind != "Name";
     NodePtr dictRef =
-        needsTemp ? nameNode(dictName, range) : receiver;
-    NodePtr keyRef = nameNode(keyName, range);
-    NodePtr element = subscriptNode(dictRef, keyRef, range);
+        needsTemp ? synth::name(dictName, range) : receiver;
+    NodePtr keyRef = synth::name(keyName, range);
+    NodePtr element = synth::subscript(dictRef, keyRef, range);
     std::vector<NodePtr> body;
     if (*attr == "items")
       appendTargetBinding(parts->target, {keyRef, element}, {},
                           std::string(), body, range);
     else
-      body.push_back(assignNode(parts->target, element, range));
+      body.push_back(synth::assign(parts->target, element, range));
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = forNode(keyRef, dictRef, std::move(body), parts->orelse,
+    NodePtr loop = synth::forStmt(keyRef, dictRef, std::move(body), parts->orelse,
                            range);
     runWithScratchNames({dictName, keyName}, [&] {
       if (needsTemp)
-        emitStatement(*assignNode(nameNode(dictName, range), receiver, range));
+        emitStatement(*synth::assign(synth::name(dictName, range), receiver, range));
       emitFor(*loop);
     });
     return true;
@@ -426,7 +346,7 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
   if (name == "iter") {
     if (!args || args->size() != 1 || (keywords && !keywords->empty()))
       return reject("iter() in a for loop requires exactly one argument");
-    emitFor(*forNode(parts->target, argAt(0), parts->body, parts->orelse,
+    emitFor(*synth::forStmt(parts->target, argAt(0), parts->body, parts->orelse,
                      range));
     return true;
   }
@@ -453,24 +373,24 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     if (!source)
       return reject("enumerate() requires an iterable argument");
     if (!start)
-      start = intConstant(0, range);
+      start = synth::intConstant(0, range);
 
     std::string counterName = scratch("i");
     std::string elementName = scratch("v");
     std::string snapshotName = scratch("ic");
-    NodePtr counter = nameNode(counterName, range);
-    NodePtr element = nameNode(elementName, range);
+    NodePtr counter = synth::name(counterName, range);
+    NodePtr element = synth::name(elementName, range);
     std::vector<NodePtr> body;
     appendTargetBinding(parts->target, {counter, element}, {0u}, snapshotName,
                         body, range);
-    body.push_back(assignNode(
-        counter, binOpNode(counter, "Add", intConstant(1, range), range),
+    body.push_back(synth::assign(
+        counter, synth::binOp(counter, "Add", synth::intConstant(1, range), range),
         range));
     body.insert(body.end(), parts->body.begin(), parts->body.end());
     NodePtr loop =
-        forNode(element, source, std::move(body), parts->orelse, range);
+        synth::forStmt(element, source, std::move(body), parts->orelse, range);
     runWithScratchNames({counterName, elementName, snapshotName}, [&] {
-      emitStatement(*assignNode(nameNode(counterName, range), start, range));
+      emitStatement(*synth::assign(synth::name(counterName, range), start, range));
       emitFor(*loop);
     });
     return true;
@@ -498,8 +418,8 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     std::string driverName = scratch("v");
     scratchNames.push_back(indexName);
     scratchNames.push_back(driverName);
-    NodePtr indexRef = nameNode(indexName, range);
-    NodePtr driverRef = nameNode(driverName, range);
+    NodePtr indexRef = synth::name(indexName, range);
+    NodePtr driverRef = synth::name(driverName, range);
 
     std::vector<NodePtr> prologue;
     std::vector<NodePtr> body;
@@ -510,28 +430,28 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
       if (source->kind != "Name") {
         std::string sourceName = scratch(("s" + std::to_string(index)).c_str());
         scratchNames.push_back(sourceName);
-        sourceRef = nameNode(sourceName, range);
-        prologue.push_back(assignNode(sourceRef, source, range));
+        sourceRef = synth::name(sourceName, range);
+        prologue.push_back(synth::assign(sourceRef, source, range));
       }
       // if __j >= len(S): break  — the shortest input stops the loop.
-      body.push_back(ifNode(
-          compareNode(indexRef, "GtE", lenCall(sourceRef, range), range),
-          {parser::makeNode("Break", range)}, range));
-      elements.push_back(subscriptNode(sourceRef, indexRef, range));
+      body.push_back(synth::ifStmt(
+          synth::compare(indexRef, "GtE", synth::lenCall(sourceRef, range), range),
+          {parser::makeNode("Break", range)}, {}, range));
+      elements.push_back(synth::subscript(sourceRef, indexRef, range));
     }
     appendTargetBinding(parts->target, std::move(elements), {},
                         std::string(), body, range);
-    body.push_back(assignNode(
-        indexRef, binOpNode(indexRef, "Add", intConstant(1, range), range),
+    body.push_back(synth::assign(
+        indexRef, synth::binOp(indexRef, "Add", synth::intConstant(1, range), range),
         range));
     body.insert(body.end(), parts->body.begin(), parts->body.end());
     NodePtr loop =
-        forNode(driverRef, argAt(0), std::move(body), parts->orelse, range);
+        synth::forStmt(driverRef, argAt(0), std::move(body), parts->orelse, range);
     runWithScratchNames(scratchNames, [&] {
       for (const NodePtr &statementNode : prologue)
         emitStatement(*statementNode);
-      emitStatement(*assignNode(nameNode(indexName, range),
-                                intConstant(0, range), range));
+      emitStatement(*synth::assign(synth::name(indexName, range),
+                                synth::intConstant(0, range), range));
       emitFor(*loop);
     });
     return true;
@@ -548,15 +468,15 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
       return true;
     if (args->size() == 2) {
       std::string elementName = scratch("v");
-      NodePtr element = nameNode(elementName, range);
+      NodePtr element = synth::name(elementName, range);
       std::vector<NodePtr> body;
       NodePtr applied;
       if (!buildLazyCall(statement, callable, {element}, body, applied))
         return true;
-      body.push_back(assignNode(parts->target, applied, range));
+      body.push_back(synth::assign(parts->target, applied, range));
       body.insert(body.end(), parts->body.begin(), parts->body.end());
       NodePtr loop =
-          forNode(element, argAt(1), std::move(body), parts->orelse, range);
+          synth::forStmt(element, argAt(1), std::move(body), parts->orelse, range);
       llvm::SmallVector<std::string, 4> names{elementName};
       names.append(callable.lambdaParams.begin(), callable.lambdaParams.end());
       runWithScratchNames(names, [&] { emitFor(*loop); });
@@ -572,18 +492,18 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
       std::string elementName =
           scratch(("v" + std::to_string(index)).c_str());
       names.push_back(elementName);
-      elementRefs.push_back(nameNode(elementName, range));
-      elementNames.push_back(nameNode(elementName, range));
+      elementRefs.push_back(synth::name(elementName, range));
+      elementNames.push_back(synth::name(elementName, range));
     }
     std::vector<NodePtr> body;
     NodePtr applied;
     if (!buildLazyCall(statement, callable, elementRefs, body, applied))
       return true;
-    body.push_back(assignNode(parts->target, applied, range));
+    body.push_back(synth::assign(parts->target, applied, range));
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr zipCall = callNode(nameNode("zip", range), std::move(zipArgs),
+    NodePtr zipCall = synth::call(synth::name("zip", range), std::move(zipArgs),
                                range);
-    NodePtr loop = forNode(tupleNode(std::move(elementNames), range), zipCall,
+    NodePtr loop = synth::forStmt(synth::tuple(std::move(elementNames), range), zipCall,
                            std::move(body), parts->orelse, range);
     names.append(callable.lambdaParams.begin(), callable.lambdaParams.end());
     runWithScratchNames(names, [&] { emitFor(*loop); });
@@ -606,17 +526,17 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
       return true;
 
     std::string elementName = scratch("v");
-    NodePtr element = nameNode(elementName, range);
-    std::vector<NodePtr> inner{assignNode(parts->target, element, range)};
+    NodePtr element = synth::name(elementName, range);
+    std::vector<NodePtr> inner{synth::assign(parts->target, element, range)};
     inner.insert(inner.end(), parts->body.begin(), parts->body.end());
     std::vector<NodePtr> body;
     NodePtr test = element;
     if (!identityPredicate &&
         !buildLazyCall(statement, callable, {element}, body, test))
       return true;
-    body.push_back(ifNode(test, std::move(inner), range));
+    body.push_back(synth::ifStmt(test, std::move(inner), {}, range));
     NodePtr loop =
-        forNode(element, argAt(1), std::move(body), parts->orelse, range);
+        synth::forStmt(element, argAt(1), std::move(body), parts->orelse, range);
     llvm::SmallVector<std::string, 4> names{elementName};
     names.append(callable.lambdaParams.begin(), callable.lambdaParams.end());
     runWithScratchNames(names, [&] { emitFor(*loop); });
@@ -637,27 +557,27 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     if (source->kind != "Name") {
       std::string sourceName = scratch("s");
       names.push_back(sourceName);
-      sourceRef = nameNode(sourceName, range);
-      prologue.push_back(assignNode(sourceRef, source, range));
+      sourceRef = synth::name(sourceName, range);
+      prologue.push_back(synth::assign(sourceRef, source, range));
     }
     std::string indexName = scratch("j");
     names.push_back(indexName);
-    NodePtr indexRef = nameNode(indexName, range);
+    NodePtr indexRef = synth::name(indexName, range);
     std::vector<NodePtr> body{
-        assignNode(indexRef,
-                   binOpNode(indexRef, "Sub", intConstant(1, range), range),
+        synth::assign(indexRef,
+                   synth::binOp(indexRef, "Sub", synth::intConstant(1, range), range),
                    range),
-        assignNode(parts->target, subscriptNode(sourceRef, indexRef, range),
+        synth::assign(parts->target, synth::subscript(sourceRef, indexRef, range),
                    range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = whileNode(
-        compareNode(indexRef, "Gt", intConstant(0, range), range),
+    NodePtr loop = synth::whileStmt(
+        synth::compare(indexRef, "Gt", synth::intConstant(0, range), range),
         std::move(body), parts->orelse, range);
     runWithScratchNames(names, [&] {
       for (const NodePtr &statementNode : prologue)
         emitStatement(*statementNode);
-      emitStatement(*assignNode(nameNode(indexName, range),
-                                lenCall(sourceRef, range), range));
+      emitStatement(*synth::assign(synth::name(indexName, range),
+                                synth::lenCall(sourceRef, range), range));
       emitWhile(*loop);
     });
     return true;
@@ -684,43 +604,8 @@ namespace {
 
 // def <symbol>(<params>): <body> — parameters carry no annotations; the
 // caller pins their types through TypeSystem::overrideParameterType.
-NodePtr makeSyntheticGeneratorDef(
-    const std::string &name, llvm::ArrayRef<std::string> params,
-    std::vector<NodePtr> body, parser::SourceRange range,
-    llvm::SmallVectorImpl<const parser::Node *> &paramNodes) {
-  NodePtr def = parser::makeNode("FunctionDef", range);
-  parser::addField(*def, "name", name);
-  NodePtr arguments = parser::makeNode("arguments", range);
-  std::vector<NodePtr> argNodes;
-  for (const std::string &param : params) {
-    NodePtr arg = parser::makeNode("arg", range);
-    parser::addField(*arg, "arg", param);
-    paramNodes.push_back(arg.get());
-    argNodes.push_back(std::move(arg));
-  }
-  parser::addField(*arguments, "posonlyargs", std::vector<NodePtr>{});
-  parser::addField(*arguments, "args", std::move(argNodes));
-  parser::addField(*arguments, "kwonlyargs", std::vector<NodePtr>{});
-  parser::addField(*arguments, "kw_defaults", std::vector<NodePtr>{});
-  parser::addField(*arguments, "defaults", std::vector<NodePtr>{});
-  parser::addField(*def, "args", std::move(arguments));
-  parser::addField(*def, "body", std::move(body));
-  return def;
-}
 
-NodePtr yieldNode(NodePtr value, parser::SourceRange range) {
-  NodePtr yield = parser::makeNode("Yield", range);
-  parser::addField(*yield, "value", std::move(value));
-  NodePtr statement = parser::makeNode("Expr", range);
-  parser::addField(*statement, "value", std::move(yield));
-  return statement;
-}
 
-NodePtr trueConstant(parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", true);
-  return node;
-}
 
 std::string typeKey(mlir::Type type) {
   std::string text;
@@ -876,38 +761,38 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
 
     parser::SourceRange bodyRange = range;
     auto param = [&](unsigned index) {
-      return nameNode(params[index], bodyRange);
+      return synth::name(params[index], bodyRange);
     };
-    NodePtr indexRef = nameNode("__lyi", bodyRange);
+    NodePtr indexRef = synth::name("__lyi", bodyRange);
 
     std::vector<NodePtr> loopBody;
     for (unsigned index = 0; index < iterableCount; ++index)
       loopBody.push_back(
-          ifNode(compareNode(indexRef, "GtE", lenCall(param(index), bodyRange),
+          synth::ifStmt(synth::compare(indexRef, "GtE", synth::lenCall(param(index), bodyRange),
                              bodyRange),
-                 {parser::makeNode("Break", bodyRange)}, bodyRange));
+                 {parser::makeNode("Break", bodyRange)}, {}, bodyRange));
     auto elementAt = [&](unsigned index) {
-      return subscriptNode(param(index), indexRef, bodyRange);
+      return synth::subscript(param(index), indexRef, bodyRange);
     };
 
     if (name == "iter") {
-      loopBody.push_back(yieldNode(elementAt(0), bodyRange));
+      loopBody.push_back(synth::yieldStmt(elementAt(0), bodyRange));
     } else if (name == "enumerate") {
-      loopBody.push_back(yieldNode(
-          tupleNode({nameNode(params.back(), bodyRange), elementAt(0)},
+      loopBody.push_back(synth::yieldStmt(
+          synth::tuple({synth::name(params.back(), bodyRange), elementAt(0)},
                     bodyRange),
           bodyRange));
-      loopBody.push_back(assignNode(
-          nameNode(params.back(), bodyRange),
-          binOpNode(nameNode(params.back(), bodyRange), "Add",
-                    intConstant(1, bodyRange), bodyRange),
+      loopBody.push_back(synth::assign(
+          synth::name(params.back(), bodyRange),
+          synth::binOp(synth::name(params.back(), bodyRange), "Add",
+                    synth::intConstant(1, bodyRange), bodyRange),
           bodyRange));
     } else if (name == "zip") {
       std::vector<NodePtr> elements;
       for (unsigned index = 0; index < iterableCount; ++index)
         elements.push_back(elementAt(index));
       loopBody.push_back(
-          yieldNode(tupleNode(std::move(elements), bodyRange), bodyRange));
+          synth::yieldStmt(synth::tuple(std::move(elements), bodyRange), bodyRange));
     } else if (name == "map") {
       std::vector<NodePtr> arguments;
       for (unsigned index = 0; index < iterableCount; ++index)
@@ -916,45 +801,48 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
       if (!buildLazyCall(expr, callable, std::move(arguments), loopBody,
                          applied))
         return emitNone(expr);
-      loopBody.push_back(yieldNode(std::move(applied), bodyRange));
+      loopBody.push_back(synth::yieldStmt(std::move(applied), bodyRange));
     } else if (name == "filter") {
       NodePtr test = elementAt(0);
       if (!identityPredicate &&
           !buildLazyCall(expr, callable, {elementAt(0)}, loopBody, test))
         return emitNone(expr);
       loopBody.push_back(
-          ifNode(std::move(test), {yieldNode(elementAt(0), bodyRange)},
+          synth::ifStmt(std::move(test), {synth::yieldStmt(elementAt(0), bodyRange)}, {},
                  bodyRange));
     }
-    loopBody.push_back(assignNode(
-        indexRef, binOpNode(indexRef, "Add", intConstant(1, bodyRange),
+    loopBody.push_back(synth::assign(
+        indexRef, synth::binOp(indexRef, "Add", synth::intConstant(1, bodyRange),
                             bodyRange),
         bodyRange));
 
     std::vector<NodePtr> body;
     if (name == "reversed") {
       // __lyi = len(src); while __lyi > 0: __lyi -= 1; yield src[__lyi]
-      body.push_back(assignNode(indexRef, lenCall(param(0), bodyRange),
+      body.push_back(synth::assign(indexRef, synth::lenCall(param(0), bodyRange),
                                 bodyRange));
       std::vector<NodePtr> reversedBody{
-          assignNode(indexRef,
-                     binOpNode(indexRef, "Sub", intConstant(1, bodyRange),
+          synth::assign(indexRef,
+                     synth::binOp(indexRef, "Sub", synth::intConstant(1, bodyRange),
                                bodyRange),
                      bodyRange),
-          yieldNode(elementAt(0), bodyRange)};
-      body.push_back(whileNode(
-          compareNode(indexRef, "Gt", intConstant(0, bodyRange), bodyRange),
+          synth::yieldStmt(elementAt(0), bodyRange)};
+      body.push_back(synth::whileStmt(
+          synth::compare(indexRef, "Gt", synth::intConstant(0, bodyRange), bodyRange),
           std::move(reversedBody), {}, bodyRange));
     } else {
-      body.push_back(assignNode(indexRef, intConstant(0, bodyRange),
+      body.push_back(synth::assign(indexRef, synth::intConstant(0, bodyRange),
                                 bodyRange));
-      body.push_back(whileNode(trueConstant(bodyRange), std::move(loopBody),
+      body.push_back(synth::whileStmt(synth::boolConstant(true, bodyRange), std::move(loopBody),
                                {}, bodyRange));
     }
 
     llvm::SmallVector<const parser::Node *, 4> paramNodes;
-    NodePtr def = makeSyntheticGeneratorDef(symbol, params, std::move(body),
-                                            bodyRange, paramNodes);
+    llvm::SmallVector<synth::Param, 4> synthParams;
+    for (const std::string &param : params)
+      synthParams.push_back(synth::Param{param, nullptr});
+    NodePtr def = synth::functionDef(symbol, synthParams, {}, std::move(body),
+                                     nullptr, {}, bodyRange, &paramNodes);
     synthesizedIteratorDefs.push_back(def);
     for (auto [index, value] : llvm::enumerate(iterableValues))
       types.overrideParameterType(paramNodes[index],
@@ -993,29 +881,9 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
 
 namespace {
 
-NodePtr noneConstant(parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", std::monostate{});
-  return node;
-}
 
-NodePtr stringConstant(const std::string &text, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", text);
-  return node;
-}
 
-NodePtr compareInNode(NodePtr left, NodePtr right, parser::SourceRange range) {
-  return compareNode(std::move(left), "In", std::move(right), range);
-}
 
-NodePtr methodCallNode(NodePtr receiver, const char *method,
-                       std::vector<NodePtr> args, parser::SourceRange range) {
-  NodePtr attr = parser::makeNode("Attribute", range);
-  parser::addField(*attr, "value", std::move(receiver));
-  parser::addField(*attr, "attr", std::string(method));
-  return callNode(std::move(attr), std::move(args), range);
-}
 
 } // namespace
 
@@ -1070,20 +938,20 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
                          "value");
     std::string valueName = scratch("fv");
     std::string keyName = scratch("fk");
-    NodePtr valueInit = argCount == 2 ? (*args)[1] : noneConstant(range);
+    NodePtr valueInit = argCount == 2 ? (*args)[1] : synth::noneConstant(range);
     NodePtr comprehension = parser::makeNode("comprehension", range);
-    parser::addField(*comprehension, "target", nameNode(keyName, range));
+    parser::addField(*comprehension, "target", synth::name(keyName, range));
     parser::addField(*comprehension, "iter", (*args)[0]);
     parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
     parser::addField(*comprehension, "is_async", std::int64_t{0});
     NodePtr comp = parser::makeNode("DictComp", range);
-    parser::addField(*comp, "key", nameNode(keyName, range));
-    parser::addField(*comp, "value", nameNode(valueName, range));
+    parser::addField(*comp, "key", synth::name(keyName, range));
+    parser::addField(*comp, "value", synth::name(valueName, range));
     parser::addField(*comp, "generators",
                      std::vector<NodePtr>{std::move(comprehension)});
     std::optional<Value> result;
     runWithScratchNames({valueName, keyName}, [&] {
-      emitStatement(*assignNode(nameNode(valueName, range),
+      emitStatement(*synth::assign(synth::name(valueName, range),
                                 std::move(valueInit), range));
       result = emitExpr(comp.get());
     });
@@ -1101,7 +969,7 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
 
   std::string dictName = scratch("d");
   bool needsTemp = receiver->kind != "Name";
-  NodePtr dictRef = needsTemp ? nameNode(dictName, range) : receiver;
+  NodePtr dictRef = needsTemp ? synth::name(dictName, range) : receiver;
   auto withPrologue = [&](llvm::ArrayRef<std::string> names,
                           llvm::function_ref<std::optional<Value>()> emit)
       -> std::optional<Value> {
@@ -1111,7 +979,7 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
       scratchNames.push_back(dictName);
     runWithScratchNames(scratchNames, [&] {
       if (needsTemp)
-        emitStatement(*assignNode(nameNode(dictName, range), receiver, range));
+        emitStatement(*synth::assign(synth::name(dictName, range), receiver, range));
       result = emit();
     });
     return result;
@@ -1122,14 +990,14 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
     std::string keyName = scratch("gk");
     std::string resultName = scratch("gr");
     return withPrologue({keyName, resultName}, [&]() -> std::optional<Value> {
-      emitStatement(*assignNode(nameNode(keyName, range), (*args)[0], range));
-      emitStatement(*assignNode(nameNode(resultName, range),
-                                noneConstant(range), range));
-      NodePtr hit = ifNode(
-          compareInNode(nameNode(keyName, range), dictRef, range),
-          {assignNode(nameNode(resultName, range),
-                      subscriptNode(dictRef, nameNode(keyName, range), range),
-                      range)},
+      emitStatement(*synth::assign(synth::name(keyName, range), (*args)[0], range));
+      emitStatement(*synth::assign(synth::name(resultName, range),
+                                synth::noneConstant(range), range));
+      NodePtr hit = synth::ifStmt(
+          synth::compareIn(synth::name(keyName, range), dictRef, range),
+          {synth::assign(synth::name(resultName, range),
+                      synth::subscript(dictRef, synth::name(keyName, range), range),
+                      range)}, {},
           range);
       emitStatement(*hit);
       auto bound = values.find(resultName);
@@ -1149,25 +1017,25 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
     return withPrologue(
         {keyName, valueName, resultName}, [&]() -> std::optional<Value> {
           emitStatement(
-              *assignNode(nameNode(keyName, range), (*args)[0], range));
-          emitStatement(*assignNode(
-              nameNode(valueName, range),
-              argCount == 2 ? (*args)[1] : noneConstant(range), range));
+              *synth::assign(synth::name(keyName, range), (*args)[0], range));
+          emitStatement(*synth::assign(
+              synth::name(valueName, range),
+              argCount == 2 ? (*args)[1] : synth::noneConstant(range), range));
           // if __k not in d: d[__k] = __v
           // __r = d[__k]
           // Single-arm shape on purpose (a two-arm branch mixing a getitem
           // arm with a setitem arm trips the If-join's structural-mutation
           // threading), and reading back d[__k] returns the STORED value —
           // CPython's setdefault does the same.
-          emitStatement(*ifNode(
-              compareNode(nameNode(keyName, range), "NotIn", dictRef, range),
-              {assignNode(
-                  subscriptNode(dictRef, nameNode(keyName, range), range),
-                  nameNode(valueName, range), range)},
+          emitStatement(*synth::ifStmt(
+              synth::compare(synth::name(keyName, range), "NotIn", dictRef, range),
+              {synth::assign(
+                  synth::subscript(dictRef, synth::name(keyName, range), range),
+                  synth::name(valueName, range), range)}, {},
               range));
-          emitStatement(*assignNode(
-              nameNode(resultName, range),
-              subscriptNode(dictRef, nameNode(keyName, range), range),
+          emitStatement(*synth::assign(
+              synth::name(resultName, range),
+              synth::subscript(dictRef, synth::name(keyName, range), range),
               range));
           auto bound = values.find(resultName);
           if (bound == values.end() || !bound->second.value)
@@ -1190,41 +1058,41 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
       {keysName, elementName, keyName, valueName},
       [&]() -> std::optional<Value> {
         NodePtr emptyTest =
-            compareNode(lenCall(dictRef, range), "Eq", intConstant(0, range),
+            synth::compare(synth::lenCall(dictRef, range), "Eq", synth::intConstant(0, range),
                         range);
         NodePtr keyError =
-            callNode(nameNode("KeyError", range),
-                     {stringConstant("popitem(): dictionary is empty", range)},
+            synth::call(synth::name("KeyError", range),
+                     {synth::strConstant("popitem(): dictionary is empty", range)},
                      range);
         NodePtr raiseNode = parser::makeNode("Raise", range);
         parser::addField(*raiseNode, "exc", std::move(keyError));
-        emitStatement(*ifNode(std::move(emptyTest), {std::move(raiseNode)},
+        emitStatement(*synth::ifStmt(std::move(emptyTest), {std::move(raiseNode)}, {},
                               range));
         NodePtr comprehension = parser::makeNode("comprehension", range);
         parser::addField(*comprehension, "target",
-                         nameNode(elementName, range));
+                         synth::name(elementName, range));
         parser::addField(*comprehension, "iter", dictRef);
         parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
         parser::addField(*comprehension, "is_async", std::int64_t{0});
         NodePtr keysComp = parser::makeNode("ListComp", range);
-        parser::addField(*keysComp, "elt", nameNode(elementName, range));
+        parser::addField(*keysComp, "elt", synth::name(elementName, range));
         parser::addField(*keysComp, "generators",
                          std::vector<NodePtr>{std::move(comprehension)});
-        emitStatement(*assignNode(nameNode(keysName, range),
+        emitStatement(*synth::assign(synth::name(keysName, range),
                                   std::move(keysComp), range));
-        emitStatement(*assignNode(
-            nameNode(keyName, range),
-            subscriptNode(nameNode(keysName, range),
-                          binOpNode(lenCall(nameNode(keysName, range), range),
-                                    "Sub", intConstant(1, range), range),
+        emitStatement(*synth::assign(
+            synth::name(keyName, range),
+            synth::subscript(synth::name(keysName, range),
+                          synth::binOp(synth::lenCall(synth::name(keysName, range), range),
+                                    "Sub", synth::intConstant(1, range), range),
                           range),
             range));
-        emitStatement(*assignNode(
-            nameNode(valueName, range),
-            methodCallNode(dictRef, "pop", {nameNode(keyName, range)}, range),
+        emitStatement(*synth::assign(
+            synth::name(valueName, range),
+            synth::methodCall(dictRef, "pop", {synth::name(keyName, range)}, range),
             range));
-        NodePtr pair = tupleNode(
-            {nameNode(keyName, range), nameNode(valueName, range)}, range);
+        NodePtr pair = synth::tuple(
+            {synth::name(keyName, range), synth::name(valueName, range)}, range);
         return emitExpr(pair.get());
       });
 }
@@ -1304,21 +1172,21 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
     auto contract = mlir::dyn_cast_if_present<py::ContractType>(
         types.widenLiteral(types.inferExpr(source.get())));
     if (contract && contract.getContractName() == "builtins.list") {
-      emitStatement(*assignNode(
-          nameNode(listName, range),
-          methodCallNode(std::move(source), "copy", {}, range), range));
+      emitStatement(*synth::assign(
+          synth::name(listName, range),
+          synth::methodCall(std::move(source), "copy", {}, range), range));
     } else {
       NodePtr comprehension = parser::makeNode("comprehension", range);
       parser::addField(*comprehension, "target",
-                       nameNode(copyElement, range));
+                       synth::name(copyElement, range));
       parser::addField(*comprehension, "iter", std::move(source));
       parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
       parser::addField(*comprehension, "is_async", std::int64_t{0});
       NodePtr copyComp = parser::makeNode("ListComp", range);
-      parser::addField(*copyComp, "elt", nameNode(copyElement, range));
+      parser::addField(*copyComp, "elt", synth::name(copyElement, range));
       parser::addField(*copyComp, "generators",
                        std::vector<NodePtr>{std::move(comprehension)});
-      emitStatement(*assignNode(nameNode(listName, range),
+      emitStatement(*synth::assign(synth::name(listName, range),
                                 std::move(copyComp), range));
     }
   }
@@ -1340,7 +1208,7 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
       NodePtr statement = parser::makeNode("Expr", range);
       parser::addField(
           *statement, "value",
-          methodCallNode(nameNode(listName, range), method, {}, range));
+          synth::methodCall(synth::name(listName, range), method, {}, range));
       emitStatement(*statement);
     };
     if (reverse)
@@ -1359,7 +1227,7 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
     if (!key)
       return argument;
     if (key->callee)
-      return callNode(key->callee, {std::move(argument)}, range);
+      return synth::call(key->callee, {std::move(argument)}, range);
     if (key->lambdaParams.size() != 1 || !key->lambdaBody) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, anchor.range.start,
@@ -1373,8 +1241,8 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
   std::string pairsName = scratch("ps");
   std::string indexName = scratch("i");
   std::string lengthName = scratch("n");
-  emitStatement(*assignNode(nameNode(lengthName, range),
-                            lenCall(nameNode(listName, range), range),
+  emitStatement(*synth::assign(synth::name(lengthName, range),
+                            synth::lenCall(synth::name(listName, range), range),
                             range));
 
   // The scratch lists start empty, so their element types must be SPELLED —
@@ -1385,8 +1253,8 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
   std::string keyTypeName = scratch("K");
   std::string elementTypeName = scratch("T");
   {
-    NodePtr elementProbe = subscriptNode(nameNode(listName, range),
-                                         intConstant(0, range), range);
+    NodePtr elementProbe = synth::subscript(synth::name(listName, range),
+                                         synth::intConstant(0, range), range);
     std::optional<NodePtr> keyProbe = keyExprFor(elementProbe);
     if (!keyProbe)
       return std::nullopt;
@@ -1410,7 +1278,7 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
     NodePtr emptyList = parser::makeNode("List", range);
     parser::addField(*emptyList, "elts", std::vector<NodePtr>{});
     NodePtr annAssign = parser::makeNode("AnnAssign", range);
-    parser::addField(*annAssign, "target", nameNode(name, range));
+    parser::addField(*annAssign, "target", synth::name(name, range));
     parser::addField(*annAssign, "annotation", std::move(annotation));
     parser::addField(*annAssign, "value", std::move(emptyList));
     parser::addField(*annAssign, "simple", std::int64_t{1});
@@ -1425,48 +1293,48 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
   {
     emitTypedEmptyList(
         pairsName,
-        subscriptNode(nameNode("list", range),
-                      subscriptNode(nameNode("tuple", range),
-                                    tupleNode({nameNode(keyTypeName, range),
-                                               nameNode("int", range)},
+        synth::subscript(synth::name("list", range),
+                      synth::subscript(synth::name("tuple", range),
+                                    synth::tuple({synth::name(keyTypeName, range),
+                                               synth::name("int", range)},
                                               range),
                                     range),
                       range));
-    emitStatement(*assignNode(nameNode(indexName, range),
-                              intConstant(0, range), range));
+    emitStatement(*synth::assign(synth::name(indexName, range),
+                              synth::intConstant(0, range), range));
     NodePtr decoratedIndex =
-        reverse ? binOpNode(binOpNode(nameNode(lengthName, range), "Sub",
-                                      intConstant(1, range), range),
-                            "Sub", nameNode(indexName, range), range)
-                : binOpNode(nameNode(indexName, range), "Add",
-                            intConstant(0, range), range);
-    std::optional<NodePtr> keyExpr = keyExprFor(subscriptNode(
-        nameNode(listName, range), nameNode(indexName, range), range));
+        reverse ? synth::binOp(synth::binOp(synth::name(lengthName, range), "Sub",
+                                      synth::intConstant(1, range), range),
+                            "Sub", synth::name(indexName, range), range)
+                : synth::binOp(synth::name(indexName, range), "Add",
+                            synth::intConstant(0, range), range);
+    std::optional<NodePtr> keyExpr = keyExprFor(synth::subscript(
+        synth::name(listName, range), synth::name(indexName, range), range));
     if (!keyExpr)
       return std::nullopt;
     NodePtr appendStatement = parser::makeNode("Expr", range);
     parser::addField(
         *appendStatement, "value",
-        methodCallNode(nameNode(pairsName, range), "append",
-                       {tupleNode({std::move(*keyExpr),
+        synth::methodCall(synth::name(pairsName, range), "append",
+                       {synth::tuple({std::move(*keyExpr),
                                    std::move(decoratedIndex)},
                                   range)},
                        range));
     std::vector<NodePtr> loopBody;
     loopBody.push_back(std::move(appendStatement));
-    loopBody.push_back(assignNode(
-        nameNode(indexName, range),
-        binOpNode(nameNode(indexName, range), "Add", intConstant(1, range),
+    loopBody.push_back(synth::assign(
+        synth::name(indexName, range),
+        synth::binOp(synth::name(indexName, range), "Add", synth::intConstant(1, range),
                   range),
         range));
-    emitWhile(*whileNode(compareNode(nameNode(indexName, range), "Lt",
-                                     nameNode(lengthName, range), range),
+    emitWhile(*synth::whileStmt(synth::compare(synth::name(indexName, range), "Lt",
+                                     synth::name(lengthName, range), range),
                          std::move(loopBody), {}, range));
   }
   {
     NodePtr sortStatement = parser::makeNode("Expr", range);
     parser::addField(*sortStatement, "value",
-                     methodCallNode(nameNode(pairsName, range), "sort", {},
+                     synth::methodCall(synth::name(pairsName, range), "sort", {},
                                     range));
     emitStatement(*sortStatement);
   }
@@ -1481,49 +1349,49 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
   std::string cursorName = scratch("q");
   {
     emitTypedEmptyList(outName,
-                       subscriptNode(nameNode("list", range),
-                                     nameNode(elementTypeName, range),
+                       synth::subscript(synth::name("list", range),
+                                     synth::name(elementTypeName, range),
                                      range));
-    emitStatement(*assignNode(nameNode(cursorName, range),
-                              reverse ? nameNode(lengthName, range)
-                                      : intConstant(0, range),
+    emitStatement(*synth::assign(synth::name(cursorName, range),
+                              reverse ? synth::name(lengthName, range)
+                                      : synth::intConstant(0, range),
                               range));
-    NodePtr storedIndex = subscriptNode(
-        subscriptNode(nameNode(pairsName, range), nameNode(cursorName, range),
+    NodePtr storedIndex = synth::subscript(
+        synth::subscript(synth::name(pairsName, range), synth::name(cursorName, range),
                       range),
-        intConstant(1, range), range);
+        synth::intConstant(1, range), range);
     NodePtr sourceIndex =
-        reverse ? binOpNode(binOpNode(nameNode(lengthName, range), "Sub",
-                                      intConstant(1, range), range),
+        reverse ? synth::binOp(synth::binOp(synth::name(lengthName, range), "Sub",
+                                      synth::intConstant(1, range), range),
                             "Sub", std::move(storedIndex), range)
                 : std::move(storedIndex);
     NodePtr appendStatement = parser::makeNode("Expr", range);
     parser::addField(
         *appendStatement, "value",
-        methodCallNode(nameNode(outName, range), "append",
-                       {subscriptNode(nameNode(listName, range),
+        synth::methodCall(synth::name(outName, range), "append",
+                       {synth::subscript(synth::name(listName, range),
                                       std::move(sourceIndex), range)},
                        range));
     std::vector<NodePtr> body;
     if (reverse) {
-      body.push_back(assignNode(
-          nameNode(cursorName, range),
-          binOpNode(nameNode(cursorName, range), "Sub",
-                    intConstant(1, range), range),
+      body.push_back(synth::assign(
+          synth::name(cursorName, range),
+          synth::binOp(synth::name(cursorName, range), "Sub",
+                    synth::intConstant(1, range), range),
           range));
       body.push_back(std::move(appendStatement));
-      emitWhile(*whileNode(compareNode(nameNode(cursorName, range), "Gt",
-                                       intConstant(0, range), range),
+      emitWhile(*synth::whileStmt(synth::compare(synth::name(cursorName, range), "Gt",
+                                       synth::intConstant(0, range), range),
                            std::move(body), {}, range));
     } else {
       body.push_back(std::move(appendStatement));
-      body.push_back(assignNode(
-          nameNode(cursorName, range),
-          binOpNode(nameNode(cursorName, range), "Add",
-                    intConstant(1, range), range),
+      body.push_back(synth::assign(
+          synth::name(cursorName, range),
+          synth::binOp(synth::name(cursorName, range), "Add",
+                    synth::intConstant(1, range), range),
           range));
-      emitWhile(*whileNode(compareNode(nameNode(cursorName, range), "Lt",
-                                       nameNode(lengthName, range), range),
+      emitWhile(*synth::whileStmt(synth::compare(synth::name(cursorName, range), "Lt",
+                                       synth::name(lengthName, range), range),
                            std::move(body), {}, range));
     }
   }
@@ -1563,9 +1431,9 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
         if (!argContract ||
             argContract.getContractName() != "builtins.list") {
           parser::SourceRange range = expr.range;
-          NodePtr wrapped = callNode(
-              nameNode("sorted", range),
-              {callNode(nameNode("list", range), {(*args)[0]}, range)},
+          NodePtr wrapped = synth::call(
+              synth::name("sorted", range),
+              {synth::call(synth::name("list", range), {(*args)[0]}, range)},
               range);
           return emitExpr(wrapped.get());
         }
@@ -1677,12 +1545,12 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
       parser::SourceRange range = expr.range;
       NodePtr clearStatement = parser::makeNode("Expr", range);
       parser::addField(*clearStatement, "value",
-                       methodCallNode(receiver, "clear", {}, range));
+                       synth::methodCall(receiver, "clear", {}, range));
       emitStatement(*clearStatement);
       NodePtr extendStatement = parser::makeNode("Expr", range);
       parser::addField(
           *extendStatement, "value",
-          methodCallNode(receiver, "extend", {nameNode(*outName, range)},
+          synth::methodCall(receiver, "extend", {synth::name(*outName, range)},
                          range));
       emitStatement(*extendStatement);
       result = emitNone(expr);
@@ -1743,35 +1611,35 @@ ModuleEmitter::tryEmitStrTranslateSugar(const parser::Node &expr,
     std::string indexName = scratch("i");
     std::optional<Value> result;
     runWithScratchNames({fromName, toName, indexName}, [&] {
-      emitStatement(*assignNode(nameNode(fromName, range), (*args)[0],
+      emitStatement(*synth::assign(synth::name(fromName, range), (*args)[0],
                                 range));
-      emitStatement(*assignNode(nameNode(toName, range), (*args)[1], range));
+      emitStatement(*synth::assign(synth::name(toName, range), (*args)[1], range));
       // if len(x) != len(y): raise ValueError(...)
       NodePtr lengthTest =
-          compareNode(lenCall(nameNode(fromName, range), range), "NotEq",
-                      lenCall(nameNode(toName, range), range), range);
-      NodePtr valueError = callNode(
-          nameNode("ValueError", range),
-          {stringConstant(
+          synth::compare(synth::lenCall(synth::name(fromName, range), range), "NotEq",
+                      synth::lenCall(synth::name(toName, range), range), range);
+      NodePtr valueError = synth::call(
+          synth::name("ValueError", range),
+          {synth::strConstant(
               "the first two maketrans arguments must have equal length",
               range)},
           range);
       NodePtr raiseNode = parser::makeNode("Raise", range);
       parser::addField(*raiseNode, "exc", std::move(valueError));
-      emitStatement(*ifNode(std::move(lengthTest), {std::move(raiseNode)},
+      emitStatement(*synth::ifStmt(std::move(lengthTest), {std::move(raiseNode)}, {},
                             range));
       // {ord(x[i]): ord(y[i]) for i in range(len(x))}
       auto ordAt = [&](const std::string &sourceName) {
-        return callNode(nameNode("ord", range),
-                        {subscriptNode(nameNode(sourceName, range),
-                                       nameNode(indexName, range), range)},
+        return synth::call(synth::name("ord", range),
+                        {synth::subscript(synth::name(sourceName, range),
+                                       synth::name(indexName, range), range)},
                         range);
       };
       NodePtr comprehension = parser::makeNode("comprehension", range);
-      parser::addField(*comprehension, "target", nameNode(indexName, range));
+      parser::addField(*comprehension, "target", synth::name(indexName, range));
       parser::addField(*comprehension, "iter",
-                       callNode(nameNode("range", range),
-                                {lenCall(nameNode(fromName, range), range)},
+                       synth::call(synth::name("range", range),
+                                {synth::lenCall(synth::name(fromName, range), range)},
                                 range));
       parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
       parser::addField(*comprehension, "is_async", std::int64_t{0});
@@ -1820,57 +1688,57 @@ ModuleEmitter::tryEmitStrTranslateSugar(const parser::Node &expr,
   std::string ordName = scratch("o");
   bool sourceIsName = receiver->kind == "Name";
   bool tableIsName = (*args)[0]->kind == "Name";
-  NodePtr sourceRef = sourceIsName ? receiver : nameNode(sourceName, range);
-  NodePtr tableRef = tableIsName ? (*args)[0] : nameNode(tableName, range);
+  NodePtr sourceRef = sourceIsName ? receiver : synth::name(sourceName, range);
+  NodePtr tableRef = tableIsName ? (*args)[0] : synth::name(tableName, range);
   std::optional<Value> result;
   runWithScratchNames({sourceName, tableName, partsName, charName, ordName},
                       [&] {
     if (!sourceIsName)
-      emitStatement(*assignNode(nameNode(sourceName, range), receiver,
+      emitStatement(*synth::assign(synth::name(sourceName, range), receiver,
                                 range));
     if (!tableIsName)
-      emitStatement(*assignNode(nameNode(tableName, range), (*args)[0],
+      emitStatement(*synth::assign(synth::name(tableName, range), (*args)[0],
                                 range));
     // __p: list[str] = []
     NodePtr emptyList = parser::makeNode("List", range);
     parser::addField(*emptyList, "elts", std::vector<NodePtr>{});
     NodePtr annAssign = parser::makeNode("AnnAssign", range);
-    parser::addField(*annAssign, "target", nameNode(partsName, range));
+    parser::addField(*annAssign, "target", synth::name(partsName, range));
     parser::addField(*annAssign, "annotation",
-                     subscriptNode(nameNode("list", range),
-                                   nameNode("str", range), range));
+                     synth::subscript(synth::name("list", range),
+                                   synth::name("str", range), range));
     parser::addField(*annAssign, "value", std::move(emptyList));
     parser::addField(*annAssign, "simple", std::int64_t{1});
     emitStatement(*annAssign);
     // for __c in s: __o = ord(__c); mapped/pass-through appends
-    NodePtr mapped = subscriptNode(tableRef, nameNode(ordName, range), range);
+    NodePtr mapped = synth::subscript(tableRef, synth::name(ordName, range), range);
     if (intValues)
-      mapped = callNode(nameNode("chr", range), {std::move(mapped)}, range);
+      mapped = synth::call(synth::name("chr", range), {std::move(mapped)}, range);
     NodePtr appendMapped = parser::makeNode("Expr", range);
     parser::addField(*appendMapped, "value",
-                     methodCallNode(nameNode(partsName, range), "append",
+                     synth::methodCall(synth::name(partsName, range), "append",
                                     {std::move(mapped)}, range));
     NodePtr appendPlain = parser::makeNode("Expr", range);
     parser::addField(*appendPlain, "value",
-                     methodCallNode(nameNode(partsName, range), "append",
-                                    {nameNode(charName, range)}, range));
-    NodePtr branch = ifNode(
-        compareInNode(nameNode(ordName, range), tableRef, range),
-        {std::move(appendMapped)}, range);
+                     synth::methodCall(synth::name(partsName, range), "append",
+                                    {synth::name(charName, range)}, range));
+    NodePtr branch = synth::ifStmt(
+        synth::compareIn(synth::name(ordName, range), tableRef, range),
+        {std::move(appendMapped)}, {}, range);
     parser::addField(*branch, "orelse",
                      std::vector<NodePtr>{std::move(appendPlain)});
     std::vector<NodePtr> body{
-        assignNode(nameNode(ordName, range),
-                   callNode(nameNode("ord", range),
-                            {nameNode(charName, range)}, range),
+        synth::assign(synth::name(ordName, range),
+                   synth::call(synth::name("ord", range),
+                            {synth::name(charName, range)}, range),
                    range),
         std::move(branch)};
-    emitFor(*forNode(nameNode(charName, range), sourceRef, std::move(body),
+    emitFor(*synth::forStmt(synth::name(charName, range), sourceRef, std::move(body),
                      {}, range));
     // "".join(__p)
     NodePtr joinCall =
-        methodCallNode(stringConstant("", range), "join",
-                       {nameNode(partsName, range)}, range);
+        synth::methodCall(synth::strConstant("", range), "join",
+                       {synth::name(partsName, range)}, range);
     result = emitExpr(joinCall.get());
   });
   return result;
@@ -1920,7 +1788,7 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
   parser::SourceRange range = expr.range;
 
   if (*viewName == "keys") {
-    NodePtr rewritten = compareNode(left, negated ? "NotIn" : "In", receiver,
+    NodePtr rewritten = synth::compare(left, negated ? "NotIn" : "In", receiver,
                                     range);
     return emitCompare(*rewritten);
   }
@@ -1931,7 +1799,7 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
   };
   std::string dictName = scratch("d");
   bool needsTemp = receiver->kind != "Name";
-  NodePtr dictRef = needsTemp ? nameNode(dictName, range) : receiver;
+  NodePtr dictRef = needsTemp ? synth::name(dictName, range) : receiver;
   std::string probeName = scratch("x");
   std::string resultName = scratch("r");
   std::string keyName = scratch("k");
@@ -1942,47 +1810,47 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
   std::optional<Value> result;
   runWithScratchNames(names, [&] {
     // Order: CPython evaluates the left operand, then the view expression.
-    emitStatement(*assignNode(nameNode(probeName, range), left, range));
+    emitStatement(*synth::assign(synth::name(probeName, range), left, range));
     if (needsTemp)
-      emitStatement(*assignNode(nameNode(dictName, range), receiver, range));
+      emitStatement(*synth::assign(synth::name(dictName, range), receiver, range));
     NodePtr falseInit = parser::makeNode("Constant", range);
     parser::addField(*falseInit, "value", false);
-    emitStatement(*assignNode(nameNode(resultName, range),
+    emitStatement(*synth::assign(synth::name(resultName, range),
                               std::move(falseInit), range));
     NodePtr trueValue = parser::makeNode("Constant", range);
     parser::addField(*trueValue, "value", true);
     if (*viewName == "values") {
       // for __k in d: if d[__k] == __x: __r = True; break
-      NodePtr hit = ifNode(
-          compareNode(subscriptNode(dictRef, nameNode(keyName, range), range),
-                      "Eq", nameNode(probeName, range), range),
-          {assignNode(nameNode(resultName, range), std::move(trueValue),
+      NodePtr hit = synth::ifStmt(
+          synth::compare(synth::subscript(dictRef, synth::name(keyName, range), range),
+                      "Eq", synth::name(probeName, range), range),
+          {synth::assign(synth::name(resultName, range), std::move(trueValue),
                       range),
-           parser::makeNode("Break", range)},
+           parser::makeNode("Break", range)}, {},
           range);
-      emitFor(*forNode(nameNode(keyName, range), dictRef, {std::move(hit)},
+      emitFor(*synth::forStmt(synth::name(keyName, range), dictRef, {std::move(hit)},
                        {}, range));
     } else {
       // items: __k = __x[0]; if __k in d and d[__k] == __x[1]: __r = True
-      emitStatement(*assignNode(
-          nameNode(keyName, range),
-          subscriptNode(nameNode(probeName, range), intConstant(0, range),
+      emitStatement(*synth::assign(
+          synth::name(keyName, range),
+          synth::subscript(synth::name(probeName, range), synth::intConstant(0, range),
                         range),
           range));
-      NodePtr valueMatches = ifNode(
-          compareNode(subscriptNode(dictRef, nameNode(keyName, range), range),
+      NodePtr valueMatches = synth::ifStmt(
+          synth::compare(synth::subscript(dictRef, synth::name(keyName, range), range),
                       "Eq",
-                      subscriptNode(nameNode(probeName, range),
-                                    intConstant(1, range), range),
+                      synth::subscript(synth::name(probeName, range),
+                                    synth::intConstant(1, range), range),
                       range),
-          {assignNode(nameNode(resultName, range), std::move(trueValue),
-                      range)},
+          {synth::assign(synth::name(resultName, range), std::move(trueValue),
+                      range)}, {},
           range);
-      emitStatement(*ifNode(
-          compareInNode(nameNode(keyName, range), dictRef, range),
-          {std::move(valueMatches)}, range));
+      emitStatement(*synth::ifStmt(
+          synth::compareIn(synth::name(keyName, range), dictRef, range),
+          {std::move(valueMatches)}, {}, range));
     }
-    NodePtr resultExpr = nameNode(resultName, range);
+    NodePtr resultExpr = synth::name(resultName, range);
     if (negated) {
       NodePtr notOp = parser::makeNode("Not", range);
       NodePtr flipped = parser::makeNode("UnaryOp", range);
@@ -2016,18 +1884,18 @@ Value ModuleEmitter::emitConstructorComprehension(const parser::Node &expr,
     std::string key = "__ctork" + std::to_string(serial);
     std::string value = "__ctorv" + std::to_string(serial);
     parser::addField(*generator, "target",
-                     tupleNode({nameNode(key, range), nameNode(value, range)},
+                     synth::tuple({synth::name(key, range), synth::name(value, range)},
                                range));
     comp = parser::makeNode("DictComp", range);
-    parser::addField(*comp, "key", nameNode(key, range));
-    parser::addField(*comp, "value", nameNode(value, range));
+    parser::addField(*comp, "key", synth::name(key, range));
+    parser::addField(*comp, "value", synth::name(value, range));
     parser::addField(*comp, "generators", std::vector<NodePtr>{generator});
     return emitComprehension(*comp, /*isDict=*/true);
   }
   std::string element = "__ctor" + std::to_string(serial);
-  parser::addField(*generator, "target", nameNode(element, range));
+  parser::addField(*generator, "target", synth::name(element, range));
   comp = parser::makeNode(which == "set" ? "SetComp" : "ListComp", range);
-  parser::addField(*comp, "elt", nameNode(element, range));
+  parser::addField(*comp, "elt", synth::name(element, range));
   parser::addField(*comp, "generators", std::vector<NodePtr>{generator});
   return emitComprehension(*comp, /*isDict=*/false, /*isSet=*/which == "set");
 }
@@ -2097,7 +1965,7 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
           !std::get<NodePtr>(valueField->value))
         return reject("dict() keyword arguments must be named "
                       "(** splats are not supported yet)");
-      keys.push_back(stringConstant(std::string(*name), range));
+      keys.push_back(synth::strConstant(std::string(*name), range));
       vals.push_back(std::get<NodePtr>(valueField->value));
     }
     NodePtr literal = parser::makeNode("Dict", range);
@@ -2198,10 +2066,10 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
         "__lyctorsrc" + std::to_string(++listCompCounter);
     std::optional<Value> built;
     runWithScratchNames({sourceName}, [&] {
-      emitStatement(*assignNode(nameNode(sourceName, range), argNode, range));
+      emitStatement(*synth::assign(synth::name(sourceName, range), argNode, range));
       if (values.find(sourceName) == values.end())
         return;
-      NodePtr bound = nameNode(sourceName, range);
+      NodePtr bound = synth::name(sourceName, range);
       if (ctor == "dict")
         built = emitConstructorComprehension(expr, bound, "dict");
       else if (ctor == "set")
@@ -2223,7 +2091,7 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
 
   if (ctor == "dict") {
     if (argClass == "builtins.dict") {
-      NodePtr copy = methodCallNode(argNode, "copy", {}, range);
+      NodePtr copy = synth::methodCall(argNode, "copy", {}, range);
       return emitExpr(copy.get());
     }
     return emitConstructorComprehension(expr, argNode, "dict");
@@ -2265,66 +2133,13 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
 
 namespace {
 
-NodePtr notNode(NodePtr operand, parser::SourceRange range) {
-  NodePtr op = parser::makeNode("Not", range);
-  NodePtr node = parser::makeNode("UnaryOp", range);
-  parser::addField(*node, "op", std::move(op));
-  parser::addField(*node, "operand", std::move(operand));
-  return node;
-}
 
-NodePtr boolConstant(bool value, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", value);
-  return node;
-}
 
-NodePtr breakStatement(parser::SourceRange range) {
-  return parser::makeNode("Break", range);
-}
 
-NodePtr continueStatement(parser::SourceRange range) {
-  return parser::makeNode("Continue", range);
-}
 
-NodePtr ifElseNode(NodePtr test, std::vector<NodePtr> body,
-                   std::vector<NodePtr> orelse, parser::SourceRange range) {
-  NodePtr node = parser::makeNode("If", range);
-  parser::addField(*node, "test", std::move(test));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "orelse", std::move(orelse));
-  return node;
-}
 
-NodePtr ifExpNode(NodePtr test, NodePtr body, NodePtr orelse,
-                  parser::SourceRange range) {
-  NodePtr node = parser::makeNode("IfExp", range);
-  parser::addField(*node, "test", std::move(test));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "orelse", std::move(orelse));
-  return node;
-}
 
-NodePtr orChainNode(std::vector<NodePtr> values, parser::SourceRange range) {
-  if (values.size() == 1)
-    return std::move(values.front());
-  NodePtr op = parser::makeNode("Or", range);
-  NodePtr node = parser::makeNode("BoolOp", range);
-  parser::addField(*node, "op", std::move(op));
-  parser::addField(*node, "values", std::move(values));
-  return node;
-}
 
-NodePtr raiseValueError(const std::string &message,
-                        parser::SourceRange range) {
-  NodePtr text = parser::makeNode("Constant", range);
-  parser::addField(*text, "value", message);
-  NodePtr call = callNode(nameNode("ValueError", range), {std::move(text)},
-                          range);
-  NodePtr node = parser::makeNode("Raise", range);
-  parser::addField(*node, "exc", std::move(call));
-  return node;
-}
 
 std::optional<std::int64_t> constantInt(const parser::Node *expr) {
   if (!expr || expr->kind != "Constant")
@@ -2481,8 +2296,8 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
       return expr;
     std::string temp = scratch(stem);
     scratchNames.push_back(temp);
-    setup.push_back(assignNode(nameNode(temp, range), expr, range));
-    return nameNode(temp, range);
+    setup.push_back(synth::assign(synth::name(temp, range), expr, range));
+    return synth::name(temp, range);
   };
   auto emitFused = [&](llvm::function_ref<void()> emitLoop) {
     runWithScratchNames(scratchNames, [&] {
@@ -2504,19 +2319,19 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     if (!step)
       step = keywordValue("step");
     if (!start)
-      start = intConstant(0, range);
+      start = synth::intConstant(0, range);
     if (!step)
-      step = intConstant(1, range);
+      step = synth::intConstant(1, range);
     std::string counterName = scratch("c");
     scratchNames.push_back(counterName);
-    NodePtr counter = nameNode(counterName, range);
-    setup.push_back(assignNode(counter, start, range));
+    NodePtr counter = synth::name(counterName, range);
+    setup.push_back(synth::assign(counter, start, range));
     NodePtr stepRef = pinned(step, "st");
     std::vector<NodePtr> body{
-        assignNode(parts->target, counter, range),
-        assignNode(counter, binOpNode(counter, "Add", stepRef, range), range)};
+        synth::assign(parts->target, counter, range),
+        synth::assign(counter, synth::binOp(counter, "Add", stepRef, range), range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = whileNode(trueConstant(range), std::move(body),
+    NodePtr loop = synth::whileStmt(synth::boolConstant(true, range), std::move(body),
                              parts->orelse, range);
     return emitFused([&] { emitWhile(*loop); });
   }
@@ -2531,27 +2346,27 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
       return reject("repeat() takes an object and an optional times");
     std::string objectName = scratch("o");
     scratchNames.push_back(objectName);
-    NodePtr objectRef = nameNode(objectName, range);
-    setup.push_back(assignNode(objectRef, object, range));
+    NodePtr objectRef = synth::name(objectName, range);
+    setup.push_back(synth::assign(objectRef, object, range));
     if (!times) {
-      std::vector<NodePtr> body{assignNode(parts->target, objectRef, range)};
+      std::vector<NodePtr> body{synth::assign(parts->target, objectRef, range)};
       body.insert(body.end(), parts->body.begin(), parts->body.end());
-      NodePtr loop = whileNode(trueConstant(range), std::move(body),
+      NodePtr loop = synth::whileStmt(synth::boolConstant(true, range), std::move(body),
                                parts->orelse, range);
       return emitFused([&] { emitWhile(*loop); });
     }
     NodePtr timesRef = pinned(times, "n");
     std::string counterName = scratch("k");
     scratchNames.push_back(counterName);
-    NodePtr counter = nameNode(counterName, range);
-    setup.push_back(assignNode(counter, intConstant(0, range), range));
+    NodePtr counter = synth::name(counterName, range);
+    setup.push_back(synth::assign(counter, synth::intConstant(0, range), range));
     std::vector<NodePtr> body{
-        assignNode(counter, binOpNode(counter, "Add", intConstant(1, range),
+        synth::assign(counter, synth::binOp(counter, "Add", synth::intConstant(1, range),
                                       range),
                    range),
-        assignNode(parts->target, objectRef, range)};
+        synth::assign(parts->target, objectRef, range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = whileNode(compareNode(counter, "Lt", timesRef, range),
+    NodePtr loop = synth::whileStmt(synth::compare(counter, "Lt", timesRef, range),
                              std::move(body), parts->orelse, range);
     return emitFused([&] { emitWhile(*loop); });
   }
@@ -2566,19 +2381,19 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     NodePtr source = pinned(argAt(0), "s");
     std::string indexName = scratch("i");
     scratchNames.push_back(indexName);
-    NodePtr indexRef = nameNode(indexName, range);
-    setup.push_back(assignNode(indexRef, intConstant(0, range), range));
+    NodePtr indexRef = synth::name(indexName, range);
+    setup.push_back(synth::assign(indexRef, synth::intConstant(0, range), range));
     std::vector<NodePtr> body{
-        assignNode(parts->target, subscriptNode(source, indexRef, range),
+        synth::assign(parts->target, synth::subscript(source, indexRef, range),
                    range),
-        assignNode(indexRef,
-                   binOpNode(binOpNode(indexRef, "Add", intConstant(1, range),
+        synth::assign(indexRef,
+                   synth::binOp(synth::binOp(indexRef, "Add", synth::intConstant(1, range),
                                        range),
-                             "Mod", lenCall(source, range), range),
+                             "Mod", synth::lenCall(source, range), range),
                    range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = whileNode(
-        compareNode(lenCall(source, range), "Gt", intConstant(0, range),
+    NodePtr loop = synth::whileStmt(
+        synth::compare(synth::lenCall(source, range), "Gt", synth::intConstant(0, range),
                     range),
         std::move(body), parts->orelse, range);
     return emitFused([&] { emitWhile(*loop); });
@@ -2641,49 +2456,49 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     std::int64_t stepValue = stepConst.value_or(1);
     NodePtr stopRef = stop ? pinned(stop, "e") : nullptr;
     if (stop && !stopConst)
-      setup.push_back(ifNode(
-          compareNode(stopRef, "Lt", intConstant(0, range), range),
-          {raiseValueError(kIsliceRangeMessage, range)}, range));
+      setup.push_back(synth::ifStmt(
+          synth::compare(stopRef, "Lt", synth::intConstant(0, range), range),
+          {synth::raiseValueError(kIsliceRangeMessage, range)}, {}, range));
     std::string pulledName = scratch("k");
     std::string indexName = scratch("j");
     scratchNames.push_back(pulledName);
     scratchNames.push_back(indexName);
-    NodePtr pulled = nameNode(pulledName, range);
-    NodePtr index = nameNode(indexName, range);
-    setup.push_back(assignNode(pulled, intConstant(0, range), range));
+    NodePtr pulled = synth::name(pulledName, range);
+    NodePtr index = synth::name(indexName, range);
+    setup.push_back(synth::assign(pulled, synth::intConstant(0, range), range));
     std::string elementName = scratch("v");
     scratchNames.push_back(elementName);
-    NodePtr element = nameNode(elementName, range);
+    NodePtr element = synth::name(elementName, range);
     std::vector<NodePtr> body;
-    body.push_back(assignNode(index, pulled, range));
-    body.push_back(assignNode(
-        pulled, binOpNode(index, "Add", intConstant(1, range), range),
+    body.push_back(synth::assign(index, pulled, range));
+    body.push_back(synth::assign(
+        pulled, synth::binOp(index, "Add", synth::intConstant(1, range), range),
         range));
     if (stop)
-      body.push_back(ifNode(compareNode(index, "GtE", stopRef, range),
-                            {breakStatement(range)}, range));
+      body.push_back(synth::ifStmt(synth::compare(index, "GtE", stopRef, range),
+                            {synth::breakStmt(range)}, {}, range));
     if (startValue > 0)
-      body.push_back(ifNode(
-          compareNode(index, "Lt", intConstant(startValue, range), range),
-          {continueStatement(range)}, range));
+      body.push_back(synth::ifStmt(
+          synth::compare(index, "Lt", synth::intConstant(startValue, range), range),
+          {synth::continueStmt(range)}, {}, range));
     if (stepValue != 1)
-      body.push_back(ifNode(
-          compareNode(
-              binOpNode(binOpNode(index, "Sub",
-                                  intConstant(startValue, range), range),
-                        "Mod", intConstant(stepValue, range), range),
-              "NotEq", intConstant(0, range), range),
-          {continueStatement(range)}, range));
-    body.push_back(assignNode(parts->target, element, range));
+      body.push_back(synth::ifStmt(
+          synth::compare(
+              synth::binOp(synth::binOp(index, "Sub",
+                                  synth::intConstant(startValue, range), range),
+                        "Mod", synth::intConstant(stepValue, range), range),
+              "NotEq", synth::intConstant(0, range), range),
+          {synth::continueStmt(range)}, {}, range));
+    body.push_back(synth::assign(parts->target, element, range));
     body.insert(body.end(), parts->body.begin(), parts->body.end());
     if (stop)
-      body.push_back(ifNode(
-          compareNode(binOpNode(index, "Add", intConstant(stepValue, range),
+      body.push_back(synth::ifStmt(
+          synth::compare(synth::binOp(index, "Add", synth::intConstant(stepValue, range),
                                 range),
                       "GtE", stopRef, range),
-          {breakStatement(range)}, range));
+          {synth::breakStmt(range)}, {}, range));
     NodePtr loop =
-        forNode(element, source, std::move(body), parts->orelse, range);
+        synth::forStmt(element, source, std::move(body), parts->orelse, range);
     return emitFused([&] { emitFor(*loop); });
   }
 
@@ -2708,41 +2523,41 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     scratchNames.push_back(elementName);
     for (const std::string &param : callable.lambdaParams)
       scratchNames.push_back(param);
-    NodePtr element = nameNode(elementName, range);
+    NodePtr element = synth::name(elementName, range);
     std::vector<NodePtr> body;
     if (name == "takewhile") {
       NodePtr test;
       if (!buildLazyCall(statement, callable, {element}, body, test))
         return true;
-      body.push_back(ifNode(notNode(test, range), {breakStatement(range)},
+      body.push_back(synth::ifStmt(synth::notOp(test, range), {synth::breakStmt(range)}, {},
                             range));
-      body.push_back(assignNode(parts->target, element, range));
+      body.push_back(synth::assign(parts->target, element, range));
       body.insert(body.end(), parts->body.begin(), parts->body.end());
     } else if (name == "dropwhile") {
       std::string flagName = scratch("d");
       scratchNames.push_back(flagName);
-      NodePtr flag = nameNode(flagName, range);
-      setup.push_back(assignNode(flag, boolConstant(true, range), range));
+      NodePtr flag = synth::name(flagName, range);
+      setup.push_back(synth::assign(flag, synth::boolConstant(true, range), range));
       std::vector<NodePtr> dropping;
       NodePtr test;
       if (!buildLazyCall(statement, callable, {element}, dropping, test))
         return true;
-      dropping.push_back(ifNode(test, {continueStatement(range)}, range));
-      dropping.push_back(assignNode(flag, boolConstant(false, range), range));
-      body.push_back(ifNode(flag, std::move(dropping), range));
-      body.push_back(assignNode(parts->target, element, range));
+      dropping.push_back(synth::ifStmt(test, {synth::continueStmt(range)}, {}, range));
+      dropping.push_back(synth::assign(flag, synth::boolConstant(false, range), range));
+      body.push_back(synth::ifStmt(flag, std::move(dropping), {}, range));
+      body.push_back(synth::assign(parts->target, element, range));
       body.insert(body.end(), parts->body.begin(), parts->body.end());
     } else { // filterfalse
       NodePtr test = element;
       if (!identityPredicate &&
           !buildLazyCall(statement, callable, {element}, body, test))
         return true;
-      std::vector<NodePtr> inner{assignNode(parts->target, element, range)};
+      std::vector<NodePtr> inner{synth::assign(parts->target, element, range)};
       inner.insert(inner.end(), parts->body.begin(), parts->body.end());
-      body.push_back(ifNode(notNode(test, range), std::move(inner), range));
+      body.push_back(synth::ifStmt(synth::notOp(test, range), std::move(inner), {}, range));
     }
     NodePtr loop =
-        forNode(element, argAt(1), std::move(body), parts->orelse, range);
+        synth::forStmt(element, argAt(1), std::move(body), parts->orelse, range);
     return emitFused([&] { emitFor(*loop); });
   }
 
@@ -2768,33 +2583,33 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     scratchNames.push_back(flagName);
     for (const std::string &param : callable.lambdaParams)
       scratchNames.push_back(param);
-    NodePtr element = nameNode(elementName, range);
-    NodePtr acc = nameNode(accName, range);
-    NodePtr flag = nameNode(flagName, range);
-    setup.push_back(assignNode(flag, boolConstant(false, range), range));
+    NodePtr element = synth::name(elementName, range);
+    NodePtr acc = synth::name(accName, range);
+    NodePtr flag = synth::name(flagName, range);
+    setup.push_back(synth::assign(flag, synth::boolConstant(false, range), range));
     // The accumulator is loop-carried, so it needs a pre-loop definition (a
     // branch-local first assignment is invisible to the sibling branch).
     // The int seed restricts fused accumulate to int elements; other element
     // types fail the merge with a diagnostic instead of mis-executing.
-    setup.push_back(assignNode(acc, intConstant(0, range), range));
+    setup.push_back(synth::assign(acc, synth::intConstant(0, range), range));
     std::vector<NodePtr> accumulateStep;
     NodePtr applied;
     if (defaultAdd)
-      applied = binOpNode(acc, "Add", element, range);
+      applied = synth::binOp(acc, "Add", element, range);
     else if (!buildLazyCall(statement, callable, {acc, element},
                             accumulateStep, applied))
       return true;
-    accumulateStep.push_back(assignNode(acc, applied, range));
+    accumulateStep.push_back(synth::assign(acc, applied, range));
     std::vector<NodePtr> firstStep{
-        assignNode(acc, element, range),
-        assignNode(flag, boolConstant(true, range), range)};
+        synth::assign(acc, element, range),
+        synth::assign(flag, synth::boolConstant(true, range), range)};
     std::vector<NodePtr> body{
-        ifElseNode(flag, std::move(accumulateStep), std::move(firstStep),
+        synth::ifStmt(flag, std::move(accumulateStep), std::move(firstStep),
                    range),
-        assignNode(parts->target, acc, range)};
+        synth::assign(parts->target, acc, range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
     NodePtr loop =
-        forNode(element, argAt(0), std::move(body), parts->orelse, range);
+        synth::forStmt(element, argAt(0), std::move(body), parts->orelse, range);
     return emitFused([&] { emitFor(*loop); });
   }
 
@@ -2809,26 +2624,26 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
       std::string cursorName = scratch("j");
       scratchNames.push_back(indexName);
       scratchNames.push_back(cursorName);
-      NodePtr index = nameNode(indexName, range);
-      NodePtr cursor = nameNode(cursorName, range);
-      setup.push_back(assignNode(index, intConstant(0, range), range));
+      NodePtr index = synth::name(indexName, range);
+      NodePtr cursor = synth::name(cursorName, range);
+      setup.push_back(synth::assign(index, synth::intConstant(0, range), range));
       std::vector<NodePtr> body{
-          assignNode(cursor, index, range),
-          assignNode(index, binOpNode(cursor, "Add", intConstant(1, range),
+          synth::assign(cursor, index, range),
+          synth::assign(index, synth::binOp(cursor, "Add", synth::intConstant(1, range),
                                       range),
                      range)};
       appendTargetBinding(
           parts->target,
-          {subscriptNode(sourceRef, cursor, range),
-           subscriptNode(sourceRef,
-                         binOpNode(cursor, "Add", intConstant(1, range),
+          {synth::subscript(sourceRef, cursor, range),
+           synth::subscript(sourceRef,
+                         synth::binOp(cursor, "Add", synth::intConstant(1, range),
                                    range),
                          range)},
           {}, std::string(), body, range);
       body.insert(body.end(), parts->body.begin(), parts->body.end());
-      NodePtr loop = whileNode(
-          compareNode(binOpNode(index, "Add", intConstant(1, range), range),
-                      "Lt", lenCall(sourceRef, range), range),
+      NodePtr loop = synth::whileStmt(
+          synth::compare(synth::binOp(index, "Add", synth::intConstant(1, range), range),
+                      "Lt", synth::lenCall(sourceRef, range), range),
           std::move(body), parts->orelse, range);
       return emitFused([&] { emitWhile(*loop); });
     }
@@ -2847,24 +2662,24 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     scratchNames.push_back(elementName);
     scratchNames.push_back(prevName);
     scratchNames.push_back(flagName);
-    NodePtr element = nameNode(elementName, range);
-    NodePtr prev = nameNode(prevName, range);
-    NodePtr flag = nameNode(flagName, range);
-    setup.push_back(assignNode(flag, boolConstant(true, range), range));
+    NodePtr element = synth::name(elementName, range);
+    NodePtr prev = synth::name(prevName, range);
+    NodePtr flag = synth::name(flagName, range);
+    setup.push_back(synth::assign(flag, synth::boolConstant(true, range), range));
     // Loop-carried previous element; same int-seed restriction as the
     // fused accumulate (see the comment there).
-    setup.push_back(assignNode(prev, intConstant(0, range), range));
+    setup.push_back(synth::assign(prev, synth::intConstant(0, range), range));
     std::vector<NodePtr> firstStep{
-        assignNode(prev, element, range),
-        assignNode(flag, boolConstant(false, range), range),
-        continueStatement(range)};
-    std::vector<NodePtr> body{ifNode(flag, std::move(firstStep), range),
-                              assignNode((*elts)[0], prev, range),
-                              assignNode((*elts)[1], element, range),
-                              assignNode(prev, element, range)};
+        synth::assign(prev, element, range),
+        synth::assign(flag, synth::boolConstant(false, range), range),
+        synth::continueStmt(range)};
+    std::vector<NodePtr> body{synth::ifStmt(flag, std::move(firstStep), {}, range),
+                              synth::assign((*elts)[0], prev, range),
+                              synth::assign((*elts)[1], element, range),
+                              synth::assign(prev, element, range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
     NodePtr loop =
-        forNode(element, source, std::move(body), parts->orelse, range);
+        synth::forStmt(element, source, std::move(body), parts->orelse, range);
     return emitFused([&] { emitFor(*loop); });
   }
 
@@ -2884,33 +2699,33 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
           pinned(argAt(i), ("s" + std::to_string(i)).c_str()));
     NodePtr fill = keywordValue("fillvalue");
     if (!fill)
-      fill = noneConstant(range);
+      fill = synth::noneConstant(range);
     NodePtr fillRef = pinned(fill, "fv");
     std::string indexName = scratch("i");
     std::string cursorName = scratch("j");
     scratchNames.push_back(indexName);
     scratchNames.push_back(cursorName);
-    NodePtr index = nameNode(indexName, range);
-    NodePtr cursor = nameNode(cursorName, range);
-    setup.push_back(assignNode(index, intConstant(0, range), range));
+    NodePtr index = synth::name(indexName, range);
+    NodePtr cursor = synth::name(cursorName, range);
+    setup.push_back(synth::assign(index, synth::intConstant(0, range), range));
     std::vector<NodePtr> condition;
     for (const NodePtr &source : sources)
       condition.push_back(
-          compareNode(index, "Lt", lenCall(source, range), range));
+          synth::compare(index, "Lt", synth::lenCall(source, range), range));
     std::vector<NodePtr> body{
-        assignNode(cursor, index, range),
-        assignNode(index, binOpNode(cursor, "Add", intConstant(1, range),
+        synth::assign(cursor, index, range),
+        synth::assign(index, synth::binOp(cursor, "Add", synth::intConstant(1, range),
                                     range),
                    range)};
     std::vector<NodePtr> components;
     for (const NodePtr &source : sources)
-      components.push_back(ifExpNode(
-          compareNode(cursor, "Lt", lenCall(source, range), range),
-          subscriptNode(source, cursor, range), fillRef, range));
+      components.push_back(synth::ifExp(
+          synth::compare(cursor, "Lt", synth::lenCall(source, range), range),
+          synth::subscript(source, cursor, range), fillRef, range));
     appendTargetBinding(parts->target, std::move(components), {},
                         std::string(), body, range);
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = whileNode(orChainNode(std::move(condition), range),
+    NodePtr loop = synth::whileStmt(synth::orChain(std::move(condition), range),
                              std::move(body), parts->orelse, range);
     return emitFused([&] { emitWhile(*loop); });
   }
@@ -2926,10 +2741,10 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     NodePtr rows = pinned(argAt(0), "r");
     std::string rowName = scratch("row");
     scratchNames.push_back(rowName);
-    NodePtr rowRef = nameNode(rowName, range);
+    NodePtr rowRef = synth::name(rowName, range);
     NodePtr inner =
-        forNode(parts->target, rowRef, parts->body, {}, range);
-    NodePtr outer = forNode(rowRef, rows, {std::move(inner)}, parts->orelse,
+        synth::forStmt(parts->target, rowRef, parts->body, {}, range);
+    NodePtr outer = synth::forStmt(rowRef, rows, {std::move(inner)}, parts->orelse,
                             range);
     return emitFused([&] { emitFor(*outer); });
   }
@@ -3027,11 +2842,11 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     argValues.push_back(value);
     paramTypes.push_back(types.widenLiteral(value.type));
     memoKey += "|" + typeKey(paramTypes.back());
-    return nameNode(param, range);
+    return synth::name(param, range);
   };
   auto increment = [&](NodePtr counter, std::int64_t by) {
-    return assignNode(counter,
-                      binOpNode(counter, "Add", intConstant(by, range),
+    return synth::assign(counter,
+                      synth::binOp(counter, "Add", synth::intConstant(by, range),
                                 range),
                       range);
   };
@@ -3051,9 +2866,9 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     NodePtr cursor = addParam("c", start);
     NodePtr stride = addParam("st", step);
     std::vector<NodePtr> loop{
-        yieldNode(cursor, range),
-        assignNode(cursor, binOpNode(cursor, "Add", stride, range), range)};
-    body.push_back(whileNode(trueConstant(range), std::move(loop), {},
+        synth::yieldStmt(cursor, range),
+        synth::assign(cursor, synth::binOp(cursor, "Add", stride, range), range)};
+    body.push_back(synth::whileStmt(synth::boolConstant(true, range), std::move(loop), {},
                              range));
   }
 
@@ -3069,16 +2884,16 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     NodePtr objectRef = addParam("o", object);
     if (!timesNode) {
       memoKey += "|inf";
-      body.push_back(whileNode(trueConstant(range),
-                               {yieldNode(objectRef, range)}, {}, range));
+      body.push_back(synth::whileStmt(synth::boolConstant(true, range),
+                               {synth::yieldStmt(objectRef, range)}, {}, range));
     } else {
       memoKey += "|times";
       NodePtr bound = addParam("n", emitExpr(timesNode));
-      NodePtr counter = nameNode("__lyi", range);
-      body.push_back(assignNode(counter, intConstant(0, range), range));
-      std::vector<NodePtr> loop{yieldNode(objectRef, range),
+      NodePtr counter = synth::name("__lyi", range);
+      body.push_back(synth::assign(counter, synth::intConstant(0, range), range));
+      std::vector<NodePtr> loop{synth::yieldStmt(objectRef, range),
                                 increment(counter, 1)};
-      body.push_back(whileNode(compareNode(counter, "Lt", bound, range),
+      body.push_back(synth::whileStmt(synth::compare(counter, "Lt", bound, range),
                                std::move(loop), {}, range));
     }
   }
@@ -3103,7 +2918,7 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
       }
       return addParam("it", value);
     };
-    NodePtr index = nameNode("__lyi", range);
+    NodePtr index = synth::name("__lyi", range);
 
     if (name == "cycle") {
       if (argCount != 1 || (keywords && !keywords->empty()))
@@ -3111,16 +2926,16 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
       std::optional<NodePtr> source = sequenceParam(argAt(0), "cycle()");
       if (!source)
         return emitNone(expr);
-      body.push_back(assignNode(index, intConstant(0, range), range));
+      body.push_back(synth::assign(index, synth::intConstant(0, range), range));
       std::vector<NodePtr> loop{
-          yieldNode(subscriptNode(*source, index, range), range),
-          assignNode(index,
-                     binOpNode(binOpNode(index, "Add", intConstant(1, range),
+          synth::yieldStmt(synth::subscript(*source, index, range), range),
+          synth::assign(index,
+                     synth::binOp(synth::binOp(index, "Add", synth::intConstant(1, range),
                                          range),
-                               "Mod", lenCall(*source, range), range),
+                               "Mod", synth::lenCall(*source, range), range),
                      range)};
-      body.push_back(whileNode(
-          compareNode(lenCall(*source, range), "Gt", intConstant(0, range),
+      body.push_back(synth::whileStmt(
+          synth::compare(synth::lenCall(*source, range), "Gt", synth::intConstant(0, range),
                       range),
           std::move(loop), {}, range));
     } else if (name == "chain") {
@@ -3134,12 +2949,12 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
         sources.push_back(*source);
       }
       for (const NodePtr &source : sources) {
-        body.push_back(assignNode(index, intConstant(0, range), range));
+        body.push_back(synth::assign(index, synth::intConstant(0, range), range));
         std::vector<NodePtr> loop{
-            yieldNode(subscriptNode(source, index, range), range),
+            synth::yieldStmt(synth::subscript(source, index, range), range),
             increment(index, 1)};
         body.push_back(
-            whileNode(compareNode(index, "Lt", lenCall(source, range), range),
+            synth::whileStmt(synth::compare(index, "Lt", synth::lenCall(source, range), range),
                       std::move(loop), {}, range));
       }
     } else if (name == "islice") {
@@ -3177,26 +2992,26 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
       if (stopNode && !stopConst) {
         stopRef = addParam("e", emitExpr(stopNode));
         memoKey += "|estop";
-        body.push_back(ifNode(
-            compareNode(stopRef, "Lt", intConstant(0, range), range),
-            {raiseValueError(kIsliceRangeMessage, range)}, range));
+        body.push_back(synth::ifStmt(
+            synth::compare(stopRef, "Lt", synth::intConstant(0, range), range),
+            {synth::raiseValueError(kIsliceRangeMessage, range)}, {}, range));
       } else if (stopConst) {
-        stopRef = intConstant(*stopConst, range);
+        stopRef = synth::intConstant(*stopConst, range);
         memoKey += "|e" + std::to_string(*stopConst);
       } else {
         memoKey += "|enone";
       }
-      body.push_back(assignNode(index, intConstant(startValue, range),
+      body.push_back(synth::assign(index, synth::intConstant(startValue, range),
                                 range));
       std::vector<NodePtr> loop{
-          ifNode(compareNode(index, "GtE", lenCall(*source, range), range),
-                 {breakStatement(range)}, range),
-          yieldNode(subscriptNode(*source, index, range), range),
+          synth::ifStmt(synth::compare(index, "GtE", synth::lenCall(*source, range), range),
+                 {synth::breakStmt(range)}, {}, range),
+          synth::yieldStmt(synth::subscript(*source, index, range), range),
           increment(index, stepValue)};
       NodePtr condition = stopRef
-                              ? compareNode(index, "Lt", stopRef, range)
-                              : trueConstant(range);
-      body.push_back(whileNode(std::move(condition), std::move(loop), {},
+                              ? synth::compare(index, "Lt", stopRef, range)
+                              : synth::boolConstant(true, range);
+      body.push_back(synth::whileStmt(std::move(condition), std::move(loop), {},
                                range));
     } else if (name == "dropwhile") {
       if (argCount != 2 || (keywords && !keywords->empty()))
@@ -3214,24 +3029,24 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
         llvm::raw_string_ostream stream(memoKey);
         stream << "|lambda:" << callable.lambdaBody.get();
       }
-      body.push_back(assignNode(index, intConstant(0, range), range));
+      body.push_back(synth::assign(index, synth::intConstant(0, range), range));
       std::vector<NodePtr> scanLoop;
       NodePtr test;
       if (!buildLazyCall(expr, callable,
-                         {subscriptNode(*source, index, range)}, scanLoop,
+                         {synth::subscript(*source, index, range)}, scanLoop,
                          test))
         return emitNone(expr);
-      scanLoop.push_back(ifNode(notNode(test, range),
-                                {breakStatement(range)}, range));
+      scanLoop.push_back(synth::ifStmt(synth::notOp(test, range),
+                                {synth::breakStmt(range)}, {}, range));
       scanLoop.push_back(increment(index, 1));
       body.push_back(
-          whileNode(compareNode(index, "Lt", lenCall(*source, range), range),
+          synth::whileStmt(synth::compare(index, "Lt", synth::lenCall(*source, range), range),
                     std::move(scanLoop), {}, range));
       std::vector<NodePtr> yieldLoop{
-          yieldNode(subscriptNode(*source, index, range), range),
+          synth::yieldStmt(synth::subscript(*source, index, range), range),
           increment(index, 1)};
       body.push_back(
-          whileNode(compareNode(index, "Lt", lenCall(*source, range), range),
+          synth::whileStmt(synth::compare(index, "Lt", synth::lenCall(*source, range), range),
                     std::move(yieldLoop), {}, range));
     } else if (name == "pairwise") {
       if (argCount != 1 || (keywords && !keywords->empty()))
@@ -3239,21 +3054,21 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
       std::optional<NodePtr> source = sequenceParam(argAt(0), "pairwise()");
       if (!source)
         return emitNone(expr);
-      body.push_back(assignNode(index, intConstant(0, range), range));
+      body.push_back(synth::assign(index, synth::intConstant(0, range), range));
       std::vector<NodePtr> loop{
-          yieldNode(
-              tupleNode({subscriptNode(*source, index, range),
-                         subscriptNode(*source,
-                                       binOpNode(index, "Add",
-                                                 intConstant(1, range),
+          synth::yieldStmt(
+              synth::tuple({synth::subscript(*source, index, range),
+                         synth::subscript(*source,
+                                       synth::binOp(index, "Add",
+                                                 synth::intConstant(1, range),
                                                  range),
                                        range)},
                         range),
               range),
           increment(index, 1)};
-      body.push_back(whileNode(
-          compareNode(binOpNode(index, "Add", intConstant(1, range), range),
-                      "Lt", lenCall(*source, range), range),
+      body.push_back(synth::whileStmt(
+          synth::compare(synth::binOp(index, "Add", synth::intConstant(1, range), range),
+                      "Lt", synth::lenCall(*source, range), range),
           std::move(loop), {}, range));
     } else if (name == "product") {
       if (keywords && !keywords->empty())
@@ -3270,26 +3085,26 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
       std::vector<NodePtr> elements;
       llvm::SmallVector<NodePtr, 4> indices;
       for (std::size_t i = 0; i < sources.size(); ++i) {
-        indices.push_back(nameNode("__lyi" + std::to_string(i), range));
-        elements.push_back(subscriptNode(sources[i], indices[i], range));
+        indices.push_back(synth::name("__lyi" + std::to_string(i), range));
+        elements.push_back(synth::subscript(sources[i], indices[i], range));
       }
       // Build inside-out: the innermost body yields, each wrapper resets its
       // index, runs the nested while, then advances the enclosing index.
       std::vector<NodePtr> inner{
-          yieldNode(tupleNode(std::move(elements), range), range),
+          synth::yieldStmt(synth::tuple(std::move(elements), range), range),
           increment(indices.back(), 1)};
       for (std::size_t i = sources.size(); i-- > 1;) {
         std::vector<NodePtr> wrapped{
-            assignNode(indices[i], intConstant(0, range), range)};
-        wrapped.push_back(whileNode(
-            compareNode(indices[i], "Lt", lenCall(sources[i], range), range),
+            synth::assign(indices[i], synth::intConstant(0, range), range)};
+        wrapped.push_back(synth::whileStmt(
+            synth::compare(indices[i], "Lt", synth::lenCall(sources[i], range), range),
             std::move(inner), {}, range));
         wrapped.push_back(increment(indices[i - 1], 1));
         inner = std::move(wrapped);
       }
-      body.push_back(assignNode(indices[0], intConstant(0, range), range));
-      body.push_back(whileNode(
-          compareNode(indices[0], "Lt", lenCall(sources[0], range), range),
+      body.push_back(synth::assign(indices[0], synth::intConstant(0, range), range));
+      body.push_back(synth::whileStmt(
+          synth::compare(indices[0], "Lt", synth::lenCall(sources[0], range), range),
           std::move(inner), {}, range));
     } else if (name == "combinations" ||
                name == "combinations_with_replacement") {
@@ -3313,30 +3128,30 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
       llvm::SmallVector<NodePtr, 4> indices;
       std::vector<NodePtr> elements;
       for (std::size_t i = 0; i < depth; ++i) {
-        indices.push_back(nameNode("__lyi" + std::to_string(i), range));
-        elements.push_back(subscriptNode(*source, indices[i], range));
+        indices.push_back(synth::name("__lyi" + std::to_string(i), range));
+        elements.push_back(synth::subscript(*source, indices[i], range));
       }
       std::vector<NodePtr> inner{
-          yieldNode(tupleNode(std::move(elements), range), range),
+          synth::yieldStmt(synth::tuple(std::move(elements), range), range),
           increment(indices.back(), 1)};
       for (std::size_t i = depth; i-- > 1;) {
         NodePtr firstValue =
             withReplacement
-                ? nameNode("__lyi" + std::to_string(i - 1), range)
-                : binOpNode(nameNode("__lyi" + std::to_string(i - 1), range),
-                            "Add", intConstant(1, range), range);
-        std::vector<NodePtr> wrapped{assignNode(indices[i],
+                ? synth::name("__lyi" + std::to_string(i - 1), range)
+                : synth::binOp(synth::name("__lyi" + std::to_string(i - 1), range),
+                            "Add", synth::intConstant(1, range), range);
+        std::vector<NodePtr> wrapped{synth::assign(indices[i],
                                                 std::move(firstValue),
                                                 range)};
-        wrapped.push_back(whileNode(
-            compareNode(indices[i], "Lt", lenCall(*source, range), range),
+        wrapped.push_back(synth::whileStmt(
+            synth::compare(indices[i], "Lt", synth::lenCall(*source, range), range),
             std::move(inner), {}, range));
         wrapped.push_back(increment(indices[i - 1], 1));
         inner = std::move(wrapped);
       }
-      body.push_back(assignNode(indices[0], intConstant(0, range), range));
-      body.push_back(whileNode(
-          compareNode(indices[0], "Lt", lenCall(*source, range), range),
+      body.push_back(synth::assign(indices[0], synth::intConstant(0, range), range));
+      body.push_back(synth::whileStmt(
+          synth::compare(indices[0], "Lt", synth::lenCall(*source, range), range),
           std::move(inner), {}, range));
     } else {
       return rejectValue("itertools." + name.str() +
@@ -3355,11 +3170,11 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     std::string symbol =
         ("__lyiter$itertools_" + stem + "$" + llvm::Twine(serial)).str();
     llvm::SmallVector<const parser::Node *, 4> paramNodes;
-    llvm::SmallVector<std::string, 4> paramStorage(params.begin(),
-                                                   params.end());
-    NodePtr def = makeSyntheticGeneratorDef(symbol, paramStorage,
-                                            std::move(body), range,
-                                            paramNodes);
+    llvm::SmallVector<synth::Param, 4> synthParams;
+    for (llvm::StringRef param : params)
+      synthParams.push_back(synth::Param{param.str(), nullptr});
+    NodePtr def = synth::functionDef(symbol, synthParams, {}, std::move(body),
+                                     nullptr, {}, range, &paramNodes);
     synthesizedIteratorDefs.push_back(def);
     for (auto [i, type] : llvm::enumerate(paramTypes))
       types.overrideParameterType(paramNodes[i], type);
@@ -3421,52 +3236,52 @@ void ModuleEmitter::emitUnpackArityCheck(const parser::Node &target,
   std::string expectedText = std::to_string(expected);
 
   auto message = [&](const char *prefix) {
-    NodePtr text = stringConstant(std::string(prefix) +
+    NodePtr text = synth::strConstant(std::string(prefix) +
                                       " values to unpack (expected " +
                                       expectedText + ", got ",
                                   range);
-    NodePtr count = callNode(nameNode("str", range),
-                             {nameNode(lengthName, range)}, range);
-    return binOpNode(binOpNode(std::move(text), "Add", std::move(count), range),
-                     "Add", stringConstant(")", range), range);
+    NodePtr count = synth::call(synth::name("str", range),
+                             {synth::name(lengthName, range)}, range);
+    return synth::binOp(synth::binOp(std::move(text), "Add", std::move(count), range),
+                     "Add", synth::strConstant(")", range), range);
   };
   auto raiseNode = [&](NodePtr text) {
     NodePtr node = parser::makeNode("Raise", range);
     parser::addField(*node, "exc",
-                     callNode(nameNode("ValueError", range),
+                     synth::call(synth::name("ValueError", range),
                               {std::move(text)}, range));
     return node;
   };
 
   NodePtr tooMany =
       reportsCount ? message("too many")
-                   : stringConstant("too many values to unpack (expected " +
+                   : synth::strConstant("too many values to unpack (expected " +
                                         expectedText + ")",
                                     range);
-  NodePtr overLong = ifNode(
-      compareNode(nameNode(lengthName, range), "Gt",
-                  intConstant(static_cast<std::int64_t>(expected), range),
+  NodePtr overLong = synth::ifStmt(
+      synth::compare(synth::name(lengthName, range), "Gt",
+                  synth::intConstant(static_cast<std::int64_t>(expected), range),
                   range),
-      {raiseNode(std::move(tooMany))}, range);
-  NodePtr tooFew = ifNode(
-      compareNode(nameNode(lengthName, range), "Lt",
-                  intConstant(static_cast<std::int64_t>(expected), range),
+      {raiseNode(std::move(tooMany))}, {}, range);
+  NodePtr tooFew = synth::ifStmt(
+      synth::compare(synth::name(lengthName, range), "Lt",
+                  synth::intConstant(static_cast<std::int64_t>(expected), range),
                   range),
-      {raiseNode(message("not enough"))}, range);
+      {raiseNode(message("not enough"))}, {}, range);
 
   std::vector<NodePtr> guarded;
   guarded.push_back(std::move(overLong));
   guarded.push_back(std::move(tooFew));
-  NodePtr check = ifNode(
-      compareNode(nameNode(lengthName, range), "NotEq",
-                  intConstant(static_cast<std::int64_t>(expected), range),
+  NodePtr check = synth::ifStmt(
+      synth::compare(synth::name(lengthName, range), "NotEq",
+                  synth::intConstant(static_cast<std::int64_t>(expected), range),
                   range),
-      std::move(guarded), range);
+      std::move(guarded), {}, range);
 
   runWithScratchNames({sourceName, lengthName}, [&] {
     values[sourceName] = source;
-    emitStatement(*assignNode(nameNode(lengthName, range),
-                              lenCall(nameNode(sourceName, range), range),
+    emitStatement(*synth::assign(synth::name(lengthName, range),
+                              synth::lenCall(synth::name(sourceName, range), range),
                               range));
     emitStatement(*check);
   });

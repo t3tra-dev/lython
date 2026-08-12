@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 
 #include "AstAccess.h"
@@ -7,6 +8,10 @@
 namespace lython::emitter {
 
 namespace {
+
+constexpr llvm::StringRef kStaticMethodDecoratorStorage[] = {"staticmethod"};
+constexpr llvm::ArrayRef<llvm::StringRef> kStaticMethodDecorator{
+    kStaticMethodDecoratorStorage};
 
 // --- AST construction / mutation helpers -----------------------------------
 //
@@ -24,90 +29,15 @@ void setField(parser::Node &node, std::string name, parser::FieldValue value) {
   parser::addField(node, std::move(name), std::move(value));
 }
 
-parser::NodePtr synthName(llvm::StringRef id, parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Name", range);
-  parser::addField(*node, "id", std::string(id));
-  return node;
-}
 
-parser::NodePtr synthStr(llvm::StringRef text, parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", std::string(text));
-  return node;
-}
 
-parser::NodePtr synthInt(std::int64_t value, parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Constant", range);
-  parser::addField(*node, "value", value);
-  return node;
-}
 
-parser::NodePtr synthAttribute(parser::NodePtr value, llvm::StringRef attr,
-                               parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Attribute", range);
-  parser::addField(*node, "value", std::move(value));
-  parser::addField(*node, "attr", std::string(attr));
-  return node;
-}
 
-parser::NodePtr synthCall(parser::NodePtr callee,
-                          std::vector<parser::NodePtr> args,
-                          parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Call", range);
-  parser::addField(*node, "func", std::move(callee));
-  parser::addField(*node, "args", std::move(args));
-  parser::addField(*node, "keywords", std::vector<parser::NodePtr>{});
-  return node;
-}
 
-parser::NodePtr synthEq(parser::NodePtr lhs, parser::NodePtr rhs,
-                        parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Compare", range);
-  parser::addField(*node, "left", std::move(lhs));
-  parser::addField(*node, "ops",
-                   std::vector<parser::NodePtr>{parser::makeNode("Eq", range)});
-  parser::addField(*node, "comparators", std::vector<parser::NodePtr>{rhs});
-  return node;
-}
 
-parser::NodePtr synthReturn(parser::NodePtr value, parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Return", range);
-  parser::addField(*node, "value", std::move(value));
-  return node;
-}
 
-parser::NodePtr synthAssignSelfAttr(llvm::StringRef attr, parser::NodePtr value,
-                                    parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Assign", range);
-  parser::addField(*node, "targets",
-                   std::vector<parser::NodePtr>{
-                       synthAttribute(synthName("self", range), attr, range)});
-  parser::addField(*node, "value", std::move(value));
-  return node;
-}
 
-parser::NodePtr synthAnnAssign(llvm::StringRef target,
-                               parser::NodePtr annotation,
-                               parser::NodePtr value,
-                               parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("AnnAssign", range);
-  parser::addField(*node, "target", synthName(target, range));
-  parser::addField(*node, "annotation", std::move(annotation));
-  parser::addField(*node, "value", std::move(value));
-  parser::addField(*node, "simple", static_cast<std::int64_t>(1));
-  return node;
-}
 
-parser::NodePtr synthIfReturn(parser::NodePtr test, parser::NodePtr returned,
-                              parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("If", range);
-  parser::addField(*node, "test", std::move(test));
-  parser::addField(*node, "body",
-                   std::vector<parser::NodePtr>{
-                       synthReturn(std::move(returned), range)});
-  parser::addField(*node, "orelse", std::vector<parser::NodePtr>{});
-  return node;
-}
 
 // f"{value}<suffix>": an interpolated expression followed by a literal tail.
 // Plain interpolation (no !r) goes through __format__, whose int rendering is
@@ -121,54 +51,11 @@ parser::NodePtr synthFormattedMessage(parser::NodePtr value,
   parser::NodePtr joined = parser::makeNode("JoinedStr", range);
   parser::addField(*joined, "values",
                    std::vector<parser::NodePtr>{std::move(formatted),
-                                                synthStr(suffix, range)});
+                                                synth::strConstant(suffix, range)});
   return joined;
 }
 
-parser::NodePtr synthRaise(parser::NodePtr exception,
-                           parser::SourceRange range) {
-  parser::NodePtr node = parser::makeNode("Raise", range);
-  parser::addField(*node, "exc", std::move(exception));
-  return node;
-}
 
-struct SynthParam {
-  std::string name;
-  parser::NodePtr annotation;
-};
-
-parser::NodePtr synthMethod(llvm::StringRef name,
-                            llvm::ArrayRef<SynthParam> params,
-                            parser::NodePtr returns,
-                            std::vector<parser::NodePtr> body,
-                            bool staticMethod, parser::SourceRange range) {
-  parser::NodePtr arguments = parser::makeNode("arguments", range);
-  std::vector<parser::NodePtr> args;
-  for (const SynthParam &param : params) {
-    parser::NodePtr arg = parser::makeNode("arg", range);
-    parser::addField(*arg, "arg", param.name);
-    if (param.annotation)
-      parser::addField(*arg, "annotation", param.annotation);
-    args.push_back(std::move(arg));
-  }
-  parser::addField(*arguments, "posonlyargs", std::vector<parser::NodePtr>{});
-  parser::addField(*arguments, "args", std::move(args));
-  parser::addField(*arguments, "kwonlyargs", std::vector<parser::NodePtr>{});
-  parser::addField(*arguments, "kw_defaults", std::vector<parser::NodePtr>{});
-  parser::addField(*arguments, "defaults", std::vector<parser::NodePtr>{});
-
-  std::vector<parser::NodePtr> decorators;
-  if (staticMethod)
-    decorators.push_back(synthName("staticmethod", range));
-
-  parser::NodePtr node = parser::makeNode("FunctionDef", range);
-  parser::addField(*node, "name", std::string(name));
-  parser::addField(*node, "args", std::move(arguments));
-  parser::addField(*node, "body", std::move(body));
-  parser::addField(*node, "decorator_list", std::move(decorators));
-  parser::addField(*node, "returns", std::move(returns));
-  return node;
-}
 
 llvm::StringRef leafName(llvm::StringRef spelling) {
   auto [head, tail] = spelling.rsplit('.');
@@ -392,13 +279,13 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
       keptStatements.push_back(statement);
     }
 
-  auto classAnnotation = [&] { return synthName(info.name, range); };
+  auto classAnnotation = [&] { return synth::name(info.name, range); };
   auto valueAnnotation = [&] {
-    return synthName(isStr ? "str" : "int", range);
+    return synth::name(isStr ? "str" : "int", range);
   };
   auto memberLiteral = [&](const EnumMember &member) {
-    return member.isStr ? synthStr(member.strValue, range)
-                        : synthInt(member.intValue, range);
+    return member.isStr ? synth::strConstant(member.strValue, range)
+                        : synth::intConstant(member.intValue, range);
   };
   auto canonicalMemberOf = [&](const EnumMember &member) -> const EnumMember & {
     if (!member.isAlias)
@@ -413,15 +300,15 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
   if (!userMethods.contains("__init__")) {
     std::vector<parser::NodePtr> body;
     body.push_back(
-        synthAssignSelfAttr("name", synthName("name", range), range));
+        synth::assign(synth::selfAttribute("self", "name", range), synth::name("name", range), range));
     body.push_back(
-        synthAssignSelfAttr("value", synthName("value", range), range));
-    synthesized.push_back(synthMethod(
+        synth::assign(synth::selfAttribute("self", "value", range), synth::name("value", range), range));
+    synthesized.push_back(synth::functionDef(
         "__init__",
-        {SynthParam{"self", nullptr},
-         SynthParam{"name", synthName("str", range)},
-         SynthParam{"value", valueAnnotation()}},
-        synthName("None", range), std::move(body), /*classMethod=*/false,
+        {synth::Param{"self", nullptr},
+         synth::Param{"name", synth::name("str", range)},
+         synth::Param{"value", valueAnnotation()}}, {}, std::move(body),
+        synth::name("None", range), llvm::ArrayRef<llvm::StringRef>{},
         range));
   }
   // Both display methods dispatch on the member name and return a literal:
@@ -439,19 +326,17 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
                                   textFor) {
     std::vector<parser::NodePtr> body;
     for (auto [index, member] : llvm::enumerate(distinctMembers)) {
-      parser::NodePtr text = synthStr(textFor(*member), range);
+      parser::NodePtr text = synth::strConstant(textFor(*member), range);
       if (index + 1 == distinctMembers.size()) {
-        body.push_back(synthReturn(std::move(text), range));
+        body.push_back(synth::returnStmt(std::move(text), range));
         break;
       }
-      body.push_back(synthIfReturn(
-          synthEq(synthAttribute(synthName("self", range), "name", range),
-                  synthStr(member->name, range), range),
-          std::move(text), range));
+      body.push_back(synth::ifStmt(
+          synth::compare(synth::attribute(synth::name("self", range), "name", range), "Eq",
+                  synth::strConstant(member->name, range), range), {synth::returnStmt(std::move(text), range)}, {}, range));
     }
-    synthesized.push_back(synthMethod(methodName, {SynthParam{"self", nullptr}},
-                                      synthName("str", range), std::move(body),
-                                      /*classMethod=*/false, range));
+    synthesized.push_back(synth::functionDef(methodName, {synth::Param{"self", nullptr}}, {}, std::move(body),
+                                      synth::name("str", range), llvm::ArrayRef<llvm::StringRef>{}, range));
   };
   auto memberValueText = [&](const EnumMember &member) {
     return member.isStr ? "'" + member.strValue + "'"
@@ -483,24 +368,23 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
     // Members are singletons, so value equality and identity coincide; the
     // typed `other` makes a cross-type comparison a diagnostic instead of
     // CPython's silent False.
-    synthesized.push_back(synthMethod(
+    synthesized.push_back(synth::functionDef(
         "__eq__",
-        {SynthParam{"self", nullptr}, SynthParam{"other", classAnnotation()}},
-        synthName("bool", range),
-        {synthReturn(
-             synthEq(synthAttribute(synthName("self", range), "value", range),
-                     synthAttribute(synthName("other", range), "value", range),
+        {synth::Param{"self", nullptr}, synth::Param{"other", classAnnotation()}}, {},
+        {synth::returnStmt(
+             synth::compare(synth::attribute(synth::name("self", range), "value", range), "Eq",
+                     synth::attribute(synth::name("other", range), "value", range),
                      range),
              range)},
-        /*classMethod=*/false, range));
+        synth::name("bool", range), llvm::ArrayRef<llvm::StringRef>{}, range));
   }
 
   {
     std::vector<parser::NodePtr> body;
     for (const EnumMember *member : distinctMembers)
-      body.push_back(synthIfReturn(
-          synthEq(synthName("value", range), memberLiteral(*member), range),
-          synthAttribute(synthName(info.name, range), member->name, range),
+      body.push_back(synth::ifStmt(
+          synth::compare(synth::name("value", range), "Eq", memberLiteral(*member), range), {synth::returnStmt(synth::attribute(synth::name(info.name, range), member->name, range),
+          range)}, {},
           range));
     // DEVIATION (documented): CPython's message names the offending value
     // ("9 is not a valid Color"). Interpolating it here — in any spelling:
@@ -508,35 +392,35 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
     // message's may-unwind string construction, which the ownership verifier
     // rejects once the class carries its other synthesized methods. The
     // exception type and the enum name are preserved; the value is not.
-    body.push_back(synthRaise(
-        synthCall(synthName("ValueError", range),
-                  {synthStr("not a valid " + info.name, range)}, range),
+    body.push_back(synth::raiseStmt(
+        synth::call(synth::name("ValueError", range),
+                  {synth::strConstant("not a valid " + info.name, range)}, range),
         range));
-    synthesized.push_back(synthMethod(
-        kFromValueMethod, {SynthParam{"value", valueAnnotation()}},
-        classAnnotation(), std::move(body), /*staticMethod=*/true, range));
+    synthesized.push_back(synth::functionDef(
+        kFromValueMethod, {synth::Param{"value", valueAnnotation()}}, {}, std::move(body),
+        classAnnotation(), llvm::ArrayRef<llvm::StringRef>{}, range));
   }
   {
     std::vector<parser::NodePtr> body;
     // Aliases resolve by name too (CPython's `E["ALIAS"]` yields the
     // canonical member), so every declared name gets a branch.
     for (const EnumMember &member : info.members)
-      body.push_back(synthIfReturn(
-          synthEq(synthName("name", range), synthStr(member.name, range),
-                  range),
-          synthAttribute(synthName(info.name, range),
+      body.push_back(synth::ifStmt(
+          synth::compare(synth::name("name", range), "Eq", synth::strConstant(member.name, range),
+                  range), {synth::returnStmt(synth::attribute(synth::name(info.name, range),
                          canonicalMemberOf(member).name, range),
+          range)}, {},
           range));
     // The interpolation is what makes the raised key an owned string: handing
     // the borrowed parameter straight to KeyError would transfer a borrow.
-    body.push_back(synthRaise(
-        synthCall(synthName("KeyError", range),
-                  {synthFormattedMessage(synthName("name", range), "", range)},
+    body.push_back(synth::raiseStmt(
+        synth::call(synth::name("KeyError", range),
+                  {synthFormattedMessage(synth::name("name", range), "", range)},
                   range),
         range));
-    synthesized.push_back(synthMethod(
-        kFromNameMethod, {SynthParam{"name", synthName("str", range)}},
-        classAnnotation(), std::move(body), /*staticMethod=*/true, range));
+    synthesized.push_back(synth::functionDef(
+        kFromNameMethod, {synth::Param{"name", synth::name("str", range)}}, {}, std::move(body),
+        classAnnotation(), llvm::ArrayRef<llvm::StringRef>{}, range));
   }
 
   // The member attributes come last: their initializers run at the ClassDef
@@ -546,15 +430,16 @@ void ModuleEmitter::rewriteEnumClassDef(const parser::Node &classDef) {
   for (const EnumMember &member : info.members) {
     parser::NodePtr value;
     if (member.isAlias) {
-      value = synthAttribute(synthName(info.name, range),
+      value = synth::attribute(synth::name(info.name, range),
                              canonicalMemberOf(member).name, range);
     } else {
-      value = synthCall(synthName(info.name, range),
-                        {synthStr(member.name, range), memberLiteral(member)},
+      value = synth::call(synth::name(info.name, range),
+                        {synth::strConstant(member.name, range), memberLiteral(member)},
                         range);
     }
     memberAttrs.push_back(
-        synthAnnAssign(member.name, classAnnotation(), std::move(value),
+        synth::annAssign(synth::name(member.name,
+                       range), classAnnotation(), std::move(value),
                        range));
   }
 
@@ -577,7 +462,7 @@ ModuleEmitter::enumMemberListNode(const EnumInfo &info,
     if (member.isAlias)
       continue;
     elements.push_back(
-        synthAttribute(synthName(info.name, range), member.name, range));
+        synth::attribute(synth::name(info.name, range), member.name, range));
   }
   parser::NodePtr list = parser::makeNode("List", range);
   parser::addField(*list, "elts", std::move(elements));
@@ -604,7 +489,7 @@ void ModuleEmitter::rewriteEnumUses(const parser::Node &node) {
       const auto *keywords = ast::nodeList(node, "keywords");
       if (args && args->size() == 1 && (!keywords || keywords->empty())) {
         setField(mutableNode, "func",
-                 synthAttribute(synthName(info->name, node.range),
+                 synth::attribute(synth::name(info->name, node.range),
                                 kFromValueMethod, node.range));
       } else {
         diagnostics.push_back(parser::Diagnostic{
@@ -641,8 +526,8 @@ void ModuleEmitter::rewriteEnumUses(const parser::Node &node) {
           if (const auto *ptr = std::get_if<parser::NodePtr>(&field->value))
             indexNode = *ptr;
         if (indexNode) {
-          parser::NodePtr call = synthCall(
-              synthAttribute(synthName(info->name, node.range),
+          parser::NodePtr call = synth::call(
+              synth::attribute(synth::name(info->name, node.range),
                              kFromNameMethod, node.range),
               {indexNode}, node.range);
           // The Subscript node is referenced by its parent, so it is rewritten
