@@ -1,0 +1,5 @@
+1.0 2.718281828459045
+math range error
+65 122
+ord() expected a character, but string of length 3 found
+ord() expected a character, but string of length 0 found

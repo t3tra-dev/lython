@@ -2088,7 +2088,19 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   // base-typed exception whose subclass declares __repr__ was refused for a
   // dispatch this ladder does not make. The __str__ gate above still stands,
   // and it is the one that has to, because a subclass __str__ DOES win.
-  if (isExceptionContractType(valueType)) {
+  //
+  // An erased `builtins.object` joins for the same reason from the other
+  // side: the manifest object __str__ dispatches the payload class and falls
+  // back to the repr form exactly where CPython's str(x) does, so the erased
+  // str inside `e.args` renders unquoted. `tryEmitStrCall` already asks this
+  // (its isErasedObject arm); reaching __repr__ below instead is how
+  // `print(e.args[0], "x")` printed `'zz' x` where single-argument print --
+  // which reaches object.__str__ down in the lowering -- printed `zz`.
+  auto isErasedObject = [&](mlir::Type type) {
+    auto contractType = mlir::dyn_cast<py::ContractType>(type);
+    return contractType && contractType.getContractName() == "builtins.object";
+  };
+  if (isExceptionContractType(valueType) || isErasedObject(valueType)) {
     if (CallInferenceResult strInference =
             types.inferMethodCallWithEvidence(valueType, "__str__", {})) {
       Value receiver = coerceValue(value, valueType, anchor);
@@ -2936,11 +2948,26 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
       std::optional<Value> argument = nextArgument(type);
       if (!argument)
         return emitNone(expr);
+      // ⭐ A FLOAT operand is truncated toward zero first. CPython's `%d`
+      // goes through `PyNumber_Long`, so `"%d" % (3.7,)` is 3 and
+      // `"%d" % (-3.7,)` is -3; handing the float to `__format__` with a 'd'
+      // code instead died at run time with "Unknown format code 'd' for
+      // object of type 'float'".
+      Value integral = *argument;
+      if (types.widenLiteral(integral.type) == types.floatType()) {
+        mlir::Type intContract = py::CallableType::get(
+            &context, {types.floatType()}, {}, {}, {}, {types.intType()});
+        auto truncated = py::IntOp::create(
+            builder, loc(expr), types.intType(),
+            mlir::FlatSymbolRefAttr::get(&context, "__int__"),
+            mlir::TypeAttr::get(intContract), integral.value);
+        integral = Value{truncated.getResult(), types.intType()};
+      }
       // Always pass the 'd' spec: with an empty spec a bool would render
       // through str() as True/False, but %d must print 1/0.
       std::string spec = numericSpec('d', false);
       appendResult(emitFormatValue(
-          expr, *argument,
+          expr, integral,
           std::optional<Value>(emitStrLiteralPiece(expr, spec)), false));
       break;
     }

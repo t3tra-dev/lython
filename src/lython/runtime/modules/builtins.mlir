@@ -1617,6 +1617,70 @@ module attributes {
     func.return
   }
 
+  // Store a str as boxed payload arg %slot: the same 16-word box layout
+  // __ly_unicode_store_item writes into a tuple slot, aimed at the payload
+  // block. The block owns one reference per slot, so the str is retained
+  // here rather than by the caller.
+  func.func private @__ly_exc_payload_store_unicode(%block: i64, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %str_class = arith.constant 4 : i64
+    %hdr_idx = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
+    %hdr_ptr = arith.index_cast %hdr_idx : index to i64
+    %bytes_idx = memref.extract_aligned_pointer_as_index %eb : memref<?xi8> -> index
+    %bytes_ptr = arith.index_cast %bytes_idx : index to i64
+    %dim = memref.dim %eb, %c0 : memref<?xi8>
+    %byte_len = arith.index_cast %dim : index to i64
+    func.call @__ly_exc_payload_store_words(%block, %slot, %one, %str_class, %hdr_ptr, %two, %hdr_ptr, %bytes_ptr, %zero, %zero, %zero, %two, %byte_len, %zero, %zero, %zero, %one, %zero) : (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> ()
+    func.return
+  }
+
+  // Store an already-boxed object as payload arg %slot: copy the 16 words
+  // and retain the entity, the same pairing LyBaseException_Args uses when
+  // it copies a slot back out into a tuple.
+  func.func private @__ly_exc_payload_store_box(%block: i64, %slot: i64, %box: !llvm.ptr) {
+    %w0 = llvm.load %box : !llvm.ptr -> i64
+    %g1 = llvm.getelementptr %box[1] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v1 = llvm.load %g1 : !llvm.ptr -> i64
+    %g2 = llvm.getelementptr %box[2] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v2 = llvm.load %g2 : !llvm.ptr -> i64
+    %g3 = llvm.getelementptr %box[3] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v3 = llvm.load %g3 : !llvm.ptr -> i64
+    %g4 = llvm.getelementptr %box[4] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v4 = llvm.load %g4 : !llvm.ptr -> i64
+    %g5 = llvm.getelementptr %box[5] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v5 = llvm.load %g5 : !llvm.ptr -> i64
+    %g6 = llvm.getelementptr %box[6] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v6 = llvm.load %g6 : !llvm.ptr -> i64
+    %g7 = llvm.getelementptr %box[7] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v7 = llvm.load %g7 : !llvm.ptr -> i64
+    %g8 = llvm.getelementptr %box[8] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v8 = llvm.load %g8 : !llvm.ptr -> i64
+    %g9 = llvm.getelementptr %box[9] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v9 = llvm.load %g9 : !llvm.ptr -> i64
+    %g10 = llvm.getelementptr %box[10] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v10 = llvm.load %g10 : !llvm.ptr -> i64
+    %g11 = llvm.getelementptr %box[11] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v11 = llvm.load %g11 : !llvm.ptr -> i64
+    %g12 = llvm.getelementptr %box[12] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v12 = llvm.load %g12 : !llvm.ptr -> i64
+    %g13 = llvm.getelementptr %box[13] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v13 = llvm.load %g13 : !llvm.ptr -> i64
+    %g15 = llvm.getelementptr %box[15] : (!llvm.ptr) -> !llvm.ptr, i64
+    %v15 = llvm.load %g15 : !llvm.ptr -> i64
+    // The owned flag is set rather than copied: the source box is the
+    // caller's (a dict lookup key is borrowed, flag 0), and copying it
+    // verbatim left the slot's retain below unmatched by release_payload_slot_ptr,
+    // which skips a slot it is told it does not own -- one leaked key
+    // reference per caught dict miss.
+    %owned = arith.constant 1 : i64
+    func.call @__ly_exc_payload_store_words(%block, %slot, %w0, %v1, %v2, %v3, %v4, %v5, %v6, %v7, %v8, %v9, %v10, %v11, %v12, %v13, %owned, %v15) : (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> ()
+    func.call @__ly_handle_retain_raw(%v2) : (i64) -> ()
+    func.return
+  }
+
   // Multi-value args message: CPython's str(e) for len(args) > 1 is
   // repr(args) -- "(r0, r1, ...)". Renders from the payload boxes, replaces
   // the empty construction-time message, and returns the receiver triple.
@@ -2222,10 +2286,29 @@ module attributes {
 
   func.func @LyKeyError_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.KeyError", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"} {
     // str(KeyError(x)) is repr(x) in CPython, so the stored message IS the
-    // argument repr; the runtime's missing-key raises store a repr already.
+    // argument repr -- the traceback and str() both read the message lane
+    // verbatim, so the repr cannot move to __str__.
+    //
+    // The argument itself therefore also goes into the payload block: .args
+    // reads back from the message lane otherwise, and `KeyError("zz").args[0]`
+    // was "'zz'". Un-quoting a repr is not a thing; keeping the value is.
+    // An empty message means no argument (the same rule LyBaseException_Args
+    // applies), and an empty payload block would turn args () into ('',).
+    %zero_len = arith.constant 0 : i64
+    %arg_len = func.call @__ly_unicode_count(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %has_arg = arith.cmpi sgt, %arg_len, %zero_len : i64
     %repr_header, %repr_bytes = func.call @LyUnicode_Repr(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-    func.call @LyUnicode_DecRef(%message_header) : (memref<2xi64>) -> ()
     %result:3 = func.call @LyBaseException_Init(%header, %old_message_header, %old_message_bytes, %repr_header, %repr_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    scf.if %has_arg {
+      %one_arg = arith.constant 1 : i64
+      %slot_zero = arith.constant 0 : i64
+      %payload_slot = arith.constant 3 : i64
+      %block = func.call @__ly_exc_payload_alloc(%one_arg) : (i64) -> i64
+      func.call @__ly_exc_ext_set(%result#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+      %kept:2 = func.call @__ly_unicode_retain_self(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @__ly_exc_payload_store_unicode(%block, %slot_zero, %kept#0, %kept#1) : (i64, i64, memref<2xi64>, memref<?xi8>) -> ()
+    }
+    func.call @LyUnicode_DecRef(%message_header) : (memref<2xi64>) -> ()
     func.return %result#0, %result#1, %result#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
@@ -2576,7 +2659,7 @@ module attributes {
         func.call @LyUnicode_DecRef(%arp_h) : (memref<2xi64>) -> ()
         scf.yield %aout_h, %aout_b : memref<2xi64>, memref<?xi8>
       } else {
-        %fallback:2 = func.call @__ly_exception_repr_plain(%class_id, %message_header, %message_bytes, %name_dyn, %name_len) : (i64, memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        %fallback:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
         scf.yield %fallback#0, %fallback#1 : memref<2xi64>, memref<?xi8>
       }
       scf.yield %preplain#0, %preplain#1 : memref<2xi64>, memref<?xi8>
@@ -2584,42 +2667,6 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  // Message-only repr tail (KeyError verbatim / generic quoting), split out
-  // so the payload-aware branch above stays region-balanced.
-  func.func private @__ly_exception_repr_plain(%class_id: i64, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>, %name_dyn: memref<?xi8>, %name_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "repr_plain"} {
-    %zero_i64 = arith.constant 0 : i64
-    %c0 = arith.constant 0 : index
-    // KeyError already stores repr(key) as its message (str(KeyError(x))
-    // == repr(x)); quoting again would render KeyError("'k'").
-    %keyerror_id = arith.constant 54 : i64
-      %is_keyerror = arith.cmpi eq, %class_id, %keyerror_id : i64
-      %msg_len = func.call @__ly_unicode_count(%message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-      %has_msg = arith.cmpi sgt, %msg_len, %zero_i64 : i64
-      %verbatim = arith.andi %is_keyerror, %has_msg : i1
-      %plain:2 = scf.if %verbatim -> (memref<2xi64>, memref<?xi8>) {
-        %c1v = arith.constant 1 : i64
-        %vname_h, %vname_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-        %vlp_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
-        %vlp_dyn = memref.cast %vlp_ref : memref<1xi8> to memref<?xi8>
-        %vlp_h, %vlp_b = func.call @LyUnicode_FromBytes(%vlp_dyn, %c0, %c1v) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-        %vh_h, %vh_b = func.call @LyUnicode_Concat(%vname_h, %vname_b, %vlp_h, %vlp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-        func.call @LyUnicode_DecRef(%vname_h) : (memref<2xi64>) -> ()
-        func.call @LyUnicode_DecRef(%vlp_h) : (memref<2xi64>) -> ()
-        %vb_h, %vb_b = func.call @LyUnicode_Concat(%vh_h, %vh_b, %message_header, %message_bytes) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-        func.call @LyUnicode_DecRef(%vh_h) : (memref<2xi64>) -> ()
-        %vrp_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
-        %vrp_dyn = memref.cast %vrp_ref : memref<1xi8> to memref<?xi8>
-        %vrp_h, %vrp_b = func.call @LyUnicode_FromBytes(%vrp_dyn, %c0, %c1v) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-        %vo_h, %vo_b = func.call @LyUnicode_Concat(%vb_h, %vb_b, %vrp_h, %vrp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-        func.call @LyUnicode_DecRef(%vb_h) : (memref<2xi64>) -> ()
-        func.call @LyUnicode_DecRef(%vrp_h) : (memref<2xi64>) -> ()
-        scf.yield %vo_h, %vo_b : memref<2xi64>, memref<?xi8>
-      } else {
-        %generic:2 = func.call @__ly_exception_repr(%message_header, %message_bytes, %name_dyn, %name_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
-        scf.yield %generic#0, %generic#1 : memref<2xi64>, memref<?xi8>
-      }
-    func.return %plain#0, %plain#1 : memref<2xi64>, memref<?xi8>
-  }
 
   // CPython repr(e): ClassName(<repr of the message>) -- ClassName() when
   // the message is empty. A no-argument construction and an explicit empty
@@ -16765,7 +16812,8 @@ module attributes {
   }
 
   // ord(): the single code point of a one-character str.
-  memref.global "private" constant @__ly_ord_msg : memref<28xi8> = dense<[111, 114, 100, 40, 41, 32, 101, 120, 112, 101, 99, 116, 101, 100, 32, 97, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 32]>
+  memref.global "private" constant @__ly_ord_msg : memref<49xi8> = dense<[111, 114, 100, 40, 41, 32, 101, 120, 112, 101, 99, 116, 101, 100, 32, 97, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 44, 32, 98, 117, 116, 32, 115, 116, 114, 105, 110, 103, 32, 111, 102, 32, 108, 101, 110, 103, 116, 104, 32]>
+  memref.global "private" constant @__ly_ord_found_msg : memref<6xi8> = dense<[32, 102, 111, 117, 110, 100]>
 
   func.func @LyBuiltin_Ord(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "ord", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "builtin_ord", ly.runtime.result_contract = "builtins.int"} {
     %c0 = arith.constant 0 : index
@@ -16773,11 +16821,27 @@ module attributes {
     %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %not_single = arith.cmpi ne, %count, %one : i64
     scf.if %not_single {
+      // CPython names the offending length: "...but string of length 3
+      // found" (Python/bltinmodule.c, builtin_ord). Stopping at "expected a
+      // character" hides whether the argument was empty or too long, which
+      // is the only thing the message is for.
       %type_error = arith.constant 52 : i64
-      %msg_static = memref.get_global @__ly_ord_msg : memref<28xi8>
-      %msg = memref.cast %msg_static : memref<28xi8> to memref<?xi8>
-      %len = arith.constant 26 : i64
-      func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      %buf_s = memref.alloca() : memref<96xi8>
+      %buf = memref.cast %buf_s : memref<96xi8> to memref<?xi8>
+      %zero = arith.constant 0 : i64
+      %prefix_s = memref.get_global @__ly_ord_msg : memref<49xi8>
+      %prefix = memref.cast %prefix_s : memref<49xi8> to memref<?xi8>
+      %l49 = arith.constant 49 : i64
+      %a = func.call @__ly_fmt_copy_bytes(%buf, %zero, %prefix, %l49) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+      %nh, %nb = func.call @LyUnicode_FromI64(%count) : (i64) -> (memref<2xi64>, memref<?xi8>)
+      %nlen = func.call @__ly_unicode_utf8_length(%nh, %nb) : (memref<2xi64>, memref<?xi8>) -> i64
+      %b = func.call @__ly_fmt_copy_bytes(%buf, %a, %nb, %nlen) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+      func.call @LyUnicode_DecRef(%nh) : (memref<2xi64>) -> ()
+      %found_s = memref.get_global @__ly_ord_found_msg : memref<6xi8>
+      %found = memref.cast %found_s : memref<6xi8> to memref<?xi8>
+      %l6 = arith.constant 6 : i64
+      %c = func.call @__ly_fmt_copy_bytes(%buf, %b, %found, %l6) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
+      func.call @__ly_long_raise_message(%type_error, %buf, %c) : (i64, memref<?xi8>, i64) -> ()
     }
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %cp = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
@@ -18580,6 +18644,15 @@ module attributes {
     %key_error = arith.constant 54 : i64
     %exception:3 = func.call @LyBaseException_New(%key_error) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    // The key object, not its repr, is what .args[0] must yield -- and here
+    // the key is already boxed, so the payload keeps the real object (an int
+    // key comes back as an int, the way CPython's KeyError carries it).
+    %one_arg = arith.constant 1 : i64
+    %slot_zero = arith.constant 0 : i64
+    %payload_slot = arith.constant 3 : i64
+    %block = func.call @__ly_exc_payload_alloc(%one_arg) : (i64) -> i64
+    func.call @__ly_exc_ext_set(%initialized#0, %payload_slot, %block) : (memref<3xi64>, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_box(%block, %slot_zero, %key_box) : (i64, i64, !llvm.ptr) -> ()
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }

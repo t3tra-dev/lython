@@ -1465,12 +1465,21 @@ void buildWritePrefix(SupportBuilder &b) {
 
 // i64 exception_group_member_count(ptr exc): the member-block count of an
 // exception's extended word 3 (0 for a plain exception or a null pointer).
+//
+// The class check lives HERE and not in the callers: extended word 3 is the
+// one payload block, shared by a group's members and by a plain exception's
+// multi-value args, so "the block is non-empty" alone is not "this is a
+// group". Two of the three callers already paired the count with
+// LyEH_ClassIdMatches; the nested-member recursion did not, and a
+// `KeyError('k')` inside a group -- which carries its key as one payload arg
+// -- opened a "+-+--- 1 ---" section under itself.
 void buildExceptionGroupMemberCount(SupportBuilder &b) {
   auto fn = b.beginFunction("exception_group_member_count",
                             b.builder.getFunctionType({b.ptr()}, {b.i64()}),
                             /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
+  mlir::Block *classCheck = b.builder.createBlock(&body);
   mlir::Block *load = b.builder.createBlock(&body);
   mlir::Block *blockLoad = b.builder.createBlock(&body);
   mlir::Block *zero = b.builder.createBlock(&body);
@@ -1478,7 +1487,16 @@ void buildExceptionGroupMemberCount(SupportBuilder &b) {
   mlir::Value excNull = b.cmpi(mlir::arith::CmpIPredicate::eq,
                                b.ptrToInt(entry->getArgument(0)), b.iconst(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, excNull, zero,
-                                 mlir::ValueRange{}, load, mlir::ValueRange{});
+                                 mlir::ValueRange{}, classCheck,
+                                 mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(classCheck);
+  mlir::Value classId =
+      b.loadI64(b.gepI64(entry->getArgument(0), b.iconst(2)));
+  mlir::Value isGroup = b.call("LyEH_ClassIdMatches", b.i1(),
+                               mlir::ValueRange{classId, b.iconst(101)})
+                            .front();
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isGroup, load,
+                                 mlir::ValueRange{}, zero, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(load);
   mlir::Value blockWord =
       b.loadI64(b.gepI64(entry->getArgument(0), b.iconst(3)));

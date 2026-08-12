@@ -52,10 +52,14 @@ foreach(path IN LISTS module_list)
         message(FATAL_ERROR "typing manifest source read as empty: ${path}")
     endif()
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+    # unsigned, like every other embedder in the tree: a signed char array
+    # rejects any byte above 0x7f at compile time, so one non-ASCII character
+    # anywhere in a manifest (a message, a comment) broke the build with a
+    # narrowing error pointing at the generated file instead of the manifest.
     string(APPEND arrays
-        "static const char k_${name}[] = {${bytes}0x00};\n")
+        "static const unsigned char k_${name}[] = {${bytes}0x00};\n")
     string(APPEND entries
-        "    {\"${name}\", k_${name}, sizeof(k_${name}) - 1},\n")
+        "    {\"${name}\", reinterpret_cast<const char *>(k_${name}), sizeof(k_${name}) - 1},\n")
 endforeach()
 
 set(content "// Generated from src/lython/dialects/CMakeLists.txt. Do not edit.

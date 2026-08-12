@@ -177,9 +177,44 @@ module attributes {
     func.return %out_header : memref<3xi64>
   }
 
+  // CPython's math_1 wrapper checks errno after libm and raises
+  // OverflowError("math range error") when the result overflowed; returning
+  // inf silently is the one thing it does not do (Modules/mathmodule.c,
+  // is_error). Only exp is repaired here because it is the one the audit
+  // reached; the same check belongs on any libm call that can set ERANGE.
+  memref.global "private" constant @__ly_math_range_msg : memref<16xi8> = dense<[109, 97, 116, 104, 32, 114, 97, 110, 103, 101, 32, 101, 114, 114, 111, 114]>
+
+  func.func private @LyOverflowError_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 104 : i64, ly.runtime.contract = "builtins.OverflowError", ly.runtime.initializer = "__new__"}
+  func.func private @LyOverflowError_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.OverflowError", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
+  func.func private @LyOverflowError_Raise(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.OverflowError", ly.runtime.primitive = "raise"}
+
+  func.func private @__ly_math_range_error() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 16 : i64
+    %class_id = arith.constant 104 : i64
+    %msg_ref = memref.get_global @__ly_math_range_msg : memref<16xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<16xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyOverflowError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyOverflowError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyOverflowError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
   func.func @LyMath_Exp(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.exp", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_exp", ly.runtime.result_contract = "builtins.float"} {
     %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
     %result = math.exp %value : f64
+    %inf = arith.constant 0x7FF0000000000000 : f64
+    %overflowed = arith.cmpf oeq, %result, %inf : f64
+    %finite_input = arith.cmpf one, %value, %inf : f64
+    %range_error = arith.andi %overflowed, %finite_input : i1
+    cf.cond_br %range_error, ^range, ^ok
+
+  ^range:
+    func.call @__ly_math_range_error() : () -> ()
+    cf.br ^ok
+
+  ^ok:
     %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
     func.return %out_header : memref<3xi64>
   }

@@ -52,3 +52,7 @@ print("%.0e" % 5.0, "%#g" % 1.0, "%#.0f" % 2.0)
 print("%s and %s" % (1.5, [1, 2]))
 print("%s" % 5)
 print("%-8s|%8s|" % ("ab", "cd"))
+# %d on a float truncates toward zero through PyNumber_Long; handing the float
+# to __format__ with a 'd' code instead died with "Unknown format code 'd'".
+print("%d %d %d" % (3.7, -3.7, 0.5))
+print("%i|%u" % (2.99, -2.99))
