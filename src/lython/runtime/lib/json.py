@@ -314,6 +314,59 @@ class JSONValue:
             i = i + 1
         return out
 
+    def __repr__(self) -> str:
+        # Deviation from CPython, deliberate: loads() returns a JSONValue
+        # where CPython returns the dict/list/scalar itself. What a reader
+        # PRINTS should still be the document, so this renders the same text
+        # CPython's repr of that value would -- `<json.JSONValue object at
+        # 0x...>` was an address where the answer is data.
+        #
+        # The recursion lives in a module function because a class method
+        # body is INLINED at its call site, so `__repr__ -> __repr__` has no
+        # bottom ("recursive class method call is not supported").
+        return _render(self)
+
+    def __str__(self) -> str:
+        # str() of the value CPython would have returned: a top-level string
+        # document prints its characters, everything else prints its repr --
+        # which is what `print(json.loads('"s"'))` shows there.
+        if ord(self._tag[0]) == 115:
+            return self._tag[1:]
+        return _render(self)
+
+
+def _render(value: JSONValue) -> str:
+    """repr() of a JSONValue: the text CPython's repr of the same document
+    produces. Recursive, so it is a module function rather than a method."""
+    kind = ord(value._tag[0])
+    if kind == 110:
+        return "None"
+    if kind == 116:
+        return "True"
+    if kind == 102:
+        return "False"
+    if kind == 105 or kind == 100:
+        return value._tag[1:]
+    if kind == 115:
+        return repr(value._tag[1:])
+    if kind == 91:
+        parts: list[str] = []
+        i = 0
+        n = len(value._kids)
+        while i < n:
+            parts.append(_render(value._kids[i]))
+            i = i + 1
+        return "[" + ", ".join(parts) + "]"
+    value._expect(123)
+    ks = _object_keys(value)
+    members: list[str] = []
+    j = 0
+    m = len(ks)
+    while j < m:
+        key = ks[j]
+        members.append(repr(key) + ": " + _render(value._kids[value._find(key) + 1]))
+        j = j + 1
+    return "{" + ", ".join(members) + "}"
 
 def _copy_kids(xs: list[JSONValue]) -> list[JSONValue]:
     out: list[JSONValue] = []
