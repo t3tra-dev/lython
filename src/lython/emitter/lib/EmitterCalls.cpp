@@ -1582,6 +1582,20 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         Value seed = emitExpr((*reducerArgs)[1].get());
         values[tmp] = seed;
         types.bindSymbol(tmp, seed.type);
+      } else if (reducerElementType() == types.floatType()) {
+        // ⭐ CPython's implicit start is the int 0 and `0 + 1.5` promotes,
+        // but the accumulator here is one SSA value with one type: seeding a
+        // float sum with the int zero asked the lowering to store a float
+        // into an int lane -- "cannot adapt runtime bundle builtins.float
+        // with physical values (memref<3xi64>) to expected ABI". Seeding the
+        // promoted zero is the same answer (sum([1.5, 2.5]) is 4.0 either
+        // way); the int seed stays wherever the promotion does not happen,
+        // including the empty iterable, whose sum CPython says is int 0.
+        auto zero = py::FloatConstantOp::create(builder, loc(expr),
+                                                types.floatType(),
+                                                builder.getF64FloatAttr(0.0));
+        values[tmp] = Value{zero.getResult(), types.floatType()};
+        types.bindSymbol(tmp, types.floatType());
       } else {
       mlir::Type zeroType = types.literal("0");
       auto zero = py::IntConstantOp::create(builder, loc(expr), zeroType,

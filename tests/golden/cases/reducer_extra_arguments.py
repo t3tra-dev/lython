@@ -22,3 +22,22 @@ def main() -> None:
 
 
 main()
+
+
+# The accumulator is one SSA value with one type, so an implicit int 0 seed
+# asked the lowering to store a float into an int lane -- "cannot adapt
+# runtime bundle builtins.float with physical values (memref<3xi64>) to
+# expected ABI". CPython's seed is the int 0 and `0 + 1.5` promotes; seeding
+# the promoted zero is the same answer, and the int seed stays wherever the
+# promotion does not happen -- including the empty iterable.
+def floats() -> None:
+    values: list[float] = [1.5, 2.5]
+    print(sum(values))
+    print(sum(values) + 1)
+    print(sum(values, 10.0))
+    print(sum(v * 0.5 for v in [1, 2]))
+    empty: list[int] = []
+    print(sum(empty))
+
+
+floats()
