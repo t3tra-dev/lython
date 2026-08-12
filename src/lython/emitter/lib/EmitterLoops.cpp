@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -437,9 +438,7 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
 
   // Innermost statements: bind the loop variable to the element expression,
   // then run the original body.
-  parser::NodePtr assign = parser::makeNode("Assign", statement.range);
-  parser::addField(*assign, "targets", std::vector<parser::NodePtr>{forTarget});
-  parser::addField(*assign, "value", elt);
+  parser::NodePtr assign = synth::assign(forTarget, elt, statement.range);
   std::vector<parser::NodePtr> current{assign};
   current.insert(current.end(), forBody.begin(), forBody.end());
 
@@ -706,9 +705,7 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       exitBody.push_back(parser::makeNode("Break", statement.range));
       parser::addField(*guard, "orelse", std::move(exitBody));
 
-      parser::NodePtr trueConstant =
-          parser::makeNode("Constant", statement.range);
-      parser::addField(*trueConstant, "value", true);
+      parser::NodePtr trueConstant = synth::boolConstant(true, statement.range);
       parser::NodePtr loop = parser::makeNode("While", statement.range);
       parser::addField(*loop, "test", trueConstant);
       parser::addField(*loop, "body", std::vector<parser::NodePtr>{guard});

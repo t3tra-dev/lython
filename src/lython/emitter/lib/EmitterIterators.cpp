@@ -1064,8 +1064,7 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
             synth::call(synth::name("KeyError", range),
                      {synth::strConstant("popitem(): dictionary is empty", range)},
                      range);
-        NodePtr raiseNode = parser::makeNode("Raise", range);
-        parser::addField(*raiseNode, "exc", std::move(keyError));
+        parser::NodePtr raiseNode = synth::raiseStmt(std::move(keyError), range);
         emitStatement(*synth::ifStmt(std::move(emptyTest), {std::move(raiseNode)}, {},
                               range));
         NodePtr comprehension = parser::makeNode("comprehension", range);
@@ -1332,10 +1331,8 @@ std::optional<std::string> ModuleEmitter::emitDsuSortStatements(
                          std::move(loopBody), {}, range));
   }
   {
-    NodePtr sortStatement = parser::makeNode("Expr", range);
-    parser::addField(*sortStatement, "value",
-                     synth::methodCall(synth::name(pairsName, range), "sort", {},
-                                    range));
+    parser::NodePtr sortStatement = synth::exprStmt(synth::methodCall(synth::name(pairsName, range), "sort", {},
+                                    range), range);
     emitStatement(*sortStatement);
   }
 
@@ -1543,9 +1540,7 @@ ModuleEmitter::tryEmitSortSugar(const parser::Node &expr,
       // clear+extend (loop-free: a per-element setitem loop followed by a
       // later may-raise use trips the unwind release placement).
       parser::SourceRange range = expr.range;
-      NodePtr clearStatement = parser::makeNode("Expr", range);
-      parser::addField(*clearStatement, "value",
-                       synth::methodCall(receiver, "clear", {}, range));
+      parser::NodePtr clearStatement = synth::exprStmt(synth::methodCall(receiver, "clear", {}, range), range);
       emitStatement(*clearStatement);
       NodePtr extendStatement = parser::makeNode("Expr", range);
       parser::addField(
@@ -1624,8 +1619,7 @@ ModuleEmitter::tryEmitStrTranslateSugar(const parser::Node &expr,
               "the first two maketrans arguments must have equal length",
               range)},
           range);
-      NodePtr raiseNode = parser::makeNode("Raise", range);
-      parser::addField(*raiseNode, "exc", std::move(valueError));
+      parser::NodePtr raiseNode = synth::raiseStmt(std::move(valueError), range);
       emitStatement(*synth::ifStmt(std::move(lengthTest), {std::move(raiseNode)}, {},
                             range));
       // {ord(x[i]): ord(y[i]) for i in range(len(x))}
@@ -1714,14 +1708,10 @@ ModuleEmitter::tryEmitStrTranslateSugar(const parser::Node &expr,
     NodePtr mapped = synth::subscript(tableRef, synth::name(ordName, range), range);
     if (intValues)
       mapped = synth::call(synth::name("chr", range), {std::move(mapped)}, range);
-    NodePtr appendMapped = parser::makeNode("Expr", range);
-    parser::addField(*appendMapped, "value",
-                     synth::methodCall(synth::name(partsName, range), "append",
-                                    {std::move(mapped)}, range));
-    NodePtr appendPlain = parser::makeNode("Expr", range);
-    parser::addField(*appendPlain, "value",
-                     synth::methodCall(synth::name(partsName, range), "append",
-                                    {synth::name(charName, range)}, range));
+    parser::NodePtr appendMapped = synth::exprStmt(synth::methodCall(synth::name(partsName, range), "append",
+                                    {std::move(mapped)}, range), range);
+    parser::NodePtr appendPlain = synth::exprStmt(synth::methodCall(synth::name(partsName, range), "append",
+                                    {synth::name(charName, range)}, range), range);
     NodePtr branch = synth::ifStmt(
         synth::compareIn(synth::name(ordName, range), tableRef, range),
         {std::move(appendMapped)}, {}, range);
@@ -1813,12 +1803,10 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
     emitStatement(*synth::assign(synth::name(probeName, range), left, range));
     if (needsTemp)
       emitStatement(*synth::assign(synth::name(dictName, range), receiver, range));
-    NodePtr falseInit = parser::makeNode("Constant", range);
-    parser::addField(*falseInit, "value", false);
+    parser::NodePtr falseInit = synth::boolConstant(false, range);
     emitStatement(*synth::assign(synth::name(resultName, range),
                               std::move(falseInit), range));
-    NodePtr trueValue = parser::makeNode("Constant", range);
-    parser::addField(*trueValue, "value", true);
+    parser::NodePtr trueValue = synth::boolConstant(true, range);
     if (*viewName == "values") {
       // for __k in d: if d[__k] == __x: __r = True; break
       NodePtr hit = synth::ifStmt(
@@ -2448,8 +2436,7 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
                     "yet");
     if (stopConst && startConst.value_or(0) >= *stopConst) {
       // Statically empty: evaluate the source for its effects only.
-      NodePtr effect = parser::makeNode("Expr", range);
-      parser::addField(*effect, "value", source);
+      parser::NodePtr effect = synth::exprStmt(source, range);
       return emitFused([&] { emitStatement(*effect); });
     }
     std::int64_t startValue = startConst.value_or(0);
@@ -3246,10 +3233,8 @@ void ModuleEmitter::emitUnpackArityCheck(const parser::Node &target,
                      "Add", synth::strConstant(")", range), range);
   };
   auto raiseNode = [&](NodePtr text) {
-    NodePtr node = parser::makeNode("Raise", range);
-    parser::addField(*node, "exc",
-                     synth::call(synth::name("ValueError", range),
-                              {std::move(text)}, range));
+    parser::NodePtr node = synth::raiseStmt(synth::call(synth::name("ValueError", range),
+                              {std::move(text)}, range), range);
     return node;
   };
 

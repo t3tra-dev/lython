@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 
 #include "llvm/ADT/ScopeExit.h"
@@ -296,19 +297,9 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           exprHasContract(target.get(), rewrite.contract))
         inPlaceMethod = rewrite.method;
     if (!inPlaceMethod.empty()) {
-      parser::NodePtr updateAttr =
-          parser::makeNode("Attribute", statement.range);
-      parser::addField(*updateAttr, "value", target);
-      parser::addField(*updateAttr, "attr", std::string(inPlaceMethod));
-      parser::NodePtr updateCall = parser::makeNode("Call", statement.range);
-      parser::addField(*updateCall, "func", std::move(updateAttr));
-      parser::addField(*updateCall, "args",
-                       std::vector<parser::NodePtr>{rhs});
-      parser::addField(*updateCall, "keywords",
-                       std::vector<parser::NodePtr>{});
-      parser::NodePtr updateStatement =
-          parser::makeNode("Expr", statement.range);
-      parser::addField(*updateStatement, "value", std::move(updateCall));
+      parser::NodePtr updateAttr = synth::attribute(target, std::string(inPlaceMethod), statement.range);
+      parser::NodePtr updateCall = synth::call(std::move(updateAttr), std::vector<parser::NodePtr>{rhs}, statement.range);
+      parser::NodePtr updateStatement = synth::exprStmt(std::move(updateCall), statement.range);
       emitStatement(*updateStatement);
       return;
     }
@@ -345,14 +336,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
           lookupClassMethod(targetType, entry.method);
       if (!inPlace || !inPlace->method)
         break;
-      parser::NodePtr attribute =
-          parser::makeNode("Attribute", statement.range);
-      parser::addField(*attribute, "value", target);
-      parser::addField(*attribute, "attr", std::string(entry.method));
-      parser::NodePtr call = parser::makeNode("Call", statement.range);
-      parser::addField(*call, "func", std::move(attribute));
-      parser::addField(*call, "args", std::vector<parser::NodePtr>{rhs});
-      parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+      parser::NodePtr attribute = synth::attribute(target, std::string(entry.method), statement.range);
+      parser::NodePtr call = synth::call(std::move(attribute), std::vector<parser::NodePtr>{rhs}, statement.range);
       Value updated = emitExpr(call.get());
       emitAssignTarget(*target, updated);
       return;
@@ -434,18 +419,10 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       // sits, which is exactly what this walk knows. A handler that already
       // completed does not count, matching CPython: `try/except/pass` then
       // `raise` raises there too.
-      parser::NodePtr message = parser::makeNode("Constant", statement.range);
-      parser::addField(*message, "value",
-                       std::string("No active exception to reraise"));
-      parser::NodePtr callee = parser::makeNode("Name", statement.range);
-      parser::addField(*callee, "id", std::string("RuntimeError"));
-      parser::NodePtr call = parser::makeNode("Call", statement.range);
-      parser::addField(*call, "func", std::move(callee));
-      parser::addField(*call, "args",
-                       std::vector<parser::NodePtr>{std::move(message)});
-      parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
-      parser::NodePtr synthesized = parser::makeNode("Raise", statement.range);
-      parser::addField(*synthesized, "exc", std::move(call));
+      parser::NodePtr message = synth::strConstant(std::string("No active exception to reraise"), statement.range);
+      parser::NodePtr callee = synth::name(std::string("RuntimeError"), statement.range);
+      parser::NodePtr call = synth::call(std::move(callee), std::vector<parser::NodePtr>{std::move(message)}, statement.range);
+      parser::NodePtr synthesized = synth::raiseStmt(std::move(call), statement.range);
       emitStatement(*synthesized);
     } else {
       py::RaiseCurrentOp::create(builder, loc(statement));

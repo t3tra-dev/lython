@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -125,17 +126,13 @@ void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
     std::string flagName = "__lywithraised" + std::to_string(serial);
     std::string excName = "__lywithexc" + std::to_string(serial);
     auto nameNode = [&](const std::string &id) {
-      parser::NodePtr node = parser::makeNode("Name", statement.range);
-      parser::addField(*node, "id", id);
+      parser::NodePtr node = synth::name(id, statement.range);
       return node;
     };
     auto assignFlag = [&](bool value) {
       parser::NodePtr constant = parser::makeNode("Constant", statement.range);
       parser::addField(*constant, "value", value);
-      parser::NodePtr node = parser::makeNode("Assign", statement.range);
-      parser::addField(*node, "targets",
-                       std::vector<parser::NodePtr>{nameNode(flagName)});
-      parser::addField(*node, "value", std::move(constant));
+      parser::NodePtr node = synth::assign(nameNode(flagName), std::move(constant), statement.range);
       return node;
     };
     auto cleanupNode = [&](parser::NodePtr exception) {

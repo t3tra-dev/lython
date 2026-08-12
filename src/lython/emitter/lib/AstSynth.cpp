@@ -209,6 +209,12 @@ NodePtr whileStmt(NodePtr test, std::vector<NodePtr> body,
   return node;
 }
 
+NodePtr exprStmt(NodePtr value, SourceRange range) {
+  NodePtr node = parser::makeNode("Expr", range);
+  parser::addField(*node, "value", std::move(value));
+  return node;
+}
+
 NodePtr breakStmt(SourceRange range) {
   return parser::makeNode("Break", range);
 }
@@ -220,9 +226,7 @@ NodePtr continueStmt(SourceRange range) {
 NodePtr yieldStmt(NodePtr value, SourceRange range) {
   NodePtr yield = parser::makeNode("Yield", range);
   parser::addField(*yield, "value", std::move(value));
-  NodePtr statement = parser::makeNode("Expr", range);
-  parser::addField(*statement, "value", std::move(yield));
-  return statement;
+  return exprStmt(std::move(yield), range);
 }
 
 NodePtr arg(llvm::StringRef name, NodePtr annotation, SourceRange range) {

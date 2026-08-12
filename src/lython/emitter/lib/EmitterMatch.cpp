@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -310,46 +311,21 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
           values[restLocal] = Value{packRest.getResult(), restType};
           types.bindSymbol(restLocal, restType);
           auto nameNode = [&](const std::string &id) {
-            parser::NodePtr node = parser::makeNode("Name", statement.range);
-            parser::addField(*node, "id", id);
+            parser::NodePtr node = synth::name(id, statement.range);
             return node;
           };
           // for __idx in range(<prefix>, len(__subj)):
           //   __rest.append(__subj[__idx])
-          parser::NodePtr prefixNode =
-              parser::makeNode("Constant", statement.range);
-          parser::addField(*prefixNode, "value",
-                           static_cast<std::int64_t>(prefixCount));
-          parser::NodePtr lenCall = parser::makeNode("Call", statement.range);
-          parser::addField(*lenCall, "func", nameNode("len"));
-          parser::addField(*lenCall, "args",
-                           std::vector<parser::NodePtr>{nameNode(subjLocal)});
-          parser::addField(*lenCall, "keywords",
-                           std::vector<parser::NodePtr>{});
-          parser::NodePtr rangeCall = parser::makeNode("Call", statement.range);
-          parser::addField(*rangeCall, "func", nameNode("range"));
-          parser::addField(*rangeCall, "args",
-                           std::vector<parser::NodePtr>{prefixNode, lenCall});
-          parser::addField(*rangeCall, "keywords",
-                           std::vector<parser::NodePtr>{});
+          parser::NodePtr prefixNode = synth::intConstant(static_cast<std::int64_t>(prefixCount), statement.range);
+          parser::NodePtr lenCall = synth::call(nameNode("len"), std::vector<parser::NodePtr>{nameNode(subjLocal)}, statement.range);
+          parser::NodePtr rangeCall = synth::call(nameNode("range"), std::vector<parser::NodePtr>{prefixNode, lenCall}, statement.range);
           parser::NodePtr subscript =
               parser::makeNode("Subscript", statement.range);
           parser::addField(*subscript, "value", nameNode(subjLocal));
           parser::addField(*subscript, "slice", nameNode(idxLocal));
-          parser::NodePtr appendAttr =
-              parser::makeNode("Attribute", statement.range);
-          parser::addField(*appendAttr, "value", nameNode(restLocal));
-          parser::addField(*appendAttr, "attr", std::string("append"));
-          parser::NodePtr appendCall =
-              parser::makeNode("Call", statement.range);
-          parser::addField(*appendCall, "func", appendAttr);
-          parser::addField(*appendCall, "args",
-                           std::vector<parser::NodePtr>{subscript});
-          parser::addField(*appendCall, "keywords",
-                           std::vector<parser::NodePtr>{});
-          parser::NodePtr appendStmt =
-              parser::makeNode("Expr", statement.range);
-          parser::addField(*appendStmt, "value", appendCall);
+          parser::NodePtr appendAttr = synth::attribute(nameNode(restLocal), std::string("append"), statement.range);
+          parser::NodePtr appendCall = synth::call(appendAttr, std::vector<parser::NodePtr>{subscript}, statement.range);
+          parser::NodePtr appendStmt = synth::exprStmt(appendCall, statement.range);
           parser::NodePtr buildLoop =
               parser::makeNode("For", statement.range);
           parser::addField(*buildLoop, "target", nameNode(idxLocal));

@@ -1260,13 +1260,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
               continue;
             }
             if (factoryNode) {
-              parser::NodePtr factoryCall =
-                  parser::makeNode("Call", value->range);
-              parser::addField(*factoryCall, "func", factoryNode);
-              parser::addField(*factoryCall, "args",
-                               std::vector<parser::NodePtr>{});
-              parser::addField(*factoryCall, "keywords",
-                               std::vector<parser::NodePtr>{});
+              parser::NodePtr factoryCall = synth::call(factoryNode, std::vector<parser::NodePtr>{}, value->range);
               fieldDefaults[ast::nameSpelling(*target)] =
                   std::move(factoryCall);
             } else if (defaultNode) {
@@ -1665,11 +1659,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         sig.positionalDefaults.push_back(defaultNode != nullptr);
         if (defaultNode)
           defaults.push_back(defaultNode);
-        parser::NodePtr assign = parser::makeNode("Assign", range);
-        parser::addField(*assign, "targets",
-                         std::vector<parser::NodePtr>{
-                             synth::selfAttribute("self", field, range)});
-        parser::addField(*assign, "value", synth::name(field, range));
+        parser::NodePtr assign = synth::assign(
+                             synth::selfAttribute("self", field, range), synth::name(field, range), range);
         body.push_back(std::move(assign));
       }
       // ⭐ CPython's dataclass `__init__` ends by calling `__post_init__` when
@@ -1686,13 +1677,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // the ordinary method dispatch, the way the field assignments above go
       // through ordinary assignment.
       if (inheritsOrDefines("__post_init__")) {
-        parser::NodePtr hook = parser::makeNode("Call", range);
-        parser::addField(*hook, "func",
-                         synth::selfAttribute("self", "__post_init__", range));
-        parser::addField(*hook, "args", std::vector<parser::NodePtr>{});
-        parser::addField(*hook, "keywords", std::vector<parser::NodePtr>{});
-        parser::NodePtr statement = parser::makeNode("Expr", range);
-        parser::addField(*statement, "value", std::move(hook));
+        parser::NodePtr hook = synth::call(synth::selfAttribute("self", "__post_init__", range), std::vector<parser::NodePtr>{}, range);
+        parser::NodePtr statement = synth::exprStmt(std::move(hook), range);
         body.push_back(std::move(statement));
       }
       if (body.empty())
@@ -1723,8 +1709,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         }
         expr = synth::binOp(std::move(expr), "Add", synth::strConstant(")", range), range);
       }
-      parser::NodePtr returnNode = parser::makeNode("Return", range);
-      parser::addField(*returnNode, "value", std::move(expr));
+      parser::NodePtr returnNode = synth::returnStmt(std::move(expr), range);
       FunctionSignature sig;
       sig.positionalNames.push_back("self");
       sig.positionalTypes.push_back(types.contract(contractName));
@@ -1769,11 +1754,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     if (isNamedTuple)
       namedTupleContracts.insert(contractName);
     if (isNamedTuple && !userDefines("__len__")) {
-      parser::NodePtr count = parser::makeNode("Constant", range);
-      parser::addField(*count, "value",
-                       static_cast<std::int64_t>(order.size()));
-      parser::NodePtr returnCount = parser::makeNode("Return", range);
-      parser::addField(*returnCount, "value", std::move(count));
+      parser::NodePtr count = synth::intConstant(static_cast<std::int64_t>(order.size()), range);
+      parser::NodePtr returnCount = synth::returnStmt(std::move(count), range);
       FunctionSignature lenSig;
       lenSig.positionalNames.push_back("self");
       lenSig.positionalTypes.push_back(types.contract(contractName));
@@ -1791,13 +1773,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         elements.push_back(synth::selfAttribute("self", field, range));
       parser::NodePtr tuple = parser::makeNode("Tuple", range);
       parser::addField(*tuple, "elts", std::move(elements));
-      parser::NodePtr call = parser::makeNode("Call", range);
-      parser::addField(*call, "func", synth::name("hash", range));
-      parser::addField(*call, "args",
-                       std::vector<parser::NodePtr>{std::move(tuple)});
-      parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
-      parser::NodePtr returnNode = parser::makeNode("Return", range);
-      parser::addField(*returnNode, "value", std::move(call));
+      parser::NodePtr call = synth::call(synth::name("hash", range), std::vector<parser::NodePtr>{std::move(tuple)}, range);
+      parser::NodePtr returnNode = synth::returnStmt(std::move(call), range);
       FunctionSignature sig;
       sig.positionalNames.push_back("self");
       sig.positionalTypes.push_back(types.contract(contractName));
@@ -1843,8 +1820,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
             std::vector<parser::NodePtr>(comparisons.begin(),
                                          comparisons.end()));
       }
-      parser::NodePtr returnNode = parser::makeNode("Return", range);
-      parser::addField(*returnNode, "value", std::move(expr));
+      parser::NodePtr returnNode = synth::returnStmt(std::move(expr), range);
       FunctionSignature sig;
       sig.positionalNames.append({"self", "other"});
       sig.positionalTypes.push_back(types.contract(contractName));

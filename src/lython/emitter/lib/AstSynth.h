@@ -81,6 +81,8 @@ NodePtr forStmt(NodePtr target, NodePtr iter, std::vector<NodePtr> body,
                 std::vector<NodePtr> orelse, SourceRange range);
 NodePtr whileStmt(NodePtr test, std::vector<NodePtr> body,
                   std::vector<NodePtr> orelse, SourceRange range);
+// An expression evaluated as a statement (`Expr` wrapping it).
+NodePtr exprStmt(NodePtr value, SourceRange range);
 NodePtr breakStmt(SourceRange range);
 NodePtr continueStmt(SourceRange range);
 // `yield <value>` as a STATEMENT (an Expr wrapping the Yield).

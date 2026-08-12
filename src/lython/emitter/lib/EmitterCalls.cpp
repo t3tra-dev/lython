@@ -1,4 +1,5 @@
 #include "Contracts.h"
+#include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -268,15 +269,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           continue;
         }
         if (lazyArgument(arg)) {
-          parser::NodePtr listName = parser::makeNode("Name", arg->range);
-          parser::addField(*listName, "id", std::string("list"));
-          parser::NodePtr materialized =
-              parser::makeNode("Call", arg->range);
-          parser::addField(*materialized, "func", std::move(listName));
-          parser::addField(*materialized, "args",
-                           std::vector<parser::NodePtr>{arg});
-          parser::addField(*materialized, "keywords",
-                           std::vector<parser::NodePtr>{});
+          parser::NodePtr listName = synth::name(std::string("list"), arg->range);
+          parser::NodePtr materialized = synth::call(std::move(listName), std::vector<parser::NodePtr>{arg}, arg->range);
           rewrittenArgs.push_back(std::move(materialized));
           continue;
         }
@@ -393,15 +387,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       for (unsigned index : needBinding) {
         std::string name = "__lyargbind" + std::to_string(++listCompCounter);
         scratch.push_back(name);
-        parser::NodePtr target = parser::makeNode("Name", expr.range);
-        parser::addField(*target, "id", name);
-        parser::NodePtr bind = parser::makeNode("Assign", expr.range);
-        parser::addField(*bind, "targets",
-                         std::vector<parser::NodePtr>{target});
-        parser::addField(*bind, "value", boundArgs[index]);
+        parser::NodePtr target = synth::name(name, expr.range);
+        parser::NodePtr bind = synth::assign(target, boundArgs[index], expr.range);
         binds.push_back(std::move(bind));
-        parser::NodePtr named = parser::makeNode("Name", expr.range);
-        parser::addField(*named, "id", name);
+        parser::NodePtr named = synth::name(name, expr.range);
         boundArgs[index] = std::move(named);
       }
       parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
@@ -487,19 +476,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         std::string subject =
             "__lyaffix" + std::to_string(++listCompCounter);
         auto affixCall = [&](std::size_t index) {
-          parser::NodePtr self = parser::makeNode("Name", expr.range);
-          parser::addField(*self, "id", subject);
-          parser::NodePtr attribute =
-              parser::makeNode("Attribute", calleeNode->range);
-          parser::addField(*attribute, "value", std::move(self));
-          parser::addField(*attribute, "attr", affix.str());
+          parser::NodePtr self = synth::name(subject, expr.range);
+          parser::NodePtr attribute = synth::attribute(std::move(self), affix.str(), calleeNode->range);
           std::vector<parser::NodePtr> callArgs{(*elts)[index]};
           for (std::size_t rest = 1; rest < affixArgs->size(); ++rest)
             callArgs.push_back((*affixArgs)[rest]);
-          parser::NodePtr call = parser::makeNode("Call", expr.range);
-          parser::addField(*call, "func", std::move(attribute));
-          parser::addField(*call, "args", std::move(callArgs));
-          parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+          parser::NodePtr call = synth::call(std::move(attribute), std::move(callArgs), expr.range);
           return call;
         };
         parser::NodePtr folded = affixCall(elts->size() - 1);
@@ -512,12 +494,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                                         std::move(folded)});
           folded = std::move(disjunction);
         }
-        parser::NodePtr target = parser::makeNode("Name", expr.range);
-        parser::addField(*target, "id", subject);
-        parser::NodePtr bind = parser::makeNode("Assign", expr.range);
-        parser::addField(*bind, "targets",
-                         std::vector<parser::NodePtr>{std::move(target)});
-        parser::addField(*bind, "value", receiver);
+        parser::NodePtr target = synth::name(subject, expr.range);
+        parser::NodePtr bind = synth::assign(std::move(target), receiver, expr.range);
         Value result = emitNone(expr);
         runWithScratchNames({subject}, [&] {
           emitStatement(*bind);
@@ -659,8 +637,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     parser::NodePtr emptyList = parser::makeNode("List", expr.range);
     parser::addField(*emptyList, "elts", std::vector<parser::NodePtr>{});
     parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
-    parser::NodePtr frozensetName = parser::makeNode("Name", expr.range);
-    parser::addField(*frozensetName, "id", std::string("frozenset"));
+    parser::NodePtr frozensetName = synth::name(std::string("frozenset"), expr.range);
     parser::addField(*rewritten, "func", std::move(frozensetName));
     parser::addField(*rewritten, "args",
                      std::vector<parser::NodePtr>{std::move(emptyList)});
@@ -673,11 +650,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (calleeNode && calleeNode->kind == "Name" &&
       ast::nameSpelling(*calleeNode) == "input" &&
       !programBindsName("input") && callHasNoArguments(expr)) {
-    parser::NodePtr empty = parser::makeNode("Constant", expr.range);
-    parser::addField(*empty, "value", std::string());
+    parser::NodePtr empty = synth::strConstant(std::string(), expr.range);
     parser::NodePtr promptCall = parser::makeNode("Call", expr.range);
-    parser::NodePtr inputName = parser::makeNode("Name", expr.range);
-    parser::addField(*inputName, "id", std::string("input"));
+    parser::NodePtr inputName = synth::name(std::string("input"), expr.range);
     parser::addField(*promptCall, "func", std::move(inputName));
     parser::addField(*promptCall, "args",
                      std::vector<parser::NodePtr>{std::move(empty)});
@@ -1013,8 +988,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
     if (!spelling.empty() && spelling != ast::nameSpelling(*calleeNode) &&
         types.lookupClass(spelling) == instance) {
-      parser::NodePtr named = parser::makeNode("Name", calleeNode->range);
-      parser::addField(*named, "id", spelling);
+      parser::NodePtr named = synth::name(spelling, calleeNode->range);
       parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
       parser::addField(*rewritten, "func", named);
       for (llvm::StringRef field : {"args", "keywords"})
@@ -1496,13 +1470,8 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     // instead of teaching this path a second dispatch ladder — repr owns
     // the source-__repr__ inline and the default-object-repr fallback.
     if (!programBindsName("repr")) {
-      parser::NodePtr reprName = parser::makeNode("Name", expr.range);
-      parser::addField(*reprName, "id", std::string("repr"));
-      parser::NodePtr reprCall = parser::makeNode("Call", expr.range);
-      parser::addField(*reprCall, "func", std::move(reprName));
-      parser::addField(*reprCall, "args",
-                       std::vector<parser::NodePtr>{strArgs->front()});
-      parser::addField(*reprCall, "keywords", std::vector<parser::NodePtr>{});
+      parser::NodePtr reprName = synth::name(std::string("repr"), expr.range);
+      parser::NodePtr reprCall = synth::call(std::move(reprName), std::vector<parser::NodePtr>{strArgs->front()}, expr.range);
       synthesizedIteratorDefs.push_back(reprCall);
       return emitCall(*reprCall);
     }
@@ -1729,12 +1698,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     if (allPresent) {
       parser::NodePtr folded = reducerArgs->front();
       for (std::size_t index = 1; index < reducerArgs->size(); ++index) {
-        parser::NodePtr pair = parser::makeNode("Call", expr.range);
-        parser::addField(*pair, "func", calleeShared);
-        parser::addField(*pair, "args",
-                         std::vector<parser::NodePtr>{
-                             folded, (*reducerArgs)[index]});
-        parser::addField(*pair, "keywords", std::vector<parser::NodePtr>{});
+        parser::NodePtr pair = synth::call(calleeShared, std::vector<parser::NodePtr>{
+                             folded, (*reducerArgs)[index]}, expr.range);
         folded = std::move(pair);
       }
       return emitExpr(folded.get());
@@ -1865,17 +1830,11 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       {
         auto scope = types.pushScope();
         types.bindLocalSymbol("__lykeyprobe", elementType);
-        parser::NodePtr probeArg = parser::makeNode("Name", expr.range);
-        parser::addField(*probeArg, "id", std::string("__lykeyprobe"));
-        parser::NodePtr probe = parser::makeNode("Call", expr.range);
-        parser::addField(*probe, "func",
-                         std::get<parser::NodePtr>(
+        parser::NodePtr probeArg = synth::name(std::string("__lykeyprobe"), expr.range);
+        parser::NodePtr probe = synth::call(std::get<parser::NodePtr>(
                              parser::findField(*reducerKeywords->front(),
                                                "value")
-                                 ->value));
-        parser::addField(*probe, "args",
-                         std::vector<parser::NodePtr>{std::move(probeArg)});
-        parser::addField(*probe, "keywords", std::vector<parser::NodePtr>{});
+                                 ->value), std::vector<parser::NodePtr>{std::move(probeArg)}, expr.range);
         keyType = types.widenLiteral(types.inferExpr(probe.get()));
       }
       keyPlaceholder = placeholderFor(keyType);
@@ -1908,19 +1867,12 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
             return !elts || elts->empty();
           }();
       if (emptyLiteral) {
-        parser::NodePtr errorName = parser::makeNode("Name", expr.range);
-        parser::addField(*errorName, "id", std::string("ValueError"));
+        parser::NodePtr errorName = synth::name(std::string("ValueError"), expr.range);
         parser::NodePtr message = parser::makeNode("Constant", expr.range);
         parser::addField(*message, "value",
                          reducer.str() + "() iterable argument is empty");
-        parser::NodePtr errorCall = parser::makeNode("Call", expr.range);
-        parser::addField(*errorCall, "func", errorName);
-        parser::addField(*errorCall, "args",
-                         std::vector<parser::NodePtr>{message});
-        parser::addField(*errorCall, "keywords",
-                         std::vector<parser::NodePtr>{});
-        parser::NodePtr raiseNode = parser::makeNode("Raise", expr.range);
-        parser::addField(*raiseNode, "exc", errorCall);
+        parser::NodePtr errorCall = synth::call(errorName, std::vector<parser::NodePtr>{message}, expr.range);
+        parser::NodePtr raiseNode = synth::raiseStmt(errorCall, expr.range);
         emitStatement(*raiseNode);
         // py.raise terminates the block; park the (unreachable) rest of
         // the enclosing expression in a fresh block.
@@ -1954,8 +1906,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     values[flag] = Value{flagInit.getResult(), flagType};
     types.bindSymbol(flag, flagType);
     auto nameNode = [&](const std::string &id) {
-      parser::NodePtr node = parser::makeNode("Name", expr.range);
-      parser::addField(*node, "id", id);
+      parser::NodePtr node = synth::name(id, expr.range);
       return node;
     };
     std::string keyAcc = "__" + reducer.str() + "key" +
@@ -1974,10 +1925,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     // if __seen: (if el >/< __acc: __acc = el) else: __acc = el; __seen = True
     // With a key the compared operands are the KEYS and both accumulators
     // move together; the key is computed once per element, above the switch.
-    parser::NodePtr assignAcc = parser::makeNode("Assign", expr.range);
-    parser::addField(*assignAcc, "targets",
-                     std::vector<parser::NodePtr>{tmpName});
-    parser::addField(*assignAcc, "value", elementName);
+    parser::NodePtr assignAcc = synth::assign(tmpName, elementName, expr.range);
     parser::NodePtr assignKeyAcc;
     if (reducerKeyNode) {
       assignKeyAcc = parser::makeNode("Assign", expr.range);
@@ -2001,17 +1949,12 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::addField(*better, "test", compare);
     parser::addField(*better, "body", std::move(betterBody));
     parser::addField(*better, "orelse", std::vector<parser::NodePtr>{});
-    parser::NodePtr trueValue = parser::makeNode("Constant", expr.range);
-    parser::addField(*trueValue, "value", std::int64_t{1});
-    parser::NodePtr markSeen = parser::makeNode("Assign", expr.range);
-    parser::addField(*markSeen, "targets",
-                     std::vector<parser::NodePtr>{flagName});
-    parser::addField(*markSeen, "value", trueValue);
+    parser::NodePtr trueValue = synth::intConstant(std::int64_t{1}, expr.range);
+    parser::NodePtr markSeen = synth::assign(flagName, trueValue, expr.range);
     // The seen-flag is an int, and int truthiness is rejected (R1): the
     // synthesized tests spell the comparison out.
     auto flagCompare = [&](const char *opKind) {
-      parser::NodePtr zero = parser::makeNode("Constant", expr.range);
-      parser::addField(*zero, "value", std::int64_t{0});
+      parser::NodePtr zero = synth::intConstant(std::int64_t{0}, expr.range);
       parser::NodePtr op = parser::makeNode(opKind, expr.range);
       parser::NodePtr compare = parser::makeNode("Compare", expr.range);
       parser::addField(*compare, "left", flagName);
@@ -2031,19 +1974,11 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::addField(*seenSwitch, "orelse", std::move(firstBody));
     std::vector<parser::NodePtr> loopBody;
     if (reducerKeyNode) {
-      parser::NodePtr keyCall = parser::makeNode("Call", expr.range);
-      parser::addField(*keyCall, "func",
-                       std::get<parser::NodePtr>(
+      parser::NodePtr keyCall = synth::call(std::get<parser::NodePtr>(
                            parser::findField(*reducerKeywords->front(),
                                              "value")
-                               ->value));
-      parser::addField(*keyCall, "args",
-                       std::vector<parser::NodePtr>{elementName});
-      parser::addField(*keyCall, "keywords", std::vector<parser::NodePtr>{});
-      parser::NodePtr bindKey = parser::makeNode("Assign", expr.range);
-      parser::addField(*bindKey, "targets",
-                       std::vector<parser::NodePtr>{keyName});
-      parser::addField(*bindKey, "value", std::move(keyCall));
+                               ->value), std::vector<parser::NodePtr>{elementName}, expr.range);
+      parser::NodePtr bindKey = synth::assign(keyName, std::move(keyCall), expr.range);
       loopBody.push_back(std::move(bindKey));
     }
     loopBody.push_back(seenSwitch);
@@ -2058,14 +1993,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::NodePtr message = parser::makeNode("Constant", expr.range);
     parser::addField(*message, "value",
                      reducer.str() + "() iterable argument is empty");
-    parser::NodePtr errorCall = parser::makeNode("Call", expr.range);
-    parser::addField(*errorCall, "func", nameNode("ValueError"));
-    parser::addField(*errorCall, "args",
-                     std::vector<parser::NodePtr>{message});
-    parser::addField(*errorCall, "keywords",
-                     std::vector<parser::NodePtr>{});
-    parser::NodePtr raiseNode = parser::makeNode("Raise", expr.range);
-    parser::addField(*raiseNode, "exc", errorCall);
+    parser::NodePtr errorCall = synth::call(nameNode("ValueError"), std::vector<parser::NodePtr>{message}, expr.range);
+    parser::NodePtr raiseNode = synth::raiseStmt(errorCall, expr.range);
     parser::NodePtr emptyGuard = parser::makeNode("If", expr.range);
     parser::addField(*emptyGuard, "test", notSeen);
     parser::addField(*emptyGuard, "body",
@@ -2147,10 +2076,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       values[tmp] = Value{init.getResult(), initType};
       types.bindSymbol(tmp, initType);
     }
-    parser::NodePtr tmpName = parser::makeNode("Name", expr.range);
-    parser::addField(*tmpName, "id", tmp);
-    parser::NodePtr elementName = parser::makeNode("Name", expr.range);
-    parser::addField(*elementName, "id", element);
+    parser::NodePtr tmpName = synth::name(tmp, expr.range);
+    parser::NodePtr elementName = synth::name(element, expr.range);
     std::vector<parser::NodePtr> body;
     if (reducer == "sum") {
       // <tmp> = <tmp> + <element>
@@ -2159,10 +2086,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       parser::addField(*add, "left", tmpName);
       parser::addField(*add, "op", addOp);
       parser::addField(*add, "right", elementName);
-      parser::NodePtr assign = parser::makeNode("Assign", expr.range);
-      parser::addField(*assign, "targets",
-                       std::vector<parser::NodePtr>{tmpName});
-      parser::addField(*assign, "value", add);
+      parser::NodePtr assign = synth::assign(tmpName, add, expr.range);
       body.push_back(assign);
     } else {
       // any: if <element>: <tmp> = True; break
@@ -2171,10 +2095,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       parser::NodePtr flippedValue =
           parser::makeNode("Constant", expr.range);
       parser::addField(*flippedValue, "value", flipped);
-      parser::NodePtr assign = parser::makeNode("Assign", expr.range);
-      parser::addField(*assign, "targets",
-                       std::vector<parser::NodePtr>{tmpName});
-      parser::addField(*assign, "value", flippedValue);
+      parser::NodePtr assign = synth::assign(tmpName, flippedValue, expr.range);
       parser::NodePtr breakNode = parser::makeNode("Break", expr.range);
       parser::NodePtr test = elementName;
       if (reducer == "all") {
@@ -2324,22 +2245,14 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
     std::string resultName = "__lynext" + std::to_string(serial);
     parser::SourceRange range = expr.range;
     auto nameNode = [&](const std::string &id) {
-      parser::NodePtr node = parser::makeNode("Name", range);
-      parser::addField(*node, "id", id);
+      parser::NodePtr node = synth::name(id, range);
       return node;
     };
     auto assign = [&](parser::NodePtr target, parser::NodePtr value) {
-      parser::NodePtr node = parser::makeNode("Assign", range);
-      parser::addField(*node, "targets",
-                       std::vector<parser::NodePtr>{std::move(target)});
-      parser::addField(*node, "value", std::move(value));
+      parser::NodePtr node = synth::assign(std::move(target), std::move(value), range);
       return node;
     };
-    parser::NodePtr nextCall = parser::makeNode("Call", range);
-    parser::addField(*nextCall, "func", nameNode("next"));
-    parser::addField(*nextCall, "args",
-                     std::vector<parser::NodePtr>{nameNode(iteratorName)});
-    parser::addField(*nextCall, "keywords", std::vector<parser::NodePtr>{});
+    parser::NodePtr nextCall = synth::call(nameNode("next"), std::vector<parser::NodePtr>{nameNode(iteratorName)}, range);
     parser::NodePtr handler = parser::makeNode("ExceptHandler", range);
     parser::addField(*handler, "type", nameNode("StopIteration"));
     parser::addField(*handler, "body",

@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 
 #include "EmitterOps.h" // IWYU pragma: keep
@@ -616,15 +617,9 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
       const parser::Field *rightField = parser::findField(expr, "right");
       if (rightField &&
           std::holds_alternative<parser::NodePtr>(rightField->value)) {
-        parser::NodePtr converter = parser::makeNode("Name", expr.range);
-        parser::addField(*converter, "id",
-                         leftKind.rsplit('.').second.str());
-        parser::NodePtr call = parser::makeNode("Call", expr.range);
-        parser::addField(*call, "func", std::move(converter));
-        parser::addField(*call, "args",
-                         std::vector<parser::NodePtr>{
-                             std::get<parser::NodePtr>(rightField->value)});
-        parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+        parser::NodePtr converter = synth::name(leftKind.rsplit('.').second.str(), expr.range);
+        parser::NodePtr call = synth::call(std::move(converter), std::vector<parser::NodePtr>{
+                             std::get<parser::NodePtr>(rightField->value)}, expr.range);
         parser::NodePtr rewritten = parser::makeNode("BinOp", expr.range);
         if (const parser::Field *leftField = parser::findField(expr, "left"))
           rewritten->fields.push_back(*leftField);
@@ -1355,11 +1350,7 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
           const parser::Field *receiverField = parser::findField(expr, "value");
           if (receiverField &&
               std::holds_alternative<parser::NodePtr>(receiverField->value)) {
-            parser::NodePtr attribute =
-                parser::makeNode("Attribute", expr.range);
-            parser::addField(*attribute, "value",
-                             std::get<parser::NodePtr>(receiverField->value));
-            parser::addField(*attribute, "attr", order[at]);
+            parser::NodePtr attribute = synth::attribute(std::get<parser::NodePtr>(receiverField->value), order[at], expr.range);
             return emitExpr(attribute.get());
           }
         }
@@ -1790,19 +1781,14 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
           types.widenLiteral(types.inferExpr(chain.front().iter.get())),
           "__iter__", {})) {
     std::string name = "__lycompsrc" + std::to_string(++listCompCounter);
-    parser::NodePtr target = parser::makeNode("Name", expr.range);
-    parser::addField(*target, "id", name);
-    parser::NodePtr assign = parser::makeNode("Assign", expr.range);
-    parser::addField(*assign, "targets",
-                     std::vector<parser::NodePtr>{target});
-    parser::addField(*assign, "value", chain.front().iter);
+    parser::NodePtr target = synth::name(name, expr.range);
+    parser::NodePtr assign = synth::assign(target, chain.front().iter, expr.range);
     if (auto found = values.find(name); found != values.end())
       hoistedPrior = found->second;
     emitStatement(*assign);
     if (values.find(name) != values.end()) {
       hoistedSource = name;
-      parser::NodePtr bound = parser::makeNode("Name", expr.range);
-      parser::addField(*bound, "id", name);
+      parser::NodePtr bound = synth::name(name, expr.range);
       chain.front().iter = std::move(bound);
     }
   }
@@ -1866,8 +1852,7 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
 
   // list: for <target> in <iter>: <tmp>.append(<elt>)
   // dict: for <target> in <iter>: <tmp>[<key>] = <value>
-  parser::NodePtr tmpName = parser::makeNode("Name", expr.range);
-  parser::addField(*tmpName, "id", tmp);
+  parser::NodePtr tmpName = synth::name(tmp, expr.range);
   parser::NodePtr statement;
   if (isDict) {
     parser::NodePtr subscript = parser::makeNode("Subscript", expr.range);
@@ -1878,14 +1863,8 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
                      std::vector<parser::NodePtr>{subscript});
     parser::addField(*statement, "value", valueExpr);
   } else {
-    parser::NodePtr appendAttr = parser::makeNode("Attribute", expr.range);
-    parser::addField(*appendAttr, "value", tmpName);
-    parser::addField(*appendAttr, "attr",
-                     std::string(isSet ? "add" : "append"));
-    parser::NodePtr appendCall = parser::makeNode("Call", expr.range);
-    parser::addField(*appendCall, "func", appendAttr);
-    parser::addField(*appendCall, "args", std::vector<parser::NodePtr>{elt});
-    parser::addField(*appendCall, "keywords", std::vector<parser::NodePtr>{});
+    parser::NodePtr appendAttr = synth::attribute(tmpName, std::string(isSet ? "add" : "append"), expr.range);
+    parser::NodePtr appendCall = synth::call(appendAttr, std::vector<parser::NodePtr>{elt}, expr.range);
     statement = parser::makeNode("Expr", expr.range);
     parser::addField(*statement, "value", appendCall);
   }
@@ -1978,17 +1957,10 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
   values[tmp] = Value{pack.getResult(), containerType};
 
   for (const parser::NodePtr &element : *elts) {
-    parser::NodePtr tmpName = parser::makeNode("Name", expr.range);
-    parser::addField(*tmpName, "id", tmp);
-    parser::NodePtr addAttr = parser::makeNode("Attribute", expr.range);
-    parser::addField(*addAttr, "value", tmpName);
-    parser::addField(*addAttr, "attr", std::string("add"));
-    parser::NodePtr addCall = parser::makeNode("Call", expr.range);
-    parser::addField(*addCall, "func", addAttr);
-    parser::addField(*addCall, "args", std::vector<parser::NodePtr>{element});
-    parser::addField(*addCall, "keywords", std::vector<parser::NodePtr>{});
-    parser::NodePtr statement = parser::makeNode("Expr", expr.range);
-    parser::addField(*statement, "value", addCall);
+    parser::NodePtr tmpName = synth::name(tmp, expr.range);
+    parser::NodePtr addAttr = synth::attribute(tmpName, std::string("add"), expr.range);
+    parser::NodePtr addCall = synth::call(addAttr, std::vector<parser::NodePtr>{element}, expr.range);
+    parser::NodePtr statement = synth::exprStmt(addCall, expr.range);
     emitStatement(*statement);
   }
 
