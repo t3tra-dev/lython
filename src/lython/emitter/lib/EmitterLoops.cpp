@@ -778,6 +778,18 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       values[local.name] = Value{postTestValues[index], local.type};
       types.bindSymbol(local.name, local.type);
     }
+    // ⛔ KNOWN DEFECT, measured and not repaired here: the body does NOT see
+    // what the condition proves. `while n is not None:` leaves n a union
+    // inside its own body, so `total += n` is refused for an operand the loop
+    // only enters with when it is an int -- while the if statement and the
+    // conditional expression both apply that narrowing.
+    //
+    // Applying it here (unwrap the carried value to the narrowed member at
+    // the top of the body, scoped) compiles and then CRASHES the program: the
+    // back edge forwards whatever the body left, and coerceValue has no way
+    // to wrap a narrowed member back INTO the carried union, so the header
+    // receives a value of the wrong shape. The missing piece is that
+    // coercion, not the narrowing.
     LoopControlContext loop{afterBlock, headerBlock};
     loop.carriedLocals.assign(carried.begin(), carried.end());
     loop.headerBlock = headerBlock;
