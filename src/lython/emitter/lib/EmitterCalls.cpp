@@ -484,29 +484,50 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
-  // ⭐ `abs(x)` on a SOURCE class calls its __abs__. The builtin is a manifest
-  // free function with numeric overloads, so a user class reached it as
-  // "static type !py.overload<...> is not callable with these arguments" --
-  // while the unary operators next to it dispatch the class's own dunder.
-  if (calleeNode && calleeNode->kind == "Name" &&
-      ast::nameSpelling(*calleeNode) == "abs" && !programBindsName("abs")) {
-    const auto *absArgs = ast::nodeList(expr, "args");
-    const auto *absKeywords = ast::nodeList(expr, "keywords");
-    if (absArgs && absArgs->size() == 1 && absArgs->front() &&
-        absArgs->front()->kind != "Starred" &&
-        (!absKeywords || absKeywords->empty())) {
-      mlir::Type argumentType =
-          types.widenLiteral(types.inferExpr(absArgs->front().get()));
-      if (std::optional<MethodBinding> sourceAbs =
-              lookupClassMethod(argumentType, "__abs__")) {
-        Value receiver = emitExpr(absArgs->front().get());
-        llvm::StringMap<Value> noKeywords;
-        return emitInlineMethodBody(
-            expr, emitDescriptorReceiver(expr, receiver, *sourceAbs),
-            methodBindingBindsReceiver(*sourceAbs), *sourceAbs, {},
-            noKeywords);
+  // ⭐ A one-argument builtin whose whole job is to call a dunder calls the
+  // SOURCE class's when there is one. Each of these is a manifest free
+  // function with builtin overloads, so a user class reached them as
+  // "!py.overload<...> is not callable with these arguments" or as a missing
+  // manifest method -- while the operators next to them dispatch the class's
+  // own dunder. One table rather than one special case per builtin: they
+  // differ only in the name.
+  if (calleeNode && calleeNode->kind == "Name") {
+    static constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral>
+        kDunderBuiltins[] = {
+            {llvm::StringLiteral("abs"), llvm::StringLiteral("__abs__")},
+            {llvm::StringLiteral("int"), llvm::StringLiteral("__int__")},
+            {llvm::StringLiteral("float"), llvm::StringLiteral("__float__")},
+            {llvm::StringLiteral("round"), llvm::StringLiteral("__round__")},
+            {llvm::StringLiteral("reversed"),
+             llvm::StringLiteral("__reversed__")},
+        };
+    // ⛔ Not len() and not hash(): those two already reach a source class
+    // through their own folds, and hash's fold is not just the call -- it
+    // remaps CPython's -1 error sentinel to -2. Routing it here bypassed the
+    // remap and hash_sentinel_and_math_domain_text printed -1.
+    llvm::StringRef builtinName = ast::nameSpelling(*calleeNode);
+    const auto *dunderArgs = ast::nodeList(expr, "args");
+    const auto *dunderKeywords = ast::nodeList(expr, "keywords");
+    if (dunderArgs && dunderArgs->size() == 1 && dunderArgs->front() &&
+        dunderArgs->front()->kind != "Starred" &&
+        (!dunderKeywords || dunderKeywords->empty()) &&
+        !programBindsName(builtinName))
+      for (const auto &[name, dunder] : kDunderBuiltins) {
+        if (builtinName != name)
+          continue;
+        mlir::Type argumentType =
+            types.widenLiteral(types.inferExpr(dunderArgs->front().get()));
+        if (std::optional<MethodBinding> sourceDunder =
+                lookupClassMethod(argumentType, dunder)) {
+          Value receiver = emitExpr(dunderArgs->front().get());
+          llvm::StringMap<Value> noKeywords;
+          return emitInlineMethodBody(
+              expr, emitDescriptorReceiver(expr, receiver, *sourceDunder),
+              methodBindingBindsReceiver(*sourceDunder), *sourceDunder, {},
+              noKeywords);
+        }
+        break;
       }
-    }
   }
 
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
