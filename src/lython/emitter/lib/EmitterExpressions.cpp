@@ -2049,6 +2049,38 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
     if (auto expectedCallable =
             mlir::dyn_cast_if_present<py::CallableType>(expected))
       return emitLambda(*expr, expectedCallable);
+  // ⭐ A container literal under a UNION expectation takes the member of its
+  // own kind. `xs: list[int] | None` then `xs = []` typed the literal
+  // `list[object]` (the union is not a container contract, so the
+  // expectation was dropped) and the branch join became
+  // `list[int] | list[object] | None`, which nothing accepts -- while the
+  // same assignment under the bare `list[int]` expectation was exact.
+  if (auto unionExpected = mlir::dyn_cast<py::UnionType>(expected)) {
+    llvm::StringRef wanted;
+    if (expr->kind == "List")
+      wanted = "builtins.list";
+    else if (expr->kind == "Tuple")
+      wanted = "builtins.tuple";
+    else if (expr->kind == "Dict")
+      wanted = "builtins.dict";
+    else if (expr->kind == "Set")
+      wanted = "builtins.set";
+    if (!wanted.empty()) {
+      mlir::Type only;
+      for (mlir::Type member : unionExpected.getMemberTypes()) {
+        auto contract = mlir::dyn_cast<py::ContractType>(member);
+        if (!contract || contract.getContractName() != wanted)
+          continue;
+        if (only) {
+          only = mlir::Type();
+          break;
+        }
+        only = member;
+      }
+      if (only)
+        expected = only;
+    }
+  }
   if (expr->kind == "List" || expr->kind == "Tuple" || expr->kind == "Dict")
     return emitContainerLiteral(*expr, expected);
   if (expr->kind == "Set")

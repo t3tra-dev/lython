@@ -113,6 +113,51 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
               }
             }
     }
+    // ⭐ An EMPTY container literal into a name that already has a declared
+    // type takes that type, the same way the field store above does. It has
+    // nothing of its own to infer an element type from, so it came out as
+    // `list[object]`, and in the canonical Optional idiom
+    //
+    //     def f(xs: list[int] | None = None) -> int:
+    //         if xs is None:
+    //             xs = []
+    //
+    // the branch join was `list[int] | list[object] | None`, which nothing
+    // accepts.
+    //
+    // ⛔ Empty only: a literal WITH elements is what the rebinding says it
+    // is. `xs = [1, 2]` where xs was `list[str]` must become `list[int]`, not
+    // be pushed at the old element type.
+    if (!emittedWithContext && rhs) {
+      bool emptyLiteral =
+          (rhs->kind == "List" || rhs->kind == "Tuple" || rhs->kind == "Set") &&
+          [&] {
+            const auto *elts = ast::nodeList(*rhs, "elts");
+            return !elts || elts->empty();
+          }();
+      if (!emptyLiteral && rhs->kind == "Dict") {
+        const auto *keys = ast::nodeList(*rhs, "keys");
+        emptyLiteral = !keys || keys->empty();
+      }
+      if (emptyLiteral)
+        if (const auto *targets = ast::nodeList(statement, "targets"))
+          if (targets->size() == 1 && targets->front() &&
+              targets->front()->kind == "Name")
+          {
+            llvm::StringRef target = ast::nameSpelling(*targets->front());
+            // The pre-narrowing type wins: inside `if xs is None:` the flow
+            // type of xs IS None, which is the right answer for a read and no
+            // constraint at all on a write.
+            mlir::Type declared = narrowedFromTypes.lookup(target);
+            if (!declared)
+              if (auto flow = types.lookupSymbol(target))
+                declared = *flow;
+            if (declared) {
+              value = emitExprExpected(rhs, declared);
+              emittedWithContext = true;
+            }
+          }
+    }
     if (!emittedWithContext)
       value = emitExpr(rhs);
     if (const auto *targets = ast::nodeList(statement, "targets"))

@@ -4,6 +4,8 @@
 
 #include "AstAccess.h"
 
+#include "llvm/ADT/ScopeExit.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -19,8 +21,13 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   const parser::Node *test = ast::node(statement, "test");
   std::optional<BranchTypeNarrowing> narrowing =
       test ? optionalBranchTypeNarrowing(*test, types, module) : std::nullopt;
+  llvm::StringMap<mlir::Type> savedNarrowedFrom = narrowedFromTypes;
+  auto restoreNarrowedFrom = llvm::make_scope_exit(
+      [&] { narrowedFromTypes = std::move(savedNarrowedFrom); });
   auto applyNarrowing = [&](const BranchTypeNarrowing &fact,
                             bool conditionIsTrue) {
+    if (std::optional<mlir::Type> before = types.lookupSymbol(fact.name))
+      narrowedFromTypes[fact.name] = *before;
     mlir::Type narrowed = conditionIsTrue ? fact.trueType : fact.falseType;
     mlir::Type sourceType =
         conditionIsTrue ? fact.trueSourceType : fact.falseSourceType;
@@ -249,8 +256,21 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   // releases the replaced token).
   llvm::SmallVector<unsigned, 2> replacementIndices;
   llvm::SmallVector<mlir::Type, 2> replacementTypes;
+  // ⭐ The fall-through edge of an else-less `if` carries the NEGATIVE
+  // narrowing, the same fact an else block would have been given. Without it
+  // the edge contributed the unnarrowed outer type, so the canonical Optional
+  // idiom kept its None forever:
+  //
+  //     def f(n: int | None = None) -> int:
+  //         if n is None:
+  //             n = 0
+  //         return n + 1     # union<int, None> does not provide '__add__'
+  //
+  // The then edge already narrowed (it assigned), and the join of the two is
+  // int. `if n is None: return 0` worked only because that edge never
+  // reaches the join.
+  llvm::SmallVector<mlir::Type, 2> replacementFallThroughTypes;
   for (auto [index, name] : llvm::enumerate(mutationCandidates)) {
-    (void)name;
     if (llvm::is_contained(threadedMutationIndices,
                            static_cast<unsigned>(index)))
       continue;
@@ -265,8 +285,20 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     if (!reassigned)
       continue;
     llvm::SmallVector<mlir::Type, 3> parts;
-    if (!hasElse)
-      parts.push_back(types.widenLiteral(outer.type));
+    // Null unless the fall-through edge is NARROWED: it doubles as the flag
+    // that the edge has to unwrap, and an unconditional compare against the
+    // outer type would fire for a literal that merely widens.
+    mlir::Type fallThroughType;
+    if (!hasElse) {
+      mlir::Type edgeType = types.widenLiteral(outer.type);
+      if (narrowing && narrowing->name == name && narrowing->falseType)
+        if (auto unionType = mlir::dyn_cast<py::UnionType>(outer.type))
+          if (unionType.hasMember(narrowing->falseType)) {
+            fallThroughType = narrowing->falseType;
+            edgeType = fallThroughType;
+          }
+      parts.push_back(edgeType);
+    }
     bool valuesPresent = true;
     if (thenExit) {
       if (index < thenMutationValues.size() && thenMutationValues[index].value)
@@ -287,6 +319,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
       continue;
     replacementIndices.push_back(static_cast<unsigned>(index));
     replacementTypes.push_back(merged);
+    replacementFallThroughTypes.push_back(fallThroughType);
     continuation->addArgument(merged, loc(statement));
   }
 
@@ -330,11 +363,17 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
       }
       for (unsigned candidateIndex : threadedMutationIndices)
         falseOperands.push_back(mutationOuterValues[candidateIndex].value);
-      for (auto [slot, candidateIndex] : llvm::enumerate(replacementIndices))
+      for (auto [slot, candidateIndex] : llvm::enumerate(replacementIndices)) {
+        Value incoming = mutationOuterValues[candidateIndex];
+        if (mlir::Type narrowed = replacementFallThroughTypes[slot];
+            narrowed && narrowed != incoming.type) {
+          auto unwrap = py::UnionUnwrapOp::create(builder, loc(statement),
+                                                  narrowed, incoming.value);
+          incoming = Value{unwrap.getResult(), narrowed};
+        }
         falseOperands.push_back(
-            coerceValue(mutationOuterValues[candidateIndex],
-                        replacementTypes[slot], statement)
-                .value);
+            coerceValue(incoming, replacementTypes[slot], statement).value);
+      }
     }
     mlir::cf::CondBranchOp::create(builder, loc(statement), condition,
                                    thenBlock, mlir::ValueRange{}, elseBlock,

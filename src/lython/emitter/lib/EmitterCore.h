@@ -821,6 +821,11 @@ private:
   // references re-emit the literal, so a function body can read them
   // (collectModuleGlobals). The node is owned by the parse tree.
   llvm::StringMap<const parser::Node *> moduleConstantBindings;
+  // Names whose flow type a branch narrowing replaced, and what it was before.
+  // A WRITE inside the branch is not constrained by the narrowing -- `xs = []`
+  // under `if xs is None:` wants the declared `list[int] | None`, not the
+  // `None` the read side sees (EmitterControlFlow.cpp / the Assign rule).
+  llvm::StringMap<mlir::Type> narrowedFromTypes;
   // Names declared `global` in the function currently being emitted (writes
   // to them target the module global instead of a new local). Saved/restored
   // around each callable body.
