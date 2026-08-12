@@ -1,2 +1,0 @@
-t = int
-print(t())

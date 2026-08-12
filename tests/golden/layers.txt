@@ -82,7 +82,6 @@ errors/generator_handler_local_yield lower
 errors/generator_method_receiver_lane lower
 errors/list_insert_on_field lower
 errors/optional_unnarrowed_object_position lower
-errors/type_object_call_via_value lower
 errors/len_takes_no_keyword_arguments emit
 errors/starred_assignment_target emit
 errors/override_behind_a_base_typed_receiver emit

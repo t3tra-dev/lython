@@ -1,1 +1,0 @@
-error: calling a type object held in a value is not supported for .*builtins\.int.*; construct through the type name directly

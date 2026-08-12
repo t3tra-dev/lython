@@ -575,6 +575,39 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
+  // ⭐ Calling a VALUE whose static type is a type object constructs that
+  // class: `cls(0)` in a classmethod (emitDescriptorReceiver binds cls to a
+  // py.type of the receiver's class), and `t = int; t()`. The instance
+  // contract is right there in the type, and the construction path is the one
+  // the class NAME already takes -- so re-spell the callee as that name and
+  // go down it. Reaching the lowering instead could only report "calling a
+  // type object held in a value is not supported", which describes the
+  // compiler's position rather than the program's.
+  if (calleeNode && calleeNode->kind != "Name")
+    ;
+  else if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
+               types.widenLiteral(types.inferExpr(calleeNode)))) {
+    mlir::Type instance = typeObject.getInstanceType();
+    std::string spelling;
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(instance)) {
+      llvm::StringRef name = contract.getContractName();
+      spelling = name.rsplit('.').second.empty() ? name.str()
+                                                 : name.rsplit('.').second.str();
+    }
+    if (!spelling.empty() && spelling != ast::nameSpelling(*calleeNode) &&
+        types.lookupClass(spelling) == instance) {
+      parser::NodePtr named = parser::makeNode("Name", calleeNode->range);
+      parser::addField(*named, "id", spelling);
+      parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+      parser::addField(*rewritten, "func", named);
+      for (llvm::StringRef field : {"args", "keywords"})
+        if (const parser::Field *original = parser::findField(expr, field))
+          rewritten->fields.push_back(*original);
+      return emitCall(*rewritten);
+    }
+  }
+
   // The callee is emitted before the operands on purpose: Python evaluates
   // the callee first, and its Callable contract is the expectation the
   // argument emission distributes (lambda parameters, empty literals).
