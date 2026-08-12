@@ -900,6 +900,21 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
         continue;
       std::optional<std::string_view> asname = ast::string(*alias, "asname");
       std::string local = importBindingName(*name, asname);
+      // ⛔ KNOWN DEFECT, measured: only `import os` works. The other three
+      // spellings of the same thing do not --
+      //
+      //     import os.path          # os.path.join: builtins.object has no 'join'
+      //     import os.path as p     # p.join: literal<None> has no 'join'
+      //     from os import path     # fails in the lowering
+      //
+      // while `import os; os.path.join(...)` is fine, and so is
+      // `import os.path` FOLLOWED by `import os`. importBindingName truncates
+      // a dotted name at the dot, so the fallback below binds the SUBMODULE's
+      // members under the ROOT name (os.join, os.basename) and leaves os.path
+      // on the object placeholder. Binding the root namespace first instead,
+      // with and without the dotted binding that follows it, was tried and
+      // does not restore it: something else in the `import os` path is what
+      // makes the name usable, and this pre-pass is not all of it.
       if (!asname && llvm::StringRef(*name).contains('.')) {
         if (bindSourceModuleNamespace(llvm::StringRef(*name),
                                       llvm::StringRef(*name))) {
