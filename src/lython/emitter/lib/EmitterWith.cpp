@@ -28,12 +28,8 @@ void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {
                            Value{enter.getResult(),
                                  enterInference.awaitableType},
                            enterInference.awaitResult);
-      } else if (std::optional<MethodBinding> method =
-                     (refuseUnresolvableDispatch(item, contextValue,
-                                                 "__enter__")
-                          ? std::nullopt
-                          : lookupClassMethod(contextValue.type,
-                                              "__enter__"))) {
+      } else if (std::optional<Value> opened =
+                     tryEmitClassDunder(item, contextValue, "__enter__")) {
         // ⭐ A context manager written in Python. `py.enter` is answered from
         // the runtime manifest, so a user class reached the lowering and was
         // refused there -- "runtime manifest has no Ctx.__enter__ method" --
@@ -41,7 +37,7 @@ void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {
         // user class is inlined at this layer (`__len__`, `__getitem__`,
         // `__eq__`); `__enter__` and `__exit__` were the two that were not,
         // and the manifest op is right only for a manager the manifest knows.
-        entered = emitInlineOperatorCall(item, contextValue, *method, {});
+        entered = *opened;
       } else {
         CallInferenceResult enterInference =
             types.inferMethodCallWithEvidence(contextValue.type, "__enter__",
@@ -211,12 +207,9 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
   }
 
   // The `__enter__` instance of the same rule; see emitWith.
-  if (std::optional<MethodBinding> method =
-          (refuseUnresolvableDispatch(anchor, cleanup.manager, "__exit__")
-               ? std::nullopt
-               : lookupClassMethod(cleanup.manager.type, "__exit__"))) {
-    Value suppress = emitInlineOperatorCall(anchor, cleanup.manager, *method,
-                                            {none, exception, none});
+  if (std::optional<Value> exited = tryEmitClassDunder(
+          anchor, cleanup.manager, "__exit__", {none, exception, none})) {
+    Value suppress = *exited;
     emitWithExitDecision(anchor, exceptionNode ? &suppress : nullptr);
     return;
   }

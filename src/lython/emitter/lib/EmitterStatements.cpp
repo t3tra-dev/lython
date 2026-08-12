@@ -543,13 +543,8 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
       }
       Value container = emitExpr(ast::node(*target, "value"));
       Value index = emitExpr(ast::node(*target, "slice"));
-      if (std::optional<MethodBinding> method =
-              (refuseUnresolvableDispatch(*target, container, "__delitem__")
-                   ? std::nullopt
-                   : lookupClassMethod(container.type, "__delitem__"))) {
-        emitInlineOperatorCall(*target, container, *method, {index});
+      if (tryEmitClassDunder(*target, container, "__delitem__", {index}))
         continue;
-      }
       CallInferenceResult inference = types.inferMethodCallWithEvidence(
           container.type, "__delitem__", {index.type});
       if (!requireStaticEvidence(*target, inference))
@@ -859,13 +854,8 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       return;
     }
     Value index = emitExpr(ast::node(target, "slice"));
-    if (std::optional<MethodBinding> method =
-            (refuseUnresolvableDispatch(target, container, "__setitem__")
-                 ? std::nullopt
-                 : lookupClassMethod(container.type, "__setitem__"))) {
-      emitInlineOperatorCall(target, container, *method, {index, value});
+    if (tryEmitClassDunder(target, container, "__setitem__", {index, value}))
       return;
-    }
     CallInferenceResult inference = types.inferMethodCallWithEvidence(
         container.type, "__setitem__", {index.type, value.type});
     if (!requireStaticEvidence(target, inference))

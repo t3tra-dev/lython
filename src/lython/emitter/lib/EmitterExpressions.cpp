@@ -557,9 +557,9 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
         {"Invert", "__invert__"},
         {"Abs", "__abs__"}})
     if (ast::isOperator(op, unaryOp))
-      if (std::optional<MethodBinding> sourceUnary =
-              lookupClassMethod(operand.type, method))
-        return emitInlineMethodCall(expr, operand, *sourceUnary);
+      if (std::optional<Value> applied =
+              tryEmitClassDunder(expr, operand, method))
+        return *applied;
   if (ast::isOperator(op, "USub"))
     return emitUnarySpecial<py::NegOp>(expr, "__neg__", operand, result);
   if (ast::isOperator(op, "UAdd"))
@@ -1088,11 +1088,9 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     return emitNone(expr);
   }
   if (ast::isOperator(op, "In") || ast::isOperator(op, "NotIn")) {
-    if (std::optional<MethodBinding> method =
-            (refuseUnresolvableDispatch(expr, rhs, "__contains__")
-                 ? std::nullopt
-                 : lookupClassMethod(rhs.type, "__contains__"))) {
-      Value membership = emitInlineOperatorCall(expr, rhs, *method, {lhs});
+    if (std::optional<Value> contains =
+            tryEmitClassDunder(expr, rhs, "__contains__", {lhs})) {
+      Value membership = *contains;
       if (ast::isOperator(op, "In"))
         return membership;
       mlir::Value bit = emitBoolValue(membership, expr);
@@ -1370,11 +1368,9 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
       sliceNode && sliceNode->kind == "Slice")
     return emitSliceSubscript(expr, container, *sliceNode);
   Value index = emitExpr(ast::node(expr, "slice"));
-  if (std::optional<MethodBinding> method =
-          (refuseUnresolvableDispatch(expr, container, "__getitem__")
-               ? std::nullopt
-               : lookupClassMethod(container.type, "__getitem__")))
-    return emitInlineOperatorCall(expr, container, *method, {index});
+  if (std::optional<Value> item =
+          tryEmitClassDunder(expr, container, "__getitem__", {index}))
+    return *item;
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
       container.type, "__getitem__", {index.type});
   if (!requireStaticEvidence(expr, inference))
@@ -2597,26 +2593,11 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
   // call that does not exist), and object's default has no runtime
   // implementation to dispatch to, because "the truth of an erased object" is
   // not a runtime question — it is answered by the static class.
-  if (std::optional<MethodBinding> truth =
-          (refuseUnresolvableDispatch(anchor, value, "__bool__")
-               ? std::nullopt
-               : lookupClassMethod(widened, "__bool__"))) {
-    llvm::StringMap<Value> emptyKeywords;
-    Value receiver = emitDescriptorReceiver(anchor, value, *truth);
-    Value result =
-        emitInlineMethodBody(anchor, receiver, methodBindingBindsReceiver(*truth),
-                             *truth, {}, emptyKeywords);
-    return emitBoolValue(result, anchor);
-  }
-  if (std::optional<MethodBinding> length =
-          (refuseUnresolvableDispatch(anchor, value, "__len__")
-               ? std::nullopt
-               : lookupClassMethod(widened, "__len__"))) {
-    llvm::StringMap<Value> emptyKeywords;
-    Value receiver = emitDescriptorReceiver(anchor, value, *length);
-    Value count = emitInlineMethodBody(anchor, receiver,
-                                       methodBindingBindsReceiver(*length),
-                                       *length, {}, emptyKeywords);
+  if (std::optional<Value> truth = tryEmitClassDunder(anchor, value, "__bool__"))
+    return emitBoolValue(*truth, anchor);
+  if (std::optional<Value> length =
+          tryEmitClassDunder(anchor, value, "__len__")) {
+    Value count = *length;
     mlir::Type zeroType = types.literal("0");
     Value zero{py::IntConstantOp::create(builder, loc(anchor), zeroType,
                                          builder.getStringAttr("0"))

@@ -571,14 +571,14 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           continue;
         mlir::Type argumentType =
             types.widenLiteral(types.inferExpr(dunderArgs->front().get()));
-        if (std::optional<MethodBinding> sourceDunder =
-                lookupClassMethod(argumentType, dunder)) {
+        // The presence check comes first because the argument must not be
+        // emitted twice: if no source class provides the dunder, the manifest
+        // path below emits it.
+        if (lookupClassMethod(argumentType, dunder)) {
           Value receiver = emitExpr(dunderArgs->front().get());
-          llvm::StringMap<Value> noKeywords;
-          return emitInlineMethodBody(
-              expr, emitDescriptorReceiver(expr, receiver, *sourceDunder),
-              methodBindingBindsReceiver(*sourceDunder), *sourceDunder, {},
-              noKeywords);
+          if (std::optional<Value> dispatched =
+                  tryEmitClassDunder(expr, receiver, dunder))
+            return *dispatched;
         }
         break;
       }
@@ -601,15 +601,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         (!divKeywords || divKeywords->empty())) {
       mlir::Type receiverType =
           types.widenLiteral(types.inferExpr(divArgs->front().get()));
-      if (std::optional<MethodBinding> sourceDivmod =
-              lookupClassMethod(receiverType, "__divmod__")) {
+      if (lookupClassMethod(receiverType, "__divmod__")) {
         Value receiver = emitExpr(divArgs->front().get());
         llvm::SmallVector<Value, 1> rest{emitExpr((*divArgs)[1].get())};
-        llvm::StringMap<Value> noKeywords;
-        return emitInlineMethodBody(
-            expr, emitDescriptorReceiver(expr, receiver, *sourceDivmod),
-            methodBindingBindsReceiver(*sourceDivmod), *sourceDivmod, rest,
-            noKeywords);
+        if (std::optional<Value> dispatched =
+                tryEmitClassDunder(expr, receiver, "__divmod__", rest))
+          return *dispatched;
       }
     }
   }
@@ -1007,10 +1004,11 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (calleeNode)
     if (auto calleeContract = mlir::dyn_cast_if_present<py::ContractType>(
             types.widenLiteral(types.inferExpr(calleeNode))))
-      if (std::optional<MethodBinding> sourceCall =
-              lookupClassMethod(calleeContract, "__call__")) {
+      if (lookupClassMethod(calleeContract, "__call__")) {
         Value receiver = emitExpr(calleeNode);
-        return emitInlineMethodCall(expr, receiver, *sourceCall);
+        if (std::optional<Value> called =
+                tryEmitClassDunderCall(expr, receiver, "__call__"))
+          return *called;
       }
 
   // The callee is emitted before the operands on purpose: Python evaluates
@@ -1428,17 +1426,11 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     // compile-time constant anyway (the emitStringifyValue rule).
     if (argumentType == types.none())
       return emitStrLiteralPiece(expr, "None");
-    if (std::optional<MethodBinding> method =
-            lookupClassMethod(argumentType, "__str__")) {
+    if (lookupClassMethod(argumentType, "__str__")) {
       Value argument = emitExpr(strArgs->front().get());
-      if (refuseUnresolvableDispatch(expr, argument, "__str__"))
-        return emitNone(expr);
-      llvm::StringMap<Value> emptyKeywords;
-      Value descriptorReceiver =
-          emitDescriptorReceiver(expr, argument, *method);
-      return emitInlineMethodBody(expr, descriptorReceiver,
-                                  methodBindingBindsReceiver(*method),
-                                  *method, {}, emptyKeywords);
+      if (std::optional<Value> dispatched =
+              tryEmitClassDunder(expr, argument, "__str__"))
+        return *dispatched;
     }
     // Manifest __str__ evidence over-accepts through the object contract
     // (container manifests only implement __repr__), so gate the __str__
@@ -2199,11 +2191,8 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
       }
     }
     Value input = emitExpr(argNode);
-    if (refuseUnresolvableDispatch(expr, input, "__len__"))
-      return emitNone(expr);
-    if (std::optional<MethodBinding> method =
-            lookupClassMethod(input.type, "__len__"))
-      return emitInlineOperatorCall(expr, input, *method, {});
+    if (std::optional<Value> count = tryEmitClassDunder(expr, input, "__len__"))
+      return *count;
     CallInferenceResult inference =
         types.inferMethodCallWithEvidence(input.type, "__len__", {});
     if (!requireStaticEvidence(expr, inference))
@@ -2362,13 +2351,10 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
   if (!lookupClassMethod(argType, "__hash__"))
     return std::nullopt;
   Value input = emitExpr(args->front().get());
-  if (refuseUnresolvableDispatch(expr, input, "__hash__"))
-    return emitNone(expr);
-  std::optional<MethodBinding> method =
-      lookupClassMethod(input.type, "__hash__");
-  if (!method)
+  std::optional<Value> dispatched = tryEmitClassDunder(expr, input, "__hash__");
+  if (!dispatched)
     return std::nullopt;
-  Value hashed = emitInlineOperatorCall(expr, input, *method, {});
+  Value hashed = *dispatched;
   // ⭐ CPython never lets a hash be -1: that value is its "error" sentinel, so
   // `Py_hash_t` -1 is remapped to -2 on the way out of `__hash__`
   // (Objects/object.c, PyObject_Hash). A class whose `__hash__` returns -1
@@ -2587,16 +2573,9 @@ ModuleEmitter::emitInheritedObjectStr(const parser::Node &anchor,
   mlir::Type widened = types.widenLiteral(receiver.type);
   if (!inheritsObjectDefaultDunder(widened, "__str__"))
     return std::nullopt;
-  if (refuseUnresolvableDispatch(anchor, receiver, "__repr__"))
-    return emitNone(anchor);
-  if (std::optional<MethodBinding> repr =
-          lookupClassMethod(widened, "__repr__")) {
-    llvm::StringMap<Value> emptyKeywords;
-    Value bound = emitDescriptorReceiver(anchor, receiver, *repr);
-    return emitInlineMethodBody(anchor, bound,
-                                methodBindingBindsReceiver(*repr), *repr, {},
-                                emptyKeywords);
-  }
+  if (std::optional<Value> dispatched =
+          tryEmitClassDunder(anchor, receiver, "__repr__"))
+    return *dispatched;
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(widened, "__repr__", {});
   if (!inference)
@@ -2620,16 +2599,8 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   // text is a compile-time constant anyway.
   if (valueType == types.none())
     return emitStrLiteralPiece(anchor, "None");
-  if (refuseUnresolvableDispatch(anchor, value, "__str__"))
-    return emitNone(anchor);
-  if (std::optional<MethodBinding> method =
-          lookupClassMethod(valueType, "__str__")) {
-    llvm::StringMap<Value> emptyKeywords;
-    Value receiver = emitDescriptorReceiver(anchor, value, *method);
-    return emitInlineMethodBody(anchor, receiver,
-                                methodBindingBindsReceiver(*method), *method,
-                                {}, emptyKeywords);
-  }
+  if (std::optional<Value> dispatched = tryEmitClassDunder(anchor, value, "__str__"))
+    return *dispatched;
   // ⭐ An EXCEPTION is the one builtin whose str and repr differ: str is the
   // message, repr is `ClassName('message')`. Falling to __repr__ below gave
   // f-strings, format() and %s the repr:
@@ -2677,16 +2648,8 @@ std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &ancho
   // (CPython object.__str__ delegates to type(x).__repr__); the manifest
   // evidence below would instead resolve the generic object formatter,
   // which cannot see source methods.
-  if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
-    return emitNone(anchor);
-  if (std::optional<MethodBinding> method =
-          lookupClassMethod(valueType, "__repr__")) {
-    llvm::StringMap<Value> emptyKeywords;
-    Value receiver = emitDescriptorReceiver(anchor, value, *method);
-    return emitInlineMethodBody(anchor, receiver,
-                                methodBindingBindsReceiver(*method), *method,
-                                {}, emptyKeywords);
-  }
+  if (std::optional<Value> dispatched = tryEmitClassDunder(anchor, value, "__repr__"))
+    return *dispatched;
   // Non-str builtins render via __repr__ (str(x) == repr(x) for every
   // non-str builtin; __str__ evidence resolves for containers through the
   // object contract but the manifest only implements their __repr__).
@@ -2715,13 +2678,9 @@ ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
   std::optional<Value> repr;
   if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
     return emitNone(anchor);
-  if (std::optional<MethodBinding> method =
-          lookupClassMethod(valueType, "__repr__")) {
-    llvm::StringMap<Value> emptyKeywords;
-    Value receiver = emitDescriptorReceiver(anchor, value, *method);
-    repr = emitInlineMethodBody(anchor, receiver,
-                                methodBindingBindsReceiver(*method), *method,
-                                {}, emptyKeywords);
+  if (std::optional<Value> dispatched =
+          tryEmitClassDunder(anchor, value, "__repr__")) {
+    repr = *dispatched;
   } else if (CallInferenceResult inference =
                  types.inferMethodCallWithEvidence(valueType, "__repr__", {})) {
     Value receiver = coerceValue(value, valueType, anchor);
@@ -2759,11 +2718,14 @@ Value ModuleEmitter::emitFormatValue(const parser::Node &anchor, Value value,
   mlir::Type valueType = types.widenLiteral(value.type);
   if (refuseUnresolvableDispatch(anchor, value, "__format__"))
     return emitNone(anchor);
-  if (std::optional<MethodBinding> method =
-          lookupClassMethod(valueType, "__format__")) {
+  // The presence check precedes the gate so that the empty format spec is
+  // materialized only on the path that consumes it.
+  if (lookupClassMethod(valueType, "__format__")) {
     Value specValue =
         spec ? coerceValue(*spec, strType, anchor) : emitEmptyStrConstant(anchor);
-    return emitInlineOperatorCall(anchor, value, *method, {specValue});
+    if (std::optional<Value> formatted =
+            tryEmitClassDunder(anchor, value, "__format__", {specValue}))
+      return *formatted;
   }
   if (CallInferenceResult inference =
           types.inferMethodCallWithEvidence(valueType, "__format__",

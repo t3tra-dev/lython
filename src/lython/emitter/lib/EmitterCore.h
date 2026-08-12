@@ -569,6 +569,40 @@ private:
   Value emitInlineOperatorCall(const parser::Node &anchor, Value receiver,
                                const MethodBinding &method,
                                llvm::ArrayRef<Value> positional);
+  // ⭐ THE gate. Every operator, every builtin whose job is to call a dunder,
+  // and every protocol the emitter drives asks the receiver's SOURCE class
+  // first, and asks it here. py ops resolve their target against the runtime
+  // manifest, where a source class is not, so a site that forgets to ask
+  // reaches the lowering as "runtime manifest has no C.__x__ method" -- which
+  // is how __iter__, the unary dunders, abs/int/float/round/reversed,
+  // __call__ and __divmod__ each arrived as a separate defect.
+  //
+  // nullopt means "no source class provides it": the caller takes its
+  // manifest path. A value means the question is ANSWERED -- including the
+  // refusal, because a receiver whose subclass overrides the method cannot be
+  // dispatched from its static type and that is the answer.
+  // `refused` is for a caller in STATEMENT position, which has nothing to
+  // return: without it, `for x in b` over a subclass-overridden __iter__
+  // printed the refusal and then a second complaint about __next__ on the
+  // None the refusal handed back.
+  std::optional<Value> tryEmitClassDunder(const parser::Node &anchor,
+                                          Value receiver,
+                                          llvm::StringRef dunder,
+                                          llvm::ArrayRef<Value> positional = {},
+                                          bool *refused = nullptr);
+  // The same gate for the one dunder whose arguments are still AST: __call__
+  // takes the call node's own arguments, keywords and defaults included, so
+  // it cannot pre-build the operand list the other entry point takes.
+  std::optional<Value> tryEmitClassDunderCall(const parser::Node &call,
+                                              Value receiver,
+                                              llvm::StringRef dunder);
+  // Shared prologue of the two entry points above. nullopt with `refused`
+  // set means the diagnostic is already out and the caller must not fall
+  // through to its manifest path.
+  std::optional<MethodBinding> resolveClassDunder(const parser::Node &anchor,
+                                                  Value receiver,
+                                                  llvm::StringRef dunder,
+                                                  bool &refused);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
   Value emitInlineMethodBody(const parser::Node &anchor, Value receiver,

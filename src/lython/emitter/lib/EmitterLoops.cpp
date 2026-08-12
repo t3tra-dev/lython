@@ -563,9 +563,14 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   Value methodIterable = concreteIterable.value ? concreteIterable : iterable;
   Value iteratorValue;
   mlir::Type iteratorType;
-  if (std::optional<MethodBinding> sourceIter =
-          lookupClassMethod(methodIterable.type, "__iter__")) {
-    iteratorValue = emitInlineMethodCall(statement, methodIterable, *sourceIter);
+  bool iterRefused = false;
+  std::optional<Value> sourceIterator =
+      tryEmitClassDunder(statement, methodIterable, "__iter__", {},
+                         &iterRefused);
+  if (iterRefused)
+    return;
+  if (sourceIterator) {
+    iteratorValue = *sourceIterator;
     iteratorType = iteratorValue.type;
   } else {
     CallInferenceResult iterInference =

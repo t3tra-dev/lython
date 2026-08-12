@@ -2442,6 +2442,45 @@ ModuleEmitter::tryEmitSuperCall(const parser::Node &expr,
                 std::string(*methodName) + "'");
 }
 
+std::optional<MethodBinding>
+ModuleEmitter::resolveClassDunder(const parser::Node &anchor, Value receiver,
+                                  llvm::StringRef dunder, bool &refused) {
+  refused = refuseUnresolvableDispatch(anchor, receiver, dunder);
+  if (refused)
+    return std::nullopt;
+  return lookupClassMethod(types.widenLiteral(receiver.type), dunder);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitClassDunder(const parser::Node &anchor, Value receiver,
+                                  llvm::StringRef dunder,
+                                  llvm::ArrayRef<Value> positional,
+                                  bool *refusedOut) {
+  bool refused = false;
+  std::optional<MethodBinding> method =
+      resolveClassDunder(anchor, receiver, dunder, refused);
+  if (refusedOut)
+    *refusedOut = refused;
+  if (refused)
+    return emitNone(anchor);
+  if (!method)
+    return std::nullopt;
+  return emitInlineOperatorCall(anchor, receiver, *method, positional);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitClassDunderCall(const parser::Node &call, Value receiver,
+                                      llvm::StringRef dunder) {
+  bool refused = false;
+  std::optional<MethodBinding> method =
+      resolveClassDunder(call, receiver, dunder, refused);
+  if (refused)
+    return emitNone(call);
+  if (!method)
+    return std::nullopt;
+  return emitInlineMethodCall(call, receiver, *method);
+}
+
 Value ModuleEmitter::emitInlineOperatorCall(const parser::Node &anchor,
                                             Value receiver,
                                             const MethodBinding &method,
