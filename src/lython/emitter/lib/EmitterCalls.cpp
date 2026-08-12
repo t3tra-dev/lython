@@ -220,6 +220,70 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           emitPrimitiveRuntimeCall(expr, calleeNode))
     return *primitive;
 
+  // ⭐ A generator expression handed to a METHOD is materialized. The lazy
+  // spellings all belong to name callees -- the reducers fuse it into an
+  // accumulator loop, the container constructors into their build loop, and
+  // a for-loop iterable into nested loops -- and those folds run below on
+  // the unrewritten node. A method is a manifest native: it consumes the
+  // whole iterable at the call, so a list is what it would have made anyway.
+  // `"-".join(str(v) for v in xs)` was "unsupported expression kind
+  // 'GeneratorExp'" followed by "builtins.str does not provide manifest
+  // method 'join'" -- the argument had no type for the overload to match.
+  //
+  // A call to one of the lazy builtin iterators is materialized for the same
+  // reason and by the same rule: `" ".join(map(str, xs))` handed the manifest
+  // join a synthesized generator and died in the lowering. `list(...)` around
+  // it is the spelling that already works.
+  auto lazyArgument = [&](const parser::NodePtr &arg) {
+    if (!arg || arg->kind != "Call")
+      return false;
+    const parser::Node *func = ast::node(*arg, "func");
+    if (!func || func->kind != "Name")
+      return false;
+    llvm::StringRef name = ast::nameSpelling(*func);
+    return (name == "zip" || name == "enumerate" || name == "map" ||
+            name == "filter" || name == "reversed") &&
+           isBuiltinIteratorName(name);
+  };
+  if (calleeNode && calleeNode->kind == "Attribute")
+    if (const auto *args = ast::nodeList(expr, "args");
+        args && llvm::any_of(*args, [&](const parser::NodePtr &arg) {
+          return (arg && arg->kind == "GeneratorExp") || lazyArgument(arg);
+        })) {
+      parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+      if (const parser::Field *func = parser::findField(expr, "func"))
+        rewritten->fields.push_back(*func);
+      std::vector<parser::NodePtr> rewrittenArgs;
+      for (const parser::NodePtr &arg : *args) {
+        if (arg && arg->kind == "GeneratorExp") {
+          parser::NodePtr materialized =
+              parser::makeNode("ListComp", arg->range);
+          for (const parser::Field &field : arg->fields)
+            materialized->fields.push_back(field);
+          rewrittenArgs.push_back(std::move(materialized));
+          continue;
+        }
+        if (lazyArgument(arg)) {
+          parser::NodePtr listName = parser::makeNode("Name", arg->range);
+          parser::addField(*listName, "id", std::string("list"));
+          parser::NodePtr materialized =
+              parser::makeNode("Call", arg->range);
+          parser::addField(*materialized, "func", std::move(listName));
+          parser::addField(*materialized, "args",
+                           std::vector<parser::NodePtr>{arg});
+          parser::addField(*materialized, "keywords",
+                           std::vector<parser::NodePtr>{});
+          rewrittenArgs.push_back(std::move(materialized));
+          continue;
+        }
+        rewrittenArgs.push_back(arg);
+      }
+      parser::addField(*rewritten, "args", std::move(rewrittenArgs));
+      if (const parser::Field *keywords = parser::findField(expr, "keywords"))
+        rewritten->fields.push_back(*keywords);
+      return emitCall(*rewritten);
+    }
+
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))
