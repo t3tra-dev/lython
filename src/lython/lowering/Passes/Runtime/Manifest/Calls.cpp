@@ -146,7 +146,17 @@ mlir::LogicalResult RuntimeBundleLowerer::bindRuntimeCallResult(
                            << " needs a concrete manifest result contract";
 
   RuntimeBundle result;
+  // ⭐ Keep the TYPE ARGUMENTS the op's own result already carries.
+  // resultContractFor answers with a contract NAME, and rebuilding a type
+  // from a name drops the parameters: `xs.copy()` came out of the manifest as
+  // a bare `builtins.list` even though the call op says
+  // `list[int]`, and storing that into a declared `list[int]` field was
+  // "attribute value builtins.list is not assignable to field
+  // builtins.list<int>". Same for `xs + ys` and `xs * n`, whose manifest
+  // result_contract is also the bare name.
   mlir::Type resultType = runtimeContractType(context, resultContract);
+  if (runtimeContractName(resultValue.getType()) == resultContract)
+    resultType = resultValue.getType();
   if (mlir::failed(RuntimeBundleLowerer::bindRuntimeCallBundle(
           op, resultType, emitted, receiverEvidence, result)))
     return mlir::failure();
