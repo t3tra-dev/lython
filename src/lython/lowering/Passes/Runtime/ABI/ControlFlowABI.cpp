@@ -548,7 +548,25 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
             branch.getSuccessorOperands(successor);
         if (operands.getProducedOperandCount() != 0 || index >= operands.size())
           continue;
-        mlir::Value logicalSource = operands[index];
+        // ⛔ KNOWN DEFECT, measured: the edge operand is taken at the block
+    // argument's OWN index, which holds only while the block and its edges
+    // are expanded in lockstep. A generator whose for-loop precedes a yield
+    //
+    //     def f(n: int) -> Iterator[int]:
+    //         total = 0
+    //         for i in range(n):
+    //             total = total + i
+    //         yield total
+    //
+    // reaches here for a logical `builtins.int` argument and finds a
+    // `memref<5xi64>` (the range iterator's physical) at that index --
+    // "control-flow branch operand has no lowered runtime bundle", because a
+    // physical value has no bundle to find. The resume clone's continuation
+    // blocks get their arguments from the state machine, not from this
+    // expansion, so the two sides are not appended in the same order. The
+    // same shape with the yield INSIDE the loop, and the same loop in a
+    // non-generator function, are both fine.
+    mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
         // Membership alone is conclusive: the set holds only values THIS
@@ -626,7 +644,24 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
                                                candidate);
       })) {
     RuntimeBundle &merged = valueBundles[argument];
+    // ⭐ The block argument keeps its OWN primitive lane. copyEvidenceFrom
+    // assigns the source's (`primitiveI64 = source.primitiveI64`), and the
+    // source's lane is an SSA pair defined in a PREDECESSOR -- for a merge
+    // it does not even dominate here. Inside a primitive-i64 clone the lane
+    // is the whole carrier for an int, so importing an absent one erased it:
+    // a generator's `for i in range(n): yield i` reached the yield with an
+    // int bundle holding neither physicals nor a lane ("generator int yield
+    // lane has neither physical values nor primitive evidence"), and so did
+    // any for-loop preceding a yield in the same body.
+    //
+    // ⛔ Why NOT drop the import entirely: a destination with no lane of its
+    // own has nothing to lose, and that is where the transfer was doing its
+    // work. Only a lane the ABI already created for this argument is
+    // protected.
+    std::optional<RuntimePrimitiveI64Evidence> ownLane = merged.primitiveI64;
     merged.copyEvidenceFrom(sourceBundles.front());
+    if (ownLane)
+      merged.primitiveI64 = ownLane;
     // Same physical identity does not imply same compile-time knowledge: an
     // arm may have recorded element/field evidence whose SSA values the other
     // arm never defines. Keeping the first arm's version would answer that
