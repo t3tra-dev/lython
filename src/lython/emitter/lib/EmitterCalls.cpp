@@ -918,6 +918,21 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
+  // ⭐ Calling an INSTANCE calls its class's __call__. py.call resolves its
+  // target against the runtime manifest, so `v(2)` over a class that defines
+  // __call__ died in the lowering as "runtime manifest has no V.__call__
+  // method" -- the same repair __iter__ and the unary dunders needed. The
+  // inline form reads the arguments from this call node, which is what a
+  // __call__ takes.
+  if (calleeNode)
+    if (auto calleeContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(types.inferExpr(calleeNode))))
+      if (std::optional<MethodBinding> sourceCall =
+              lookupClassMethod(calleeContract, "__call__")) {
+        Value receiver = emitExpr(calleeNode);
+        return emitInlineMethodCall(expr, receiver, *sourceCall);
+      }
+
   // The callee is emitted before the operands on purpose: Python evaluates
   // the callee first, and its Callable contract is the expectation the
   // argument emission distributes (lambda parameters, empty literals).
