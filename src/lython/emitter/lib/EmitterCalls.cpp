@@ -1604,8 +1604,17 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       return Value{result, resultType};
     }
   }
+  // ⭐ `key=` rides the SAME loop: one more carried accumulator holding the
+  // best key, compared in place of the element. CPython's builtin_max does
+  // exactly that (keyfunc applied once per item, the item kept). It was
+  // refused for an argument shape the fold could take with one extra slot.
+  const parser::Node *reducerKeyNode = nullptr;
+  if ((reducer == "max" || reducer == "min") && reducerKeywords &&
+      reducerKeywords->size() == 1 && reducerKeywords->front() &&
+      ast::string(*reducerKeywords->front(), "arg").value_or("") == "key")
+    reducerKeyNode = ast::node(*reducerKeywords->front(), "value");
   if (reducerArgs && reducerArgs->size() == 1 && reducerArgs->front() &&
-      (!reducerKeywords || reducerKeywords->empty()) &&
+      (!reducerKeywords || reducerKeywords->empty() || reducerKeyNode) &&
       (reducer == "max" || reducer == "min")) {
     mlir::Type elementType = reducerElementType();
     auto contract =
@@ -1629,6 +1638,62 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
                         builder, loc(expr), elementType,
                         builder.getF64FloatAttr(0.0))
                         .getResult();
+    }
+    // The key accumulator needs its own placeholder, on the same terms.
+    mlir::Value keyPlaceholder;
+    if (placeholder && reducerKeyNode) {
+      mlir::Type keyType;
+      {
+        auto scope = types.pushScope();
+        types.bindLocalSymbol("__lykeyprobe", elementType);
+        parser::NodePtr probeArg = parser::makeNode("Name", expr.range);
+        parser::addField(*probeArg, "id", std::string("__lykeyprobe"));
+        parser::NodePtr probe = parser::makeNode("Call", expr.range);
+        parser::addField(*probe, "func",
+                         std::get<parser::NodePtr>(
+                             parser::findField(*reducerKeywords->front(),
+                                               "value")
+                                 ->value));
+        parser::addField(*probe, "args",
+                         std::vector<parser::NodePtr>{std::move(probeArg)});
+        parser::addField(*probe, "keywords", std::vector<parser::NodePtr>{});
+        keyType = types.widenLiteral(types.inferExpr(probe.get()));
+      }
+      auto keyContract = mlir::dyn_cast_if_present<py::ContractType>(keyType);
+      llvm::StringRef keyName =
+          keyContract ? keyContract.getContractName() : llvm::StringRef();
+      if (keyName == "builtins.int")
+        keyPlaceholder = py::IntConstantOp::create(
+                             builder, loc(expr), types.literal("0"),
+                             builder.getStringAttr("0"))
+                             .getResult();
+      else if (keyName == "builtins.str")
+        keyPlaceholder = py::StrConstantOp::create(
+                             builder, loc(expr), types.literal("\"\""),
+                             builder.getStringAttr(""))
+                             .getResult();
+      else if (keyName == "builtins.float")
+        keyPlaceholder = py::FloatConstantOp::create(
+                             builder, loc(expr), keyType,
+                             builder.getF64FloatAttr(0.0))
+                             .getResult();
+      if (!keyPlaceholder) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            keyType ? reducer.str() +
+                          "() with a key needs an int/str/float key; this one "
+                          "produces " +
+                          [&] {
+                            std::string text;
+                            llvm::raw_string_ostream stream(text);
+                            stream << keyType;
+                            return text;
+                          }()
+                    : reducer.str() +
+                          "() cannot see what its key returns; give the key "
+                          "function a return annotation"});
+        return emitNone(expr);
+      }
     }
     if (!placeholder) {
       // max()/min() over an EMPTY literal always raises: emit the
@@ -1690,25 +1755,48 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       parser::addField(*node, "id", id);
       return node;
     };
+    std::string keyAcc = "__" + reducer.str() + "key" +
+                         std::to_string(listCompCounter);
+    std::string keyOfElement =
+        "__" + reducer.str() + "k" + std::to_string(listCompCounter);
+    if (keyPlaceholder) {
+      values[keyAcc] = Value{keyPlaceholder, keyPlaceholder.getType()};
+      types.bindSymbol(keyAcc, keyPlaceholder.getType());
+    }
     parser::NodePtr tmpName = nameNode(tmp);
     parser::NodePtr flagName = nameNode(flag);
     parser::NodePtr elementName = nameNode(element);
+    parser::NodePtr keyAccName = nameNode(keyAcc);
+    parser::NodePtr keyName = nameNode(keyOfElement);
     // if __seen: (if el >/< __acc: __acc = el) else: __acc = el; __seen = True
+    // With a key the compared operands are the KEYS and both accumulators
+    // move together; the key is computed once per element, above the switch.
     parser::NodePtr assignAcc = parser::makeNode("Assign", expr.range);
     parser::addField(*assignAcc, "targets",
                      std::vector<parser::NodePtr>{tmpName});
     parser::addField(*assignAcc, "value", elementName);
+    parser::NodePtr assignKeyAcc;
+    if (reducerKeyNode) {
+      assignKeyAcc = parser::makeNode("Assign", expr.range);
+      parser::addField(*assignKeyAcc, "targets",
+                       std::vector<parser::NodePtr>{keyAccName});
+      parser::addField(*assignKeyAcc, "value", keyName);
+    }
     parser::NodePtr cmpOp = parser::makeNode(
         reducer == "max" ? "Gt" : "Lt", expr.range);
     parser::NodePtr compare = parser::makeNode("Compare", expr.range);
-    parser::addField(*compare, "left", elementName);
+    parser::addField(*compare, "left",
+                     reducerKeyNode ? keyName : elementName);
     parser::addField(*compare, "ops", std::vector<parser::NodePtr>{cmpOp});
     parser::addField(*compare, "comparators",
-                     std::vector<parser::NodePtr>{tmpName});
+                     std::vector<parser::NodePtr>{
+                         reducerKeyNode ? keyAccName : tmpName});
+    std::vector<parser::NodePtr> betterBody{assignAcc};
+    if (assignKeyAcc)
+      betterBody.push_back(assignKeyAcc);
     parser::NodePtr better = parser::makeNode("If", expr.range);
     parser::addField(*better, "test", compare);
-    parser::addField(*better, "body",
-                     std::vector<parser::NodePtr>{assignAcc});
+    parser::addField(*better, "body", std::move(betterBody));
     parser::addField(*better, "orelse", std::vector<parser::NodePtr>{});
     parser::NodePtr trueValue = parser::makeNode("Constant", expr.range);
     parser::addField(*trueValue, "value", std::int64_t{1});
@@ -1729,17 +1817,37 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
                        std::vector<parser::NodePtr>{zero});
       return compare;
     };
+    std::vector<parser::NodePtr> firstBody{assignAcc};
+    if (assignKeyAcc)
+      firstBody.push_back(assignKeyAcc);
+    firstBody.push_back(markSeen);
     parser::NodePtr seenSwitch = parser::makeNode("If", expr.range);
     parser::addField(*seenSwitch, "test", flagCompare("NotEq"));
     parser::addField(*seenSwitch, "body",
                      std::vector<parser::NodePtr>{better});
-    parser::addField(*seenSwitch, "orelse",
-                     std::vector<parser::NodePtr>{assignAcc, markSeen});
+    parser::addField(*seenSwitch, "orelse", std::move(firstBody));
+    std::vector<parser::NodePtr> loopBody;
+    if (reducerKeyNode) {
+      parser::NodePtr keyCall = parser::makeNode("Call", expr.range);
+      parser::addField(*keyCall, "func",
+                       std::get<parser::NodePtr>(
+                           parser::findField(*reducerKeywords->front(),
+                                             "value")
+                               ->value));
+      parser::addField(*keyCall, "args",
+                       std::vector<parser::NodePtr>{elementName});
+      parser::addField(*keyCall, "keywords", std::vector<parser::NodePtr>{});
+      parser::NodePtr bindKey = parser::makeNode("Assign", expr.range);
+      parser::addField(*bindKey, "targets",
+                       std::vector<parser::NodePtr>{keyName});
+      parser::addField(*bindKey, "value", std::move(keyCall));
+      loopBody.push_back(std::move(bindKey));
+    }
+    loopBody.push_back(seenSwitch);
     parser::NodePtr loop = parser::makeNode("For", expr.range);
     parser::addField(*loop, "target", elementName);
     parser::addField(*loop, "iter", reducerArgs->front());
-    parser::addField(*loop, "body",
-                     std::vector<parser::NodePtr>{seenSwitch});
+    parser::addField(*loop, "body", std::move(loopBody));
     parser::addField(*loop, "orelse", std::vector<parser::NodePtr>{});
     // if __seen == 0: raise ValueError("max()/min() iterable argument is
     // empty")
@@ -1776,6 +1884,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     Value result = built->second;
     values.erase(tmp);
     values.erase(flag);
+    values.erase(keyAcc);
+    values.erase(keyOfElement);
     if (priorElement)
       values[element] = *priorElement;
     else

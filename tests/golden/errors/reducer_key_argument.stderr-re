@@ -1,1 +1,1 @@
-min\(\) with the 'key' keyword argument is not supported
+min\(\) with a key needs an int/str/float key

@@ -41,3 +41,24 @@ def floats() -> None:
 
 
 floats()
+
+
+# key= rides the same loop as one more carried accumulator, the way CPython's
+# builtin_max does it: the key function is applied once per item and the ITEM
+# is what is kept. Ties keep the first, which is the strict comparison.
+def keyed() -> None:
+    words = ["bb", "a", "ccc"]
+    print(max(words, key=len), min(words, key=len))
+    print(max(["ab", "cd"], key=len), min(["ab", "cd"], key=len))
+
+    def neg(v: int) -> int:
+        return -v
+
+    print(max([3, 1, 2], key=neg), min([3, 1, 2], key=neg))
+    try:
+        print(max([], key=len))
+    except ValueError as err:
+        print(err)
+
+
+keyed()
