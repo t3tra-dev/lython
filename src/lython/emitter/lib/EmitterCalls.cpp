@@ -1294,11 +1294,13 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     for (const parser::NodePtr &argument : *printArgs)
       evaluated.push_back(emitExpr(argument.get()));
     bool allConverted = true;
+    std::size_t unconverted = 0;
     Value joined;
     for (auto [index, value] : llvm::enumerate(evaluated)) {
       std::optional<Value> piece = emitStringifyValue(expr, value);
       if (!piece) {
         allConverted = false;
+        unconverted = index;
         break;
       }
       if (index == 0) {
@@ -1320,8 +1322,23 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
           emitCallOperands(expr, {joined}, /*includeAstArguments=*/false);
       return emitCallableDispatch(expr, printCallee, operands);
     }
-    // Fall through: the lowering reports the single-argument restriction
-    // for arguments without __str__ evidence.
+    // ⭐ With ONE argument, falling through is right: the lowering reports
+    // what is wrong with that argument (an unnarrowed union says so by
+    // name). With more, the fall-through lands on the manifest print, whose
+    // arity is one, and the report became "builtin callable 'print' expects
+    // exactly one positional argument" -- the argument count is not the
+    // problem, and the count is the only thing that message mentions.
+    if (evaluated.size() > 1) {
+      std::string described;
+      llvm::raw_string_ostream stream(described);
+      stream << evaluated[unconverted].type;
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "print() cannot render argument " + std::to_string(unconverted + 1) +
+              " of type " + described +
+              ": it has no __str__ or __repr__ this dispatch can resolve"});
+      return emitNone(expr);
+    }
   }
   return std::nullopt;
 }
