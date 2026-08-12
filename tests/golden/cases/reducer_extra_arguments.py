@@ -62,3 +62,20 @@ def keyed() -> None:
 
 
 keyed()
+
+
+# The accumulator needs a value of the element type before the first trip, and
+# the seen-flag is what keeps it from ever being READ -- so only its TYPE has
+# to be right. A tuple gets one member-wise: a uniform `tuple[T]` has lost its
+# arity, but a one-element `(t,)` has exactly that type. `max(rows)` over
+# tuples was refused for a comparison the tuple contract already implements --
+# sorted() orders the same rows.
+def tuples() -> None:
+    rows = [("b", 2), ("a", 1), ("c", 1)]
+    print(max(rows), min(rows))
+    pairs = [(1, 2), (1, 3)]
+    print(max(pairs), min(pairs))
+    print(max([(1, 2)]), min([(1, 2)]))
+
+
+tuples()

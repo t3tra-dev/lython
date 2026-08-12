@@ -8,6 +8,8 @@
 
 #include "AstAccess.h"
 
+#include <functional>
+
 #include "llvm/ADT/ScopeExit.h"
 #include "EmitterOps.h"
 
@@ -1621,24 +1623,52 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         mlir::dyn_cast_if_present<py::ContractType>(elementType);
     llvm::StringRef contractName =
         contract ? contract.getContractName() : llvm::StringRef();
-    mlir::Value placeholder;
-    if (contractName == "builtins.int") {
-      placeholder = py::IntConstantOp::create(builder, loc(expr),
-                                              types.literal("0"),
-                                              builder.getStringAttr("0"))
-                        .getResult();
-    } else if (contractName == "builtins.str") {
-      placeholder =
-          py::StrConstantOp::create(builder, loc(expr),
-                                    types.literal("\"\""),
-                                    builder.getStringAttr(""))
-              .getResult();
-    } else if (contractName == "builtins.float") {
-      placeholder = py::FloatConstantOp::create(
-                        builder, loc(expr), elementType,
-                        builder.getF64FloatAttr(0.0))
-                        .getResult();
-    }
+    // The accumulator needs a value of the element type before the first
+    // trip; the seen-flag is what keeps it from ever being READ, so only its
+    // TYPE has to be right.
+    //
+    // ⭐ A tuple gets one member-wise: a uniform `tuple[T]` has lost its
+    // arity, but a one-element `(t,)` has exactly that type, and the arity
+    // never matters because the value is unread. `max(rows)` over
+    // `list[tuple[str, int]]` was refused for a comparison the tuple contract
+    // already implements -- sorted() orders the same rows.
+    std::function<mlir::Value(mlir::Type)> placeholderFor =
+        [&](mlir::Type type) -> mlir::Value {
+      auto contractType = mlir::dyn_cast_if_present<py::ContractType>(type);
+      if (!contractType)
+        return {};
+      llvm::StringRef name = contractType.getContractName();
+      if (name == "builtins.int")
+        return py::IntConstantOp::create(builder, loc(expr),
+                                         types.literal("0"),
+                                         builder.getStringAttr("0"))
+            .getResult();
+      if (name == "builtins.str")
+        return py::StrConstantOp::create(builder, loc(expr),
+                                         types.literal("\"\""),
+                                         builder.getStringAttr(""))
+            .getResult();
+      if (name == "builtins.float")
+        return py::FloatConstantOp::create(builder, loc(expr), type,
+                                           builder.getF64FloatAttr(0.0))
+            .getResult();
+      if (name == "builtins.bool")
+        return py::BoolConstantOp::create(builder, loc(expr),
+                                          types.literal("False"),
+                                          builder.getBoolAttr(false))
+            .getResult();
+      if (name != "builtins.tuple" || contractType.getArguments().empty())
+        return {};
+      llvm::SmallVector<mlir::Value, 4> members;
+      for (mlir::Type member : contractType.getArguments()) {
+        mlir::Value part = placeholderFor(member);
+        if (!part)
+          return {};
+        members.push_back(part);
+      }
+      return py::PackOp::create(builder, loc(expr), type, members).getResult();
+    };
+    mlir::Value placeholder = placeholderFor(elementType);
     // The key accumulator needs its own placeholder, on the same terms.
     mlir::Value keyPlaceholder;
     if (placeholder && reducerKeyNode) {
@@ -1659,30 +1689,13 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         parser::addField(*probe, "keywords", std::vector<parser::NodePtr>{});
         keyType = types.widenLiteral(types.inferExpr(probe.get()));
       }
-      auto keyContract = mlir::dyn_cast_if_present<py::ContractType>(keyType);
-      llvm::StringRef keyName =
-          keyContract ? keyContract.getContractName() : llvm::StringRef();
-      if (keyName == "builtins.int")
-        keyPlaceholder = py::IntConstantOp::create(
-                             builder, loc(expr), types.literal("0"),
-                             builder.getStringAttr("0"))
-                             .getResult();
-      else if (keyName == "builtins.str")
-        keyPlaceholder = py::StrConstantOp::create(
-                             builder, loc(expr), types.literal("\"\""),
-                             builder.getStringAttr(""))
-                             .getResult();
-      else if (keyName == "builtins.float")
-        keyPlaceholder = py::FloatConstantOp::create(
-                             builder, loc(expr), keyType,
-                             builder.getF64FloatAttr(0.0))
-                             .getResult();
+      keyPlaceholder = placeholderFor(keyType);
       if (!keyPlaceholder) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, expr.range.start,
             keyType ? reducer.str() +
-                          "() with a key needs an int/str/float key; this one "
-                          "produces " +
+                          "() needs a key the fold can seed (int, str, float, "
+                          "bool, or a tuple of those); this one produces " +
                           [&] {
                             std::string text;
                             llvm::raw_string_ostream stream(text);
@@ -1731,7 +1744,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
           reducer.str() +
-              "() requires int/str/float iterable element evidence"});
+              "() needs an element type the fold can seed (int, str, float, "
+              "bool, or a tuple of those)"});
       return emitNone(expr);
     }
     std::string tmp =

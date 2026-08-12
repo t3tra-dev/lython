@@ -18,3 +18,6 @@ ccc a
 ab ab
 1 3
 max() iterable argument is empty
+('c', 1) ('a', 1)
+(1, 3) (1, 2)
+(1, 2) (1, 2)
