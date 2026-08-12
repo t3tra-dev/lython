@@ -536,6 +536,53 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
                         types.contract("builtins.str"))
       return emitPercentFormat(expr);
   }
+  // ⭐ A set operator answers the LEFT operand's type: CPython runs the
+  // left's __or__, which builds its own kind, so `frozenset | set` is a
+  // frozenset and `set | frozenset` is a set. The two kinds are different
+  // headers here (11 words against 13), so the mixed pair had no operator at
+  // all -- `sorted(f | {3})` was refused for a value that is an ordinary
+  // frozenset at run time. Converting the right operand to the left's kind
+  // is the same result, computed by the operator that already exists.
+  if (const parser::Node *setOp = ast::node(expr, "op");
+      ast::isOperator(setOp, "BitOr") || ast::isOperator(setOp, "BitAnd") ||
+      ast::isOperator(setOp, "BitXor") || ast::isOperator(setOp, "Sub")) {
+    auto setKind = [&](const parser::Node *side) -> llvm::StringRef {
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(side)));
+      if (!contract)
+        return {};
+      llvm::StringRef name = contract.getContractName();
+      return name == "builtins.set" || name == "builtins.frozenset"
+                 ? name
+                 : llvm::StringRef();
+    };
+    const parser::Node *leftNode = ast::node(expr, "left");
+    const parser::Node *rightNode = ast::node(expr, "right");
+    llvm::StringRef leftKind = setKind(leftNode);
+    llvm::StringRef rightKind = setKind(rightNode);
+    if (!leftKind.empty() && !rightKind.empty() && leftKind != rightKind) {
+      const parser::Field *rightField = parser::findField(expr, "right");
+      if (rightField &&
+          std::holds_alternative<parser::NodePtr>(rightField->value)) {
+        parser::NodePtr converter = parser::makeNode("Name", expr.range);
+        parser::addField(*converter, "id",
+                         leftKind.rsplit('.').second.str());
+        parser::NodePtr call = parser::makeNode("Call", expr.range);
+        parser::addField(*call, "func", std::move(converter));
+        parser::addField(*call, "args",
+                         std::vector<parser::NodePtr>{
+                             std::get<parser::NodePtr>(rightField->value)});
+        parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+        parser::NodePtr rewritten = parser::makeNode("BinOp", expr.range);
+        if (const parser::Field *leftField = parser::findField(expr, "left"))
+          rewritten->fields.push_back(*leftField);
+        if (const parser::Field *opField = parser::findField(expr, "op"))
+          rewritten->fields.push_back(*opField);
+        parser::addField(*rewritten, "right", std::move(call));
+        return emitBinary(*rewritten);
+      }
+    }
+  }
   Value lhs = emitExpr(ast::node(expr, "left"));
   Value rhs = emitExpr(ast::node(expr, "right"));
   const parser::Node *op = ast::node(expr, "op");

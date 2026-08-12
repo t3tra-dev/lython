@@ -2486,6 +2486,26 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       method = "__xor__";
     else if (ast::isOperator(op, "Pow"))
       method = "__pow__";
+    // ⭐ A set operator answers the LEFT operand's type: CPython runs the
+    // left's __or__, which builds its own kind, so `frozenset | set` is a
+    // frozenset and `set | frozenset` is a set. The manifest declares the
+    // parameter as the other kind too, and the solution joined the two into
+    // the union `frozenset | set` -- which nothing downstream accepts, so
+    // `sorted(f | {3})` was refused for a value that is an ordinary
+    // frozenset at run time.
+    {
+      auto setKind = [&](mlir::Type type) {
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+        if (!contract)
+          return false;
+        llvm::StringRef name = contract.getContractName();
+        return name == "builtins.set" || name == "builtins.frozenset";
+      };
+      if (setKind(left) && setKind(right) && left != right &&
+          (method == "__or__" || method == "__and__" || method == "__xor__" ||
+           method == "__sub__"))
+        return left;
+    }
     // int ** compile-time negative int types as float (CPython; the emitter
     // desugars it to float(base) ** float(exponent)). Exponents beyond the
     // double range keep the int path, matching the emitter's fallback.
