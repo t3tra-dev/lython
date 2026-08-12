@@ -1995,6 +1995,33 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       };
       if (isSimpleName(name))
         return annotationTypeForName(name);
+      // ⭐ A union of simple names resolves on the same terms. Every class it
+      // can name is predeclared before bodies are typed, which is what makes
+      // the simple-name case need no second pass -- splitting on `|` does not
+      // change that. `self.next: "Node | None" = None` is how a
+      // self-referential node type is spelled (the class is not bound yet at
+      // its own body, so the annotation MUST be a string), and it was refused
+      // while the unquoted `int | None` resolved one line away.
+      if (name.contains('|')) {
+        llvm::SmallVector<llvm::StringRef, 4> members;
+        name.split(members, '|');
+        llvm::SmallVector<mlir::Type, 4> resolved;
+        bool everyMemberSimple = !members.empty();
+        for (llvm::StringRef member : members) {
+          member = member.trim();
+          if (member == "None") {
+            resolved.push_back(none());
+            continue;
+          }
+          if (!isSimpleName(member)) {
+            everyMemberSimple = false;
+            break;
+          }
+          resolved.push_back(annotationTypeForName(member));
+        }
+        if (everyMemberSimple)
+          return py::UnionType::getNormalized(&context, resolved);
+      }
       parser::Diagnostic diagnostic{
           parser::Severity::Error, node->range.start,
           "string annotation \"" + name.str() +
