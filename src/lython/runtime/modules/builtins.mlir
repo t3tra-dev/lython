@@ -4937,6 +4937,11 @@ module attributes {
   memref.global "private" constant @__ly_bytes_msg_subsection_not_found : memref<20xi8> = dense<[115, 117, 98, 115, 101, 99, 116, 105, 111, 110, 32, 110, 111, 116, 32, 102, 111, 117, 110, 100]>
   // "non-hexadecimal number found in fromhex() arg at position "
   memref.global "private" constant @__ly_bytes_msg_fromhex : memref<58xi8> = dense<[110, 111, 110, 45, 104, 101, 120, 97, 100, 101, 99, 105, 109, 97, 108, 32, 110, 117, 109, 98, 101, 114, 32, 102, 111, 117, 110, 100, 32, 105, 110, 32, 102, 114, 111, 109, 104, 101, 120, 40, 41, 32, 97, 114, 103, 32, 97, 116, 32, 112, 111, 115, 105, 116, 105, 111, 110, 32]>
+  // "fromhex() arg must contain an even number of hexadecimal digits" --
+  // CPython's OTHER fromhex message: an odd digit count is not a bad
+  // character at any position, and reporting it as one pointed past the end
+  // of the string for `bytes.fromhex("abc")`.
+  memref.global "private" constant @__ly_bytes_msg_fromhex_odd : memref<63xi8> = dense<[102, 114, 111, 109, 104, 101, 120, 40, 41, 32, 97, 114, 103, 32, 109, 117, 115, 116, 32, 99, 111, 110, 116, 97, 105, 110, 32, 97, 110, 32, 101, 118, 101, 110, 32, 110, 117, 109, 98, 101, 114, 32, 111, 102, 32, 104, 101, 120, 97, 100, 101, 99, 105, 109, 97, 108, 32, 100, 105, 103, 105, 116, 115]>
 
   // ASCII-insensitive equality of a str operand against an ASCII literal:
   // encoding/error-handler names are latin-1 width by construction.
@@ -5718,14 +5723,23 @@ module attributes {
     %has_bad = arith.cmpi sge, %bad_final, %zero : i64
     scf.if %has_bad {
       %class_id = arith.constant 53 : i64
-      %length = arith.constant 58 : i64
-      %static = memref.get_global @__ly_bytes_msg_fromhex : memref<58xi8>
-      %message = memref.cast %static : memref<58xi8> to memref<?xi8>
-      %prefix_h, %prefix_b = func.call @LyUnicode_FromBytes(%message, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-      %pos_h, %pos_b = func.call @LyUnicode_FromI64(%bad_final) : (i64) -> (memref<2xi64>, memref<?xi8>)
-      %msg_h, %msg_b = func.call @LyUnicode_Concat(%prefix_h, %prefix_b, %pos_h, %pos_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
-      func.call @LyUnicode_DecRef(%prefix_h) : (memref<2xi64>) -> ()
-      func.call @LyUnicode_DecRef(%pos_h) : (memref<2xi64>) -> ()
+      %msg_h, %msg_b = scf.if %odd_bad -> (memref<2xi64>, memref<?xi8>) {
+        %odd_length = arith.constant 63 : i64
+        %odd_static = memref.get_global @__ly_bytes_msg_fromhex_odd : memref<63xi8>
+        %odd_message = memref.cast %odd_static : memref<63xi8> to memref<?xi8>
+        %odd_h, %odd_b = func.call @LyUnicode_FromBytes(%odd_message, %c0, %odd_length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %odd_h, %odd_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %length = arith.constant 58 : i64
+        %static = memref.get_global @__ly_bytes_msg_fromhex : memref<58xi8>
+        %message = memref.cast %static : memref<58xi8> to memref<?xi8>
+        %prefix_h, %prefix_b = func.call @LyUnicode_FromBytes(%message, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %pos_h, %pos_b = func.call @LyUnicode_FromI64(%bad_final) : (i64) -> (memref<2xi64>, memref<?xi8>)
+        %joined_h, %joined_b = func.call @LyUnicode_Concat(%prefix_h, %prefix_b, %pos_h, %pos_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        func.call @LyUnicode_DecRef(%prefix_h) : (memref<2xi64>) -> ()
+        func.call @LyUnicode_DecRef(%pos_h) : (memref<2xi64>) -> ()
+        scf.yield %joined_h, %joined_b : memref<2xi64>, memref<?xi8>
+      }
       %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
       %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %msg_h, %msg_b) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
       func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()

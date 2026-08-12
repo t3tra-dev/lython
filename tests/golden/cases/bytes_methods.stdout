@@ -28,5 +28,5 @@ b'a'
 b'b'
 b'c'
 fromhex: non-hexadecimal number found in fromhex() arg at position 2
-odd: non-hexadecimal number found in fromhex() arg at position 3
+odd: fromhex() arg must contain an even number of hexadecimal digits
 split: empty separator
