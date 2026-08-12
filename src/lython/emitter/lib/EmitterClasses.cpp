@@ -22,6 +22,29 @@
 namespace lython::emitter {
 namespace {
 
+// A method's contract, as the protocol table stores it. One spelling for both
+// registrations of a class: the progressive one that makes a method visible
+// to the next method's body walk, and the complete one at the end.
+void addProtocolMethod(py::protocols::ProtocolInfo &info,
+                       llvm::StringRef methodName, mlir::Type methodContract) {
+  auto pushSignature = [&](py::CallableType signature) {
+    if (!signature)
+      return;
+    py::protocols::ProtocolMethod method;
+    method.signature = signature;
+    method.mayThrow = true;
+    info.methods[methodName.str()].push_back(method);
+  };
+  if (auto signature =
+          mlir::dyn_cast_if_present<py::CallableType>(methodContract)) {
+    pushSignature(signature);
+  } else if (auto overload =
+                 mlir::dyn_cast_if_present<py::OverloadType>(methodContract)) {
+    for (mlir::Type candidate : overload.getCandidateTypes())
+      pushSignature(mlir::dyn_cast_if_present<py::CallableType>(candidate));
+  }
+}
+
 // Positional parameters with no annotation: the synthesized dataclass and
 // record constructors take their types from the field declarations, not from
 // the AST.
@@ -1378,6 +1401,29 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
     registeredFields[fieldName] = fieldType;
 
+  // ⭐ The protocol table learns this class's FIELDS here, not at the bottom
+  // of this function with its methods: a method's signature is inferred
+  // below, and that inference walks the body, where `self.n` has to resolve
+  // against these fields. It could not, so every unannotated method that
+  // read a field inferred builtins.object -- `def peek(self): return self.n`
+  // then failed at the call site with "builtins.object does not provide
+  // manifest method '__add__'". The full registration below overwrites this
+  // entry; only the fields are needed this early, and they are already
+  // merged with the bases' at this point.
+  py::protocols::ProtocolInfo progressiveInfo;
+  for (const std::string &base : canonicalBases)
+    progressiveInfo.bases.push_back(py::protocols::ProtocolBase{
+        py::contracts::manifestClassNameForContract(base), {}});
+  progressiveInfo.bases.push_back(py::protocols::ProtocolBase{
+      py::contracts::manifestClassNameForContract("builtins.object"), {}});
+  for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
+    progressiveInfo.fields[fieldName] = fieldType;
+  auto publishProgress = [&] {
+    py::protocols::Table::getMutable(context).registerClass(contractName,
+                                                            progressiveInfo);
+  };
+  publishProgress();
+
   // Class attributes register BEFORE any method body is emitted: method
   // bodies read them (Counter.count += 1) through the very lookups being
   // registered here.
@@ -1499,9 +1545,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         receiverName = "self";
       else if (kind == "class" || kind == "classmethod")
         receiverName = "cls";
+      mlir::Type receiverType;
+      if (kind == "instance" || propertyAccessor)
+        receiverType = types.contract(contractName);
+      else if (kind == "class" || kind == "classmethod")
+        receiverType = types.typeObject(types.contract(contractName));
       FunctionSignature bodySig = types.functionSignature(
           *statement,
-          kind == "static" ? std::optional<llvm::StringRef>() : receiverName);
+          kind == "static" ? std::optional<llvm::StringRef>() : receiverName,
+          py::CallableType(), receiverType);
       if (kind == "instance" || propertyAccessor)
         replaceSelfInSignature(bodySig, types.contract(contractName), types);
       else if (kind == "class" || kind == "classmethod") {
@@ -1537,6 +1589,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       methodNames.push_back(std::string(*methodName));
       methodKinds.push_back(kind);
       methodContracts.push_back(bodySig.publicCallable);
+      // Visible to the NEXT method's body walk. `def twice(self): return
+      // self.peek() * 2` inferred against a table that learned this class's
+      // methods only after every signature was computed, so a sibling call
+      // read as "contract 'Chain' does not provide manifest method 'peek'"
+      // -- while the same call compiled once the walk was over. Textual
+      // order is what this buys; two unannotated methods that call each
+      // other still need the annotation.
+      addProtocolMethod(progressiveInfo, *methodName, bodySig.publicCallable);
+      publishProgress();
 
       std::string symbolName =
           sourceMethodSymbolName(contractName, *methodName, *statement);
@@ -1885,25 +1946,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   for (auto [fieldName, fieldType] : llvm::zip_equal(fieldNames, fieldTypes))
     protocolInfo.fields[fieldName] = fieldType;
   for (auto [methodName, methodContract] :
-       llvm::zip_equal(methodNames, methodContracts)) {
-    std::string registeredMethodName = methodName;
-    auto pushSignature = [&](py::CallableType signature) {
-      if (!signature)
-        return;
-      py::protocols::ProtocolMethod method;
-      method.signature = signature;
-      method.mayThrow = true;
-      protocolInfo.methods[registeredMethodName].push_back(method);
-    };
-    if (auto signature =
-            mlir::dyn_cast_if_present<py::CallableType>(methodContract)) {
-      pushSignature(signature);
-    } else if (auto overload = mlir::dyn_cast_if_present<py::OverloadType>(
-                   methodContract)) {
-      for (mlir::Type candidate : overload.getCandidateTypes())
-        pushSignature(mlir::dyn_cast_if_present<py::CallableType>(candidate));
-    }
-  }
+       llvm::zip_equal(methodNames, methodContracts))
+    addProtocolMethod(protocolInfo, methodName, methodContract);
   py::protocols::Table::getMutable(context).registerClass(
       contractName, std::move(protocolInfo));
 

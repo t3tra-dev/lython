@@ -3451,7 +3451,8 @@ mlir::Type TypeSystem::widenLiteral(mlir::Type type) const {
 FunctionSignature
 TypeSystem::functionSignature(const parser::Node &function,
                               std::optional<llvm::StringRef> selfName,
-                              py::CallableType expectedCallable) const {
+                              py::CallableType expectedCallable,
+                              mlir::Type selfType) const {
   if (!selfName && !expectedCallable) {
     auto memoized = signatureMemo.find(&function);
     if (memoized != signatureMemo.end())
@@ -3535,7 +3536,7 @@ TypeSystem::functionSignature(const parser::Node &function,
               ? overriddenParameterType(*arg)
               : std::nullopt;
       if (isSelfParameter)
-        type = py::SelfType::get(&context);
+        type = selfType ? selfType : py::SelfType::get(&context);
       if (fromExpectedCallable)
         type = expectedPositional[index];
       if (overridden) {
@@ -3643,9 +3644,12 @@ TypeSystem::functionSignature(const parser::Node &function,
                                   sig.generatorReturnType});
     }
 
-    if (returns) {
-      sig.generatorAnnotationIncompatible =
-          !py::isAssignableTo(sig.inferredGeneratorType, annotatedReturn);
+    if (returns && !py::isAssignableTo(sig.inferredGeneratorType,
+                                       annotatedReturn)) {
+      sig.generatorAnnotationMismatch =
+          "generator function is annotated " + typeText(annotatedReturn) +
+          " but yields " + typeText(sig.generatorYieldType) + " (inferred " +
+          typeText(sig.inferredGeneratorType) + ")";
     }
     sig.resultType = sig.generatorReturnType;
   } else if (function.kind == "Lambda") {

@@ -21,11 +21,10 @@ bool diagnoseUnsupportedGeneratorFunction(parser::Diagnostics &diagnostics,
                                           const parser::Node &function,
                                           const FunctionSignature &sig) {
   bool unsupported = false;
-  if (sig.generatorAnnotationIncompatible) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, function.range.start,
-        "generator function return annotation is incompatible with inferred "
-        "Generator or AsyncGenerator contract"});
+  if (!sig.generatorAnnotationMismatch.empty()) {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             function.range.start,
+                                             sig.generatorAnnotationMismatch});
     unsupported = true;
   }
   for (const std::string &reason : sig.generatorAnalysisFailures) {

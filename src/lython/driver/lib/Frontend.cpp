@@ -12,6 +12,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -510,12 +511,21 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
         emitOptions);
   }
   if (!emitted.ok()) {
+    // One line per distinct complaint. A method's signature is diagnosed by
+    // whichever paths emit it as a callable -- the class body pass and the
+    // bound-method-object path both do, for a generator method -- and the
+    // reader has no way to tell the second copy from a second defect.
+    llvm::StringSet<> rendered;
     for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics) {
       StringRef diagnosticFile =
           diagnostic.filename.empty() ? sourcePath : diagnostic.filename;
-      diag << diagnosticFile << ':' << diagnostic.location.line << ':'
-           << diagnostic.location.column
-           << ": emit error: " << diagnostic.message << "\n";
+      std::string line;
+      llvm::raw_string_ostream stream(line);
+      stream << diagnosticFile << ':' << diagnostic.location.line << ':'
+             << diagnostic.location.column
+             << ": emit error: " << diagnostic.message << "\n";
+      if (rendered.insert(stream.str()).second)
+        diag << line;
     }
     return failure();
   }

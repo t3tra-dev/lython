@@ -41,7 +41,10 @@ struct FunctionSignature {
   bool isAsyncFunction = false;
   bool isGeneratorFunction = false;
   bool isAsyncGeneratorFunction = false;
-  bool generatorAnnotationIncompatible = false;
+  // The mismatch MESSAGE, not a flag: the two types are known only here, and
+  // "incompatible with inferred Generator contract" left the reader to guess
+  // which of the yield, send and return channels disagreed.
+  std::string generatorAnnotationMismatch;
   bool asyncGeneratorReturnsValue = false;
   llvm::SmallVector<std::string, 4> generatorAnalysisFailures;
   mlir::Type inferredGeneratorType;
@@ -360,10 +363,17 @@ public:
     parameterTypeOverrides[argNode] = type;
   }
 
+  // `selfType` is the receiver's CONCRETE type, and it matters for more than
+  // the signature: the body is inferred inside this call, so with the
+  // placeholder py.self bound to the receiver, `self.n` had no attribute to
+  // resolve and every unannotated method inferred builtins.object. The class
+  // emitter substitutes py.self in the signature afterwards either way --
+  // that substitution reaches the types, never the body inference.
   FunctionSignature
   functionSignature(const parser::Node &function,
                     std::optional<llvm::StringRef> selfName = std::nullopt,
-                    py::CallableType expectedCallable = {}) const;
+                    py::CallableType expectedCallable = {},
+                    mlir::Type selfType = {}) const;
   void refreshCallable(FunctionSignature &sig) const;
 
 private:
