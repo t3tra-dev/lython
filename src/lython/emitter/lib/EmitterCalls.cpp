@@ -286,6 +286,37 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       return emitCall(*rewritten);
     }
 
+  // ⭐ A module attribute that the runtime does not provide says so as a
+  // MODULE attribute. `math.gcd(12, 8)` reported "static type
+  // builtins.object does not provide manifest method 'gcd'" -- the module
+  // namespace root is typed `object` (it is a lookup root, not a receiver),
+  // so the report described that placeholder instead of the module, and the
+  // reader had no way to tell a missing function from a broken call.
+  if (calleeNode && calleeNode->kind == "Attribute") {
+    const parser::Node *receiverNode = ast::node(*calleeNode, "value");
+    llvm::StringRef attribute =
+        ast::string(*calleeNode, "attr").value_or("");
+    if (receiverNode && receiverNode->kind == "Name" && !attribute.empty()) {
+      llvm::StringRef space = ast::nameSpelling(*receiverNode);
+      std::string qualified = (space + "." + attribute).str();
+      const py::protocols::Table &table = py::protocols::Table::get(context);
+      std::optional<mlir::Type> spaceType = types.lookupSymbol(space);
+      // The namespace root is the object placeholder and nothing else: a
+      // local of the same name (or a real value) keeps its own dispatch.
+      bool knownModule = !table.moduleCallableExports(space).empty() ||
+                         lookupSourceModule(space) != nullptr;
+      if (knownModule &&
+          !types.lookupSymbol(qualified) && !types.lookupClass(qualified) &&
+          !values.count(space) && spaceType && *spaceType == types.object()) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "module '" + space.str() + "' has no attribute '" +
+                attribute.str() + "' in this runtime"});
+        return emitNone(expr);
+      }
+    }
+  }
+
   // ⭐ `s.startswith((a, b))` is `s.startswith(a) or s.startswith(b)`, which
   // is what CPython's C loop over the tuple computes. The tuple form was
   // "builtins.str does not provide manifest method 'startswith'" -- the
