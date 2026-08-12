@@ -107,6 +107,13 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
   // assignment (the field is absent on for/async-for statements).
   if (const parser::Node *test = ast::node(statement, "test"))
     collectAssignedNames(test, assignedInBody);
+  // ⭐ The `else` clause writes on the loop's EXIT edge, so its writes have
+  // to reach the after-block the same way the body's do. A name written only
+  // there was not carried, and the else block's own scope closed over it:
+  // `for i in [1, 2]: pass` / `else: acc += 7` printed 7 inside the else and
+  // the PRE-LOOP value after it, with no diagnostic. The break edges skip the
+  // else and carry the pre-loop value, which is what CPython does too.
+  collectAssignedNames(ast::nodeList(statement, "orelse"), assignedInBody);
   llvm::SmallVector<std::string, 4> names;
   for (const auto &assigned : assignedInBody) {
     if (excludedNames && excludedNames->contains(assigned.getKey()))
@@ -663,7 +670,17 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
 
   if (elseBlock) {
     builder.setInsertionPointToStart(elseBlock);
-    ScopedEmitterScope scope(values, types);
+    // ⛔ Why the else body is NOT scoped when the loop cannot break: a name
+    // FIRST bound in the else has no pre-loop value to carry, so the carried
+    // machinery cannot thread it -- but without a break the else block is the
+    // after-block's only predecessor, so it dominates every later read and
+    // the value needs no edge at all. Scoping it away made `else: fresh = 5`
+    // followed by `return fresh` read as "unresolved name 'fresh'" where
+    // CPython prints 5. With a break in the loop the scope stays: that path
+    // skips the else, and CPython raises NameError there.
+    std::optional<ScopedEmitterScope> scope;
+    if (breakForwardsCarried)
+      scope.emplace(values, types);
     bindCarriedLoopLocals(carried, elseBlock);
     emitStatements(orelse);
     if (!insertionBlockTerminated(builder))
@@ -837,7 +854,17 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
 
   if (elseBlock) {
     builder.setInsertionPointToStart(elseBlock);
-    ScopedEmitterScope scope(values, types);
+    // ⛔ Why the else body is NOT scoped when the loop cannot break: a name
+    // FIRST bound in the else has no pre-loop value to carry, so the carried
+    // machinery cannot thread it -- but without a break the else block is the
+    // after-block's only predecessor, so it dominates every later read and
+    // the value needs no edge at all. Scoping it away made `else: fresh = 5`
+    // followed by `return fresh` read as "unresolved name 'fresh'" where
+    // CPython prints 5. With a break in the loop the scope stays: that path
+    // skips the else, and CPython raises NameError there.
+    std::optional<ScopedEmitterScope> scope;
+    if (breakForwardsCarried)
+      scope.emplace(values, types);
     bindCarriedLoopLocals(carried, elseBlock);
     emitStatements(orelse);
     if (!insertionBlockTerminated(builder))
