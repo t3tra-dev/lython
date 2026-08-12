@@ -1,6 +1,5 @@
 #include "EmitterCore.h"
 
-#include "llvm/ADT/ScopeExit.h"
 #include "EmitterOps.h" // IWYU pragma: keep
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -8,6 +7,8 @@
 #include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
+
+#include "llvm/ADT/ScopeExit.h"
 #include "PyProtocols.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1602,6 +1603,47 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
   }
 
   // Element type: bind each generator's target to its iteration element type
+  // ⭐ The FIRST iterable may be a call whose type only the emission knows:
+  // the lazy builtin iterators (zip/enumerate/map/filter/reversed) synthesize
+  // their generator when emitted, so `zip(a, b)` is `builtins.object` to
+  // inferExpr. Evaluating it into a scratch binding first is what the
+  // programmer's own workaround looks like -- `z = zip(a, b); [p for p in z]`
+  // worked while `[p for p in zip(a, b)]` was "builtins.object does not
+  // provide __iter__". Only the first: a later iterable may reference an
+  // earlier target, so it cannot be hoisted out of the loop that binds it.
+  std::string hoistedSource;
+  std::optional<Value> hoistedPrior;
+  auto restoreHoisted = llvm::make_scope_exit([&] {
+    if (hoistedSource.empty())
+      return;
+    if (hoistedPrior)
+      values[hoistedSource] = *hoistedPrior;
+    else
+      values.erase(hoistedSource);
+  });
+  if (!chain.empty() && chain.front().iter &&
+      chain.front().iter->kind == "Call" &&
+      !types.inferMethodCallWithEvidence(
+          types.widenLiteral(types.inferExpr(chain.front().iter.get())),
+          "__iter__", {})) {
+    std::string name = "__lycompsrc" + std::to_string(++listCompCounter);
+    parser::NodePtr target = parser::makeNode("Name", expr.range);
+    parser::addField(*target, "id", name);
+    parser::NodePtr assign = parser::makeNode("Assign", expr.range);
+    parser::addField(*assign, "targets",
+                     std::vector<parser::NodePtr>{target});
+    parser::addField(*assign, "value", chain.front().iter);
+    if (auto found = values.find(name); found != values.end())
+      hoistedPrior = found->second;
+    emitStatement(*assign);
+    if (values.find(name) != values.end()) {
+      hoistedSource = name;
+      parser::NodePtr bound = parser::makeNode("Name", expr.range);
+      parser::addField(*bound, "id", name);
+      chain.front().iter = std::move(bound);
+    }
+  }
+
   // (later iterables may reference earlier targets), then infer the element
   // expression under those bindings.
   mlir::Type elementType, keyType, valueType;

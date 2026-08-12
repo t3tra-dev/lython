@@ -2179,6 +2179,44 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
   llvm::StringRef argClass =
       argContract ? argContract.getContractName() : llvm::StringRef();
 
+  // ⭐ A call whose type the INFERENCE cannot see, but the emission can: the
+  // lazy builtin iterators (zip/enumerate/map/filter/reversed) synthesize a
+  // generator function when they are emitted, so `zip(...)` is
+  // `builtins.object` to inferExpr and a typed generator to emitExpr. The
+  // comprehension below reads the static type, so `list(zip(a, b))` was
+  // "builtins.object does not provide __iter__" while the SAME program with
+  // the call bound to a name first -- `z = zip(a, b); list(z)` -- worked.
+  // Binding it here is that spelling, written once.
+  //
+  // ⛔ Why NOT teach inferExpr the five return types instead: it would have
+  // to reproduce what the synthesis decides (zip's tuple arity, map's
+  // callable result, enumerate's index pair) from the argument nodes, and
+  // the two would drift. The value the synthesis produced already carries it.
+  if (argNode->kind == "Call" &&
+      !types.inferMethodCallWithEvidence(argumentType, "__iter__", {})) {
+    std::string sourceName =
+        "__lyctorsrc" + std::to_string(++listCompCounter);
+    std::optional<Value> built;
+    runWithScratchNames({sourceName}, [&] {
+      emitStatement(*assignNode(nameNode(sourceName, range), argNode, range));
+      if (values.find(sourceName) == values.end())
+        return;
+      NodePtr bound = nameNode(sourceName, range);
+      if (ctor == "dict")
+        built = emitConstructorComprehension(expr, bound, "dict");
+      else if (ctor == "set")
+        built = emitConstructorComprehension(expr, bound, "set");
+      else if (ctor == "list")
+        built = emitConstructorComprehension(expr, bound, "list");
+      else
+        built = emitListToTupleFreeze(
+            expr, *calleeNode,
+            emitConstructorComprehension(expr, bound, "list"));
+    });
+    if (built)
+      return *built;
+  }
+
   // CPython's tuple(t) returns t itself: tuples are immutable.
   if (ctor == "tuple" && argClass == "builtins.tuple")
     return emitExpr(argNode.get());

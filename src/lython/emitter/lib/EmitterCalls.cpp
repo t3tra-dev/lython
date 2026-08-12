@@ -226,6 +226,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitFloatCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitPowCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitBoolCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitAsciiCall(expr, calleeNode))
@@ -927,6 +929,40 @@ ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
   return std::nullopt;
 }
 
+// Two-argument pow IS the ** operator: CPython's builtin_pow calls
+// PyNumber_Power with Py_None for the modulus, the same slot `**` reaches.
+// The manifest declares only the three-argument form (the modular one, which
+// has no operator spelling), so `pow(2, 10)` was refused for an arity the
+// operator accepts.
+//
+// ⛔ Why NOT a second manifest contract for the two-argument form: `**` is
+// not one call. It picks between the int and float towers, folds a negative
+// literal exponent to the float path, and reaches the complex tower -- all
+// in emitBinary. A parallel two-argument pow would be that ladder again,
+// drifting from the day it is written. Rewriting to the operator's own AST
+// node is the ladder itself.
+std::optional<Value>
+ModuleEmitter::tryEmitPowCall(const parser::Node &expr,
+                              const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "pow" || programBindsName("pow"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 2 || (keywords && !keywords->empty()))
+    return std::nullopt;
+  const parser::NodePtr &base = (*args)[0];
+  const parser::NodePtr &exponent = (*args)[1];
+  if (!base || !exponent || base->kind == "Starred" ||
+      exponent->kind == "Starred")
+    return std::nullopt;
+  parser::NodePtr rewritten = parser::makeNode("BinOp", expr.range);
+  parser::addField(*rewritten, "left", base);
+  parser::addField(*rewritten, "op", parser::makeNode("Pow", expr.range));
+  parser::addField(*rewritten, "right", exponent);
+  return emitBinary(*rewritten);
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
@@ -1595,6 +1631,36 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     else
       values.erase(element);
     return result;
+  }
+  // ⭐ Every shape this fold does not take is refused HERE, naming the
+  // reducer. Falling through left the generic call path to look the name up,
+  // and it is not a value -- `min(xs, key=f)` was "unresolved name 'min'",
+  // which points away from the actual limit (the keyword, not the name).
+  // The same wrong report is recorded twice above for the argument COUNT;
+  // this is that report closed for the argument SHAPE.
+  std::string limit;
+  if (reducerKeywords && !reducerKeywords->empty()) {
+    llvm::StringRef keyword;
+    for (const parser::NodePtr &entry : *reducerKeywords)
+      if (entry && keyword.empty())
+        if (std::optional<llvm::StringRef> name = ast::string(*entry, "arg"))
+          keyword = *name;
+    limit = keyword.empty() ? "a keyword argument"
+                            : ("the '" + keyword.str() + "' keyword argument");
+  } else if (!reducerArgs || reducerArgs->empty()) {
+    limit = "no arguments";
+  } else {
+    for (const parser::NodePtr &argument : *reducerArgs)
+      if (argument && argument->kind == "Starred")
+        limit = "a starred argument";
+  }
+  if (!limit.empty()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        reducer.str() + "() with " + limit +
+            " is not supported: it is folded over an iterable or over two or "
+            "more operands, and neither form takes it"});
+    return emitNone(expr);
   }
   return std::nullopt;
 }

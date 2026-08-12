@@ -478,6 +478,8 @@ private:
                                       const parser::Node *calleeNode);
   std::optional<Value> tryEmitFloatCall(const parser::Node &expr,
                                         const parser::Node *calleeNode);
+  std::optional<Value> tryEmitPowCall(const parser::Node &expr,
+                                      const parser::Node *calleeNode);
   Value emitFloatFromInt(const parser::Node &anchor, Value argument);
   std::optional<Value> tryEmitStrCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
