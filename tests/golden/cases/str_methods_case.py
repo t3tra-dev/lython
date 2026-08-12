@@ -75,3 +75,17 @@ def affix_tuples() -> None:
 
 
 affix_tuples()
+
+
+# A method argument that is a CALL the inference cannot type is bound first:
+# `translate(str.maketrans(...))` was "str.translate requires a dict table"
+# while the same call through a temporary worked, because inferExpr sees
+# builtins.object for the inner call and the emission sees the dict.
+def bound_arguments() -> None:
+    print("Hello".translate(str.maketrans("l", "L")))
+    print("Hello".translate({108: 76}))
+    table = str.maketrans("eo", "30")
+    print("Hello".translate(table))
+
+
+bound_arguments()

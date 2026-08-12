@@ -1308,6 +1308,49 @@ std::optional<Value> ModuleEmitter::emitOptionalCompare(
 }
 
 Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
+  // ⭐ A NamedTuple's literal subscript IS the field at that position: the
+  // instance is a tuple whose members are the declared fields, and the index
+  // is right here. `p[0]` was "contract 'P' does not provide manifest method
+  // '__getitem__'" while `p.x` worked. Only a literal index folds -- a
+  // computed one would need a real tuple to index, and the fields have
+  // different types anyway.
+  if (const parser::Node *indexNode = ast::node(expr, "slice")) {
+    // A negative literal is UnaryOp(USub, Constant), not a Constant.
+    std::optional<std::int64_t> literalIndex;
+    if (indexNode->kind == "Constant")
+      literalIndex = ast::integer(*indexNode, "value");
+    else if (indexNode->kind == "UnaryOp" &&
+             ast::isOperator(ast::node(*indexNode, "op"), "USub"))
+      if (const parser::Node *operand = ast::node(*indexNode, "operand");
+          operand && operand->kind == "Constant")
+        if (std::optional<std::int64_t> magnitude =
+                ast::integer(*operand, "value"))
+          literalIndex = -*magnitude;
+    if (std::optional<std::int64_t> position = literalIndex) {
+      const parser::Node *receiverNode = ast::node(expr, "value");
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(receiverNode)));
+      if (contract && namedTupleContracts.count(contract.getContractName())) {
+        llvm::ArrayRef<std::string> order =
+            classFieldOrders[contract.getContractName()];
+        std::int64_t at = *position < 0
+                              ? *position + static_cast<std::int64_t>(order.size())
+                              : *position;
+        if (at >= 0 && at < static_cast<std::int64_t>(order.size())) {
+          const parser::Field *receiverField = parser::findField(expr, "value");
+          if (receiverField &&
+              std::holds_alternative<parser::NodePtr>(receiverField->value)) {
+            parser::NodePtr attribute =
+                parser::makeNode("Attribute", expr.range);
+            parser::addField(*attribute, "value",
+                             std::get<parser::NodePtr>(receiverField->value));
+            parser::addField(*attribute, "attr", order[at]);
+            return emitExpr(attribute.get());
+          }
+        }
+      }
+    }
+  }
   Value container = emitExpr(ast::node(expr, "value"));
   // Shaped primitives are indexed before the slice is emitted: their indices
   // are static shape coordinates, not values a manifest __getitem__ receives.

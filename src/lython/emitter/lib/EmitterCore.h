@@ -775,6 +775,9 @@ private:
   // Declaration order of each class's fields (classFieldBindings is
   // unordered); drives the synthesized field-record constructor.
   llvm::StringMap<llvm::SmallVector<std::string, 8>> classFieldOrders;
+  // Classes written as `class P(NamedTuple)`: their instances are tuples, so
+  // a literal subscript folds to the field at that position (EmitterExpressions).
+  llvm::StringSet<> namedTupleContracts;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
   // Canonical (resolved) base contract names per class, in declaration order.

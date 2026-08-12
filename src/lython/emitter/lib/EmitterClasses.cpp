@@ -1808,6 +1808,28 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     // Why NOT a new primitive: the tuple this builds hashes through the same
     // manifest `tuple.__hash__` any other tuple does, so the two answers are
     // the same by construction rather than by agreement.
+    // ⭐ A NamedTuple IS a tuple: len() is its field count, known here, and a
+    // literal subscript is the field at that position (folded at the
+    // subscript, where the index is). `len(p)` and `p[0]` were "contract 'P'
+    // does not provide manifest method '__len__' / '__getitem__'" while
+    // `p.x` and `print(p)` worked.
+    if (isNamedTuple)
+      namedTupleContracts.insert(contractName);
+    if (isNamedTuple && !userDefines("__len__")) {
+      parser::NodePtr count = parser::makeNode("Constant", range);
+      parser::addField(*count, "value",
+                       static_cast<std::int64_t>(order.size()));
+      parser::NodePtr returnCount = parser::makeNode("Return", range);
+      parser::addField(*returnCount, "value", std::move(count));
+      FunctionSignature lenSig;
+      lenSig.positionalNames.push_back("self");
+      lenSig.positionalTypes.push_back(types.contract(contractName));
+      lenSig.positionalDefaults.push_back(false);
+      lenSig.resultType = types.intType();
+      registerSynthesized(synthFunctionDef("__len__", {"self"}, {},
+                                           {std::move(returnCount)}, range),
+                          std::move(lenSig));
+    }
     if (isNamedTuple && !userDefines("__hash__") && !order.empty()) {
       std::vector<parser::NodePtr> elements;
       elements.reserve(order.size());

@@ -288,6 +288,62 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       return emitCall(*rewritten);
     }
 
+  // ⭐ A method argument that is a CALL the inference cannot type is bound
+  // first. `"x".translate(str.maketrans("l", "L"))` was "str.translate
+  // requires a dict table" while the same call through a temporary --
+  // `t = str.maketrans("l", "L"); "x".translate(t)` -- worked: inferExpr sees
+  // `builtins.object` for the inner call and the emission sees the dict. The
+  // binding is that temporary, written once. (Same shape as the lazy-iterator
+  // and generator-expression materializations below; those two need a
+  // container around them, this one only needs a name.)
+  if (calleeNode && calleeNode->kind == "Attribute") {
+    const auto *bindArgs = ast::nodeList(expr, "args");
+    llvm::SmallVector<unsigned, 2> needBinding;
+    if (bindArgs)
+      for (auto [index, arg] : llvm::enumerate(*bindArgs)) {
+        if (!arg || arg->kind != "Call")
+          continue;
+        mlir::Type inferred = types.widenLiteral(types.inferExpr(arg.get()));
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(inferred);
+        if (!inferred ||
+            (contract && contract.getContractName() == "builtins.object"))
+          needBinding.push_back(static_cast<unsigned>(index));
+      }
+    if (!needBinding.empty()) {
+      llvm::SmallVector<std::string, 2> scratch;
+      std::vector<parser::NodePtr> boundArgs(bindArgs->begin(),
+                                             bindArgs->end());
+      std::vector<parser::NodePtr> binds;
+      for (unsigned index : needBinding) {
+        std::string name = "__lyargbind" + std::to_string(++listCompCounter);
+        scratch.push_back(name);
+        parser::NodePtr target = parser::makeNode("Name", expr.range);
+        parser::addField(*target, "id", name);
+        parser::NodePtr bind = parser::makeNode("Assign", expr.range);
+        parser::addField(*bind, "targets",
+                         std::vector<parser::NodePtr>{target});
+        parser::addField(*bind, "value", boundArgs[index]);
+        binds.push_back(std::move(bind));
+        parser::NodePtr named = parser::makeNode("Name", expr.range);
+        parser::addField(*named, "id", name);
+        boundArgs[index] = std::move(named);
+      }
+      parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+      if (const parser::Field *func = parser::findField(expr, "func"))
+        rewritten->fields.push_back(*func);
+      parser::addField(*rewritten, "args", std::move(boundArgs));
+      if (const parser::Field *keywords = parser::findField(expr, "keywords"))
+        rewritten->fields.push_back(*keywords);
+      Value bound = emitNone(expr);
+      runWithScratchNames(scratch, [&] {
+        for (const parser::NodePtr &bind : binds)
+          emitStatement(*bind);
+        bound = emitCall(*rewritten);
+      });
+      return bound;
+    }
+  }
+
   // ⭐ A module attribute that the runtime does not provide says so as a
   // MODULE attribute. `math.gcd(12, 8)` reported "static type
   // builtins.object does not provide manifest method 'gcd'" -- the module
