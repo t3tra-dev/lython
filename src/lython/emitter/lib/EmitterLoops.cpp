@@ -785,11 +785,15 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
     // conditional expression both apply that narrowing.
     //
     // Applying it here (unwrap the carried value to the narrowed member at
-    // the top of the body, scoped) compiles and then CRASHES the program: the
-    // back edge forwards whatever the body left, and coerceValue has no way
-    // to wrap a narrowed member back INTO the carried union, so the header
-    // receives a value of the wrong shape. The missing piece is that
-    // coercion, not the narrowing.
+    // the top of the body, scoped) compiles, runs the loop, prints the right
+    // answer and THEN crashes on the way out -- re-measured after the
+    // primitive-lane repair, with the same result for an int, a str and a
+    // list payload. coerceValue does wrap a member back into the union
+    // (py.union.wrap, EmitterExpressions.cpp), so the missing piece is not
+    // the coercion: the unwrap hands the body a borrowed view of the carried
+    // value, and the back edge re-wrapping it leaves the ownership of the two
+    // unbalanced. Whatever is done here has to say which of the two holds the
+    // token.
     LoopControlContext loop{afterBlock, headerBlock};
     loop.carriedLocals.assign(carried.begin(), carried.end());
     loop.headerBlock = headerBlock;
