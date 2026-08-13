@@ -188,11 +188,30 @@ mlir::LogicalResult RuntimeBundleLowerer::loadObjectGlobalValues(
 // be reachable from a signal handler. The i64 cell is not an optimization
 // here; it is the async-signal-safe channel py.global.get/set promises.
 //
-// So the repair is not "box it" but "box it where boxing is allowed", and
-// the discriminator is missing: nothing today separates a global a signal
-// handler may touch from one only ordinary code touches, and a per-module
-// split (runtime-internal vs user) still leaves a user's own ctypes callback
-// reading a boxed global, which verifyCallbackSignalSafety then refuses.
+// The discriminator can be built -- and was, and it is not enough. Measured:
+// an `EmitOptions::runtimeInternal` flag set by the pre-lowering tool, a
+// `ly.global.boxed` attribute on py.global.get/set for every other module,
+// and this branch keyed on the attribute instead of the contract. `x: int =
+// 1` grown past 2**63 then prints 1180591620717411303424, matching CPython.
+//
+// It also breaks three tests, and only one of them is the expected trade:
+//
+//   examples/ctypes_signal.py .......... refused, as designed: a callback
+//       reading a boxed global retains, and verifyCallbackSignalSafety says
+//       so. That is the policy working.
+//   golden/cases/default_once .......... prints 0 where it must print 1.
+//   golden/cases/default_expressions ... same shape.
+//
+// The last two are the finding: a WRONG VALUE, not a refusal, so the object
+// global path is not ready to carry an int today -- a read that reaches the
+// cell before its first store answers with the empty box instead of
+// refusing. Fixing the bigint means fixing that first, and it is the same
+// unbound-read question the object path already has an answer for on other
+// contracts (it raises RuntimeError); the int path never had to ask because
+// its cell starts at a valid 0.
+//
+// So: the repair is not "box it", it is "make the object cell's unbound
+// read right, then box it". The attribute plumbing above is the cheap half.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalGet(py::GlobalGetOp op) {
   if (runtimeContractName(op.getResult().getType()) != "builtins.int")
     return RuntimeBundleLowerer::lowerObjectGlobalGet(op);
