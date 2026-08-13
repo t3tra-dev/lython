@@ -2480,11 +2480,21 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       // the seven measured variants are in
       // tests/probe/wb_union_loop_carried_borrow_overrelease.py.
       //
-      // What a repair needs that nothing here has: a tag-guarded call. The
-      // condition carries the tag value and the active index, and across a
-      // block-argument edge the tag is forwarded too, so the retain and the
-      // release both have to be emitted under `cmpi eq(tag, activeTag)`.
-      // This pass emits only unguarded calls today.
+      // ⛔ What a repair needs is NOT the tag-guarded call this note used to
+      // name. Read at refcount-elision, the emitter's acquisition is already
+      // guarded -- `py.incref` on a union lowers through
+      // `forEachActiveUnionMember` -- and the tag rides the same edge as the
+      // member lanes, so it is a block argument wherever the release would
+      // go. Spelling the guard is the easy half.
+      //
+      // The obstacle is that the group is never SEEDED. This function collects
+      // candidates from owned CALL RESULTS and from `owned_local_object`
+      // markers; the reference is minted by an `Ly_IncRef` with no results and
+      // an `aggregate_retain` label, which is neither. The skip below is not
+      // what keeps the release away -- there is no group here to skip.
+      // Measured 2026-08-14, tests/probe/wb_union_carried_exit_release_leak.py,
+      // which also records why moving the acquisition instead breaks one of
+      // the four bisect lines in each of its three placements.
       //
       // The retain half was repaired in the EMITTER instead
       // (`acquireUnionCarriedTokens`, EmitterLoops.cpp), which is why the
