@@ -178,6 +178,7 @@ int_pow_and_literals.py AGREE
 int_pow_negative_const.py AGREE
 int_round_ndigits.py AGREE
 int_shift_bitwise_hash.py AGREE
+int_with_base.py AGREE
 interior_view_nested_chain_grow.py AGREE
 interior_view_realloc_publishes.py AGREE
 io_defaults.py AGREE

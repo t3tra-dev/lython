@@ -474,6 +474,13 @@ private:
                              mlir::Type resultOverride = {});
   std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);
+  // int(s, base): a synthesized module function, memoized by symbol. The
+  // parse is ordinary Python over the str and int surface that already
+  // compiles, so there is no new native for it.
+  std::optional<Value> tryEmitIntBaseCall(const parser::Node &expr,
+                                          const parser::Node *calleeNode);
+  std::string intBaseHelperSymbol;
+  py::CallableType intBaseHelperCallable;
   std::optional<Value> tryEmitIntCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
   std::optional<Value> tryEmitFloatCall(const parser::Node &expr,

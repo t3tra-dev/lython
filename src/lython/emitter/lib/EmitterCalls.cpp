@@ -655,6 +655,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitIntBaseCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitIntCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitFloatCall(expr, calleeNode))
@@ -1191,6 +1193,179 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     bit = test.getResult();
   }
   return boxedBool(builder, loc(expr), types, bit);
+}
+
+// ⭐ `int(s, base)` as a SYNTHESIZED PYTHON FUNCTION, not a new native. The
+// whole parse -- strip, sign, the 0x/0o/0b prefix, underscores, digit value
+// by position in "0123456789abc...z", and the multiply-accumulate that grows
+// into a bigint on its own -- is ordinary Python over surface that already
+// compiles. A native would have duplicated LyLong_FromStr's limb arithmetic
+// for the one thing it does not do, and the emitter is where CPython's own
+// int() dispatch decides between the two anyway.
+//
+// ⛔ base=0 (auto-detect from the prefix) is NOT accepted: it raises here
+// rather than guessing, because "0" is also a valid base-10 literal and the
+// CPython rule for it (prefix decides, bare leading zeros are an error) is a
+// different parse, not a parameter of this one.
+std::optional<Value>
+ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "int" || programBindsName("int"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 2 || !args->front() || !(*args)[1] ||
+      args->front()->kind == "Starred" || (*args)[1]->kind == "Starred" ||
+      (keywords && !keywords->empty()))
+    return std::nullopt;
+  mlir::Type subjectType = types.widenLiteral(types.inferExpr(args->front().get()));
+  if (subjectType != types.contract("builtins.str"))
+    return std::nullopt;
+
+  parser::SourceRange range = expr.range;
+  if (intBaseHelperSymbol.empty()) {
+    std::string symbol = "__lyintbase$" + std::to_string(++syntheticFunctionCounter);
+    auto name = [&](llvm::StringRef id) { return synth::name(id, range); };
+    auto str = [&](llvm::StringRef text) { return synth::strConstant(text, range); };
+    auto num = [&](std::int64_t value) { return synth::intConstant(value, range); };
+    auto slice = [&](llvm::StringRef target, std::int64_t from) {
+      parser::NodePtr sliceNode = parser::makeNode("Slice", range);
+      parser::addField(*sliceNode, "lower", num(from));
+      return synth::subscript(name(target), std::move(sliceNode), range);
+    };
+
+    // The message CPython raises, rebuilt from the ORIGINAL argument:
+    //   invalid literal for int() with base 16: '  zz  '
+    auto invalidLiteral = [&] {
+      parser::NodePtr message = synth::binOp(
+          synth::binOp(
+              synth::binOp(str("invalid literal for int() with base "), "Add",
+                           synth::call(name("str"), {name("base")}, range),
+                           range),
+              "Add", str(": "), range),
+          "Add", synth::reprCall(name("s"), range), range);
+      return synth::raiseStmt(
+          synth::call(name("ValueError"), {std::move(message)}, range), range);
+    };
+
+    std::vector<parser::NodePtr> body;
+    // ⛔ base=0 is refused rather than guessed: CPython's auto-detect is a
+    // different parse (the prefix decides, and a bare leading zero is an
+    // error), not a parameter of this one.
+    body.push_back(synth::ifStmt(
+        synth::compare(name("base"), "Eq", num(0), range),
+        {synth::raiseValueError(
+            "int() base 0 (auto-detect) is not supported; pass a base "
+            "between 2 and 36",
+            range)},
+        {}, range));
+    body.push_back(synth::ifStmt(
+        synth::orChain({synth::compare(name("base"), "Lt", num(2), range),
+                        synth::compare(name("base"), "Gt", num(36), range)},
+                       range),
+        {synth::raiseValueError("int() base must be >= 2 and <= 36, or 0",
+                                range)},
+        {}, range));
+    body.push_back(synth::assign(
+        name("text"), synth::methodCall(name("s"), "strip", {}, range), range));
+    body.push_back(
+        synth::assign(name("negative"), synth::boolConstant(false, range), range));
+    body.push_back(synth::ifStmt(
+        synth::methodCall(name("text"), "startswith", {str("-")}, range),
+        {synth::assign(name("negative"), synth::boolConstant(true, range), range),
+         synth::assign(name("text"), slice("text", 1), range)},
+        {synth::ifStmt(
+            synth::methodCall(name("text"), "startswith", {str("+")}, range),
+            {synth::assign(name("text"), slice("text", 1), range)}, {}, range)},
+        range));
+    body.push_back(synth::assign(
+        name("body"), synth::methodCall(name("text"), "lower", {}, range), range));
+    // An underscore is legal only BETWEEN digits, so the scan starts as if it
+    // had just seen one -- except right after a prefix, where CPython allows
+    // `int("0x_1f", 16)`.
+    body.push_back(
+        synth::assign(name("pending"), synth::boolConstant(true, range), range));
+    // The prefix is accepted only when it agrees with the base, as CPython does.
+    for (auto [prefixBase, prefix] :
+         {std::pair<std::int64_t, const char *>{16, "0x"}, {8, "0o"}, {2, "0b"}})
+      body.push_back(synth::ifStmt(
+          synth::boolOp("And",
+                        {synth::compare(name("base"), "Eq", num(prefixBase),
+                                        range),
+                         synth::methodCall(name("body"), "startswith",
+                                           {str(prefix)}, range)},
+                        range),
+          {synth::assign(name("body"), slice("body", 2), range),
+           synth::assign(name("pending"), synth::boolConstant(false, range),
+                         range)},
+          {}, range));
+    body.push_back(synth::assign(
+        name("alphabet"), str("0123456789abcdefghijklmnopqrstuvwxyz"), range));
+    body.push_back(synth::assign(name("total"), num(0), range));
+    body.push_back(synth::assign(name("seen"), num(0), range));
+    std::vector<parser::NodePtr> loop;
+    loop.push_back(synth::ifStmt(
+        synth::compare(name("ch"), "Eq", str("_"), range),
+        {synth::ifStmt(name("pending"), {invalidLiteral()}, {}, range),
+         synth::assign(name("pending"), synth::boolConstant(true, range), range),
+         synth::continueStmt(range)},
+        {}, range));
+    loop.push_back(synth::assign(
+        name("digit"),
+        synth::methodCall(name("alphabet"), "find", {name("ch")}, range), range));
+    loop.push_back(synth::ifStmt(
+        synth::orChain({synth::compare(name("digit"), "Lt", num(0), range),
+                        synth::compare(name("digit"), "GtE", name("base"), range)},
+                       range),
+        {invalidLiteral()}, {}, range));
+    loop.push_back(synth::assign(
+        name("total"),
+        synth::binOp(synth::binOp(name("total"), "Mult", name("base"), range),
+                     "Add", name("digit"), range),
+        range));
+    loop.push_back(synth::assign(
+        name("seen"), synth::binOp(name("seen"), "Add", num(1), range), range));
+    loop.push_back(
+        synth::assign(name("pending"), synth::boolConstant(false, range), range));
+    body.push_back(
+        synth::forStmt(name("ch"), name("body"), std::move(loop), {}, range));
+    // A trailing underscore and an empty digit run are the same refusal.
+    body.push_back(synth::ifStmt(
+        synth::orChain({name("pending"),
+                        synth::compare(name("seen"), "Eq", num(0), range)},
+                       range),
+        {invalidLiteral()}, {}, range));
+    {
+      parser::NodePtr negate = parser::makeNode("UnaryOp", range);
+      parser::addField(*negate, "op", parser::makeNode("USub", range));
+      parser::addField(*negate, "operand", name("total"));
+      body.push_back(synth::ifStmt(
+          name("negative"),
+          {synth::returnStmt(std::move(negate), range)}, {}, range));
+    }
+    body.push_back(synth::returnStmt(name("total"), range));
+
+    llvm::SmallVector<synth::Param, 2> params{
+        synth::Param{"s", synth::name("str", range)},
+        synth::Param{"base", synth::name("int", range)}};
+    parser::NodePtr def =
+        synth::functionDef(symbol, params, {}, std::move(body),
+                           synth::name("int", range), {}, range);
+    synthesizedIteratorDefs.push_back(def);
+    FunctionSignature sig = types.functionSignature(*def);
+    emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    intBaseHelperSymbol = symbol;
+    intBaseHelperCallable = sig.publicCallable;
+  }
+
+  llvm::SmallVector<Value, 2> arguments{emitExpr(args->front().get()),
+                                        emitExpr((*args)[1].get())};
+  Value callee =
+      emitBindingRef(expr, intBaseHelperSymbol, intBaseHelperCallable);
+  return emitCallableDispatch(
+      expr, callee,
+      emitCallOperands(expr, arguments, /*includeAstArguments=*/false));
 }
 
 std::optional<Value>
