@@ -556,6 +556,11 @@ set(LYTHON_LEAK_GATE_CASES
     namedtuple_hash_and_reverse_stability
     # A captured middle operand is released once, on the arm that made it.
     chained_comparison_short_circuits
+    # Nested loops in a generator: the inner loop's back edge carries the
+    # OUTER iterator through a forwarding block, and used to LEND it a token
+    # every trip. Repaired into this list -- it leaked 1 root / 56 B, and it
+    # is the case that pins `isOwnedIncoming` following a forwarding edge.
+    generator_nested_loops
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

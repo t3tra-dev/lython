@@ -1,44 +1,36 @@
-# LEAKS one range iterator: 1 allocation / 56 B above the AOT baseline,
-# BOUNDED -- the identical figure at n=3, n=10 and n=40, so it is one object
-# whose refcount never reaches zero, not a per-iteration leak.
+# FIXED 2026-08-14. Kept as the reproducer, and as the record of what the
+# affine walk's non-convergence was hiding.
 #
-# This program is the reason the affine ownership walk's non-convergence
-# mattered. It used to be refused with "ownership CFG exploration exceeded
-# 20000 states", and the ⚠️ note at that cap says a refusal there is NOT a
-# safe-side failure -- nothing downstream of where the walk stopped has been
-# judged. It was masking exactly this.
+# WAS: 1 allocation / 56 B above the AOT baseline, BOUNDED -- the identical
+# figure at n=3, n=10 and n=40, so one range iterator whose refcount never
+# reached zero. Invisible until 2026-08-14, because the ownership walk did
+# not converge on this CFG and refused with "ownership CFG exploration
+# exceeded 20000 states". The ⚠️ note at that cap says a refusal there is not
+# a safe-side failure; this is the instance that proves it.
 #
-# MEASURED (tests/leak_gate.py against ./build/bin/lyc):
+# MEASURED, at the time:
 #
 #   this file, nested loops in a generator ... 1 alloc / 56 B, any n
 #   one loop before a yield ..................  0 (clean)
 #   the yield inside the loop ................  0 (clean)
 #
-# LOCATED, in the IR the verifier walks (LYTHON_IR_DUMP=refcount-elision):
-# the INNER loop's back edge lends the OUTER range iterator a token on every
-# trip and nothing gives it back.
+# THE CAUSE: a token stopped being OWNED when it passed through a forwarding
+# block. `isOwnedIncoming` (Passes/Ownership.cpp) recognised a block argument
+# only when the argument was itself a merge candidate, so the inner loop's
+# back edge saw its own argument -- the outer iterator, forwarded from the
+# outer loop's merge through a single-predecessor block -- as unowned and
+# LENT it a token every trip. Nothing gave it back. A single loop was clean
+# because its back edge carries the merge argument itself, with no forwarding
+# block in between.
 #
-#     ^bb14(... %43: memref<5xi64>):            ; %43 is the OUTER iterator
-#       %subview = memref.subview %43[0][2][1]
-#       %cast = memref.cast %subview
-#       call @Ly_IncRef(%cast) {block-arg-merge-borrow}
-#       cf.br ^bb11(..., %43)                   ; the inner loop header
+# The repair follows the forwarding edge back to where the token is owned,
+# which turns the lend into the transfer it always was. It deliberately stops
+# at a block with no predecessor: an entry argument is genuinely borrowed
+# (70 of the 299 borrow-edge retains in the 2026-07-30 census are entry
+# arguments and not one carries a transfer/release/retain contract).
 #
-# The outer loop's own back edge (^bb16 -> ^bb4) lends the same way and IS
-# balanced, by the `LyRangeIterator_DecRef(%9#4)` the `next` call's result
-# gets each trip. The inner loop has the equivalent release for the INNER
-# iterator (^bb15) and none for the outer one.
-#
-# So the lend half of the loop-carried contract was placed and the release
-# half was not -- the mirror image of the union-carried-local defect fixed
-# 2026-08-13, where a conditional release meant NEITHER half was placed.
-# Ownership.cpp's edge-retain loop is where the lend is decided
-# (`EdgeRetain`, gated on `insertReleases`), so the two halves already share
-# a caller; what is not established is why this candidate group got one.
-#
-# NOT in the leak gate: a red test is not something to commit
-# (tests/CMakeLists.txt). tests/golden/cases/generator_nested_loops.py pins
-# the VALUE, which is correct; this file pins the leak.
+# tests/golden/cases/generator_nested_loops.py pins the value; this file and
+# tests/leak_gate.py pin the absence of the leak (net 0 at n=3, 10 and 40).
 from typing import Iterator
 
 

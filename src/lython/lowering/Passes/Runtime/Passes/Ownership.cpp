@@ -2495,14 +2495,69 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
   // What is open is not a defect but a REPRESENTATION gap, recorded in
   // `proof/`: the kernel cannot say "the emitted code disagrees with the ghost
   // state", which is the shape every one of these bugs had.
+  //
+  // ⭐ A token stays owned across a FORWARDING block. A block with one
+  // predecessor and one edge from it does not merge anything -- its argument
+  // is the same token under a new name -- so the walk follows that edge back
+  // rather than answering "not owned" and making the loop lend.
+  //
+  // Without it, a loop that carries a value through such a block lent it a
+  // token on every trip and nothing gave it back. Measured: nested loops in a
+  // generator leaked the OUTER range iterator, 1 allocation / 56 B, flat at
+  // n=3, 10 and 40 -- the inner loop's back edge lends `%43` (its own
+  // argument, forwarded from the outer loop's merge) and the outer loop's
+  // exit lends `%65` the same way. A single loop is clean because its back
+  // edge carries the merge argument itself.
+  //
+  // ⛔ Why the chain stops at a block with no predecessor rather than calling
+  // an entry argument owned: 70 of the 299 borrow-edge retains in the
+  // 2026-07-30 census are entry block arguments and every one is genuinely
+  // BORROWED -- not one carries `transfer_args`, `release_args` or
+  // `retain_args` at its index. Calling them owned drops retains that are
+  // load-bearing.
+  //
+  // ⛔ Why a single edge and not merely a single predecessor: a `cond_br`
+  // whose two successors are both this block reaches it from one predecessor
+  // over TWO edges, and only one of them runs. Following either would claim a
+  // token the other path did not pass.
   auto isOwnedIncoming = [&](mlir::Value v) {
-    if (ownedValues.count(v))
-      return true;
-    if (mlir::isa<mlir::BlockArgument>(v))
+    llvm::SmallPtrSet<mlir::Value, 4> seen;
+    while (v) {
+      if (ownedValues.count(v))
+        return true;
+      if (!seen.insert(v).second)
+        return false;
+      auto argument = mlir::dyn_cast<mlir::BlockArgument>(v);
+      if (!argument)
+        return false;
       for (auto &entry : candidates)
-        for (mlir::Value arg : entry.second.args)
-          if (arg == v)
+        for (mlir::Value candidateArg : entry.second.args)
+          if (candidateArg == v)
             return true;
+      mlir::Block *owner = argument.getOwner();
+      mlir::Value incoming;
+      unsigned edges = 0;
+      for (mlir::Block *predecessor : owner->getPredecessors()) {
+        auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(
+            predecessor->getTerminator());
+        if (!branch)
+          return false;
+        for (unsigned index = 0, end = branch->getNumSuccessors(); index < end;
+             ++index) {
+          if (branch->getSuccessor(index) != owner)
+            continue;
+          ++edges;
+          mlir::SuccessorOperands operands =
+              branch.getSuccessorOperands(index);
+          unsigned position = argument.getArgNumber();
+          incoming =
+              position < operands.size() ? operands[position] : mlir::Value();
+        }
+      }
+      if (edges != 1)
+        return false;
+      v = incoming;
+    }
     return false;
   };
   // An incoming value dies on the edge pred→dest when it is not LIVE-IN at
