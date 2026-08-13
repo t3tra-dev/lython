@@ -571,6 +571,14 @@ set(LYTHON_LEAK_GATE_CASES
     # 1 root / 52 B per call, and the str form never did, so only a leak
     # check tells the two apart.
     string_annotation_union
+    # Removing and replacing a container element. Both give the element a
+    # SECOND aggregate release, which is what exposed the ownership walk
+    # counting one reference in hand where the literal had already retained
+    # for the slot. Repaired into this list -- 2 allocs / 93 B and
+    # 3 allocs / 8316 B, recorded as separate defects until the bisect made
+    # them one.
+    delete_item
+    container_shared_with_a_holder
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

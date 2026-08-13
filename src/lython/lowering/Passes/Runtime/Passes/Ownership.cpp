@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Process.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -1613,14 +1614,93 @@ bool releaseOwnedGroupByLiveness(
         }
       }
   }
-  // One reference in hand, one taken away per consume, one more needed if
+  // References in hand, one taken away per consume, one more needed if
   // anything still reads the value after the last of them. So the count to
   // reach is `consumes + (reads after the last ? 1 : 0)`, and the retains to
-  // insert are that minus the one already held -- which is a retain before
+  // insert are that minus what is already held -- which is a retain before
   // every consume except the last, plus one before the last when reads follow
   // it. Writing it as the general count rather than as the single-consume case
   // is what makes `a = ValueError(msg); b = ValueError(msg)` fall out instead
   // of needing its own arm.
+  //
+  // ⭐ WHAT IS IN HAND IS NOT ALWAYS ONE. The producer's token is one; every
+  // `aggregate_retain` the runtime lowerer already minted on this entity is
+  // another, and a container literal mints one per element it stores. Reading
+  // the total as one made each consume past the first look unpaid, so an
+  // unfold retain went in that nothing discharges:
+  //
+  //     a = ["p", "q"]
+  //     del a[0]              # leaked the deleted element -- 41 B str, 52 B
+  //                           # int -- and the dict spelling with it
+  //
+  // The element there has two references (its own and the literal's slot) and
+  // two releases (`sequence.literal.source` and `list.delitem`), so the right
+  // number of unfold retains is zero. Without the `del` there is only one
+  // release and the old arithmetic reached zero by accident, which is why
+  // every leak-gate member kept passing over it.
+  //
+  // ⛔ Why NOT read the second release as "not a read" in
+  // `readFollowsConsumeInBlock` instead, which is where the retain is decided
+  // for a single consume: it is not that path. Both releases are CONSUMES
+  // (`release_args` on the deallocator), so the retain comes from the
+  // all-but-the-last rule, and a group with one consume and a later read
+  // still needs its retain.
+  //
+  // ⛔ And why the count is PAIRED against the SLOT releases below rather than
+  // added outright: a slot's retain is discharged by that slot, which is
+  // usually the container's teardown and not a consume this walk can see.
+  // Crediting it against an unrelated consume drops a reference the container
+  // still holds --
+  //
+  //     msg = "hi"; xs = [msg]
+  //     a = ValueError(msg); b = ValueError(msg)   # two transfer_args
+  //
+  // would take `msg` to zero while `xs` still points at it, which is the one
+  // direction this may never move in. Only a slot release among the consumes
+  // proves a slot's reference is being discharged HERE, so the credit is
+  // `min(retains, those releases)`.
+  //
+  // ⛔ And a `.source` aggregate release is NOT one of them, which is not a
+  // detail: it discharges the value's OWN token, the one the literal took
+  // over. Counting it cost `cross_enum_generic_handler` its two dict literals
+  // holding the same enum singleton -- two reads, two `.source` releases of
+  // ONE frame token, credited against the two SLOT retains, one unfold retain
+  // fewer than needed and `Ly_IncRef observed non-positive refcount` at the
+  // second read. The suffix is the lowerer's own convention for the
+  // distinction (Ops/AttributeOps.cpp writes it as `slotName + ".source"`).
+  auto aggregateRetainsHeldAt = [&](mlir::Operation *point) -> unsigned {
+    mlir::func::FuncOp fn = point->getParentOfType<mlir::func::FuncOp>();
+    if (!fn)
+      return 0;
+    // The retain takes a rank-1 VIEW of the header, so the operand naming the
+    // entity is one `memref.cast` past the retain itself.
+    auto retainedEntity = [](mlir::Value value) {
+      while (auto cast = value.getDefiningOp<mlir::memref::CastOp>())
+        value = cast.getSource();
+      return own::underlyingObjectValue(value);
+    };
+    llvm::SmallPtrSet<mlir::Value, 8> names;
+    for (mlir::Value result : group.values) {
+      llvm::SmallVector<mlir::Value, 8> equivalents;
+      aliases.namesOf(result, equivalents);
+      for (mlir::Value equivalent : equivalents)
+        names.insert(retainedEntity(equivalent));
+    }
+    if (!dominance)
+      dominance.emplace(fn);
+    unsigned held = 0;
+    fn.walk([&](mlir::Operation *op) {
+      if (!op->hasAttr(own::kAggregateRetainAttr) || op == point ||
+          !dominance->properlyDominates(op, point))
+        return;
+      for (mlir::Value operand : op->getOperands())
+        if (names.contains(retainedEntity(operand))) {
+          ++held;
+          break;
+        }
+    });
+    return held;
+  };
   {
     bool sameBlock = true;
     for (mlir::Operation *op : consumingOps)
@@ -1639,11 +1719,28 @@ bool releaseOwnedGroupByLiveness(
         return a->isBeforeInBlock(b);
       });
       mlir::Operation *last = consumingOps.back();
-      for (unsigned index = 0; index + 1 < consumingOps.size(); ++index)
+      bool readsFollow = readFollowsConsumeInBlock(last);
+      unsigned needed =
+          static_cast<unsigned>(consumingOps.size()) + (readsFollow ? 1u : 0u);
+      // The credit is asked for only when it can change the answer, so the
+      // function walk stays off every group that has no aggregate release
+      // among its consumes -- which is nearly all of them.
+      unsigned slotConsumes = 0;
+      if (needed > 1)
+        for (mlir::Operation *consume : consumingOps)
+          if (auto label = consume->getAttrOfType<mlir::StringAttr>(
+                  own::kAggregateReleaseAttr);
+              label && !label.getValue().ends_with(".source"))
+            ++slotConsumes;
+      unsigned inHand =
+          slotConsumes == 0
+              ? 1
+              : 1 + std::min(slotConsumes,
+                             aggregateRetainsHeldAt(consumingOps.front()));
+      for (unsigned index = 0, unfolds = needed > inHand ? needed - inHand : 0u;
+           index < unfolds; ++index)
         unfoldRetainBefore.push_back(consumingOps[index]);
-      if (readFollowsConsumeInBlock(last)) {
-        unfoldRetainBefore.push_back(last);
-      } else {
+      if (!readsFollow) {
         groupHasConsumingCall = true;
         consumeSites.push_back(last);
       }

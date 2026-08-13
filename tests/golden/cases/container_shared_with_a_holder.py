@@ -38,11 +38,11 @@ def through_a_field() -> None:
     print(a, b.xs)
 
 
-# ⛔ NOT in the leak gate because of this one: replacing a list element leaks
-# the old element (3 allocations per execution, and identically on the
-# pre-session binary), which is the teardown-accounting defect recorded in
-# SpecialMethodOps.cpp. The VALUES here are the assertion; the accounting is
-# tracked separately.
+# This one kept the file out of the leak gate until 2026-08-14: replacing a
+# list element leaked the old one, 3 allocations / 8316 B per execution. The
+# element had two references and two releases, and the ownership walk counted
+# one reference against them and retained to make up the difference
+# (tests/probe/wb_aggregate_slot_unfold_retain_leak.py). Now in the gate.
 def through_a_subscript_store() -> None:
     a: list[int] = [1]
     holder: list[list[int]] = [[9]]

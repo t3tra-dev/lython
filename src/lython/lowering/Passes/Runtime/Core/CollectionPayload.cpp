@@ -757,31 +757,27 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
       bool firstOccurrence =
           sourceValues.empty() ||
           movedSources.insert(sourceValues.front().getAsOpaquePointer()).second;
-      // ⛔ KNOWN DEFECT, and this release is where it starts. `grid[1][0] = 9`
-      // leaks 52 B with no read of the value at all -- only for a store into
-      // the LAST element, because only the setitem receiver is read back.
+      // FIXED 2026-08-14. `grid[1][0] = 9` leaked 52 B with no read of the
+      // value at all, and this release was suspected because it is the
+      // source's death. It is correct: the literal owns the reference now.
       //
-      // What happens: this release is the source's death, the literal owns the
-      // reference now. But a later read of that element mints a frame token
-      // (`Core/ObjectBundles.cpp`, off `objectValue.ownership == Own`) and the
-      // refcount pass reads it as a second obligation -- three releases for
-      // two references, and the outer list's slot loses one.
+      // ⭐ THE COUNT WAS WRONG, NOT THIS RELEASE. The element ends up with two
+      // references -- this token and the `aggregate_retain` for the slot --
+      // and the store adds a second aggregate release, so two discharge two.
+      // `releaseOwnedGroupByLiveness` read "one reference in hand" against two
+      // consumes and inserted an unfold retain nothing pays for
+      // (Passes/Ownership.cpp, "WHAT IS IN HAND IS NOT ALWAYS ONE").
       //
-      // Three repairs measured, none of them right:
-      //   - suppress that token's release when the value was absorbed: 52 B
-      //     becomes 8420 B. The token also releases the value on paths where
-      //     the literal did NOT take it over.
+      // Which is why the three repairs measured here all missed. Each looked
+      // for a way to suppress a RELEASE:
+      //   - suppress the later read's frame token when the value was absorbed:
+      //     52 B became 8420 B -- that token also releases the value on paths
+      //     where the literal did NOT take it over.
       //   - treat a literal-absorbed element as borrowed in
-      //     `frameKeepsOwnedSourceOf`: no effect; that predicate is not on
-      //     this path (traced, `ROOT-MINT` never fires).
-      //   - demote the SOURCE bundle's ownership here, so the later read finds
-      //     no `Own` to mint from: no effect either. The lookup succeeds (six
-      //     absorptions, all found) and the marker count is unchanged at 30,
-      //     so the token is minted off a bundle this write does not reach.
-      //
-      // The next attempt needs to find WHICH bundle the mint reads -- it is
-      // not the one keyed by `logicalSource` -- rather than another way to
-      // suppress a release.
+      //     `frameKeepsOwnedSourceOf`: no effect; not on this path.
+      //   - demote the SOURCE bundle's ownership here: no effect either.
+      // None of them could work: there was one release too FEW for the retains
+      // in hand, not one too many.
       if (firstOccurrence &&
           mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, *payload, "sequence.literal.source")))

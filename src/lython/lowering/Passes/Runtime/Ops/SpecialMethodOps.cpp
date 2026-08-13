@@ -548,22 +548,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         if (mlir::failed(RuntimeBundleLowerer::storeSequencePayloadElement(
                 op, updated, position, *payload)))
           return mlir::failure();
-        // ⛔ KNOWN DEFECT: replacing a list element LEAKS the old one.
+        // FIXED 2026-08-14, and the diagnosis above it was wrong about where.
         //
         //     holder: list[list[int]] = [[9]]
-        //     holder[0] = [7]      # 3 allocations, 8316 B, per execution
+        //     holder[0] = [7]      # was 3 allocations, 8316 B, per execution
         //
-        // `replaceAggregateSlot` above does release the slot's reference, and
-        // the same shape with a NAMED value on the right leaks identically, so
-        // it is the replaced element's OTHER reference -- the one the nested
-        // literal `[9]` kept when its token did not move into the outer
-        // literal. That is the teardown-accounting defect the
-        // `valueIsConsumedOnlyBy` note in CollectionPayload.cpp records, seen
-        // from the store side. Measured on the pre-session binary too: same
-        // three allocations, so it predates this work.
+        // `replaceAggregateSlot` above was never the problem: it releases the
+        // slot's reference, correctly, and that release plus the nested
+        // literal's `sequence.literal.source` release made TWO consumes of one
+        // entity. `releaseOwnedGroupByLiveness` counted one reference in hand
+        // against them and inserted an unfold retain nothing discharges. The
+        // element's second reference is the literal's `aggregate_retain`, so
+        // counting those makes it two against two and the retain goes away
+        // (Passes/Ownership.cpp, "WHAT IS IN HAND IS NOT ALWAYS ONE";
+        // tests/probe/wb_aggregate_slot_unfold_retain_leak.py).
         //
-        // Moving the NEW value's token here was tried and changes nothing --
-        // the leak is on the old side, not the new.
+        // ⭐ It is the same defect as `del a[0]` and as `grid[1][0] = 9`,
+        // which were recorded separately at 41/52 B and 52 B. What made them
+        // look like three was that each needs a SECOND aggregate release to
+        // show; with one release the old arithmetic reached zero by accident.
         RuntimeBundle stored =
             payload->withObjectOwnership(ownership::logicalOwnershipKind(
                 payload->objectValue.contract, /*ownsObject=*/false));
