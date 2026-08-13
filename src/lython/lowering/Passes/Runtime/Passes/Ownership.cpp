@@ -5201,6 +5201,18 @@ public:
       // Does the frame own what this value names? Only then can a select
       // strand a reference.
       auto frameProduces = [&](mlir::Value value) {
+        // ⭐ Ask the value ITSELF before peeling. `underlyingObjectValue`
+        // reads through the `owned_local_object` marker cast to the raw
+        // alloc, whose defining op carries no attribute -- so a loop element
+        // materialised as an owned temporary and then merged by a select
+        // answered "not frame-owned", the diamond was never built, and the
+        // losing arm's reference was stranded. Measured: `if v < lo: lo = v`
+        // over a three-element list leaked 3 allocations / 156 B, one per
+        // element, and six elements leaked five.
+        if (mlir::Operation *marker = value.getDefiningOp())
+          if (marker->hasAttr(own::kOwnedLocalObjectAttr) ||
+              marker->hasAttr(own::kObjectHeaderAttr))
+            return true;
         mlir::Value root = own::underlyingObjectValue(value);
         mlir::Operation *definition = root.getDefiningOp();
         if (!definition)

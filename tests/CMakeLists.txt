@@ -561,6 +561,10 @@ set(LYTHON_LEAK_GATE_CASES
     # every trip. Repaired into this list -- it leaked 1 root / 56 B, and it
     # is the case that pins `isOwnedIncoming` following a forwarding edge.
     generator_nested_loops
+    # A loop-carried local CONDITIONALLY rebound to the loop element: the
+    # select merging them stranded the losing arm's reference, one per
+    # element. Repaired into this list -- it leaked 8 roots / 383 B.
+    loop_conditional_rebind
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
