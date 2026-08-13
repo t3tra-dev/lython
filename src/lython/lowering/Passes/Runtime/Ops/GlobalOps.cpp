@@ -175,6 +175,24 @@ mlir::LogicalResult RuntimeBundleLowerer::loadObjectGlobalValues(
   return mlir::success();
 }
 
+// ⛔ KNOWN DEFECT, measured, not repaired here: an int global is an UNBOXED
+// i64 cell, so `x: int = 1` grown past 2**63 by module-scope arithmetic
+// raises "int too large to convert to a native 64-bit integer" where CPython
+// prints the value -- while the same loop over a LOCAL prints it here too.
+//
+// The object path below is what a boxed int would need, and it is one line
+// away: `if (true || ...)` sends int down it. Measured, that breaks the
+// runtime's own signal-safe module -- "runtime pre-lowering pipeline failed
+// for src/lython/runtime/lib/stackguard_support.py" -- because an object
+// global's read retains and its write allocates, and that module exists to
+// be reachable from a signal handler. The i64 cell is not an optimization
+// here; it is the async-signal-safe channel py.global.get/set promises.
+//
+// So the repair is not "box it" but "box it where boxing is allowed", and
+// the discriminator is missing: nothing today separates a global a signal
+// handler may touch from one only ordinary code touches, and a per-module
+// split (runtime-internal vs user) still leaves a user's own ctypes callback
+// reading a boxed global, which verifyCallbackSignalSafety then refuses.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalGet(py::GlobalGetOp op) {
   if (runtimeContractName(op.getResult().getType()) != "builtins.int")
     return RuntimeBundleLowerer::lowerObjectGlobalGet(op);
