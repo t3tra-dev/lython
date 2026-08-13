@@ -2388,6 +2388,18 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       // block-argument edge the tag is forwarded too, so the retain and the
       // release both have to be emitted under `cmpi eq(tag, activeTag)`.
       // This pass emits only unguarded calls today.
+      //
+      // The retain half was repaired in the EMITTER instead
+      // (`acquireUnionCarriedTokens`, EmitterLoops.cpp), which is why the
+      // over-release is gone. The missing exit release now shows as a LEAK as
+      // well as a refusal, measured 2026-08-14: `pick(None, 3)` over a
+      // `while v is not None:` loop leaks 52 B -- the entry retain stands
+      // alone when the body never runs -- and `pick(None, None)` is clean,
+      // because a None union's release is a no-op and the absence is
+      // invisible. Two of the four leakers a full sweep of tests/golden/cases
+      // found are this shape, and it is the likely attribution for the
+      // "bounded, 62 B each, ATTRIBUTION UNKNOWN" family that had no
+      // reproducer. tests/probe/wb_union_carried_exit_release_leak.py.
       if (!g.deallocator || g.condition)
         continue;
       std::optional<Seeded> seeded = seedGroup(fn, g, call->getBlock());
