@@ -110,6 +110,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       mlir::Type type = moduleGlobals.lookup(name);
       auto op = py::GlobalGetOp::create(builder, loc(*expr), type,
                                         builder.getStringAttr(name));
+      markBoxedModuleGlobal(op);
       return {op.getResult(), type};
     }
     if (auto literal = moduleConstantBindings.find(name);

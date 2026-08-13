@@ -601,17 +601,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
       target.primitiveI64->value && target.primitiveI64->valid &&
       isKnownTrue(target.primitiveI64->valid)) {
     RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
-    RuntimeCtypesEvidence evidence;
-    evidence.kind = RuntimeCtypesEvidence::Kind::Symbol;
-    evidence.provenance = RuntimeCtypesEvidence::Provenance::ExternalAddress;
-    evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
-    evidence.ctypeName = "_ctypes.CFuncPtr";
-    evidence.ctype = ctypesContractType(context, "_ctypes.CFuncPtr");
-    evidence.argTypes = callable.ctypes->argTypes;
-    evidence.resultType = callable.ctypes->resultType;
-    evidence.addressValue = target.primitiveI64->value;
-    evidence.addressValid = target.primitiveI64->valid;
-    result.ctypes = std::move(evidence);
+    result.ctypes = callThroughAddressEvidence(
+        context, target.primitiveI64->value, target.primitiveI64->valid,
+        *callable.ctypes);
     valueBundles[op.getResult(0)] = std::move(result);
     erase.push_back(op);
     return mlir::success();

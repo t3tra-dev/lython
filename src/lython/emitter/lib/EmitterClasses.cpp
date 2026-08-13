@@ -2117,7 +2117,11 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     if (!storageBacked) {
       if (auto contract = mlir::dyn_cast<py::ContractType>(annotated)) {
         llvm::StringRef contractName = contract.getContractName();
+        // `ctypes.c_void_p` is the ADDRESS spelling: its cell is the machine
+        // word, which is what a signal handler may read and what an `int`
+        // global deliberately no longer is (see lowerGlobalGet).
         storageBacked = contractName == "builtins.bytes" ||
+                        contractName == "ctypes.c_void_p" ||
                         !contractName.contains('.');
       }
     }
@@ -2158,6 +2162,12 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
       continue;
     moduleConstantBindings[name] = value;
   }
+}
+
+void ModuleEmitter::markBoxedModuleGlobal(mlir::Operation *op) const {
+  if (options.runtimeInternal)
+    return;
+  op->setAttr("ly.global.boxed", mlir::UnitAttr::get(&context));
 }
 
 bool ModuleEmitter::isModuleGlobalRead(llvm::StringRef name) const {

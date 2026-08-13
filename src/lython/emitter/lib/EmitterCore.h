@@ -244,6 +244,11 @@ private:
   void collectModuleGlobals(const parser::Node &moduleNode);
   bool isModuleGlobalRead(llvm::StringRef name) const;
   bool isModuleGlobalWrite(llvm::StringRef name) const;
+  // Mark a py.global.get/set that reaches the MODULE-GLOBAL population, so
+  // lowering gives an `int` one the boxed object cell instead of the machine
+  // word. Default cells and class-attribute slots ride the same two ops and
+  // are deliberately left unmarked.
+  void markBoxedModuleGlobal(mlir::Operation *op) const;
 
   // EmitterEnums.cpp: `class C(Enum)` desugars to a plain class whose members
   // are class attributes instantiated at the ClassDef statement position, plus

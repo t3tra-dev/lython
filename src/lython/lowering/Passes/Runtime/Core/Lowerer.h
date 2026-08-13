@@ -328,6 +328,12 @@ private:
   mlir::LogicalResult lowerGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerObjectGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerObjectGlobalSet(py::GlobalSetOp op);
+  // The ADDRESS family: a module global whose annotation is a ctypes pointer
+  // type is a machine word with process lifetime, not a Python object.
+  mlir::LogicalResult lowerAddressGlobalGet(py::GlobalGetOp op);
+  mlir::LogicalResult lowerAddressGlobalSet(py::GlobalSetOp op,
+                                            const RuntimeBundle &value);
+  static bool isAddressGlobalType(mlir::Type type);
   // `cellType` is what the cell holds: `i64` for the bound flag, sizes and
   // scalars, `!llvm.ptr` for the `_p<i>` slots. A pointer slot holding a
   // pointer is the whole reason this takes a type -- see lowerObjectGlobalSet.

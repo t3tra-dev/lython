@@ -47,6 +47,26 @@ bool isCtypesPointerContract(llvm::StringRef contract) {
   return stripCtypesModule(contract) == "_Pointer";
 }
 
+RuntimeCtypesEvidence
+callThroughAddressEvidence(mlir::MLIRContext *context, mlir::Value address,
+                           mlir::Value addressValid,
+                           const RuntimeCtypesEvidence &signature) {
+  RuntimeCtypesEvidence evidence;
+  evidence.kind = RuntimeCtypesEvidence::Kind::Symbol;
+  evidence.provenance = RuntimeCtypesEvidence::Provenance::ExternalAddress;
+  evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+  evidence.ctypeName = "_ctypes.CFuncPtr";
+  evidence.ctype = ctypesContractType(context, "_ctypes.CFuncPtr");
+  evidence.argTypes = signature.argTypes;
+  evidence.resultType = signature.resultType;
+  evidence.addressValue = address;
+  evidence.addressValid = addressValid;
+  // ⛔ symbolName stays EMPTY on purpose: it is what selects the
+  // call-through-address form over the linked-symbol declaration, and setting
+  // it would send the call at a symbol that is not in the module.
+  return evidence;
+}
+
 bool isNoneContractName(llvm::StringRef contract) {
   return contract == "types.NoneType";
 }

@@ -142,6 +142,7 @@ int main(int argc, char **argv) {
 
   lython::emitter::EmitOptions emitOptions;
   emitOptions.targetTriple = triple.normalize();
+  emitOptions.runtimeInternal = true;
   lython::emitter::EmitResult emitted = lython::emitter::emitModule(
       *parsed.tree, context, "__main__", input, emitOptions);
   if (!emitted.ok()) {

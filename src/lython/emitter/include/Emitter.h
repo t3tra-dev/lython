@@ -34,6 +34,12 @@ struct EmitOptions {
   };
 
   bool sanitizeUndefined = false;
+  // Set for `runtime/lib/*.py` compiled by RuntimePyLowering. Those modules
+  // are linked into every program and reachable from a signal handler, so
+  // their `: int` module globals keep the unboxed machine-word cell; a user
+  // module's `: int` global is a Python integer and is boxed (see the
+  // `ly.global.boxed` mark on py.global.get/set).
+  bool runtimeInternal = false;
   std::string mainPackageName;
   std::string targetTriple;
   std::vector<SourceModule> sourceModules;

@@ -408,6 +408,23 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(py::CallOp op,
     } else if (isCtypesPointerContract(*targetContract)) {
       evidence.kind = RuntimeCtypesEvidence::Kind::Pointer;
       evidence.pointeeType = *targetContract;
+    } else if (*targetContract == "_ctypes.CFuncPtr") {
+      // Casting TO a function-pointer type is how CPython spells "call the
+      // code at this address with this signature" -- the only way to reach a
+      // c_void_p's target, since `PROTO(p)` takes an integer address and
+      // rejects a c_void_p (CPython: "argument must be callable or integer
+      // function address"). The signature comes from the CFUNCTYPE type
+      // object, so a bare _ctypes.CFuncPtr with no evidence has nothing to
+      // call through and keeps the refusal below.
+      if (!target->ctypes ||
+          target->ctypes->provenance !=
+              RuntimeCtypesEvidence::Provenance::CallbackThunk)
+        return op.emitError()
+               << "ctypes.cast to a function pointer requires a CFUNCTYPE "
+                  "type object, which carries the native signature";
+      evidence = callThroughAddressEvidence(context, *address,
+                                            evidence.addressValid,
+                                            *target->ctypes);
     } else {
       return op.emitError() << "ctypes.cast target " << *targetContract
                             << " is not a supported pointer-like ctypes type";

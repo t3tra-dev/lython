@@ -222,6 +222,7 @@ math_range_and_ord_text.py AGREE
 method_call_on_a_constructed_receiver.py AGREE
 method_iterable_argument.py AGREE
 method_return_through_try.py AGREE
+module_global_int_grows.py AGREE
 module_globals.py AGREE
 mutable_element_read_out_of_a_container.py AGREE
 mutate_a_parameter_then_return_it.py AGREE
@@ -375,4 +376,5 @@ w3_cross_json_ordereddict.py EXTRA
 w3_cross_os_try_rebind.py WRONG
 w3_cross_random_json.py EXTRA
 walrus.py AGREE
+while_condition_narrowing.py AGREE
 with_statement_on_a_python_class.py AGREE

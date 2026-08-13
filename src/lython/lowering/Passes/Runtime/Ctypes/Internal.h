@@ -110,6 +110,16 @@ bool isFixedOrTargetDependentCtypesScalar(llvm::StringRef contract);
 bool isCtypesIntegralLike(llvm::StringRef contract);
 bool isCtypesVoidPointer(llvm::StringRef contract);
 bool isCtypesPointerContract(llvm::StringRef contract);
+// The evidence a CFuncPtr carries when it names a foreign function reached
+// through a runtime ADDRESS rather than through a linked symbol: `PROTO(addr)`
+// and `ctypes.cast(p, PROTO)` are the two spellings, and both must produce
+// exactly this or `lowerStaticCtypesNativeCall` will not call through it.
+// `signature` supplies argTypes/resultType; it is the CFUNCTYPE type object's
+// own evidence.
+RuntimeCtypesEvidence
+callThroughAddressEvidence(mlir::MLIRContext *context, mlir::Value address,
+                           mlir::Value addressValid,
+                           const RuntimeCtypesEvidence &signature);
 bool isNoneBundle(const RuntimeBundle &bundle);
 bool isStaticSequenceBundle(const RuntimeBundle &bundle);
 std::string ctypesContractFromBundle(const RuntimeBundle &bundle);

@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include "Runtime/Ctypes/Internal.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace py::lowering {
@@ -175,78 +176,104 @@ mlir::LogicalResult RuntimeBundleLowerer::loadObjectGlobalValues(
   return mlir::success();
 }
 
-// ⛔ KNOWN DEFECT, measured, not repaired here: an int global is an UNBOXED
-// i64 cell, so `x: int = 1` grown past 2**63 by module-scope arithmetic
-// raises "int too large to convert to a native 64-bit integer" where CPython
-// prints the value -- while the same loop over a LOCAL prints it here too.
+// An address global's cell is the machine word itself: no header, no
+// refcount, so a read is one `llvm.load` and a signal handler may take it.
+// The bundle it hands back is the same ctypes CELL evidence
+// `ctypes.cast(x, c_void_p)` produces, which is what makes a global
+// interchangeable with a cast result everywhere downstream.
+bool RuntimeBundleLowerer::isAddressGlobalType(mlir::Type type) {
+  return ctypes::isCtypesVoidPointer(runtimeContractName(type));
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerAddressGlobalGet(py::GlobalGetOp op) {
+  mlir::Type type = op.getResult().getType();
+  mlir::LLVM::GlobalOp storage =
+      RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
+
+  builder.setInsertionPoint(op);
+  mlir::Value cell =
+      mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);
+  mlir::Value word = mlir::LLVM::LoadOp::create(builder, op.getLoc(),
+                                                builder.getI64Type(), cell);
+  mlir::Value valid =
+      mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1);
+
+  RuntimeBundle result = RuntimeBundle::object(type, {});
+  RuntimeCtypesEvidence evidence;
+  evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
+  // ⛔ Why NOT Provenance::Cast, which is what the c_void_p cast records: a
+  // cast keeps its SOURCE alive, and this word outlives every source. Static
+  // says the address is not owned by anything in this frame, which is the
+  // only claim a process-lifetime cell can make.
+  evidence.provenance = RuntimeCtypesEvidence::Provenance::ExternalAddress;
+  evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
+  evidence.ctypeName = runtimeContractName(type);
+  evidence.ctype = type;
+  evidence.addressValue = word;
+  evidence.addressValid = valid;
+  evidence.scalarValue = word;
+  evidence.scalarValid = valid;
+  result.ctypes = std::move(evidence);
+  valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerAddressGlobalSet(py::GlobalSetOp op,
+                                            const RuntimeBundle &value) {
+  mlir::LLVM::GlobalOp storage =
+      RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
+
+  builder.setInsertionPoint(op);
+  std::optional<ctypes::TargetPlatformFacts> facts =
+      ctypes::targetPlatformFacts(module);
+  std::optional<mlir::Value> word =
+      ctypes::extractPointerAddressInteger(op, builder, value, facts);
+  if (!word)
+    return op.emitError()
+           << "module global '" << op.getName()
+           << "' is an address cell, so its value must carry a concrete "
+              "pointer: None, a c_void_p, or a cast of one";
+  mlir::Value stored = *word;
+  if (!stored.getType().isInteger(64))
+    stored = mlir::arith::ExtUIOp::create(builder, op.getLoc(),
+                                          builder.getI64Type(), stored)
+                 .getResult();
+  mlir::Value cell =
+      mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);
+  mlir::LLVM::StoreOp::create(builder, op.getLoc(), stored, cell);
+  erase.push_back(op);
+  return mlir::success();
+}
+
+// ⭐ An int module global is a Python integer and is BOXED; a machine address
+// is spelled with its ctypes type and keeps the word. Nothing in the surface
+// distinguished the two before, and the single unboxed i64 cell that served
+// both is why `x: int = 1` grown past 2**63 raised "int too large to convert
+// to a native 64-bit integer" where CPython printed the value -- while the
+// same loop over a LOCAL printed it correctly here too.
 //
-// The object path below is what a boxed int would need, and it is one line
-// away: `if (true || ...)` sends int down it. Measured, that breaks the
-// runtime's own signal-safe module -- "runtime pre-lowering pipeline failed
-// for src/lython/runtime/lib/stackguard_support.py" -- because an object
-// global's read retains and its write allocates, and that module exists to
-// be reachable from a signal handler. The i64 cell is not an optimization
-// here; it is the async-signal-safe channel py.global.get/set promises.
+// The boxing is keyed on a `ly.global.boxed` mark the emitter puts on the two
+// ops that reach the MODULE-GLOBAL population.
 //
-// RESOLVED to a single program, and it is a language question, not a
-// lowering one. The full repair works: an `EmitOptions::runtimeInternal`
-// flag the pre-lowering tool sets, a `ly.global.boxed` mark on the two ops
-// that read and write the MODULE-GLOBAL population (the read by name and
-// the `global NAME` write -- the default-cell and class-attribute-slot
-// populations share these ops and must keep the word, which is what marking
-// per population rather than per module gets right), and this branch keyed
-// on the mark. `x: int = 1` then grows past 2**63 and prints
-// 1180591620717411303424 like CPython, and 666 of 667 tests pass.
+// ⛔ Why NOT box every py.global.get/set instead, which is one line here:
+// default cells and class-attribute slots ride the SAME two ops, and boxing
+// them made `golden/cases/default_once` print 0 for a default that must
+// evaluate once. Marking per population is what tells the three apart.
 //
-// The one failure is `examples/ctypes_signal.py`, and it is not a bug in
-// the repair: `g_write: int = 0` holds a libc `write` POINTER, read from
-// inside a signal handler, so boxing it is refused by
-// verifyCallbackSignalSafety exactly as the policy says it must be.
-//
-// So an int module global is two different things -- a Python integer,
-// which must grow, and a machine word, which must stay unboxed and
-// allocation-free -- and nothing in the SURFACE distinguished them.
-//
-// ⭐ DECIDED (user, 2026-08-13): an address is never written as `int`. A
-// global that holds a ctypes address declares a ctypes type
-// (`ctypes.c_void_p`), and `int` means the Python integer, always boxed.
-// What that leaves to do, in order:
-//   1. re-apply the marking described above (it is complete and measured);
-//   2. make a `ctypes.c_void_p` module global storage-backed on the WORD
-//      path -- collectModuleGlobals accepts int/str/float/bool/bytes and
-//      user classes today, and the contract-name test in this file keys on
-//      "builtins.int", so both need the address family added;
-//   3. migrate examples/ctypes_signal.py off `g_write: int` onto it.
-// Until 2 exists there is nowhere for the example's address to live, which
-// is why the marking is not landed on its own.
-//
-// The earlier measurement, kept because it is the reason to mark per
-// population and not per module:
-// an `EmitOptions::runtimeInternal` flag set by the pre-lowering tool, a
-// `ly.global.boxed` attribute on py.global.get/set for every other module,
-// and this branch keyed on the attribute instead of the contract. `x: int =
-// 1` grown past 2**63 then prints 1180591620717411303424, matching CPython.
-//
-// It also breaks three tests, and only one of them is the expected trade:
-//
-//   examples/ctypes_signal.py .......... refused, as designed: a callback
-//       reading a boxed global retains, and verifyCallbackSignalSafety says
-//       so. That is the policy working.
-//   golden/cases/default_once .......... prints 0 where it must print 1.
-//   golden/cases/default_expressions ... same shape.
-//
-// The last two are the finding: a WRONG VALUE, not a refusal, so the object
-// global path is not ready to carry an int today -- a read that reaches the
-// cell before its first store answers with the empty box instead of
-// refusing. Fixing the bigint means fixing that first, and it is the same
-// unbound-read question the object path already has an answer for on other
-// contracts (it raises RuntimeError); the int path never had to ask because
-// its cell starts at a valid 0.
-//
-// So: the repair is not "box it", it is "make the object cell's unbound
-// read right, then box it". The attribute plumbing above is the cheap half.
+// ⛔ Why NOT box the runtime's own modules too: `stackguard_support.py` keeps
+// libc function pointers in module globals and reads them from a signal
+// handler, and an object global's read retains. `EmitOptions::runtimeInternal`
+// leaves those on the word, so the exemption is one flag set by one tool
+// rather than a name test -- the runtime's modules are emitted as `__main__`
+// as well, so the emitter cannot tell them apart by module name.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalGet(py::GlobalGetOp op) {
-  if (runtimeContractName(op.getResult().getType()) != "builtins.int")
+  if (RuntimeBundleLowerer::isAddressGlobalType(op.getResult().getType()))
+    return RuntimeBundleLowerer::lowerAddressGlobalGet(op);
+  if (runtimeContractName(op.getResult().getType()) != "builtins.int" ||
+      op->hasAttr("ly.global.boxed"))
     return RuntimeBundleLowerer::lowerObjectGlobalGet(op);
   mlir::LLVM::GlobalOp storage =
       RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
@@ -365,6 +392,30 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
                                                  "module global object ABI");
   if (mlir::failed(valueTypes))
     return mlir::failure();
+
+  // An int that never needed a box carries only its i64 lane, and the cell
+  // stores objects. Boxing here is what lets a module global hold a value
+  // wider than the machine word.
+  //
+  // ⛔ Why NOT let the fresh object BE the slot's reference and skip the
+  // retain below: the materialized `__new__` result is an owned local like
+  // any other, and `insertOwnedResultReleases` releases it after the store.
+  // Skipping the retain left the slot holding a freed object, and the next
+  // read of that global aborted with "Ly_IncRef observed non-positive
+  // refcount" -- `golden.cases.module_globals` and
+  // `golden.cases.float_floordiv_mod_round`, both of which store a boxed
+  // value and read it back.
+  RuntimeBundle boxed;
+  if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*value)) {
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<RuntimeValue> object =
+        RuntimeBundleLowerer::materializePrimitiveI64Object(op, *value);
+    if (mlir::failed(object))
+      return mlir::failure();
+    boxed = RuntimeBundle::objectWithOwnership(object->contract, object->values,
+                                               ownership::OwnershipKind::Own);
+    value = &boxed;
+  }
   llvm::ArrayRef<mlir::Value> newValues = value->physicalValues();
   if (newValues.size() != valueTypes->size())
     return op.emitError() << "module global '" << op.getName()
@@ -463,27 +514,18 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
   return mlir::success();
 }
 
-// ⛔ KNOWN DEFECT: a module-level `int` global is a 64-bit cell, and CPython's
-// int is arbitrary precision.
+// The store side of the same split (see lowerGlobalGet): an address cell takes
+// the word, a marked int takes the object path, and only the runtime's own
+// modules still unbox an int into the native cell below.
 //
-//     a: int = 3037000500
-//     a = a * a
-//     print(a)      # -9223372036709301616; CPython 9223372037000250000
+// ⛔ Why NOT drop `int` from the storage-backed set in `EmitterClasses.cpp`
+// altogether, so these globals take `lowerObjectGlobalSet` like every other
+// contract: `stackguard_support.py` keeps function POINTERS and a file
+// descriptor in int globals and reads them from a signal handler that may not
+// allocate. That is what `EmitOptions::runtimeInternal` exempts instead.
 //
-// Nothing is diagnosed. The multiply is not at fault -- it detects the
-// overflow with `mulsi_extended` and produces a real `LyLong_Mul` result --
-// but the store below unboxes that back through `unbox.i64` because the cell
-// is an `i64`. The same code inside a function is correct: a local int is not
-// a cell.
-//
-// Why NOT drop `int` from the storage-backed set in `EmitterClasses.cpp`, so
-// these globals take `lowerObjectGlobalSet` like every other contract, which
-// is the shape the fix wants: `stackguard_support.py` keeps function POINTERS
-// and a file descriptor in int globals and reads them from a signal handler
-// that may not allocate -- the "signal-safe channel" the collector's own
-// comment names. Those uses stop resolving without a native slot.
-//
-// Measured, so the next attempt starts from the real boundary:
+// The measurement that located the boundary, kept because it is the reason
+// the exemption is per module and not per name:
 //
 //   - the breakage is EXACTLY 31 errors in that ONE file. Nothing else in the
 //     tree needs the native cell: `io.py`'s SEEK_* and `posixpath.py`'s
@@ -492,15 +534,16 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
 //   - so the exemption wants to be per-module, and `moduleName` cannot carry
 //     it: the runtime's own modules are emitted as `__main__` too, so the
 //     collector cannot tell them apart by name.
-//
-// What is missing is a way for a module to declare that a global is a machine
-// word rather than a Python int -- which is a new spelling, not a repair to
-// this path.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
   if (!value)
     return op.emitError() << "module global assignment value has no bundle";
-  if (runtimeContractName(op.getValue().getType()) != "builtins.int")
+  // The operand already carries the DECLARED type: the emitter coerces every
+  // module-global assignment to it before building this op.
+  if (RuntimeBundleLowerer::isAddressGlobalType(op.getValue().getType()))
+    return RuntimeBundleLowerer::lowerAddressGlobalSet(op, *value);
+  if (runtimeContractName(op.getValue().getType()) != "builtins.int" ||
+      op->hasAttr("ly.global.boxed"))
     return RuntimeBundleLowerer::lowerObjectGlobalSet(op);
   mlir::LLVM::GlobalOp storage =
       RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());

@@ -692,8 +692,10 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     if (isModuleGlobalWrite(name)) {
       mlir::Type type = moduleGlobals.lookup(name);
       Value coerced = coerceValue(value, type, target);
-      py::GlobalSetOp::create(builder, loc(target),
-                              builder.getStringAttr(name), coerced.value);
+      auto op = py::GlobalSetOp::create(builder, loc(target),
+                                        builder.getStringAttr(name),
+                                        coerced.value);
+      markBoxedModuleGlobal(op);
       return;
     }
     // A name bound to a nonlocal cell (owner scope or a `nonlocal`-declaring
