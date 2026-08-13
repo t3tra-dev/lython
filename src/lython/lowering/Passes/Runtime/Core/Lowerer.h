@@ -205,10 +205,15 @@ private:
   mlir::FailureOr<unsigned>
   unionMemberValueOffset(mlir::Operation *op, py::UnionType unionType,
                          unsigned memberIndex, llvm::StringRef purpose) const;
+  // `lanesSource`, when given, receives the bundle whose physical values
+  // actually went into `values` -- which is not `source` when a lazily-boxed
+  // int had to be materialized to fill the member lanes. A caller that
+  // remembers the active member must remember THAT one; see lowerUnionWrap.
   mlir::LogicalResult
   appendUnionRuntimeValues(mlir::Operation *op, py::UnionType resultUnion,
                            const RuntimeBundle &source, mlir::Type sourceType,
-                           llvm::SmallVectorImpl<mlir::Value> &values);
+                           llvm::SmallVectorImpl<mlir::Value> &values,
+                           RuntimeBundle *lanesSource = nullptr);
   mlir::LogicalResult
   appendRuntimeValueTypes(mlir::Operation *op, mlir::Type type,
                           llvm::SmallVectorImpl<mlir::Type> &types) const;

@@ -63,7 +63,8 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::unionMemberValueOffset(
 
 mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     mlir::Operation *op, py::UnionType resultUnion, const RuntimeBundle &source,
-    mlir::Type sourceType, llvm::SmallVectorImpl<mlir::Value> &values) {
+    mlir::Type sourceType, llvm::SmallVectorImpl<mlir::Value> &values,
+    RuntimeBundle *lanesSource) {
   if (source.kind != RuntimeBundle::Kind::Object)
     return op->emitError() << "union source must be an object bundle";
 
@@ -78,6 +79,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     materializedSource = std::move(*materialized);
     sourceBundle = &materializedSource;
   }
+  if (lanesSource)
+    *lanesSource = *sourceBundle;
 
   auto sourceUnion = mlir::dyn_cast<py::UnionType>(sourceType);
   auto appendDeadMember = [&](mlir::Type member) -> mlir::LogicalResult {
@@ -207,8 +210,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerUnionWrap(py::UnionWrapOp op) {
 
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 8> values;
+  RuntimeBundle lanesSource;
   if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
-          op, resultUnion, *input, op.getInput().getType(), values)))
+          op, resultUnion, *input, op.getInput().getType(), values,
+          &lanesSource)))
     return mlir::failure();
 
   RuntimeBundle result;
@@ -216,9 +221,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerUnionWrap(py::UnionWrapOp op) {
           op, op.getResult().getType(), values, result)))
     return mlir::failure();
   result.copyEvidenceFrom(*input);
+  // ⭐ The active member is the bundle whose values are IN the union's lanes,
+  // not the one this op was handed. They differ for a lazily-boxed int: the
+  // member lanes hold an object `appendUnionRuntimeValues` had to materialize,
+  // while `*input` still carries only the raw i64. Recording `*input` left the
+  // returned-object evidence lane (Returns.cpp, "the owned evidence lane must
+  // alias its values") with nothing to alias, so it materialized a SECOND
+  // int -- and only that one is named by `ly.ownership.owned_results`, so the
+  // one in the union's own lanes was never released. `def pick(f: bool) ->
+  // int | None: return 7` leaked 52 B per call; the str form, which needs no
+  // materialization and so aliased already, did not.
   if (input->kind == RuntimeBundle::Kind::Object &&
       !mlir::isa<py::UnionType>(op.getInput().getType()))
-    result.unionActiveMember = std::make_shared<RuntimeBundle>(*input);
+    result.unionActiveMember =
+        std::make_shared<RuntimeBundle>(std::move(lanesSource));
   valueBundles[op.getResult()] = std::move(result);
   erase.push_back(op);
   return mlir::success();

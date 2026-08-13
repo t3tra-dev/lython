@@ -32,10 +32,15 @@
 # only unguarded calls today, which is the whole reason for the skip.
 #
 # FOUND by tests/probe/tools/leak_sweep.py over tests/golden/cases: 374
-# programs, 369 clean, 4 leaking. This shape is two of the four
-# (`while_condition_narrowing`, `string_annotation_union`) and is the likely
-# attribution for the "bounded, 62 B each, ATTRIBUTION UNKNOWN" family in the
-# debt list, which had no reproducer.
+# programs, 369 clean, 4 leaking. This shape is ONE of the four,
+# `while_condition_narrowing`.
+#
+# ⛔ `string_annotation_union` leaks the same 52 B off a union and is NOT this
+# defect -- it needs no loop at all, and it stayed red after this shape's
+# reproducer was written. It was the union RETURN's double materialization
+# (wb_union_return_double_box_leak.py), fixed 2026-08-14. Equal figures off
+# the same type are not one attribution; two of them here were three
+# defects.
 #
 # differential: skip the leak is invisible to stdout; this records the shape
 

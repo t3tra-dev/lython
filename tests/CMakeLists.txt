@@ -565,6 +565,12 @@ set(LYTHON_LEAK_GATE_CASES
     # select merging them stranded the losing arm's reference, one per
     # element. Repaired into this list -- it leaked 8 roots / 383 B.
     loop_conditional_rebind
+    # A function returning `int | None`: the union's member lanes and the
+    # returned-object evidence lane have to name ONE object, and for a
+    # lazily-boxed int they named two. Repaired into this list -- it leaked
+    # 1 root / 52 B per call, and the str form never did, so only a leak
+    # check tells the two apart.
+    string_annotation_union
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
