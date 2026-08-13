@@ -605,12 +605,24 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     //    expanded, so an argument not yet reached has no bundle and is
     //    miscounted as a physical lane.
     //
-    // So the block side needs a discriminator that does not depend on how
-    // far the expansion has got. The type test is close -- it agreed with
-    // the bundle test on every position of the program above -- but is not
-    // sound alone: a prim tensor local's logical type is a bare `memref`,
-    // the same shape a physical lane has. Not landed: a half-corrected index
-    // in this pass is worse than the honest refusal it would replace.
+    // 3. Give each side its own progress-independent test -- on the block,
+    //    "an argument this pass did not append as a lane" (a new set filled
+    //    at the insertArgument site); on the edge, "has a runtime bundle".
+    //    That pairs correctly for the reproducer, which then reaches a
+    //    LATER phase and stops at "primitive int merge source has neither
+    //    evidence nor an unboxable representation" -- but it breaks 185 of
+    //    667 tests, so the block-side set is not the population it looks
+    //    like: physical block arguments also arrive from the entry ABI and
+    //    from the generator state machine, and an argument this pass did
+    //    not append is not therefore a logical head.
+    //
+    // What the next attempt needs before writing code: the ONE place that
+    // knows, for an arbitrary block argument, whether it is a logical head
+    // or a lane -- across all three producers, not just this pass's. Until
+    // that exists the pairing cannot be computed, and a half-corrected
+    // index here is worse than the honest refusal it would replace: 185
+    // tests is what "worse" looks like when it is measured instead of
+    // assumed.
     mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
