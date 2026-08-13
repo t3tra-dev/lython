@@ -188,7 +188,30 @@ mlir::LogicalResult RuntimeBundleLowerer::loadObjectGlobalValues(
 // be reachable from a signal handler. The i64 cell is not an optimization
 // here; it is the async-signal-safe channel py.global.get/set promises.
 //
-// The discriminator can be built -- and was, and it is not enough. Measured:
+// RESOLVED to a single program, and it is a language question, not a
+// lowering one. The full repair works: an `EmitOptions::runtimeInternal`
+// flag the pre-lowering tool sets, a `ly.global.boxed` mark on the two ops
+// that read and write the MODULE-GLOBAL population (the read by name and
+// the `global NAME` write -- the default-cell and class-attribute-slot
+// populations share these ops and must keep the word, which is what marking
+// per population rather than per module gets right), and this branch keyed
+// on the mark. `x: int = 1` then grows past 2**63 and prints
+// 1180591620717411303424 like CPython, and 666 of 667 tests pass.
+//
+// The one failure is `examples/ctypes_signal.py`, and it is not a bug in
+// the repair: `g_write: int = 0` holds a libc `write` POINTER, read from
+// inside a signal handler, so boxing it is refused by
+// verifyCallbackSignalSafety exactly as the policy says it must be.
+//
+// So an int module global is two different things -- a Python integer,
+// which must grow, and a machine word, which must stay unboxed and
+// allocation-free -- and nothing in the SURFACE distinguishes them today.
+// That is the decision this waits on (an annotation, a distinct ctypes
+// type, or a rule that the address family is never a plain `int`), not more
+// work in this file. Everything below the surface is measured and ready.
+//
+// The earlier measurement, kept because it is the reason to mark per
+// population and not per module:
 // an `EmitOptions::runtimeInternal` flag set by the pre-lowering tool, a
 // `ly.global.boxed` attribute on py.global.get/set for every other module,
 // and this branch keyed on the attribute instead of the contract. `x: int =
