@@ -271,6 +271,7 @@ wb_finally_loop_local_unwind.py GAP
 wb_forloop_handler_local_unwind.py GAP
 wb_generator_object_argument_leak.py AGREE
 wb_generator_resume_raise_unwind.py GAP
+wb_int_module_global_bigint.py SKIP
 wb_loopelse_only_write_lost.py AGREE
 wb_merge_arg_one_lane_list_overrelease.py AGREE
 wb_method_store_bigint.py GAP
@@ -323,4 +324,4 @@ wb_param_store_tuple.py AGREE
 wb_param_store_twofloat.py AGREE
 wb_param_store_twolevel_float.py AGREE
 wb_range_elem_into_list_literal.py AGREE
-wb_union_loop_carried_borrow_overrelease.py SKIP
+wb_union_loop_carried_borrow_overrelease.py AGREE

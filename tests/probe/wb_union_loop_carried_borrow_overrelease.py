@@ -1,9 +1,9 @@
-# differential: skip the over-release shows up as a wrong value or an abort
-# depending on allocator reuse, so the runner cannot classify it stably
+# FIXED 2026-08-13 -- kept as the reproducer for the half that remains.
 #
-# SILENT WRONG, and sometimes an abort. CPython prints "start"; this prints an
-# empty line with rc=0 and no diagnostic -- 12 of 12 sequential runs -- and
-# aborts instead when the differential runner runs it under load.
+# WAS: a silent wrong answer, and sometimes an abort. CPython prints "start";
+# this printed an empty line with rc=0 and no diagnostic -- 12 of 12
+# sequential runs -- and aborted instead when the differential runner ran it
+# under load.
 #
 # A loop-carried local of UNION type is released on the loop's back edge --
 # `py.decref` of the old incarnation, which lowers to a release guarded by the
@@ -31,6 +31,11 @@
 # value below is the stable half, which is why THIS spelling is the one in the
 # corpus -- the aborting spellings would make the differential runner flaky.
 #
+# THE REPAIR: the loop acquires its own token for a union carried local on
+# the entry edge (acquireUnionCarriedTokens, EmitterLoops.cpp), which is the
+# acquisition the pass places for every other type. The exit-edge RELEASE is
+# still missing, so the second reproducer below still refuses.
+#
 # MECHANISM, located: insertOwnedBlockArgumentReleases
 # (src/lython/lowering/Passes/Runtime/Passes/Ownership.cpp) places both halves
 # of the loop-carried contract -- the borrow-edge retain that compensates a
@@ -46,16 +51,13 @@
 #           n = total + 100           #  return"
 #       return total
 #
-# WHY IT MATTERS BEYOND ITSELF: `while x is not None:` cannot narrow x for its
-# own body until this is fixed. The narrowing is one line in emitWhile and the
-# whole suite stays green with it, but it puts an unwrap on the carried value
-# and moves which lanes the pass sees -- measured, it turns the second
-# spelling above from "aborts 6 of 12" into "aborts every run". The note at
-# that line in EmitterLoops.cpp carries the same measurement.
+# WHAT IT UNBLOCKED: `while x is not None:` now narrows x for its own body.
+# That narrowing is one line in emitWhile, and before the repair it made this
+# worse rather than better -- the unwrap moved which lanes the pass sees and
+# turned "aborts 6 of 12" into "aborts every run". With the token acquired,
+# all five aborting spellings are 0 of 12 and the narrowing is in.
 #
-# NOT A GOLDEN: a golden that asserts the wrong answer would lock it in, and a
-# red golden is not something to commit. When it is fixed, the seven rows
-# above are the test.
+# tests/golden/cases/while_condition_narrowing.py is the golden for both.
 def f(s: str | None) -> str:
     while s is not None:
         s = None

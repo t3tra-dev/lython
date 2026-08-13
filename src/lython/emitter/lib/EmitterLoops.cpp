@@ -21,6 +21,43 @@ namespace lython::emitter {
 
 namespace {
 
+// ⭐ The loop's own token for a UNION carried local, acquired on the entry
+// edge. Every carried local is released once per iteration by
+// carriedLoopEdgeOperands ("the loop-carried ownership token stays balanced
+// on every edge that leaves the body"), and the matching acquisition on the
+// way IN is placed by insertOwnedBlockArgumentReleases -- for every type
+// except a union, whose release is guarded by its tag and which that pass
+// skips (`g.condition`, Passes/Runtime/Passes/Ownership.cpp).
+//
+// With neither half, the first back edge released a value the loop never
+// owned: `def f(s: str | None): while s is not None: s = None; return
+// "start"` freed the CALLER's argument and printed an empty line, or aborted
+// with "Ly_DecRef observed non-positive refcount" depending on what reused
+// the hole. The pre-loop value's own token stays with the pre-loop binding,
+// exactly as the "defined before the loop covers none" rule in that function
+// says, so this is an acquisition and not a duplicate.
+//
+// ⛔ Why here and not there: emitting it in the pass needs a TAG-GUARDED
+// call (`cmpi eq(tag, activeTag)` around the retain), and that pass emits
+// only unguarded ones. py.incref on a union already lowers to the guarded
+// form, so the emitter can say it in one op. When the pass grows a guarded
+// emitter this belongs there, with the release half.
+void acquireUnionCarriedTokens(mlir::OpBuilder &builder, mlir::Location loc,
+                               llvm::ArrayRef<CarriedLoopLocal> carried,
+                               llvm::ArrayRef<mlir::Value> initialValues) {
+  for (auto [index, local] : llvm::enumerate(carried)) {
+    if (index >= initialValues.size() || !initialValues[index])
+      continue;
+    if (!mlir::isa<py::UnionType>(local.type))
+      continue;
+    py::IncRefOp::create(builder, loc, initialValues[index]);
+  }
+}
+
+} // namespace
+
+namespace {
+
 Value stripLocalProtocolView(Value value) {
   if (!value.value)
     return value;
@@ -628,6 +665,7 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   }
 
   builder.setInsertionPointToEnd(entry);
+  acquireUnionCarriedTokens(builder, loc(statement), carried, carriedInitial);
   mlir::cf::BranchOp::create(builder, loc(statement), checkBlock, carriedInitial);
 
   builder.setInsertionPointToStart(checkBlock);
@@ -781,6 +819,7 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   }
 
   builder.setInsertionPointToEnd(entry);
+  acquireUnionCarriedTokens(builder, loc(statement), carried, carriedInitial);
   mlir::cf::BranchOp::create(builder, loc(statement), headerBlock,
                              carriedInitial);
 
@@ -822,45 +861,27 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       values[local.name] = Value{postTestValues[index], local.type};
       types.bindSymbol(local.name, local.type);
     }
-    // ⛔ KNOWN DEFECT: the body does NOT see what the condition proves.
-    // `while n is not None:` leaves n a union inside its own body, so
-    // `total += n` is refused for an operand the loop only enters with when
-    // it is an int -- while the if statement and the conditional expression
-    // both narrow it. The narrowing itself is one line here
-    // (applyBranchNarrowing with the test's fact, conditionIsTrue) and the
-    // 662-case suite stays green with it, so what follows is why it is not
-    // that line.
+    // The body sees what the condition proves: `while n is not None:`
+    // narrows n for its own body, the same fact the if statement and the
+    // conditional expression apply, through the same applyBranchNarrowing.
+    if (test)
+      if (std::optional<BranchTypeNarrowing> narrowing =
+              optionalBranchTypeNarrowing(*test, types, module))
+        applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
+    // ⛔ What is still missing, measured: the OTHER half of the same
+    // ownership hole. The acquisition above balances the per-iteration
+    // release; nothing releases the LAST incarnation on the exit edge,
+    // because that release is the same `g.condition` skip in
+    // insertOwnedBlockArgumentReleases. So a loop that rebinds a union
+    // carried local to a freshly owned value --
     //
-    // What blocks it is UNION OWNERSHIP ACROSS A LOOP EDGE, which is already
-    // broken without any narrowing. Two measurements, both on the pre-change
-    // binary:
+    //     while n is not None:
+    //         total += n
+    //         n = n - 1          # or `v = "done"` for a str member
     //
-    //   def f(s: str | None) -> str:        # prints "start" in CPython;
-    //       while s is not None:            # aborts with "Ly_DecRef observed
-    //           s = None                    # non-positive refcount"
-    //       return "start"
-    //
-    //   def f(n: int | None) -> int:        # refused: "owned resource from
-    //       total = 0                       # @LyLong_Add result 0 reaches
-    //       while total < 3:                # function exit without release"
-    //           total += 1
-    //           n = total + 100
-    //       return total
-    //
-    // The first releases a BORROWED parameter: the back edge decrefs the old
-    // incarnation of the carried local, and on the first iteration that is
-    // the caller's value. The second never releases the new one: the exit
-    // edge has no decref at all. Both are the same hole --
-    // insertOwnedBlockArgumentReleases (Passes/Runtime/Passes/Ownership.cpp)
-    // places BOTH the borrow-edge retain and the exit release, and it skips
-    // any group whose `condition` is set. A union's release is conditional on
-    // its tag, so a union-carried local gets neither.
-    //
-    // Turning narrowing on before that is fixed makes it WORSE, measured:
-    // `def f(s: str|None) -> int: out = "start"; while s is not None: s =
-    // None; return len(out)` runs correctly today and aborts with the
-    // unwrap in place, because the unwrap changes which lanes the pass sees.
-    // Fix the conditional group first; the narrowing is one line after that.
+    // -- is refused with "owned resource from @LyLong_Sub result 0 reaches
+    // function exit without release". It is a refusal, not a wrong answer,
+    // and the shapes that rebind to None or to another borrowed union run.
     LoopControlContext loop{afterBlock, headerBlock};
     loop.carriedLocals.assign(carried.begin(), carried.end());
     loop.headerBlock = headerBlock;
@@ -993,6 +1014,8 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
     afterBlock->addArgument(local.type, loc(statement));
   }
   builder.setInsertionPointToEnd(entryBlock);
+  acquireUnionCarriedTokens(builder, loc(statement), carriedLocals,
+                            carriedInitialValues);
   mlir::cf::BranchOp::create(builder, loc(statement), loopBlock,
                              carriedInitialValues);
   builder.setInsertionPointToStart(loopBlock);
