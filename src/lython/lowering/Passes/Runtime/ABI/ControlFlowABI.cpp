@@ -559,20 +559,42 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     //         yield total
     //
     // reaches here for a logical `builtins.int` argument and finds a
-    // `memref<5xi64>` (the range iterator's physical) at that index --
-    // "control-flow branch operand has no lowered runtime bundle", because a
-    // physical value has no bundle to find. The resume clone's continuation
-    // blocks get their arguments from the state machine, not from this
-    // expansion, so the two sides are not appended in the same order. The
+    // `memref<5xi64>` at that index -- "control-flow branch operand has no
+    // lowered runtime bundle", because a physical value has no bundle. The
     // same shape with the yield INSIDE the loop, and the same loop in a
     // non-generator function, are both fine.
+    //
+    // The two sides, printed at this line for that program (arg#3 of 8):
+    //
+    //   block: [int, i64, i1, int, i64, i1, range_iterator, memref<5xi64>]
+    //   edge:  [int,           int,         range_iterator, memref<5xi64>]
+    //
+    // So the block is EXPANDED and the edge is not: each logical int already
+    // carries its primitive-i64 lane pair on the block side. The wanted
+    // operand is the second LOGICAL group (index 1), not index 3. The resume
+    // clone's continuation blocks get their arguments from the state machine
+    // rather than from this expansion, which is how the two sides come apart.
     //
     // ⛔ Why NOT skip an edge whose operand type disagrees with the argument
     // and let the deferral retry it: the index is not merely early, it is
     // wrong for that edge, so the retry never finds a match and the same
     // program stops one message later ("logical branch operand index is
-    // outside the predecessor operand list"). The fix has to make the two
-    // sides agree, not to search harder for the operand.
+    // outside the predecessor operand list").
+    //
+    // The index question itself is ANSWERED, and half-measured: count
+    // LOGICAL groups on both sides -- the k-th logical block argument pairs
+    // with the k-th logical edge operand, which holds whether or not either
+    // side has been expanded. "Logical" is readable here after all: a value
+    // is logical exactly when `valueBundles` has it, and a spliced physical
+    // lane has no bundle (verified on the program above, block `B--B--B-`
+    // against edge `BBB-`, and the type test agrees with the bundle test on
+    // every position). Implementing just that moves this program one step
+    // further and stops at the next misalignment -- "cannot adapt runtime
+    // bundle builtins.int with physical values (memref<2xi64>,
+    // memref<2xi64>, memref<?xi32>) to expected ABI (memref<5xi64>)" -- so
+    // the block side of the pairing has to move with it, and that is the
+    // remaining work. Not landed here: a half-corrected index in this pass
+    // is worse than an honest refusal.
     mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
