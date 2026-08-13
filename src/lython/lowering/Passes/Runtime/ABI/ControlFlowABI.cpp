@@ -616,13 +616,29 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     //    from the generator state machine, and an argument this pass did
     //    not append is not therefore a logical head.
     //
-    // What the next attempt needs before writing code: the ONE place that
-    // knows, for an arbitrary block argument, whether it is a logical head
-    // or a lane -- across all three producers, not just this pass's. Until
-    // that exists the pairing cannot be computed, and a half-corrected
-    // index here is worse than the honest refusal it would replace: 185
-    // tests is what "worse" looks like when it is measured instead of
-    // assumed.
+    // 4. Read the grouping STRUCTURALLY from the types -- a head is a value
+    //    whose `runtimeValueTypesFor` lanes follow it, checked against the
+    //    object lanes and against the primitive-int (i64, i1) pair -- and
+    //    pair the k-th head on each side. This is the closest yet:
+    //
+    //      Debug, 667/667 green, and FOUR generator forms that were refused
+    //      now run and match CPython -- a for-loop before a yield, that
+    //      loop followed by two yields, a while-loop before a yield, and
+    //      the yield-inside-the-loop shape that already worked.
+    //
+    //      RelWithDebInfo regresses `pick` in
+    //      tests/golden/cases/while_condition_narrowing.py to "control-flow
+    //      branch operand has no lowered runtime bundle". Same source, and
+    //      only the optimized build reshapes the blocks enough for the scan
+    //      to pick a WRONG head (not a missing one: falling back to the raw
+    //      index when the scan sees too few groups does not change it).
+    //
+    // So the structural scan is right about what to compute and wrong about
+    // how to recognise a lane, and the difference only shows under the
+    // optimizer. What is missing is unchanged since attempt 3 -- one
+    // authority that answers head-vs-lane for an arbitrary block argument
+    // across all three producers -- and a scan that is 99.85% right is
+    // exactly the shape that turns an honest refusal into a wrong index.
     mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
