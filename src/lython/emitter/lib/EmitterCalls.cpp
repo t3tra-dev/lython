@@ -1579,6 +1579,21 @@ ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
     Value argument = emitExpr(floatArgs->front().get());
     return emitFloatFromInt(expr, argument);
   }
+  if (argumentType == types.strType()) {
+    // The str parse, the twin of the str.__int__ dispatch above: also a
+    // runtime-level __float__ that the typed manifest surface does not carry
+    // (CPython has no str.__float__ either), so its contract is built here.
+    Value argument =
+        coerceValue(emitExpr(floatArgs->front().get()), argumentType, expr);
+    mlir::Type resultType = types.floatType();
+    mlir::Type contract = py::CallableType::get(&context, {argumentType}, {},
+                                                {}, {}, {resultType});
+    auto op = py::FloatOp::create(
+        builder, loc(expr), resultType,
+        mlir::FlatSymbolRefAttr::get(&context, "__float__"),
+        mlir::TypeAttr::get(contract), argument.value);
+    return Value{op.getResult(), resultType};
+  }
   return std::nullopt;
 }
 

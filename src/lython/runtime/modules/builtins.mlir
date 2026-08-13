@@ -6674,6 +6674,181 @@ module attributes {
     func.return
   }
 
+  // "could not convert string to float: "
+  memref.global "private" constant @__ly_float_msg_invalid_literal_prefix : memref<35xi8> = dense<[99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 115, 116, 114, 105, 110, 103, 32, 116, 111, 32, 102, 108, 111, 97, 116, 58, 32]>
+
+  func.func private @__ly_float_raise_invalid_literal(%subject_header: memref<2xi64> {ly.ownership.object_header}, %subject_bytes: memref<?xi8>) {
+    %class_id = arith.constant 53 : i64
+    %start = arith.constant 0 : index
+    %prefix_length = arith.constant 35 : i64
+    %prefix_static = memref.get_global @__ly_float_msg_invalid_literal_prefix : memref<35xi8>
+    %prefix_bytes = memref.cast %prefix_static : memref<35xi8> to memref<?xi8>
+    %prefix_h, %prefix_b = func.call @LyUnicode_FromBytes(%prefix_bytes, %start, %prefix_length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %quoted_h, %quoted_b = func.call @LyUnicode_Repr(%subject_header, %subject_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    %full_h, %full_b = func.call @LyUnicode_Concat(%prefix_h, %prefix_b, %quoted_h, %quoted_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%prefix_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%quoted_h) : (memref<2xi64>) -> ()
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %full_h, %full_b) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // float(str). Runtime-level __float__ on str, the twin of LyLong_FromStr's
+  // __int__: CPython has no str.__float__ either, and only the emitter's
+  // float(x) rewrite targets it.
+  //
+  // The digits go to strtod rather than to a hand-rolled accumulate, because
+  // "2.5" has to round the way CPython rounds it and CPython's own dtoa is
+  // correctly rounded -- an int mantissa divided by a power of ten rounds
+  // twice and is off by an ulp on inputs this function must not be wrong on.
+  // What is checked HERE is everything strtod is more permissive about than
+  // float() is: a hex-float spelling ("0x1p3", which strtod accepts and
+  // CPython rejects), trailing garbage, and underscore placement.
+  func.func @LyFloat_FromStr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__float__", ly.runtime.result_contract = "builtins.float"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero64 = arith.constant 0 : i64
+    %one64 = arith.constant 1 : i64
+    %neg_one = arith.constant -1 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %ch_nul = arith.constant 0 : i8
+    %cp_space = arith.constant 32 : i64
+    %cp_tab = arith.constant 9 : i64
+    %cp_cr = arith.constant 13 : i64
+    %cp_underscore = arith.constant 95 : i64
+    %cp_zero = arith.constant 48 : i64
+    %cp_nine = arith.constant 57 : i64
+    %cp_ascii_max = arith.constant 127 : i64
+
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %len_index = arith.index_cast %len : i64 to index
+
+    // Trim ASCII whitespace at both ends (strtod skips it in front only).
+    %first = scf.for %i = %c0 to %len_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %is_sp = arith.cmpi eq, %cp, %cp_space : i64
+      %ge_tab = arith.cmpi sge, %cp, %cp_tab : i64
+      %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
+      %is_ctl = arith.andi %ge_tab, %le_cr : i1
+      %is_ws = arith.ori %is_sp, %is_ctl : i1
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %i64v = arith.index_cast %i : index to i64
+      %candidate = arith.select %is_ws, %found, %i64v : i1, i64
+      %next = arith.select %unset, %candidate, %found : i1, i64
+      scf.yield %next : i64
+    }
+    %last = scf.for %i = %c0 to %len_index step %c1 iter_args(%found = %neg_one) -> (i64) {
+      %step = arith.addi %i, %c1 : index
+      %rev = arith.subi %len_index, %step : index
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %rev) : (memref<?xi8>, i64, index) -> i64
+      %is_sp = arith.cmpi eq, %cp, %cp_space : i64
+      %ge_tab = arith.cmpi sge, %cp, %cp_tab : i64
+      %le_cr = arith.cmpi sle, %cp, %cp_cr : i64
+      %is_ctl = arith.andi %ge_tab, %le_cr : i1
+      %is_ws = arith.ori %is_sp, %is_ctl : i1
+      %unset = arith.cmpi eq, %found, %neg_one : i64
+      %rev64 = arith.index_cast %rev : index to i64
+      %candidate = arith.select %is_ws, %found, %rev64 : i1, i64
+      %next = arith.select %unset, %candidate, %found : i1, i64
+      scf.yield %next : i64
+    }
+    %empty = arith.cmpi eq, %first, %neg_one : i64
+    cf.cond_br %empty, ^invalid, ^scan
+
+  ^scan:
+    %end = arith.addi %last, %one64 : i64
+    %span = arith.subi %end, %first : i64
+    %span_index = arith.index_cast %span : i64 to index
+    %buffer_len = arith.addi %span, %one64 : i64
+    %buffer_index = arith.index_cast %buffer_len : i64 to index
+    %buffer = memref.alloc(%buffer_index) : memref<?xi8>
+    %start_index = arith.index_cast %first : i64 to index
+    %end_index = arith.index_cast %end : i64 to index
+
+    // One pass: copy, drop underscores, and reject everything float() does
+    // not accept -- a non-ASCII code point, an 'x'/'X' (the hex-float
+    // spelling), and an underscore that is not between two digits.
+    %scan_state:3 = scf.for %i = %start_index to %end_index step %c1 iter_args(%out = %c0, %ok = %true, %prev_digit = %false) -> (index, i1, i1) {
+      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+      %too_wide = arith.cmpi sgt, %cp, %cp_ascii_max : i64
+      %cp_x_lower = arith.constant 120 : i64
+      %cp_x_upper = arith.constant 88 : i64
+      %is_x_lower = arith.cmpi eq, %cp, %cp_x_lower : i64
+      %is_x_upper = arith.cmpi eq, %cp, %cp_x_upper : i64
+      %is_x = arith.ori %is_x_lower, %is_x_upper : i1
+      %is_underscore = arith.cmpi eq, %cp, %cp_underscore : i64
+      %ge_zero = arith.cmpi sge, %cp, %cp_zero : i64
+      %le_nine = arith.cmpi sle, %cp, %cp_nine : i64
+      %is_digit = arith.andi %ge_zero, %le_nine : i1
+      // An underscore needs a digit before it and a digit after it; the
+      // "after" half is the next character's own check, so a run of two
+      // underscores fails on the second one and a trailing one fails below.
+      %bad_underscore_pre = arith.xori %prev_digit, %true : i1
+      %bad_underscore = arith.andi %is_underscore, %bad_underscore_pre : i1
+      %bad_char = arith.ori %too_wide, %is_x : i1
+      %bad = arith.ori %bad_char, %bad_underscore : i1
+      %still_ok_pre = arith.xori %bad, %true : i1
+      %still_ok = arith.andi %ok, %still_ok_pre : i1
+      %keep = arith.xori %is_underscore, %true : i1
+      %next_out = scf.if %keep -> (index) {
+        %byte = arith.trunci %cp : i64 to i8
+        memref.store %byte, %buffer[%out] : memref<?xi8>
+        %bumped = arith.addi %out, %c1 : index
+        scf.yield %bumped : index
+      } else {
+        scf.yield %out : index
+      }
+      // An underscore clears the flag as well as reading it, so `1__0` fails
+      // on the second one the way CPython's parser does.
+      scf.yield %next_out, %still_ok, %is_digit : index, i1, i1
+    }
+    // A trailing underscore leaves no digit after it.
+    %last_index = arith.subi %end_index, %c1 : index
+    %last_cp = func.call @__ly_unicode_get(%bytes, %width, %last_index) : (memref<?xi8>, i64, index) -> i64
+    %ends_underscore = arith.cmpi eq, %last_cp, %cp_underscore : i64
+    %trailing_ok = arith.xori %ends_underscore, %true : i1
+    %clean = arith.andi %scan_state#1, %trailing_ok : i1
+    %copied = arith.index_cast %scan_state#0 : index to i64
+    %has_digits = arith.cmpi sgt, %copied, %zero64 : i64
+    %parseable = arith.andi %clean, %has_digits : i1
+    memref.store %ch_nul, %buffer[%scan_state#0] : memref<?xi8>
+    cf.cond_br %parseable, ^parse, ^invalid_free
+
+  ^invalid_free:
+    memref.dealloc %buffer : memref<?xi8>
+    cf.br ^invalid
+
+  ^parse:
+    %text_index = memref.extract_aligned_pointer_as_index %buffer : memref<?xi8> -> index
+    %text_word = arith.index_cast %text_index : index to i64
+    %text_ptr = llvm.inttoptr %text_word : i64 to !llvm.ptr
+    %endptr_slot = memref.alloc() : memref<1xi64>
+    memref.store %zero64, %endptr_slot[%c0] : memref<1xi64>
+    %slot_index = memref.extract_aligned_pointer_as_index %endptr_slot : memref<1xi64> -> index
+    %slot_word = arith.index_cast %slot_index : index to i64
+    %slot_ptr = llvm.inttoptr %slot_word : i64 to !llvm.ptr
+    %parsed = func.call @strtod(%text_ptr, %slot_ptr) : (!llvm.ptr, !llvm.ptr) -> f64
+    %stop_word = memref.load %endptr_slot[%c0] : memref<1xi64>
+    memref.dealloc %endptr_slot : memref<1xi64>
+    %consumed = arith.subi %stop_word, %text_word : i64
+    %all_consumed = arith.cmpi eq, %consumed, %copied : i64
+    memref.dealloc %buffer : memref<?xi8>
+    cf.cond_br %all_consumed, ^ok, ^invalid
+
+  ^ok:
+    %result = func.call @LyFloat_FromF64(%parsed) : (f64) -> memref<3xi64>
+    func.return %result : memref<3xi64>
+
+  ^invalid:
+    func.call @__ly_float_raise_invalid_literal(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
+    %zero_f = arith.constant 0.0 : f64
+    %unreached = func.call @LyFloat_FromF64(%zero_f) : (f64) -> memref<3xi64>
+    func.return %unreached : memref<3xi64>
+  }
+
   func.func private @__ly_long_raise_float_nan() {
     %class_id = arith.constant 53 : i64
     %length = arith.constant 35 : i64

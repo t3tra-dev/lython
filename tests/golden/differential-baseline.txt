@@ -118,6 +118,7 @@ fib_prim.py EXTRA
 field_empty_literal_init.py AGREE
 field_store_from_method_result.py AGREE
 float_floordiv_mod_round.py AGREE
+float_from_str.py AGREE
 float_repr_shortest.py AGREE
 float_unary_and_reprless_key.py AGREE
 format_spec_float.py AGREE

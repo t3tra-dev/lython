@@ -1,0 +1,24 @@
+2.5
+-3.25
+10000000000.0
+0.5
+1000.5
+42.0
+0.5
+50.0
+inf
+-inf
+3.5
+0.30000000000000004
+12.5
+7.0
+2.5
+ValueError: could not convert string to float: '0x1p3'
+ValueError: could not convert string to float: '2.5x'
+ValueError: could not convert string to float: ''
+ValueError: could not convert string to float: '   '
+ValueError: could not convert string to float: '_1'
+ValueError: could not convert string to float: '1__0'
+ValueError: could not convert string to float: '1_'
+ValueError: could not convert string to float: '1.5.2'
+ValueError: could not convert string to float: 'e5'
