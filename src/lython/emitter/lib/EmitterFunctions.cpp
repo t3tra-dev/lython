@@ -365,23 +365,24 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       llvm::StringRef name = ast::nameSpelling(*argument);
       Value bound{entry->getArgument(logicalIndex),
                   sig.positionalTypes[logicalIndex]};
-      // ⛔ KNOWN DEFECT: a boxed PARAMETER gets no cell, so a nested function
-      // reading a parameter the body then rebinds captures the entry value:
+      // FIXED. A boxed PARAMETER used to get no cell, so a nested function
+      // reading a parameter the body then rebinds captured the entry value:
       //
       //     def make(n: int) -> None:
       //         def get() -> int: return n
       //         n = n * 2
       //         print(get())      # printed 5; CPython prints 10
       //
-      // The boxing predicate knows about it (`nonlocalBoxedNames` counts the
-      // parameter as a prior binding, so one assignment in the body is the
-      // second). Creating the cell HERE is the obvious repair and was
-      // measured: the cell is built, but the nested function then refers to it
-      // directly -- "'py.binding.ref' op using value defined outside the
-      // region" -- because the capture that routes a cell into a nested body
-      // is wired for a cell the BODY created, not one that exists at entry.
-      // The same shape with a local instead of a parameter works, which is
-      // where to look.
+      // Re-measured 2026-08-14 against CPython 3.14: 10, and the str form and
+      // the two-rebind form agree too.
+      //
+      // ⛔ Kept for the shape of the failed repair, which is still the
+      // constraint on anything that wants to create a cell at this point: it
+      // was tried HERE, the cell was built, and the nested function then
+      // referred to it directly -- "'py.binding.ref' op using value defined
+      // outside the region" -- because the capture that routes a cell into a
+      // nested body is wired for a cell the BODY created, not one that exists
+      // at entry.
       values[name] = bound;
       types.bindSymbol(name, sig.positionalTypes[logicalIndex]);
     }

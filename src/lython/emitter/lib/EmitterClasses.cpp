@@ -676,23 +676,30 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
   }
 }
 
-// ⛔ KNOWN DEFECT: which body a method call reaches is decided from the STATIC
-// receiver type, so an override behind a base-typed reference is never
-// reached.
+// ⛔ KNOWN DEFECT, now DIAGNOSED rather than silent: which body a method call
+// reaches is decided from the STATIC receiver type, so an override behind a
+// base-typed reference cannot be resolved.
 //
 //     class A:
 //         def name(self) -> str: return "A"
 //     class B(A):
 //         def name(self) -> str: return "B"
 //     def show(a: A) -> None: print(a.name())
-//     show(B())                                  # prints "A"; CPython "B"
+//     show(B())
 //
 // Also `a: A = B()`, and `list[A]` holding a `B`. A call on `B` itself, or on
-// a base no subclass overrides, is correct. Nothing is diagnosed.
+// a base no subclass overrides, is correct.
 //
-// Why NOT refuse when the receiver's class has an overriding subclass, which
-// is the shape the fix wants and is statically decidable from `classMros` and
-// `classMethodBindings`: tried three times, and it refuses `class_mro` and
+// ⭐ It used to PRINT "A" with nothing diagnosed. It now refuses with "'name'
+// is overridden by a subclass of 'A', so this call cannot be resolved from
+// the static type of the receiver" (re-measured 2026-08-14). That is the
+// project's rule applied -- a shape that cannot be resolved statically is
+// rejected at the earliest static boundary -- so what is left here is missing
+// SURFACE (dynamic dispatch), not a wrong answer.
+//
+// Why the refusal took three attempts to land: refusing whenever the
+// receiver's class has an overriding subclass, which is statically decidable
+// from `classMros` and `classMethodBindings`, also refused `class_mro` and
 // `class_super` every time.
 //
 // A base method's own body calls `self.who()` with `self` typed as the base,

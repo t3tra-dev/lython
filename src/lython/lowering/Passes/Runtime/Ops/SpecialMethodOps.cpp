@@ -391,15 +391,20 @@ void RuntimeBundleLowerer::markAbsorbedContainerAsShared(mlir::Operation *op) {
   bundle.sharedWithHolder = true;
 }
 
-// ⛔ KNOWN DEFECT: a container read out of another container keeps that other
-// one's description of it.
+// FIXED, by the walk to the root at the top of `lowerSetItem` below. A
+// container read out of another container used to keep that other one's
+// description of it:
 //
 //     grid: list[list[int]] = [[1, 2], [3, 4]]
 //     grid[1][0] = 9
 //     print(grid)          # [[1, 2], [9, 4]] -- the write landed
 //     print(grid[1][0])    # 3                -- the read did not see it
 //
-// The store below updates the element evidence of the container it stores INTO
+// Re-measured 2026-08-14 against CPython 3.14: 9, and so does the aliased
+// spelling (`first = data[0]; first["n"] = 5; data[0]["n"]`) and a store at a
+// non-last outer index. The description below is what the walk is FOR.
+//
+// The store updates the element evidence of the container it stores INTO
 // -- here the inner list. The outer list still holds the inner list's pre-store
 // description in `sequenceElementBundles`, and the next `grid[1]` is answered
 // from that. A FIELD receiver has a write-back for exactly this
