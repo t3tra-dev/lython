@@ -322,6 +322,7 @@ str_literal_loop_frame_growth.py AGREE
 str_methods_case.py AGREE
 str_methods_search.py AGREE
 str_methods_split.py AGREE
+str_split_maxsplit.py AGREE
 str_translate_maketrans.py AGREE
 str_unwind_nonascii.py AGREE
 str_widths.py AGREE

@@ -522,6 +522,48 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (single && (method == "split" || method == "rsplit"))
       defaulted = args->front()->kind == "Constant" &&
                   ast::isNoneField(*args->front(), "value");
+    // ⭐ `s.split(None, k)` and `s.split(maxsplit=k)` are the whitespace split
+    // WITH a cap -- CPython's own two spellings of it -- and both were "does
+    // not provide manifest method 'split'". The cap is dropped onto the
+    // whitespace overload, which takes it as its only argument; rsplit is
+    // left alone because its cap withholds splits from the right, which the
+    // manifest's left-to-right walk cannot produce.
+    if (method == "split") {
+      const parser::Node *cap = nullptr;
+      if (args && args->size() == 2 && args->front() && (*args)[1] &&
+          (!keywords || keywords->empty()) &&
+          args->front()->kind == "Constant" &&
+          ast::isNoneField(*args->front(), "value"))
+        cap = (*args)[1].get();
+      if ((!args || args->empty()) && keywords && keywords->size() == 1)
+        if (const parser::NodePtr &keyword = keywords->front();
+            keyword && ast::string(*keyword, "arg").value_or("") == "maxsplit")
+          cap = ast::node(*keyword, "value");
+      if (cap) {
+        parser::NodePtr shared;
+        if (args)
+          for (const parser::NodePtr &candidate : *args)
+            if (candidate.get() == cap)
+              shared = candidate;
+        if (keywords && !shared)
+          for (const parser::NodePtr &keyword : *keywords)
+            if (const parser::Field *value =
+                    parser::findField(*keyword, "value");
+                value && std::holds_alternative<parser::NodePtr>(value->value) &&
+                std::get<parser::NodePtr>(value->value).get() == cap)
+              shared = std::get<parser::NodePtr>(value->value);
+        if (shared) {
+          parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+          if (const parser::Field *func = parser::findField(expr, "func"))
+            rewritten->fields.push_back(*func);
+          parser::addField(*rewritten, "args",
+                           std::vector<parser::NodePtr>{shared});
+          parser::addField(*rewritten, "keywords",
+                           std::vector<parser::NodePtr>{});
+          return emitCall(*rewritten);
+        }
+      }
+    }
     if (single && (method == "encode" || method == "decode"))
       if (args->front()->kind == "Constant")
         if (std::optional<llvm::StringRef> encoding =

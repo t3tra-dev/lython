@@ -23,9 +23,13 @@
 //     UnicodeDecodeError/UnicodeEncodeError take a message instead of
 //     CPython's 5-argument form, and decode failures carry a simplified
 //     message ("invalid utf-8 sequence").
-//   - str.split(None, maxsplit) is not accepted; only the no-argument form
-//     selects whitespace splitting. str/bytes `.join` accepts list/tuple
-//     operands (no arbitrary-iterable protocol dispatch yet).
+//   - str.split takes the whitespace cap (`split(maxsplit=1)` and its
+//     `split(None, 1)` spelling); str.rsplit does not, because its cap
+//     withholds splits from the right, which the left-to-right walk cannot
+//     produce. The cap rides the whitespace overload as a bare int, so
+//     `split(1)` -- a TypeError in CPython, which reads the int as the
+//     separator -- is accepted here. str/bytes `.join` accepts
+//     list/tuple operands (no arbitrary-iterable protocol dispatch yet).
 //   - str.translate / str.maketrans are absent until the hash-based dict
 //     rework lands (they need int-keyed runtime dicts).
 //   - bytes.decode accepts only utf-8/strict and validates the arguments
@@ -300,27 +304,26 @@ module attributes {
   py.class @str attributes {
     base_names = ["Sequence", "Hashable"],
     ly.typing.base_args = [[!py.contract<"builtins.str">], []],
-    method_names = ["__new__", "__len__", "__iter__", "__getitem__",
-                    "__getslice__", "__add__",
-                    "__contains__", "__eq__", "__lt__", "__le__", "__gt__",
-                    "__ge__", "join", "startswith", "startswith", "startswith",
-                    "endswith", "endswith", "endswith", "__repr__", "__str__",
-                    "__ne__", "encode", "upper", "lower", "casefold", "title",
-                    "capitalize", "swapcase", "isalpha", "isspace", "isdecimal",
-                    "isdigit", "isnumeric", "isupper", "islower", "isprintable",
-                    "istitle", "isalnum", "isidentifier", "isascii", "find",
-                    "find", "find", "rfind", "rfind", "rfind", "index", "index",
-                    "index", "rindex", "rindex", "rindex", "count", "count",
-                    "count", "replace", "replace", "strip", "strip", "lstrip",
-                    "lstrip", "rstrip", "rstrip", "removeprefix",
+    method_names = ["__new__", "__len__", "__iter__", "__getitem__", "__getslice__",
+                    "__add__", "__contains__", "__eq__", "__lt__", "__le__",
+                    "__gt__", "__ge__", "join", "startswith", "startswith",
+                    "startswith", "endswith", "endswith", "endswith", "__repr__",
+                    "__str__", "__ne__", "encode", "upper", "lower",
+                    "casefold", "title", "capitalize", "swapcase", "isalpha",
+                    "isspace", "isdecimal", "isdigit", "isnumeric", "isupper",
+                    "islower", "isprintable", "istitle", "isalnum", "isidentifier",
+                    "isascii", "find", "find", "find", "rfind",
+                    "rfind", "rfind", "index", "index", "index",
+                    "rindex", "rindex", "rindex", "count", "count",
+                    "count", "replace", "replace", "strip", "strip",
+                    "lstrip", "lstrip", "rstrip", "rstrip", "removeprefix",
                     "removesuffix", "center", "center", "ljust", "ljust",
                     "rjust", "rjust", "zfill", "expandtabs", "expandtabs",
-                    "__mul__", "split", "split", "split", "rsplit", "rsplit",
-                    "rsplit", "splitlines", "splitlines", "partition",
-                    "rpartition", "__hash__", "__format__", "__ascii__",
-                    "__fmt_next__", "__fmt_prefix__", "__fmt_tail__",
-                    "__fmt_conv__", "__fmt_spec__", "__fmt_end__",
-                    "__fmt_pick__"],
+                    "__mul__", "split", "split", "split", "split",
+                    "rsplit", "rsplit", "rsplit", "splitlines", "splitlines",
+                    "partition", "rpartition", "__hash__", "__format__", "__ascii__",
+                    "__fmt_next__", "__fmt_prefix__", "__fmt_tail__", "__fmt_conv__", "__fmt_spec__",
+                    "__fmt_end__", "__fmt_pick__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -401,6 +404,7 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.str">]>]>,
@@ -419,7 +423,7 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
-    method_kinds = ["classmethod", "instance", "instance", "instance",
+    method_kinds = ["classmethod", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -437,7 +441,8 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -10703,7 +10708,11 @@ module attributes {
   // of Unicode whitespace delimit; leading/trailing whitespace produces no
   // empty segments. Unlimited maxsplit makes the two directions agree, so
   // one forward implementation serves both names.
-  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  // maxsplit < 0 means unlimited. The cap only engages when the string has
+  // MORE runs than the cap allows (`"  a  ".split(maxsplit=1)` is ['a'], not
+  // ['a  ']): with no split actually withheld there is no remainder, and the
+  // remainder is the only part that keeps its interior and trailing spaces.
+  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %maxsplit: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -10726,43 +10735,72 @@ module attributes {
       scf.yield %next_segs, %non_space : i64, i1
     }
 
-    %list = func.call @LyList_FromLength(%count#0) : (i64) -> memref<9xi64>
+    // The cap engages only when it actually withholds a split.
+    %capped = arith.cmpi sge, %maxsplit, %zero : i64
+    %over = arith.cmpi sgt, %count#0, %maxsplit : i64
+    %cap_active = arith.andi %capped, %over : i1
+    %cap_count = arith.addi %maxsplit, %one : i64
+    %emitted = arith.select %cap_active, %cap_count, %count#0 : i64
+    %tail_slot = arith.subi %emitted, %one : i64
+
+    %list = func.call @LyList_FromLength(%emitted) : (i64) -> memref<9xi64>
     %list_items = func.call @__ly_list_items(%list) : (memref<9xi64>) -> memref<?xi64>
 
-    // Pass 2: emit each run.
+    // Pass 2: emit each run. Once the tail is emitted `done` stays set and
+    // every producer below is gated on it: the remainder is one slice from
+    // its run's start to the end of the string, spaces and all.
     %false_ws2 = arith.constant false
-    scf.for %i = %c0 to %len_index step %c1 iter_args(%slot = %zero, %run_start = %len_index, %in_run = %false_ws2) -> (i64, index, i1) {
+    %false_done = arith.constant false
+    scf.for %i = %c0 to %len_index step %c1 iter_args(%slot = %zero, %run_start = %len_index, %in_run = %false_ws2, %done = %false_done) -> (i64, index, i1, i1) {
       %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
       %is_space = func.call @__ly_unicode_cp_is_space(%cp) : (i64) -> i1
       %true_w = arith.constant true
+      %not_done = arith.xori %done, %true_w : i1
       %non_space = arith.xori %is_space, %true_w : i1
       %not_in_run = arith.xori %in_run, %true_w : i1
-      %starts = arith.andi %non_space, %not_in_run : i1
-      %ends = arith.andi %is_space, %in_run : i1
+      %starts_raw = arith.andi %non_space, %not_in_run : i1
+      %starts = arith.andi %starts_raw, %not_done : i1
+      %ends_raw = arith.andi %is_space, %in_run : i1
+      %ends = arith.andi %ends_raw, %not_done : i1
+      %at_tail = arith.cmpi eq, %slot, %tail_slot : i64
+      %tail_here = arith.andi %cap_active, %at_tail : i1
+      %is_tail = arith.andi %starts, %tail_here : i1
       %new_start = arith.select %starts, %i, %run_start : index
+      scf.if %is_tail {
+        func.call @__ly_unicode_store_slice(%list_items, %slot, %header, %bytes, %i, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
+      }
       scf.if %ends {
         func.call @__ly_unicode_store_slice(%list_items, %slot, %header, %bytes, %run_start, %i) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       }
       %bump = arith.select %ends, %one, %zero : i64
       %next_slot = arith.addi %slot, %bump : i64
+      %next_done = arith.ori %done, %is_tail : i1
+      %still_running = arith.xori %next_done, %true_w : i1
+      %next_in_run = arith.andi %non_space, %still_running : i1
       %last = arith.subi %len_index, %c1 : index
       %is_last = arith.cmpi eq, %i, %last : index
-      %closes = arith.andi %is_last, %non_space : i1
+      %closes_raw = arith.andi %is_last, %non_space : i1
+      %closes = arith.andi %closes_raw, %still_running : i1
       scf.if %closes {
         func.call @__ly_unicode_store_slice(%list_items, %next_slot, %header, %bytes, %new_start, %len_index) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>, index, index) -> ()
       }
-      scf.yield %next_slot, %new_start, %non_space : i64, index, i1
+      scf.yield %next_slot, %new_start, %next_in_run, %next_done : i64, index, i1, i1
     }
     func.return %list : memref<9xi64>
   }
 
-  func.func @LyUnicode_SplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
-    %result = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> memref<9xi64>
+  func.func @LyUnicode_SplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %maxsplit: i64 {ly.runtime.default_i64 = -1 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "split", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
+    %result = func.call @__ly_unicode_split_ws_core(%header, %bytes, %maxsplit) : (memref<2xi64>, memref<?xi8>, i64) -> memref<9xi64>
     func.return %result : memref<9xi64>
   }
 
   func.func @LyUnicode_RSplitWS(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rsplit", ly.runtime.result_contract = "builtins.list", ly.runtime.element_contract = "builtins.str"} {
-    %result = func.call @__ly_unicode_split_ws_core(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> memref<9xi64>
+    // ⛔ No maxsplit overload for rsplit: its cap withholds splits from the
+    // RIGHT ("a b c".rsplit(maxsplit=1) is ['a b', 'c']), which this
+    // left-to-right walk cannot produce. Refusing the argument is the answer
+    // until the mirrored walk exists.
+    %unlimited = arith.constant -1 : i64
+    %result = func.call @__ly_unicode_split_ws_core(%header, %bytes, %unlimited) : (memref<2xi64>, memref<?xi8>, i64) -> memref<9xi64>
     func.return %result : memref<9xi64>
   }
 
