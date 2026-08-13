@@ -1803,9 +1803,24 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
       return RuntimeBundleLowerer::lowerListRuntimeNext(op, *iterator);
     return RuntimeBundleLowerer::lowerListEvidenceNext(op, *iterator);
   }
-  if (iterator->contractName() == "types.GeneratorType" &&
-      !iterator->generatorTarget.empty())
-    return RuntimeBundleLowerer::lowerSourceGeneratorNext(op, *iterator);
+  if (iterator->contractName() == "types.GeneratorType") {
+    if (!iterator->generatorTarget.empty())
+      return RuntimeBundleLowerer::lowerSourceGeneratorNext(op, *iterator);
+    // ⛔ A generator VALUE with no frame target: it crossed a function
+    // return, and the frame it resumes into is not part of what a return
+    // carries. Falling through to the manifest path reported "runtime
+    // manifest has no types.GeneratorType.__next__ method" -- a sentence
+    // about the manifest for a program that did nothing to it, and the same
+    // generator iterates fine when it is bound to a local instead
+    // (`g = inner()` then `for v in g`). Named here rather than repaired:
+    // carrying the target through a return is the generator-frame work the
+    // resume lane note in GeneratorStateMachine.cpp describes.
+    return op.emitError()
+           << "a generator returned out of a function cannot be resumed: the "
+              "frame it resumes into is not carried by the returned value. "
+              "Call the generator in the for statement, bind it to a local "
+              "in the same function, or return a list";
+  }
 
   llvm::SmallVector<const RuntimeBundle *, 1> sources{iterator};
   std::optional<EmittedRuntimeCall> emitted;

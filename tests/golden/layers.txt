@@ -52,6 +52,7 @@ errors/eq_without_hash_unhashable emit
 errors/except_star_local_rebind emit
 errors/float_truthiness emit
 errors/for_over_a_subclass_overridden_iter emit
+errors/generator_returned_from_a_function lower
 errors/generic_bare_reference emit
 errors/generic_class_no_class_object emit
 errors/generic_class_pack_parameter emit
