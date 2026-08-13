@@ -1634,9 +1634,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
         // Register with the logical block-argument machinery so the standard
         // post-lowering passes drop the logical operands/arguments (the raw
         // evidence pairs are the runtime ABI).
-        if (controlFlowLogicalBlockArgumentSet.insert(arg).second)
-          controlFlowLogicalBlockArguments.push_back(
-              ControlFlowLogicalBlockArgumentABI{arg});
+        controlFlowLogicalBlockArguments.insert(arg);
       }
       // The resumed continuation reads the CURRENT resume's sent lane: the
       // alias op moved into the continuation with the split; wire it to the

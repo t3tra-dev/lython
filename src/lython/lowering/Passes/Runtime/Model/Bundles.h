@@ -310,10 +310,6 @@ inline constexpr llvm::StringLiteral kProtocolTemplateAttr{
 inline constexpr llvm::StringLiteral kProtocolSpecializationAttr{
     "ly.protocol_specialization_of"};
 
-struct ControlFlowLogicalBlockArgumentABI {
-  mlir::BlockArgument argument;
-};
-
 // One logical block argument whose physical arguments are inserted but whose
 // incoming EDGES are not spliced yet, because a sibling argument of the same
 // block was mid-expansion when this one was reached. Everything needed to finish

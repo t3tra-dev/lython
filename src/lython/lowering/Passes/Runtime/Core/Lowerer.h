@@ -41,6 +41,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -328,11 +329,16 @@ private:
   mlir::LogicalResult lowerGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerObjectGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerObjectGlobalSet(py::GlobalSetOp op);
-  // The ADDRESS family: a module global whose annotation is a ctypes pointer
-  // type is a machine word with process lifetime, not a Python object.
+  // The two NATIVE-cell paths (see nativeGlobalCell). An ADDRESS global is a
+  // machine word with process lifetime, not a Python object; a
+  // runtime-internal module's `int` global keeps the word so a signal handler
+  // may read it. Everything else takes the object path above.
   mlir::LogicalResult lowerAddressGlobalGet(py::GlobalGetOp op);
   mlir::LogicalResult lowerAddressGlobalSet(py::GlobalSetOp op,
                                             const RuntimeBundle &value);
+  mlir::LogicalResult lowerNativeIntGlobalGet(py::GlobalGetOp op);
+  mlir::LogicalResult lowerNativeIntGlobalSet(py::GlobalSetOp op,
+                                              const RuntimeBundle &value);
   static bool isAddressGlobalType(mlir::Type type);
   // `cellType` is what the cell holds: `i64` for the bound flag, sizes and
   // scalars, `!llvm.ptr` for the `_p<i>` slots. A pointer slot holding a
@@ -357,14 +363,25 @@ private:
   mlir::LogicalResult lowerGlobalSet(py::GlobalSetOp op);
   // Process-lifetime i64 storage for a module-level int global, created on
   // first use. Reads/writes are plain load/store (async-signal-safe).
-  mlir::LLVM::GlobalOp moduleGlobalStorage(mlir::Operation *op,
-                                           llvm::StringRef name);
+  mlir::LLVM::GlobalOp nativeGlobalCell(mlir::Operation *op,
+                                        llvm::StringRef name);
+  mlir::Value loadNativeGlobalWord(mlir::Operation *op, llvm::StringRef name);
+  void storeNativeGlobalWord(mlir::Operation *op, llvm::StringRef name,
+                             mlir::Value word);
   mlir::LogicalResult lowerStaticCtypesGetItem(py::GetItemOp op,
                                                const RuntimeBundle &container,
                                                const RuntimeBundle &index);
   mlir::LogicalResult
   lowerStaticCtypesLibraryGetItem(py::GetItemOp op,
                                   const RuntimeBundle &container);
+  // The one body behind both spellings of a library symbol access,
+  // `lib["write"]` and `lib.write`: they differ only in where the name and
+  // the alias owner come from.
+  mlir::LogicalResult
+  bindStaticCtypesLibrarySymbol(mlir::Operation *op,
+                                const RuntimeBundle &library,
+                                llvm::StringRef symbol, mlir::Value aliasOwner,
+                                mlir::Value result);
   mlir::LogicalResult lowerStaticCtypesModuleCall(py::CallOp op,
                                                   const RuntimeBundle &receiver,
                                                   llvm::StringRef methodName);
@@ -1468,6 +1485,9 @@ private:
                                llvm::SmallVectorImpl<mlir::Value> &operands);
   mlir::LogicalResult ensureValueBundle(mlir::Operation *op, mlir::Value value);
   mlir::LogicalResult ensureOperationOperandBundles(mlir::Operation *op);
+  // "May this argument's edges be spliced now?" -- asked by both the deferral
+  // and the drain, which is why it is one function.
+  bool hasPrecedingSiblingInFlight(mlir::BlockArgument argument) const;
   mlir::LogicalResult
   lowerControlFlowBlockArgument(mlir::Operation *op,
                                 mlir::BlockArgument argument);
@@ -1527,9 +1547,12 @@ private:
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
   llvm::SmallVector<CallableLogicalEntryArgs, 8> callableLogicalEntryArgCounts;
-  llvm::SmallVector<ControlFlowLogicalBlockArgumentABI, 16>
+  // Insertion-ordered: the drop/erase passes below walk it, and both a
+  // membership test and a stable order are needed. Two containers held this
+  // before -- a vector and a parallel DenseSet -- and every producer had to
+  // remember to feed both.
+  llvm::SmallSetVector<mlir::BlockArgument, 16>
       controlFlowLogicalBlockArguments;
-  llvm::DenseSet<mlir::Value> controlFlowLogicalBlockArgumentSet;
   llvm::DenseSet<mlir::Value> controlFlowBlockArgumentsInProgress;
   llvm::SmallVector<ControlFlowDeferredExpansion, 4>
       controlFlowDeferredExpansions;

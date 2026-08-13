@@ -71,19 +71,8 @@ EmitResult ModuleEmitter::emit() {
 
   // Register module globals after the top-level classes are predeclared (a
   // global's annotation may name a user class) but before any function body
-  // is emitted so their reads resolve. Publish their names/types for
-  // runtime storage lowering.
+  // is emitted so their reads resolve.
   collectModuleGlobals(moduleNode);
-  if (!moduleGlobals.empty()) {
-    llvm::SmallVector<std::string, 4> globalNames;
-    llvm::SmallVector<mlir::Type, 4> globalTypes;
-    for (const auto &entry : moduleGlobals) {
-      globalNames.push_back(entry.first().str());
-      globalTypes.push_back(entry.second);
-    }
-    module->setAttr("ly.module_global_names", stringArray(builder, globalNames));
-    module->setAttr("ly.module_global_types", typeArray(builder, globalTypes));
-  }
 
   // Generic class instantiations may now be emitted as they are demanded.
   // Everything registerModule's fixpoint allocated (a parameter annotated

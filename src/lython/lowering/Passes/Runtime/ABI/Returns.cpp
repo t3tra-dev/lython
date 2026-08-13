@@ -685,10 +685,9 @@ mlir::LogicalResult RuntimeBundleLowerer::dropUnusedLogicalBlockArguments() {
   // the point of use instead.
   llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::BlockArgument, 4>>
       registeredByBlock;
-  for (const ControlFlowLogicalBlockArgumentABI &abi :
-       controlFlowLogicalBlockArguments) {
-    registered.insert(abi.argument.getAsOpaquePointer());
-    registeredByBlock[abi.argument.getOwner()].push_back(abi.argument);
+  for (mlir::BlockArgument argument : controlFlowLogicalBlockArguments) {
+    registered.insert(argument.getAsOpaquePointer());
+    registeredByBlock[argument.getOwner()].push_back(argument);
   }
   bool changed = true;
   while (changed) {

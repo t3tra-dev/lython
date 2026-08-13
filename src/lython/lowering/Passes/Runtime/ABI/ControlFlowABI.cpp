@@ -229,6 +229,21 @@ RuntimeBundleLowerer::ensureOperationOperandBundles(mlir::Operation *op) {
   return mlir::success();
 }
 
+// The one authority for "may this argument's edges be spliced NOW". Both the
+// decision to defer and the decision to drain ask it, and they must ask the
+// same question: an argument whose earlier sibling has no edge operands yet is
+// counted by its block index and missing from its edge index, so its raw index
+// names the wrong operand. Written twice, it drifted -- the drain did not ask
+// at all, which is the defect recorded at drainDeferredControlFlowExpansions.
+bool RuntimeBundleLowerer::hasPrecedingSiblingInFlight(
+    mlir::BlockArgument argument) const {
+  for (mlir::BlockArgument sibling : argument.getOwner()->getArguments())
+    if (sibling.getArgNumber() < argument.getArgNumber() &&
+        controlFlowBlockArgumentsInProgress.contains(sibling))
+      return true;
+  return false;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     mlir::Operation *op, mlir::BlockArgument argument) {
   if (valueBundles.find(argument) != valueBundles.end())
@@ -404,17 +419,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   // sits BEFORE me", which is exactly when its unforwarded physical arguments are
   // counted by my block index and missing from my edge index. A sibling after me
   // contributes nothing to either.
-  bool precedingSiblingInFlight = false;
-  for (mlir::BlockArgument sibling : block->getArguments())
-    if (sibling != argument &&
-        sibling.getArgNumber() < argument.getArgNumber() &&
-        controlFlowBlockArgumentsInProgress.contains(sibling))
-      precedingSiblingInFlight = true;
-  bool siblingInFlight = precedingSiblingInFlight && !ablateDeferral;
+  bool siblingInFlight =
+      RuntimeBundleLowerer::hasPrecedingSiblingInFlight(argument) &&
+      !ablateDeferral;
 
-  if (controlFlowLogicalBlockArgumentSet.insert(argument).second)
-    controlFlowLogicalBlockArguments.push_back(
-        ControlFlowLogicalBlockArgumentABI{argument});
+  controlFlowLogicalBlockArguments.insert(argument);
 
   if (cfArityTraceEnabled())
     llvm::errs() << "[cf-begin] arg#" << argument.getArgNumber() << " type "
@@ -776,21 +785,13 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
 // refusal into a wrong answer, and the ordering needs no oracle at all.
 mlir::LogicalResult RuntimeBundleLowerer::drainDeferredControlFlowExpansions() {
   while (!controlFlowDeferredExpansions.empty()) {
-    // Ready = no sibling of the same block, at a LOWER argument number, is
-    // still mid-expansion. An unready one waits for that sibling's own drain.
-    auto ready = [&](const ControlFlowDeferredExpansion &candidate) {
-      for (mlir::BlockArgument sibling : candidate.argument.getOwner()->getArguments())
-        if (sibling.getArgNumber() < candidate.argument.getArgNumber() &&
-            controlFlowBlockArgumentsInProgress.contains(sibling))
-          return false;
-      return true;
-    };
     std::optional<unsigned> best;
     for (unsigned index = 0, end = controlFlowDeferredExpansions.size();
          index < end; ++index) {
       const ControlFlowDeferredExpansion &candidate =
           controlFlowDeferredExpansions[index];
-      if (!ready(candidate))
+      // An unready one waits for the sibling ahead of it to drain its own.
+      if (RuntimeBundleLowerer::hasPrecedingSiblingInFlight(candidate.argument))
         continue;
       if (!best) {
         best = index;
@@ -842,9 +843,8 @@ RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
 
   llvm::SmallVector<mlir::BlockArgument, 16> arguments;
   arguments.reserve(controlFlowLogicalBlockArguments.size());
-  for (ControlFlowLogicalBlockArgumentABI abi :
-       controlFlowLogicalBlockArguments)
-    arguments.push_back(abi.argument);
+  arguments.append(controlFlowLogicalBlockArguments.begin(),
+                   controlFlowLogicalBlockArguments.end());
   llvm::sort(arguments, [](mlir::BlockArgument lhs, mlir::BlockArgument rhs) {
     if (lhs.getOwner() != rhs.getOwner())
       return std::less<mlir::Block *>()(lhs.getOwner(), rhs.getOwner());
@@ -918,9 +918,8 @@ RuntimeBundleLowerer::eraseControlFlowLogicalBlockArguments() {
   traceControlFlowArity(module, "before-erase-logical-args");
   llvm::SmallVector<mlir::BlockArgument, 16> arguments;
   arguments.reserve(controlFlowLogicalBlockArguments.size());
-  for (ControlFlowLogicalBlockArgumentABI abi :
-       controlFlowLogicalBlockArguments)
-    arguments.push_back(abi.argument);
+  arguments.append(controlFlowLogicalBlockArguments.begin(),
+                   controlFlowLogicalBlockArguments.end());
   llvm::sort(arguments, [](mlir::BlockArgument lhs, mlir::BlockArgument rhs) {
     if (lhs.getOwner() != rhs.getOwner())
       return std::less<mlir::Block *>()(lhs.getOwner(), rhs.getOwner());

@@ -441,13 +441,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     if (contractName == "builtins.int") {
       // Module int globals live in the primitive i64 cell (the GlobalSet
       // side routes int values there); read it back as the primitive lane.
-      mlir::LLVM::GlobalOp storage =
-          RuntimeBundleLowerer::moduleGlobalStorage(op, cell);
-      mlir::Value address =
-          mlir::LLVM::AddressOfOp::create(builder, loc, storage);
-      mlir::Value raw = mlir::LLVM::LoadOp::create(builder, loc,
-                                                   builder.getI64Type(),
-                                                   address);
+      mlir::Value raw = RuntimeBundleLowerer::loadNativeGlobalWord(op, cell);
       mlir::Value valid =
           mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
       return RuntimeBundleLowerer::makePrimitiveI64Bundle(

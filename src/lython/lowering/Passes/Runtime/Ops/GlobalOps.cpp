@@ -4,16 +4,15 @@
 
 namespace py::lowering {
 
-// Module-level int globals are backed by a single process-lifetime i64 cell.
-// Reads/writes are a plain llvm.load/llvm.store, so accessing a module global
-// never allocates -- an async-signal-safe channel for signal handlers to
-// exchange primitive state. The stored
-// representation is the UNBOXED i64 value; the boxed int object is
-// reconstructed on demand at each read (box-on-read), and the value is
-// unboxed at each write (unbox-on-write).
+// The NATIVE cell: one process-lifetime i64 holding a module global's raw
+// machine word. A read is a plain llvm.load and a write a plain llvm.store,
+// so touching one never allocates -- the async-signal-safe channel a signal
+// handler exchanges state through. Two populations live here: a ctypes
+// address (lowerAddressGlobal*) and a runtime-internal module's `int`
+// (lowerNativeIntGlobal*, which boxes on read and unboxes on write).
 mlir::LLVM::GlobalOp
-RuntimeBundleLowerer::moduleGlobalStorage(mlir::Operation *op,
-                                          llvm::StringRef name) {
+RuntimeBundleLowerer::nativeGlobalCell(mlir::Operation *op,
+                                       llvm::StringRef name) {
   std::string symbol = ("__ly_module_global_" + name).str();
   if (auto existing = module.lookupSymbol<mlir::LLVM::GlobalOp>(symbol))
     return existing;
@@ -25,6 +24,24 @@ RuntimeBundleLowerer::moduleGlobalStorage(mlir::Operation *op,
       mlir::LLVM::Linkage::Internal, symbol,
       builder.getI64IntegerAttr(0), /*alignment=*/8);
   return global;
+}
+
+mlir::Value RuntimeBundleLowerer::loadNativeGlobalWord(mlir::Operation *op,
+                                                       llvm::StringRef name) {
+  mlir::LLVM::GlobalOp cell = RuntimeBundleLowerer::nativeGlobalCell(op, name);
+  mlir::Value address =
+      mlir::LLVM::AddressOfOp::create(builder, op->getLoc(), cell);
+  return mlir::LLVM::LoadOp::create(builder, op->getLoc(),
+                                    builder.getI64Type(), address);
+}
+
+void RuntimeBundleLowerer::storeNativeGlobalWord(mlir::Operation *op,
+                                                 llvm::StringRef name,
+                                                 mlir::Value word) {
+  mlir::LLVM::GlobalOp cell = RuntimeBundleLowerer::nativeGlobalCell(op, name);
+  mlir::Value address =
+      mlir::LLVM::AddressOfOp::create(builder, op->getLoc(), cell);
+  mlir::LLVM::StoreOp::create(builder, op->getLoc(), word, address);
 }
 
 namespace {
@@ -188,14 +205,9 @@ bool RuntimeBundleLowerer::isAddressGlobalType(mlir::Type type) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerAddressGlobalGet(py::GlobalGetOp op) {
   mlir::Type type = op.getResult().getType();
-  mlir::LLVM::GlobalOp storage =
-      RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
-
   builder.setInsertionPoint(op);
-  mlir::Value cell =
-      mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);
-  mlir::Value word = mlir::LLVM::LoadOp::create(builder, op.getLoc(),
-                                                builder.getI64Type(), cell);
+  mlir::Value word =
+      RuntimeBundleLowerer::loadNativeGlobalWord(op, op.getName());
   mlir::Value valid =
       mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1);
 
@@ -223,9 +235,6 @@ RuntimeBundleLowerer::lowerAddressGlobalGet(py::GlobalGetOp op) {
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerAddressGlobalSet(py::GlobalSetOp op,
                                             const RuntimeBundle &value) {
-  mlir::LLVM::GlobalOp storage =
-      RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
-
   builder.setInsertionPoint(op);
   std::optional<ctypes::TargetPlatformFacts> facts =
       ctypes::targetPlatformFacts(module);
@@ -241,9 +250,7 @@ RuntimeBundleLowerer::lowerAddressGlobalSet(py::GlobalSetOp op,
     stored = mlir::arith::ExtUIOp::create(builder, op.getLoc(),
                                           builder.getI64Type(), stored)
                  .getResult();
-  mlir::Value cell =
-      mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);
-  mlir::LLVM::StoreOp::create(builder, op.getLoc(), stored, cell);
+  RuntimeBundleLowerer::storeNativeGlobalWord(op, op.getName(), stored);
   erase.push_back(op);
   return mlir::success();
 }
@@ -275,14 +282,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalGet(py::GlobalGetOp op) {
   if (runtimeContractName(op.getResult().getType()) != "builtins.int" ||
       op->hasAttr("ly.global.boxed"))
     return RuntimeBundleLowerer::lowerObjectGlobalGet(op);
-  mlir::LLVM::GlobalOp storage =
-      RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
+  return RuntimeBundleLowerer::lowerNativeIntGlobalGet(op);
+}
 
+// A runtime-internal module's `int` global: the word IS the value, boxed on
+// read into the primitive lane so ordinary int ops still work on it.
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerNativeIntGlobalGet(py::GlobalGetOp op) {
   builder.setInsertionPoint(op);
-  mlir::Value address =
-      mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);
-  mlir::Value raw = mlir::LLVM::LoadOp::create(builder, op.getLoc(),
-                                               builder.getI64Type(), address);
+  mlir::Value raw =
+      RuntimeBundleLowerer::loadNativeGlobalWord(op, op.getName());
   mlir::Value valid =
       mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1);
   RuntimeBundle result;
@@ -545,9 +554,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   if (runtimeContractName(op.getValue().getType()) != "builtins.int" ||
       op->hasAttr("ly.global.boxed"))
     return RuntimeBundleLowerer::lowerObjectGlobalSet(op);
-  mlir::LLVM::GlobalOp storage =
-      RuntimeBundleLowerer::moduleGlobalStorage(op, op.getName());
+  return RuntimeBundleLowerer::lowerNativeIntGlobalSet(op, *value);
+}
 
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerNativeIntGlobalSet(py::GlobalSetOp op,
+                                              const RuntimeBundle &value) {
   builder.setInsertionPoint(op);
   mlir::Value raw;
   // The WORD is only the value when its VALID flag is a compile-time true.
@@ -569,17 +581,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   // `t = a + b; if c: print(t)` too -- and is repaired by
   // `liftGroupToEnclosingRegionOp` (Passes/Ownership.cpp).
   std::optional<RuntimeSymbol> unbox =
-      manifest.primitive(value->contractName(), "unbox.i64");
+      manifest.primitive(value.contractName(), "unbox.i64");
   bool boxedIsReachable =
       unbox &&
-      unbox->function.getNumArguments() == value->physicalValues().size();
-  if (primitiveI64LaneKnownValid(value->primitiveI64)) {
-    raw = value->primitiveI64->value;
+      unbox->function.getNumArguments() == value.physicalValues().size();
+  if (primitiveI64LaneKnownValid(value.primitiveI64)) {
+    raw = value.primitiveI64->value;
   } else if (boxedIsReachable) {
     mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
-        op.getLoc(), *unbox, value->physicalValues());
+        op.getLoc(), *unbox, value.physicalValues());
     raw = unboxCall.getResult(0);
-  } else if (value->primitiveI64 && value->primitiveI64->value) {
+  } else if (value.primitiveI64 && value.primitiveI64->value) {
     // No boxed payload to read instead: a primitive-i64 clone lane carries
     // only the (value, valid) pair, so the lane IS the sole carrier and a
     // runtime flag is no reason to refuse it. Demanding the unbox here took
@@ -587,15 +599,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
     // ("module global assignment value builtins.int has no unbox.i64
     // primitive"); the flag only chooses between two carriers when there are
     // two.
-    raw = value->primitiveI64->value;
+    raw = value.primitiveI64->value;
   } else {
     return op.emitError() << "module global assignment value "
-                          << value->contractName()
+                          << value.contractName()
                           << " has no unbox.i64 primitive";
   }
-  mlir::Value address =
-      mlir::LLVM::AddressOfOp::create(builder, op.getLoc(), storage);
-  mlir::LLVM::StoreOp::create(builder, op.getLoc(), raw, address);
+  RuntimeBundleLowerer::storeNativeGlobalWord(op, op.getName(), raw);
   erase.push_back(op);
   return mlir::success();
 }

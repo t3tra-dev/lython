@@ -9,6 +9,7 @@ add_library(LythonEmitter STATIC
     lib/EmitterExceptions.cpp
     lib/EmitterExpressions.cpp
     lib/EmitterFunctions.cpp
+    lib/EmitterGlobals.cpp
     lib/EmitterImports.cpp
     lib/EmitterIterators.cpp
     lib/EmitterLoops.cpp
