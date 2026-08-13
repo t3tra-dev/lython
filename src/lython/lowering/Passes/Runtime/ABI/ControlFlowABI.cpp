@@ -548,98 +548,21 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
             branch.getSuccessorOperands(successor);
         if (operands.getProducedOperandCount() != 0 || index >= operands.size())
           continue;
-        // ⛔ KNOWN DEFECT, measured: the edge operand is taken at the block
-    // argument's OWN index, which holds only while the block and its edges
-    // are expanded in lockstep. A generator whose for-loop precedes a yield
-    //
-    //     def f(n: int) -> Iterator[int]:
-    //         total = 0
-    //         for i in range(n):
-    //             total = total + i
-    //         yield total
-    //
-    // reaches here for a logical `builtins.int` argument and finds a
-    // `memref<5xi64>` at that index -- "control-flow branch operand has no
-    // lowered runtime bundle", because a physical value has no bundle. The
-    // same shape with the yield INSIDE the loop, and the same loop in a
-    // non-generator function, are both fine.
-    //
-    // The two sides, printed at this line for that program (arg#3 of 8):
-    //
-    //   block: [int, i64, i1, int, i64, i1, range_iterator, memref<5xi64>]
-    //   edge:  [int,           int,         range_iterator, memref<5xi64>]
-    //
-    // So the block is EXPANDED and the edge is not: each logical int already
-    // carries its primitive-i64 lane pair on the block side. The wanted
-    // operand is the second LOGICAL group (index 1), not index 3. The resume
-    // clone's continuation blocks get their arguments from the state machine
-    // rather than from this expansion, which is how the two sides come apart.
-    //
-    // ⛔ Why NOT skip an edge whose operand type disagrees with the argument
-    // and let the deferral retry it: the index is not merely early, it is
-    // wrong for that edge, so the retry never finds a match and the same
-    // program stops one message later ("logical branch operand index is
-    // outside the predecessor operand list").
-    //
-    // The index question itself is ANSWERED, and half-measured: count
-    // LOGICAL groups on both sides -- the k-th logical block argument pairs
-    // with the k-th logical edge operand, which holds whether or not either
-    // side has been expanded. "Logical" is readable here after all: a value
-    // is logical exactly when `valueBundles` has it, and a spliced physical
-    // lane has no bundle (verified on the program above, block `B--B--B-`
-    // against edge `BBB-`, and the type test agrees with the bundle test on
-    // every position).
-    // Two attempts, both measured and both reverted, so the next one starts
-    // past them:
-    //
-    // 1. Count logically on the EDGE only and splice at the block index: the
-    //    read and the write then name different positions, and the program
-    //    stops at "cannot adapt runtime bundle builtins.int with physical
-    //    values (memref<2xi64>, memref<2xi64>, memref<?xi32>) to expected
-    //    ABI (memref<5xi64>)".
-    // 2. Carry the read's position through to the splice too (one
-    //    `operandIndex` on PendingEdge): same failure, and the trace says
-    //    why -- for `arg#1` of type range_iterator the BLOCK-side count came
-    //    out 0, so it claimed the int at operand#0. The block-side test is
-    //    the broken half: `valueBundles` is filled AS arguments are
-    //    expanded, so an argument not yet reached has no bundle and is
-    //    miscounted as a physical lane.
-    //
-    // 3. Give each side its own progress-independent test -- on the block,
-    //    "an argument this pass did not append as a lane" (a new set filled
-    //    at the insertArgument site); on the edge, "has a runtime bundle".
-    //    That pairs correctly for the reproducer, which then reaches a
-    //    LATER phase and stops at "primitive int merge source has neither
-    //    evidence nor an unboxable representation" -- but it breaks 185 of
-    //    667 tests, so the block-side set is not the population it looks
-    //    like: physical block arguments also arrive from the entry ABI and
-    //    from the generator state machine, and an argument this pass did
-    //    not append is not therefore a logical head.
-    //
-    // 4. Read the grouping STRUCTURALLY from the types -- a head is a value
-    //    whose `runtimeValueTypesFor` lanes follow it, checked against the
-    //    object lanes and against the primitive-int (i64, i1) pair -- and
-    //    pair the k-th head on each side. This is the closest yet:
-    //
-    //      Debug, 667/667 green, and FOUR generator forms that were refused
-    //      now run and match CPython -- a for-loop before a yield, that
-    //      loop followed by two yields, a while-loop before a yield, and
-    //      the yield-inside-the-loop shape that already worked.
-    //
-    //      RelWithDebInfo regresses `pick` in
-    //      tests/golden/cases/while_condition_narrowing.py to "control-flow
-    //      branch operand has no lowered runtime bundle". Same source, and
-    //      only the optimized build reshapes the blocks enough for the scan
-    //      to pick a WRONG head (not a missing one: falling back to the raw
-    //      index when the scan sees too few groups does not change it).
-    //
-    // So the structural scan is right about what to compute and wrong about
-    // how to recognise a lane, and the difference only shows under the
-    // optimizer. What is missing is unchanged since attempt 3 -- one
-    // authority that answers head-vs-lane for an arbitrary block argument
-    // across all three producers -- and a scan that is 99.85% right is
-    // exactly the shape that turns an honest refusal into a wrong index.
-    mlir::Value logicalSource = operands[index];
+        // ⭐ The edge operand is taken at the block argument's OWN index, and
+        // that is exact BY ORDERING, not by luck: every argument before this
+        // one is already forwarded on this edge, because an expansion whose
+        // preceding sibling is still in flight defers and is drained lowest
+        // argument number first (see drainDeferredControlFlowExpansions,
+        // which is also where the four measured attempts at computing the
+        // index instead are recorded).
+        //
+        // ⛔ Why NOT skip an edge whose operand type disagrees with the
+        // argument and let the deferral retry it: if the ordering is ever
+        // broken the index is not merely early, it is wrong for that edge, so
+        // the retry never finds a match and the program stops one message
+        // later ("logical branch operand index is outside the predecessor
+        // operand list") -- further from the cause, not closer.
+        mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
         // Membership alone is conclusive: the set holds only values THIS
@@ -815,23 +738,76 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
 // back to this argument, and `controlFlowBlockArgumentsInProgress` turns that into
 // "cyclic Python control-flow block argument ABI is not implemented yet" -- a
 // refusal of a program that works today.
+//
+// ⭐ The same predicate that DEFERRED an expansion has to hold when it is
+// drained, and it is not the caller's to assume: this runs at the end of every
+// expansion, including a NESTED one, so finishing the inner sibling does not
+// mean the outer one is finished. A generator whose for-loop precedes a yield
+//
+//     def f(n: int) -> Iterator[int]:
+//         total = 0
+//         for i in range(n):
+//             total = total + i
+//         yield total
+//
+// nests two expansions of arg#0 (the loop's `total` merge, reached again
+// through the back edge's operand), and the inner one's drain took arg#3 of
+// the same block while the OUTER arg#0 still had no edge operands. arg#3's
+// index then counted arg#0's block lanes, which the edge did not have:
+//
+//   block: [int, i64, i1, int, i64, i1, range_iterator, memref<5xi64>]
+//   edge:  [int,           int,         range_iterator, memref<5xi64>]
+//
+// so it read the `memref` as its logical operand -- "control-flow branch
+// operand has no lowered runtime bundle", because a physical value has no
+// bundle. Nothing about the INDEX was wrong; the work was done too early.
+//
+// ⛔ Why NOT make the index exact instead -- count LOGICAL groups on both sides
+// and pair the k-th with the k-th, which is the contract this ordering enforces
+// by construction. Four attempts, all measured: counting logically on the edge
+// alone makes the read and the write name different positions; carrying the
+// read's position to the write miscounts the block side, because `valueBundles`
+// fills AS arguments expand and an unreached argument looks like a lane; a
+// per-side set of "arguments this pass appended" is not the lane population
+// (the entry ABI and the generator state machine append lanes too) and broke
+// 185 of 667 tests; and reading the grouping structurally from the types is
+// 99.85% right -- Debug-green, but under the optimizer it picks a WRONG head
+// in `while_condition_narrowing.py`. An almost-right index turns an honest
+// refusal into a wrong answer, and the ordering needs no oracle at all.
 mlir::LogicalResult RuntimeBundleLowerer::drainDeferredControlFlowExpansions() {
   while (!controlFlowDeferredExpansions.empty()) {
-    unsigned best = 0;
-    for (unsigned index = 1, end = controlFlowDeferredExpansions.size();
+    // Ready = no sibling of the same block, at a LOWER argument number, is
+    // still mid-expansion. An unready one waits for that sibling's own drain.
+    auto ready = [&](const ControlFlowDeferredExpansion &candidate) {
+      for (mlir::BlockArgument sibling : candidate.argument.getOwner()->getArguments())
+        if (sibling.getArgNumber() < candidate.argument.getArgNumber() &&
+            controlFlowBlockArgumentsInProgress.contains(sibling))
+          return false;
+      return true;
+    };
+    std::optional<unsigned> best;
+    for (unsigned index = 0, end = controlFlowDeferredExpansions.size();
          index < end; ++index) {
       const ControlFlowDeferredExpansion &candidate =
           controlFlowDeferredExpansions[index];
+      if (!ready(candidate))
+        continue;
+      if (!best) {
+        best = index;
+        continue;
+      }
       const ControlFlowDeferredExpansion &incumbent =
-          controlFlowDeferredExpansions[best];
+          controlFlowDeferredExpansions[*best];
       if (candidate.argument.getOwner() == incumbent.argument.getOwner() &&
           candidate.argument.getArgNumber() <
               incumbent.argument.getArgNumber())
         best = index;
     }
-    ControlFlowDeferredExpansion pending = controlFlowDeferredExpansions[best];
+    if (!best)
+      return mlir::success();
+    ControlFlowDeferredExpansion pending = controlFlowDeferredExpansions[*best];
     controlFlowDeferredExpansions.erase(controlFlowDeferredExpansions.begin() +
-                                        best);
+                                        *best);
     if (cfArityTraceEnabled())
       llvm::errs() << "[cf-drain] arg#" << pending.argument.getArgNumber()
                    << " type " << pending.argument.getType() << ", "
