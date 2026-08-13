@@ -386,8 +386,26 @@ struct AffinePathState {
   // argument (`while True: i += 1 ... break; print(i)`).
   llvm::SmallVector<mlir::Value, 4> views;
   // Outstanding block-arg-merge-borrow retains (identity merge edges lend the
-  // merge argument a token; the paired release targets the pre-merge name).
-  unsigned borrowed = 0;
+  // merge argument a token; the paired release targets the pre-merge name),
+  // held as the RETAIN OPS and not as a count.
+  //
+  // ⭐ Bounded by construction, and it has to be: this is part of the
+  // visited-state key, so anything that can grow once per trip round a loop
+  // stops the fixpoint from ever closing. A count did exactly that. The
+  // borrow at a loop's back edge retains a DERIVED view of the carried value
+  // (`memref.cast` of a `memref.subview` of the frame), rebuilt as a fresh
+  // SSA value every trip, so `callConsumesStaleValue` -- which cancels a
+  // borrow by matching a release against the PRE-RENAME name -- can never
+  // match it: there is no pre-rename name for a value that is recomputed.
+  // Measured on a nested loop in a generator: 39 increments, 0 decrements,
+  // all from ONE retain op, and `borrowed` reached 285,714 with the state cap
+  // raised to 4,000,000.
+  //
+  // Re-executing the same static retain is the walk going round again, not a
+  // second outstanding borrow, so the same op is recorded once. Distinct ops
+  // still count separately, and the only question ever asked of this is
+  // "is any borrow outstanding" -- see the single reader below.
+  llvm::SmallVector<mlir::Operation *, 4> borrowedRetains;
   // Path entered through an exceptional (unwind) edge. The affine invariant
   // holds on these paths like any other (rfc/stdlib-semantics.md R2: unwind
   // cleanup is inserted, no leak is accepted); the flag only disambiguates
@@ -472,7 +490,7 @@ bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
   return lhs.block == rhs.block && lhs.start == rhs.start &&
          lhs.token == rhs.token && lhs.retained == rhs.retained &&
          lhs.parkedUnnamed == rhs.parkedUnnamed &&
-         lhs.borrowed == rhs.borrowed &&
+         lhs.borrowedRetains == rhs.borrowedRetains &&
          lhs.exceptional == rhs.exceptional &&
          lhs.slotParents == rhs.slotParents &&
          own::sameEntityRoot(lhs.group, rhs.group);
@@ -508,7 +526,9 @@ std::size_t dedupBucket(llvm::hash_code code) {
 std::size_t pathStateDedupKey(const AffinePathState &state) {
   llvm::hash_code code = llvm::hash_combine(
       state.block, state.start, static_cast<int>(state.token), state.retained,
-      state.parkedUnnamed, state.borrowed, state.exceptional,
+      state.parkedUnnamed, state.exceptional,
+      llvm::hash_combine_range(state.borrowedRetains.begin(),
+                               state.borrowedRetains.end()),
       llvm::hash_combine_range(state.slotParents.begin(),
                                state.slotParents.end()));
   // Hashing the whole lane list would break the equal-implies-same-hash
@@ -2322,7 +2342,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
              << "ownership CFG exploration exceeded " << kMaxAffineStates
              << " states (last: retained=" << state.retained
              << " parked=" << state.slotParents.size()
-             << " borrowed=" << state.borrowed << " prev=" << state.previous.size()
+             << " borrowed=" << state.borrowedRetains.size()
+             << " prev=" << state.previous.size()
              << " stale=" << state.stale.size() << " group=" << state.group.size()
              << " token=" << static_cast<int>(state.token) << ")";
 
@@ -2476,7 +2497,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                   successor, firstOperation(successor), nextToken,
                   state.retained, std::move(mappedGroup),
                   /*stale=*/{}, /*previous=*/{}, std::move(mappedViews),
-                  /*borrowed=*/0, state.exceptional};
+                  /*borrowedRetains=*/{}, state.exceptional};
               // Parked slot retains follow the path, not the group's names:
               // the container that holds them is unaffected by a union-tag
               // branch on the element.
@@ -2592,10 +2613,10 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         // A release through PRE-RENAME names of the current group cancels an
         // outstanding borrow-edge retain (identity merge edge): the token
         // continues under the current names.
-        if (!consumes && state.borrowed > 0 && mentionsTracked &&
+        if (!consumes && !state.borrowedRetains.empty() && mentionsTracked &&
             callConsumesStaleValue(contracts, call, state.previous,
                                    state.group, aliases)) {
-          --state.borrowed;
+          state.borrowedRetains.pop_back();
           op = op->getNextNode();
           continue;
         }
@@ -2684,7 +2705,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                              << blockOrdinal(resource.producer->getBlock())
                              << ") by " << call.getCallee() << " in ^bb"
                              << blockOrdinal(state.block)
-                             << ", borrowed=" << state.borrowed
+                             << ", borrowed=" << state.borrowedRetains.size()
                              << " exceptional=" << state.exceptional
                              << ", path=";
                 for (unsigned ordinal : state.trail)
@@ -2786,9 +2807,10 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           }
         }
         if (state.token == AffineTokenState::Owned && retains) {
-          if (isBlockArgMergeBorrowRetain(call))
-            ++state.borrowed;
-          else if (slotAbsorptionRetain) {
+          if (isBlockArgMergeBorrowRetain(call)) {
+            if (!llvm::is_contained(state.borrowedRetains, call.getOperation()))
+              state.borrowedRetains.push_back(call.getOperation());
+          } else if (slotAbsorptionRetain) {
             if (!llvm::is_contained(state.slotParents, *slotParent))
               state.slotParents.push_back(*slotParent);
           }
@@ -2989,7 +3011,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                            std::move(mappedStale),
                            std::move(mappedPrevious),
                            std::move(mappedViews),
-                           state.borrowed,
+                           state.borrowedRetains,
                            nextExceptional};
       // Parked slot retains are keyed by the HOLDER's identity, so unlike
       // group/stale/previous/views they need no rename across the edge: the

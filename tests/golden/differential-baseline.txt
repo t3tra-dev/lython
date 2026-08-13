@@ -139,6 +139,7 @@ generator_iterate.py AGREE
 generator_list_yield.py AGREE
 generator_local_list.py AGREE
 generator_loop_before_yield.py AGREE
+generator_nested_loops.py AGREE
 generator_object_args.py AGREE
 generator_owned_frame.py AGREE
 generator_pep479.py AGREE
