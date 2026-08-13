@@ -588,13 +588,29 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     // is logical exactly when `valueBundles` has it, and a spliced physical
     // lane has no bundle (verified on the program above, block `B--B--B-`
     // against edge `BBB-`, and the type test agrees with the bundle test on
-    // every position). Implementing just that moves this program one step
-    // further and stops at the next misalignment -- "cannot adapt runtime
-    // bundle builtins.int with physical values (memref<2xi64>,
-    // memref<2xi64>, memref<?xi32>) to expected ABI (memref<5xi64>)" -- so
-    // the block side of the pairing has to move with it, and that is the
-    // remaining work. Not landed here: a half-corrected index in this pass
-    // is worse than an honest refusal.
+    // every position).
+    // Two attempts, both measured and both reverted, so the next one starts
+    // past them:
+    //
+    // 1. Count logically on the EDGE only and splice at the block index: the
+    //    read and the write then name different positions, and the program
+    //    stops at "cannot adapt runtime bundle builtins.int with physical
+    //    values (memref<2xi64>, memref<2xi64>, memref<?xi32>) to expected
+    //    ABI (memref<5xi64>)".
+    // 2. Carry the read's position through to the splice too (one
+    //    `operandIndex` on PendingEdge): same failure, and the trace says
+    //    why -- for `arg#1` of type range_iterator the BLOCK-side count came
+    //    out 0, so it claimed the int at operand#0. The block-side test is
+    //    the broken half: `valueBundles` is filled AS arguments are
+    //    expanded, so an argument not yet reached has no bundle and is
+    //    miscounted as a physical lane.
+    //
+    // So the block side needs a discriminator that does not depend on how
+    // far the expansion has got. The type test is close -- it agreed with
+    // the bundle test on every position of the program above -- but is not
+    // sound alone: a prim tensor local's logical type is a bare `memref`,
+    // the same shape a physical lane has. Not landed: a half-corrected index
+    // in this pass is worse than the honest refusal it would replace.
     mlir::Value logicalSource = operands[index];
         if (onlySource && logicalSource != *onlySource)
           continue;
