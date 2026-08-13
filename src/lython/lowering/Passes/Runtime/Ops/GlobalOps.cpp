@@ -205,10 +205,20 @@ mlir::LogicalResult RuntimeBundleLowerer::loadObjectGlobalValues(
 //
 // So an int module global is two different things -- a Python integer,
 // which must grow, and a machine word, which must stay unboxed and
-// allocation-free -- and nothing in the SURFACE distinguishes them today.
-// That is the decision this waits on (an annotation, a distinct ctypes
-// type, or a rule that the address family is never a plain `int`), not more
-// work in this file. Everything below the surface is measured and ready.
+// allocation-free -- and nothing in the SURFACE distinguished them.
+//
+// ⭐ DECIDED (user, 2026-08-13): an address is never written as `int`. A
+// global that holds a ctypes address declares a ctypes type
+// (`ctypes.c_void_p`), and `int` means the Python integer, always boxed.
+// What that leaves to do, in order:
+//   1. re-apply the marking described above (it is complete and measured);
+//   2. make a `ctypes.c_void_p` module global storage-backed on the WORD
+//      path -- collectModuleGlobals accepts int/str/float/bool/bytes and
+//      user classes today, and the contract-name test in this file keys on
+//      "builtins.int", so both need the address family added;
+//   3. migrate examples/ctypes_signal.py off `g_write: int` onto it.
+// Until 2 exists there is nowhere for the example's address to live, which
+// is why the marking is not landed on its own.
 //
 // The earlier measurement, kept because it is the reason to mark per
 // population and not per module:
