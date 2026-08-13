@@ -21,11 +21,25 @@
 #       "source generator next lowering currently supports only straight-line
 #       pure int yield bodies"
 #
-# So what is left here is not a missing bundle: the ownership placement walk
-# does not converge inside the budget on the resume clone's CFG for a nested
-# loop, and n=3 is enough. The message names the budget, which is the right
-# shape for a refusal, but the walk is the thing to look at -- the same
-# nested loop in a NON-generator costs nothing.
+# So what is left here is not a missing bundle, and it is NOT A BUDGET
+# SHORTFALL either. Measured by raising kMaxAffineStates to 4,000,000: the
+# walk still does not close, and the counter that grows is `borrowed` --
+# 1,428 at the 20,000-state cap, 285,714 at four million. It is unbounded.
+#
+#   state.borrowed is incremented at a block-argument merge borrow retain
+#   (AffineOwnership.cpp, `isBlockArgMergeBorrowRetain`) and decremented by a
+#   release through a PRE-RENAME name. It is part of the visited-state key,
+#   so a borrow retain on a cyclic path whose cancelling release is not on
+#   that path makes the key differ every trip and the fixpoint never closes.
+#
+# That is the same failure mode the ⚠️ note at the cap already records for
+# `retained` (tests/probe/seqlit_slot_retain_in_loop_str.py), and the comment
+# at the increment site names both counters as having shown it. Which means
+# this refusal MAY BE MASKING A REAL FINDING: the cap is not a safe-side
+# failure, and nothing downstream of where the walk stopped has been judged.
+#
+# The same nested loop in a NON-generator costs nothing -- the resume clone's
+# CFG is what puts a borrow retain on a cycle.
 #
 # differential: skip the refusal is the recorded state, not a wrong answer
 from typing import Iterator
