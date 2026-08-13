@@ -1,29 +1,31 @@
-# REFUSED with an INTERNAL message where CPython prints. A generator body
-# that builds a second `range` -- nested loops, or one loop after another --
-# stops at "new class object has no lowered type bundle", which names a
-# lowering invariant and not anything the reader wrote.
+# PARTLY FIXED 2026-08-13. The type-object half is repaired; what this file
+# still reproduces is a BUDGET, reached only by nested loops.
 #
-# MEASURED:
+# WAS: a generator body that builds a second `range` -- nested loops, or one
+# loop after another -- stopped at "new class object has no lowered type
+# bundle", which names a lowering invariant and not anything the reader
+# wrote. The resume clone's SSA normalization threads every value that
+# crosses a block boundary through a new block argument, and a
+# `!py.type<...>` was among them; that type has no runtime ABI, so nothing
+# could ever give the argument a bundle. Type objects are rematerialized in
+# the using block now (GeneratorStateMachine.cpp).
 #
-#   nested for loops, one yield at the end ........ this file: refused
-#   the same two loops in a NON-generator .........  correct
-#   one loop before a yield .......................  correct (fixed
-#       2026-08-13, tests/golden/cases/generator_loop_before_yield.py)
-#   two loops, the yield inside the second ........  refused, same message
-#   two sequential loops, a yield in EACH .........  refused, but honestly:
+# MEASURED after the repair:
+#
+#   two sequential loops, one yield at the end .... correct
+#   two sequential loops, the yield in the second . correct
+#   both are in tests/golden/cases/generator_loop_before_yield.py
+#   NESTED loops, one yield at the end ............ this file: refused with
+#       "ownership CFG exploration exceeded 20000 states", a stated budget
+#   two sequential loops with a yield in EACH ..... refused, honestly:
 #       "source generator next lowering currently supports only straight-line
-#       pure int yield bodies", which is a stated boundary
+#       pure int yield bodies"
 #
-# So this is not the straight-line boundary above -- that one says what it
-# does not support. `py.new`'s class object arrives as something that is not
-# a TypeObject bundle (lowerNew, Passes/Runtime/Manifest/Calls.cpp), and the
-# likely reason is the resume clone's SSA normalization: it threads every
-# value that crosses a block boundary through a new block argument
-# (GeneratorStateMachine.cpp, `blockValueArguments`), a `!py.type<...>` among
-# them, and a block argument has no type-object bundle.
-#
-# NOT the drain-ordering defect this file was found next to: the refusal is
-# identical on the binary from before that repair.
+# So what is left here is not a missing bundle: the ownership placement walk
+# does not converge inside the budget on the resume clone's CFG for a nested
+# loop, and n=3 is enough. The message names the budget, which is the right
+# shape for a refusal, but the walk is the thing to look at -- the same
+# nested loop in a NON-generator costs nothing.
 #
 # differential: skip the refusal is the recorded state, not a wrong answer
 from typing import Iterator

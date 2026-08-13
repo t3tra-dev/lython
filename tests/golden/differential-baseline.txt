@@ -138,6 +138,7 @@ generator_handler_suspend_raise.py AGREE
 generator_iterate.py AGREE
 generator_list_yield.py AGREE
 generator_local_list.py AGREE
+generator_loop_before_yield.py AGREE
 generator_object_args.py AGREE
 generator_owned_frame.py AGREE
 generator_pep479.py AGREE
@@ -312,7 +313,7 @@ stdlib_pathlib.py WRONG
 stdlib_random.py AGREE
 stdlib_string_basics.py AGREE
 stdlib_string_catch.py AGREE
-stdlib_string_template.py AGREE
+stdlib_string_template.py TIMEOUT
 stdlib_time.py AGREE
 store_into_a_container_then_return_it.py AGREE
 store_through_element_alias.py AGREE

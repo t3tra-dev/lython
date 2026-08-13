@@ -1745,6 +1745,37 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
             }
             external.insert(operand);
           }
+        // ⭐ A value with NO runtime representation is rematerialized, never
+        // threaded. `py.type.object` is the whole population: it is
+        // operand-free and pure, its result is a compile-time `!py.type<...>`
+        // with no ABI, and a block argument of that type is one nothing can
+        // ever give a bundle. A generator that builds a SECOND `range` --
+        // nested loops, or one loop after another -- reached `py.new` with
+        // its class object threaded and stopped at "new class object has no
+        // lowered type bundle", which names a lowering invariant rather than
+        // anything the reader wrote.
+        //
+        // ⛔ Why NOT teach the block-argument ABI to carry a type object
+        // instead: there is nothing to carry. The dispatch would have to
+        // forward a value that occupies no register, and every edge into the
+        // block would have to invent one.
+        {
+          llvm::SmallVector<mlir::Value, 4> rematerializable;
+          for (mlir::Value value : external)
+            if (mlir::isa_and_nonnull<py::TypeObjectOp>(value.getDefiningOp()))
+              rematerializable.push_back(value);
+          for (mlir::Value value : rematerializable) {
+            mlir::OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(block);
+            mlir::Operation *clonedOp = builder.clone(*value.getDefiningOp());
+            mlir::Value local = clonedOp->getResult(0);
+            value.replaceUsesWithIf(local, [&](mlir::OpOperand &use) {
+              return use.getOwner()->getBlock() == block &&
+                     use.getOwner() != clonedOp;
+            });
+            external.remove(value);
+          }
+        }
         if (external.empty())
           continue;
         if (continuationBlocks.contains(block)) {
