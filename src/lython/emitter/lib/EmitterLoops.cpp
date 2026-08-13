@@ -822,22 +822,45 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       values[local.name] = Value{postTestValues[index], local.type};
       types.bindSymbol(local.name, local.type);
     }
-    // ⛔ KNOWN DEFECT, measured and not repaired here: the body does NOT see
-    // what the condition proves. `while n is not None:` leaves n a union
-    // inside its own body, so `total += n` is refused for an operand the loop
-    // only enters with when it is an int -- while the if statement and the
-    // conditional expression both apply that narrowing.
+    // ⛔ KNOWN DEFECT: the body does NOT see what the condition proves.
+    // `while n is not None:` leaves n a union inside its own body, so
+    // `total += n` is refused for an operand the loop only enters with when
+    // it is an int -- while the if statement and the conditional expression
+    // both narrow it. The narrowing itself is one line here
+    // (applyBranchNarrowing with the test's fact, conditionIsTrue) and the
+    // 662-case suite stays green with it, so what follows is why it is not
+    // that line.
     //
-    // Applying it here (unwrap the carried value to the narrowed member at
-    // the top of the body, scoped) compiles, runs the loop, prints the right
-    // answer and THEN crashes on the way out -- re-measured after the
-    // primitive-lane repair, with the same result for an int, a str and a
-    // list payload. coerceValue does wrap a member back into the union
-    // (py.union.wrap, EmitterExpressions.cpp), so the missing piece is not
-    // the coercion: the unwrap hands the body a borrowed view of the carried
-    // value, and the back edge re-wrapping it leaves the ownership of the two
-    // unbalanced. Whatever is done here has to say which of the two holds the
-    // token.
+    // What blocks it is UNION OWNERSHIP ACROSS A LOOP EDGE, which is already
+    // broken without any narrowing. Two measurements, both on the pre-change
+    // binary:
+    //
+    //   def f(s: str | None) -> str:        # prints "start" in CPython;
+    //       while s is not None:            # aborts with "Ly_DecRef observed
+    //           s = None                    # non-positive refcount"
+    //       return "start"
+    //
+    //   def f(n: int | None) -> int:        # refused: "owned resource from
+    //       total = 0                       # @LyLong_Add result 0 reaches
+    //       while total < 3:                # function exit without release"
+    //           total += 1
+    //           n = total + 100
+    //       return total
+    //
+    // The first releases a BORROWED parameter: the back edge decrefs the old
+    // incarnation of the carried local, and on the first iteration that is
+    // the caller's value. The second never releases the new one: the exit
+    // edge has no decref at all. Both are the same hole --
+    // insertOwnedBlockArgumentReleases (Passes/Runtime/Passes/Ownership.cpp)
+    // places BOTH the borrow-edge retain and the exit release, and it skips
+    // any group whose `condition` is set. A union's release is conditional on
+    // its tag, so a union-carried local gets neither.
+    //
+    // Turning narrowing on before that is fixed makes it WORSE, measured:
+    // `def f(s: str|None) -> int: out = "start"; while s is not None: s =
+    // None; return len(out)` runs correctly today and aborts with the
+    // unwrap in place, because the unwrap changes which lanes the pass sees.
+    // Fix the conditional group first; the narrowing is one line after that.
     LoopControlContext loop{afterBlock, headerBlock};
     loop.carriedLocals.assign(carried.begin(), carried.end());
     loop.headerBlock = headerBlock;

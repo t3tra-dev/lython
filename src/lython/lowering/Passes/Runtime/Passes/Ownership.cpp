@@ -2365,6 +2365,29 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     ++calleeResolutions;
     for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
              module, call, deallocators, symbols)) {
+      // ⛔ KNOWN DEFECT, measured, not repaired here: `g.condition` -- a
+      // union, whose release is guarded by its tag -- is skipped, and this
+      // function places BOTH halves of the loop-carried contract. The
+      // borrow-edge retain that compensates the back edge's release, and the
+      // release on the exit edge. A union-carried local gets neither, so
+      //
+      //   def f(s: str | None) -> str:
+      //       while s is not None:
+      //           s = None
+      //       return "start"
+      //
+      // frees the CALLER's argument on the first back edge and prints an
+      // empty line (deterministically, rc=0, no diagnostic), while the
+      // exit-release half shows up as "owned resource from @LyLong_Add
+      // result 0 reaches function exit without release". Both spellings and
+      // the seven measured variants are in
+      // tests/probe/wb_union_loop_carried_borrow_overrelease.py.
+      //
+      // What a repair needs that nothing here has: a tag-guarded call. The
+      // condition carries the tag value and the active index, and across a
+      // block-argument edge the tag is forwarded too, so the retain and the
+      // release both have to be emitted under `cmpi eq(tag, activeTag)`.
+      // This pass emits only unguarded calls today.
       if (!g.deallocator || g.condition)
         continue;
       std::optional<Seeded> seeded = seedGroup(fn, g, call->getBlock());

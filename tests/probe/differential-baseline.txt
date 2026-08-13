@@ -323,3 +323,4 @@ wb_param_store_tuple.py AGREE
 wb_param_store_twofloat.py AGREE
 wb_param_store_twolevel_float.py AGREE
 wb_range_elem_into_list_literal.py AGREE
+wb_union_loop_carried_borrow_overrelease.py SKIP

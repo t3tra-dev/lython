@@ -566,6 +566,11 @@ private:
   // Operator protocol on a source-class receiver (x[i], x[i]=v, len(x),
   // i in x): the class method inlines with pre-built arguments, the same
   // dispatch as an explicit x.__getitem__(i) call.
+  // A proved fact (`x is not None`, `isinstance(x, C)`) becoming a narrower
+  // SSA value for the branch that proved it.
+  void applyBranchNarrowing(const parser::Node &anchor,
+                            const struct BranchTypeNarrowing &fact,
+                            bool conditionIsTrue);
   Value emitInlineOperatorCall(const parser::Node &anchor, Value receiver,
                                const MethodBinding &method,
                                llvm::ArrayRef<Value> positional);

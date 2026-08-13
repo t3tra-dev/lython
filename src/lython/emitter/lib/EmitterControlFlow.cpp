@@ -17,15 +17,12 @@
 
 namespace lython::emitter {
 
-void ModuleEmitter::emitIf(const parser::Node &statement) {
-  const parser::Node *test = ast::node(statement, "test");
-  std::optional<BranchTypeNarrowing> narrowing =
-      test ? optionalBranchTypeNarrowing(*test, types, module) : std::nullopt;
-  llvm::StringMap<mlir::Type> savedNarrowedFrom = narrowedFromTypes;
-  auto restoreNarrowedFrom = llvm::make_scope_exit(
-      [&] { narrowedFromTypes = std::move(savedNarrowedFrom); });
-  auto applyNarrowing = [&](const BranchTypeNarrowing &fact,
-                            bool conditionIsTrue) {
+// The one place a proved fact becomes a narrower SSA value. `if`, the
+// conditional expression and the `while` body all reach it: each of them
+// used to be its own copy, and the loop had none at all.
+void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
+                                         const BranchTypeNarrowing &fact,
+                                         bool conditionIsTrue) {
     if (std::optional<mlir::Type> before = types.lookupSymbol(fact.name))
       narrowedFromTypes[fact.name] = *before;
     mlir::Type narrowed = conditionIsTrue ? fact.trueType : fact.falseType;
@@ -41,18 +38,18 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
             mlir::cast<py::UnionType>(found->second.value.getType());
         if (unionType.hasMember(narrowed)) {
           auto unwrap = py::UnionUnwrapOp::create(
-              builder, loc(statement), narrowed, found->second.value);
+              builder, loc(anchor), narrowed, found->second.value);
           found->second.value = unwrap.getResult();
         } else if (sourceType && unionType.hasMember(sourceType)) {
           auto unwrap = py::UnionUnwrapOp::create(
-              builder, loc(statement), sourceType, found->second.value);
+              builder, loc(anchor), sourceType, found->second.value);
           found->second.value = unwrap.getResult();
           if (sourceType != narrowed &&
               mlir::isa<py::ContractType>(sourceType) &&
               mlir::isa<py::ContractType>(narrowed) &&
               py::isAssignableTo(narrowed, sourceType, module)) {
             auto refine = py::ClassRefineOp::create(
-                builder, loc(statement), narrowed, found->second.value);
+                builder, loc(anchor), narrowed, found->second.value);
             found->second.value = refine.getResult();
           }
         }
@@ -61,7 +58,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
                  mlir::isa<py::ContractType>(narrowed) &&
                  py::isAssignableTo(narrowed, found->second.value.getType(),
                                     module)) {
-        auto refine = py::ClassRefineOp::create(builder, loc(statement),
+        auto refine = py::ClassRefineOp::create(builder, loc(anchor),
                                                 narrowed, found->second.value);
         found->second.value = refine.getResult();
       }
@@ -70,7 +67,15 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     }
     if (found == values.end() || found->second.value.getType() == narrowed)
       types.bindSymbol(fact.name, narrowed);
-  };
+}
+
+void ModuleEmitter::emitIf(const parser::Node &statement) {
+  const parser::Node *test = ast::node(statement, "test");
+  std::optional<BranchTypeNarrowing> narrowing =
+      test ? optionalBranchTypeNarrowing(*test, types, module) : std::nullopt;
+  llvm::StringMap<mlir::Type> savedNarrowedFrom = narrowedFromTypes;
+  auto restoreNarrowedFrom = llvm::make_scope_exit(
+      [&] { narrowedFromTypes = std::move(savedNarrowedFrom); });
 
   std::optional<bool> staticTruth =
       test ? optionalStaticBranchTruth(*test, types, module) : std::nullopt;
@@ -80,7 +85,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     // persist after the fold, so the platform-switch idiom can bind names
     // (`if os.name == "posix": from posix import *`).
     if (narrowing)
-      applyNarrowing(*narrowing, *staticTruth);
+      applyBranchNarrowing(statement, *narrowing, *staticTruth);
     const auto *selected = *staticTruth ? ast::nodeList(statement, "body")
                                         : ast::nodeList(statement, "orelse");
     if (selected && !selected->empty())
@@ -154,7 +159,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   {
     ScopedEmitterScope scope(values, types);
     if (narrowing)
-      applyNarrowing(*narrowing, /*conditionIsTrue=*/true);
+      applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
     emitStatements(ast::nodeList(statement, "body"));
     if (!insertionBlockTerminated(builder)) {
       thenExit = builder.getInsertionBlock();
@@ -177,7 +182,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     {
       ScopedEmitterScope scope(values, types);
       if (narrowing)
-        applyNarrowing(*narrowing, /*conditionIsTrue=*/false);
+        applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/false);
       emitStatements(orelse);
       if (!insertionBlockTerminated(builder)) {
         elseExit = builder.getInsertionBlock();
@@ -409,9 +414,9 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     types.bindSymbol(name, replacementTypes[slot]);
   }
   if (narrowing && thenTerminates && !elseTerminates)
-    applyNarrowing(*narrowing, /*conditionIsTrue=*/false);
+    applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/false);
   else if (narrowing && hasElse && elseTerminates && !thenTerminates)
-    applyNarrowing(*narrowing, /*conditionIsTrue=*/true);
+    applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
 }
 
 } // namespace lython::emitter
