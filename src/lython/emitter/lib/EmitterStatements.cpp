@@ -685,8 +685,9 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
           parser::Severity::Error, target.range.start,
           "'global " + name.str() +
               "' names a module global this compiler does not give storage "
-              "to, so the assignment cannot reach it; only an annotated "
-              "int-typed module global is writable from a function"});
+              "to, so the assignment cannot reach it; an annotated module "
+              "global of a scalar, bytes, ctypes-pointer or user-class type "
+              "is writable from a function, a container is not"});
       return;
     }
     if (isModuleGlobalWrite(name)) {

@@ -44,17 +44,12 @@ std::string importBindingName(std::string_view module,
                               std::optional<std::string_view> asname);
 mlir::Attribute defaultValueAttr(mlir::Builder &builder,
                                  const parser::Node *node);
-mlir::ArrayAttr callableDefaultValues(mlir::Builder &builder,
-                                      const parser::Node &function,
-                                      const FunctionSignature &sig);
 llvm::SmallVector<const parser::Node *, 8>
 positionalArgumentNodes(const parser::Node &arguments);
 
 bool blockHasTerminator(mlir::Block &block);
 mlir::Operation *blockTerminator(mlir::Block &block);
 void setInsertionBeforeTerminator(mlir::OpBuilder &builder, mlir::Block &block);
-void ensureYield(mlir::OpBuilder &builder, mlir::Location loc,
-                 mlir::Block &block);
 bool insertionBlockTerminated(const mlir::OpBuilder &builder);
 bool containsReturnStatement(const std::vector<parser::NodePtr> *statements);
 bool containsBreakOrContinueStatement(

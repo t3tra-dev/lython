@@ -1008,11 +1008,6 @@ bool isCpythonSoftKeyword(std::string_view text) {
   return index.softKeywords.find(text) != index.softKeywords.end();
 }
 
-bool isCpythonOperator(std::string_view text) {
-  const CpythonSpecIndex &index = cpython314Index();
-  return index.operatorSpellings.find(text) != index.operatorSpellings.end();
-}
-
 std::optional<std::string_view>
 cpythonLongestOperatorPrefix(std::string_view text) {
   const CpythonSpec &spec = cpython314Spec();
@@ -1100,14 +1095,6 @@ bool isCpythonAstKindOfType(std::string_view kind, std::string_view type) {
   if (found == index.astKindTypes.end())
     return false;
   return found->second == type;
-}
-
-const GeneratedRuleSpec *cpythonGeneratedRule(std::string_view name) {
-  const CpythonSpecIndex &index = cpython314Index();
-  auto found = index.generatedRuleIndices.find(name);
-  if (found == index.generatedRuleIndices.end())
-    return nullptr;
-  return &index.spec.generatedRules[found->second];
 }
 
 } // namespace lython::parser

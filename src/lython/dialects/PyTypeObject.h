@@ -26,8 +26,5 @@ mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,
 // verification sites where an unknown name is an error.
 bool isKnownSubclassOf(mlir::Operation *from, llvm::StringRef derived,
                        llvm::StringRef base);
-mlir::FailureOr<bool> exceptionMatches(mlir::Operation *from,
-                                       llvm::StringRef handler);
-
 } // namespace type_object
 } // namespace py

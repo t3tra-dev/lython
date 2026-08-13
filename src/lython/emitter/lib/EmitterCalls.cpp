@@ -1997,10 +1997,6 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       (!reducerKeywords || reducerKeywords->empty() || reducerKeyNode) &&
       (reducer == "max" || reducer == "min")) {
     mlir::Type elementType = reducerElementType();
-    auto contract =
-        mlir::dyn_cast_if_present<py::ContractType>(elementType);
-    llvm::StringRef contractName =
-        contract ? contract.getContractName() : llvm::StringRef();
     // The accumulator needs a value of the element type before the first
     // trip; the seen-flag is what keeps it from ever being READ, so only its
     // TYPE has to be right.

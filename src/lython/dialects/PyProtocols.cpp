@@ -39,17 +39,6 @@ bool sameMethodContract(const ProtocolMethod &lhs, const ProtocolMethod &rhs) {
          lhs.noThrow == rhs.noThrow;
 }
 
-std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
-                                                      std::size_t size) {
-  if (size == 0)
-    return std::nullopt;
-  if (index < 0)
-    index += static_cast<std::int64_t>(size);
-  if (index < 0 || index >= static_cast<std::int64_t>(size))
-    return std::nullopt;
-  return index;
-}
-
 namespace {
 
 using py::contracts::isIntegerLiteralSpelling;
@@ -1420,15 +1409,6 @@ Table::protocolArgumentsFor(mlir::Type receiverType,
   }
 
   return std::nullopt;
-}
-
-std::optional<std::vector<mlir::Type>>
-Table::completeProtocolArguments(llvm::StringRef protocolName,
-                                 llvm::ArrayRef<mlir::Type> supplied) const {
-  const ProtocolInfo *info = lookup(protocolName);
-  if (!info || !info->isProtocol)
-    return std::nullopt;
-  return completeProtocolInstantiationArguments(*info, supplied);
 }
 
 Variance Table::parameterVariance(llvm::StringRef protocolName,

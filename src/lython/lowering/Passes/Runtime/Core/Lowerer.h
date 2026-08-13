@@ -1271,10 +1271,6 @@ private:
       llvm::SmallVectorImpl<RuntimeBundle> &closureSources,
       llvm::SmallVectorImpl<RuntimeBundle> &argumentEvidenceSources,
       llvm::SmallVectorImpl<RuntimeBundle> &aggregateEvidenceSources);
-  mlir::LogicalResult appendIndirectCallableResultOperands(
-      mlir::Operation *op, const RuntimeBundle &result,
-      llvm::ArrayRef<mlir::Type> expectedTypes,
-      llvm::SmallVectorImpl<mlir::Value> &operands);
   mlir::LogicalResult appendCallableAggregateEvidenceSources(
       py::CallOp op, llvm::StringRef targetName,
       const CallableAggregateEvidenceABI &evidence,
@@ -1422,9 +1418,6 @@ private:
   mlir::LogicalResult lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
                                         llvm::StringRef methodName,
                                         mlir::Value resultValue);
-  bool canAppendExactValueSequence(mlir::FunctionType functionType,
-                                   unsigned inputIndex,
-                                   const RuntimeBundle &source) const;
   mlir::LogicalResult
   appendRuntimeSource(mlir::Operation *op, const RuntimeSymbol &symbol,
                       mlir::FunctionType functionType, unsigned &inputIndex,
@@ -1496,6 +1489,8 @@ private:
       llvm::ArrayRef<mlir::Type> physicalTypes, bool primitiveIntLane);
   mlir::LogicalResult drainDeferredControlFlowExpansions();
   mlir::LogicalResult lowerRuntimeValueSelect(mlir::arith::SelectOp select);
+  llvm::SmallVector<mlir::BlockArgument, 16>
+  logicalBlockArgumentsHighestIndexFirst() const;
   mlir::LogicalResult dropControlFlowLogicalBranchOperands();
   mlir::LogicalResult eraseControlFlowLogicalBlockArguments();
   const RuntimeBundle *bundleFor(mlir::Value value) const;

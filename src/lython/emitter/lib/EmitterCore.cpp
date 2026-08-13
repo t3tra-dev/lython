@@ -304,8 +304,4 @@ bool ModuleEmitter::requireStaticEvidence(
   return false;
 }
 
-mlir::Type ModuleEmitter::boolProtocol() const {
-  return types.protocol("Callable");
-}
-
 } // namespace lython::emitter

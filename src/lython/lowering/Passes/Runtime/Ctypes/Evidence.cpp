@@ -471,8 +471,6 @@ mlir::Value widenNativeInteger(mlir::OpBuilder &builder, mlir::Location loc,
   return mlir::arith::ExtSIOp::create(builder, loc, i64, value).getResult();
 }
 
-std::string describeNativeArgumentSource(const RuntimeBundle &source);
-
 void copyNativeBytes(mlir::OpBuilder &builder, mlir::Location loc,
                      mlir::Value destinationAddress, mlir::Value sourceAddress,
                      std::uint64_t byteCount,
@@ -643,7 +641,5 @@ mlir::FailureOr<RuntimeBundle> materializeCtypesPythonReadResult(
                                       layout, storageAddress, storageValid,
                                       owner);
 }
-
-std::string describeNativeArgumentSource(const RuntimeBundle &source);
 
 } // namespace py::lowering::ctypes

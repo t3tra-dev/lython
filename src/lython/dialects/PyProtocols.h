@@ -46,9 +46,6 @@ struct ProtocolMethod {
 
 bool sameMethodContract(const ProtocolMethod &lhs, const ProtocolMethod &rhs);
 
-std::optional<std::int64_t> normalizeFiniteTupleIndex(std::int64_t index,
-                                                      std::size_t size);
-
 // Returns the callable view used for a bound method by dropping the receiver
 // parameter while preserving parameter metadata.
 py::CallableType bindReceiverCallable(py::CallableType signature);
@@ -262,9 +259,6 @@ public:
   std::optional<std::vector<mlir::Type>>
   protocolArgumentsFor(mlir::Type receiverType,
                        llvm::StringRef protocolName) const;
-  std::optional<std::vector<mlir::Type>>
-  completeProtocolArguments(llvm::StringRef protocolName,
-                            llvm::ArrayRef<mlir::Type> supplied) const;
   Variance parameterVariance(llvm::StringRef protocolName,
                              unsigned index) const;
   bool isProtocolSubtypeOf(

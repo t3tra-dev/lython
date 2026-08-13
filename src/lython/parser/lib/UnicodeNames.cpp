@@ -301,20 +301,6 @@ std::optional<unsigned int> dawgLookupPosition(std::string_view name) {
   return std::nullopt;
 }
 
-std::optional<std::uint32_t> dawgNameCodepoint(std::string_view name) {
-  std::optional<unsigned int> position = dawgLookupPosition(name);
-  if (!position)
-    return std::nullopt;
-  std::uint32_t codepoint = dawg_pos_to_codepoint[*position];
-  if (codepoint >= aliases_start && codepoint < aliases_end)
-    codepoint = name_aliases[codepoint - aliases_start];
-  if (codepoint >= named_sequences_start && codepoint < named_sequences_end)
-    return std::nullopt;
-  if (codepoint > 0x10ffff)
-    return std::nullopt;
-  return codepoint;
-}
-
 std::optional<std::string> dawgNameString(std::string_view name) {
   std::optional<unsigned int> position = dawgLookupPosition(name);
   if (!position)
@@ -340,16 +326,6 @@ std::optional<std::string> dawgNameString(std::string_view name) {
 }
 
 } // namespace
-
-std::optional<std::uint32_t>
-cpythonUnicodeNameCodepoint(std::string_view rawName) {
-  std::string name = canonicalUnicodeName(rawName);
-  if (auto codepoint = derivedNameCodepoint(name))
-    return codepoint;
-  if (auto codepoint = dawgNameCodepoint(name))
-    return codepoint;
-  return std::nullopt;
-}
 
 std::optional<std::string> cpythonUnicodeNameString(std::string_view rawName) {
   std::string name = canonicalUnicodeName(rawName);

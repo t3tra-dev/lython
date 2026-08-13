@@ -44,9 +44,6 @@ public:
                       llvm::StringRef role = {});
 
   VarKind varKind(unsigned id) { return vars[findRep(id)].kind; }
-  const parser::Node *varOrigin(unsigned id) { return vars[findRep(id)].origin; }
-  llvm::StringRef varRole(unsigned id) { return vars[findRep(id)].role; }
-
   // Follows var -> binding chains until a non-variable type or an unbound
   // variable (returned as its canonical representative).
   mlir::Type resolveShallow(mlir::Type type);
@@ -75,8 +72,6 @@ public:
   // for parameter lists, not single types, and keep flowing through the
   // existing TypeBindingMap expansion until that machinery is subsumed.
   mlir::Type instantiate(mlir::Type scheme, const parser::Node *origin = nullptr);
-
-  int currentLevel() const { return level; }
 
   // Monotonically increasing count of successful bindings and variable
   // merges. Fixpoint drivers compare generations across a sweep instead of

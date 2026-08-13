@@ -9,10 +9,6 @@ namespace lython::emitter {
 
 namespace {
 
-constexpr llvm::StringRef kStaticMethodDecoratorStorage[] = {"staticmethod"};
-constexpr llvm::ArrayRef<llvm::StringRef> kStaticMethodDecorator{
-    kStaticMethodDecoratorStorage};
-
 // --- AST construction / mutation helpers -----------------------------------
 //
 // The desugar rewrites the parsed tree in place: an Enum subclass becomes a

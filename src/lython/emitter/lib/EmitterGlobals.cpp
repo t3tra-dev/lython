@@ -27,11 +27,9 @@
 namespace lython::emitter {
 
 void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
-  // Opt-in: an annotated module-level assignment (`NAME: T = ...`) becomes
-  // a storage-backed mutable global (int keeps its unboxed i64 cell for the
-  // signal-safe channel; other contracts store their physical value words).
-  // Plain `NAME = expr` at module scope keeps its value-binding behavior
-  // (module-scope constants).
+  // Opt-in: an annotated module-level assignment (`NAME: T = ...`) becomes a
+  // storage-backed mutable global. Plain `NAME = expr` at module scope keeps
+  // its value-binding behaviour (module-scope constants).
   const auto *body = ast::nodeList(moduleNode, "body");
   if (!body)
     return;
@@ -79,12 +77,12 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
   // `N = 5` from a function was "unresolved name 'N'" while `N: int = 5`
   // worked, and CPython does not distinguish the two spellings.
   //
-  // ⛔ Why NOT make it a storage cell like the annotated form: an int cell is
-  // an UNBOXED i64 (the async-signal-safe channel), so a module `fact = 1`
-  // grown past 2**63 by module-scope arithmetic would raise
-  // "int too large to convert to a native 64-bit integer" where it prints
-  // the value today. Measured: 4 goldens, one of them exactly that
-  // factorial. A literal bound once has no such arithmetic on it.
+  // ⛔ Why NOT make it a storage cell like the annotated form: a cell is a
+  // rebindable slot, and re-emitting the literal is strictly cheaper for a
+  // name that is never rebound. (Until the boxing repair an int cell was also
+  // an unboxed i64, so `fact = 1` grown past 2**63 raised where it printed --
+  // measured at 4 goldens, one of them exactly that factorial. That reason is
+  // gone; the cheapness one is not.)
   llvm::StringSet<> boundOnce = singleAssignmentNames(moduleNode);
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "Assign")

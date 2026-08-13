@@ -98,13 +98,7 @@ bool installPythonExceptionCleanupFrames(
     llvm::Module &module, llvm::ArrayRef<PythonCallSiteRange> callSites);
 void installArmStreamingCompatibleMemoryRoutines(llvm::Module &module);
 
-namespace optimizer::publication {
-void prepare(mlir::ModuleOp module);
-}
-
 namespace optimizer::pipeline {
-void preLowering(mlir::ModuleOp module);
-void postValueLowering(mlir::ModuleOp module);
 void finalLLVMCleanup(mlir::ModuleOp module);
 } // namespace optimizer::pipeline
 

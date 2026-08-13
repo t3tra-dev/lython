@@ -303,11 +303,6 @@ struct SupportBuilder {
 // of being declared privately in each and drifting.
 // ---------------------------------------------------------------------------
 
-// {allocated, aligned, offset, size[1], stride[1]} -- MLIR's own rank-1 memref
-// descriptor, which only the two bridge helpers at the bottom of this header
-// have any business naming.
-mlir::Type memRef1DType(SupportBuilder &b);
-
 // {{allocated, aligned, offset, size, stride} x3}, 120 bytes.
 mlir::Type exceptionPartsType(SupportBuilder &b);
 

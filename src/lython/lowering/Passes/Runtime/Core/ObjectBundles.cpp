@@ -439,8 +439,11 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     llvm::StringRef cell = value.getValue();
     std::string contractName = runtimeContractName(parameterType);
     if (contractName == "builtins.int") {
-      // Module int globals live in the primitive i64 cell (the GlobalSet
-      // side routes int values there); read it back as the primitive lane.
+      // ⛔ A default cell is NOT a module global, even though both are
+      // py.global.get/set: this population is never marked `ly.global.boxed`,
+      // so an int default stays in the native word cell and is read back as
+      // the primitive lane. Boxing it along with the module globals made
+      // `default_once` print 0 for a default that must evaluate once.
       mlir::Value raw = RuntimeBundleLowerer::loadNativeGlobalWord(op, cell);
       mlir::Value valid =
           mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);

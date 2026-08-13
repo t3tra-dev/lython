@@ -217,7 +217,6 @@ public:
   mlir::Type tupleOf(mlir::Type elementType) const;
   mlir::Type listOf(mlir::Type elementType) const;
   mlir::Type dictOf(mlir::Type keyType, mlir::Type valueType) const;
-  mlir::Type iteratorOf(mlir::Type elementType) const;
   mlir::Type coroutineOf(mlir::Type resultType) const;
   // Manifest-driven contract refinement on field assignment
   // (ly.typing.field_param_bindings): the refined receiver type when

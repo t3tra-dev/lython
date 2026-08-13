@@ -1265,13 +1265,6 @@ mlir::Type TypeSystem::dictOf(mlir::Type keyType, mlir::Type valueType) const {
   return contract("builtins.dict", args);
 }
 
-mlir::Type TypeSystem::iteratorOf(mlir::Type elementType) const {
-  llvm::SmallVector<mlir::Type, 1> args;
-  if (elementType)
-    args.push_back(elementType);
-  return protocol("Iterator", args);
-}
-
 mlir::Type TypeSystem::coroutineOf(mlir::Type resultType) const {
   return contract("types.CoroutineType",
                   {any(), any(), resultType ? resultType : any()});

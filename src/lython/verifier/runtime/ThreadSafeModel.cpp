@@ -153,24 +153,6 @@ parseRetainPremiseSource(llvm::StringRef value) {
       .Default(std::nullopt);
 }
 
-llvm::StringRef retainPremiseName(RetainPremiseKind premise) {
-  switch (premise) {
-  case RetainPremiseKind::None:
-    return "";
-  case RetainPremiseKind::OwnedToken:
-    return "owned-token";
-  case RetainPremiseKind::EntryBorrowed:
-    return "entry-borrowed";
-  case RetainPremiseKind::CapturedBorrowed:
-    return "captured-borrowed";
-  case RetainPremiseKind::AggregateBorrow:
-    return "aggregate-borrow";
-  case RetainPremiseKind::LockedBorrow:
-    return "locked-borrow";
-  }
-  return "<invalid>";
-}
-
 llvm::StringRef retainPremiseSourceName(RetainPremiseSourceKind source) {
   switch (source) {
   case RetainPremiseSourceKind::Unknown:

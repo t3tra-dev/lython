@@ -90,7 +90,6 @@ std::optional<RetainPremiseKind>
 parseRetainPremise(llvm::StringRef value);
 std::optional<RetainPremiseSourceKind>
 parseRetainPremiseSource(llvm::StringRef value);
-llvm::StringRef retainPremiseName(RetainPremiseKind premise);
 llvm::StringRef retainPremiseSourceName(RetainPremiseSourceKind source);
 
 AtomicOperationKind classifyAtomicOperation(mlir::Operation *op);

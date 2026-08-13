@@ -2243,10 +2243,6 @@ mlir::Type memRefPartsStruct(SupportBuilder &b, llvm::StringRef name) {
 
 } // namespace
 
-mlir::Type memRef1DType(SupportBuilder &b) {
-  return memRef1DDescriptorType(b.builder.getContext());
-}
-
 mlir::Type exceptionPartsType(SupportBuilder &b) {
   auto type = mlir::LLVM::LLVMStructType::getIdentified(b.builder.getContext(),
                                                         "ExceptionParts");

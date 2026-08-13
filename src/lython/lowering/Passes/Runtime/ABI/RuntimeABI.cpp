@@ -23,7 +23,6 @@ namespace own = py::ownership;
 constexpr llvm::StringLiteral kReleaseStorageToZeroName{
     "LyObject_ReleaseStorageToZero"};
 constexpr unsigned kPrimitiveFieldSlotBase = 4;
-constexpr unsigned kPrimitiveFieldSlotLimit = 16;
 
 std::string sanitizeSymbolComponent(llvm::StringRef text) {
   std::string result;
@@ -647,10 +646,6 @@ RuntimeValue RuntimeValue::withOwnership(own::OwnershipKind ownership) const {
   RuntimeValue value = *this;
   value.ownership = normalizeRuntimeValueOwnership(contract, ownership);
   return value;
-}
-
-RuntimeValue RuntimeValue::withLogicalOwnership(bool ownsObject) const {
-  return withOwnership(own::logicalOwnershipKind(contract, ownsObject));
 }
 
 const RuntimeValue *RuntimeObjectEvidence::slot(llvm::StringRef name) const {

@@ -57,13 +57,6 @@ mlir::LogicalResult rejectConsumingObjectView(mlir::Operation *op,
 
 } // namespace
 
-bool RuntimeBundleLowerer::canAppendExactValueSequence(
-    mlir::FunctionType functionType, unsigned inputIndex,
-    const RuntimeBundle &source) const {
-  return canAppendExactValues(functionType, inputIndex,
-                              source.physicalValues());
-}
-
 mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     mlir::Operation *op, const RuntimeSymbol &symbol,
     mlir::FunctionType functionType, unsigned &inputIndex,

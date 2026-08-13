@@ -99,17 +99,4 @@ inline bool sourcePointLessOrEqual(std::int32_t lhsLine, std::int32_t lhsColumn,
   return lhsLine < rhsLine || (lhsLine == rhsLine && lhsColumn <= rhsColumn);
 }
 
-inline bool sourceRangeContains(const PythonSourceRange &outer,
-                                const PythonSourceRange &inner) {
-  if (outer.filename != inner.filename)
-    return false;
-  if (outer.line <= 0 || inner.line <= 0 || outer.endLine <= 0 ||
-      inner.endLine <= 0)
-    return false;
-  return sourcePointLessOrEqual(outer.line, outer.column, inner.line,
-                                inner.column) &&
-         sourcePointLessOrEqual(inner.endLine, inner.endColumn, outer.endLine,
-                                outer.endColumn);
-}
-
 } // namespace py

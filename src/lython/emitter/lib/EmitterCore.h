@@ -36,8 +36,6 @@ private:
   bool
   requireStaticEvidence(const parser::Node &anchor,
                         const AsyncContextMethodInferenceResult &inference);
-  mlir::Type boolProtocol() const;
-
   void predeclareTopLevel();
   void predeclareSourceModules();
   void emitTopLevelDeclarations();

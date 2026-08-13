@@ -57,7 +57,6 @@ struct RuntimeValue {
   std::string contractName() const;
   RuntimeValue
   withOwnership(ownership::OwnershipKind ownership) const;
-  RuntimeValue withLogicalOwnership(bool ownsObject) const;
 };
 
 struct RuntimeCallableAlternative {

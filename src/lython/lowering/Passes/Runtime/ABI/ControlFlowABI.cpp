@@ -825,6 +825,23 @@ mlir::LogicalResult RuntimeBundleLowerer::drainDeferredControlFlowExpansions() {
   return mlir::success();
 }
 
+// Every registered logical block argument, HIGHEST INDEX FIRST within a block.
+// Both passes below mutate by index -- one erases an operand, the other erases
+// the argument -- and either renumbers everything above what it touched, so
+// descending order is what keeps the indices they have already computed valid.
+llvm::SmallVector<mlir::BlockArgument, 16>
+RuntimeBundleLowerer::logicalBlockArgumentsHighestIndexFirst() const {
+  llvm::SmallVector<mlir::BlockArgument, 16> arguments(
+      controlFlowLogicalBlockArguments.begin(),
+      controlFlowLogicalBlockArguments.end());
+  llvm::sort(arguments, [](mlir::BlockArgument lhs, mlir::BlockArgument rhs) {
+    if (lhs.getOwner() != rhs.getOwner())
+      return std::less<mlir::Block *>()(lhs.getOwner(), rhs.getOwner());
+    return lhs.getArgNumber() > rhs.getArgNumber();
+  });
+  return arguments;
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
   traceControlFlowArity(module, "before-drop-logical-operands");
@@ -841,15 +858,8 @@ RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
     return mlir::success();
   };
 
-  llvm::SmallVector<mlir::BlockArgument, 16> arguments;
-  arguments.reserve(controlFlowLogicalBlockArguments.size());
-  arguments.append(controlFlowLogicalBlockArguments.begin(),
-                   controlFlowLogicalBlockArguments.end());
-  llvm::sort(arguments, [](mlir::BlockArgument lhs, mlir::BlockArgument rhs) {
-    if (lhs.getOwner() != rhs.getOwner())
-      return std::less<mlir::Block *>()(lhs.getOwner(), rhs.getOwner());
-    return lhs.getArgNumber() > rhs.getArgNumber();
-  });
+  llvm::SmallVector<mlir::BlockArgument, 16> arguments =
+      RuntimeBundleLowerer::logicalBlockArgumentsHighestIndexFirst();
 
   for (mlir::BlockArgument argument : arguments) {
     mlir::Block *block = argument.getOwner();
@@ -916,15 +926,8 @@ RuntimeBundleLowerer::dropControlFlowLogicalBranchOperands() {
 mlir::LogicalResult
 RuntimeBundleLowerer::eraseControlFlowLogicalBlockArguments() {
   traceControlFlowArity(module, "before-erase-logical-args");
-  llvm::SmallVector<mlir::BlockArgument, 16> arguments;
-  arguments.reserve(controlFlowLogicalBlockArguments.size());
-  arguments.append(controlFlowLogicalBlockArguments.begin(),
-                   controlFlowLogicalBlockArguments.end());
-  llvm::sort(arguments, [](mlir::BlockArgument lhs, mlir::BlockArgument rhs) {
-    if (lhs.getOwner() != rhs.getOwner())
-      return std::less<mlir::Block *>()(lhs.getOwner(), rhs.getOwner());
-    return lhs.getArgNumber() > rhs.getArgNumber();
-  });
+  llvm::SmallVector<mlir::BlockArgument, 16> arguments =
+      RuntimeBundleLowerer::logicalBlockArgumentsHighestIndexFirst();
 
   for (mlir::BlockArgument argument : arguments) {
     if (!argument.use_empty())

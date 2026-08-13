@@ -183,33 +183,6 @@ mlir::Attribute defaultValueAttr(mlir::Builder &builder,
   return dict("unsupported", builder.getStringAttr("Constant"));
 }
 
-mlir::ArrayAttr callableDefaultValues(mlir::Builder &builder,
-                                      const parser::Node &function,
-                                      const FunctionSignature &sig) {
-  unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
-  llvm::SmallVector<mlir::Attribute, 8> values(
-      positionalCount + sig.kwOnlyTypes.size(), builder.getUnitAttr());
-  const parser::Node *arguments = ast::node(function, "args");
-  const auto *defaults =
-      arguments ? ast::nodeList(*arguments, "defaults") : nullptr;
-  if (defaults && !defaults->empty()) {
-    unsigned firstDefault = positionalCount - defaults->size();
-    for (auto [index, value] : llvm::enumerate(*defaults))
-      if (firstDefault + index < values.size())
-        values[firstDefault + index] = defaultValueAttr(builder, value.get());
-  }
-  const auto *kwDefaults =
-      arguments ? ast::nodeList(*arguments, "kw_defaults") : nullptr;
-  if (kwDefaults) {
-    for (auto [index, value] : llvm::enumerate(*kwDefaults)) {
-      unsigned slot = positionalCount + static_cast<unsigned>(index);
-      if (slot < values.size())
-        values[slot] = defaultValueAttr(builder, value.get());
-    }
-  }
-  return builder.getArrayAttr(values);
-}
-
 llvm::SmallVector<const parser::Node *, 8>
 positionalArgumentNodes(const parser::Node &arguments) {
   llvm::SmallVector<const parser::Node *, 8> result;
@@ -239,14 +212,6 @@ void setInsertionBeforeTerminator(mlir::OpBuilder &builder,
     return;
   }
   builder.setInsertionPointToEnd(&block);
-}
-
-void ensureYield(mlir::OpBuilder &builder, mlir::Location loc,
-                 mlir::Block &block) {
-  if (!blockHasTerminator(block)) {
-    builder.setInsertionPointToEnd(&block);
-    mlir::scf::YieldOp::create(builder, loc);
-  }
 }
 
 bool insertionBlockTerminated(const mlir::OpBuilder &builder) {

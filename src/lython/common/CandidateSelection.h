@@ -120,30 +120,4 @@ std::optional<TransactionalState<State, Match>> selectBestTransactionalState(
       std::move(equivalentState), [](const State &) { return true; });
 }
 
-template <typename Range, typename CaptureStateFn, typename RestoreStateFn,
-          typename TryCandidateFn, typename ScoreCandidateFn,
-          typename EquivalentStateFn>
-std::optional<std::decay_t<std::invoke_result_t<CaptureStateFn>>>
-selectBestRestoredState(const Range &candidates, CaptureStateFn captureState,
-                        RestoreStateFn restoreState,
-                        TryCandidateFn tryCandidate,
-                        ScoreCandidateFn scoreCandidate,
-                        EquivalentStateFn equivalentState) {
-  using State = std::decay_t<std::invoke_result_t<CaptureStateFn>>;
-  State baseState = captureState();
-  return selectBestState<State>(
-      candidates,
-      [&](const auto &candidate) -> std::optional<State> {
-        restoreState(baseState);
-        if (!tryCandidate(candidate)) {
-          restoreState(baseState);
-          return std::nullopt;
-        }
-        State selectedState = captureState();
-        restoreState(baseState);
-        return selectedState;
-      },
-      std::move(scoreCandidate), std::move(equivalentState));
-}
-
 } // namespace lython::selection

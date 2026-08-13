@@ -213,9 +213,4 @@ mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,
   return llvm::is_contained(*mro, base);
 }
 
-mlir::FailureOr<bool> exceptionMatches(mlir::Operation *from,
-                                       llvm::StringRef handler) {
-  return isSubclassOf(from, kException, handler);
-}
-
 } // namespace py::type_object

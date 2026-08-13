@@ -182,57 +182,6 @@ struct InvocationSpecificityScore : NoopMatchObserver {
   void onDefaultedKeywordOnly(std::size_t) { onDefaultedParameter(); }
 };
 
-template <typename KindT, typename TypeT, typename ValueT> struct Slot {
-  using Kind = KindT;
-  using Type = TypeT;
-  using Value = ValueT;
-
-  Kind kind;
-  unsigned index = 0;
-  Type type;
-  Value value;
-  std::string keywordName;
-  Value keywordNameValue;
-};
-
-template <typename SlotT>
-SlotT makeFormalSlot(typename SlotT::Kind kind, unsigned index,
-                     typename SlotT::Type type) {
-  SlotT slot;
-  slot.kind = kind;
-  slot.index = index;
-  slot.type = type;
-  return slot;
-}
-
-template <typename SlotT>
-llvm::SmallVector<SlotT, 8>
-makeFormalSlots(llvm::ArrayRef<typename SlotT::Type> types,
-                typename SlotT::Kind kind) {
-  llvm::SmallVector<SlotT, 8> slots;
-  slots.reserve(types.size());
-  for (auto [index, type] : llvm::enumerate(types))
-    slots.push_back(
-        makeFormalSlot<SlotT>(kind, static_cast<unsigned>(index), type));
-  return slots;
-}
-
-template <typename SlotT>
-SlotT makeActualSlot(typename SlotT::Kind kind, typename SlotT::Value value,
-                     typename SlotT::Type type) {
-  SlotT slot;
-  slot.kind = kind;
-  slot.type = type;
-  slot.value = value;
-  return slot;
-}
-
-template <typename SlotT> struct Keyword {
-  std::string name;
-  typename SlotT::Value nameValue;
-  SlotT value;
-};
-
 template <typename T> struct VarargShape {
   enum class Kind { Invalid, Repeated, Exact };
 

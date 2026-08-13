@@ -74,7 +74,6 @@ struct CpythonSpec {
 const CpythonSpec &cpython314Spec();
 bool isCpythonHardKeyword(std::string_view text);
 bool isCpythonSoftKeyword(std::string_view text);
-bool isCpythonOperator(std::string_view text);
 std::optional<std::string_view>
 cpythonLongestOperatorPrefix(std::string_view text);
 bool isCpythonTokenName(std::string_view text);
@@ -90,6 +89,4 @@ const std::vector<AstFieldSpec> *cpythonAstFieldSpecs(std::string_view kind);
 std::optional<std::size_t> cpythonAstFieldIndex(std::string_view kind,
                                                 std::string_view field);
 bool isCpythonAstKindOfType(std::string_view kind, std::string_view type);
-const GeneratedRuleSpec *cpythonGeneratedRule(std::string_view name);
-
 } // namespace lython::parser

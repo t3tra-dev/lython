@@ -65,8 +65,6 @@ llvm::StringRef stripCtypesModule(llvm::StringRef contract);
 std::optional<std::string> ctypesModuleAttrContract(mlir::MLIRContext &context,
                                                     llvm::StringRef moduleName,
                                                     llvm::StringRef attr);
-std::optional<std::string> ctypesBareNameContract(mlir::MLIRContext &context,
-                                                  llvm::StringRef name);
 std::optional<std::string>
 ctypesQualifiedNameContract(mlir::MLIRContext &context, llvm::StringRef name);
 bool isStaticCtypesFunctionName(mlir::MLIRContext &context,

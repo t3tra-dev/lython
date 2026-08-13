@@ -227,13 +227,6 @@ inline constexpr OSErrorErrnoMapping kOSErrorErrnoMap[] = {
     {llvm::StringLiteral("ECONNREFUSED"), 61, 111, 142},
 };
 
-inline std::int64_t oserrorSubclassForErrno(int errnoValue, bool isLinux) {
-  for (const OSErrorErrnoMapping &entry : kOSErrorErrnoMap)
-    if ((isLinux ? entry.linuxValue : entry.darwinValue) == errnoValue)
-      return entry.classId;
-  return kOSErrorClassId;
-}
-
 inline const BuiltinExceptionInfo *findByName(llvm::StringRef name) {
   for (const BuiltinExceptionInfo &entry : kBuiltinExceptions)
     if (entry.name == name)
@@ -246,18 +239,6 @@ inline const BuiltinExceptionInfo *findByClassId(std::int64_t classId) {
     if (entry.classId == classId)
       return &entry;
   return nullptr;
-}
-
-// Leaf name of the direct base class; empty for BaseException and for names
-// outside the builtin taxonomy. Only the primary chain: multiple-inheritance
-// members' extra edges are in kBuiltinExceptionExtraEdges, and subclass
-// queries should go through isBuiltinExceptionSubclassName.
-inline llvm::StringRef builtinExceptionBaseName(llvm::StringRef name) {
-  const BuiltinExceptionInfo *entry = findByName(name);
-  if (!entry || entry->baseClassId == kRootClassId)
-    return {};
-  const BuiltinExceptionInfo *base = findByClassId(entry->baseClassId);
-  return base ? llvm::StringRef(base->name) : llvm::StringRef();
 }
 
 // Subclass relation over class ids, primary chain plus extra edges.

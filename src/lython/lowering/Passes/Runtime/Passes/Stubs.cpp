@@ -54,27 +54,17 @@ createPyOptimizationPass() {
       "lython-py-optimization", "optimize resolved Py dialect operations");
 }
 
+// The hooks the pipeline still CALLS, and nothing else. Eight sibling cleanup
+// transforms and three sibling optimizer hooks were declared and stubbed here
+// with no caller at all; a hook that nothing invokes is not an extension
+// point, it is a claim the build does not check.
 namespace lowering::runtime::cleanup {
 
-bool unreachableBlocks(mlir::ModuleOp) { return false; }
-bool pyBridgeCasts(mlir::Operation *) { return false; }
-bool pyMultiCasts(mlir::Operation *) { return false; }
-bool voidPyReturns(mlir::Operation *) { return false; }
-bool memrefDescriptorCasts(mlir::Operation *) { return false; }
-bool memrefRuntimeCalls(mlir::Operation *) { return false; }
 bool pointerRoundTrips(mlir::ModuleOp) { return false; }
-bool llvmFuncReturns(mlir::Operation *) { return false; }
-bool finalBoundary(mlir::ModuleOp) { return false; }
 
 } // namespace lowering::runtime::cleanup
 
-namespace optimizer::publication {
-void prepare(mlir::ModuleOp) {}
-} // namespace optimizer::publication
-
 namespace optimizer::pipeline {
-void preLowering(mlir::ModuleOp) {}
-void postValueLowering(mlir::ModuleOp) {}
 void finalLLVMCleanup(mlir::ModuleOp) {}
 } // namespace optimizer::pipeline
 
