@@ -1,52 +1,44 @@
-# ⛔ REFUSED, BEFORE AND AFTER the 2026-07-28 dict repair, on the FIRST block --
-# and that is a separate pre-existing defect, not this repair's. Kept because it
-# holds the DENOMINATOR, which is the part of this investigation that was easiest
-# to get wrong and hardest to recover once wrong.
+# OPEN, and the LAST program in either corpus that hits the affine state cap:
 #
-# The runtime-key block below refuses with `ownership CFG exploration exceeded
-# 20000 states (last: retained=909 parked=0 ...)`. Byte-identical message AND
-# counters on a genuine pre-fix binary, so the dict source-move repair neither
-# caused nor touched it -- it cannot, because the shape never reaches
-# initializeDictPayload at all (that is the whole point of this file).
+#     ownership CFG exploration exceeded 20000 states
+#     (last: retained=952 parked=0 borrowed=0 prev=0 stale=0 group=1 token=0)
 #
-# `parked=0` is the interesting number: the `setitem_box` probe path emits its
-# per-entry retains with NO aggregate parent, so the retain count climbs every
-# iteration and the visited-state key never repeats. That is exactly the shape
-# `chargeSlotRetainsToParent` was added to fix on the payload path, applied there
-# and not here. NOT fixed as part of the dict source-move work because it is a
-# different pass's accounting and lives behind a file another track holds; it is
-# recorded here so the next person does not read this file's refusal as a
-# regression of the source-move rule.
+# MEASURED 2026-08-15 over tests/golden/cases + tests/probe, 717 programs: this
+# one and no other. That figure matters because the cap is not a diagnostic --
+# the note at AffineOwnership.cpp says so outright, and says any claim that the
+# verifier is green on a program requires that the program did not hit it. The
+# exposure is now a number instead of an unknown.
 #
-# ⚠️ So "the key side is unreachable" does NOT mean "the key side is safe". It
-# means the key side fails somewhere else, earlier, and safely.
+# ⭐ ROOT CAUSE, and it is ONE MISSING STAMP. The chain, measured end to end:
 #
-# The brief for the dict-side measurement said "dict keys are hashed, so the key
-# side and the value side may behave differently -- MEASURE BOTH". Reading
-# PackAndBindingOps.cpp first showed that half of that instruction is
-# unsatisfiable, and reading it AFTER a sweep would have produced a sweep whose
-# key-side rows were all clean for a reason unrelated to ownership.
+#   1. `LyDict_FromLength` carries no `ly.ownership.aggregate_id`. Counted in
+#      the emitted `__main__`: the dict program has 0 of them, the equivalent
+#      list program has 2.
+#   2. So `aggregateIdentityOf(container lane)` answers nothing, and
+#      `chargeSlotRetainsToParent` (Core/CollectionPayload.cpp) returns without
+#      stamping -- it IS called on the dict path, right after the
+#      `dict.literal.key` and `dict.literal.value` retains.
+#   3. So those retains carry `aggregate_retain` and no `aggregate_parent`,
+#      and `slotRetainParent` in the verifier answers nothing.
+#   4. So the walk counts them in `state.retained` instead of parking them in
+#      `state.slotParents`. `retained` is part of the visited-state key and
+#      `slotParents` is bounded by the number of containers, so inside nested
+#      loops the fixpoint never closes. `parked=0` in the message above is that
+#      fact printed.
 #
-# THE GATE. `initializeDictPayload` -- and therefore the source-move decision at
-# all -- is reached only when EVERY key of the literal is a `py.str_constant`.
-# `keywordNameFromValue` answers only for StrConstantOp; a single non-static key
-# clears `allStaticStringKeys`, and the whole literal is then built by the
-# `setitem_box` probe path (LyDict_New plus one insert per entry), which never
-# asks whether a source is a temporary.
+# This is the same shape as tests/probe/seqlit_slot_retain_in_loop_str.py,
+# repaired 2026-07-28 by charging the retain to the container's identity: one
+# side of a symmetric pair, again, and this time the side that was never
+# stamped rather than the side that never read the stamp.
 #
-# So `{i: v}` with a loop-variable key CANNOT reach the defect, and the key side
-# can only ever vary the constant. The 25-shape grid was cut on the value side
-# for that reason, not because the key side was skipped.
+# ⚠️ MAKING IT CONVERGE MAY EXPOSE A REAL FINDING, and that is not a reason to
+# leave it. The 2026-07-28 repair of the sequence-literal twin revealed a
+# genuine `used after release` in neighbouring shapes that had been invisible
+# the whole time the cap was firing. Budget the repair with room to chase what
+# it uncovers.
 #
-# ⛔ IF THIS FILE EVER STOPS BEING THE GATE -- if non-constant keys start reaching
-# the evidence payload path -- the dict source-move rule acquires a whole family
-# of shapes nobody has measured, and the key side of that grid has to be cut
-# before the change lands.
-#
-# Below: the runtime-key spelling (probe path, no move question -- REFUSED, see
-# above) and the constant-key spelling (payload path, move question asked --
-# repaired, runs), side by side in the loop nesting that makes the frequency
-# mismatch reachable. Run the second block alone to see it pass.
+# differential: skip refused; the point is the refusal
+
 probe = 0
 for i in range(3, 6):
     for j in range(2):
