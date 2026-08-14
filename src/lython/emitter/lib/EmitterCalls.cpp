@@ -1593,6 +1593,14 @@ ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
     Value argument = emitExpr(floatArgs->front().get());
     return emitFloatFromInt(expr, argument);
   }
+  if (argumentType == types.boolType()) {
+    // ⛔ Why NOT let this fall through to the class-instantiation paths, which
+    // is what it did: they claim builtins.float and report "does not provide
+    // manifest method '__init__'", naming a constructor CPython never calls.
+    // float(True) is int's __float__ reached through bool, so both rungs run.
+    Value argument = emitExpr(floatArgs->front().get());
+    return emitFloatFromInt(expr, emitIntFromBool(expr, argument));
+  }
   if (argumentType == types.strType()) {
     // The str parse, the twin of the str.__int__ dispatch above: also a
     // runtime-level __float__ that the typed manifest surface does not carry

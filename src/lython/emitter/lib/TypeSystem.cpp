@@ -3449,14 +3449,31 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
     // where a float parameter is declared.
     //
     //     def f(x: float) -> float: return x * 2
-    //     print(f(3))      # refused; CPython prints 6.0
+    //     print(f(3))      # refused; CPython prints 6
     //
-    // PEP 484 makes int acceptable for float, and CPython's tower converts at
-    // the boundary. `emitBinary` now promotes the same pair for operators, so
-    // the relation is already spelled once -- what is missing here is both
-    // halves at once: this check has to ACCEPT the argument and the call site
-    // has to CONVERT it, and accepting without converting hands the callee an
-    // int where its ABI expects a float's lanes.
+    // ⛔ Why NOT the repair this note used to prescribe -- "accept here and
+    // CONVERT at the call site". Measured against python3.14, converting is a
+    // WRONG ANSWER, not a fix:
+    //
+    //     def p(x: float) -> None: print(x)
+    //     p(3)          # CPython: 3      converted: 3.0
+    //     def q(n: int) -> None: print(n)
+    //     q(True)       # CPython: True   converted: 1
+    //
+    // CPython does not convert at the boundary: the annotation is inert there,
+    // and the argument keeps its own type. Every path in this compiler that
+    // ALREADY handles the case agrees with that and converts nothing -- an
+    // inlined method (`C().m(3)` prints 6, `C().m(3.0)` prints 6.0) and a
+    // local annotated binding (`x: float = 3; print(x)` prints 3).
+    //
+    // ⭐ So the repair is SPECIALIZATION, not conversion: emit a second body
+    // for the actual argument types, which is what the inlined-method path
+    // gets for free and what `ensureGenericSpecialization` already does for
+    // type parameters (memoized, capped at 32, recursion-safe). The rung
+    // conversions are still needed, but for `float(True)`-style calls where
+    // the tower conversion IS the operation, not for argument passing.
+    //
+    // tests/probe/wb_argument_boundary_numeric_tower.py holds the measurements.
     return unresolvedCallable(
         calleeType, "call arguments do not match the Callable contract");
   }
