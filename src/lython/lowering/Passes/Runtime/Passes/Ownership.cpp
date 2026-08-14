@@ -1454,20 +1454,32 @@ bool releaseOwnedGroupByLiveness(
             continue;
           if (consumingUseEndsThisToken(use, candidate))
             continue;
-          // ⛔ KNOWN DEFECT: a TERMINATOR forwarding the value counts as a
-          // later use here, and for a loop back-edge that is wrong -- the
-          // branch hands the value over, the destination argument gets its own
-          // token from the merge-borrow retain on that edge, and the retain
-          // this unfold then inserts has nothing to discharge it:
+          // ⛔ A TERMINATOR forwarding the value counts as a later use here,
+          // and for a loop back-edge that is wrong: the branch hands the value
+          // over, the destination argument gets its own token from the
+          // merge-borrow retain on that edge, and the retain this unfold then
+          // inserts has nothing of its own to discharge it.
           //
           //     lo: int = 0
           //     for x in [4, -2, 9]:
           //         if x < lo:
           //             lo = x
           //
-          // leaks 52 B, and the str form 81 B. The emitted block reads
-          // balanced because the inserted retain sits directly before an
-          // unrelated `py.decref` of the same name.
+          // NO LONGER LEAKS, since 2026-08-14, and not by anything below. The
+          // select merging the carried value with the loop element has two
+          // losers and only one release was placed; giving the loser its
+          // release (the select-to-diamond expansion, which was not firing
+          // because `frameProduces` peeled the owned-local marker off before
+          // asking) supplied the discharge this retain was missing.
+          // Re-measured at four sizes and both element types: net 0, values
+          // correct (tests/probe/wb_conditional_rebind_element_leak.py).
+          //
+          // The retain is still emitted -- it is visible as the unlabelled
+          // `Ly_IncRef` in that block -- so the reading below is still the
+          // reading, and the eight attempts are still the map of what does not
+          // work. What changed is that the imbalance it caused now has a payer.
+          // Whoever removes this retain must check the loser's release is not
+          // then one too many.
           //
           // Why NOT skip terminators outright, which is what the shape
           // suggests: measured, and both reproducers then fail to compile.
