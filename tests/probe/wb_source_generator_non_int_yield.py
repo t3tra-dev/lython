@@ -15,9 +15,19 @@
 # of one defect; they are one defect seen through seven payload types, and any
 # repair closes all of them at once.
 #
-# ⭐ THE GATE IS ONE LINE, and it is honest about being a gate:
-# `lowerSourceGeneratorNext` (Runtime/Ops/SourceGenerator.cpp) refuses unless
-# `runtimeContractName(elementType) == "builtins.int"`.
+# ⭐ THE GATE IS ONE LINE, and as of 2026-08-15 it states the real requirement:
+# `lowerSourceGeneratorNext` (Runtime/Ops/SourceGenerator.cpp) asks whether the
+# element's runtime value is a SINGLE LANE, which is what the code below needs,
+# rather than whether the contract is spelled "builtins.int". Measured: int
+# yields still run, and every probe here still refuses -- a Box's runtime value
+# is its class layout, not a lone handle, so none of them had the property the
+# old spelling was standing in for. Zero programs fixed by that change; it
+# renamed the requirement and moved one probe to its real next blocker.
+#
+# ⭐ AND rebind_gen_w3int IS NOT IN THIS CLUSTER after all. With the gate stating
+# lanes, it gets past and reports something else: "source generator yield from
+# lowering currently supports only straight-line delegation". A delegation
+# limitation, not a payload one, and it was invisible behind the int gate.
 #
 # ⭐ AND THE REASON IT IS INT-ONLY IS STRUCTURAL, not a missing case in a switch.
 # Everything below that gate is written around a single SSA value per yield:

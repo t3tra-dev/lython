@@ -165,9 +165,26 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
   target.walk(
       [&](py::YieldFromOp yieldFrom) { yieldFroms.push_back(yieldFrom); });
 
-  if (runtimeContractName(elementType) != "builtins.int")
+  // ⭐ ONE LANE, not one contract. Everything below is written around
+  // `SourceYieldPlan`, which carries a single SSA value per yield, so what the
+  // path actually requires is that the element's whole runtime value fit in one
+  // -- true of an int's i64 lane and equally of any handle-fronted contract.
+  // Spelling the requirement as "builtins.int" refused seven probes
+  // (tests/probe/wb_source_generator_non_int_yield.py) for a property they have.
+  //
+  // ⛔ Why NOT widen further here: a str is two lanes and a union is a tag plus
+  // every member's, and for those the plan really would have to carry a group.
+  // That is the mechanism this note is not adding.
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> elementLanes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, elementType,
+                                                 "source generator yield ABI");
+  if (mlir::failed(elementLanes))
+    return mlir::failure();
+  if (elementLanes->size() != 1)
     return op->emitError()
-           << "source generator next lowering currently supports int yields";
+           << "source generator next lowering currently supports yields whose "
+              "runtime value is a single lane, and "
+           << elementType << " has " << elementLanes->size();
   const RuntimeBundle *delegatedSource = nullptr;
   const RuntimeBundle *delegatedIndexedIterable = nullptr;
   const RuntimeBundle *delegatedManifestIterator = nullptr;
