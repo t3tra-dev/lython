@@ -551,6 +551,9 @@ private:
                         std::optional<Value> spec, bool specKnownEmpty);
   Value emitEmptyStrConstant(const parser::Node &anchor);
   Value emitStrLiteralPiece(const parser::Node &anchor, llvm::StringRef text);
+  bool canStringifyType(mlir::Type type);
+  Value emitUnionStringify(const parser::Node &anchor, Value value,
+                           py::UnionType unionType, unsigned index);
   // str.format with a compile-time template: fields are matched against the
   // call arguments during emission (R4: literal templates are checked here).
   std::optional<Value> tryEmitStrFormatCall(const parser::Node &expr,

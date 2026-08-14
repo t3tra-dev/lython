@@ -1371,6 +1371,59 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   // int/bool past the last header word. These keep the pre-4a lane splice, and
   // with it the pre-4a defect: a store here is only visible where these lanes
   // are. Union fields are the only shape that reaches it in practice.
+  //
+  // ⛔ WHICH IS A WRONG ANSWER WHEN THE RECEIVER CAME FROM A CALLER, so that
+  // is refused here. The splice writes the receiver's own SSA expansion; a
+  // caller holds its own and never sees it:
+  //
+  //     def rebind(b: Box) -> None:
+  //         b.f = 5                   # b.f: Optional[int]
+  //     rebind(o); print(o.f is None) # printed True; CPython prints False
+  //
+  // Silent, and reachable only since Optional stores began lowering at all --
+  // before that this arm refused every union store, so the hole opened with
+  // the feature. Refusing is the floor until the field is stored behind a
+  // handle the way every other field is; a splice cannot cross a frame.
+  //
+  // ⭐ Gated on the function actually being CALLED, which is what keeps `self`
+  // and `__init__` accepted. The emitter inlines a call to a known method, so
+  // the store the caller executes is the inlined one, on the caller's own
+  // value; the method body still exists as a symbol and is lowered here, but
+  // nothing reaches it and symbol DCE removes it later. Refusing on "receiver
+  // is a parameter" alone rejected every constructor in the suite.
+  //
+  // ⛔ Why the reference scan and not `SymbolTable::symbolKnownUseEmpty`,
+  // which is the obvious spelling: a Python-level call names its target
+  // through `py.binding.ref`, whose binding is a plain StringAttr and not a
+  // SymbolRef, so the symbol table sees no use and every callee looked dead.
+  // Measured -- the refusal never fired.
+  if (auto receiver = mlir::dyn_cast<mlir::BlockArgument>(op.getObject())) {
+    mlir::Block *owner = receiver.getOwner();
+    auto enclosing =
+        mlir::dyn_cast_if_present<mlir::func::FuncOp>(owner->getParentOp());
+    if (owner->isEntryBlock() && enclosing) {
+      llvm::StringRef name = enclosing.getSymName();
+      bool reached = false;
+      mlir::ModuleOp moduleOp = module;
+      moduleOp.walk([&](mlir::Operation *user) {
+        if (auto call = mlir::dyn_cast<mlir::func::CallOp>(user)) {
+          if (call.getCallee() == name)
+            reached = true;
+        } else if (auto ref = mlir::dyn_cast<py::BindingRefOp>(user)) {
+          if (ref.getBinding() == name)
+            reached = true;
+        }
+        return reached ? mlir::WalkResult::interrupt()
+                       : mlir::WalkResult::advance();
+      });
+      if (reached)
+        return op.emitError()
+               << "storing into field '" << op.getName()
+               << "' of a receiver that arrived as a parameter is not "
+                  "supported for this field's type: the store writes the "
+                  "receiver's own value lanes, so the caller would not see it";
+    }
+  }
   RuntimeBundle slotValue;
   {
     mlir::FailureOr<RuntimeBundle> storageValue =

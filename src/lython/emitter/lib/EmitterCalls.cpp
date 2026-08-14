@@ -1672,6 +1672,13 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     // compile-time constant anyway (the emitStringifyValue rule).
     if (argumentType == types.none())
       return emitStrLiteralPiece(expr, "None");
+    // A union renders by tag, which is `emitStringifyValue`'s union arm and
+    // not anything the ladder below can ask: `str(d.get("b"))` fell all the
+    // way through to the str CLASS and came out as "unresolved name 'repr'".
+    if (mlir::isa<py::UnionType>(argumentType))
+      if (std::optional<Value> rendered =
+              emitStringifyValue(expr, emitExpr(strArgs->front().get())))
+        return *rendered;
     if (lookupClassMethod(argumentType, "__str__")) {
       Value argument = emitExpr(strArgs->front().get());
       if (std::optional<Value> dispatched =
@@ -1790,8 +1797,21 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         emitCallOperands(expr, {piece}, /*includeAstArguments=*/false);
     return emitCallableDispatch(expr, printCallee, operands);
   }
-  bool plainArguments = printArgs && printArgs->size() >= 2 &&
-                        noPrintKeywords;
+  // ⭐ ONE argument normally goes to the manifest print, which renders more
+  // than this ladder can and is the reason the threshold is two. A UNION is
+  // the case it cannot take: it has no header to dispatch on, so
+  // `print(d.get("b"))` came out of the lowering as "unnarrowed
+  // !py.union<...> cannot be used where a concrete object is required".
+  // Rendering it here -- by tag, member by member -- is the only place that
+  // question can be answered, because only the emitter still knows the
+  // members.
+  bool singleUnionArgument =
+      printArgs && printArgs->size() == 1 && printArgs->front() &&
+      printArgs->front()->kind != "Starred" &&
+      mlir::isa<py::UnionType>(
+          types.widenLiteral(types.inferExpr(printArgs->front().get())));
+  bool plainArguments = printArgs && noPrintKeywords &&
+                        (printArgs->size() >= 2 || singleUnionArgument);
   if (plainArguments)
     for (const parser::NodePtr &argument : *printArgs)
       if (!argument || argument->kind == "Starred")
@@ -2831,12 +2851,98 @@ ModuleEmitter::emitInheritedObjectStr(const parser::Node &anchor,
   return Value{op.getResult(), strType};
 }
 
+// Can `emitStringifyValue` below render this type? Asked WITHOUT emitting,
+// which is why it is a separate body rather than a trial run: the union arm
+// has to know every member is renderable before it commits to the branch
+// chain, and a half-emitted chain is not something the caller can undo.
+//
+// It mirrors the ladder in `emitStringifyValue` condition for condition. The
+// two drifting apart costs a refusal reported at the fall-through rather than
+// at the member, not a wrong answer.
+bool ModuleEmitter::canStringifyType(mlir::Type type) {
+  mlir::Type widened = types.widenLiteral(type);
+  if (widened == types.contract("builtins.str") || widened == types.none())
+    return true;
+  if (lookupClassMethod(widened, "__str__") ||
+      lookupClassMethod(widened, "__repr__"))
+    return true;
+  if (isExceptionContractType(widened) &&
+      types.inferMethodCallWithEvidence(widened, "__str__", {}))
+    return true;
+  return static_cast<bool>(
+      types.inferMethodCallWithEvidence(widened, "__repr__", {}));
+}
+
+// ⭐ A UNION renders by TESTING ITS TAG, member by member, and rendering the
+// one that is live. There is no other way to do it: the inactive members hold
+// zeroed placeholders, so a `select` over eagerly-rendered arms would call
+// `__repr__` on a header nobody wrote.
+//
+// The chain is right-nested -- test member 0, else test member 1, ... with the
+// last member as the final else -- and each arm goes back through
+// `emitStringifyValue`, so a member that is itself a class, an exception or a
+// container renders the way it does anywhere else.
+Value ModuleEmitter::emitUnionStringify(const parser::Node &anchor, Value value,
+                                        py::UnionType unionType,
+                                        unsigned index) {
+  mlir::Type strType = types.contract("builtins.str");
+  llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+  auto renderMember = [&](mlir::Type member) -> mlir::Value {
+    // None has no physical header to unwrap OR to dispatch on; its text is a
+    // constant, the same answer the scalar ladder gives it.
+    if (py::isPyNoneType(member))
+      return emitStrLiteralPiece(anchor, "None").value;
+    auto unwrap =
+        py::UnionUnwrapOp::create(builder, loc(anchor), member, value.value);
+    std::optional<Value> text =
+        emitStringifyValue(anchor, Value{unwrap.getResult(), member});
+    // Unreachable while `canStringifyType` gates every member, and cheaper to
+    // answer than to prove: an empty string is a wrong ANSWER, so it may not
+    // stand in. The caller checked; if the two ever disagree this is a crash
+    // in a debug build rather than a silent blank.
+    assert(text && "union member passed canStringifyType but did not render");
+    // ⛔ A str member renders to ITSELF (the first arm of
+    // `emitStringifyValue` is the identity), so what comes back is the union's
+    // own payload rather than a freshly built string the way every other
+    // member's is. Retaining it here to even that out was tried and measured:
+    // 42 B before and 42 B after, so the imbalance is not on this side. The
+    // leak is in the callee (tests/probe/wb_union_str_member_render_leak.py).
+    return coerceValue(*text, strType, anchor).value;
+  };
+  if (index + 1 >= members.size())
+    return Value{renderMember(members[index]), strType};
+  auto test =
+      py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                              value.value, mlir::TypeAttr::get(members[index]));
+  mlir::Value rendered = emitValueDiamond(
+      loc(anchor), test.getResult(), strType,
+      [&] { return renderMember(members[index]); },
+      [&] {
+        return emitUnionStringify(anchor, value, unionType, index + 1).value;
+      });
+  return Value{rendered, strType};
+}
+
 std::optional<Value> ModuleEmitter::emitStringifyValue(const parser::Node &anchor,
                                                        Value value) {
   mlir::Type strType = types.contract("builtins.str");
   mlir::Type valueType = types.widenLiteral(value.type);
   if (valueType == strType)
     return coerceValue(value, strType, anchor);
+  // A union renders through its tag. Placed before the dunder ladder because
+  // none of those questions has an answer for a union: it has no class, no
+  // manifest contract and no header of its own to dispatch on, which is what
+  // "unnarrowed ... cannot be used where a concrete object is required" was
+  // reporting from the lowering when `print(d.get("b"))` fell through here.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(valueType)) {
+    llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+    if (members.empty())
+      return std::nullopt;
+    for (mlir::Type member : members)
+      if (!canStringifyType(member))
+        return std::nullopt;
+    return emitUnionStringify(anchor, value, unionType, /*index=*/0);
+  }
   // None has no physical header for a __repr__ dispatch to receive; its
   // text is a compile-time constant anyway.
   if (valueType == types.none())

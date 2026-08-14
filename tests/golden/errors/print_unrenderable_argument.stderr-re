@@ -1,1 +1,1 @@
-print\(\) cannot render argument 2 of type .*union.*: it has no __str__ or __repr__
+print\(\) cannot render argument 2 of type .*callable.*: it has no __str__ or __repr__
