@@ -9,27 +9,35 @@
 # verifier is green on a program requires that the program did not hit it. The
 # exposure is now a number instead of an unknown.
 #
-# ⭐ ROOT CAUSE, and it is ONE MISSING STAMP. The chain, measured end to end:
+# ⭐ IT IS THE INT PAYLOAD, NOT THE DICT. Bisected by payload type, counting the
+# attributes in the emitted `@f`:
 #
-#   1. `LyDict_FromLength` carries no `ly.ownership.aggregate_id`. Counted in
-#      the emitted `__main__`: the dict program has 0 of them, the equivalent
-#      list program has 2.
-#   2. So `aggregateIdentityOf(container lane)` answers nothing, and
-#      `chargeSlotRetainsToParent` (Core/CollectionPayload.cpp) returns without
-#      stamping -- it IS called on the dict path, right after the
-#      `dict.literal.key` and `dict.literal.value` retains.
-#   3. So those retains carry `aggregate_retain` and no `aggregate_parent`,
-#      and `slotRetainParent` in the verifier answers nothing.
-#   4. So the walk counts them in `state.retained` instead of parking them in
-#      `state.slotParents`. `retained` is part of the visited-state key and
-#      `slotParents` is bounded by the number of containers, so inside nested
-#      loops the fixpoint never closes. `parked=0` in the message above is that
-#      fact printed.
+#   s = "k"; d = {s: 1} .... aggregate_id=2  aggregate_parent=2  retains=2
+#   i = 5;   d = {i: 1} .... aggregate_id=0  aggregate_parent=0  retains=2
 #
-# This is the same shape as tests/probe/seqlit_slot_retain_in_loop_str.py,
-# repaired 2026-07-28 by charging the retain to the container's identity: one
-# side of a symmetric pair, again, and this time the side that was never
-# stamped rather than the side that never read the stamp.
+# So `chargeSlotRetainsToParent` (Core/CollectionPayload.cpp) stamps the dict
+# correctly whenever the payload is an ordinary object, and stamps NOTHING when
+# it is an int. `aggregate_id=0` says the identity was never even minted, so the
+# helper took one of its two early returns before reaching `aggregateIdentityOf`
+# -- the container lanes being empty, or the builder's insertion block no longer
+# being the block captured before the retains. An int arrives as a LAZY box and
+# materialising one emits the fast/slow `scf.if`, which is the one thing in this
+# path that can move the insertion block, so that is where to look first.
+#
+# ⛔ An earlier version of this note said `LyDict_FromLength` carries no
+# `ly.ownership.aggregate_id` and that the list twin does. Both halves were
+# wrong: the count was taken from the int program only, and the dict gets its id
+# on the str spelling. Recorded because the wrong reading is the plausible one
+# -- the failing program is a dict, and the working comparison was a list, so
+# the container looked like the variable when the payload was.
+#
+# The consequence downstream is unchanged and still measured: unparented retains
+# land in `state.retained` instead of `state.slotParents`, `retained` is part of
+# the visited-state key while `slotParents` is bounded by the container count,
+# and inside nested loops the fixpoint never closes. `parked=0` in the message
+# above is that fact printed. Same shape as
+# tests/probe/seqlit_slot_retain_in_loop_str.py, repaired 2026-07-28 by charging
+# the retain to the container's identity.
 #
 # ⚠️ MAKING IT CONVERGE MAY EXPOSE A REAL FINDING, and that is not a reason to
 # leave it. The 2026-07-28 repair of the sequence-literal twin revealed a
