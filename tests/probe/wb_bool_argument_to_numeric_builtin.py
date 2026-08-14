@@ -42,5 +42,28 @@
 # layer down in ABI adaptation rather than in method resolution. The table is a
 # list of builtins, not the boundary the rule belongs at.
 #
+# ⭐ THE BOUNDARY IS THE MANIFEST ABI ADAPTER, which divmod's message names
+# exactly. `appendRuntimeSource` (Runtime/Calls/Operands.cpp:120) has arms that
+# UNBOX an object into i64 / i1 / f64 and no arm that WIDENS a truth bit into an
+# int's lanes; `makePrimitiveI64Bundle` (Core/ObjectBundles.cpp:89) already
+# builds the lazy int a widened i1 would produce, so the arm is short.
+#
+# It is also the right boundary for the reason the parameter boundary is not:
+# the value is consumed by a native implementation that reads it numerically and
+# nothing can observe that it stopped being a bool, whereas a user function's
+# parameter may be printed. That distinction is what makes converting safe here
+# and a wrong answer there.
+#
+# ⭐ AND IT MUST BE ADDED TWICE. `canAppendRuntimeSource` (same file, :371) is
+# the PREDICATE half, consulted during overload selection; an arm added only to
+# the appending half never runs, because the overload is rejected before it is
+# reached. The two are mirrored by hand, which is why the i1 arm went missing
+# from one of them in the first place.
+#
+# ⛔ Not attempted this pass: the widened int is a NEW object at an argument
+# position, and who releases it is the question that produced most of the leaks
+# fixed on 2026-08-14. Landing the arm without settling that is how a refusal
+# becomes a leak.
+#
 # differential: skip refused; the point is the refusal
 print(abs(True), round(True))
