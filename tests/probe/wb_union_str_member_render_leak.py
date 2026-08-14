@@ -30,16 +30,44 @@
 #   ^bb5:
 #     LyUnicode_DecRef(%8)            ; the rendered string
 #
-# So the None arm discharges the union and the str arm does not -- the walk
-# reads the forward into the merge as a transfer, which it is, and the merge's
-# release at ^bb5 is then the one release for one reference. That reads
-# balanced, and it measures 42 B, so one of those two readings is wrong and
-# the IR above is where to look.
+# ⭐ ROOT CAUSE, and the ^bb1 line above is missing from that sketch: the merge
+# takes a BORROW RETAIN there --
+#
+#   ^bb1:
+#     Ly_IncRef(%cast_2) {aggregate_retain = "block-arg-merge-borrow"}
+#     cf.br ^bb4(%4#1, %4#2)
+#
+# -- so the str path reads: "hi" born with 1, +1 for the merge borrow, -1 at
+# ^bb5. It ends at 1. The union's own obligation, the one
+# `ly.ownership.owned_results` names, is never discharged on that path.
+#
+# And the merge is right to retain, GIVEN WHAT IT KNOWS. A union return carries
+# the payload TWICE -- once as the member lane (%4#1) and once as the
+# owned-result evidence lane (%4#3) -- and the callee returns the same value
+# for both (`return %c0_i64, %1#0, %1#1, %1#0, %1#1`). Only %4#3 is in
+# `ownedValues`, because only %4#3 is what the ABI declares owned. So
+# `isOwnedIncoming(%4#1)` says borrowed, the edge lends, and nothing gives the
+# lend back.
 #
 # ⛔ Retaining the payload in the renderer, on the reasoning that the caller
 # releases what it is handed: implemented and measured, 42 B before and 42 B
-# after. Reverted. Whatever is unbalanced is not on the renderer's side of the
-# handoff.
+# after, and the dumps are IDENTICAL apart from the retain's label
+# (`builtins.str:py.incref` where the merge would have written
+# `block-arg-merge-borrow`). The pass credited the emitter's retain instead of
+# adding its own -- which is `emitterLaneIncrefInBlock` doing exactly its job.
+# Reverted; the renderer is not the side that is unbalanced.
+#
+# ⭐ SO THE REPAIR IS TO TELL THE CALLER THE TWO LANES ARE ONE OBJECT. The
+# callee knows -- it returns one value into both -- and nothing in the ABI
+# says so, so the caller's ownership walk cannot know. An
+# `owned_result_aliases`-style note beside `ly.ownership.owned_results`, read
+# where the call-result groups are seeded, would put %4#1 in `ownedValues` and
+# turn the lend into the transfer it already is.
+#
+# ⛔ NOT by un-aliasing the two lanes in the callee: for an int member they
+# were two objects until 2026-08-14 and that was the union return's double
+# materialization, 52 B per call. One object is right; the caller just has to
+# be told.
 #
 # tests/golden/cases/union_renders_by_tag.py pins the VALUES, which are
 # correct, and is deliberately NOT in LYTHON_LEAK_GATE_CASES because of this.
