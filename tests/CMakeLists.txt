@@ -592,7 +592,7 @@ set(LYTHON_LEAK_GATE_CASES
     # either box is released is exactly what the goldens cannot see, since the
     # printed values are right the moment the box exists at all.
     float_of_bool divmod_of_bool bool_inherits_int_methods
-    round_without_ndigits
+    round_without_ndigits bool_in_object_position
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

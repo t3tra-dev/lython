@@ -868,6 +868,34 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
       return mlir::failure();
     concrete.objectValue = *materialized;
   }
+  // ⭐ bool is the one builtin with no header of its own: its whole runtime
+  // value is a truth bit, and a payload word needs something to point at. The
+  // manifest's `box` primitive selects between two immortal singletons, which
+  // is what CPython hands over for True and False as well, so this is the same
+  // on-demand materialization the lazy int gets just above.
+  //
+  // ⛔ Why NOT retain the result, which every other payload here needs: the
+  // singletons are immortal and `LyBool_DecRef` is a no-op deallocator. Nothing
+  // to own means nothing for `retainPayload` to balance, and the box words hold
+  // a global's address rather than an allocation.
+  if (concrete.physicalValues().size() == 1 &&
+      concrete.physicalValues().front().getType().isInteger(1)) {
+    std::optional<RuntimeSymbol> boxPrimitive =
+        manifest.primitive(concrete.contractName(), "box");
+    if (!boxPrimitive)
+      return op->emitError()
+             << concrete.contractName()
+             << " has no runtime value group an object position can hold, and "
+                "no box primitive to give it one";
+    mlir::func::CallOp boxCall = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), *boxPrimitive, concrete.physicalValues());
+    if (boxCall.getNumResults() != 1)
+      return op->emitError() << concrete.contractName()
+                             << " box primitive must return one handle";
+    concrete.objectValue = RuntimeValue::objectWithOwnership(
+        concrete.contract, mlir::ValueRange{boxCall.getResult(0)},
+        ownership::OwnershipKind::Borrow);
+  }
 
   mlir::Location loc = op->getLoc();
   mlir::MemRefType boxType = box_abi::boxWordsType(builder);
