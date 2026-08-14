@@ -56,6 +56,8 @@ std::optional<std::int64_t> aggregateIdentityOf(mlir::Operation *parent) {
   return next;
 }
 
+} // namespace
+
 // Charge to `container` every slot-absorption retain emitted since `anchor`, so
 // an ownership walk can name the `parent` of `aggregate(parent, path)`. The
 // retains are found by their existing marker rather than returned by the emitter
@@ -110,6 +112,8 @@ mlir::Operation *insertionAnchor(mlir::OpBuilder &builder) {
     return nullptr;
   return &*std::prev(point);
 }
+
+namespace {
 
 mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
                           unsigned value) {

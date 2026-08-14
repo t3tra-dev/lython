@@ -1577,6 +1577,23 @@ inline mlir::Value stripReturnedObjectView(mlir::Value value) {
   return value;
 }
 
+// Charge to `container` every slot-absorption retain emitted since `anchor`,
+// so an ownership walk can name the `parent` of `aggregate(parent, path)`.
+// Defined in Core/CollectionPayload.cpp beside the rule it serves.
+//
+// ⭐ Shared rather than file-local because the dict literal has TWO lowerings
+// and only one of them lived there: an all-static-string-key literal fills its
+// slots directly, and one non-static key sends the whole thing down the
+// `setitem_box` probe path in Ops/PackAndBindingOps.cpp. Retains from the
+// second went unparented, which the affine walk then counted in
+// `state.retained` -- part of its visited-state key -- so `{i: 1}` in nested
+// loops never closed the fixpoint.
+void chargeSlotRetainsToParent(mlir::OpBuilder &builder, mlir::Block *block,
+                               mlir::Operation *anchor,
+                               const RuntimeBundle &container);
+// The op the builder would insert after, or null at a block's beginning.
+mlir::Operation *insertionAnchor(mlir::OpBuilder &builder);
+
 // The Callable contract a lowered function carries; null for declarations
 // and non-callable functions. Dozens of walks used to re-spell this
 // attribute lookup inline.

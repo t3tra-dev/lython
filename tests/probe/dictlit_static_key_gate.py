@@ -1,4 +1,5 @@
-# OPEN, and the LAST program in either corpus that hits the affine state cap:
+# FIXED 2026-08-15. It was the LAST program in either corpus that hit the
+# affine state cap, and the scan is now zero:
 #
 #     ownership CFG exploration exceeded 20000 states
 #     (last: retained=952 parked=0 borrowed=0 prev=0 stale=0 group=1 token=0)
@@ -28,11 +29,22 @@
 # That also explains the file's NAME, which predates the diagnosis: the static
 # key gate is what routes `{s: 1}` and `{i: 1}` to different lowerings.
 #
-# ⛔ Not the insertion block, which was the next guess and was measured: the
+# ⛔ Not the insertion block, which was the second guess and was measured: the
 # early return for a moved insertion block was replaced with a program-order
 # walk from the anchor, rebuilt, and `{i: 1}` still stamped nothing -- because
 # the helper is not on that path at all. Reverted rather than kept: a codegen
 # change that does not do what it was written for is not worth its risk.
+#
+# ⭐ THE REPAIR was to give `chargeSlotRetainsToParent` a home both lowerings can
+# reach and call it from the probe path too. Three localizations, two of them
+# measured wrong first, and the third was already written in a code comment.
+#
+# ⚠️ AND THE WARNING DID NOT COME DUE, which is worth recording as precisely as
+# the warning was. The July twin's repair exposed a real use-after-release once
+# the walk could reach the checks past the cap. This one exposed nothing: 700
+# tests green in both builds, the golden sweep 386 programs with 385 clean and 0
+# leaking, and this program itself net zero. The cap had been hiding a correct
+# program, not a finding.
 #
 # ⛔ An earlier version of this note said `LyDict_FromLength` carries no
 # `ly.ownership.aggregate_id` and that the list twin does. Both halves were
@@ -55,7 +67,7 @@
 # the whole time the cap was firing. Budget the repair with room to chase what
 # it uncovers.
 #
-# differential: skip refused; the point is the refusal
+# differential: run agrees with CPython now
 
 probe = 0
 for i in range(3, 6):

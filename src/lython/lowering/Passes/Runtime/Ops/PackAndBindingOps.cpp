@@ -230,12 +230,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
                 op, *valueBundle);
         if (mlir::failed(payloadValue))
           return mlir::failure();
+        mlir::Block *retainBlock = builder.getInsertionBlock();
+        mlir::Operation *retainAnchor = insertionAnchor(builder);
         if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
                 op, *payloadKey, "dict.literal.key")))
           return mlir::failure();
         if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
                 op, *payloadValue, "dict.literal")))
           return mlir::failure();
+        // The static-key lowering charges its slot retains to the container
+        // (Core/CollectionPayload.cpp); this one never did, so `{i: 1}` handed
+        // the affine walk retains with no parent to park them under.
+        chargeSlotRetainsToParent(builder, retainBlock, retainAnchor, bundle);
         auto transientBox =
             [&](const RuntimeBundle &entry) -> mlir::FailureOr<mlir::Value> {
           return RuntimeBundleLowerer::transientPayloadBox(op, entry,

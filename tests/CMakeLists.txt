@@ -614,6 +614,11 @@ set(LYTHON_LEAK_GATE_CASES
     # payload into the slot's box, so whether the reference it hands over is
     # accounted for is a question the printed 7 cannot answer.
     callable_valued_field
+    # The dict literal whose non-static key sent it down the probe path: its slot
+    # retains had no parent, so nothing could park them and the affine walk never
+    # closed. The values were always right; only the allocator and the verifier
+    # could see the difference.
+    dict_literal_runtime_key_in_loops
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
