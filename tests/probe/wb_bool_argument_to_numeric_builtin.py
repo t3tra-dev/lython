@@ -1,43 +1,39 @@
-# OPEN, narrowed three times on 2026-08-15. This file started as "five
-# refusals, one cause"; both halves were wrong, and one refusal is left.
+# FIXED 2026-08-15, all five. Kept for the readings, because this file was
+# wrong three times in a row and each wrong reading predicted a repair that
+# measurement rejected.
 #
-#   abs(True) ......... FIXED (tests/golden/cases/bool_inherits_int_methods.py)
-#   divmod(True, 2) ... FIXED (tests/golden/cases/divmod_of_bool.py)
-#   float(True) ....... FIXED (tests/golden/cases/float_of_bool.py)
-#   max(True, 2) ...... already worked; the operator repair of 2026-08-14
-#                       carried it, because max compares
-#   round(True) ....... refused, and NOT for a bool reason: int's __round__
-#                       contract makes ndigits required, so round(True, 0) works
-#                       and `n: int = 5; n.__round__()` is refused as well. See
-#                       tests/probe/wb_manifest_class_inherits_nothing.py.
+#   float(True) ....... FIXED  tests/golden/cases/float_of_bool.py
+#   divmod(True, 2) ... FIXED  tests/golden/cases/divmod_of_bool.py
+#   abs(True) ......... FIXED  tests/golden/cases/bool_inherits_int_methods.py
+#   round(True) ....... FIXED  tests/golden/cases/round_without_ndigits.py
+#   max(True, 2) ...... never broken by the time it was written; the operator
+#                       repair of 2026-08-14 had carried it, because max compares
 #
-# ⭐ IT IS NOT THE ARGUMENT BOUNDARY, which is what this file used to say. See
-# tests/probe/wb_argument_boundary_numeric_tower.py: at a PARAMETER boundary
-# CPython keeps the argument's own type and converting is a wrong answer. At the
-# MANIFEST ABI it is the opposite -- CPython's bool inherits int's `__abs__` and
-# `__round__` unchanged and they return an int, so `abs(True)` is 1, and the
-# native implementation reads the value numerically where nothing can observe
-# that it stopped being a bool. Converting there is the operation, not a
-# divergence.
+# ⛔ READING 1, "the numeric tower is missing at the argument boundary, and the
+# repair is to accept the argument and convert it at the call site". Wrong about
+# the repair, and the note it inherited that from was wrong for two sessions.
+# Converting at a PARAMETER boundary is a wrong answer: CPython prints True for
+# `def q(n: int): print(n); q(True)` and a converted argument prints 1. See
+# tests/probe/wb_argument_boundary_numeric_tower.py.
 #
-# ⭐ AND THE CONVERSION IS NOW THERE. `appendRuntimeSource`
-# (Runtime/Calls/Operands.cpp) widens a truth bit into an int's lanes by routing
-# it through a lazy primitive-i64 bundle, so the box and its ownership come from
-# the arms the int case already runs, and `canAppendRuntimeSource` carries the
-# matching arm because it runs first during overload selection. That is what
-# fixed divmod, and it is why nothing further is needed on the receiver side.
+# ⛔ READING 2, "so the boundary is the manifest ABI adapter instead". Half
+# right, and confidently wrong about scope. The adapter really was missing an
+# arm -- it could unbox an object into i64, i1 and f64 and not widen a truth bit
+# into an int's lanes -- and adding it fixed divmod and NOTHING else, because
+# abs never got that far.
 #
-# ⭐ AND SO IS THE RESOLUTION. abs(True) needed a second half the adapter could
-# not supply: the manifest index had to find int's `__abs__` under a bool
-# receiver. `selectManifestMethod` now walks the base chain. divmod landed first
-# only because divmod resolved and abs did not -- the two halves were
-# independent all along, which is why the earlier "one cause" reading kept
-# producing predictions that measured wrong.
+# ⛔ READING 3, "what is left is that bool inherits no method of int's,
+# bit_length included". Right about the inheritance (the manifest index carried
+# no base information; the protocol table did) and wrong about the evidence.
+# `bit_length` is not declared on int at all, so a plain int is refused too, and
+# round(True) was a third cause again: int's __round__ contract made ndigits
+# required, and `n: int = 5; n.__round__()` was refused as well.
 #
-# ⛔ Why NOT widen the promotion into the builtin table (`kDunderBuiltins` in
-# EmitterCalls.cpp), which is where this file first pointed: it would have
-# papered over two names at the one boundary that turned out to hold neither
-# half of the cause. The table is a list of builtins, not a boundary.
+# ⭐ WHAT ACTUALLY HELD: five refusals, four causes, at four different depths --
+# a missing emitter arm, a missing ABI arm, a missing base walk, and a missing
+# contract arity. Every reading that compressed them into one cause produced a
+# repair that measured wrong. The shared symptom was "bool reaches a numeric
+# builtin", which is a description of the SYMPTOM and was never a cause.
 #
-# differential: skip refused; the point is the refusal
-print(round(True))
+# differential: run all five agree with CPython now
+print(float(True), divmod(True, 2), abs(True), round(True), max(True, 2))

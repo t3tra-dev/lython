@@ -29,21 +29,21 @@
 #   That is a missing method on int, and it has nothing to do with bool.
 #
 #   `round(True)` is NOT the inheritance gap either. int's `__round__` contract
-#   declares ndigits as a REQUIRED second parameter, so the no-argument form is
-#   refused for a plain int as well:
+#   declared ndigits as a REQUIRED second parameter, so the no-argument form was
+#   refused for a plain int as well -- `n.__round__(0)` and `round(n)` both
+#   worked, the latter through the `round` builtin's own one-argument contract.
+#   A manifest method contract cannot spell an optional parameter; float already
+#   declares __round__ twice, once per arity, and int now does the same. Fixed
+#   separately, pinned by tests/golden/cases/round_without_ndigits.py.
 #
-#     n: int = 5
-#     n.__round__()  ... refused    n.__round__(0) ... 5
-#     round(n) ....... 5            round(True) .... refused
+# ⭐ WHAT THE TWO MISREADINGS HAVE IN COMMON: both took a symptom shared by
+# several programs -- "bool cannot reach int's numeric methods" -- for a cause.
+# Four causes at four depths produced it. What localised each one in a single
+# measurement was running the SAME spelling on the BASE type: `n: int = 5;
+# n.__round__()` and `n.bit_length()` both fail, which puts the defect above the
+# derived class rather than in the inheritance between them.
 #
-#   round(n) works because the `round` builtin carries its own one-argument
-#   contract; the dunder does not. CPython's int.__round__ takes ndigits
-#   optionally, and the default exists here only as `ly.runtime.default_i64` on
-#   LyLong_Round (builtins.mlir:8122) -- a runtime fact the protocol contract
-#   does not carry. THAT is the remaining defect, and it is about optional
-#   parameters in manifest contracts, not about bases.
-#
-# differential: skip refused; the point is the refusal
+# differential: run agrees with CPython now
 
 n: int = 5
-print(n.__round__())
+print(n.__round__(), round(n), round(True), n.__index__())
