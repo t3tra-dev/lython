@@ -154,7 +154,7 @@ module attributes {
                     "__gt__", "__ge__", "__repr__", "__str__", "__eq__", "__ne__",
                     "__pow__", "__abs__", "__format__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
-                    "__round__"],
+                    "__round__", "bit_length"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.union<!py.contract<"typing.SupportsInt">, !py.contract<"typing.SupportsIndex">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
@@ -194,6 +194,7 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
@@ -206,7 +207,7 @@ module attributes {
                     "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
 
   py.class @bool attributes {
@@ -6922,6 +6923,16 @@ module attributes {
     %message = memref.cast %message_static : memref<21xi8> to memref<?xi8>
     func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
+  }
+
+  // CPython's int.bit_length(): the width of the ABSOLUTE value, 0 for zero.
+  // The magnitude view has already dropped the sign, so the shared helper below
+  // -- the one pow, division and _random's bounded draw count with -- answers it
+  // unchanged, and this wrapper exists only to put it on the manifest surface.
+  func.func @LyLong_BitLength(%header: memref<2xi64> {ly.ownership.object_header}, %meta_raw: memref<2xi64>, %digits_raw: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "bit_length"} {
+    %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
+    %bits = func.call @__ly_long_bit_length(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    func.return %bits : i64
   }
 
   func.func private @__ly_long_bit_length(%meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 {

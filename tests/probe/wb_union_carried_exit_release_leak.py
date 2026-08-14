@@ -58,6 +58,22 @@
 # block argument %11 (for `other`) and %18 (for `v`) at ^bb4 -- so the guard's
 # operand is not the hard part either.
 #
+# ⭐ AND THE CREDIT PATH ALREADY EXISTS, read 2026-08-15: once a candidate for
+# the destination block arguments exists, `emitterLaneIncrefInBlock`
+# (Passes/Ownership.cpp, inside the candidate loop) finds an emitter incref in
+# the predecessor and books the edge as a TRANSFER rather than a borrow -- which
+# is exactly what the entry edge's `py.incref` should be. So the seeding is not
+# merely the first step, it is very nearly the only one on the acquisition side;
+# what remains after it is letting a group with `g.condition` reach release
+# placement, and that skip appears in three separate walks.
+#
+# ⛔ Why the seed cannot be `Ly_IncRef` + `aggregate_retain` alone: that label
+# is what EVERY emitter incref carries (the dump above shows
+# `builtins.int:py.incref` on this very acquisition), and one incref pays for
+# one header lane while the group is the union's whole lane span. Recognising
+# the acquisition needs a mark the emitter puts there ON PURPOSE, carried
+# through the union incref's lowering onto the guarded call.
+#
 # ⛔ Why NOT move the acquisition instead, which looks like it would avoid all
 # of this. Three placements were reasoned through against the four bisect
 # lines above and each breaks one of them:
