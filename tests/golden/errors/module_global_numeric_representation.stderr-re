@@ -1,0 +1,1 @@
+module global 'x' holds float and this assignment gives it int; a module global has one runtime representation

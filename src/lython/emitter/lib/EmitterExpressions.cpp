@@ -2530,6 +2530,11 @@ Value ModuleEmitter::emitPack(mlir::ArrayRef<Value> valuesIn,
   return {op.getResult(), resultType};
 }
 
+bool ModuleEmitter::isNumericPrimitiveContract(mlir::Type type) const {
+  return type && (type == types.boolType() || type == types.intType() ||
+                  type == types.floatType());
+}
+
 Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                  const parser::Node &anchor) {
   if (!targetType || value.type == targetType)
@@ -2557,6 +2562,29 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                          value.value);
     return {op.getResult(), targetType};
   }
+  // ⛔ Why NOT upcast between the numeric contracts, which is what the branch
+  // below did: ClassUpcastOp is a RETYPING, right for Derived -> Base where the
+  // object handle is unchanged, and int, float and bool share no
+  // representation. `x: float = 3` emitted
+  //
+  //     %0 = py.int.constant "3" : !py.literal<3>
+  //     %1 = py.class.upcast %0 : !py.literal<3> -> !py.contract<"builtins.float">
+  //
+  // with the int's three lanes still underneath, and the lie surfaced one use
+  // later -- at module scope as "module global 'x' assignment value group has 3
+  // values, expected 1", and in a function as "cannot adapt builtins.float to
+  // runtime input 3 of builtins.int.__add__" the moment x was added to.
+  //
+  // ⛔ And why NOT convert instead: CPython does not convert at an annotation
+  // either, so `x: float = 3; print(x)` prints 3 there. Converting would print
+  // 3.0 -- see tests/probe/wb_argument_boundary_numeric_tower.py, where the
+  // same measurement rejects it at a parameter boundary. The annotation is a
+  // constraint that an int already satisfies, and the mixed int/float
+  // arithmetic path carries the value from here.
+  if (mlir::Type widened = types.widenLiteral(value.type);
+      widened != targetType && isNumericPrimitiveContract(widened) &&
+      isNumericPrimitiveContract(targetType))
+    return value;
   if (mlir::isa<py::ContractType, py::LiteralType, py::CallableType,
                 py::TypeType, py::SelfType, py::TypeVarType, py::ParamSpecType>(
           targetType)) {

@@ -92,5 +92,6 @@ errors/global_declaration_without_storage emit
 errors/self_referential_union_field lower
 errors/exit_reads_the_exception_class emit
 errors/reducer_key_argument emit
+errors/module_global_numeric_representation emit
 errors/print_unrenderable_argument emit
 errors/module_missing_attribute emit

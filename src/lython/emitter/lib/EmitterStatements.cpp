@@ -692,6 +692,39 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     }
     if (isModuleGlobalWrite(name)) {
       mlir::Type type = moduleGlobals.lookup(name);
+      // ⭐ A module global's cell has ONE runtime representation, fixed by the
+      // declaration, and `coerceValue` no longer retypes between the numeric
+      // contracts because that retyping was a lie. So the mismatch has to be
+      // reported here, at the write.
+      //
+      // ⛔ Why NOT convert the value to the cell's type: `x: float = 3` would
+      // then print 3.0 where CPython prints 3 -- the annotation does not
+      // convert there either (tests/probe/wb_argument_boundary_numeric_tower.py
+      // measures the same rejection at a parameter boundary).
+      //
+      // ⛔ And why NOT let the store through, which is what the retyping used
+      // to do: the read still comes back at the cell's declared type, so the
+      // int's lanes were reinterpreted as a double and `x: float = 3`
+      // printed 5e-324. It reported "assignment value group has 3 values,
+      // expected 1" before that, which named the count and not the cause.
+      if (mlir::Type widened = types.widenLiteral(value.type);
+          widened != type && isNumericPrimitiveContract(widened) &&
+          isNumericPrimitiveContract(type)) {
+        auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
+          if (numeric == types.boolType())
+            return "bool";
+          return numeric == types.intType() ? "int" : "float";
+        };
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "module global '" + name.str() + "' holds " +
+                spell(type).str() + " and this assignment gives it " +
+                spell(widened).str() +
+                "; a module global has one runtime representation and these "
+                "two do not share one, so write the value in the declared "
+                "type"});
+        return;
+      }
       Value coerced = coerceValue(value, type, target);
       auto op = py::GlobalSetOp::create(builder, loc(target),
                                         builder.getStringAttr(name),

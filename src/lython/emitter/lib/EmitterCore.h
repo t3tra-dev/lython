@@ -765,6 +765,9 @@ private:
                  llvm::ArrayRef<char> unpacked = {});
   Value coerceValue(Value value, mlir::Type targetType,
                     const parser::Node &anchor);
+  // bool, int and float: the three contracts that carry a VALUE rather than an
+  // object handle, and so the three between which a retyping is a lie.
+  bool isNumericPrimitiveContract(mlir::Type type) const;
   mlir::Value emitBoolValue(Value value, const parser::Node &anchor);
 
   template <typename Op>
