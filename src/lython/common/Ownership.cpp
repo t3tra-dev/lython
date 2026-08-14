@@ -1253,6 +1253,30 @@ static llvm::SmallSet<unsigned, 4> staticEvidenceCoveredLogicalOffsets(
   return covered;
 }
 
+llvm::SmallVector<mlir::Value, 4> staticEvidenceDuplicateLanes(
+    mlir::ModuleOp module, mlir::func::CallOp call,
+    llvm::ArrayRef<RuntimeDeallocator> deallocators,
+    mlir::SymbolTable *symbols) {
+  llvm::SmallVector<mlir::Value, 4> duplicates;
+  mlir::func::FuncOp callee =
+      symbols ? symbols->lookup<mlir::func::FuncOp>(call.getCallee())
+              : module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  if (!callee || call.getNumResults() == 0)
+    return duplicates;
+  mlir::FailureOr<FunctionContract> contract = readFunctionContract(callee);
+  if (mlir::failed(contract) || contract->ownedResults.empty())
+    return duplicates;
+  llvm::SmallSet<unsigned, 4> covered =
+      staticEvidenceCoveredLogicalOffsets(callee, *contract);
+  if (covered.empty())
+    return duplicates;
+  for (const ResourceGroup &group :
+       collectRuntimeResourceGroups(call.getResults(), deallocators))
+    if (covered.contains(group.offset))
+      duplicates.append(group.values.begin(), group.values.end());
+  return duplicates;
+}
+
 llvm::SmallVector<ResourceGroup, 8>
 collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators,

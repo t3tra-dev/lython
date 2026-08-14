@@ -562,6 +562,18 @@ bool ownedLocalMarkerIsRetainRooted(mlir::Operation *marker,
 // `symbols`, when non-null, must be a symbol table over `module`; it only
 // short-circuits the callee lookup (a module-symbol-list walk otherwise) for
 // callers that sweep every call op and can build the table once.
+// The call results that hold the SAME handle an owned static-evidence lane
+// holds. A `T | None` return carries its payload TWICE -- once as the member
+// lane and once as the lane `ly.ownership.owned_results` names -- and the
+// callee returns one value into both. Only the evidence lane becomes an owned
+// group (the member lane's group is skipped as covered), so without this the
+// member lane reads as borrowed wherever it is consumed and a merge lends what
+// was actually transferred. Not release operands: releasing once is right.
+llvm::SmallVector<mlir::Value, 4>
+staticEvidenceDuplicateLanes(mlir::ModuleOp module, mlir::func::CallOp call,
+                             llvm::ArrayRef<RuntimeDeallocator> deallocators,
+                             mlir::SymbolTable *symbols = nullptr);
+
 llvm::SmallVector<ResourceGroup, 8>
 collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators,

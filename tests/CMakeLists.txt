@@ -593,6 +593,12 @@ set(LYTHON_LEAK_GATE_CASES
     # printed values are right the moment the box exists at all.
     float_of_bool divmod_of_bool bool_inherits_int_methods
     round_without_ndigits bool_in_object_position
+    # Held OUT of the gate from 2026-08-14 to 2026-08-15 because it leaked 42 B
+    # on the arm whose member renders to itself: a union return hands its
+    # payload back as both the member lane and the owned-result lane, and only
+    # the second was known to be owned, so the merge lent what had been
+    # transferred. In now, because that is the property the repair claims.
+    union_renders_by_tag
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

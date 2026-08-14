@@ -2472,6 +2472,20 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     if (!fn || own::isRuntimeManifestFunction(fn))
       return;
     ++calleeResolutions;
+    // ⭐ A union return hands its payload back TWICE -- as the member lane and
+    // as the lane `ly.ownership.owned_results` names -- and only the second
+    // becomes a group, because the first is skipped as covered by it. Both hold
+    // the one handle the callee returned, so the member lane is owned too, and
+    // saying so here is the whole repair: no group, no release, only the fact.
+    //
+    // ⛔ Why NOT a second group: releasing twice is what that would place, and
+    // the payload is one object. ⛔ And why NOT let the merge retain it, which
+    // is what happened -- `block-arg-merge-borrow` lent a value that had been
+    // transferred, so `print(pick_str(True))` leaked 42 B while the None arm,
+    // which reaches the evidence lane directly, was balanced.
+    for (mlir::Value duplicate : own::staticEvidenceDuplicateLanes(
+             module, call, deallocators, symbols))
+      ownedValues.insert(duplicate);
     for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
              module, call, deallocators, symbols)) {
       // ⛔ KNOWN DEFECT, measured, not repaired here: `g.condition` -- a
