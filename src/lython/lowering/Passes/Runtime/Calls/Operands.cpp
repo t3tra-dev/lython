@@ -37,6 +37,20 @@ bool canAppendExactValues(mlir::FunctionType functionType, unsigned inputIndex,
   return true;
 }
 
+// Whether an int's runtime value group lands exactly on the inputs starting at
+// `inputIndex`. Shared by the lazy-int arm and the bool widening below, which
+// ask the same question of the same shape from the two mirrored halves.
+bool intValueGroupMatchesExactly(const RuntimeValueShape &shape,
+                                 mlir::FunctionType functionType,
+                                 unsigned inputIndex) {
+  if (inputIndex + shape.valueTypes.size() > functionType.getNumInputs())
+    return false;
+  for (auto [offset, type] : llvm::enumerate(shape.valueTypes))
+    if (type != functionType.getInput(inputIndex + offset))
+      return false;
+  return true;
+}
+
 bool runtimeInputConsumesObject(const RuntimeSymbol &symbol,
                                 unsigned inputIndex) {
   return symbol.function &&
@@ -294,6 +308,37 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     }
   }
 
+  // ⭐ bool has no numeric implementation of its own: CPython's bool inherits
+  // int's `__abs__`, `__round__` and `__divmod__` unchanged, and each takes an
+  // int and returns an int. So widening the truth bit here IS the operation
+  // rather than a conversion imposed on the value, and it is unobservable for
+  // the same reason -- the callee reads the widened value numerically and
+  // nothing downstream can see that it stopped being a bool.
+  //
+  // ⛔ Why NOT do this at the call site, the way a numeric argument is usually
+  // adapted: at a USER function's parameter boundary the same widening is a
+  // wrong answer, because the callee may print the parameter and CPython would
+  // print True where the widened value prints 1
+  // (tests/probe/wb_argument_boundary_numeric_tower.py). What makes it safe is
+  // being at the manifest ABI, not being a numeric tower rung.
+  //
+  // ⛔ Why NOT materialize the int object here: routing through a lazy
+  // primitive-i64 bundle re-enters this function, so the box and its ownership
+  // come from the arms the int case already runs. A second materialization
+  // site is a second place for the owned-result release to go missing.
+  if (source.contractName() == "builtins.bool" && sourceValues.size() == 1 &&
+      sourceValues.front().getType().isInteger(1) && !expected.isInteger(1)) {
+    mlir::Value wide = mlir::arith::ExtUIOp::create(
+        builder, op->getLoc(), builder.getI64Type(), sourceValues.front());
+    RuntimeBundle widened;
+    if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+            op, runtimeContractType(context, "builtins.int"), wide,
+            boolConstant(builder, op->getLoc(), true), widened)))
+      return mlir::failure();
+    return RuntimeBundleLowerer::appendRuntimeSource(
+        op, symbol, functionType, inputIndex, widened, operands);
+  }
+
   {
     auto diag = op->emitError()
                 << "cannot adapt " << source.contractName()
@@ -395,14 +440,7 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     const RuntimeValueShape *shape = manifest.valueShape("builtins.int");
     if (shape &&
         inputIndex + shape->valueTypes.size() <= functionType.getNumInputs()) {
-      bool exact = true;
-      for (auto [offset, type] : llvm::enumerate(shape->valueTypes)) {
-        if (type != functionType.getInput(inputIndex + offset)) {
-          exact = false;
-          break;
-        }
-      }
-      if (exact) {
+      if (intValueGroupMatchesExactly(*shape, functionType, inputIndex)) {
         inputIndex += static_cast<unsigned>(shape->valueTypes.size());
         return true;
       }
@@ -475,6 +513,24 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     if (unbox && unbox->function.getFunctionType().getNumResults() == 1 &&
         unbox->function.getFunctionType().getResult(0) == expected) {
       ++inputIndex;
+      return true;
+    }
+  }
+
+  // The predicate half of the bool -> int widening in `appendRuntimeSource`.
+  // ⛔ Why NOT leave it to that arm: the two halves are mirrored by hand and
+  // this one runs FIRST, during overload selection, so an arm added only there
+  // never executes -- the candidate is rejected before it is reached.
+  if (source.contractName() == "builtins.bool" && sourceValues.size() == 1 &&
+      sourceValues.front().getType().isInteger(1) && !expected.isInteger(1)) {
+    if (expected.isInteger(64)) {
+      ++inputIndex;
+      return true;
+    }
+    if (const RuntimeValueShape *shape = manifest.valueShape("builtins.int");
+        shape &&
+        intValueGroupMatchesExactly(*shape, functionType, inputIndex)) {
+      inputIndex += static_cast<unsigned>(shape->valueTypes.size());
       return true;
     }
   }
