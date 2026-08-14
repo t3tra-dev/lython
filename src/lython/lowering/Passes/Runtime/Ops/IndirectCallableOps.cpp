@@ -52,6 +52,19 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
       return;
     if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
       return;
+    // ⭐ A primitive-i64 clone is not a callable VALUE. It is an internal
+    // specialization that takes its int arguments unboxed and returns its int
+    // result the same way, reachable only from a site that knows to speculate
+    // on it -- and it carries a copy of the original's `callable_type`, so it
+    // matches here exactly as well as the original does.
+    //
+    // `Holder(make).call()`, with `_f: Callable[[], int]`, collected
+    // `make__lyrt_prim_i64` and then consumed its result through the object
+    // ABI: "function target 'make__lyrt_prim_i64' returned too few values for
+    // result object ABI". The speculation path is keyed on the ORIGINAL's name,
+    // so once the clone is the target nothing recognises it as one.
+    if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function))
+      return;
 
     py::CallableType callable = callableTypeOf(function);
     if (!callable || callable.getResultTypes().size() != 1)

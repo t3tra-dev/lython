@@ -921,6 +921,34 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                     emitInheritedObjectStr(expr, receiver))
               return *stringified;
         }
+        // ⭐ A CALLABLE-VALUED FIELD IS CALLED, NOT DISPATCHED. `self._f()`
+        // where `_f` is declared `Callable[[], int]` calls the value the field
+        // holds; there is no method `_f` on the class and none inherited
+        // either, so the refusal below claimed "'Holder' inherits
+        // builtins.object._f" -- naming a member of object that does not
+        // exist. That predicate answers for ANY name once the class
+        // linearizes onto object, so a field name reaches it looking like a
+        // missing dunder.
+        //
+        // ⛔ Why NOT leave it to the generic method path further down: that
+        // path infers a METHOD call, which passes the receiver as the first
+        // argument, and the field's callable does not take one. Binding
+        // through a local (`g = self._f; g()`) already resolved the value,
+        // which is what says the callable is fine and only the syntax was
+        // routed wrongly.
+        if (std::optional<mlir::Type> fieldType =
+                lookupClassField(receiver.type, *methodName)) {
+          if (auto fieldCallable = mlir::dyn_cast_if_present<py::CallableType>(
+                  types.widenLiteral(*fieldType))) {
+            if (std::optional<Value> fieldValue =
+                    emitValueAttribute(*calleeNode, receiver, *methodName))
+              return emitCallableDispatch(
+                  expr, *fieldValue,
+                  emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                                   fieldCallable));
+          }
+        }
+
         // A source class inherits ALL of builtins.object's declared methods
         // through its protocol-table base, but only the defaults above have
         // something behind them. The rest are refused here, located and naming
