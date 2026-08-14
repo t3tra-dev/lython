@@ -1297,8 +1297,35 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   if (RuntimeBundleLowerer::isCellClassOp(classOp))
     return RuntimeBundleLowerer::lowerCellAttrSet(op, *object, *value, classOp,
                                                   *fieldIndex);
-  if (!py::isAssignableTo(value->objectValue.contract, fieldTypes[*fieldIndex],
-                          op))
+  // ⭐ A FUNCTION VALUE'S CONTRACT IS ITS TARGET'S, NOT ITS REPRESENTATION'S.
+  // A lowered function reference is `builtins.function` whatever it points at,
+  // so comparing that name against a `Callable[...]` field asks a runtime
+  // representation a logical question and always answers no:
+  //
+  //     self._f: Callable[[], int] = f
+  //     attribute value '!py.contract<"builtins.function">' is not assignable
+  //     to field '!py.callable<[], returns = [!py.contract<"builtins.int">]>'
+  //
+  // The bundle names the target it holds, and that target declares a callable.
+  // Asking THAT one is the same question the emitter already answered when it
+  // accepted the assignment.
+  //
+  // ⛔ Why the lane shapes do not have to be reconciled first, which is what
+  // this note said when the layer below was found: a Callable field is stored
+  // boxed, and the boxed path writes the value's PAYLOAD into the slot's box16
+  // rather than splicing a fixed lane tuple into the instance. There is no
+  // tuple here to disagree about.
+  bool assignable = py::isAssignableTo(value->objectValue.contract,
+                                       fieldTypes[*fieldIndex], op);
+  if (!assignable && !value->functionTarget.empty() &&
+      mlir::isa<py::CallableType>(fieldTypes[*fieldIndex])) {
+    if (mlir::func::FuncOp target =
+            module.lookupSymbol<mlir::func::FuncOp>(value->functionTarget))
+      if (py::CallableType declared = callableTypeOf(target))
+        assignable =
+            py::isAssignableTo(declared, fieldTypes[*fieldIndex], op);
+  }
+  if (!assignable)
     return op.emitError() << "attribute value " << value->objectValue.contract
                           << " is not assignable to field "
                           << fieldTypes[*fieldIndex];

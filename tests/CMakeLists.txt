@@ -610,6 +610,10 @@ set(LYTHON_LEAK_GATE_CASES
     # leaks and `pick(None, None)` is not, because a None union's release is a
     # no-op -- so the gate, not the stdout, is what can see the difference.
     while_condition_narrowing
+    # A function stored in a field and called back: the store writes the value's
+    # payload into the slot's box, so whether the reference it hands over is
+    # accounted for is a question the printed 7 cannot answer.
+    callable_valued_field
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
