@@ -604,6 +604,12 @@ set(LYTHON_LEAK_GATE_CASES
     # the only witness. The three spellings beside it in the file never showed
     # the defect, which is exactly why they belong under the same gate.
     duplicate_element_delitem
+    # The last leaking golden, and the one the sweep kept finding: a union
+    # carried local acquired a token on the loop's entry edge and nothing
+    # discharged it when the body never ran. `pick(None, 3)` is the line that
+    # leaks and `pick(None, None)` is not, because a None union's release is a
+    # no-op -- so the gate, not the stdout, is what can see the difference.
+    while_condition_narrowing
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

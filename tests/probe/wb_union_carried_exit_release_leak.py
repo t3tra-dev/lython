@@ -1,108 +1,64 @@
-# LEAKS the boxed value of a UNION carried local when the loop body never
-# runs: 1 allocation / 52 B. This is the EXIT-EDGE half of the union
-# loop-carried contract, recorded as still missing when the ENTRY half was
-# repaired 2026-08-13
+# FIXED 2026-08-15. 1 allocation / 52 B when the loop body never ran: the
+# EXIT-EDGE half of the union loop-carried contract, still missing when the
+# ENTRY half was repaired 2026-08-13
 # (tests/probe/wb_union_loop_carried_borrow_overrelease.py).
 #
 # BISECTED (tests/leak_gate.py against ./build/bin/lyc):
 #
-#   pick(None, 3) .................. 1 alloc / 52 B   <- this file
-#   pick(None, None) ...............  0 (clean -- a None union's release is
-#                                     a no-op, so the missing one is invisible)
+#   pick(None, 3) .................. 1 alloc / 52 B
+#   pick(None, None) ...............  0 (clean -- a None union's release is a
+#                                     no-op, so the missing one is invisible)
 #   pick(1, 2) .....................  0 (clean -- the body runs and consumes)
 #   the same signature with `if` ...  0 (clean -- no loop, no carried local)
 #
-# THE MECHANISM, already located: `acquireUnionCarriedTokens`
-# (EmitterLoops.cpp) retains a union carried local on the loop's ENTRY edge,
-# which is the acquisition the ownership pass places for every other type.
-# The matching release belongs on the EXIT edge and is placed by
-# `insertOwnedBlockArgumentReleases` (Passes/Ownership.cpp), which skips any
-# group whose `condition` is set:
+# `acquireUnionCarriedTokens` (EmitterLoops.cpp) retains a union carried local
+# on the loop's ENTRY edge, which is the acquisition the ownership pass places
+# for every other type. The matching release belongs on the way out, and
+# `insertOwnedBlockArgumentReleases` skips any group whose `condition` is set --
+# a union's release is guarded by its tag, so it always has one.
 #
-#     if (!g.deallocator || g.condition)
-#       continue;
+# ⭐ THE REPAIR IS THE EMITTER'S, and what settles that is reading
+# `carriedLoopEdgeOperands`: it does not only release the lane the body
+# replaced, it RE-ACQUIRES the replacement (`acquiringLanes`). The loop's token
+# therefore rides the carry, and releasing whatever is carried at the after-block
+# balances the entry retain in all three shapes:
 #
-# A union's release is guarded by its tag, so it always has a condition, so a
-# union carried local never gets one. The entry retain then stands alone --
-# and it stands even when the loop body never executes, which is why the
-# ZERO-ITERATION call is the one that leaks.
+#   body never runs .... exit carries v0; the release balances the entry retain
+#   body keeps v0 ...... no edge release and no reacquire; the same
+#   body rebinds to v1 . the back edge released v0 and retained v1, so the exit
+#                        release discharges THAT token, while v1's own producer
+#                        token stays the pass's to place
 #
-# THE REPAIR IS NOT THE ONE THAT NOTE NAMES, and the emitted IR is what says
-# so. Read at refcount-elision, `@pick` is:
+# ⛔ Why NOT the three placements this file used to reason through, each of
+# which was said to break one of the four bisect lines:
+#   - retain at the TOP OF THE BODY: still true, a leak per iteration for a lane
+#     that keeps its value.
+#   - retain immediately before the back edge's release: still true, a no-op
+#     pair, which is the over-release the entry half exists to fix.
+#   - release on the EXIT EDGE in the emitter: this was the one that was WRONG.
+#     It said the release would dangle when the body rebound to a fresh value,
+#     because the after-block still names it and the emitter cannot ask whether
+#     anything reads it. But the token released there is the loop's, minted by
+#     the reacquire, and never the value's only one. The objection was written
+#     without reading `acquiringLanes`.
 #
-#     scf.if %0 { Ly_IncRef(%arg5) {aggregate_retain = "builtins.int:py.incref"} }
-#     scf.if %1 { Ly_IncRef(%arg1) {aggregate_retain = "builtins.int:py.incref"} }
-#     cf.br ^bb1(%5, %arg5, %arg6, %arg7, ..., %9, %arg1, %arg2, %arg3)
-#   ^bb1(%11, %12,%13,%14, %15,%16,%17, %18, %19,%20,%21):
-#     ...
-#   ^bb4:                       ; the loop exit
-#     return %15, %16, %17, ...      ; `seen` only -- nothing released
+# ⛔ Why the after-block START and not the exit edge itself: with a break the
+# after-block has several predecessors and each carries the token, so one
+# release at the join covers them all where an edge release would need one per
+# edge and would still miss the else block's.
 #
-# Two facts fall out. First, the guard is ALREADY THERE: `py.incref` on a
-# union lowers through `forEachActiveUnionMember`, so the acquisition is a
-# tag-guarded call and the release would lower the same way. Teaching the pass
-# to spell a guard is not what is missing.
+# ⛔ What was NOT needed after all: seeding a group in the ownership pass and
+# teaching release placement to spell a tag guard. Both were scoped
+# (`emitterLaneIncrefInBlock` already books the entry edge as a transfer once a
+# candidate exists, and `g.condition` is skipped in three separate walks) and
+# neither is required, because the guard already exists -- py.decref on a union
+# lowers through `forEachActiveUnionMember` exactly as py.incref does.
 #
-# Second, and this is the actual obstacle: this group is never SEEDED.
-# `insertOwnedBlockArgumentReleases` collects candidates from owned CALL
-# RESULTS and from `owned_local_object` markers. The reference here is minted
-# by an `Ly_IncRef` the EMITTER emitted, which is neither -- it has no
-# results, so `collectOwnedCallResultGroups` cannot name it, and it carries an
-# `aggregate_retain` label, which books it against a slot rather than the
-# frame. So the `g.condition` skip is not what keeps the release away; the
-# walk never has a group to skip.
+# tests/golden/cases/while_condition_narrowing.py pins it and is now in
+# LYTHON_LEAK_GATE_CASES. With this, a sweep of tests/golden/cases is 385
+# programs, 384 clean, 0 leaking -- down from 4 leaking on 2026-08-14.
 #
-# ⭐ Which makes the repair "give the emitter's acquisition a producer the
-# pass can see", and only then the guarded release. The tag is available where
-# the release has to go -- it rides the same edge as the member lanes and is
-# block argument %11 (for `other`) and %18 (for `v`) at ^bb4 -- so the guard's
-# operand is not the hard part either.
-#
-# ⭐ AND THE CREDIT PATH ALREADY EXISTS, read 2026-08-15: once a candidate for
-# the destination block arguments exists, `emitterLaneIncrefInBlock`
-# (Passes/Ownership.cpp, inside the candidate loop) finds an emitter incref in
-# the predecessor and books the edge as a TRANSFER rather than a borrow -- which
-# is exactly what the entry edge's `py.incref` should be. So the seeding is not
-# merely the first step, it is very nearly the only one on the acquisition side;
-# what remains after it is letting a group with `g.condition` reach release
-# placement, and that skip appears in three separate walks.
-#
-# ⛔ Why the seed cannot be `Ly_IncRef` + `aggregate_retain` alone: that label
-# is what EVERY emitter incref carries (the dump above shows
-# `builtins.int:py.incref` on this very acquisition), and one incref pays for
-# one header lane while the group is the union's whole lane span. Recognising
-# the acquisition needs a mark the emitter puts there ON PURPOSE, carried
-# through the union incref's lowering onto the guarded call.
-#
-# ⛔ Why NOT move the acquisition instead, which looks like it would avoid all
-# of this. Three placements were reasoned through against the four bisect
-# lines above and each breaks one of them:
-#   - retain at the TOP OF THE BODY rather than the entry edge: correct for a
-#     lane the back edge releases, and a leak per iteration for a lane that
-#     KEEPS its value (`carriedLoopEdgeOperands` releases only the lanes that
-#     changed), so `pick(1, 2)` leaks where it is clean today.
-#   - retain immediately before the back edge's release: a no-op pair, which
-#     is the same as not releasing at all -- and that is the over-release
-#     `acquireUnionCarriedTokens` exists to fix
-#     (wb_union_loop_carried_borrow_overrelease.py).
-#   - release on the EXIT edge in the emitter: correct when the loop exits
-#     with a borrowed value, dangling when the body rebound to a fresh one --
-#     the after-block still names it and the emitter cannot ask whether
-#     anything reads it. That question is the liveness the pass computes,
-#     which is why the release belongs there and not in the emitter.
-#
-# FOUND by tests/probe/tools/leak_sweep.py over tests/golden/cases: 374
-# programs, 369 clean, 4 leaking. This shape is ONE of the four,
-# `while_condition_narrowing`.
-#
-# ⛔ `string_annotation_union` leaks the same 52 B off a union and is NOT this
-# defect -- it needs no loop at all, and it stayed red after this shape's
-# reproducer was written. It was the union RETURN's double materialization
-# (wb_union_return_double_box_leak.py), fixed 2026-08-14. Equal figures off
-# the same type are not one attribution; two of them here were three
-# defects.
-#
-# differential: skip the leak is invisible to stdout; this records the shape
+# differential: run agrees with CPython now
 
 
 def pick(v: int | None, other: int | None) -> int:
@@ -114,4 +70,4 @@ def pick(v: int | None, other: int | None) -> int:
     return seen
 
 
-print(pick(None, 3))
+print(pick(None, 3), pick(None, None), pick(1, 2))
