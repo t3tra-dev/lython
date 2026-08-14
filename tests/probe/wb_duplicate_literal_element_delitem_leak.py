@@ -1,74 +1,64 @@
-# OPEN. 1 allocation / 48 B, and it PREDATES the aggregate-retain counting
-# repair of 2026-08-14 -- measured identically on a binary built before it
-# (wb_aggregate_slot_unfold_retain_leak.py is that repair; this shape survived
-# it, which is why it gets its own file rather than a line in that one).
+# FIXED 2026-08-15. 1 allocation / 48 B, and it PREDATED the aggregate-retain
+# counting repair of 2026-08-14 -- measured identically on a binary built before
+# it. The shape is one source filling TWO slots of a literal, then a `del`:
 #
-# The shape is one source filling TWO slots of a literal, then a `del`:
-#
-#   xs = [msg, msg]; del xs[0] ....... 1 alloc / 48 B   <- this file
+#   xs = [msg, msg]; del xs[0] ....... 1 alloc / 48 B
 #   xs = [msg];      del xs[0] .......  0 (clean)
 #   xs = [msg, msg]; no del ..........  0 (clean)
 #   xs = ["p", "q"]; del xs[0] .......  0 (clean -- two distinct sources)
 #
-# So it needs the DUPLICATE and it needs the delete: neither alone shows it.
+# ⭐ THE LEDGER, counted in @f at refcount-elision, is what finally named it.
+# `msg` is TWO frame groups over one object: the `LyUnicode_FromBytes` call
+# result and the `owned_local_object` marker cast of it.
 #
-# WHERE TO LOOK. The literal takes an `aggregate_retain` per slot -- two here
-# -- but `movedSources` (Core/CollectionPayload.cpp) dedupes the `.source`
-# release to ONE, because the source holds one token to hand over and may only
-# be released once.
+#   without del:  DecRef(%1#0) {aggregate_release = "...sequence.literal.source"}
+#                 DecRef(%1#0) {reference_release}          <- the second group
+#                 LyList_DecRef(%4)                         ; teardown, 2 slots
+#                 = 4 discharges
 #
-# LOCATED, by diffing the emitted `@f` against the same program with the `del`
-# removed (LYTHON_IR_DUMP=refcount-elision). The retains are IDENTICAL in both
-# -- four on `%1#0`, the same four ops. What the `del` changes is the exit:
+#   with del:     DecRef(%1#0) {aggregate_release = "...sequence.literal.source"}
+#                 DecRef(%1#0) {aggregate_release = "...list.delitem"}
+#                 LyList_DecRef(%4)                         ; teardown, 1 slot
+#                 = 3 discharges
 #
-#   without del: ... {aggregate_release = "...sequence.literal.source"}
-#                LyList_DecRef(%4)                     ; teardown, length 2
-#                LyUnicode_DecRef(%1#0) {reference_release}   <- the FRAME's
+# The delitem does not ADD one: it removes a slot, so the teardown shortens by
+# exactly the amount the delitem adds. What went missing is the second frame
+# group's exit release, because the walk read the delitem as its death.
 #
-#   with del:    ... {aggregate_release = "...sequence.literal.source"}
-#                LyUnicode_DecRef(%1#0) {aggregate_release = "...list.delitem"}
-#                LyList_DecRef(%4)                     ; teardown, length 1
-#                                                      ; and NO frame release
+# ⭐ THE RULE: of the `aggregate_release` labels, `.source` is the one that
+# discharges the moved value's OWN token; every other spelling discharges a
+# CONTAINER's reference, and a slot's discharge is never a frame token's death.
+# It is not caught by `consumeIsAnotherReferencesDischarge` because that
+# predicate's third leg asks whether the name is ours and here it IS -- the
+# delitem releases `%1#0`, a group value, since a slot and the frame reference
+# one object. Only the label separates them.
 #
-# So the `del` did not add a discharge, it REPLACED one: the walk read the
-# delitem release as this group's death (`consumeSites`) and placed no release
-# at the function exit. The delitem release discharges the SLOT, so the
-# frame's own reference is the one left over. The single-element spelling is
-# clean because there the frame has nothing left after the literal takes its
-# token; with the source filling two slots it does.
+# ⛔ Why the rule is guarded by "the `.source` release is PRESENT" rather than
+# the label alone: "any non-`.source` aggregate release is never a death" was
+# implemented and measured, and 185 of 384 goldens stopped compiling with
+# "owned resource from @LyLong_FromI64 result 0 is released or transferred more
+# than once on one CFG path". A slot release is the only discharge a group has
+# in plenty of shapes. What makes this one different is that the value's own
+# token has already LEFT: after `.source` moves it into the container, the
+# frame's remaining reference belongs to the other group.
 #
 # ⛔ Not the unfold-retain count repaired 2026-08-14: with that in place this
-# group asks for zero unfold retains (2 consumes, 1 slot release, 2 retains
-# held, credit 1), and the leak is 48 B with it and without it.
+# group asks for zero unfold retains, and the leak was 48 B with it and without.
 #
-# ⛔ And NOT `consumeSites`, which the exit diff points straight at. Making a
-# slot release ineligible to be a group's death -- take the last consume that
-# is not one, and record no death when every consume is -- was implemented and
-# measured: 48 B, unchanged, and every other case in this family stayed clean.
-# So the frame's exit release does not come from that decision, and the thing
-# the `del` displaces is placed somewhere else. Reverted rather than left in:
-# it changes codegen with no test able to see it.
+# ⛔ Not `consumeSites`, which the exit diff points at. Making a slot release
+# ineligible to be a group's death -- take the last consume that is not one --
+# was implemented and measured at 48 B unchanged. Nor is it leg 1 of the
+# discharge predicate: dropping `isMinted` entirely, measured 2026-08-15, is
+# also 48 B, because leg 3 was the one answering.
 #
-# ⛔ And it is not a different STRATEGY being chosen.
-# LYTHON_OWNERSHIP_TRACE_PLACEMENT is 331 lines, byte-identical in order
-# between the two programs, and LYTHON_TRACE_OWNED_LOCAL is identical too. So
-# every group takes the same arm in both; what differs is where that arm PUTS
-# the release, inside `releaseOwnedGroupByLiveness`.
+# ⛔ And not a different STRATEGY. LYTHON_OWNERSHIP_TRACE_PLACEMENT is 331
+# lines, byte-identical in order between the two programs, and
+# LYTHON_TRACE_OWNED_LOCAL is identical too.
 #
-# Narrowed to that function, with the surrounding decisions measured equal:
-# `readFollowsConsumeInBlock` is true in both (the `xs[0]` read follows), so
-# `consumeSites` is empty and `groupHasConsumingCall` false in BOTH, and the
-# unfold-retain count is 1 in both. The remaining difference is the liveness
-# itself -- `lastUse` / `consumedBlocks` / the edge releases -- over a block
-# that now holds two releases of the same name instead of one.
+# tests/golden/cases/duplicate_element_delitem.py pins it, red-checked at 48 B
+# on the pre-fix binary, and is in LYTHON_LEAK_GATE_CASES.
 #
-# `msg` is TWO groups over one object: the `LyUnicode_FromBytes` call result
-# and the `owned_local_object` marker cast of it. Without the del both are
-# released at the exit, one after the other; with the del only the marker's
-# is. So the arm to instrument next is the call-result group's liveness, not
-# the marker's.
-#
-# differential: skip the leak is invisible to stdout; this records the shape
+# differential: run agrees with CPython now
 
 
 def f() -> None:

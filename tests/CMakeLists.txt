@@ -599,6 +599,11 @@ set(LYTHON_LEAK_GATE_CASES
     # the second was known to be owned, so the merge lent what had been
     # transferred. In now, because that is the property the repair claims.
     union_renders_by_tag
+    # One source filling two slots, then a delete: the frame's reference
+    # outlived the frame and nothing printed differently, so the allocator is
+    # the only witness. The three spellings beside it in the file never showed
+    # the defect, which is exactly why they belong under the same gate.
+    duplicate_element_delitem
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

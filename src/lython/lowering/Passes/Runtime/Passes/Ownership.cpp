@@ -1315,6 +1315,53 @@ bool releaseOwnedGroupByLiveness(
     if (consumeIsAnotherReferencesDischarge(references, use, group.values,
                                             equivalent, mine))
       return false;
+    // ⭐ A SLOT'S DISCHARGE IS NEVER A FRAME TOKEN'S DEATH, even when it names
+    // the frame's own value. Of the `aggregate_release` labels, `.source` is
+    // the one that discharges the moved value's OWN token; every other spelling
+    // discharges a CONTAINER's reference.
+    //
+    //     msg = "hi there"
+    //     xs = [msg, msg]
+    //     del xs[0]
+    //
+    // leaked 48 B on that difference. `msg` is two frame groups over one object
+    // (the `LyUnicode_FromBytes` result and the owned-local marker cast of it);
+    // without the `del` the literal's `.source` release discharges one and an
+    // exit release discharges the other. The `del` adds
+    // `aggregate_release = "builtins.str:list.delitem"`, the walk read it as the
+    // second group's death, and the exit release went away -- one decref short,
+    // since the delitem also shortens the list teardown by the slot it removed.
+    //
+    // ⛔ Why the predicate above does not already cover it: its third leg asks
+    // whether the name is ours, and here it IS -- the delitem releases `%1#0`,
+    // a group value, because a slot and the frame reference one object. The
+    // label is the only thing that separates them, and it says so outright.
+    //
+    // ⛔ And why the `.source` release has to be PRESENT rather than the label
+    // alone deciding: "any non-`.source` aggregate release is never a death"
+    // was implemented and measured, and 185 of 384 goldens stopped compiling
+    // with "owned resource from @LyLong_FromI64 result 0 is released or
+    // transferred more than once on one CFG path". A slot release is the only
+    // discharge a group has in plenty of shapes. What makes THIS one different
+    // is that the value's own token has already left: once `.source` has moved
+    // it into the container, the frame's remaining reference is the other
+    // group's, and every later aggregate release names a slot.
+    if (auto label = use.getOwner()->getAttrOfType<mlir::StringAttr>(
+            own::kAggregateReleaseAttr);
+        label && !label.getValue().ends_with(".source") &&
+        !group.values.empty()) {
+      bool ownTokenAlreadyMoved = false;
+      for (mlir::Operation *user : group.values.front().getUsers()) {
+        auto other = user->getAttrOfType<mlir::StringAttr>(
+            own::kAggregateReleaseAttr);
+        if (other && other.getValue().ends_with(".source")) {
+          ownTokenAlreadyMoved = true;
+          break;
+        }
+      }
+      if (ownTokenAlreadyMoved)
+        return false;
+    }
     return ownershipConsumingUseInvalidatesGroup(contracts, use, group.values,
                                                  aliases);
   };
