@@ -1401,14 +1401,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
                    static_cast<unsigned>(fieldValueTypes->size()), oldValues);
   builder.setInsertionPoint(op);
   std::string slotName = (llvm::Twine("class.") + op.getName()).str();
+  // ⭐ A LAZILY-BOXED int has no physical values until the store materializes
+  // one, and the question here is whether the value arrives OWNED -- which it
+  // does either way. Asking `physicalValues()` before the materialization
+  // answered "no" and skipped the `.source` release below, so the object the
+  // widening had just boxed was retained for the slot and never released:
+  // `self.v: Optional[int]` then `n.v = 7; n.v = None` leaked 52 B, while the
+  // str member, which is never lazy, was correct. Same shape as the union
+  // return's double materialization -- a decision read off a bundle before the
+  // step that gives it values.
   bool releaseOwnedSource = false;
   if (const RuntimeBundle *source =
           RuntimeBundleLowerer::concreteObjectForOwnership(*value)) {
     releaseOwnedSource =
         source->kind == RuntimeBundle::Kind::Object &&
         source->objectValue.ownership == ownership::OwnershipKind::Own &&
-        !source->physicalValues().empty();
+        (!source->physicalValues().empty() ||
+         RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source));
   }
+  // And the release names the object the STORE materialized, not the lazy
+  // bundle it was handed: releasing through the latter would box a SECOND int
+  // and discharge that one instead.
+  const RuntimeBundle &ownedSource =
+      slotValue.unionActiveMember ? *slotValue.unionActiveMember : *value;
   const RuntimeBundle *oldSlotValue = nullptr;
   auto oldFieldBundle = object->fieldBundles.find(op.getName());
   if (oldFieldBundle != object->fieldBundles.end())
@@ -1435,7 +1450,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     return mlir::failure();
   if (releaseOwnedSource &&
       mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-          op, *value, llvm::Twine(slotName).concat(".source").str())))
+          op, ownedSource, llvm::Twine(slotName).concat(".source").str())))
     return mlir::failure();
   for (auto [index, replacement] : llvm::enumerate(slotValue.physicalValues()))
     values[*offset + index] = replacement;

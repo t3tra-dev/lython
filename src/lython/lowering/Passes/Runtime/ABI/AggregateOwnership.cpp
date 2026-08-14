@@ -1,6 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 
 namespace py::lowering {
 
@@ -9,6 +10,22 @@ namespace {
 namespace own = py::ownership;
 
 bool isNoneLikeType(mlir::Type type) { return py::isPyNoneType(type); }
+
+// ⭐ WHEN THE ACTIVE MEMBER IS KNOWN, THE GUARD IS NOT A BRANCH. A union
+// assembled from a concrete value carries a constant tag, so the per-member
+// `cmpi eq(tag, index)` below compares two constants -- and until the
+// canonicalizer runs, five phases later, the affine ownership walk sees a
+// real region branch and explores the arm the guard excludes. On that arm the
+// retain does not happen while the unguarded `.source` release still does, so
+// storing a value into an `Optional` field was refused with "released owned
+// resource from @LyUnicode_FromBytes is used after release (by call to
+// '__ly_dealloc_N')" over IR whose runtime accounting is exactly right.
+std::optional<std::int64_t> constantTagValue(mlir::Value tag) {
+  mlir::IntegerAttr attr;
+  if (!mlir::matchPattern(tag, mlir::m_Constant(&attr)))
+    return std::nullopt;
+  return attr.getInt();
+}
 
 std::string describeSlotType(mlir::Type type) {
   std::string name = runtimeContractName(type);
@@ -102,6 +119,7 @@ mlir::LogicalResult RuntimeBundleLowerer::forEachActiveUnionMember(
     return op->emitError() << abiLabel << " value has no tag";
   context->loadDialect<mlir::scf::SCFDialect>();
   mlir::Value tag = values.front();
+  std::optional<std::int64_t> staticTag = constantTagValue(tag);
   unsigned offset = 1;
   for (auto [memberIndex, member] :
        llvm::enumerate(unionType.getMemberTypes())) {
@@ -113,6 +131,17 @@ mlir::LogicalResult RuntimeBundleLowerer::forEachActiveUnionMember(
     if (offset + size > values.size())
       return op->emitError() << abiLabel << " member exceeds value group";
     if (size == 0) {
+      offset += size;
+      continue;
+    }
+
+    if (staticTag) {
+      if (*staticTag != static_cast<std::int64_t>(memberIndex)) {
+        offset += size;
+        continue;
+      }
+      if (mlir::failed(emitMember(member, values.slice(offset, size))))
+        return mlir::failure();
       offset += size;
       continue;
     }

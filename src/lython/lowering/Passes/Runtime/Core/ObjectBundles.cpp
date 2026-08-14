@@ -219,28 +219,38 @@ RuntimeBundleLowerer::materializeObjectBundleForStorage(
     result.objectValue = *materialized;
   }
 
-  // ⛔ KNOWN DEFECT: assigning to an Optional field is refused, at this check.
+  // A member arriving where a UNION slot is expected is injected, which is the
+  // conversion `union.wrap` performs and the reason a store into
+  // `self.v: Optional[str]` used to be refused with "attribute value ABI has 2
+  // values, but storage expects 3": the slot is a tag plus the widest member's
+  // lanes, and a str arrives as itself.
   //
-  //     class N:
-  //         def __init__(self) -> None:
-  //             self.v: Optional[str] = None
-  //     n.v = "set"      # attribute value ABI has 2 values, but storage
-  //                      # expects 3
-  //
-  // The slot is a union -- a tag plus the widest member's lanes -- and a `str`
-  // is two lanes arriving as itself. Every assignment fails: `= None`, an int
-  // into `Optional[int]`, and one written inside `__init__`. Reading such a
-  // field works; only the store is refused.
-  //
-  // Why NOT widen here with `appendUnionRuntimeValues`, which is the existing
-  // spelling of that conversion and does clear this check (measured, and
-  // 570/570 stays green): the program still does not compile. It advances to
-  // "released owned resource from @LyLong_FromI64 is used after release", and
-  // giving the widened value the member's borrowed ownership instead of a
-  // fresh owner does not change that. The widening is necessary and not
-  // sufficient -- the store also has to hand the slot the member's reference,
-  // which `replaceAggregateSlot` cannot do while the value it is handed is a
-  // union it did not build.
+  // ⭐ The active member has to be recorded, and that is what the earlier
+  // attempt at this widening was missing. Whoever hands the slot its reference
+  // asks the bundle which member holds the token; a union assembled here with
+  // no answer left the store handing over a reference it could not name, and
+  // the program advanced from this check to "released owned resource from
+  // @LyLong_FromI64 is used after release" -- read at the time as the widening
+  // being insufficient. It was the same omission `lowerUnionWrap` had.
+  if (auto storageUnion = mlir::dyn_cast<py::UnionType>(storageContract);
+      storageUnion && !mlir::isa<py::UnionType>(result.objectValue.contract)) {
+    builder.setInsertionPoint(op);
+    llvm::SmallVector<mlir::Value, 8> widened;
+    RuntimeBundle lanesSource;
+    if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
+            op, storageUnion, result, result.objectValue.contract, widened,
+            &lanesSource)))
+      return mlir::failure();
+    RuntimeBundle injected;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, storageContract, widened, injected)))
+      return mlir::failure();
+    injected.copyEvidenceFrom(result);
+    injected.unionActiveMember =
+        std::make_shared<RuntimeBundle>(std::move(lanesSource));
+    result = std::move(injected);
+  }
+
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expectedTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, storageContract, purpose);
   if (mlir::failed(expectedTypes))

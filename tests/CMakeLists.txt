@@ -579,6 +579,13 @@ set(LYTHON_LEAK_GATE_CASES
     # them one.
     delete_item
     container_shared_with_a_holder
+    # Storing into an `Optional[T]` field, which was refused outright until
+    # 2026-08-14. The int member arrives as a LAZY box with no physical values,
+    # so the predicate deciding whether to release the source's own token read
+    # "not owned" and skipped it -- 52 B per store, and invisible to the golden
+    # because the VALUES are right either way. The str member, never lazy, was
+    # correct throughout, so only a leak check separates them.
+    optional_field_assignment
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

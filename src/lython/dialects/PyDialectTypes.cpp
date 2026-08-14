@@ -1044,6 +1044,22 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
       (supertypeContract.getContractName() == "typing.Any" ||
        supertypeContract.getContractName() == "builtins.object"))
     return isPyType(subtype);
+  // ⭐ THE TWO SPELLINGS OF None ARE ONE TYPE, in both directions.
+  // `types.NoneType` has exactly one inhabitant, so `contract<"types.NoneType">`
+  // and `literal<None>` denote the same set -- unlike every other
+  // contract/literal pair, where the contract is strictly the wider one and
+  // only the literal -> contract direction below holds.
+  //
+  // `Optional[T]` carries its None member as the LITERAL, and a `None`
+  // expression arrives as the contract, so without this the assignment that
+  // every Optional exists for was refused:
+  //
+  //     self.v: Optional[str] = None    # accepted (the declaration)
+  //     n.v = None                      # "attribute value 'types.NoneType' is
+  //                                     #  not assignable to field
+  //                                     #  'union<str, literal<None>>'"
+  if (isPyNoneType(subtype) && isPyNoneType(supertype))
+    return true;
   if (auto subtypeLiteral = mlir::dyn_cast<LiteralType>(subtype)) {
     if (supertypeContract) {
       std::optional<llvm::StringRef> literalContract =
