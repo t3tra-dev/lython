@@ -586,6 +586,12 @@ set(LYTHON_LEAK_GATE_CASES
     # because the VALUES are right either way. The str member, never lazy, was
     # correct throughout, so only a leak check separates them.
     optional_field_assignment
+    # The two bool rungs added on 2026-08-15, both of which MATERIALIZE a new
+    # object where the refused program made none: float(True) boxes a float,
+    # and divmod(True, 2) boxes the widened int inside the ABI adapter. Whether
+    # either box is released is exactly what the goldens cannot see, since the
+    # printed values are right the moment the box exists at all.
+    float_of_bool divmod_of_bool
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
