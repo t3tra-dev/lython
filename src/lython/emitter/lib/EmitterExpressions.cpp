@@ -561,6 +561,19 @@ Value ModuleEmitter::emitUnary(const parser::Node &expr) {
       if (std::optional<Value> applied =
               tryEmitClassDunder(expr, operand, method))
         return *applied;
+  // ⭐ The numeric tower's bottom rung, on the one operand there is. `-True` is
+  // -1 in CPython because bool inherits int's arithmetic; here it was refused
+  // with "builtins.bool.__neg__ ... has no implementation".
+  //
+  // ⛔ `not` is excluded and stays below: it is the only unary operator whose
+  // answer is a BOOL, and it already lowers through the truth bit without
+  // touching int at all.
+  if (types.widenLiteral(operand.type) == types.boolType() &&
+      (ast::isOperator(op, "USub") || ast::isOperator(op, "UAdd") ||
+       ast::isOperator(op, "Invert") || ast::isOperator(op, "Abs"))) {
+    operand = emitIntFromBool(expr, operand);
+    result = types.intType();
+  }
   if (ast::isOperator(op, "USub"))
     return emitUnarySpecial<py::NegOp>(expr, "__neg__", operand, result);
   if (ast::isOperator(op, "UAdd"))
@@ -672,16 +685,37 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
     return *complexResult;
   mlir::Type left = types.widenLiteral(lhs.type);
   mlir::Type right = types.widenLiteral(rhs.type);
-  // ⛔ KNOWN DEFECT: `True + 1` is refused -- "builtins.bool.__add__ is
-  // declared by the standard-library contract but has no implementation".
-  // bool IS an int in CPython and inherits int's arithmetic; here the bool
-  // contract declares the operators (typeshed shows what it inherits) and
-  // implements none. Promoting the operand the way int -> float is promoted
-  // below is the obvious repair and does NOT work: `coerceValue` to int
-  // produces a bundle with bool's single value where the int ABI expects
-  // three, which took out `float_floordiv_mod_round` with "runtime bundle for
-  // builtins.int has 1 values, but ABI expects 3". The promotion needs the
-  // boxing `emitFloatFromInt` does for the rung above, not a coercion.
+  // ⭐ THE BOTTOM RUNG OF THE NUMERIC TOWER, at the operands, exactly like the
+  // int -> float promotion below. bool IS an int in CPython and inherits int's
+  // arithmetic; here the bool contract declares the operators (typeshed shows
+  // what it inherits) and implements none, so `True + 1` was refused with
+  // "builtins.bool.__add__ is declared by the standard-library contract but
+  // has no implementation".
+  //
+  // ⛔ EXCEPT the three bitwise operators over TWO bools, where CPython's
+  // answer is a bool and not an int -- `True | False` is `True`, and
+  // `True | 1` is `1`. Those already work through bool's own operators, and
+  // promoting them would change a correct answer's type.
+  if (left == types.boolType() || right == types.boolType()) {
+    bool bitwiseOverTwoBools =
+        left == types.boolType() && right == types.boolType() &&
+        (ast::isOperator(op, "BitOr") || ast::isOperator(op, "BitAnd") ||
+         ast::isOperator(op, "BitXor"));
+    auto numeric = [&](mlir::Type type) {
+      return type == types.boolType() || type == types.intType() ||
+             type == types.floatType();
+    };
+    if (!bitwiseOverTwoBools && numeric(left) && numeric(right)) {
+      if (left == types.boolType()) {
+        lhs = emitIntFromBool(expr, lhs);
+        left = types.intType();
+      }
+      if (right == types.boolType()) {
+        rhs = emitIntFromBool(expr, rhs);
+        right = types.intType();
+      }
+    }
+  }
   // ⭐ int * sequence is sequence * int. CPython gets there by returning
   // NotImplemented from int.__mul__ and running the sequence's __rmul__,
   // which for str/list/tuple/bytes IS __mul__ with the operands swapped --
@@ -1006,6 +1040,37 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
                                              types.boolType(),
                                              compared.getResult());
     return Value{pyBool.getResult(), types.boolType()};
+  }
+  // ⭐ The same bottom rung of the numeric tower emitBinary applies, applied to
+  // the comparison operands: bool IS an int, so the truth bit is widened and
+  // int's comparison runs. `True < 2` was refused with "builtins.bool.__lt__ is
+  // declared by the standard-library contract but has no implementation", and
+  // so were `==`, `!=` and the other three orderings against a number.
+  //
+  // ⛔ AFTER the bool-vs-bool equality above, not before: two bools compare
+  // through their truth bits with no boxing at all, and that is both correct
+  // and cheaper. This rung is for the pairs that reach int's operators.
+  //
+  // ⛔ And not for `is` / `is not`, which R6 below rejects on value types --
+  // promoting first would replace that diagnostic with an int identity test,
+  // which is the answer R6 exists to refuse to give.
+  {
+    auto numericOperand = [&](mlir::Type type) {
+      mlir::Type widened = types.widenLiteral(type);
+      return widened == types.boolType() || widened == types.intType() ||
+             widened == types.floatType();
+    };
+    bool comparesNumerically =
+        ast::isOperator(op, "Lt") || ast::isOperator(op, "LtE") ||
+        ast::isOperator(op, "Gt") || ast::isOperator(op, "GtE") ||
+        ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq");
+    if (comparesNumerically && (isBoolLike(lhs.type) || isBoolLike(rhs.type)) &&
+        numericOperand(lhs.type) && numericOperand(rhs.type)) {
+      if (isBoolLike(lhs.type))
+        lhs = emitIntFromBool(expr, lhs);
+      if (isBoolLike(rhs.type))
+        rhs = emitIntFromBool(expr, rhs);
+    }
   }
   auto emitNoneIdentityTest = [&](Value candidate,
                                   Value other) -> std::optional<Value> {

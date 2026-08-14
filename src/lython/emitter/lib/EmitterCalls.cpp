@@ -1396,13 +1396,7 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
   }
   if (argumentType == types.boolType()) {
     // int(True) == 1 / int(False) == 0: widen the truth bit.
-    Value argument = emitExpr(intArgs->front().get());
-    mlir::Value bit = emitBoolValue(argument, expr);
-    auto wide = mlir::arith::ExtUIOp::create(
-        builder, loc(expr), mlir::IntegerType::get(&context, 64), bit);
-    auto op = py::CastFromPrimOp::create(builder, loc(expr), types.intType(),
-                                         wide.getResult());
-    return Value{op.getResult(), types.intType()};
+    return emitIntFromBool(expr, emitExpr(intArgs->front().get()));
   }
   if (argumentType == types.strType() || argumentType == types.floatType()) {
     // The runtime-level __int__ methods of str (base-10 parse) and float
@@ -1532,6 +1526,26 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
   auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
                                              builder.getBoolAttr(truth));
   return Value{constant.getResult(), literalType};
+}
+
+// The bottom rung of the numeric tower: bool IS an int, so widening the truth
+// bit is the whole conversion. `int(True)` has always spelled it; this is that
+// spelling given a name so the OPERAND promotion in emitBinary can reach it.
+//
+// ⛔ Why NOT `coerceValue` to int, which is what the note here used to call the
+// obvious repair: it produces a bundle carrying bool's single value where the
+// int ABI expects three, and took out `float_floordiv_mod_round` with "runtime
+// bundle for builtins.int has 1 values, but ABI expects 3". A rung of the tower
+// is a CONVERSION, not a retyping -- the same reason `emitFloatFromInt` exists
+// one rung up.
+Value ModuleEmitter::emitIntFromBool(const parser::Node &anchor,
+                                     Value argument) {
+  mlir::Value bit = emitBoolValue(argument, anchor);
+  auto wide = mlir::arith::ExtUIOp::create(
+      builder, loc(anchor), mlir::IntegerType::get(&context, 64), bit);
+  auto op = py::CastFromPrimOp::create(builder, loc(anchor), types.intType(),
+                                       wide.getResult());
+  return Value{op.getResult(), types.intType()};
 }
 
 Value ModuleEmitter::emitFloatFromInt(const parser::Node &anchor,
