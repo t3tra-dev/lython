@@ -15,14 +15,24 @@
 #   s = "k"; d = {s: 1} .... aggregate_id=2  aggregate_parent=2  retains=2
 #   i = 5;   d = {i: 1} .... aggregate_id=0  aggregate_parent=0  retains=2
 #
-# So `chargeSlotRetainsToParent` (Core/CollectionPayload.cpp) stamps the dict
-# correctly whenever the payload is an ordinary object, and stamps NOTHING when
-# it is an int. `aggregate_id=0` says the identity was never even minted, so the
-# helper took one of its two early returns before reaching `aggregateIdentityOf`
-# -- the container lanes being empty, or the builder's insertion block no longer
-# being the block captured before the retains. An int arrives as a LAZY box and
-# materialising one emits the fast/slow `scf.if`, which is the one thing in this
-# path that can move the insertion block, so that is where to look first.
+# ⭐ AND THE HELPER IS NEVER REACHED, which the code already says out loud. A
+# comment in `initializeDictPayload` (Core/CollectionPayload.cpp, beside the
+# source-move rule) records it: "A dict literal reaches this function only when
+# every key is a `py.str_constant` (PackAndBindingOps.cpp), so `{i: v}` never
+# gets here -- one non-static key sends the whole literal down the `setitem_box`
+# probe path." That path emits its own `dict.literal.key` / `dict.literal`
+# retains and does not call `chargeSlotRetainsToParent`, which lives as a
+# file-local in the other file. Hence `aggregate_id=0`: nothing on this path ever
+# asks for the container's identity.
+#
+# That also explains the file's NAME, which predates the diagnosis: the static
+# key gate is what routes `{s: 1}` and `{i: 1}` to different lowerings.
+#
+# ⛔ Not the insertion block, which was the next guess and was measured: the
+# early return for a moved insertion block was replaced with a program-order
+# walk from the anchor, rebuilt, and `{i: 1}` still stamped nothing -- because
+# the helper is not on that path at all. Reverted rather than kept: a codegen
+# change that does not do what it was written for is not worth its risk.
 #
 # ⛔ An earlier version of this note said `LyDict_FromLength` carries no
 # `ly.ownership.aggregate_id` and that the list twin does. Both halves were
