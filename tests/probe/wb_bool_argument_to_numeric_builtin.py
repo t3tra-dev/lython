@@ -1,13 +1,15 @@
-# OPEN, narrowed twice on 2026-08-15. This file started as "five refusals, one
-# cause"; both halves were wrong, and what is left of it is two refusals whose
-# cause is not numeric.
+# OPEN, narrowed three times on 2026-08-15. This file started as "five
+# refusals, one cause"; both halves were wrong, and one refusal is left.
 #
-#   abs(True) ......... refused: builtins.bool.__abs__ has no implementation
-#   round(True) ....... refused: bool does not provide manifest '__round__'
+#   abs(True) ......... FIXED (tests/golden/cases/bool_inherits_int_methods.py)
 #   divmod(True, 2) ... FIXED (tests/golden/cases/divmod_of_bool.py)
 #   float(True) ....... FIXED (tests/golden/cases/float_of_bool.py)
 #   max(True, 2) ...... already worked; the operator repair of 2026-08-14
 #                       carried it, because max compares
+#   round(True) ....... refused, and NOT for a bool reason: int's __round__
+#                       contract makes ndigits required, so round(True, 0) works
+#                       and `n: int = 5; n.__round__()` is refused as well. See
+#                       tests/probe/wb_manifest_class_inherits_nothing.py.
 #
 # ⭐ IT IS NOT THE ARGUMENT BOUNDARY, which is what this file used to say. See
 # tests/probe/wb_argument_boundary_numeric_tower.py: at a PARAMETER boundary
@@ -25,16 +27,17 @@
 # matching arm because it runs first during overload selection. That is what
 # fixed divmod, and it is why nothing further is needed on the receiver side.
 #
-# ⭐ WHAT STILL REFUSES abs AND round IS RESOLUTION, NOT ADAPTATION: bool
-# inherits no method of int's in either the manifest implementation index or the
-# emitter's lookup, `bit_length` included. Recorded with the three disagreeing
-# tables in tests/probe/wb_manifest_class_inherits_nothing.py. divmod works and
-# abs does not for exactly that reason -- divmod resolves and abs does not.
+# ⭐ AND SO IS THE RESOLUTION. abs(True) needed a second half the adapter could
+# not supply: the manifest index had to find int's `__abs__` under a bool
+# receiver. `selectManifestMethod` now walks the base chain. divmod landed first
+# only because divmod resolved and abs did not -- the two halves were
+# independent all along, which is why the earlier "one cause" reading kept
+# producing predictions that measured wrong.
 #
 # ⛔ Why NOT widen the promotion into the builtin table (`kDunderBuiltins` in
-# EmitterCalls.cpp): it would paper over two names and leave `bit_length` and
-# every other inherited method refused. The table is a list of builtins, not the
-# boundary the rule belongs at.
+# EmitterCalls.cpp), which is where this file first pointed: it would have
+# papered over two names at the one boundary that turned out to hold neither
+# half of the cause. The table is a list of builtins, not a boundary.
 #
 # differential: skip refused; the point is the refusal
-print(abs(True), round(True))
+print(round(True))

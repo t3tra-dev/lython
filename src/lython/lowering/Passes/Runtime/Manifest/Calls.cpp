@@ -59,6 +59,50 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
     methods = manifest.methodCandidates("builtins.object", methodName);
   }
   if (methods.empty()) {
+    // ⭐ A manifest class inherits its base's implementations. `py.class @bool`
+    // declares nine methods of its own and `base_names = ["int"]`, while
+    // CPython's bool inherits every one of int's. The protocol table already
+    // resolves the DECLARATION through that base -- it is why the message just
+    // below can say the contract declares it -- and only this index stopped at
+    // the derived name, so abs(True), True.__int__(), __index__, __invert__ and
+    // round(True, 0) each reached lowering and died here.
+    //
+    // ⛔ Why NOT the source-class walk over the same `base_names`
+    // (`classMethodSymbol`, ABI/CallableABI.cpp): it resolves through
+    // `classForContract`, which does not find manifest classes -- the check
+    // below relies on exactly that to tell a stdlib contract from compiled
+    // code. The chain is read from the protocol table instead, the one table
+    // that already carries it.
+    const py::protocols::Table &table = py::protocols::Table::get(*context);
+    llvm::StringRef prefix = receiverContract;
+    prefix = prefix.substr(0, prefix.rfind('.') + 1);
+    llvm::SmallVector<std::string, 4> pending{std::string(receiverContract)};
+    llvm::SmallVector<std::string, 4> visited;
+    while (!pending.empty() && methods.empty()) {
+      std::string current = pending.pop_back_val();
+      if (llvm::is_contained(visited, current))
+        continue;
+      visited.push_back(current);
+      llvm::StringRef bare = llvm::StringRef(current).rsplit('.').second;
+      if (bare.empty())
+        bare = current;
+      const py::protocols::ProtocolInfo *info = table.lookup(bare);
+      if (!info)
+        continue;
+      for (const py::protocols::ProtocolBase &base : info->bases) {
+        // A base is spelled bare in `base_names` when it lives in the same
+        // manifest module as the class that names it.
+        std::string qualified = base.name;
+        if (!llvm::StringRef(qualified).contains('.'))
+          qualified = (llvm::Twine(prefix) + qualified).str();
+        methods = manifest.methodCandidates(qualified, methodName);
+        if (!methods.empty())
+          break;
+        pending.push_back(qualified);
+      }
+    }
+  }
+  if (methods.empty()) {
     // The empty promise, named for what it is. A contract that declares
     // `methodName` with nothing behind it used to report "runtime manifest has
     // no X.Y method", which reads to the author as "that method does not

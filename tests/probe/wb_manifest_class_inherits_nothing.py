@@ -1,57 +1,49 @@
-# OPEN, and NEW (found 2026-08-15) -- the cause behind abs(True) and
-# round(True), which tests/probe/wb_bool_argument_to_numeric_builtin.py had
-# attributed to the numeric tower. It is not numeric at all:
+# FIXED 2026-08-15 for the manifest index; the residue below is a DIFFERENT
+# defect that the first draft of this file misattributed to inheritance.
 #
-#   b: bool = True
-#   b.bit_length() .... bool does not provide manifest method 'bit_length'
-#   b.__abs__() ....... the same
-#   abs(True) ......... builtins.bool.__abs__ is declared by the standard-library
-#                       contract but has no implementation in Lython
-#   round(True) ....... bool does not provide manifest method '__round__'
+# WHAT WAS WRONG: `py.class @bool` declares nine methods and
+# `base_names = ["int"]` (runtime/modules/builtins.mlir:209), and CPython's bool
+# inherits every one of int's. Three tables answered differently about that:
 #
-# `py.class @bool` declares `base_names = ["int"]` and nine methods of its own
-# (runtime/modules/builtins.mlir:209). CPython's bool inherits every one of
-# int's; here it inherits NONE. bit_length is the proof that this is not about
-# abs, round, or the numeric tower.
+#   1. the protocol/contract table -- KNEW the base. `ProtocolInfo::bases` is
+#      populated from `base_names` (PyProtocols.cpp:884), which is why
+#      True.__int__() passed the emitter.
+#   2. the manifest implementation index -- DID NOT. `methodCandidates(
+#      "builtins.bool", "__abs__")` was empty and its only rescues were named
+#      special cases: exception ancestors, and the dunders every class inherits
+#      from object. So abs(True), True.__int__(), __index__, __invert__ and
+#      round(True, 0) all passed the emitter and died in lowering with
+#      "declared by the standard-library contract but has no implementation".
+#   3. the emitter's manifest lookup -- went through table 1, so it agreed.
 #
-# ⭐ THREE TABLES DISAGREE ABOUT INHERITANCE, and each failure above is one of
-# them answering:
+# `selectManifestMethod` now walks the base chain, reading it from the protocol
+# table because `classForContract` does not find manifest classes. Pinned by
+# tests/golden/cases/bool_inherits_int_methods.py; the receiver widening those
+# calls need was landed the same day in `appendRuntimeSource`.
 #
-#   1. the protocol/contract table -- KNOWS the base. It is what lets abs(True)
-#      past the emitter: `methodContractCandidatesWithEvidence` finds int's
-#      __abs__ declaration through bool, which is why the lowering diagnostic
-#      can say "declared by the standard-library contract"
-#      (Runtime/Manifest/Calls.cpp:74).
-#   2. the manifest implementation index -- DOES NOT. `methodCandidates(
-#      "builtins.bool", "__abs__")` is empty and Manifest/Index.h carries no
-#      base information at all, so there is nothing to walk. Its two rescues are
-#      named special cases: exception ancestors, and the dunders every class
-#      inherits from object.
-#   3. the emitter's manifest method lookup -- DOES NOT. This is the one that
-#      refuses bit_length and __round__ before lowering is reached.
+# ⛔ Two claims in the first draft of this file were WRONG and are recorded so
+# the measurements are not repeated:
 #
-# So a method reaches lowering when table 1 answers and dies there when table 2
-# cannot, and never leaves the emitter when table 3 cannot. The three failures
-# above are the same missing fact reported from three depths.
+#   `b.bit_length()` is NOT evidence of the inheritance gap. int does not
+#   declare bit_length at all -- `n: int = 5; n.bit_length()` is refused too.
+#   That is a missing method on int, and it has nothing to do with bool.
 #
-# ⛔ Why NOT declare int's methods on bool in builtins.mlir: it is the
-# variant-adding shape this project rejects, it would have to repeat every
-# method int gains, and `base_names` already states the fact -- nothing reads it.
+#   `round(True)` is NOT the inheritance gap either. int's `__round__` contract
+#   declares ndigits as a REQUIRED second parameter, so the no-argument form is
+#   refused for a plain int as well:
 #
-# ⛔ Why NOT reuse the source-class base walk (`classMethodSymbol` in
-# ABI/CallableABI.cpp:137, which does exactly this loop over `base_names`):
-# it resolves through `classForContract`, which does not find manifest classes.
-# The diagnostic at Manifest/Calls.cpp:69 relies on that -- `!classForContract`
-# is how it decides a receiver is a stdlib contract rather than compiled code.
-# The walk is right; the class it walks is not reachable from there.
+#     n: int = 5
+#     n.__round__()  ... refused    n.__round__(0) ... 5
+#     round(n) ....... 5            round(True) .... refused
 #
-# ⭐ THE RECEIVER SIDE IS ALREADY DONE. Once resolution reaches int's method,
-# a bool receiver has to become an int, and `appendRuntimeSource` widens the
-# truth bit as of 2026-08-15 (tests/golden/cases/divmod_of_bool.py pins it).
-# That is why divmod(True, 2) works and abs(True) does not: divmod resolves,
-# abs does not.
+#   round(n) works because the `round` builtin carries its own one-argument
+#   contract; the dunder does not. CPython's int.__round__ takes ndigits
+#   optionally, and the default exists here only as `ly.runtime.default_i64` on
+#   LyLong_Round (builtins.mlir:8122) -- a runtime fact the protocol contract
+#   does not carry. THAT is the remaining defect, and it is about optional
+#   parameters in manifest contracts, not about bases.
 #
 # differential: skip refused; the point is the refusal
 
-flag: bool = True
-print(flag.bit_length())
+n: int = 5
+print(n.__round__())
