@@ -13,7 +13,8 @@
 # float, a list, a user class -- and rebind_gen_w3int is in the set because its
 # yield is a Box holding an int, not an int. So the seven are not seven shapes
 # of one defect; they are one defect seen through seven payload types, and any
-# repair closes all of them at once.
+# repair closes all of them at once -- though see below: one of the seven has a
+# second gate behind the first, so "one repair" means widening more than one.
 #
 # ⭐ THE GATE IS ONE LINE, and as of 2026-08-15 it states the real requirement:
 # `lowerSourceGeneratorNext` (Runtime/Ops/SourceGenerator.cpp) asks whether the
@@ -24,10 +25,15 @@
 # old spelling was standing in for. Zero programs fixed by that change; it
 # renamed the requirement and moved one probe to its real next blocker.
 #
-# ⭐ AND rebind_gen_w3int IS NOT IN THIS CLUSTER after all. With the gate stating
-# lanes, it gets past and reports something else: "source generator yield from
-# lowering currently supports only straight-line delegation". A delegation
-# limitation, not a payload one, and it was invisible behind the int gate.
+# ⭐ AND rebind_gen_w3int IS BEHIND A SECOND GATE. With the first one stating
+# lanes, it gets past and reports:
+#
+#     source generator next lowering currently supports only straight-line
+#     pure int yield bodies
+#
+# Still a payload restriction, and still spelled as a contract name, but a
+# different one further in -- so the cluster needs BOTH gates widened, and
+# whoever takes it should expect a third.
 #
 # ⭐ AND THE REASON IT IS INT-ONLY IS STRUCTURAL, not a missing case in a switch.
 # Everything below that gate is written around a single SSA value per yield:
