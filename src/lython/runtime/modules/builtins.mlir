@@ -153,7 +153,8 @@ module attributes {
                     "__bool__", "__index__", "__hash__", "__lt__", "__le__",
                     "__gt__", "__ge__", "__repr__", "__str__", "__eq__", "__ne__",
                     "__pow__", "__abs__", "__format__",
-                    "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"],
+                    "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__",
+                    "__round__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.int">>, !py.union<!py.contract<"typing.SupportsInt">, !py.contract<"typing.SupportsIndex">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
@@ -192,7 +193,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -203,7 +205,8 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance",
+                    "instance"]
   } {}
 
   py.class @bool attributes {
