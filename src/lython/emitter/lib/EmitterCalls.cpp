@@ -936,16 +936,20 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // through a local (`g = self._f; g()`) already resolved the value,
         // which is what says the callable is fine and only the syntax was
         // routed wrongly.
-        if (std::optional<mlir::Type> fieldType =
-                lookupClassField(receiver.type, *methodName)) {
-          if (auto fieldCallable = mlir::dyn_cast_if_present<py::CallableType>(
-                  types.widenLiteral(*fieldType))) {
+        std::optional<mlir::Type> calleeFieldType =
+            lookupClassField(receiver.type, *methodName);
+        if (calleeFieldType) {
+          mlir::Type widenedField = types.widenLiteral(*calleeFieldType);
+          // A type object in a field is called to CONSTRUCT, so it takes the
+          // same route: the callee is the value, not a method of the receiver.
+          if (mlir::isa<py::CallableType, py::TypeType>(widenedField)) {
             if (std::optional<Value> fieldValue =
                     emitValueAttribute(*calleeNode, receiver, *methodName))
               return emitCallableDispatch(
                   expr, *fieldValue,
-                  emitCallOperands(expr, {}, /*includeAstArguments=*/true,
-                                   fieldCallable));
+                  emitCallOperands(
+                      expr, {}, /*includeAstArguments=*/true,
+                      mlir::dyn_cast<py::CallableType>(widenedField)));
           }
         }
 
@@ -956,7 +960,15 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // C.__setattr__ method" from the lowering — which is the same
         // points-away-from-the-defect wording the contract audit was written
         // about.
-        if (inheritsObjectDefaultDunder(receiver.type, *methodName) &&
+        // ⛔ Never for a name the class declares as a FIELD. That predicate
+        // answers for ANY name once the class linearizes onto object, so a
+        // field whose value this path could not call reached it and was
+        // reported as "'Box' inherits builtins.object.t" -- a member of object
+        // that does not exist. Whatever is wrong with calling the field, the
+        // message for it belongs to the paths below, which know what the field
+        // holds.
+        if (!calleeFieldType &&
+            inheritsObjectDefaultDunder(receiver.type, *methodName) &&
             !isImplementedObjectDefault(*methodName)) {
           auto contract =
               mlir::cast<py::ContractType>(types.widenLiteral(receiver.type));
