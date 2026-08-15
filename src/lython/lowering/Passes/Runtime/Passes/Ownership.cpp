@@ -2365,15 +2365,30 @@ bool releaseOwnedGroupByLiveness(
 // accumulating a one-lane float printed 0.0 where CPython prints 9.0 -- silent,
 // and surviving --release. tests/golden/cases/scalar_loop_carried_mutate.py
 // pins that shape.
+//
+// ⛔ AND `retainPoint` IS NOT DECORATION. The paragraph above says the three
+// `memref.alloc` boxes "depend on a different invariant -- the anchor may sit at
+// the header's definition". That invariant is a property of the SITE, not of the
+// producer, and the caller below establishes it in exactly one case: the header
+// is defined in the anchor's own block, where the retain is hoisted to just
+// after the definition so it precedes a release. Everywhere else the retain goes
+// before the anchor's terminator, blocks away from the alloc, and asking the
+// definition question there refuses a program for a window that closed in an
+// earlier block -- which is what `for` inside `try` was refused for
+// (`tests/golden/cases/loop_in_try_cell_merge.py`). So the point is passed in
+// rather than assumed.
 bool borrowEdgeRetainIsSpellable(mlir::Value header,
-                                 mlir::func::FuncOp retainFunction) {
+                                 mlir::func::FuncOp retainFunction,
+                                 mlir::Operation *retainPoint,
+                                 const mlir::DominanceInfo &dominance) {
   // Why NO ablation switch for this one, unlike the rest of this file: both other
   // readings of this predicate are known to produce a wrong RELEASE -- the shipped
   // one over-releases the merge case, the naive one over-retains three boxing
   // cases. `LYTHON_ABLATE_OWNERSHIP_SYMBOL_TABLE` is safe to ship because a
   // mistake with it set costs compile time; a switch here would cost memory
   // safety. Both arms were measured on one build and the switches removed.
-  return entity_header::prefixIsInitializedAtDefinition(header) &&
+  return entity_header::prefixIsInitializedBefore(header, retainPoint,
+                                                  dominance) &&
          own::canSpellHeaderPrefix(
              header.getType(), retainFunction.getFunctionType().getInput(0));
 }
@@ -3071,6 +3086,14 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       if (definition->getBlock() == anchorBlock)
         builder.setInsertionPointAfter(definition);
     }
+    // The op the retain will sit in FRONT of, which is what the spellability
+    // question is about — not the header's definition, which the three branches
+    // above only sometimes agree with. A block always ends in a terminator, so
+    // the `end()` arm is unreachable defensiveness rather than a real case.
+    mlir::Operation *retainPoint =
+        builder.getInsertionPoint() == builder.getInsertionBlock()->end()
+            ? builder.getInsertionBlock()->getTerminator()
+            : &*builder.getInsertionPoint();
     mlir::Type retainInput = retainFunction.getFunctionType().getInput(0);
     mlir::Value header = retain.header;
     if (header.getType() != retainInput) {
@@ -3079,7 +3102,17 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
         header = mlir::memref::CastOp::create(builder, anchor->getLoc(),
                                               retainInput, header)
                      .getResult();
-      } else if (borrowEdgeRetainIsSpellable(retain.header, retainFunction)) {
+      } else if (
+          // Rebuilt per retain rather than hoisted: the edge split above
+          // inserts blocks, so dominance computed before this loop would answer
+          // about a CFG that no longer exists. Only reached when the header
+          // needs its prefix spelled, which no golden hits more than once.
+          [&] {
+            mlir::DominanceInfo dominance(
+                anchor->getParentOfType<mlir::func::FuncOp>());
+            return borrowEdgeRetainIsSpellable(retain.header, retainFunction,
+                                               retainPoint, dominance);
+          }()) {
         header = own::spellHeaderPrefix(builder, anchor->getLoc(), header,
                                         retainInput);
         if (!header)

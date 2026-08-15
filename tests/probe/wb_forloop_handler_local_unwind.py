@@ -1,3 +1,38 @@
+# FIXED 2026-08-15, and by NONE of the four parts costed below.
+#
+# ⭐ THE REPAIR ACCEPTS THE TWO ENTITIES AND PAYS FOR THE SECOND. Everything
+# under "ATTEMPTED REPAIR" tries to make the block-argument incarnation stop
+# existing (B+D delete the pure-renaming group, C teaches the verifier the old
+# name, A pins the handler check to every name) -- four parts, 80 of 490 tests
+# refused, not shipped. Two entities sharing one allocation is not the defect:
+# it is the ordinary shape of a loop-carried merge, and it is CORRECT as soon
+# as the entry edge LENDS a reference, which is what
+# `insertBlockArgMergeBorrowRetains` was already trying to do. It was refusing
+# instead, because `borrowEdgeRetainIsSpellable` asked whether the cell's
+# refcount word is written AT THE `memref.alloc` -- and the retain does not go
+# there. It goes before the branch in the block the alloc dominates, blocks
+# later, with `ly.ownership.owned_local_object` in between. The predicate now
+# takes the point the retain will occupy (`prefixIsInitializedBefore`).
+#
+# ⭐ SO THE THREE OBSERVABLE DEFECTS BELOW WERE ALL ONE MISSING RETAIN. Defect 1
+# (the pad releases the cell, the handler reads it freed) and defect 2 (two
+# releases on the normal path) are both a refcount of 1 being spent twice; with
+# the lend it is 2. Defect 3 (the verifier reports no release for a token
+# released two instructions earlier) is the one that says so directly -- it
+# honours a release under a pre-rename name exactly when `state.borrowed > 0`,
+# which is the retain, so the walk it was written to accept is the one that now
+# happens.
+#
+# ⛔ THE INTERVENING STATE IS WHY THIS TOOK A SECOND PASS. Between bcfbbf9 and
+# the fix the crash had already become a REFUSAL -- same site, same cause, and
+# no longer a memory-safety event, so nothing here read as urgent. A defect
+# that has been de-fanged is still the defect.
+#
+# golden: tests/golden/cases/loop_in_try_cell_merge.py (red-checked; nine
+# spellings, `for`/`while`, `except`/`finally`, function and module scope,
+# int/float/str, and it is in the leak gate because the repair ADDS a retain).
+#
+# ============================================================
 # SHIPPED SIGSEGV on bcfbbf9. NO GENERATOR, NO EXCEPTION EVER RAISED.
 #
 # Run it: `rc=139`, deterministic 5/5. CPython prints 3.

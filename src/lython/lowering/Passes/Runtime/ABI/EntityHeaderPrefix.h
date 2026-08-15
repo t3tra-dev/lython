@@ -64,6 +64,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 
 #include <cstdint>
@@ -165,6 +166,46 @@ inline bool prefixIsInitializedAtDefinition(mlir::Value handle) {
   // container handle comes out of its contract's allocator as a call result, not
   // as a block argument (rfc/stdlib-semantics.md, family D).
   return mlir::isa_and_nonnull<mlir::func::CallOp>(root.getDefiningOp());
+}
+
+// The same PROVENANCE question asked at a PROGRAM POINT, for a writer whose
+// store does not land at the definition.
+//
+// ⛔ WHY THIS IS NOT A RELAXATION of the predicate above, which is the reading
+// that shipped an over-release once already. "At the definition" is the right
+// question only while the write is anchored there, and
+// `insertBlockArgMergeBorrowRetains` anchors there in exactly one case: the
+// header is defined in the anchor's OWN block, where the retain must be hoisted
+// above a release of the same value. A header defined in a block that dominates
+// the anchor is written before the anchor's terminator instead -- a different
+// program point, with the initialisation window closed in an earlier block.
+// Answering the definition question there is answering about a point the write
+// never reaches.
+//
+// ⭐ What closes the window is the MARKER, not the distance.
+// `verifyInitialisationWindowIn` refuses any `ly.ownership.owned_local_object`
+// the word-0 store does not dominate, so a marker dominating `point` IS the
+// proof that word 0 is stored there. Why NOT accept "defined in an earlier
+// block" on its own: raw storage can be allocated in one block and boxed in the
+// next, and that shape would then read a refcount nothing has written.
+inline bool prefixIsInitializedBefore(mlir::Value handle,
+                                      mlir::Operation *point,
+                                      const mlir::DominanceInfo &dominance) {
+  if (prefixIsInitializedAtDefinition(handle))
+    return true;
+  if (!point || !typeCarriesHeaderPrefix(handle.getType()))
+    return false;
+  auto markedBefore = [&](mlir::Value value) {
+    for (mlir::Operation *user : value.getUsers())
+      if (user->hasAttr("ly.ownership.owned_local_object") &&
+          dominance.properlyDominates(user, point))
+        return true;
+    return false;
+  };
+  if (markedBefore(handle))
+    return true;
+  mlir::Value root = handleProvenanceRoot(handle);
+  return root != handle && markedBefore(root);
 }
 
 } // namespace py::lowering::entity_header

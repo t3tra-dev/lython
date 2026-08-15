@@ -640,6 +640,12 @@ set(LYTHON_LEAK_GATE_CASES
     # the right text -- and the arms are exercised thousands of times so the
     # count is the only thing that separates balance from drift.
     union_return_two_owning_members
+    # A loop inside a `try`: the borrow edge into the loop header now carries a
+    # retain, and the only two ways of being wrong about it are invisible to
+    # stdout. One too few frees the cell while the loop still reads it (that
+    # was the SIGSEGV); one too many is a cell per entry to the statement, and
+    # the accumulation prints the same either way.
+    loop_in_try_cell_merge
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

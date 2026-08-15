@@ -1,3 +1,21 @@
+# FIXED 2026-08-15 by the repair in `wb_forloop_handler_local_unwind.py`, and
+# this file is why that repair can be believed. Everything the table below
+# established as WIDER than the `except` form -- the `finally` clause, `while`,
+# module scope, a local nobody reads again -- is one program point: the borrow
+# edge into a loop-carried merge, refused a retain because the spellability
+# predicate asked about the `memref.alloc` instead of about where the retain
+# goes. Nothing in the repair mentions `except`, `for`, a frame or a read, so
+# the seven crashing rows and the five clean ones both fall out of it.
+#
+# ⭐ AND THE PREDICTION HELD BOTH WAYS. The five `.....` rows are programs that
+# never reach the merge, so they were already correct and had to stay correct;
+# 710/710 in both builds says they did.
+#
+# golden: tests/golden/cases/loop_in_try_cell_merge.py (red-checked), whose
+# `for_finally` is this shape with the loop in the try body and `while_rebind`
+# is the `while` row.
+#
+# ============================================================
 # SHIPPED SIGSEGV on 51fb04d. rc=139, deterministic 5/5. CPython prints 4.
 # NO `except` CLAUSE ANYWHERE, and nothing outside the `try` statement reads
 # the local the loop writes.
@@ -62,12 +80,11 @@
 # accumulator, i.e. it lacks (c). nestgrid.py counts that edge for exactly this
 # reason.
 #
-# ⚠️ NO REPAIR, so no golden. `wb_forloop_handler_local_unwind.py` records a
-# four-part attempt that turns the `except` form into a correct answer at the
-# cost of 80 of 490 tests REFUSED, and its root cause -- one object tracked as
-# two ownership entities across the loop's back edge -- is in `src/`, which
-# other tracks own this session. Nothing in `src/` was touched to produce this
-# file.
+# ⛔ THE PARAGRAPH THAT STOOD HERE SAID "NO REPAIR, so no golden", and pointed
+# at the four-part attempt that costs 80 of 490 tests. It is kept as history in
+# the other file and it is not what shipped: two ownership entities over one
+# allocation is the ordinary shape of a merge, and the repair pays the second
+# one rather than deleting it.
 def w() -> int:
     acc = 0
     try:

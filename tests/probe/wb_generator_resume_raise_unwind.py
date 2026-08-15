@@ -1,3 +1,31 @@
+# BOTH DEFECTS CLOSED, and NEITHER by anything aimed at a generator. The file
+# is kept because what it got wrong about its own shape is the reusable part.
+#
+# ⭐ (1) THE SIGSEGV WAS THE LOOP-CARRIED CELL, not the pad. The write-up below
+# reads the IR correctly -- the unwind pad deallocates the cell and the handler
+# then loads it -- and draws the wrong conclusion from it, that the pad runs too
+# early. The pad runs exactly where it should. The cell's refcount was 1 when
+# two entities were entitled to release it, because the entry edge into the loop
+# header was refused its lend. Fixed 2026-08-15 in
+# `borrowEdgeRetainIsSpellable`; the ⭐ is in
+# `wb_forloop_handler_local_unwind.py`.
+#
+# ⛔ SO THE MINIMISATION BELOW IS EVIDENCE ABOUT ONE COMPILER, NOT ABOUT THE
+# DEFECT, and it says so twice over: the warning under it already records two
+# rows that moved, and the row it rests on ("same try/except/accumulator, NO
+# generator .... OK") is the crashing program of the file that superseded it.
+# Eight spellings of one shape cannot separate the generator from the loop when
+# every spelling has the loop.
+#
+# ⭐ (2) THE BOUNDED LEAK IS ALSO GONE, and it was closed by other work -- the
+# generator frame's unwind edge (`traceback_generator_raise`,
+# `cross_generator_throw_unwind` in the leak gate). Re-measured 2026-08-15 with
+# `tests/leak_gate.py`, which counts the runtime's own allocations rather than
+# `leaks` roots: the uncaught form is `net 0 allocs / 0 B`, and so are the two
+# spellings the table used to separate bounded from per-iteration (a 16-element
+# argument list, and raising on the SECOND resume).
+#
+# ============================================================
 # TWO OPEN DEFECTS on df48b61, both isolated, NEITHER FIXED. They share one
 # shape: an exception raised INSIDE a generator body, escaping the resume.
 #
