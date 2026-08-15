@@ -1,9 +1,9 @@
-# OPEN. A union with TWO owning members, returned:
+# FIXED 2026-08-15. A union with TWO owning members, returned, was refused:
 #
 #     conditionally owned resource from @pick3 result 4 reaches function exit
 #     without tag-conditioned release, transfer, or owned return
 #
-# BISECTED against ./build/bin/lyc:
+# BISECTED before the repair:
 #
 #   int | str | None, returned and printed ..... refused   <- this file
 #   int | None, the same shape ................. OK (cases/union_renders_by_tag)
@@ -11,26 +11,21 @@
 #   int | str | None built and NARROWED in the
 #     same frame, never returned ............... OK
 #
-# So it is the two OWNING members crossing the return boundary, not the third
-# member and not the rendering: the renderer handles a three-member chain, and
-# every two-member spelling of the same program runs.
+# ⭐ THE CAUSE WAS ONE FIELD, and the two-member ABI is what pointed at it:
 #
-# ⭐ LOCALIZED 2026-08-15 to the exact declaration, which is one field:
-#
-#     struct ReturnedStaticObjectSummary {     // Runtime/Model/Bundles.h:372
+#     struct ReturnedStaticObjectSummary {     // Runtime/Model/Bundles.h
 #       mlir::Type objectContract;             //  <- ONE
 #       unsigned resultIndex = 0;
 #     };
 #
-# `buildReturnedStaticObjectSummaries` (Evidence/Returned.cpp) walks the
-# returns collecting the object contract each one produces, and the moment a
-# SECOND distinct one appears it sets `allReturnsSummarized = false` and emits
-# no summary at all. No summary means no owned-result lane, which is why the
-# obligation stays conditional all the way to the exit -- the verifier is
-# reporting the absence correctly.
+# `buildReturnedStaticObjectSummaries` collects the object contract each return
+# produces and abandons the whole summary the moment a SECOND distinct one
+# appears. No summary meant no owned-result lane, so the obligation stayed
+# conditional all the way to the exit and the verifier reported the absence
+# correctly.
 #
-# ⭐ WHAT THE LANE ACTUALLY IS, measured from the two ABIs, because it is not
-# the union's own layout and that is the surprise:
+# ⭐ AND THE ABIs SAID WHAT THE ONE-MEMBER PATH ACTUALLY DOES, which is what
+# kept the repair from being the obvious one:
 #
 #   str | None      -> (i64 tag, str hdr, str bytes, str hdr, str bytes)
 #                      owned_results = [3], contracts = ["builtins.str"]
@@ -38,33 +33,40 @@
 #                       str hdr, str bytes)
 #                      no owned_results at all
 #
-# The two-member ABI carries the str lanes TWICE: once as the union's own
-# member layout (borrowed) and once as an appended static-object evidence lane
-# (owned). So the repair is not "mark the union's member lanes owned" -- it is
-# "append one evidence lane per owning member", and the attribute side already
-# takes a list (`owned_results` is a DenseI64Array and
-# `owned_result_contracts` an ArrayAttr; the generator clone path in
-# CallableABI.cpp already writes several).
+# The two-member ABI carries the str lanes TWICE -- once as the union's own
+# member layout, borrowed, and once as an appended static-object evidence lane,
+# owned. So the summary is not a description of the union's layout; it is an
+# extra copy bolted beside it.
 #
-# ⛔ WHY IT IS STILL NOT A SMALL CHANGE, and the four sites are the estimate:
+# ⛔ Why NOT extend that summary to a LIST of contracts, which is what the
+# attribute already takes (`owned_results` is a DenseI64Array and the generator
+# clone path writes several): it appends a duplicate lane per member, and the
+# caller would then need one conditionally owned bundle per duplicate while
+# `RuntimeBundle` has a single `boxedObject` slot. That is the wall the earlier
+# note called "the missing mechanism".
 #
-#   1. Evidence/Returned.cpp -- collect a SET of contracts and order it by the
-#      union's member order (not by the order the returns were walked, or the
-#      ABI is not a function of the type).
-#   2. ABI/CallableABI.cpp:1082 -- loop the append instead of doing it once.
-#   3. ABI/Returns.cpp:452 -- per member, fill the lane from the active member
-#      when it matches and from a dead placeholder otherwise. Already written
-#      for one; the loop is mechanical.
-#   4. Ops/FunctionTargetCalls.cpp:679 -- THE HARD ONE. `RuntimeBundle` has a
-#      single `boxedObject` slot, and with two owning members which one holds
-#      the token is a RUNTIME question the tag answers. The caller needs a
-#      per-lane conditional bundle and a release emitted under
-#      `cmpi eq(tag, activeTag)` -- which is the same missing mechanism as
-#      tests/probe/wb_union_carried_exit_release_leak.py, reached from the
-#      return instead of the loop. Neither is waiting on the guard itself;
-#      both are waiting on a bundle that can be conditionally owned.
+# ⭐ THE REPAIR GOES ROUND IT. The union's OWN layout already puts each member
+# after the tag, and `collectTypedResourceGroups` (common/Ownership.cpp)
+# already walks those lanes and already stamps each group with its
+# `OwnershipCondition{tag, memberIndex, memberCount}`. Every piece of the
+# conditional machinery was present; nothing named the offsets. So a union
+# result with more than one owning member now declares its own member lanes as
+# owned results (`prepareCallableFunctionABIs`), and no second copy exists to
+# need a second bundle.
 #
-# differential: skip refused; the point is the refusal
+# "Owning" is asked of the manifest, not guessed from the type: a member counts
+# only when some `ly.runtime.deallocator` claims its contract, so a bool or a
+# None member names no lane.
+#
+# ⛔ WHAT IS STILL THE ONE-MEMBER PATH: a union with exactly one owning member
+# keeps the static-object evidence lane it has always had. Two mechanisms for
+# one job is a smell, and unifying them is a real simplification -- but the
+# evidence lane also carries the PROTOCOL and coroutine returns through the
+# same field, so removing it is not a union change. Measured, not merged.
+#
+# golden: tests/golden/cases/union_return_two_owning_members.py (red-checked;
+# also in LYTHON_LEAK_GATE_CASES, since which lane gets released is invisible
+# to stdout)
 
 
 def pick3(n: int) -> int | str | None:

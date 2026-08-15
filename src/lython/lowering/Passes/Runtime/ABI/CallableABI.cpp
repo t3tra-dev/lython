@@ -747,6 +747,23 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
 
 mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
   mlir::LogicalResult result = mlir::success();
+  // Collected once: the walk below asks, per union-typed result, which of its
+  // members are entities the caller has to release. Only a contract with a
+  // release interface is one -- `int | str | None` has two and `int | None`
+  // has one, and a member that is merely NAMED (a bool, a None) has none.
+  llvm::SmallVector<ownership::RuntimeDeallocator, 8> deallocators =
+      ownership::collectRuntimeDeallocators(module);
+  auto memberOwnsALane = [&](mlir::Type member) {
+    if (py::isPyNoneType(member))
+      return false;
+    std::string contract = runtimeContractName(member);
+    if (contract.empty())
+      return false;
+    return llvm::any_of(deallocators,
+                        [&](const ownership::RuntimeDeallocator &candidate) {
+                          return candidate.contractName == contract;
+                        });
+  };
   module.walk([&](mlir::func::FuncOp function) {
     auto callableType =
         function->getAttrOfType<mlir::TypeAttr>("callable_type");
@@ -1071,6 +1088,48 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         ownedResultOffsets.push_back(
             static_cast<std::int64_t>(resultTypes.size()));
         ownedResultContracts.push_back(builder.getStringAttr("builtins.object"));
+      }
+      // ⭐ A union with MORE THAN ONE owning member owns its OWN member lanes.
+      // With one, the static-object summary below appends a second copy of
+      // that member and marks THAT owned; the summary carries a single
+      // contract, so with two it produces nothing at all and the obligation
+      // reached the exit unnamed ("conditionally owned resource from @pick3
+      // result 4 reaches function exit"). The union's layout already lays each
+      // member out after the tag, so the lanes to name are there -- what was
+      // missing was naming them.
+      //
+      // ⛔ Why NOT extend the static-object summary to a list of contracts
+      // instead, which is the shape the attribute already takes: that appends
+      // a DUPLICATE lane per member, and the caller would then need one
+      // conditionally owned bundle per duplicate while `RuntimeBundle` has a
+      // single `boxedObject` slot. The union's own lanes need no second bundle
+      // -- `collectTypedResourceGroups` already walks them and already stamps
+      // each with its `OwnershipCondition{tag, memberIndex}`, so the whole
+      // conditional machinery is reached by declaring the offsets.
+      if (auto unionResult =
+              mlir::dyn_cast_if_present<py::UnionType>(abiResultType)) {
+        llvm::SmallVector<std::pair<std::int64_t, std::string>, 2> memberLanes;
+        std::int64_t memberOffset =
+            static_cast<std::int64_t>(resultTypes.size()) + 1;
+        bool laid = true;
+        for (mlir::Type member : unionResult.getMemberTypes()) {
+          mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
+              RuntimeBundleLowerer::runtimeValueTypesFor(
+                  function, member, "union result member lane");
+          if (mlir::failed(memberTypes)) {
+            laid = false;
+            break;
+          }
+          if (memberOwnsALane(member))
+            memberLanes.emplace_back(memberOffset, runtimeContractName(member));
+          memberOffset += static_cast<std::int64_t>(memberTypes->size());
+        }
+        if (laid && memberLanes.size() > 1) {
+          for (const auto &[offset, contract] : memberLanes) {
+            ownedResultOffsets.push_back(offset);
+            ownedResultContracts.push_back(builder.getStringAttr(contract));
+          }
+        }
       }
       if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
               function, abiResultType, resultTypes))) {

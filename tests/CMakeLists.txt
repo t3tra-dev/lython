@@ -633,6 +633,13 @@ set(LYTHON_LEAK_GATE_CASES
     # an insert. The table itself is a second allocation per set, so a missed
     # free here is invisible to every other check.
     set_table_order
+    # A union return with two owning members. Each member's lane is declared
+    # owned on its own, so the caller holds several conditional obligations at
+    # once and discharges exactly the one the tag selects. Nothing printed can
+    # tell a released inactive lane from an unreleased active one -- both give
+    # the right text -- and the arms are exercised thousands of times so the
+    # count is the only thing that separates balance from drift.
+    union_return_two_owning_members
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
