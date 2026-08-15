@@ -28,8 +28,29 @@
 # the continuation's use is `py.next @__next__ : ...(%it : !py.protocol<...>)`.
 # An object-typed argument does not spell that operand. The lane would have to
 # carry a LOGICAL type beside its physical shape, and the lane grouping (keyed
-# by contract name today) would have to key on the logical one. That is the
+# by contract name today) would have to key on the logical one. That is one
 # mechanism; it was scoped, not built.
+#
+# ⭐ AND THERE IS A SECOND ONE, FOUND 2026-08-16, which does not touch the lane
+# at all: GIVE THE LIST A REAL ITERATOR CONTRACT. The reason `range` works is
+# not that ranges are special -- it is that `builtins.range_iterator` is a
+# manifest class with `ly.runtime.shape`, `alloc`, `__iter__`, `__next__` and a
+# deallocator. `builtins.str_iterator` is the same pattern, and `for c in s:
+# yield c` inside a generator gets past this scan for exactly that reason (it
+# then fails further downstream, in `str.join`). Those are the only two
+# iterator contracts the manifest has:
+#
+#     ly.runtime.contracts = [..., "builtins.range_iterator",
+#                                  "builtins.str_iterator", ...]
+#
+# A list is iterated as an index walk over the container instead, so `py.iter`
+# has nothing concrete to answer with and produces the protocol. A
+# `builtins.list_iterator` (header + index + the list handle, mirroring
+# str_iterator's header + state + source) would make this generator eligible
+# with no change to the lane machinery, and would carry tuple/dict/set behind
+# it. Which of the two mechanisms is right is a design call: the lane one is
+# general and touches the suspension ABI, this one is local and adds a runtime
+# class per container.
 
 from typing import Iterator
 
