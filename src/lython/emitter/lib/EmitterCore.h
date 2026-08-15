@@ -242,6 +242,12 @@ private:
   void collectModuleGlobals(const parser::Node &moduleNode);
   bool isModuleGlobalRead(llvm::StringRef name) const;
   bool isModuleGlobalWrite(llvm::StringRef name) const;
+  // Where a structural mutation's re-described receiver goes: a local's
+  // binding or the module global's cell (EmitterGlobals.cpp).
+  bool isStructuralMutationRebindable(llvm::StringRef name,
+                                      mlir::Value receiver) const;
+  void rebindStructuralMutation(const parser::Node &at, llvm::StringRef name,
+                                Value rebound);
   // Mark a py.global.get/set that reaches the MODULE-GLOBAL population, so
   // lowering gives an `int` one the boxed object cell instead of the machine
   // word. Default cells and class-attribute slots ride the same two ops and

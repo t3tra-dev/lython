@@ -604,9 +604,8 @@ void ModuleEmitter::emitSliceMutation(const parser::Node &target,
   }
   Value container = emitExpr(containerNode);
   llvm::StringRef containerName = ast::nameSpelling(*containerNode);
-  auto bound = values.find(containerName);
-  if (bound == values.end() || bound->second.value != container.value) {
-    unsupported("requires a rebindable local list target");
+  if (!isStructuralMutationRebindable(containerName, container.value)) {
+    unsupported("requires a rebindable local or module-global list target");
     return;
   }
 
@@ -658,36 +657,40 @@ void ModuleEmitter::emitSliceMutation(const parser::Node &target,
       namePack.value, valuePack.value);
   op->setAttr("ly.bound_method", builder.getStringAttr(methodName));
   op->setAttr("ly.structural_mutation", builder.getUnitAttr());
-  values[containerName] = Value{op.getResult(1), container.type};
+  rebindStructuralMutation(target, containerName,
+                           Value{op.getResult(1), container.type});
 }
 
 void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
   if (target.kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(target);
-    // ⭐ `global X` where X is not a global this walk can WRITE. Only
-    // storage-backed (annotated int) module globals get a cell, so a
-    // container global fell through to the local binding below and the write
-    // was a silent no-op:
+    // ⭐ `global X` where X is not a global this walk can WRITE. A name with
+    // no cell falls through to the local binding below, which makes the write
+    // a silent no-op -- the module global keeps its old value:
     //
-    //     X: list[int] = [1]
+    //     X: list[int] | None = [1]
     //     def f() -> None:
     //         global X
     //         X = [2]
     //     f(); print(X)      # printed [1]; CPython prints [2]
     //
-    // Refused rather than made to work: the cell a container global would
-    // need does not exist, and the declaration is an explicit statement that
-    // this assignment is not a local one -- so binding a local is the one
-    // answer it cannot have.
+    // Refused rather than made to work: the declaration is an explicit
+    // statement that this assignment is not a local one, so binding a local is
+    // the one answer it cannot have. The population it names shrank when every
+    // contract got a cell -- the example above was `list[int]` until then --
+    // and what is left is the annotations with no runtime value group to store
+    // (a union, a protocol, a callable, `type[X]`), plus every UNannotated
+    // module name, which is value-bound by the opt-in rule.
     if (!atModuleScope && currentGlobalDecls.count(name) &&
         !moduleGlobals.count(name)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, target.range.start,
           "'global " + name.str() +
               "' names a module global this compiler does not give storage "
-              "to, so the assignment cannot reach it; an annotated module "
-              "global of a scalar, bytes, ctypes-pointer or user-class type "
-              "is writable from a function, a container is not"});
+              "to, so the assignment cannot reach it; a module global is "
+              "writable from a function when it is annotated with a concrete "
+              "type, which a union, a protocol, a callable and 'type[X]' are "
+              "not"});
       return;
     }
     if (isModuleGlobalWrite(name)) {
@@ -902,8 +905,7 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     if (containerNode && containerNode->kind == "Name" &&
         types.isStructuralMutatorMethod(container.type, "__setitem__")) {
       llvm::StringRef containerName = ast::nameSpelling(*containerNode);
-      auto bound = values.find(containerName);
-      if (bound != values.end() && bound->second.value == container.value) {
+      if (isStructuralMutationRebindable(containerName, container.value)) {
         auto op = py::SetItemOp::create(
             builder, loc(target),
             mlir::TypeRange{container.value.getType()},
@@ -911,7 +913,8 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
             callProtocolFor(inference), container.value, index.value,
             value.value);
         op->setAttr("ly.structural_mutation", builder.getUnitAttr());
-        values[containerName] = Value{op.getResult(0), container.type};
+        rebindStructuralMutation(target, containerName,
+                                 Value{op.getResult(0), container.type});
         return;
       }
     }

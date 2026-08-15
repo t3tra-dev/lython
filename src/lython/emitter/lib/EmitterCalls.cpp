@@ -1044,8 +1044,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         if (receiverNode->kind == "Name" &&
             types.isStructuralMutatorMethod(receiver.type, *methodName)) {
           llvm::StringRef receiverName = ast::nameSpelling(*receiverNode);
-          auto bound = values.find(receiverName);
-          if (bound != values.end() && bound->second.value == receiver.value) {
+          if (isStructuralMutationRebindable(receiverName, receiver.value)) {
             auto op = py::CallOp::create(
                 builder, loc(expr),
                 mlir::TypeRange{resultType, receiver.value.getType()},
@@ -1053,7 +1052,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 namePack.value, valuePack.value);
             op->setAttr("ly.bound_method", builder.getStringAttr(*methodName));
             op->setAttr("ly.structural_mutation", builder.getUnitAttr());
-            values[receiverName] = Value{op.getResult(1), receiver.type};
+            rebindStructuralMutation(expr, receiverName,
+                                     Value{op.getResult(1), receiver.type});
             return {op.getResults().front(), resultType};
           }
         }

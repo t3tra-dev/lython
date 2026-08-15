@@ -1,11 +1,12 @@
-# `global X` for a container global used to fall through to a LOCAL binding,
-# so the assignment was a silent no-op and the module global kept its old
-# value. A container is the one annotated shape with no cell to write -- its
-# structural mutations reallocate the interior arrays through SSA rebinding,
-# which a cell would go stale against -- and the declaration is an explicit
-# statement that the assignment is not a local one, so binding a local is the
-# one answer it cannot have.
-X: list[int] = [1]
+# `global X` for a name with no cell falls through to a LOCAL binding, so the
+# assignment is a silent no-op and the module global keeps its old value. The
+# declaration is an explicit statement that the assignment is not a local one,
+# so binding a local is the one answer it cannot have.
+#
+# This was a `list[int]` until container globals got cells. A union is what is
+# left: it stays value-bound so isinstance narrowing keeps working on the
+# module flow, which means there is nothing for the write to reach.
+X: list[int] | None = [1]
 
 
 def f() -> None:

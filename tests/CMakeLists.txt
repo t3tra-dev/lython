@@ -646,6 +646,11 @@ set(LYTHON_LEAK_GATE_CASES
     # was the SIGSEGV); one too many is a cell per entry to the statement, and
     # the accumulation prints the same either way.
     loop_in_try_cell_merge
+    # Container module globals: the cell parks ONE retained reference, and a
+    # rebinding has to release exactly the one it replaces. Every print here is
+    # right whether the read retained or not, and whether the rebinding
+    # released the old holder or leaked it.
+    container_module_globals
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
