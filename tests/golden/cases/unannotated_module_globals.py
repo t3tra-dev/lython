@@ -84,6 +84,35 @@ def go() -> int:
 print(go(), go(), COUNTER.n)
 
 
+# --- `global NAME` over a plain literal binding ---------------------------
+# A literal bound once is re-emitted at each reference rather than given a
+# cell, which is cheaper and correct for a read -- and there is nothing to
+# write into, so the counter idiom was "'global COUNT' names a module global
+# this compiler does not give storage to". A `global` declaration is the
+# strongest statement a program can make that the binding needs storage.
+COUNT = 0
+FLAG = False
+LABEL = "start"
+
+
+def bump() -> int:
+    global COUNT
+    COUNT += 1
+    return COUNT
+
+
+def finish(name: str) -> None:
+    global FLAG, LABEL
+    FLAG = True
+    LABEL = name
+
+
+print(bump(), bump(), COUNT)
+print(FLAG, LABEL)
+finish("done")
+print(FLAG, LABEL)
+
+
 # --- a name a function does NOT read keeps its value binding --------------
 # `local` is bound at module scope and read only here; `shadow` is the same
 # spelling as a function's own local, so the function does not capture it and

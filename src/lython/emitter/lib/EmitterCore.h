@@ -240,6 +240,8 @@ private:
       const parser::Node &moduleNode, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values) const;
   void collectModuleGlobals(const parser::Node &moduleNode);
+  // Every name any function in `scope` declares `global`, at any depth.
+  llvm::StringSet<> moduleGlobalDeclarations(const parser::Node &scope) const;
   bool isModuleGlobalRead(llvm::StringRef name) const;
   bool isModuleGlobalWrite(llvm::StringRef name) const;
   // Where a structural mutation's re-described receiver goes: a local's

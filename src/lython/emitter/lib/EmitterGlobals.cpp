@@ -89,7 +89,16 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
   // an unboxed i64, so `fact = 1` grown past 2**63 raised where it printed --
   // measured at 4 goldens, one of them exactly that factorial. That reason is
   // gone; the cheapness one is not.)
+  //
+  // ⛔ EXCEPT a name some function declares `global`, which the loop below
+  // excludes and the cell pass after it then claims. Re-emitting the literal
+  // is a READ strategy and there is nothing to write into, so the counter
+  // idiom -- `G = 0` with `global G; G += 1` in a function -- was refused:
+  // "'global G' names a module global this compiler does not give storage
+  // to". A `global` declaration is the strongest statement a program can make
+  // that the binding needs storage.
   llvm::StringSet<> boundOnce = singleAssignmentNames(moduleNode);
+  llvm::StringSet<> declaredGlobal = moduleGlobalDeclarations(moduleNode);
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "Assign")
       continue;
@@ -102,7 +111,8 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
         ast::isNoneField(*value, "value"))
       continue;
     llvm::StringRef name = ast::nameSpelling(*targets->front());
-    if (!boundOnce.contains(name) || moduleGlobals.count(name))
+    if (!boundOnce.contains(name) || moduleGlobals.count(name) ||
+        declaredGlobal.contains(name))
       continue;
     moduleConstantBindings[name] = value;
   }
@@ -173,6 +183,12 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     for (const parser::Node *callable : callables)
       for (const std::string &capture : lexicalCaptureNames(*callable))
         readFromAFunction.insert(capture);
+    // ⭐ AND EVERY `global NAME`, which `lexicalCaptureNames` does not report.
+    // That walk answers about CLOSURES, and a name a function ASSIGNS is its
+    // own local as far as closure capture goes -- `global G` says the opposite
+    // and is not one of the things it subtracts.
+    for (const auto &entry : declaredGlobal)
+      readFromAFunction.insert(entry.getKey());
   }
 
   for (const parser::NodePtr &statement : *body) {
@@ -196,6 +212,30 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     moduleGlobals[name] = inferred;
     types.bindSymbol(name, inferred);
   }
+}
+
+// Every name any function in this module declares `global`, at any depth.
+llvm::StringSet<>
+ModuleEmitter::moduleGlobalDeclarations(const parser::Node &scope) const {
+  llvm::StringSet<> declared;
+  auto walk = [&](const parser::Node &node, auto &&recurse) -> void {
+    const auto *statements = ast::nodeList(node, "body");
+    if (!statements)
+      return;
+    for (const parser::NodePtr &statement : *statements) {
+      if (!statement)
+        continue;
+      if (statement->kind == "Global") {
+        if (const auto *names = ast::stringList(*statement, "names"))
+          for (const std::string &name : *names)
+            declared.insert(name);
+        continue;
+      }
+      recurse(*statement, recurse);
+    }
+  };
+  walk(scope, walk);
+  return declared;
 }
 
 void ModuleEmitter::markBoxedModuleGlobal(mlir::Operation *op) const {
