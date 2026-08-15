@@ -886,8 +886,40 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   // annotation). It is a CACHE: `dropObjectFieldEvidence` clears it at every
   // boundary this walk cannot see a store through, so a hit means the box still
   // holds the object the cache describes and the two are consistent.
+  // ⛔ AND THE CACHE IS NOT CONSULTED WHEN THE READ WANTS A UNION AND THE
+  // CACHE HOLDS A MEMBER. The entry records what was last STORED --
+  // `self.name: str | None = "a"` caches a `builtins.str` -- and
+  // `isAssignableTo(str, str | None)` is true, so the narrower bundle was
+  // handed back where the union's own lanes were expected. Every consumer of a
+  // union reads the TAG from lane 0, so `union.test` took the str's header
+  // memref for the tag and `arith.cmpi` inferred its result from the operand:
+  //
+  //     class H:
+  //         def __init__(self) -> None:
+  //             self.name: str | None = "a"
+  //     print(H().name is None)
+  //     # runtime bundle value 0 for 'builtins.bool' has type 'memref<2xi1>',
+  //     # but ABI expects 'i1'
+  //
+  // Loud, and it refuses `x.f is None` on any Optional field whose member has
+  // more than one lane -- `int | None` reaches the same code with one lane and
+  // happens to survive. The lane slice below is authoritative here: the inline
+  // splice writes the whole union into the instance on every store.
+  //
+  // ⭐ Keyed on the RESULT type, not on the field's. A narrowed read
+  // (`attr.get` typed `str` after an isinstance) is exactly what the cache
+  // exists for and the slice would hand it the union instead; a read typed as
+  // the union needs the union whatever the cache last saw stored.
+  //
+  // ⛔ Why NOT compare the cached contract against the result type and keep
+  // the entry when they agree, which is the narrower-looking guard: the entry
+  // whose contract IS the union can still carry the member's lanes through
+  // `boxedObject`, and that spelling reaches the same `arith.cmpi`. Measured --
+  // it was written that way first and all four programs stayed red.
+  bool unionRead = mlir::isa<py::UnionType>(op.getResult().getType());
   auto fieldBundle = object->fieldBundles.find(op.getName());
-  if (!boxedField && fieldBundle != object->fieldBundles.end()) {
+  if (!boxedField && !unionRead &&
+      fieldBundle != object->fieldBundles.end()) {
     if (!fieldBundle->second)
       return op.emitError()
              << "attribute evidence for '" << op.getName() << "' is empty";
