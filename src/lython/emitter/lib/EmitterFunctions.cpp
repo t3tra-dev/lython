@@ -106,11 +106,50 @@ void ModuleEmitter::emitFunctionDecl(const parser::Node &function) {
         info.symbolBase = std::string(topLevelFunctionSymbol(*name));
       }
     } else {
-      emitCallableFunction(function, topLevelFunctionSymbol(*name), sig, {},
-                           /*isLambda=*/false);
+      llvm::StringRef symbol = topLevelFunctionSymbol(*name);
+      emitCallableFunction(function, symbol, sig, {}, /*isLambda=*/false);
+      recordMonomorphicFunction(*name, function, sig, symbol,
+                                /*source=*/nullptr);
     }
   }
   types.bindSymbol(*name, sig.publicCallable);
+}
+
+void ModuleEmitter::recordMonomorphicFunction(
+    llvm::StringRef key, const parser::Node &function,
+    const FunctionSignature &sig, llvm::StringRef symbolBase,
+    const EmitOptions::SourceModule *source) {
+  // Only a plain positional signature can be argument-specialized: the
+  // mapping from a call's operands back to the parameters has to be exact,
+  // and defaults, *args, **kwargs and keyword-only parameters each make it
+  // not be. Recording the rest anyway would put the decision in the call
+  // site, which is where it would be got wrong once.
+  if (sig.varargType || sig.kwargType || !sig.kwOnlyTypes.empty())
+    return;
+  for (bool hasDefault : sig.positionalDefaults)
+    if (hasDefault)
+      return;
+  if (sig.positionalTypes.empty())
+    return;
+  GenericFunctionInfo &info = monomorphicFunctions[key];
+  info.node = &function;
+  info.signature = sig;
+  info.symbolBase = std::string(symbolBase);
+  info.source = source;
+}
+
+ModuleEmitter::GenericFunctionInfo *
+ModuleEmitter::lookupMonomorphicFunction(llvm::StringRef name) {
+  auto found = monomorphicFunctions.find(name);
+  if (found != monomorphicFunctions.end())
+    return &found->second;
+  if (std::optional<std::string> canonical =
+          types.lookupCanonicalBinding(name)) {
+    found = monomorphicFunctions.find(*canonical);
+    if (found != monomorphicFunctions.end())
+      return &found->second;
+  }
+  return nullptr;
 }
 
 std::optional<std::pair<std::string, py::CallableType>>

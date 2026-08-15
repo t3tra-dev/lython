@@ -1,68 +1,111 @@
-# OPEN, and the record that replaces a WRONG prescription. `def f(x: float)`
-# refuses `f(3)`; the note at TypeSystem.cpp used to say the repair was "accept
-# the argument here and CONVERT it at the call site", and measurement says
-# converting would produce wrong answers rather than fix anything.
-#
-# MEASURED against python3.14 (./build/bin/lyc, 2026-08-15):
+# FIXED 2026-08-15 by SPECIALIZATION, and the prescription this file carried
+# for two sessions was the wrong repair. `def f(x: float)` refused `f(3)`; the
+# note at TypeSystem.cpp said the fix was "accept the argument here and CONVERT
+# it at the call site", and measurement said converting produces wrong answers:
 #
 #   def p(x: float) -> None: print(x)
-#   p(3)            CPython: 3      would-convert: 3.0    <- WRONG
+#   p(3)            CPython: 3      would-convert: 3.0
 #   def q(n: int) -> None: print(n)
-#   q(True)         CPython: True   would-convert: 1      <- WRONG
+#   q(True)         CPython: True   would-convert: 1
 #
 # CPython does not convert at a parameter boundary. The annotation is inert
-# there and the argument keeps its own type, so a compiler that honours the
-# annotation by converting diverges on every program that can OBSERVE the
-# argument's type -- print, str, repr, type-dispatch.
+# there and the argument keeps its own type, so honouring it by converting
+# diverges on every program that can OBSERVE the argument's type.
 #
-# ⭐ AND THE PATHS THAT ALREADY WORK AGREE, which is the strongest evidence:
+# ⭐ WHAT THE PATHS THAT ALREADY WORKED SAID, which is what located it: an
+# inlined method (`C().m(3)` prints 6, `C().m(3.0)` prints 6.0) and a local
+# annotated binding (`x: float = 3; print(x)` prints 3) both agree with CPython
+# and neither converts. Both are specialization -- one by accident, one by
+# construction. A free function was the only spelling that failed, because it
+# is the only one whose ABI comes from the annotation rather than from a value.
 #
-#   C().m(3) / C().m(3.0), m declared (self, x: float) ..... 6 / 6.0   (= CPython)
-#   x: float = 3; print(x), in a function ................... 3        (= CPython)
-#   x: float = 3; x = 2.5; print both ....................... 3 / 2.5  (= CPython)
+# ⭐ THE MECHANISM. `functionSignature` grew a `monomorphize` mode that re-reads
+# a function as if its annotations were absent: parameters take the expected
+# callable's types, and the RETURN annotation is ignored so the body walk
+# decides the result. That last half is not optional -- `def r(x: float) ->
+# float: return x * 2` reached by `r(3)` must return the int 6, and keeping the
+# annotation would return 6.0. A lambda has had exactly this for as long as it
+# has had parameters, because it has no annotations to read.
 #
-# Neither converts. The method case is right because the emitter INLINES a
-# known method, so the body is emitted against the actual argument type; the
-# local case is right because each binding is typed by its own value. Both are
-# specialization, reached by accident in one case and by construction in the
-# other.
+# Every non-generic top-level function with a plain positional signature is
+# registered like a generic (EmitterFunctions.cpp), and a call whose argument
+# stands a rung BELOW the declared parameter in the numeric tower gets one body
+# per ground signature, memoized on it and capped at 32.
 #
-# ⭐ SO THE REPAIR IS SPECIALIZATION AT THE FREE-FUNCTION BOUNDARY. A free
-# function is not inlined: it is a real func.func whose ABI comes from the
-# declared parameter types, which is why this is the only spelling that fails.
-# `ensureGenericSpecialization` (EmitterFunctions.cpp:117) already emits a
-# second body per instantiation -- memoized on the specialized callable, capped
-# at 32 for polymorphic recursion, and memoized BEFORE the body so monomorphic
-# recursion resolves to itself. What it keys on is unbound static type
-# parameters, so a non-generic `def f(x: float)` never reaches it and its node
-# is not retained past emitFunctionDecl.
+# ⭐ THE DECISION IS MADE ON THE EMITTED OPERAND TYPES, not on inference, and
+# that is not a refinement -- it is the difference between working and not.
+# `types.inferExpr` answers `builtins.float` for `1.0 + 0.0j`, so a
+# pre-inference decision specialized `def rotate(z: complex, n: int)` at float
+# and emitted a body that could not compile. Caught by
+# golden scalar_loop_carried_mutate, which is the only program in the corpus
+# that passes a complex literal expression to a complex parameter.
 #
-# ⛔ Why NOT widen the acceptance check alone (isSubtypeOfImpl, or the
-# bindExpectedType callback in tryCallableApplication): the emitter and lowering
-# hold two independent implementations of this relation and they already
-# DISAGREE about bool <: int --
+# ⛔ TWO THINGS IT DOES NOT COVER, both refusals rather than wrong answers, and
+# both with the mechanism named:
 #
-#   def g(n: int) -> int: return n + 1
-#   print(g(True))
-#     emit:     accepted
-#     lowering: "arguments do not match Callable contract for function target g"
-#               (CallablePlanning.cpp:159, via py::isAssignableTo)
+#   1. A specialization whose body calls a specializable function -- ANOTHER
+#      one, or ITSELF -- with the narrowed parameter:
 #
-# -- so widening emit's side alone moves the refusal later, not away, and
-# widening both hands the callee an i1 where three int lanes are expected.
-# Lowering is the side that is RIGHT here: with no specialization there is no
-# body that can receive a bool.
+#          def r(x: float) -> float: return x * 2
+#          def outer(x: float) -> float: return r(x)
+#          print(outer(4))          # CPython 8; refused here
 #
-# ⛔ Why NOT convert only where the argument is not observable: "observable"
-# is not a property of the call site. The callee may print its parameter, and
-# whether it does is exactly the whole-program question a per-call rule cannot
-# answer.
+#      Specializing `outer` at int has to TYPE `r(x)` with an int, and
+#      inference answers on r's declared signature -- the refusal this whole
+#      path exists to lift. Covering it means a hook from
+#      `inferCallWithEvidence` back to the registry, keyed on the declared
+#      callable (so two functions of identical signature have to be detected
+#      and dropped) and cycle-guarded. Scoped, not built. Self-recursion is the
+#      same wall and not a milder one: `def power(base: float, n: int)` reached
+#      by `power(2, 3)` fails at exactly the same point, even though the
+#      signature it recurses at is the one already being emitted.
 #
-# differential: skip refused; the point is the refusal
-
+#   2. A body whose branches return different rungs:
+#
+#          def pick(n: int) -> int:
+#              if n <= 0: return n
+#              return 5
+#          print(pick(True))        # CPython 5; refused here
+#
+#      Re-read at bool the result is `bool | 5`, and the annotation is what was
+#      collapsing that to int. ⛔ Why NOT collapse it here the same way:
+#      CPython does not. `pick(False)` prints False and an int-collapsed result
+#      prints 0. The union is the honest type, the py ABI cannot return one,
+#      and a refusal is the right outcome -- which is also what this program
+#      got before the change, so nothing regressed.
+#
+# golden: tests/golden/cases/argument_numeric_tower_specialization.py
 
 def f(x: float) -> float:
     return x * 2
 
 
 print(f(3))
+print(f(3.0))
+print(f(True))
+
+
+def p(x: float) -> None:
+    print(x)
+
+
+p(3)
+p(3.5)
+p(True)
+
+
+def q(n: int) -> None:
+    print(n)
+
+
+q(True)
+q(7)
+
+
+def mix(a: float, b: int, c: float) -> float:
+    return a + b + c
+
+
+print(mix(1, 2, 3))
+print(mix(1.0, 2, 3))
+print(mix(1.0, 2, 3.5))

@@ -826,6 +826,8 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         } else {
           emitCallableFunction(*statement, canonical, sig, {},
                                /*isLambda=*/false);
+          recordMonomorphicFunction(canonical, *statement, sig, canonical,
+                                    &source);
         }
       } else if (isTopLevelClass(*statement)) {
         std::optional<std::string_view> name = ast::string(*statement, "name");

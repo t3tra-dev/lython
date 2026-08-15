@@ -449,6 +449,41 @@ private:
   ensureGenericSpecialization(const parser::Node &anchor,
                               GenericFunctionInfo &generic,
                               py::CallableType target);
+  // Argument specialization, and the record is the same GenericFunctionInfo
+  // because the mechanism is: one extra body per demanded ground signature,
+  // memoized on it, emitted under the defining module's scope. What differs
+  // is what makes a signature ground -- there a solved type parameter, here
+  // an argument standing a rung BELOW the declared parameter in the numeric
+  // tower (`def f(x: float)` reached by `f(3)`).
+  //
+  // ⭐ Why a second body and not a conversion at the boundary: measured
+  // against python3.14, converting is a wrong answer. `def p(x: float)`
+  // called `p(3)` prints 3, not 3.0, and `def q(n: int)` called `q(True)`
+  // prints True, not 1 -- the annotation is inert at a parameter and the
+  // argument keeps its own type. The paths that already work agree: an
+  // INLINED method (`C().m(3)` prints 6, `C().m(3.0)` prints 6.0) and a local
+  // annotated binding (`x: float = 3; print(x)` prints 3) both specialize and
+  // neither converts. A free function is the only spelling that fails,
+  // because it is the only one whose ABI comes from the annotation.
+  llvm::StringMap<GenericFunctionInfo> monomorphicFunctions;
+  GenericFunctionInfo *lookupMonomorphicFunction(llvm::StringRef name);
+  void recordMonomorphicFunction(llvm::StringRef key,
+                                 const parser::Node &function,
+                                 const FunctionSignature &sig,
+                                 llvm::StringRef symbolBase,
+                                 const EmitOptions::SourceModule *source);
+  // A cheap AST + inference filter, run BEFORE anything is emitted, so the
+  // ordinary path stays untouched for every call that cannot specialize.
+  bool mayArgumentSpecialize(const parser::Node &expr,
+                             const GenericFunctionInfo &info);
+  // Emits the call. Takes the callee already emitted, and dispatches to the
+  // DECLARED symbol whenever the specialization turns out not to apply, so
+  // that this is a drop-in for the ordinary dispatch rather than a branch the
+  // caller has to unwind.
+  Value emitArgumentSpecializedCall(const parser::Node &expr,
+                                    const parser::Node &calleeNode,
+                                    GenericFunctionInfo &info,
+                                    Value declaredCallee);
   // Runs `body` under the environment of the module that DEFINES an imported
   // generic, not the use site's. Scope ISOLATION rather than a plain push is
   // what keeps that honest: a plain push would let an unbound name in the

@@ -3445,35 +3445,21 @@ CallInferenceResult TypeSystem::inferCallWithEvidence(
                                                        std::nullopt},
                                  true,
                                  {}};
-    // ⛔ KNOWN DEFECT reached through this message: an int argument is refused
-    // where a float parameter is declared.
+    // ⛔ This refusal is CORRECT and must stay: the declared signature does not
+    // admit these arguments, and nothing here may widen it. What used to be a
+    // defect behind it -- an int argument where a float parameter is declared
+    // -- is handled a layer up, by emitting a SECOND BODY for the argument's
+    // own rung (`emitArgumentSpecializedCall`), never by converting: CPython
+    // leaves the annotation inert at a parameter, so `def p(x: float)` reached
+    // by `p(3)` prints 3 and not 3.0.
     //
-    //     def f(x: float) -> float: return x * 2
-    //     print(f(3))      # refused; CPython prints 6
-    //
-    // ⛔ Why NOT the repair this note used to prescribe -- "accept here and
-    // CONVERT at the call site". Measured against python3.14, converting is a
-    // WRONG ANSWER, not a fix:
-    //
-    //     def p(x: float) -> None: print(x)
-    //     p(3)          # CPython: 3      converted: 3.0
-    //     def q(n: int) -> None: print(n)
-    //     q(True)       # CPython: True   converted: 1
-    //
-    // CPython does not convert at the boundary: the annotation is inert there,
-    // and the argument keeps its own type. Every path in this compiler that
-    // ALREADY handles the case agrees with that and converts nothing -- an
-    // inlined method (`C().m(3)` prints 6, `C().m(3.0)` prints 6.0) and a
-    // local annotated binding (`x: float = 3; print(x)` prints 3).
-    //
-    // ⭐ So the repair is SPECIALIZATION, not conversion: emit a second body
-    // for the actual argument types, which is what the inlined-method path
-    // gets for free and what `ensureGenericSpecialization` already does for
-    // type parameters (memoized, capped at 32, recursion-safe). The rung
-    // conversions are still needed, but for `float(True)`-style calls where
-    // the tower conversion IS the operation, not for argument passing.
-    //
-    // tests/probe/wb_argument_boundary_numeric_tower.py holds the measurements.
+    // ⛔ Why the specializer does not simply call back in here to ask: it
+    // would have to, to cover a specialized body that calls another
+    // specializable function with the narrowed parameter, and that call needs
+    // a way from a callable TYPE back to the function NODE -- which this class
+    // does not have and which two same-signature functions would make
+    // ambiguous. The limitation and its shape are in
+    // tests/probe/wb_argument_boundary_numeric_tower.py.
     return unresolvedCallable(
         calleeType, "call arguments do not match the Callable contract");
   }
@@ -3570,7 +3556,7 @@ FunctionSignature
 TypeSystem::functionSignature(const parser::Node &function,
                               std::optional<llvm::StringRef> selfName,
                               py::CallableType expectedCallable,
-                              mlir::Type selfType) const {
+                              mlir::Type selfType, bool monomorphize) const {
   if (!selfName && !expectedCallable) {
     auto memoized = signatureMemo.find(&function);
     if (memoized != signatureMemo.end())
@@ -3648,7 +3634,8 @@ TypeSystem::functionSignature(const parser::Node &function,
       mlir::Type type = annotationType(annotation);
       bool isSelfParameter = selfName && index == 0 && name == *selfName;
       bool fromExpectedCallable =
-          function.kind == "Lambda" && index < expectedPositional.size();
+          (function.kind == "Lambda" || monomorphize) &&
+          index < expectedPositional.size();
       std::optional<mlir::Type> overridden =
           !annotation && !isSelfParameter && !fromExpectedCallable
               ? overriddenParameterType(*arg)
@@ -3678,7 +3665,8 @@ TypeSystem::functionSignature(const parser::Node &function,
         sig.kwOnlyNames.push_back(name);
         mlir::Type type = annotationType(annotation);
         bool fromExpectedCallable =
-            function.kind == "Lambda" && index < expectedKwOnly.size();
+            (function.kind == "Lambda" || monomorphize) &&
+            index < expectedKwOnly.size();
         std::optional<mlir::Type> overridden =
             !annotation && !fromExpectedCallable ? overriddenParameterType(*arg)
                                                  : std::nullopt;
@@ -3772,7 +3760,7 @@ TypeSystem::functionSignature(const parser::Node &function,
     sig.resultType = sig.generatorReturnType;
   } else if (function.kind == "Lambda") {
     sig.resultType = inferExpr(ast::node(function, "body"));
-  } else if (returns) {
+  } else if (returns && !monomorphize) {
     sig.resultType = annotationType(returns);
   } else if (ast::nameSpelling(function) == "__init__") {
     sig.resultType = none();

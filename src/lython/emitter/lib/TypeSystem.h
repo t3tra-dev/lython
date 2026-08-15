@@ -368,11 +368,20 @@ public:
   // resolve and every unannotated method inferred builtins.object. The class
   // emitter substitutes py.self in the signature afterwards either way --
   // that substitution reaches the types, never the body inference.
+  //
+  // `monomorphize` re-reads the function AS IF its annotations were absent:
+  // the parameters take `expectedCallable`'s types and the return annotation
+  // is ignored so the body walk decides the result. That is what an argument
+  // specialization needs and what a lambda has always had -- a lambda's
+  // parameters already come from the expected callable, because it has no
+  // annotations to come from. It is deliberately not the default: an
+  // annotation is a CONTRACT at the declaration and only a call that has
+  // already been shown to be admissible may re-read it as inert.
   FunctionSignature
   functionSignature(const parser::Node &function,
                     std::optional<llvm::StringRef> selfName = std::nullopt,
                     py::CallableType expectedCallable = {},
-                    mlir::Type selfType = {}) const;
+                    mlir::Type selfType = {}, bool monomorphize = false) const;
   void refreshCallable(FunctionSignature &sig) const;
 
 private:

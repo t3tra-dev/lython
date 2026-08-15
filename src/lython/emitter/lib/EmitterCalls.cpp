@@ -873,6 +873,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       auto generic = genericFunctions.find(binding);
       if (generic != genericFunctions.end())
         return emitGenericCall(expr, *calleeNode, generic->second);
+      if (auto mono = monomorphicFunctions.find(binding);
+          mono != monomorphicFunctions.end() &&
+          mayArgumentSpecialize(expr, mono->second))
+        return emitArgumentSpecializedCall(
+            expr, *calleeNode, mono->second,
+            emitBindingRef(*calleeNode, binding, *symbol));
       mlir::Type resultOverride =
           binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
       Value callee = emitBindingRef(*calleeNode, binding, *symbol);
@@ -1038,6 +1044,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (values.find(name) == values.end()) {
       if (GenericFunctionInfo *generic = lookupGenericFunction(name))
         return emitGenericCall(expr, *calleeNode, *generic);
+      if (GenericFunctionInfo *mono = lookupMonomorphicFunction(name);
+          mono && mayArgumentSpecialize(expr, *mono))
+        return emitArgumentSpecializedCall(expr, *calleeNode, *mono,
+                                           emitExpr(calleeNode));
     }
     if (!types.lookupSymbol(name) && !types.lookupClass(name)) {
       diagnostics.push_back(parser::Diagnostic{
@@ -1104,6 +1114,182 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       emitCallOperands(expr, {}, /*includeAstArguments=*/true,
                        mlir::dyn_cast_if_present<py::CallableType>(
                            callee.type)));
+}
+
+namespace {
+
+// CPython's numeric tower as a total order on the four rungs that are
+// implicitly acceptable where a higher one is declared (PEP 484 §"The numeric
+// tower"). -1 is "not on the tower", which never compares.
+int numericTowerRung(const TypeSystem &types, mlir::Type type) {
+  if (!type)
+    return -1;
+  if (type == types.boolType())
+    return 0;
+  if (type == types.intType())
+    return 1;
+  if (type == types.floatType())
+    return 2;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (contract && contract.getArguments().empty() &&
+      contract.getContractName() == "builtins.complex")
+    return 3;
+  return -1;
+}
+
+} // namespace
+
+// `def f(x: float)` reached by `f(3)`. The declared parameter is a promise
+// about what the function ACCEPTS, and CPython honours it by accepting the int
+// unchanged -- so the body has to be emitted a second time against the int,
+// which is monomorphization and not coercion. Returns nullopt when the call is
+// not that shape, leaving the ordinary dispatch to run (and, when the call is
+// simply wrong, to report it).
+bool ModuleEmitter::mayArgumentSpecialize(const parser::Node &expr,
+                                          const GenericFunctionInfo &info) {
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords && !keywords->empty())
+    return false;
+  const auto *args = ast::nodeList(expr, "args");
+  llvm::ArrayRef<mlir::Type> declared = info.signature.positionalTypes;
+  if (!args || args->size() != declared.size())
+    return false;
+  for (auto [index, arg] : llvm::enumerate(*args)) {
+    if (!arg || arg->kind == "Starred")
+      return false;
+    mlir::Type supplied = types.widenLiteral(types.inferExpr(arg.get()));
+    int suppliedRung = numericTowerRung(types, supplied);
+    int declaredRung = numericTowerRung(types, declared[index]);
+    if (suppliedRung >= 0 && declaredRung >= 0 && suppliedRung < declaredRung)
+      return true;
+  }
+  return false;
+}
+
+Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
+                                                 const parser::Node &calleeNode,
+                                                 GenericFunctionInfo &info,
+                                                 Value declaredCallee) {
+  // ⭐ The decision is made on the types the operands ACTUALLY came out as,
+  // not on what inference predicted, and the two do disagree: `types.inferExpr`
+  // answers `builtins.float` for `1.0 + 0.0j`, so a pre-inference decision
+  // specialized `def rotate(z: complex, n: int)` at float and then emitted a
+  // body that could not compile (golden scalar_loop_carried_mutate). Deciding
+  // after emission also means the fallback costs nothing: the operands are
+  // already the ones the ordinary dispatch wanted.
+  auto declaredCallable =
+      mlir::dyn_cast_if_present<py::CallableType>(declaredCallee.type);
+  CallOperands operands = emitCallOperands(expr, {},
+                                           /*includeAstArguments=*/true,
+                                           declaredCallable);
+  auto ordinary = [&] {
+    return emitCallableDispatch(expr, declaredCallee, operands);
+  };
+  if (!operands.valid)
+    return ordinary();
+  llvm::ArrayRef<mlir::Type> declared = info.signature.positionalTypes;
+  if (operands.positionalTypes.size() != declared.size())
+    return ordinary();
+  llvm::SmallVector<mlir::Type, 4> actual;
+  bool anyLowerRung = false;
+  for (auto [index, supplied] : llvm::enumerate(operands.positionalTypes)) {
+    mlir::Type widened = types.widenLiteral(supplied);
+    int suppliedRung = numericTowerRung(types, widened);
+    int declaredRung = numericTowerRung(types, declared[index]);
+    // Only a tower rung is re-read. Every other proper subtype already
+    // reaches the declared body correctly (a subclass instance travels the
+    // object ABI, `take(Dog(4))` against `def take(a: Animal)` runs today),
+    // and specializing those would emit a second body for no difference in
+    // behaviour.
+    if (suppliedRung >= 0 && declaredRung >= 0 && suppliedRung < declaredRung) {
+      actual.push_back(widened);
+      anyLowerRung = true;
+      continue;
+    }
+    if (widened != declared[index])
+      return ordinary();
+    actual.push_back(declared[index]);
+  }
+  if (!anyLowerRung)
+    return ordinary();
+
+  py::CallableType target = py::CallableType::get(
+      builder.getContext(), actual, {}, {}, {},
+      llvm::ArrayRef<mlir::Type>{info.signature.resultType});
+  FunctionSignature specialized = types.functionSignature(
+      *info.node, /*selfName=*/std::nullopt, target, /*selfType=*/{},
+      /*monomorphize=*/true);
+  if (specialized.positionalTypes.size() != actual.size())
+    return ordinary();
+  for (auto [index, type] : llvm::enumerate(specialized.positionalTypes))
+    if (type != actual[index])
+      return ordinary();
+  // ⭐ A signature the emit boundary would reject means the specialization is
+  // not available, NOT that the program is wrong -- so bail silently and let
+  // the ordinary dispatch report the call site. Emitting it instead would
+  // attribute the failure to the DECLARATION, which the reader did not write
+  // wrong: it is the specialized reading of it that does not type.
+  //
+  // The failure that actually occurs here is a chain. `def outer(x: float):
+  // return r(x)` specialized at int has to type `r(x)` with an int, and
+  // inference answers on `r`'s DECLARED signature, which is the refusal this
+  // whole path exists to lift. Covering it means teaching inference to
+  // monomorphize too -- a hook from `inferCallWithEvidence` back to this
+  // registry, keyed on the declared callable, with a cycle guard -- and the
+  // registry is name-keyed today, so two functions of identical signature
+  // would have to be detected and dropped. Scoped, not built; recorded in
+  // tests/probe/wb_argument_boundary_numeric_tower.py.
+  if (!specialized.bodyInferenceFailures.empty() ||
+      !specialized.missingParameterAnnotations.empty() ||
+      !specialized.invalidParameterAnnotations.empty() ||
+      !specialized.generatorAnalysisFailures.empty() ||
+      !specialized.generatorAnnotationMismatch.empty())
+    return ordinary();
+  // ⭐ A result the annotation was WIDENING must not be specialized, and this
+  // is the guard that keeps the whole path from turning a refusal into a wrong
+  // answer. Re-reading `def pick(n: int) -> int` at bool gives its two
+  // branches `builtins.bool` and the literal 5, whose join is a union -- and
+  // the annotation is exactly what used to collapse that to int.
+  //
+  // ⛔ Why NOT collapse it here instead, along the tower, which is what the
+  // annotation did: because CPython does not. `def pick(n: int) -> int` with
+  // `return n` reached by `pick(False)` prints False, and an int-collapsed
+  // result prints 0. The union is the honest type and the py ABI cannot carry
+  // one as a return value, so the call goes back to being refused -- which is
+  // what it already was, and a refusal is the outcome this project prefers to
+  // a plausible number.
+  if (mlir::isa_and_present<py::UnionType>(specialized.resultType) &&
+      !mlir::isa_and_present<py::UnionType>(info.signature.resultType))
+    return ordinary();
+
+  auto memoized = info.specializations.find(specialized.publicCallable);
+  std::string symbol;
+  if (memoized != info.specializations.end()) {
+    symbol = memoized->second;
+  } else {
+    // The same divergence backstop the generic specializer carries: a body
+    // that calls itself one rung down would otherwise re-enter forever.
+    if (info.specializations.size() >= 32)
+      return ordinary();
+    symbol = (llvm::Twine(info.symbolBase) + "$arg" +
+              llvm::Twine(static_cast<unsigned>(info.specializations.size())))
+                 .str();
+    // Memoize BEFORE the body, so a recursive call at the same ground
+    // signature resolves to this symbol instead of specializing again.
+    info.specializations[specialized.publicCallable] = symbol;
+    auto emitBody = [&] {
+      emitCallableFunction(*info.node, symbol, specialized, {},
+                           /*isLambda=*/false);
+    };
+    if (info.source)
+      emitInDefiningModuleScope(*info.source, emitBody);
+    else
+      emitBody();
+  }
+
+  Value callee =
+      emitBindingRef(calleeNode, symbol, specialized.publicCallable);
+  return emitCallableDispatch(expr, callee, operands);
 }
 
 Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
