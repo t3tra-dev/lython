@@ -528,6 +528,12 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
   llvm::SmallVector<BoxedObjectSource, 4> boxedObjectSources;
   unsigned inputIndex = 0;
   for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
+    // A `type[X]` argument occupies no ABI input: which class it is, is in
+    // its type, so the callee reconstructs it from its own parameter type.
+    // Skipped BEFORE the bound check, or a trailing one reads as an overflow.
+    if (sourceIndex < logicalInputTypes.size() &&
+        mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]))
+      continue;
     if (inputIndex >= functionType.getNumInputs())
       return op.emitError()
              << "too many positional args for function target " << targetName;
@@ -969,6 +975,9 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
   unsigned inputIndex = 0;
   builder.setInsertionPoint(op);
   for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
+    if (sourceIndex < logicalInputTypes.size() &&
+        mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]))
+      continue;
     if (inputIndex >= functionType.getNumInputs())
       return op->emitError()
              << "too many positional args for function target " << targetName;

@@ -1,93 +1,81 @@
-# OPEN, and now reported honestly. A field holding a TYPE object:
+# FIXED 2026-08-15, and the record is mostly about the three attempts that
+# were reverted first. A field holding a TYPE object was refused:
 #
 #     callable ABI type has no concrete runtime contract:
 #     '!py.type<!py.contract<"Other">>'
 #
-# ⛔ It used to say something else, and the something else was FALSE:
-# "'Box' inherits builtins.object.t, which Lython does not implement". There is
-# no member `t` of object. The attribute-call path tried method dispatch, found
-# no method `t`, and fell into the inherited-object refusal, whose predicate
-# answers for ANY name once the class linearizes onto object -- so a field name
-# arrives there looking like a missing dunder. Fixed 2026-08-15 alongside the
-# callable-field family (tests/probe/wb_callable_field_store.py): a name the
-# class declares as a field never reaches that refusal, and a field holding a
-# type object is CALLED, since calling one constructs.
+# ⛔ THE FIRST DIAGNOSIS WAS FALSE and is kept because the shape recurs: it
+# read "'Box' inherits builtins.object.t, which Lython does not implement".
+# There is no member `t` of object. The attribute-call path tried method
+# dispatch, found no method `t`, and fell into the inherited-object refusal,
+# whose predicate answers for ANY name once the class linearizes onto object --
+# so a field name arrived there looking like a missing dunder.
 #
-# ⭐ WHAT IS ACTUALLY MISSING is a runtime representation. A type object is
-# materialised as an i64 class id at a call operand and nowhere else
-# (`RuntimeBundle::Kind::TypeObject` in Runtime/Calls/Operands.cpp), and
-# `runtimeShapeContractName` answers "" for `!py.type<...>`: the manifest
-# declares `py.class @type` but no `ly.runtime.shape` for it, so there is no
-# value shape a field could hold. The field store also expects
-# `RuntimeBundle::Kind::Object` and would refuse a TypeObject bundle before
-# reaching any layout question.
+# ⛔ AND THE SECOND WAS THE REPAIR ITSELF. Three layers were built and reverted,
+# each moving the refusal one layer down and every one of them building toward
+# the same i64 class id:
 #
-# ⭐ ATTEMPTED 2026-08-15 AND REVERTED, three layers in. Each edit moved the
-# refusal one layer down, which is the useful part of the record:
+#   1. `runtimeShapeContractName` answering "builtins.type", plus a
+#      `@LyType_Shape() -> i64` declaration
+#        -> "runtime object header has invalid type 'i64'"
+#   2. `primitiveFieldSlot` accepting builtins.type, since a class id is
+#      "a whole value in one i64"
+#        -> "attribute value has no unbox.i64 primitive for field '_cls'"
+#   3. `lowerAttrSet` materialising the class id as a constant
+#        -> NO CHANGE: the bundle reaching there is not
+#           `RuntimeBundle::Kind::TypeObject`, because it is
+#           `Box.__init__`'s PARAMETER and nothing made a TypeObject bundle
+#           for an entry argument.
 #
-#   1. `runtimeShapeContractName` answering "builtins.type" for `!py.type<...>`,
-#      plus a `@LyType_Shape() -> i64` declaration in builtins.mlir
-#        -> past "no concrete runtime contract", into
-#           "runtime object header has invalid type 'i64'"
-#   2. `primitiveFieldSlot` accepting builtins.type beside int and bool, since a
-#      class id is exactly "a whole value in one i64" -- asked through
-#      runtimeShapeContractName, because `!py.type<...>` is not a ContractType
-#      and the plain name answers ""
-#        -> past the header demand, into
-#           "attribute value has no unbox.i64 primitive for field '_cls'"
-#   3. `lowerAttrSet` materialising the class id as a constant instead of
-#      unboxing, the same lookup a call operand does
-#        -> NO CHANGE. The bundle reaching there is not
-#           `RuntimeBundle::Kind::TypeObject`, and its `contractName()` prints
-#           empty, so whatever the attr.set sees has already lost the kind.
+# ⭐ AND THE FOURTH LAYER IS WHERE THE PLAN WAS WRONG, not merely unfinished.
+# `t(3)` on a parameter holding a runtime class id has to pick a constructor at
+# run time, and this compiler has no dynamic dispatch to fall back to -- so
+# every layer above was being built to support a thing that would have had to
+# be refused at the top. The i64 was never going to arrive anywhere.
 #
-# ⭐ AND THE FOURTH LAYER IS ANSWERED, cheaply, which changes the shape of the
-# whole item. The attr.set's value is not a `py.type.object` result at all:
+# ⭐ WHAT IT IS INSTEAD: `type[X]` HAS AN EMPTY PHYSICAL SHAPE. A type object
+# carries nothing observable beyond WHICH class it is, and that is in its type,
+# so a parameter, a field, a return and a suspension lane all carry it for
+# free and constructing through it stays statically resolved. Five sites, each
+# one small because the value is not there:
 #
-#     py.attr.set %arg0["_cls"] = %arg1 ... : !py.contract<"Holder">,
-#                                             !py.type<!py.contract<"Inner">>
+#   runtimeValueTypesFor      `!py.type<X>` -> {} (and the refusal below)
+#   seedCallableEntry...      a `type[X]` parameter rebuilds its own bundle
+#   FunctionTargetCalls       a `type[X]` argument occupies no ABI input
+#   lowerAttrSet / AttrGet    the store writes nothing, the read rebuilds
+#   emitCall                  a non-Name callee whose type is `type[X]` is
+#                             re-spelled as the class name, with the callee
+#                             expression still emitted for its effects
 #
-# `%arg1` is `Holder.__init__`'s PARAMETER. `lowerTypeObject` makes a
-# `RuntimeBundle::typeObject` for a `py.type.object` op, and nothing makes one
-# for an entry argument, so the store was never going to see the kind.
+# ⭐ AND THE GENERATOR SYMPTOM WENT WITH IT, but not through a lane. The
+# emitter emits `py.type.object` ONCE per class and every construction shares
+# it, so a generator constructing at two or more yields had one live across the
+# first suspend. The state machine now SINKS type objects to their uses on the
+# clone before liveness runs -- the op is Pure with no operands, so a copy in
+# front of each user is the same value -- and nothing is live to need a lane.
+# One construction always worked because the value died before the suspend.
 #
-# So this is not "a field cannot hold a type object". It is that `type[X]` has a
-# runtime representation at a CALL OPERAND and nowhere else -- not in a
-# parameter, not in a field, not in a local. Four layers found and the parameter
-# ABI is only the next; expect a read side and a call site behind it. Scope it as
-# "give type[X] a representation end to end", not as a field repair. Reverted rather than left in: three layers of gate changes that
-# still refuse the program are untested surface, which is the same rule that
-# sent back the `consumeSites` variant and the insertion-block walk today.
+# ⛔ WHAT IS STILL REFUSED, with a diagnostic that says so: a `type[X]` whose
+# class is SUBCLASSED in the program.
 #
-# ⭐ AND IT HAS A SECOND SYMPTOM, found 2026-08-15 while closing the generator
-# lane cluster, which raises what the item is worth. A generator that
-# CONSTRUCTS an instance at two or more yields is refused:
+#     class Base: ...
+#     class Derived(Base): ...
+#     def make(t: type[Base]) -> Base: return t(3)
+#     print(make(Base).n, make(Derived).n)   # CPython 3 30
 #
-#     def gen() -> Iterator[C]:
-#         yield C(1)
-#         yield C(2)
+# The empty shape is sound because the type decides the class, and `type[Base]`
+# stops deciding it the moment Base has a subclass. ⛔ Why the argument
+# specializer does not already cover it (it is the same shape as `f(3)` against
+# `def f(x: float)`): a specialized body would have parameter type
+# `!py.type<Base>` for the `make(Base)` call, and that spelling is still the
+# subclassed one -- `py::TypeType` has no exactness bit, so "exactly Base" and
+# "Base or a subclass" are the same type. The mechanism is that bit (or a
+# marker on a specialized parameter saying only exact classes reach it), and
+# with it the specializer covers both calls.
 #
-# The emitter emits `py.type.object` ONCE and both `py.new` ops use it, so it is
-# live across the first yield -- and the state machine's frame-lane scan needs a
-# lane for every live value. `type[X]` has none, so the whole generator is
-# declared ineligible and falls back to the int-only inline tier. One
-# construction runs, because the type object dies before the suspend.
-#
-# So this is not only "a field cannot hold a type object": the same absent
-# representation costs a plain multi-yield factory generator. Two positions
-# known (a parameter, a live-across-suspend local), both under the same repair.
-#
-# BISECTED (./build/bin/lyc):
-#
-#   Box(Other) then o.t(5).n .......... refused at the ABI   <- this file
-#   Holder(Inner), never called ....... refused at the ABI (the STORE alone is
-#                                       enough; s8_type_object_field)
-#   the same field typed Callable ..... runs (callable_valued_field.py)
-#
-# The callable spelling running is what says the field machinery is fine and
-# only the type object's representation is absent.
-#
-# differential: skip refused; the point is the refusal
+# golden: tests/golden/cases/type_object_representation.py (red-checked)
+
+from typing import Iterator
 
 
 class Other:
@@ -101,3 +89,19 @@ class Box:
 
 
 print(Box(Other).t(5).n)
+
+
+def make(t: type[Other]) -> Other:
+    return t(3)
+
+
+print(make(Other).n)
+
+
+def gen() -> Iterator[Other]:
+    yield Other(1)
+    yield Other(2)
+
+
+for o in gen():
+    print(o.n)

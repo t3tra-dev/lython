@@ -897,6 +897,34 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (calleeNode && calleeNode->kind == "Attribute") {
     if (const parser::Node *receiverNode = ast::node(*calleeNode, "value")) {
       if (auto methodName = ast::string(*calleeNode, "attr")) {
+        // ⭐ A FIELD holding a type object CONSTRUCTS when called, and the
+        // class is in the field's type. The receiver is emitted first because
+        // it still has to happen -- `Box(Other).t(5)` builds a Box -- and then
+        // the call is re-spelled as the class name, which is the path a class
+        // NAME already takes. Reaching the lowering instead reports "calling a
+        // type object held in a value is not supported", which describes the
+        // compiler rather than the program.
+        if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
+                types.widenLiteral(types.inferExpr(calleeNode)))) {
+          std::string spelling;
+          if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                  typeObject.getInstanceType())) {
+            llvm::StringRef name = contract.getContractName();
+            auto tail = name.rsplit('.').second;
+            spelling = tail.empty() ? name.str() : tail.str();
+          }
+          if (!spelling.empty() &&
+              types.lookupClass(spelling) == typeObject.getInstanceType()) {
+            emitExpr(receiverNode);
+            parser::NodePtr named = synth::name(spelling, calleeNode->range);
+            parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+            parser::addField(*rewritten, "func", named);
+            for (llvm::StringRef field : {"args", "keywords"})
+              if (const parser::Field *original = parser::findField(expr, field))
+                rewritten->fields.push_back(*original);
+            return emitCall(*rewritten);
+          }
+        }
         Value receiver = emitExpr(receiverNode);
         if (refuseUnresolvableDispatch(*calleeNode, receiver, *methodName,
                                        receiverNode))
@@ -1065,10 +1093,15 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   // go down it. Reaching the lowering instead could only report "calling a
   // type object held in a value is not supported", which describes the
   // compiler's position rather than the program's.
-  if (calleeNode && calleeNode->kind != "Name")
-    ;
-  else if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
-               types.widenLiteral(types.inferExpr(calleeNode)))) {
+  // An ATTRIBUTE callee reaches the same rewrite, with one difference that is
+  // not optional: the receiver still has to be EVALUATED. `Box(Other).t(5)`
+  // constructs a Box, and re-spelling the call as `Other(5)` would drop that
+  // construction along with anything it did. So the receiver is emitted for
+  // its effects and the class name replaces only the callee.
+  if (auto typeObject =
+          calleeNode ? mlir::dyn_cast_if_present<py::TypeType>(
+                           types.widenLiteral(types.inferExpr(calleeNode)))
+                     : py::TypeType()) {
     mlir::Type instance = typeObject.getInstanceType();
     std::string spelling;
     if (auto contract =
@@ -1077,8 +1110,15 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       spelling = name.rsplit('.').second.empty() ? name.str()
                                                  : name.rsplit('.').second.str();
     }
-    if (!spelling.empty() && spelling != ast::nameSpelling(*calleeNode) &&
+    bool isName = calleeNode->kind == "Name";
+    if (!spelling.empty() &&
+        (!isName || spelling != ast::nameSpelling(*calleeNode)) &&
         types.lookupClass(spelling) == instance) {
+      // Anything but a bare name still has to be EVALUATED -- `pick(A)(9)`
+      // calls pick -- so the callee expression is emitted for its effects and
+      // only the callee spelling is replaced.
+      if (!isName)
+        emitExpr(calleeNode);
       parser::NodePtr named = synth::name(spelling, calleeNode->range);
       parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
       parser::addField(*rewritten, "func", named);

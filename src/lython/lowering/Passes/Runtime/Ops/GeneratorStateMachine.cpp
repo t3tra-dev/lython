@@ -1159,6 +1159,41 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           return mlir::failure();
     }
 
+    // ⭐ SINK the type objects to their uses before liveness runs. The emitter
+    // emits `py.type.object` ONCE per class and every construction shares it,
+    // so a generator that constructs at two or more yields had one live across
+    // the first suspend -- and a `type[X]` has no lane to be live in, which
+    // made the whole generator ineligible and sent it to the int-only inline
+    // tier. One construction was fine only because the value died before the
+    // suspend.
+    //
+    // Cloning is sound without any analysis: the op is `Pure`, takes no
+    // operands, and its result is decided entirely by its type, so a copy in
+    // front of each user is the same value. Doing it only on the CLONE leaves
+    // the sharing (and the CSE that produced it) alone everywhere else.
+    //
+    // ⛔ Why NOT give `type[X]` a zero-width frame lane instead, now that its
+    // physical shape is empty: a lane also types the clone's block argument
+    // and is what the continuation reads the value back from, so a lane
+    // carrying nothing would still need a rematerialization at the far end.
+    // This does that rematerialization once, where the value is defined.
+    {
+      llvm::SmallVector<py::TypeObjectOp, 4> typeObjects;
+      clone.walk([&](py::TypeObjectOp op) { typeObjects.push_back(op); });
+      for (py::TypeObjectOp typeObject : typeObjects) {
+        llvm::SmallVector<mlir::OpOperand *, 4> uses;
+        for (mlir::OpOperand &use : typeObject.getResult().getUses())
+          uses.push_back(&use);
+        for (mlir::OpOperand *use : uses) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPoint(use->getOwner());
+          mlir::Operation *copy = builder.clone(*typeObject.getOperation());
+          use->set(copy->getResult(0));
+        }
+        typeObject.erase();
+      }
+    }
+
     // Frame lanes: values live across a yield, from backward liveness on
     // the flattened clone CFG (phase 2 recomputes on the same clone; the
     // sent alias inserted there replaces the yield result one-for-one, so

@@ -90,6 +90,11 @@ private:
   runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
                        llvm::StringRef purpose) const;
   py::ClassOp classForContract(mlir::Type type) const;
+  // Does any class in this module name `contract` as a base? A `type[X]` has
+  // an empty physical shape only because its type decides the class, and that
+  // stops being true the moment X is subclassed. Built once and cached: the
+  // question is asked per ABI lane and the answer is a property of the module.
+  bool contractIsSubclassed(llvm::StringRef contract) const;
   // Nearest manifest exception ancestor (a contract with a `raise`
   // primitive) along a source class's emitter-computed linearization
   // (`mro_names`); nullopt for non-exception source classes. Instances of
@@ -1541,6 +1546,7 @@ private:
   // Contracts whose runtime layout is being expanded right now. A layout that
   // re-enters itself has no finite expansion (CallableABI.cpp).
   mutable llvm::DenseSet<mlir::Type> expandingContracts;
+  mutable std::optional<llvm::StringSet<>> subclassedContracts;
   llvm::DenseMap<mlir::Value, mlir::Operation *> ownedLocalObjectMarkers;
   llvm::StringMap<ReturnedValueSummary> returnedValueSummaries;
   llvm::StringMap<ReturnedCallableSummary> returnedCallableSummaries;

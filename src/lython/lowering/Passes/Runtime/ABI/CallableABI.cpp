@@ -65,6 +65,30 @@ RuntimeBundleLowerer::runtimeValueShapeFor(mlir::Operation *op, mlir::Type type,
   return shape;
 }
 
+bool RuntimeBundleLowerer::contractIsSubclassed(
+    llvm::StringRef contract) const {
+  if (!subclassedContracts) {
+    subclassedContracts.emplace();
+    mlir::ModuleOp mutableModule =
+        const_cast<RuntimeBundleLowerer *>(this)->module;
+    mutableModule.walk([&](py::ClassOp classOp) {
+      auto bases = classOp->getAttrOfType<mlir::ArrayAttr>("base_names");
+      if (!bases)
+        return;
+      for (mlir::Attribute base : bases)
+        if (auto name = mlir::dyn_cast<mlir::StringAttr>(base))
+          subclassedContracts->insert(name.getValue());
+    });
+  }
+  // A base is named as written, which may be the bare class name or the
+  // qualified contract; both spellings are recorded, so both are asked.
+  if (subclassedContracts->contains(contract))
+    return true;
+  auto dot = contract.rfind('.');
+  return dot != llvm::StringRef::npos &&
+         subclassedContracts->contains(contract.substr(dot + 1));
+}
+
 py::ClassOp RuntimeBundleLowerer::classForContract(mlir::Type type) const {
   std::string contract = runtimeContractName(type);
   if (contract.empty())
@@ -173,6 +197,48 @@ RuntimeBundleLowerer::classFieldContractTypes(py::ClassOp classOp) const {
 mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
 RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
                                            llvm::StringRef purpose) const {
+  // ⭐ `type[X]` IS ITS OWN VALUE. A type object carries nothing a program can
+  // observe beyond WHICH class it is, and that is in the type -- so its
+  // physical shape is EMPTY, and a parameter, a field, a return and a
+  // suspension lane all carry it for free. Constructing through it stays
+  // statically resolved, which is the whole point: an i64 class id in a
+  // parameter would make `t(3)` a dispatch on a runtime value, and this
+  // compiler has no dynamic dispatch to fall back to.
+  //
+  // ⛔ Why NOT the i64 class id, which is what three earlier attempts built
+  // and reverted: each moved the refusal one layer down (no contract -> bad
+  // object header -> no unbox.i64 primitive -> the bundle is not a
+  // TypeObject) and the fourth layer is where it stops being a wiring
+  // question. `t(3)` on a parameter-held class id has to pick a constructor
+  // at run time, and every ancestor of that decision -- the ABI, the field
+  // slot, the operand -- was being built to support a dispatch that would
+  // then have to be refused anyway.
+  //
+  // The soundness condition is that the class is DETERMINED by the type, so a
+  // class with subclasses is refused here rather than silently constructing
+  // the base. Reaching those is the argument specializer's job: `make(Base)`
+  // and `make(Derived)` get one body each, and inside each the parameter's
+  // type names exactly one class.
+  if (auto typeType = mlir::dyn_cast_if_present<py::TypeType>(type)) {
+    mlir::Type instance = typeType.getInstanceType();
+    std::string instanceName = runtimeContractName(instance);
+    if (instanceName.empty()) {
+      op->emitError() << purpose << " has no concrete runtime contract: "
+                      << type;
+      return mlir::failure();
+    }
+    if (contractIsSubclassed(instanceName)) {
+      op->emitError()
+          << purpose << " is " << type
+          << ", whose class is subclassed in this program, so which class it "
+             "names is not decided by its type; pass the exact class (a "
+             "`type[" << instanceName
+          << "]` parameter reached with a subclass specializes per call) or "
+             "annotate the exact one";
+      return mlir::failure();
+    }
+    return llvm::SmallVector<mlir::Type, 8>{};
+  }
   // ⭐ A layout cannot contain itself. A union-typed field stays INLINE (see
   // `classFieldStoredBoxed`), so a class reachable from its own field through
   // one -- `nxt: Optional["Node"]`, the shape every linked structure is
@@ -1293,6 +1359,16 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
       physicalArgs.push_back(
           entry.addArgument(physicalType, logicalArg.getLoc()));
 
+    // A `type[X]` parameter took no ABI input, so the bundle is rebuilt from
+    // the parameter's own type. This is the fourth layer an earlier attempt
+    // stopped at -- `lowerTypeObject` makes a TypeObject bundle for a
+    // `py.type.object` op and nothing made one for an entry argument, so an
+    // attr.set on a class-valued parameter saw a bundle with no kind at all.
+    if (auto typeType = mlir::dyn_cast<py::TypeType>(abiType)) {
+      valueBundles[logicalArg] =
+          RuntimeBundle::typeObject(abiType, typeType.getInstanceType());
+      continue;
+    }
     RuntimeBundle bundle;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
             function, abiType, physicalArgs, bundle,

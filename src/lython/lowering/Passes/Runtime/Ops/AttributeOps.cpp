@@ -807,6 +807,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       return op.emitError() << "class field metadata is malformed for "
                             << classOp.getSymName();
     mlir::Type fieldType = fieldTypes[*fieldIndex];
+    // The store wrote nothing, so the read loads nothing: a `type[X]` field's
+    // value is its declared type, and the bundle is rebuilt from it.
+    if (auto typeField = mlir::dyn_cast<py::TypeType>(fieldType)) {
+      valueBundles[op.getResult()] =
+          RuntimeBundle::typeObject(fieldType, typeField.getInstanceType());
+      erase.push_back(op);
+      return mlir::success();
+    }
     if (std::optional<unsigned> primitiveSlot =
             primitiveFieldSlot(fieldType, *fieldIndex)) {
       builder.setInsertionPoint(op);
@@ -1276,6 +1284,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     if (op.getName() == "value")
       return RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(op, *object,
                                                                  value);
+  }
+  // ⭐ Storing a `type[X]` STORES NOTHING. The field's physical shape is empty
+  // because which class the value names is decided by its type, so the write
+  // has no slot to write and the read reconstructs it from the field's
+  // declared type. The assignability the emitter already checked is what makes
+  // the two agree.
+  if (value && value->kind == RuntimeBundle::Kind::TypeObject &&
+      mlir::isa<py::TypeType>(op.getValue().getType())) {
+    erase.push_back(op);
+    return mlir::success();
   }
   if (!value || value->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "attr.set value has no lowered runtime bundle";
