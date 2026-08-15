@@ -22,9 +22,31 @@
 # `RuntimeBundle::Kind::Object` and would refuse a TypeObject bundle before
 # reaching any layout question.
 #
-# So this needs three things and has none: a declared shape for the class id, a
-# store/load path that accepts the TypeObject kind, and the call site reading
-# the id back out of the field instead of from a constant.
+# ⭐ ATTEMPTED 2026-08-15 AND REVERTED, three layers in. Each edit moved the
+# refusal one layer down, which is the useful part of the record:
+#
+#   1. `runtimeShapeContractName` answering "builtins.type" for `!py.type<...>`,
+#      plus a `@LyType_Shape() -> i64` declaration in builtins.mlir
+#        -> past "no concrete runtime contract", into
+#           "runtime object header has invalid type 'i64'"
+#   2. `primitiveFieldSlot` accepting builtins.type beside int and bool, since a
+#      class id is exactly "a whole value in one i64" -- asked through
+#      runtimeShapeContractName, because `!py.type<...>` is not a ContractType
+#      and the plain name answers ""
+#        -> past the header demand, into
+#           "attribute value has no unbox.i64 primitive for field '_cls'"
+#   3. `lowerAttrSet` materialising the class id as a constant instead of
+#      unboxing, the same lookup a call operand does
+#        -> NO CHANGE. The bundle reaching there is not
+#           `RuntimeBundle::Kind::TypeObject`, and its `contractName()` prints
+#           empty, so whatever the attr.set sees has already lost the kind.
+#
+# So the count is FOUR layers, not three, and the fourth is the one to start
+# from: find what `bundleFor(op.getValue())` holds for a type object at an
+# attr.set, because the answer is neither a TypeObject bundle nor a named
+# contract. Reverted rather than left in: three layers of gate changes that
+# still refuse the program are untested surface, which is the same rule that
+# sent back the `consumeSites` variant and the insertion-block walk today.
 #
 # BISECTED (./build/bin/lyc):
 #
