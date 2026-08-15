@@ -1148,7 +1148,59 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   // The callee is emitted before the operands on purpose: Python evaluates
   // the callee first, and its Callable contract is the expectation the
   // argument emission distributes (lambda parameters, empty literals).
-  Value callee = emitExpr(calleeNode);
+  //
+  // ⭐ Which leaves a LAMBDA callee with nothing to be expected against, and
+  // an unannotated lambda has no type of its own: `(lambda v: v * 2)(5)` was
+  // "lambda requires a Callable annotation because its type contains
+  // unresolved Unknown". The arguments are what say the parameter types here,
+  // exactly as the sequence does for `map`, so they are INFERRED (not emitted)
+  // first and handed back as the expectation. Order is preserved because
+  // inference emits nothing; the lambda expression itself has no effects to
+  // sequence against.
+  //
+  // ⛔ Why only when every argument infers and there are no starred ones: a
+  // partial expectation would bind some parameters and leave the rest
+  // Unknown, which is the diagnostic above with fewer names in it. Falling
+  // through to the unexpected emission keeps that case exactly as it was.
+  Value callee;
+  if (calleeNode && calleeNode->kind == "Lambda") {
+    llvm::SmallVector<mlir::Type, 4> argumentTypes;
+    bool complete = true;
+    if (const auto *args = ast::nodeList(expr, "args"))
+      for (const parser::NodePtr &argument : *args) {
+        if (!argument || argument->kind == "Starred") {
+          complete = false;
+          break;
+        }
+        mlir::Type argumentType =
+            types.widenLiteral(types.inferExpr(argument.get()));
+        if (!argumentType) {
+          complete = false;
+          break;
+        }
+        argumentTypes.push_back(argumentType);
+      }
+    else
+      complete = false;
+    if (complete && !argumentTypes.empty()) {
+      // Two steps, because `emitLambda` checks the body against the
+      // expectation's RESULT: a params-only callable makes every lambda
+      // "not compatible with its Callable annotation". The signature pass
+      // binds the parameters and reads the body's own type back out, and that
+      // is what completes the contract the emission is then checked against.
+      py::CallableType parameters =
+          py::CallableType::get(&context, argumentTypes, {}, {}, {}, {});
+      mlir::Type resultType =
+          types.functionSignature(*calleeNode, std::nullopt, parameters)
+              .resultType;
+      if (resultType)
+        callee = emitExprExpected(
+            calleeNode, py::CallableType::get(&context, argumentTypes, {}, {},
+                                              {}, {resultType}));
+    }
+  }
+  if (!callee.value)
+    callee = emitExpr(calleeNode);
   return emitCallableDispatch(
       expr, callee,
       emitCallOperands(expr, {}, /*includeAstArguments=*/true,
@@ -2355,7 +2407,27 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     mlir::Value keyPlaceholder;
     if (placeholder && reducerKeyNode) {
       mlir::Type keyType;
-      {
+      // ⭐ A LAMBDA key is asked directly, against the element type. The probe
+      // below infers a synthesized `key(__lykeyprobe)` call, and for a lambda
+      // that call carries no expectation into the body: the parameter is
+      // unannotated, so it types as `object` and so does the result. Both
+      // `max(xs, key=lambda p: p[1])` and `max(xs, key=lambda v: -v)` were
+      // refused with "needs a key the fold can seed ... this one produces
+      // builtins.object", while the same key spelled as a `def` and
+      // `sorted(xs, key=lambda ...)` worked -- so the refusal was about the
+      // spelling, not the fold.
+      //
+      // Same shape as `map`'s lambda arm in TypeSystem.cpp, and the same
+      // reason: a lambda's parameter type comes from the sequence, which is
+      // the expectation the emitter already distributes when it inlines the
+      // body.
+      if (reducerKeyNode->kind == "Lambda") {
+        py::CallableType expected =
+            py::CallableType::get(&context, {elementType}, {}, {}, {}, {});
+        keyType = types.widenLiteral(
+            types.functionSignature(*reducerKeyNode, std::nullopt, expected)
+                .resultType);
+      } else {
         auto scope = types.pushScope();
         types.bindLocalSymbol("__lykeyprobe", elementType);
         parser::NodePtr probeArg = synth::name(std::string("__lykeyprobe"), expr.range);
