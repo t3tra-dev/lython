@@ -59,6 +59,24 @@
 # still refuse the program are untested surface, which is the same rule that
 # sent back the `consumeSites` variant and the insertion-block walk today.
 #
+# ⭐ AND IT HAS A SECOND SYMPTOM, found 2026-08-15 while closing the generator
+# lane cluster, which raises what the item is worth. A generator that
+# CONSTRUCTS an instance at two or more yields is refused:
+#
+#     def gen() -> Iterator[C]:
+#         yield C(1)
+#         yield C(2)
+#
+# The emitter emits `py.type.object` ONCE and both `py.new` ops use it, so it is
+# live across the first yield -- and the state machine's frame-lane scan needs a
+# lane for every live value. `type[X]` has none, so the whole generator is
+# declared ineligible and falls back to the int-only inline tier. One
+# construction runs, because the type object dies before the suspend.
+#
+# So this is not only "a field cannot hold a type object": the same absent
+# representation costs a plain multi-yield factory generator. Two positions
+# known (a parameter, a live-across-suspend local), both under the same repair.
+#
 # BISECTED (./build/bin/lyc):
 #
 #   Box(Other) then o.t(5).n .......... refused at the ABI   <- this file

@@ -892,6 +892,15 @@ private:
     // types.NoneType lane: dead immortal placeholders cross the boundary.
     bool isNone = false;
     unsigned physicalCount = 0;
+    // The contract's physical parts, carried on the lane rather than looked up
+    // from the manifest on each use.
+    // ⛔ Why NOT re-ask `manifest.valueShape(contract)` at every use site (which
+    // is what `generatorLanePhysicalTypes` did): a SOURCE class has no manifest
+    // shape at all -- its layout is computed from its ClassOp -- so the lookup
+    // silently answered "no parts" for exactly the contracts this lane needs to
+    // carry, and every generator yielding a user class fell back to the
+    // int-only inline tier (seven probes, tests/probe/rebind_gen_w*.py).
+    llvm::SmallVector<mlir::Type, 4> physicalTypes;
     bool isControl() const { return contract.empty(); }
   };
   struct GeneratorResumeInfo {
@@ -935,6 +944,12 @@ private:
   GeneratorResumeInfo *generatorResumeInfoForClone(mlir::func::FuncOp clone);
   mlir::FailureOr<GeneratorResumeLane>
   computeGeneratorResumeLane(mlir::Operation *op, mlir::Type type);
+  // A contract's suspension-lane parts, or nullopt when the contract cannot
+  // ride a lane. Quiet by construction: the eligibility scan asks about every
+  // yield in the module and a contract that cannot ride a lane is a fallback,
+  // not a program error.
+  std::optional<llvm::SmallVector<mlir::Type, 4>>
+  generatorLaneParts(mlir::Operation *op, mlir::Type type) const;
   llvm::SmallVector<mlir::Type, 6>
   generatorLanePhysicalTypes(const GeneratorResumeLane &lane) const;
   // Immortal dead placeholders for a lane's physical span: release-safe

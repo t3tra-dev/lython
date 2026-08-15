@@ -1,57 +1,65 @@
-# OPEN, and the largest remaining cluster in the differential: SEVEN probes,
-# one cause. Measured 2026-08-15 by running each and reading the first line.
+# FIXED 2026-08-15, and the record is worth more than the repair: the cluster
+# was seven probes, and the cause named in this file for two sessions was WRONG.
 #
 #   rebind_gen_w1dict   rebind_gen_w1obj   rebind_gen_w1str
 #   rebind_gen_w2float  rebind_gen_w3int   rebind_gen_w3list
 #   rebind_gen_wNcls
 #
-# Every one of them:
+# All eight (these seven and this file) now agree with CPython 3.14.
 #
-#     source generator next lowering currently supports int yields
+# ⛔ THE RECORDED CAUSE WAS FALSE. It read: "everything below the gate is
+# written around `struct SourceYieldPlan { mlir::Value value; }`, so a str is
+# two lanes and generalising means the plan carries a lane GROUP -- a mechanism
+# to add, not a branch to fix." Every sentence about `SourceYieldPlan` is true
+# and none of it was the reason, because the failing programs never needed that
+# code to work. Refuted in one command:
 #
-# They differ only in what the generator yields -- a dict, an object, a str, a
-# float, a list, a user class -- and rebind_gen_w3int is in the set because its
-# yield is a Box holding an int, not an int. So the seven are not seven shapes
-# of one defect; they are one defect seen through seven payload types, and any
-# repair closes all of them at once -- though see below: one of the seven has a
-# second gate behind the first, so "one repair" means widening more than one.
+#     def gen() -> Iterator[str]: yield "abcd"     -> runs, prints "4 abcd"
 #
-# ⭐ THE GATE IS ONE LINE, and as of 2026-08-15 it states the real requirement:
-# `lowerSourceGeneratorNext` (Runtime/Ops/SourceGenerator.cpp) asks whether the
-# element's runtime value is a SINGLE LANE, which is what the code below needs,
-# rather than whether the contract is spelled "builtins.int". Measured: int
-# yields still run, and every probe here still refuses -- a Box's runtime value
-# is its class layout, not a lone handle, so none of them had the property the
-# old spelling was standing in for. Zero programs fixed by that change; it
-# renamed the requirement and moved one probe to its real next blocker.
+# A str is TWO LANES and it already worked, through
+# `emitStateMachineGeneratorResume`, which has carried lane groups all along.
+# This is [[lython-localization-discipline]] exactly: a cause that explains the
+# failing program was never checked against a program that WORKS.
 #
-# ⭐ AND rebind_gen_w3int IS BEHIND A SECOND GATE. With the first one stating
-# lanes, it gets past and reports:
+# ⭐ THE REAL CAUSE, one predicate. `laneEligibleContract` in the state
+# machine's eligibility scan (GeneratorStateMachine.cpp) asked
+# `manifest.valueShape(contract)`, and a SOURCE class has no manifest shape --
+# its layout is computed from its ClassOp by `runtimeValueTypesFor`. So every
+# generator yielding a user class was declared ineligible and fell back to the
+# int-only inline tier, whose refusal is the message this file used to carry.
+# `builtins.str` has a manifest shape, which is the whole reason a str yield ran
+# and a Box yield did not.
 #
-#     source generator next lowering currently supports only straight-line
-#     pure int yield bodies
+# ⭐ AND TWO MORE DEFECTS WERE BEHIND IT, both invisible until the lane opened,
+# both of them wrong ANSWERS rather than refusals:
 #
-# Still a payload restriction, and still spelled as a contract name, but a
-# different one further in -- so the cluster needs BOTH gates widened, and
-# whoever takes it should expect a third.
+#   1. Release placement. `insertImmediateSuccessorReleases` pinned liveness on
+#      the group's physical uses only. A field read loads the instance's box
+#      words and assembles a BORROWED memref from them, so the loads are the
+#      last physical use while the borrow is retained several ops later -- the
+#      deallocator landed between the two and `Ly_IncRef` resurrected freed
+#      storage. `findReleaseInsertion` and `releaseOwnedGroupByLiveness` both
+#      already called `collectBoxWordDerivedViews`; this one did not.
+#      Symptom: `for o in gen(): print(o.f)` printed an EMPTY LINE.
+#   2. The borrowed-entry return retain. `insertBorrowedReturnRetains`
+#      re-derived each result's operand offset by accumulating deallocator
+#      widths, which is wrong for a resume clone (its int results are raw
+#      (i64, i1) pairs, one memref of release interface). The wrong offset fell
+#      through to the contract-blind deallocator lookup, which is ambiguous as
+#      soon as two source classes share a lane shape -- so adding an UNRELATED
+#      second class moved the retain from the instance header onto its field
+#      box. Now it reads the declared `ly.ownership.owned_results`.
 #
-# ⭐ AND THE REASON IT IS INT-ONLY IS STRUCTURAL, not a missing case in a switch.
-# Everything below that gate is written around a single SSA value per yield:
+# ⭐ WHAT IS STILL REFUSED, and it is a different item: a generator whose body
+# has a loop or another region op, and a generator that CONSTRUCTS instances at
+# two or more yields. The second one is the type-object item
+# (tests/probe/wb_type_object_field.py): `py.type.object` is emitted once and
+# used by every construction, so with two constructions it is live across a
+# yield, and `type[X]` has no lane. One construction is fine because the value
+# dies before the suspend.
 #
-#     struct SourceYieldPlan { mlir::Value value; ... };
-#
-# An int's runtime value at that point is one i64 lane, so one value is the whole
-# payload. A str is two lanes, an object is a handle plus whatever its layout
-# carries, and a union is a tag plus every member's lanes. Generalising means the
-# plan carries a lane GROUP and the suspended state stores one, which is the same
-# widening the generator frame would need -- so this is a mechanism to add, not a
-# branch to fix, and it is worth scoping as one item rather than seven.
-#
-# ⛔ Not the same thing as the generator defects already recorded
-# (wb_generator_resume_raise_unwind, the frame's unwind edge): those are about
-# what happens when a generator RAISES, and they reproduce with int yields.
-#
-# differential: skip refused; the point is the refusal
+# golden: tests/golden/cases/generator_instance_yield.py (red-checked; also in
+# LYTHON_LEAK_GATE_CASES, since two of the three repairs are reference counts)
 
 from typing import Iterator
 

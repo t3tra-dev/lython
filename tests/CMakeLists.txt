@@ -619,6 +619,11 @@ set(LYTHON_LEAK_GATE_CASES
     # closed. The values were always right; only the allocator and the verifier
     # could see the difference.
     dict_literal_runtime_key_in_loops
+    # An instance crossing the generator suspension ABI. Three references the
+    # printed text cannot count: the resumer's release of the yielded instance
+    # (deferred past the field borrow's retain), the frame lane's absorbed
+    # token, and the retain on a borrowed argument the clone returns as owned.
+    generator_instance_yield
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

@@ -457,6 +457,57 @@ mlir::LogicalResult insertBorrowedReturnRetains(
       return;
 
     function.walk([&](mlir::func::ReturnOp returnOp) {
+      // ⭐ The DECLARED owned-result offsets when the function has them. They
+      // are the ground truth this walk was re-deriving, and re-deriving it is
+      // what a generator resume clone breaks: the clone's int results are raw
+      // (i64, i1) evidence pairs while builtins.int's release interface is one
+      // memref, so accumulating deallocator widths names the wrong operand for
+      // every result after the first.
+      //
+      // ⛔ Why NOT fix only the widths: a wrong offset makes the lookup fall
+      // through to the CONTRACT-BLIND overload, which is ambiguous the moment
+      // two source classes share a lane shape. With one such class the
+      // ambiguity never fired and the walk looked correct; adding an unrelated
+      // second class slid the retain from the instance header onto its field
+      // box -- so the header got no retain at all, and only the affine
+      // verifier's "returned as owned without a dominating retain" said so.
+      //
+      // ⛔ Why NOT `callableOwnedReturnRanges`, which the verifier uses: it
+      // sizes each logical result by looking the contract's deallocator up
+      // AGAINST THE VALUES, and a raw evidence pair matches no deallocator, so
+      // it answers nullopt for exactly the clones that need it.
+      if (mlir::FailureOr<own::FunctionContract> declared =
+              own::readFunctionContract(function);
+          mlir::succeeded(declared) && !declared->ownedResults.empty() &&
+          declared->ownedResultContracts.size() ==
+              declared->ownedResults.values.size()) {
+        for (auto [index, resultIndex] :
+             llvm::enumerate(declared->ownedResults.values)) {
+          if (resultIndex >= returnOp.getNumOperands())
+            continue;
+          const own::RuntimeDeallocator *deallocator =
+              own::findDeallocatorForValueGroup(
+                  returnOp.getOperands(), resultIndex, deallocators,
+                  declared->ownedResultContracts[index]);
+          if (!deallocator)
+            continue;
+          llvm::SmallVector<mlir::Value, 4> group = own::valueSlice(
+              returnOp.getOperands(), resultIndex,
+              static_cast<unsigned>(deallocator->inputTypes.size()));
+          if (group.empty())
+            continue;
+          if (own::valueGroupEqualsEntryArgumentGroup(function, group) ||
+              valueGroupDerivedFromEntryArguments(function, group, aliases)) {
+            if (mlir::failed(insertRetain(retain, returnOp.getOperation(),
+                                          group.front()))) {
+              result = mlir::failure();
+              return;
+            }
+          }
+        }
+        return;
+      }
+
       unsigned offset = 0;
       while (offset < returnOp.getNumOperands()) {
         std::optional<std::string> logicalContract =
@@ -1143,6 +1194,47 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
   llvm::SmallDenseMap<mlir::Block *, mlir::Operation *, 2> lastUser;
   for (mlir::Block *successor : successors)
     lastUser.try_emplace(successor, nullptr);
+
+  // Box-word reconstructions pin liveness here for the same reason they do in
+  // `findReleaseInsertion` and `releaseOwnedGroupByLiveness`: a field read off
+  // an instance loads the box words and assembles a BORROWED memref from them,
+  // so the entity's last physical use is the load, while the borrow is retained
+  // several ops later. Without the pin the deallocator landed between the two
+  // and `Ly_IncRef` resurrected freed storage -- `for o in gen(): print(o.f)`
+  // printed an empty string where CPython prints the field.
+  llvm::SmallVector<mlir::Value, 8> pinnedViews;
+  {
+    llvm::SmallVector<mlir::Value, 8> groupEquivalents;
+    for (mlir::Value result : group.values) {
+      llvm::SmallVector<mlir::Value, 8> equivalents;
+      aliases.namesOf(result, equivalents);
+      groupEquivalents.append(equivalents.begin(), equivalents.end());
+    }
+    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews);
+  }
+  for (mlir::Value view : pinnedViews) {
+    for (mlir::Operation *user : view.getUsers()) {
+      if (user == owner || user == terminator)
+        continue;
+      // Views only pin; a terminator forward rides along with the token's own
+      // edges, which the group walk below judges.
+      if (user->hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+      mlir::Block *owningSuccessor = nullptr;
+      for (mlir::Block *successor : successors)
+        if (ancestorInBlock(user, successor)) {
+          owningSuccessor = successor;
+          break;
+        }
+      if (!owningSuccessor)
+        return false;
+      mlir::Operation *successorUser = ancestorInBlock(user, owningSuccessor);
+      if (successorUser->hasTrait<mlir::OpTrait::IsTerminator>())
+        continue;
+      lastUser[owningSuccessor] =
+          latestUserInBlock(lastUser[owningSuccessor], successorUser);
+    }
+  }
 
   for (mlir::Value result : group.values) {
     llvm::SmallVector<mlir::Value, 8> equivalents;

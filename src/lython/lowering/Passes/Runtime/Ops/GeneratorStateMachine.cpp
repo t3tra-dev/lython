@@ -214,6 +214,41 @@ RuntimeBundleLowerer::generatorResumeInfoForClone(mlir::func::FuncOp clone) {
   return &found->second;
 }
 
+std::optional<llvm::SmallVector<mlir::Type, 4>>
+RuntimeBundleLowerer::generatorLaneParts(mlir::Operation *op,
+                                         mlir::Type type) const {
+  llvm::SmallVector<mlir::Type, 4> parts;
+  if (const RuntimeValueShape *shape =
+          manifest.valueShape(runtimeContractName(type))) {
+    parts.append(shape->valueTypes.begin(), shape->valueTypes.end());
+  } else if (RuntimeBundleLowerer::classForContract(type)) {
+    // ⛔ Why NOT call `runtimeValueTypesFor` bare: it REPORTS. A source class
+    // whose layout has no finite expansion (the self-referential union field)
+    // emits there, and this runs as a probe over every yield in the module --
+    // an eligibility answer of "no" must leave the inline path free to emit
+    // its own diagnostic, not abort the pass with one from a scan.
+    mlir::ScopedDiagnosticHandler quiet(
+        context, [](mlir::Diagnostic &) { return mlir::success(); });
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> types =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, type,
+                                                   "generator suspension lane");
+    if (mlir::failed(types))
+      return std::nullopt;
+    parts.append(types->begin(), types->end());
+  } else {
+    return std::nullopt;
+  }
+  // The frame words hold (pointer, size) per part, so every part must be a
+  // rank-1 memref the load can reconstruct. A class with an inline union field
+  // has an i64 tag lane, which those two words would silently zero.
+  for (mlir::Type part : parts) {
+    auto memref = mlir::dyn_cast<mlir::MemRefType>(part);
+    if (!memref || memref.getRank() != 1)
+      return std::nullopt;
+  }
+  return parts;
+}
+
 mlir::FailureOr<RuntimeBundleLowerer::GeneratorResumeLane>
 RuntimeBundleLowerer::computeGeneratorResumeLane(mlir::Operation *op,
                                                  mlir::Type type) {
@@ -229,14 +264,16 @@ RuntimeBundleLowerer::computeGeneratorResumeLane(mlir::Operation *op,
     return op->emitError()
            << "generator suspension lane has no concrete runtime contract: "
            << type;
-  const RuntimeValueShape *shape = manifest.valueShape(contract);
-  if (!shape)
+  std::optional<llvm::SmallVector<mlir::Type, 4>> parts =
+      RuntimeBundleLowerer::generatorLaneParts(op, type);
+  if (!parts)
     return op->emitError()
            << "generator suspension lane contract " << contract
            << " has no runtime ABI shape";
   lane.contract = contract;
   lane.isInt = contract == "builtins.int";
-  lane.physicalCount = static_cast<unsigned>(shape->valueTypes.size());
+  lane.physicalCount = static_cast<unsigned>(parts->size());
+  lane.physicalTypes = std::move(*parts);
   return lane;
 }
 
@@ -250,8 +287,7 @@ llvm::SmallVector<mlir::Type, 6> RuntimeBundleLowerer::generatorLanePhysicalType
     types.push_back(i1);
     return types;
   }
-  if (const RuntimeValueShape *shape = manifest.valueShape(lane.contract))
-    types.append(shape->valueTypes.begin(), shape->valueTypes.end());
+  types.append(lane.physicalTypes.begin(), lane.physicalTypes.end());
   if (lane.isInt) {
     types.push_back(i64);
     types.push_back(i1);
@@ -515,8 +551,7 @@ RuntimeBundleLowerer::generatorArgumentPhysicalTypes(
     types.push_back(mlir::IntegerType::get(context, 1));
     return types;
   }
-  if (const RuntimeValueShape *shape = manifest.valueShape(lane.contract))
-    types.append(shape->valueTypes.begin(), shape->valueTypes.end());
+  types.append(lane.physicalTypes.begin(), lane.physicalTypes.end());
   return types;
 }
 
@@ -998,9 +1033,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         callableAttr ? callableAttr.getValue() : mlir::Type());
     if (!callable || callable.hasVararg() || callable.hasKwarg())
       continue;
-    // Arguments: int rides the legacy (i64, i1) evidence pair; any
-    // manifest-shaped object contract rides its physical span (the lazy
-    // iterator desugars pass lists/strs/tuples into synthetic generators).
+    // Arguments: int rides the legacy (i64, i1) evidence pair; any object
+    // contract with a lane shape rides its physical span (the lazy iterator
+    // desugars pass lists/strs/tuples into synthetic generators, and a source
+    // class rides the layout computed from its ClassOp).
     // A parameter with no runtime shape falls back to the legacy tier.
     llvm::SmallVector<GeneratorResumeLane, 4> argumentLanes;
     bool argumentsEligible = true;
@@ -1014,18 +1050,15 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       lane.contract = contract;
       lane.isInt = contract == "builtins.int";
       if (!lane.isInt) {
-        const RuntimeValueShape *shape = manifest.valueShape(contract);
-        // The storage words hold (pointer, size) per part, so every part
-        // must be a rank-1 memref the load can reconstruct.
-        if (!shape || shape->valueTypes.empty() ||
-            !llvm::all_of(shape->valueTypes, [](mlir::Type type) {
-              auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
-              return memref && memref.getRank() == 1;
-            })) {
+        std::optional<llvm::SmallVector<mlir::Type, 4>> parts =
+            RuntimeBundleLowerer::generatorLaneParts(body.getOperation(),
+                                                     positional);
+        if (!parts || parts->empty()) {
           argumentsEligible = false;
           break;
         }
-        lane.physicalCount = static_cast<unsigned>(shape->valueTypes.size());
+        lane.physicalCount = static_cast<unsigned>(parts->size());
+        lane.physicalTypes = std::move(*parts);
       }
       argumentLanes.push_back(lane);
     }
@@ -1074,7 +1107,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       if (isIntContract(type))
         return "builtins.int";
       std::string contract = runtimeContractName(type);
-      if (contract.empty() || !manifest.valueShape(contract))
+      if (contract.empty() ||
+          !RuntimeBundleLowerer::generatorLaneParts(clone.getOperation(), type))
         return std::string();
       return contract;
     };

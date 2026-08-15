@@ -167,14 +167,22 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
 
   // ⭐ ONE LANE, not one contract. Everything below is written around
   // `SourceYieldPlan`, which carries a single SSA value per yield, so what the
-  // path actually requires is that the element's whole runtime value fit in one
-  // -- true of an int's i64 lane and equally of any handle-fronted contract.
-  // Spelling the requirement as "builtins.int" refused seven probes
-  // (tests/probe/wb_source_generator_non_int_yield.py) for a property they have.
+  // path actually requires is that the element's whole runtime value fit in one.
   //
-  // ⛔ Why NOT widen further here: a str is two lanes and a union is a tag plus
-  // every member's, and for those the plan really would have to carry a group.
-  // That is the mechanism this note is not adding.
+  // ⛔ Why NOT widen the plan to carry a lane group, which is what this note
+  // used to prescribe: the generator that yields a multi-lane value does not
+  // come here at all. `emitStateMachineGeneratorResume` has carried lane groups
+  // since it was written, and a generator yielding a `str` -- two lanes -- runs
+  // today. The seven probes that reached this refusal
+  // (tests/probe/wb_source_generator_non_int_yield.py) yielded SOURCE CLASSES,
+  // whose contracts have no manifest `ly.runtime.shape`, so the state machine's
+  // eligibility scan answered "no lane" and dropped them here. Widening was in
+  // GeneratorStateMachine.cpp; this path stayed as it is.
+  //
+  // What still lands here is a body the state machine declines for a different
+  // reason -- a loop or another region op, a live value with no lane -- and for
+  // those a group really would have to be carried. That mechanism is still not
+  // added.
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> elementLanes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, elementType,
                                                  "source generator yield ABI");

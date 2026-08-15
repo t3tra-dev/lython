@@ -3,6 +3,8 @@
 # CLASSIFICATION @ kernel/4b fa71a3c: 3 loud 拒否 (診断)
 #   source generator next lowering currently supports int yields
 # CPython 3.14 expects: 1 2.5 z
+# FIXED 2026-08-15: the yield lane, not the payload type -- see
+# tests/probe/wb_source_generator_non_int_yield.py for the whole cluster.
 
 class Other:
     def __init__(self, n: int) -> None:
