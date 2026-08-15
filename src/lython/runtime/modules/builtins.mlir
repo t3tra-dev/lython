@@ -19924,14 +19924,48 @@ module attributes {
   //   builtins.set        memref<11xi64>
   //   builtins.frozenset  memref<13xi64>
   //
-  //   word 0  refcount            word 5  unused (mapping secondary array)
-  //   word 1  class id (21 / 23)  word 6  unused (mapping present flags)
-  //   word 2  length              word 7  reserved
+  //   word 0  refcount            word 5  table base address
+  //   word 1  class id (21 / 23)  word 6  table mask (size - 1)
+  //   word 2  used (live entries) word 7  fill (live + dummies)
   //   word 3  capacity            word 8..  dead space up to the width
   //   word 4  items base address
   //
+  // ITERATION ORDER IS THE TABLE'S, and it is bought without teaching a single
+  // walk about the table: the DENSE ARRAY IS KEPT IN TABLE-SLOT ORDER, so
+  // `items[0..used)` -- what __repr__, the for-loop lowering, list(s) and every
+  // algebra scan below already read -- is CPython's order by construction.
+  // Insert therefore places at a rank rather than appending, and the table's
+  // state words carry the dense index so a probe still answers in one step.
+  //
+  // Why NOT walk the table at each of those sites instead: the order consumers
+  // are spread across this file, the emitter and the runtime lowering, and the
+  // `items_view` primitive is the only thing they share. Ordering the array is
+  // one place to be right; teaching every reader the table is many.
+  //
+  // Why NOT keep the array insertion-ordered and sort at iteration: CPython's
+  // order is not sorted, it is the table's -- it coincides with sorted for
+  // small ints only because a small int hashes to itself.
+  //
+  // ⛔ THE COST, measured, because ordering the array is what buys it. An
+  // insert is O(n): it shifts the dense tail and renumbers the slots after the
+  // one it takes. That is the same class the dense array was already in (the
+  // probe used to be a linear scan of every live entry), so nothing regressed
+  // asymptotically, and the table pays for it on the other side --
+  //
+  //   20k adds     2.7 s -> 5.4 s     (the shift, against an O(n) probe)
+  //   200k `in`    4.6 s -> 2.6 s     (one table lookup, against that scan)
+  //
+  // -- but O(1) inserts are reachable and this is where to start: append, mark
+  // the handle dirty, and permute into slot order inside the `items_view`
+  // primitive, which is the ONE place both this file and the C++ lowering go
+  // through to see the array. Not done here because the primitive is declared
+  // `ly.runtime.interior_word` and the ownership walk treats it as a pure
+  // view, so making it write is a change to that contract rather than to a
+  // loop.
+  //
   // Words 0-7 are the layout in Passes/Runtime/ABI/ContainerLayout.h, which
-  // dict and list already use; a set leaves 5 and 6 unused. The words above 7
+  // dict and list already use; a set spends 5 and 6 (a mapping's secondary
+  // array and present flags) and 7 on the table instead. The words above 7
   // are dead space and they are deliberate: one-laning makes a contract's shape
   // arity equal its release-interface arity, so shapeMatch scores it 0 and it
   // can never win a structural tiebreak, and an untied single-input interface
@@ -19972,7 +20006,7 @@ module attributes {
 
   // ---- the width-agnostic core --------------------------------------------
   // Every helper below takes the handle as `memref<?xi64>` and reads or writes
-  // only words 2..4, which both widths share. A caller obtains one with
+  // only words 2..7, which both widths share. A caller obtains one with
   // `memref.cast %self : memref<Nxi64> to memref<?xi64>`.
 
   func.func private @__ly_set_raw_len(%self: memref<?xi64>) -> i64 {
@@ -19998,6 +20032,604 @@ module attributes {
     func.return %view : memref<?xi64>
   }
 
+  // ---- the hash table ------------------------------------------------------
+  // CPython Objects/setobject.c, transcribed: PySet_MINSIZE 8, LINEAR_PROBES 9,
+  // PERTURB_SHIFT 5, the `fill*5 >= mask*3` growth trigger and the
+  // `used > 50000 ? used*2 : used*4` target. Each slot is TWO words --
+  //
+  //   table[2*s]     state: 0 unused, 1 dummy, n >= 2 the dense index n - 2
+  //   table[2*s + 1] the entry's hash
+  //
+  // -- which is CPython's `setentry` with the key pointer replaced by the dense
+  // index, since the box already lives in the items array.
+  //
+  // Why the state word and not CPython's (key == NULL, hash == 0 / -1) pair:
+  // an element whose hash IS 0 is ordinary here (hash(0) == 0, and word 15 of a
+  // box uses 0 for "not yet cached"), so the two conditions CPython folds into
+  // the hash field have to be spelled apart or a set containing 0 reads as
+  // empty at its own slot.
+  func.func private @__ly_set_raw_table(%self: memref<?xi64>) -> memref<?xi64> attributes {ly.runtime.interior_word} {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %table_slot = arith.constant 5 : index
+    %mask_slot = arith.constant 6 : index
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    %size = arith.addi %mask, %one : i64
+    %words = arith.muli %size, %two : i64
+    %base = memref.load %self[%table_slot] : memref<?xi64>
+    %view = func.call @__ly_global_view_i64(%base, %words) : (i64, i64) -> memref<?xi64>
+    func.return %view : memref<?xi64>
+  }
+
+  // A zeroed table of %size slots; returns its base address. Plain memref.alloc
+  // with no alignment attribute, so free_raw_i64_ptr can release it later (the
+  // same convention as the items array).
+  func.func private @__ly_set_table_new(%size: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %two = arith.constant 2 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %words = arith.muli %size, %two : i64
+    %words_index = arith.index_cast %words : i64 to index
+    %table = memref.alloc(%words_index) : memref<?xi64>
+    scf.for %w = %c0 to %words_index step %c1 {
+      memref.store %zero, %table[%w] : memref<?xi64>
+    }
+    %table_index = memref.extract_aligned_pointer_as_index %table : memref<?xi64> -> index
+    %table_word = arith.index_cast %table_index : index to i64
+    func.return %table_word : i64
+  }
+
+  // set_lookkey: the DENSE index of the entry equal to %elem_box, or -1.
+  func.func private @__ly_set_table_lookup(%self: memref<?xi64>, %elem_box: !llvm.ptr, %hash: i64) -> i64 {
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %five = arith.constant 5 : i64
+    %nine = arith.constant 9 : i64
+    %c16 = arith.constant 16 : i64
+    %shift = arith.constant 5 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %mask_slot = arith.constant 6 : index
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+    %i0 = arith.andi %hash, %mask : i64
+    %walk:4 = scf.while (%i = %i0, %p = %hash, %ans = %minus_one, %done = %false)
+        : (i64, i64, i64, i1) -> (i64, i64, i64, i1) {
+      %again = arith.xori %done, %true : i1
+      scf.condition(%again) %i, %p, %ans, %done : i64, i64, i64, i1
+    } do {
+    ^body(%i: i64, %p: i64, %ans: i64, %done: i1):
+      %limit = arith.addi %i, %nine : i64
+      %linear = arith.cmpi ule, %limit, %mask : i64
+      %probes = arith.select %linear, %nine, %zero : i1, i64
+      %count = arith.addi %probes, %one : i64
+      %count_index = arith.index_cast %count : i64 to index
+      %run:2 = scf.for %k = %c0 to %count_index step %c1
+          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
+        %step:2 = scf.if %d -> (i64, i1) {
+          scf.yield %a, %d : i64, i1
+        } else {
+          %kk = arith.index_cast %k : index to i64
+          %s = arith.addi %i, %kk : i64
+          %state_off = arith.muli %s, %two : i64
+          %state_index = arith.index_cast %state_off : i64 to index
+          %state = memref.load %table[%state_index] : memref<?xi64>
+          %unused = arith.cmpi eq, %state, %zero : i64
+          %seen:2 = scf.if %unused -> (i64, i1) {
+            scf.yield %minus_one, %true : i64, i1
+          } else {
+            %live = arith.cmpi sge, %state, %two : i64
+            %hit:2 = scf.if %live -> (i64, i1) {
+              %hash_off = arith.addi %state_off, %one : i64
+              %hash_index = arith.index_cast %hash_off : i64 to index
+              %entry_hash = memref.load %table[%hash_index] : memref<?xi64>
+              %same_hash = arith.cmpi eq, %entry_hash, %hash : i64
+              %cmp:2 = scf.if %same_hash -> (i64, i1) {
+                %dense = arith.subi %state, %two : i64
+                %off = arith.muli %dense, %c16 : i64
+                %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+                %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+                %found = arith.select %eq, %dense, %a : i1, i64
+                scf.yield %found, %eq : i64, i1
+              } else {
+                scf.yield %a, %false : i64, i1
+              }
+              scf.yield %cmp#0, %cmp#1 : i64, i1
+            } else {
+              scf.yield %a, %false : i64, i1
+            }
+            scf.yield %hit#0, %hit#1 : i64, i1
+          }
+          scf.yield %seen#0, %seen#1 : i64, i1
+        }
+        scf.yield %step#0, %step#1 : i64, i1
+      }
+      %np = arith.shrui %p, %shift : i64
+      %i5 = arith.muli %i, %five : i64
+      %i51 = arith.addi %i5, %one : i64
+      %i5p = arith.addi %i51, %np : i64
+      %ni = arith.andi %i5p, %mask : i64
+      scf.yield %ni, %np, %run#0, %run#1 : i64, i64, i64, i1
+    }
+    func.return %walk#2 : i64
+  }
+
+  // set_add_entry's probe half: (dense index or -1, target slot, target was
+  // unused rather than a dummy). The caller writes the entry, because only it
+  // knows where the box comes from.
+  //
+  // ⭐ The freeslot is the LAST dummy in the run, not the first: CPython
+  // assigns `freeslot = entry` without a null check, and taking the first
+  // instead disagrees with CPython on 20 of 1632 measured insert/discard
+  // sequences -- always a pair of neighbours in the printed order.
+  func.func private @__ly_set_table_add_probe(%self: memref<?xi64>, %elem_box: !llvm.ptr, %hash: i64) -> (i64, i64, i1) {
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %five = arith.constant 5 : i64
+    %nine = arith.constant 9 : i64
+    %c16 = arith.constant 16 : i64
+    %shift = arith.constant 5 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %mask_slot = arith.constant 6 : index
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+    %items_i64 = arith.index_cast %items_idx : index to i64
+    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
+    %i0 = arith.andi %hash, %mask : i64
+    // (i, perturb, found, slot, freeslot, done)
+    %walk:6 = scf.while (%i = %i0, %p = %hash, %found = %minus_one,
+                         %slot = %minus_one, %free = %minus_one, %done = %false)
+        : (i64, i64, i64, i64, i64, i1) -> (i64, i64, i64, i64, i64, i1) {
+      %again = arith.xori %done, %true : i1
+      scf.condition(%again) %i, %p, %found, %slot, %free, %done : i64, i64, i64, i64, i64, i1
+    } do {
+    ^body(%i: i64, %p: i64, %found: i64, %slot: i64, %free: i64, %done: i1):
+      %limit = arith.addi %i, %nine : i64
+      %linear = arith.cmpi ule, %limit, %mask : i64
+      %probes = arith.select %linear, %nine, %zero : i1, i64
+      %count = arith.addi %probes, %one : i64
+      %count_index = arith.index_cast %count : i64 to index
+      %run:4 = scf.for %k = %c0 to %count_index step %c1
+          iter_args(%f = %found, %sl = %slot, %fr = %free, %d = %done)
+          -> (i64, i64, i64, i1) {
+        %step:4 = scf.if %d -> (i64, i64, i64, i1) {
+          scf.yield %f, %sl, %fr, %d : i64, i64, i64, i1
+        } else {
+          %kk = arith.index_cast %k : index to i64
+          %s = arith.addi %i, %kk : i64
+          %state_off = arith.muli %s, %two : i64
+          %state_index = arith.index_cast %state_off : i64 to index
+          %state = memref.load %table[%state_index] : memref<?xi64>
+          %unused = arith.cmpi eq, %state, %zero : i64
+          %seen:4 = scf.if %unused -> (i64, i64, i64, i1) {
+            // found_unused_or_dummy: a dummy already seen wins the slot.
+            %reuse = arith.cmpi sge, %fr, %zero : i64
+            %target = arith.select %reuse, %fr, %s : i1, i64
+            scf.yield %minus_one, %target, %fr, %true : i64, i64, i64, i1
+          } else {
+            %live = arith.cmpi sge, %state, %two : i64
+            %hit:4 = scf.if %live -> (i64, i64, i64, i1) {
+              %hash_off = arith.addi %state_off, %one : i64
+              %hash_index = arith.index_cast %hash_off : i64 to index
+              %entry_hash = memref.load %table[%hash_index] : memref<?xi64>
+              %same_hash = arith.cmpi eq, %entry_hash, %hash : i64
+              %cmp:4 = scf.if %same_hash -> (i64, i64, i64, i1) {
+                %dense = arith.subi %state, %two : i64
+                %off = arith.muli %dense, %c16 : i64
+                %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+                %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+                %hit_dense = arith.select %eq, %dense, %f : i1, i64
+                %hit_slot = arith.select %eq, %s, %sl : i1, i64
+                scf.yield %hit_dense, %hit_slot, %fr, %eq : i64, i64, i64, i1
+              } else {
+                scf.yield %f, %sl, %fr, %false : i64, i64, i64, i1
+              }
+              scf.yield %cmp#0, %cmp#1, %cmp#2, %cmp#3 : i64, i64, i64, i1
+            } else {
+              // A dummy. CPython overwrites freeslot, so the last one wins.
+              scf.yield %f, %sl, %s, %false : i64, i64, i64, i1
+            }
+            scf.yield %hit#0, %hit#1, %hit#2, %hit#3 : i64, i64, i64, i1
+          }
+          scf.yield %seen#0, %seen#1, %seen#2, %seen#3 : i64, i64, i64, i1
+        }
+        scf.yield %step#0, %step#1, %step#2, %step#3 : i64, i64, i64, i1
+      }
+      %np = arith.shrui %p, %shift : i64
+      %i5 = arith.muli %i, %five : i64
+      %i51 = arith.addi %i5, %one : i64
+      %i5p = arith.addi %i51, %np : i64
+      %ni = arith.andi %i5p, %mask : i64
+      scf.yield %ni, %np, %run#0, %run#1, %run#2, %run#3 : i64, i64, i64, i64, i64, i1
+    }
+    // The slot came from a dummy exactly when the run recorded one AND it is
+    // the slot chosen; `fill` only moves when a never-used slot is consumed.
+    %was_free = arith.cmpi eq, %walk#4, %walk#3 : i64
+    %from_unused = arith.xori %was_free, %true : i1
+    func.return %walk#2, %walk#3, %from_unused : i64, i64, i1
+  }
+
+  // set_insert_clean: the slot a hash lands in when no key can already be
+  // present (a resize, or a merge into an empty receiver).
+  func.func private @__ly_set_table_clean_slot(%table: memref<?xi64>, %mask: i64, %hash: i64) -> i64 {
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %five = arith.constant 5 : i64
+    %nine = arith.constant 9 : i64
+    %shift = arith.constant 5 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %i0 = arith.andi %hash, %mask : i64
+    %walk:4 = scf.while (%i = %i0, %p = %hash, %ans = %minus_one, %done = %false)
+        : (i64, i64, i64, i1) -> (i64, i64, i64, i1) {
+      %again = arith.xori %done, %true : i1
+      scf.condition(%again) %i, %p, %ans, %done : i64, i64, i64, i1
+    } do {
+    ^body(%i: i64, %p: i64, %ans: i64, %done: i1):
+      %limit = arith.addi %i, %nine : i64
+      %linear = arith.cmpi ule, %limit, %mask : i64
+      %probes = arith.select %linear, %nine, %zero : i1, i64
+      %count = arith.addi %probes, %one : i64
+      %count_index = arith.index_cast %count : i64 to index
+      %run:2 = scf.for %k = %c0 to %count_index step %c1
+          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
+        %step:2 = scf.if %d -> (i64, i1) {
+          scf.yield %a, %d : i64, i1
+        } else {
+          %kk = arith.index_cast %k : index to i64
+          %s = arith.addi %i, %kk : i64
+          %state_off = arith.muli %s, %two : i64
+          %state_index = arith.index_cast %state_off : i64 to index
+          %state = memref.load %table[%state_index] : memref<?xi64>
+          %unused = arith.cmpi eq, %state, %zero : i64
+          %pick = arith.select %unused, %s, %a : i1, i64
+          scf.yield %pick, %unused : i64, i1
+        }
+        scf.yield %step#0, %step#1 : i64, i1
+      }
+      %np = arith.shrui %p, %shift : i64
+      %i5 = arith.muli %i, %five : i64
+      %i51 = arith.addi %i5, %one : i64
+      %i5p = arith.addi %i51, %np : i64
+      %ni = arith.andi %i5p, %mask : i64
+      scf.yield %ni, %np, %run#0, %run#1 : i64, i64, i64, i1
+    }
+    func.return %walk#2 : i64
+  }
+
+  // Rewrite the dense array so that it is the table's slot order again, given
+  // that every occupied slot's state currently names an index into %src_items.
+  // The receiver's own items array is REPLACED, so the source may be the array
+  // being replaced (a resize) or another set's (a merge into an empty
+  // receiver); %retain says which -- entries that move keep their reference,
+  // entries copied from another set gain one.
+  func.func private @__ly_set_table_rebuild_dense(%self: memref<?xi64>, %src_items: memref<?xi64>, %retain: i1) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %c16_i64 = arith.constant 16 : i64
+    %entity_slot = arith.constant 2 : index
+    %length_slot = arith.constant 2 : index
+    %capacity_slot = arith.constant 3 : index
+    %items_slot = arith.constant 4 : index
+    %mask_slot = arith.constant 6 : index
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    %capacity = memref.load %self[%capacity_slot] : memref<?xi64>
+    %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+    %payload_words = arith.muli %capacity, %c16_i64 : i64
+    %payload_index = arith.index_cast %payload_words : i64 to index
+    %fresh = memref.alloc(%payload_index) : memref<?xi64>
+    %slots = arith.addi %mask, %one : i64
+    %slots_index = arith.index_cast %slots : i64 to index
+    %placed = scf.for %s = %c0 to %slots_index step %c1 iter_args(%k = %c0) -> (index) {
+      %ss = arith.index_cast %s : index to i64
+      %state_off = arith.muli %ss, %two : i64
+      %state_index = arith.index_cast %state_off : i64 to index
+      %state = memref.load %table[%state_index] : memref<?xi64>
+      %live = arith.cmpi sge, %state, %two : i64
+      %next = scf.if %live -> (index) {
+        %src_dense = arith.subi %state, %two : i64
+        %src_base_i64 = arith.muli %src_dense, %c16_i64 : i64
+        %src_base = arith.index_cast %src_base_i64 : i64 to index
+        %dst_base = arith.muli %k, %c16 : index
+        scf.for %w = %c0 to %c16 step %c1 {
+          %src = arith.addi %src_base, %w : index
+          %dst = arith.addi %dst_base, %w : index
+          %word = memref.load %src_items[%src] : memref<?xi64>
+          memref.store %word, %fresh[%dst] : memref<?xi64>
+        }
+        scf.if %retain {
+          %entity_index = arith.addi %dst_base, %entity_slot : index
+          %entity = memref.load %fresh[%entity_index] : memref<?xi64>
+          func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
+        }
+        %kk = arith.index_cast %k : index to i64
+        %new_state = arith.addi %kk, %two : i64
+        memref.store %new_state, %table[%state_index] : memref<?xi64>
+        %inc = arith.addi %k, %c1 : index
+        scf.yield %inc : index
+      } else {
+        scf.yield %k : index
+      }
+      scf.yield %next : index
+    }
+    // Zero the tail so a stale handle in an unused slot never looks live.
+    %placed_words = arith.muli %placed, %c16 : index
+    scf.for %w = %placed_words to %payload_index step %c1 {
+      memref.store %zero, %fresh[%w] : memref<?xi64>
+    }
+    %old_items = memref.load %self[%items_slot] : memref<?xi64>
+    %fresh_index = memref.extract_aligned_pointer_as_index %fresh : memref<?xi64> -> index
+    %fresh_word = arith.index_cast %fresh_index : index to i64
+    memref.store %fresh_word, %self[%items_slot] : memref<?xi64>
+    %placed_i64 = arith.index_cast %placed : index to i64
+    memref.store %placed_i64, %self[%length_slot] : memref<?xi64>
+    func.call @free_raw_i64_ptr(%old_items) : (i64) -> ()
+    func.return
+  }
+
+  // set_table_resize. The old table is walked in SLOT order, which is what
+  // makes the outcome a function of the table rather than of the insertion
+  // history -- and then the dense array is permuted to the new slot order.
+  func.func private @__ly_set_raw_resize(%self: memref<?xi64>, %minused: i64) {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %eight = arith.constant 8 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %false = arith.constant false
+    %length_slot = arith.constant 2 : index
+    %table_slot = arith.constant 5 : index
+    %mask_slot = arith.constant 6 : index
+    %fill_slot = arith.constant 7 : index
+    %newsize = scf.while (%size = %eight) : (i64) -> i64 {
+      %small = arith.cmpi sle, %size, %minused : i64
+      scf.condition(%small) %size : i64
+    } do {
+    ^body(%size: i64):
+      %doubled = arith.muli %size, %two : i64
+      scf.yield %doubled : i64
+    }
+    %newmask = arith.subi %newsize, %one : i64
+    %newbase = func.call @__ly_set_table_new(%newsize) : (i64) -> i64
+    %newwords = arith.muli %newsize, %two : i64
+    %newtable = func.call @__ly_global_view_i64(%newbase, %newwords) : (i64, i64) -> memref<?xi64>
+    %oldmask = memref.load %self[%mask_slot] : memref<?xi64>
+    %oldbase = memref.load %self[%table_slot] : memref<?xi64>
+    %oldtable = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+    %oldslots = arith.addi %oldmask, %one : i64
+    %oldslots_index = arith.index_cast %oldslots : i64 to index
+    scf.for %s = %c0 to %oldslots_index step %c1 {
+      %ss = arith.index_cast %s : index to i64
+      %state_off = arith.muli %ss, %two : i64
+      %state_index = arith.index_cast %state_off : i64 to index
+      %state = memref.load %oldtable[%state_index] : memref<?xi64>
+      %live = arith.cmpi sge, %state, %two : i64
+      scf.if %live {
+        %hash_off = arith.addi %state_off, %one : i64
+        %hash_index = arith.index_cast %hash_off : i64 to index
+        %hash = memref.load %oldtable[%hash_index] : memref<?xi64>
+        %slot = func.call @__ly_set_table_clean_slot(%newtable, %newmask, %hash) : (memref<?xi64>, i64, i64) -> i64
+        %dst_off = arith.muli %slot, %two : i64
+        %dst_index = arith.index_cast %dst_off : i64 to index
+        %dst_hash_off = arith.addi %dst_off, %one : i64
+        %dst_hash_index = arith.index_cast %dst_hash_off : i64 to index
+        memref.store %state, %newtable[%dst_index] : memref<?xi64>
+        memref.store %hash, %newtable[%dst_hash_index] : memref<?xi64>
+      }
+    }
+    memref.store %newbase, %self[%table_slot] : memref<?xi64>
+    memref.store %newmask, %self[%mask_slot] : memref<?xi64>
+    func.call @free_raw_i64_ptr(%oldbase) : (i64) -> ()
+    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+    func.call @__ly_set_table_rebuild_dense(%self, %items, %false) : (memref<?xi64>, memref<?xi64>, i1) -> ()
+    %used = memref.load %self[%length_slot] : memref<?xi64>
+    memref.store %used, %self[%fill_slot] : memref<?xi64>
+    func.return
+  }
+
+  // Write a new entry at %slot, whose 16 box words come from
+  // %src_items[%src_slot]. Returns the entity word of the placed box so the
+  // caller can retain it (LySet_AddBox's caller already did; a copy out of
+  // another set has not).
+  //
+  // The dense array is in table order, so the entry belongs at the RANK of its
+  // slot -- one walk of the tail both finds that rank and shifts the dense
+  // indices the insert displaces.
+  func.func private @__ly_set_raw_place(%self: memref<?xi64>, %slot: i64, %from_unused: i1, %src_items: memref<?xi64>, %src_slot: i64, %hash: i64) -> i64 {
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %five = arith.constant 5 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c15 = arith.constant 15 : index
+    %c16 = arith.constant 16 : index
+    %c16_i64 = arith.constant 16 : i64
+    %big = arith.constant 50000 : i64
+    %four = arith.constant 4 : i64
+    %entity_slot = arith.constant 2 : index
+    %length_slot = arith.constant 2 : index
+    %mask_slot = arith.constant 6 : index
+    %fill_slot = arith.constant 7 : index
+    %used = memref.load %self[%length_slot] : memref<?xi64>
+    %required = arith.addi %used, %one : i64
+    func.call @__ly_set_raw_ensure_capacity(%self, %required) : (memref<?xi64>, i64) -> ()
+    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+    %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    // The rank is the dense index of the first live slot after %slot; every
+    // live slot after it is displaced by one.
+    %tail_first = arith.addi %slot, %one : i64
+    %tail_start = arith.index_cast %tail_first : i64 to index
+    %slots = arith.addi %mask, %one : i64
+    %slots_index = arith.index_cast %slots : i64 to index
+    %scanned = scf.for %s = %tail_start to %slots_index step %c1
+        iter_args(%r = %minus_one) -> (i64) {
+      %ss = arith.index_cast %s : index to i64
+      %state_off = arith.muli %ss, %two : i64
+      %state_index = arith.index_cast %state_off : i64 to index
+      %state = memref.load %table[%state_index] : memref<?xi64>
+      %live = arith.cmpi sge, %state, %two : i64
+      %next = scf.if %live -> (i64) {
+        %dense = arith.subi %state, %two : i64
+        %first = arith.cmpi eq, %r, %minus_one : i64
+        %rank = arith.select %first, %dense, %r : i1, i64
+        %bumped = arith.addi %state, %one : i64
+        memref.store %bumped, %table[%state_index] : memref<?xi64>
+        scf.yield %rank : i64
+      } else {
+        scf.yield %r : i64
+      }
+      scf.yield %next : i64
+    }
+    %none_after = arith.cmpi eq, %scanned, %minus_one : i64
+    %rank = arith.select %none_after, %used, %scanned : i1, i64
+    // Shift the dense tail up one entry, highest first.
+    %rank_index = arith.index_cast %rank : i64 to index
+    %used_index = arith.index_cast %used : i64 to index
+    %shift_count = arith.subi %used_index, %rank_index : index
+    scf.for %n = %c0 to %shift_count step %c1 {
+      %back = arith.subi %shift_count, %n : index
+      %src_entry = arith.addi %rank_index, %back : index
+      %src_prev = arith.subi %src_entry, %c1 : index
+      %src_base = arith.muli %src_prev, %c16 : index
+      %dst_base = arith.muli %src_entry, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %src = arith.addi %src_base, %w : index
+        %dst = arith.addi %dst_base, %w : index
+        %word = memref.load %items[%src] : memref<?xi64>
+        memref.store %word, %items[%dst] : memref<?xi64>
+      }
+    }
+    %src_base_i64 = arith.muli %src_slot, %c16_i64 : i64
+    %src_base = arith.index_cast %src_base_i64 : i64 to index
+    %dst_base = arith.muli %rank_index, %c16 : index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %src = arith.addi %src_base, %w : index
+      %dst = arith.addi %dst_base, %w : index
+      %word = memref.load %src_items[%src] : memref<?xi64>
+      memref.store %word, %items[%dst] : memref<?xi64>
+    }
+    %hash_index = arith.addi %dst_base, %c15 : index
+    memref.store %hash, %items[%hash_index] : memref<?xi64>
+    %entity_index = arith.addi %dst_base, %entity_slot : index
+    %entity = memref.load %items[%entity_index] : memref<?xi64>
+    %state = arith.addi %rank, %two : i64
+    %slot_off = arith.muli %slot, %two : i64
+    %slot_index = arith.index_cast %slot_off : i64 to index
+    %slot_hash_off = arith.addi %slot_off, %one : i64
+    %slot_hash_index = arith.index_cast %slot_hash_off : i64 to index
+    memref.store %state, %table[%slot_index] : memref<?xi64>
+    memref.store %hash, %table[%slot_hash_index] : memref<?xi64>
+    memref.store %required, %self[%length_slot] : memref<?xi64>
+    scf.if %from_unused {
+      %fill = memref.load %self[%fill_slot] : memref<?xi64>
+      %new_fill = arith.addi %fill, %one : i64
+      memref.store %new_fill, %self[%fill_slot] : memref<?xi64>
+      %loaded = arith.muli %new_fill, %five : i64
+      %room = arith.muli %mask, %three : i64
+      %crowded = arith.cmpi sge, %loaded, %room : i64
+      scf.if %crowded {
+        %huge = arith.cmpi sgt, %required, %big : i64
+        %factor = arith.select %huge, %two, %four : i1, i64
+        %target = arith.muli %required, %factor : i64
+        func.call @__ly_set_raw_resize(%self, %target) : (memref<?xi64>, i64) -> ()
+      }
+    }
+    func.return %entity : i64
+  }
+
+  // set_discard_entry's write half: the slot becomes a dummy (so the probe
+  // sequences that ran through it still reach what is behind it), and the
+  // dense array closes the gap.
+  func.func private @__ly_set_raw_discard_dense(%self: memref<?xi64>, %dense: i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %minus_one = arith.constant -1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %length_slot = arith.constant 2 : index
+    %mask_slot = arith.constant 6 : index
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+    %target_state = arith.addi %dense, %two : i64
+    %slots = arith.addi %mask, %one : i64
+    %slots_index = arith.index_cast %slots : i64 to index
+    scf.for %s = %c0 to %slots_index step %c1 {
+      %ss = arith.index_cast %s : index to i64
+      %state_off = arith.muli %ss, %two : i64
+      %state_index = arith.index_cast %state_off : i64 to index
+      %state = memref.load %table[%state_index] : memref<?xi64>
+      %is_target = arith.cmpi eq, %state, %target_state : i64
+      scf.if %is_target {
+        %hash_off = arith.addi %state_off, %one : i64
+        %hash_index = arith.index_cast %hash_off : i64 to index
+        memref.store %one, %table[%state_index] : memref<?xi64>
+        memref.store %minus_one, %table[%hash_index] : memref<?xi64>
+      }
+      %after = arith.cmpi sgt, %state, %target_state : i64
+      scf.if %after {
+        %lowered = arith.subi %state, %one : i64
+        memref.store %lowered, %table[%state_index] : memref<?xi64>
+      }
+    }
+    %len = memref.load %self[%length_slot] : memref<?xi64>
+    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %dense) : (memref<?xi64>, i64) -> ()
+    %slot_index = arith.index_cast %dense : i64 to index
+    %from = arith.addi %slot_index, %c1 : index
+    %len_index = arith.index_cast %len : i64 to index
+    scf.for %j = %from to %len_index step %c1 {
+      %dst_entry = arith.subi %j, %c1 : index
+      %src_base = arith.muli %j, %c16 : index
+      %dst_base = arith.muli %dst_entry, %c16 : index
+      scf.for %w = %c0 to %c16 step %c1 {
+        %src = arith.addi %src_base, %w : index
+        %dst = arith.addi %dst_base, %w : index
+        %word = memref.load %items[%src] : memref<?xi64>
+        memref.store %word, %items[%dst] : memref<?xi64>
+      }
+    }
+    %new_len = arith.subi %len, %one : i64
+    %last = arith.index_cast %new_len : i64 to index
+    %last_base = arith.muli %last, %c16 : index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %dst = arith.addi %last_base, %w : index
+      memref.store %zero, %items[%dst] : memref<?xi64>
+    }
+    memref.store %new_len, %self[%length_slot] : memref<?xi64>
+    func.return
+  }
+
   // Allocate the items array and publish words 0..7. The caller has already
   // zeroed its own dead words, which is the only part that knows the width.
   func.func private @__ly_set_raw_init(%self: memref<?xi64>, %class_id: i64, %length: i64) {
@@ -20010,9 +20642,10 @@ module attributes {
     %length_slot = arith.constant 2 : index
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
-    %unused_secondary_slot = arith.constant 5 : index
-    %unused_present_slot = arith.constant 6 : index
-    %reserved_slot = arith.constant 7 : index
+    %table_slot = arith.constant 5 : index
+    %mask_slot = arith.constant 6 : index
+    %fill_slot = arith.constant 7 : index
+    %min_table = arith.constant 8 : i64
 
     %needs_min_capacity = arith.cmpi slt, %length, %minimum_capacity : i64
     %capacity = arith.select %needs_min_capacity, %minimum_capacity, %length : i1, i64
@@ -20030,9 +20663,14 @@ module attributes {
     memref.store %length, %self[%length_slot] : memref<?xi64>
     memref.store %capacity, %self[%capacity_slot] : memref<?xi64>
     memref.store %items_word, %self[%items_slot] : memref<?xi64>
-    memref.store %zero, %self[%unused_secondary_slot] : memref<?xi64>
-    memref.store %zero, %self[%unused_present_slot] : memref<?xi64>
-    memref.store %zero, %self[%reserved_slot] : memref<?xi64>
+    // PySet_MINSIZE, and it is the table's size rather than the items array's:
+    // the two grow on different triggers (the table on load factor, the items
+    // array on count) and only the table's schedule is observable.
+    %table_word = func.call @__ly_set_table_new(%min_table) : (i64) -> i64
+    %min_mask = arith.subi %min_table, %one : i64
+    memref.store %table_word, %self[%table_slot] : memref<?xi64>
+    memref.store %min_mask, %self[%mask_slot] : memref<?xi64>
+    memref.store %zero, %self[%fill_slot] : memref<?xi64>
     func.return
   }
 
@@ -20129,74 +20767,25 @@ module attributes {
     func.return %found : i64
   }
 
-  // Probe a handle for a raw box. The view is derived here rather than by the
-  // caller so a caller that has just grown the set cannot hand in a stale one.
+  // Probe a handle for a raw box: the dense index, or -1. One table lookup,
+  // where this used to be a linear scan of every live entry.
   func.func private @__ly_set_raw_probe(%self: memref<?xi64>, %elem_box: !llvm.ptr, %elem_hash: i64) -> i64 {
-    %len = func.call @__ly_set_raw_len(%self) : (memref<?xi64>) -> i64
-    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
-    %found = func.call @__ly_set_probe(%len, %items, %elem_box, %elem_hash) : (i64, memref<?xi64>, !llvm.ptr, i64) -> i64
+    %found = func.call @__ly_set_table_lookup(%self, %elem_box, %elem_hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
     func.return %found : i64
   }
 
-  // Remove the slot at `found` from a dense set (release + tail shift).
+  // Remove the entry at dense index `found`.
   func.func private @__ly_set_raw_remove_slot(%self: memref<?xi64>, %found: i64) {
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    %length_slot = arith.constant 2 : index
-    %len = memref.load %self[%length_slot] : memref<?xi64>
-    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
-    func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %found) : (memref<?xi64>, i64) -> ()
-    %slot_index = arith.index_cast %found : i64 to index
-    %from = arith.addi %slot_index, %c1 : index
-    %len_index = arith.index_cast %len : i64 to index
-    scf.for %j = %from to %len_index step %c1 {
-      %dst_entry = arith.subi %j, %c1 : index
-      %src_base = arith.muli %j, %c16 : index
-      %dst_base = arith.muli %dst_entry, %c16 : index
-      scf.for %w = %c0 to %c16 step %c1 {
-        %src = arith.addi %src_base, %w : index
-        %dst = arith.addi %dst_base, %w : index
-        %word = memref.load %items[%src] : memref<?xi64>
-        memref.store %word, %items[%dst] : memref<?xi64>
-      }
-    }
-    %new_len = arith.subi %len, %one : i64
-    %last = arith.index_cast %new_len : i64 to index
-    %last_base = arith.muli %last, %c16 : index
-    scf.for %w = %c0 to %c16 step %c1 {
-      %dst = arith.addi %last_base, %w : index
-      memref.store %zero, %items[%dst] : memref<?xi64>
-    }
-    memref.store %new_len, %self[%length_slot] : memref<?xi64>
+    func.call @__ly_set_raw_discard_dense(%self, %found) : (memref<?xi64>, i64) -> ()
     func.return
   }
 
-  // Append the slot at src_slot (a raw box) to a set if not already present.
-  // Void: ensure_capacity may reallocate, and the new base is published through
-  // the handle, so there is nothing to hand back. The destination view is
-  // derived AFTER the growth, which is the property the conversion buys.
-  func.func private @__ly_set_raw_insert_slot(%self: memref<?xi64>, %src_items: memref<?xi64>, %src_slot: index) {
-    %minus_one = arith.constant -1 : i64
-    %one = arith.constant 1 : i64
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+  // The cached hash of a raw box, refilled lazily (word 15, 0 = not yet known).
+  func.func private @__ly_set_entry_hash(%entry: !llvm.ptr) -> i64 {
+    %zero = arith.constant 0 : i64
     %c15_i64 = arith.constant 15 : i64
-    %c16_i64 = arith.constant 16 : i64
-    %length_slot = arith.constant 2 : index
-    %src_idx = memref.extract_aligned_pointer_as_index %src_items : memref<?xi64> -> index
-    %src_i64 = arith.index_cast %src_idx : index to i64
-    %src_ptr = llvm.inttoptr %src_i64 : i64 to !llvm.ptr
-    %slot_i64 = arith.index_cast %src_slot : index to i64
-    %off = arith.muli %slot_i64, %c16_i64 : i64
-    %entry = llvm.getelementptr %src_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    // Cached hash (lazy refill through the shared probe convention).
     %hash_gep = llvm.getelementptr %entry[%c15_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %cached = llvm.load %hash_gep : !llvm.ptr -> i64
-    %zero = arith.constant 0 : i64
     %unknown = arith.cmpi eq, %cached, %zero : i64
     %hash = scf.if %unknown -> (i64) {
       %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
@@ -20205,33 +20794,35 @@ module attributes {
     } else {
       scf.yield %cached : i64
     }
-    %found = func.call @__ly_set_raw_probe(%self, %entry, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
-    %missing = arith.cmpi eq, %found, %minus_one : i64
+    func.return %hash : i64
+  }
+
+  // Insert the box at src_slot of a raw array if the receiver does not already
+  // hold it, retaining it on the way in. Void: the growth publishes the new
+  // items base through the handle, so there is nothing to hand back.
+  func.func private @__ly_set_raw_insert_slot(%self: memref<?xi64>, %src_items: memref<?xi64>, %src_slot: index) {
+    %minus_one = arith.constant -1 : i64
+    %c16_i64 = arith.constant 16 : i64
+    %src_idx = memref.extract_aligned_pointer_as_index %src_items : memref<?xi64> -> index
+    %src_i64 = arith.index_cast %src_idx : index to i64
+    %src_ptr = llvm.inttoptr %src_i64 : i64 to !llvm.ptr
+    %slot_i64 = arith.index_cast %src_slot : index to i64
+    %off = arith.muli %slot_i64, %c16_i64 : i64
+    %entry = llvm.getelementptr %src_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %hash = func.call @__ly_set_entry_hash(%entry) : (!llvm.ptr) -> i64
+    %probe:3 = func.call @__ly_set_table_add_probe(%self, %entry, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> (i64, i64, i1)
+    %missing = arith.cmpi eq, %probe#0, %minus_one : i64
     scf.if %missing {
-      %len = memref.load %self[%length_slot] : memref<?xi64>
-      %required = arith.addi %len, %one : i64
-      func.call @__ly_set_raw_ensure_capacity(%self, %required) : (memref<?xi64>, i64) -> ()
-      %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
-      %dst_entry = arith.index_cast %len : i64 to index
-      %src_base = arith.muli %src_slot, %c16 : index
-      %dst_base = arith.muli %dst_entry, %c16 : index
-      scf.for %w = %c0 to %c16 step %c1 {
-        %src = arith.addi %src_base, %w : index
-        %dst = arith.addi %dst_base, %w : index
-        %word = memref.load %src_items[%src] : memref<?xi64>
-        memref.store %word, %items[%dst] : memref<?xi64>
-      }
-      %entity_slot = arith.constant 2 : index
-      %entity_index = arith.addi %dst_base, %entity_slot : index
-      %entity = memref.load %items[%entity_index] : memref<?xi64>
+      %entity = func.call @__ly_set_raw_place(%self, %probe#1, %probe#2, %src_items, %slot_i64, %hash) : (memref<?xi64>, i64, i1, memref<?xi64>, i64, i64) -> i64
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
-      memref.store %required, %self[%length_slot] : memref<?xi64>
     }
     func.return
   }
 
-  // Insert every slot of (olen, oi) that the receiver does not already hold.
-  // The union half of the algebra, and set.update itself.
+  // Insert every slot of a raw (olen, oi) array the receiver does not hold.
+  // This is `set_update_internal` for a NON-set iterable: CPython adds those in
+  // the source's own order, one set_add_entry each. A set source goes through
+  // @__ly_set_raw_merge_set instead, which has three orderings this does not.
   func.func private @__ly_set_raw_merge(%self: memref<?xi64>, %olen: i64, %oi: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
@@ -20242,15 +20833,189 @@ module attributes {
     func.return
   }
 
-  // Insert each slot of (alen, ai) whose membership in (blen, bi) equals
-  // `want_present`. want=true is intersection, want=false is difference, and
-  // symmetric difference is difference(l,r) followed by this with the operands
-  // swapped and want=false.
-  func.func private @__ly_set_raw_select(%self: memref<?xi64>, %alen: i64, %ai: memref<?xi64>, %blen: i64, %bi: memref<?xi64>, %want_present: i1) {
+  // set_merge: the receiver absorbs another SET. All three branches are
+  // CPython's, and all three are load-bearing for the ORDER of the result --
+  // dropping the two fast paths disagrees with python3.14 on 274 of 2000
+  // measured `set.copy()` pairs, and dropping the up-front resize on 1342.
+  func.func private @__ly_set_raw_merge_set(%self: memref<?xi64>, %other: memref<?xi64>) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %five = arith.constant 5 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %c16_i64 = arith.constant 16 : i64
+    %true = arith.constant true
+    %entity_slot = arith.constant 2 : index
+    %length_slot = arith.constant 2 : index
+    %mask_slot = arith.constant 6 : index
+    %fill_slot = arith.constant 7 : index
+    %oused = memref.load %other[%length_slot] : memref<?xi64>
+    %nonempty = arith.cmpi sgt, %oused, %zero : i64
+    scf.if %nonempty {
+      %fill0 = memref.load %self[%fill_slot] : memref<?xi64>
+      %mask0 = memref.load %self[%mask_slot] : memref<?xi64>
+      %used0 = memref.load %self[%length_slot] : memref<?xi64>
+      %after = arith.addi %fill0, %oused : i64
+      %loaded = arith.muli %after, %five : i64
+      %room = arith.muli %mask0, %three : i64
+      %crowded = arith.cmpi sge, %loaded, %room : i64
+      scf.if %crowded {
+        %total = arith.addi %used0, %oused : i64
+        %target = arith.muli %total, %two : i64
+        func.call @__ly_set_raw_resize(%self, %target) : (memref<?xi64>, i64) -> ()
+      }
+      %fill = memref.load %self[%fill_slot] : memref<?xi64>
+      %mask = memref.load %self[%mask_slot] : memref<?xi64>
+      %omask = memref.load %other[%mask_slot] : memref<?xi64>
+      %ofill = memref.load %other[%fill_slot] : memref<?xi64>
+      %empty = arith.cmpi eq, %fill, %zero : i64
+      %same_mask = arith.cmpi eq, %mask, %omask : i64
+      %no_dummies = arith.cmpi eq, %ofill, %oused : i64
+      %m0 = arith.andi %empty, %same_mask : i1
+      %wholesale = arith.andi %m0, %no_dummies : i1
+      scf.if %wholesale {
+        // Identical geometry and nothing to skip: the table and the dense array
+        // are copied verbatim, which is the only branch that preserves the
+        // source's slot positions exactly.
+        func.call @__ly_set_raw_ensure_capacity(%self, %oused) : (memref<?xi64>, i64) -> ()
+        %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+        %oitems = func.call @__ly_set_raw_items(%other) : (memref<?xi64>) -> memref<?xi64>
+        %words_i64 = arith.muli %oused, %c16_i64 : i64
+        %words = arith.index_cast %words_i64 : i64 to index
+        scf.for %w = %c0 to %words step %c1 {
+          %word = memref.load %oitems[%w] : memref<?xi64>
+          memref.store %word, %items[%w] : memref<?xi64>
+        }
+        %oused_index = arith.index_cast %oused : i64 to index
+        scf.for %e = %c0 to %oused_index step %c1 {
+          %base = arith.muli %e, %c16 : index
+          %entity_index = arith.addi %base, %entity_slot : index
+          %entity = memref.load %items[%entity_index] : memref<?xi64>
+          func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
+        }
+        %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+        %otable = func.call @__ly_set_raw_table(%other) : (memref<?xi64>) -> memref<?xi64>
+        %slots = arith.addi %mask, %one : i64
+        %table_words_i64 = arith.muli %slots, %two : i64
+        %table_words = arith.index_cast %table_words_i64 : i64 to index
+        scf.for %w = %c0 to %table_words step %c1 {
+          %word = memref.load %otable[%w] : memref<?xi64>
+          memref.store %word, %table[%w] : memref<?xi64>
+        }
+        memref.store %oused, %self[%length_slot] : memref<?xi64>
+        memref.store %ofill, %self[%fill_slot] : memref<?xi64>
+      } else {
+        scf.if %empty {
+          // Nothing can already be present, so every entry lands by
+          // set_insert_clean; the dense array is then permuted into the slot
+          // order those choices produced.
+          func.call @__ly_set_raw_ensure_capacity(%self, %oused) : (memref<?xi64>, i64) -> ()
+          %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+          %otable = func.call @__ly_set_raw_table(%other) : (memref<?xi64>) -> memref<?xi64>
+          %oitems = func.call @__ly_set_raw_items(%other) : (memref<?xi64>) -> memref<?xi64>
+          %oslots = arith.addi %omask, %one : i64
+          %oslots_index = arith.index_cast %oslots : i64 to index
+          scf.for %s = %c0 to %oslots_index step %c1 {
+            %ss = arith.index_cast %s : index to i64
+            %state_off = arith.muli %ss, %two : i64
+            %state_index = arith.index_cast %state_off : i64 to index
+            %state = memref.load %otable[%state_index] : memref<?xi64>
+            %live = arith.cmpi sge, %state, %two : i64
+            scf.if %live {
+              %hash_off = arith.addi %state_off, %one : i64
+              %hash_index = arith.index_cast %hash_off : i64 to index
+              %hash = memref.load %otable[%hash_index] : memref<?xi64>
+              %slot = func.call @__ly_set_table_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
+              %dst_off = arith.muli %slot, %two : i64
+              %dst_index = arith.index_cast %dst_off : i64 to index
+              %dst_hash_off = arith.addi %dst_off, %one : i64
+              %dst_hash_index = arith.index_cast %dst_hash_off : i64 to index
+              memref.store %state, %table[%dst_index] : memref<?xi64>
+              memref.store %hash, %table[%dst_hash_index] : memref<?xi64>
+            }
+          }
+          func.call @__ly_set_table_rebuild_dense(%self, %oitems, %true) : (memref<?xi64>, memref<?xi64>, i1) -> ()
+          memref.store %oused, %self[%fill_slot] : memref<?xi64>
+        } else {
+          // Duplicates are possible: ordinary insertions, in the source's slot
+          // order, which is its dense order.
+          %oitems = func.call @__ly_set_raw_items(%other) : (memref<?xi64>) -> memref<?xi64>
+          %oused_index = arith.index_cast %oused : i64 to index
+          scf.for %e = %c0 to %oused_index step %c1 {
+            func.call @__ly_set_raw_insert_slot(%self, %oitems, %e) : (memref<?xi64>, memref<?xi64>, index) -> ()
+          }
+        }
+      }
+    }
+    func.return
+  }
+
+  // Discard a raw box if present; answers whether it was.
+  func.func private @__ly_set_raw_discard_box(%self: memref<?xi64>, %entry: !llvm.ptr, %hash: i64) -> i1 {
+    %minus_one = arith.constant -1 : i64
+    %found = func.call @__ly_set_table_lookup(%self, %entry, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
+    %present = arith.cmpi ne, %found, %minus_one : i64
+    scf.if %present {
+      func.call @__ly_set_raw_discard_dense(%self, %found) : (memref<?xi64>, i64) -> ()
+    }
+    func.return %present : i1
+  }
+
+  // set_difference_update_internal's tail: dummies past a fifth of the table
+  // are resized away. Without it a repeated discard/add cycle keeps a table
+  // CPython would have rebuilt, and the two orders drift apart for good.
+  func.func private @__ly_set_raw_shed_dummies(%self: memref<?xi64>) {
+    %five = arith.constant 5 : i64
+    %two = arith.constant 2 : i64
+    %big = arith.constant 50000 : i64
+    %length_slot = arith.constant 2 : index
+    %mask_slot = arith.constant 6 : index
+    %fill_slot = arith.constant 7 : index
+    %fill = memref.load %self[%fill_slot] : memref<?xi64>
+    %used = memref.load %self[%length_slot] : memref<?xi64>
+    %mask = memref.load %self[%mask_slot] : memref<?xi64>
+    %dummies = arith.subi %fill, %used : i64
+    %scaled = arith.muli %dummies, %five : i64
+    %crowded = arith.cmpi sge, %scaled, %mask : i64
+    scf.if %crowded {
+      %huge = arith.cmpi sgt, %used, %big : i64
+      %doubled = arith.muli %used, %two : i64
+      %target = arith.select %huge, %doubled, %used : i1, i64
+      func.call @__ly_set_raw_resize(%self, %target) : (memref<?xi64>, i64) -> ()
+    }
+    func.return
+  }
+
+  // set_swap_bodies, narrowed to what an in-place update needs: the receiver
+  // takes over the freshly built set's storage and the temporary is left
+  // holding the receiver's, so releasing it frees what the receiver dropped.
+  func.func private @__ly_set_raw_swap_bodies(%lhs: memref<?xi64>, %rhs: memref<?xi64>) {
+    %c2 = arith.constant 2 : index
+    %c8 = arith.constant 8 : index
+    %c1 = arith.constant 1 : index
+    scf.for %w = %c2 to %c8 step %c1 {
+      %l = memref.load %lhs[%w] : memref<?xi64>
+      %r = memref.load %rhs[%w] : memref<?xi64>
+      memref.store %r, %lhs[%w] : memref<?xi64>
+      memref.store %l, %rhs[%w] : memref<?xi64>
+    }
+    func.return
+  }
+
+  // Insert each entry of %a whose membership in %b equals `want_present`. The
+  // scan is over %a's DENSE array, which is its table order, so the result is
+  // built in the order CPython's set_next hands the entries out.
+  func.func private @__ly_set_raw_select(%self: memref<?xi64>, %a: memref<?xi64>, %b: memref<?xi64>, %want_present: i1) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = arith.constant 16 : i64
     %minus_one = arith.constant -1 : i64
+    %length_slot = arith.constant 2 : index
+    %alen = memref.load %a[%length_slot] : memref<?xi64>
+    %ai = func.call @__ly_set_raw_items(%a) : (memref<?xi64>) -> memref<?xi64>
     %alen_index = arith.index_cast %alen : i64 to index
     %ai_idx = memref.extract_aligned_pointer_as_index %ai : memref<?xi64> -> index
     %ai_i64 = arith.index_cast %ai_idx : index to i64
@@ -20259,8 +21024,8 @@ module attributes {
       %ii = arith.index_cast %i : index to i64
       %off = arith.muli %ii, %c16_i64 : i64
       %entry = llvm.getelementptr %ai_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
-      %in_b = func.call @__ly_set_probe(%blen, %bi, %entry, %entry_hash) : (i64, memref<?xi64>, !llvm.ptr, i64) -> i64
+      %entry_hash = func.call @__ly_set_entry_hash(%entry) : (!llvm.ptr) -> i64
+      %in_b = func.call @__ly_set_table_lookup(%b, %entry, %entry_hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
       %present = arith.cmpi ne, %in_b, %minus_one : i64
       %keep = arith.cmpi eq, %present, %want_present : i1
       scf.if %keep {
@@ -20270,68 +21035,71 @@ module attributes {
     func.return
   }
 
-  // Keep/drop filter core: keep receiver entries whose membership in
-  // (olen, oi) equals %keep_present; dropped entries are released and the
-  // dense prefix compacted. Entries at or past %scan_limit are always kept.
-  func.func private @__ly_set_raw_filter_in_place(%self: memref<?xi64>, %olen: i64, %oi: memref<?xi64>, %keep_present: i1, %scan_limit: i64) {
+  // Drop from the receiver every entry whose membership in %other equals
+  // %drop_present, walking the receiver back to front so a dense removal never
+  // moves an entry the walk has still to visit.
+  //
+  // ⛔ Why NOT the compacting forward filter this replaces: a discard leaves a
+  // DUMMY behind, and the dummy is what a later insert reuses -- rebuilding the
+  // dense prefix without it would put the receiver in a state no CPython
+  // sequence reaches, and the next insertion would then land somewhere CPython
+  // does not put it.
+  func.func private @__ly_set_raw_drop_matching(%self: memref<?xi64>, %other: memref<?xi64>, %drop_present: i1) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
     %c16_i64 = arith.constant 16 : i64
     %minus_one = arith.constant -1 : i64
-    %zero = arith.constant 0 : i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<?xi64>
-    %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
     %len_index = arith.index_cast %len : i64 to index
-    %limit_index = arith.index_cast %scan_limit : i64 to index
-    %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
-    %items_i64 = arith.index_cast %items_idx : index to i64
-    %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
-    %kept = scf.for %i = %c0 to %len_index step %c1 iter_args(%next = %c0) -> (index) {
+    scf.for %n = %c0 to %len_index step %c1 {
+      %back = arith.subi %len_index, %n : index
+      %i = arith.subi %back, %c1 : index
+      %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+      %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
+      %items_i64 = arith.index_cast %items_idx : index to i64
+      %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
       %ii = arith.index_cast %i : index to i64
       %off = arith.muli %ii, %c16_i64 : i64
       %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %beyond_limit = arith.cmpi sge, %i, %limit_index : index
-      %matches = scf.if %beyond_limit -> (i1) {
-        %true_k = arith.constant true
-        scf.yield %true_k : i1
-      } else {
-        %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
-        %in_other = func.call @__ly_set_probe(%olen, %oi, %entry, %entry_hash) : (i64, memref<?xi64>, !llvm.ptr, i64) -> i64
-        %present = arith.cmpi ne, %in_other, %minus_one : i64
-        %k = arith.cmpi eq, %present, %keep_present : i1
-        scf.yield %k : i1
+      %entry_hash = func.call @__ly_set_entry_hash(%entry) : (!llvm.ptr) -> i64
+      %in_other = func.call @__ly_set_table_lookup(%other, %entry, %entry_hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
+      %present = arith.cmpi ne, %in_other, %minus_one : i64
+      %drop = arith.cmpi eq, %present, %drop_present : i1
+      scf.if %drop {
+        func.call @__ly_set_raw_discard_dense(%self, %ii) : (memref<?xi64>, i64) -> ()
       }
-      %advanced = scf.if %matches -> (index) {
-        %same = arith.cmpi eq, %next, %i : index
-        scf.if %same {
-        } else {
-          %src_base = arith.muli %i, %c16 : index
-          %dst_base = arith.muli %next, %c16 : index
-          scf.for %w = %c0 to %c16 step %c1 {
-            %src = arith.addi %src_base, %w : index
-            %dst = arith.addi %dst_base, %w : index
-            %word = memref.load %items[%src] : memref<?xi64>
-            memref.store %word, %items[%dst] : memref<?xi64>
-          }
-        }
-        %inc = arith.addi %next, %c1 : index
-        scf.yield %inc : index
-      } else {
-        func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %ii) : (memref<?xi64>, i64) -> ()
-        scf.yield %next : index
+    }
+    func.return
+  }
+
+  // set_symmetric_difference_update's loop: each entry of %other is discarded
+  // from the receiver if present and added if not. %other is not mutated, so
+  // its dense array is a stable walk -- the `so is other` case is a clear and
+  // never reaches here.
+  func.func private @__ly_set_raw_toggle(%self: memref<?xi64>, %other: memref<?xi64>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %c16_i64 = arith.constant 16 : i64
+    %length_slot = arith.constant 2 : index
+    %olen = memref.load %other[%length_slot] : memref<?xi64>
+    %oi = func.call @__ly_set_raw_items(%other) : (memref<?xi64>) -> memref<?xi64>
+    %olen_index = arith.index_cast %olen : i64 to index
+    %oi_idx = memref.extract_aligned_pointer_as_index %oi : memref<?xi64> -> index
+    %oi_i64 = arith.index_cast %oi_idx : index to i64
+    %oi_ptr = llvm.inttoptr %oi_i64 : i64 to !llvm.ptr
+    scf.for %i = %c0 to %olen_index step %c1 {
+      %ii = arith.index_cast %i : index to i64
+      %off = arith.muli %ii, %c16_i64 : i64
+      %entry = llvm.getelementptr %oi_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %hash = func.call @__ly_set_entry_hash(%entry) : (!llvm.ptr) -> i64
+      %removed = func.call @__ly_set_raw_discard_box(%self, %entry, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i1
+      %absent = arith.xori %removed, %true : i1
+      scf.if %absent {
+        func.call @__ly_set_raw_insert_slot(%self, %oi, %i) : (memref<?xi64>, memref<?xi64>, index) -> ()
       }
-      scf.yield %advanced : index
     }
-    // Zero the vacated tail so stale handles never look live.
-    %kept_i64 = arith.index_cast %kept : index to i64
-    %kept_words = arith.muli %kept, %c16 : index
-    %len_words = arith.muli %len_index, %c16 : index
-    scf.for %w = %kept_words to %len_words step %c1 {
-      memref.store %zero, %items[%w] : memref<?xi64>
-    }
-    memref.store %kept_i64, %self[%length_slot] : memref<?xi64>
     func.return
   }
 
@@ -20413,6 +21181,19 @@ module attributes {
       memref.store %zero, %items[%w] : memref<?xi64>
     }
     memref.store %zero, %self[%length_slot] : memref<?xi64>
+    // set_clear_internal drops back to the minimum table, dummies and all.
+    %one = arith.constant 1 : i64
+    %min_table = arith.constant 8 : i64
+    %table_slot = arith.constant 5 : index
+    %mask_slot = arith.constant 6 : index
+    %fill_slot = arith.constant 7 : index
+    %old_table = memref.load %self[%table_slot] : memref<?xi64>
+    %fresh = func.call @__ly_set_table_new(%min_table) : (i64) -> i64
+    %min_mask = arith.subi %min_table, %one : i64
+    memref.store %fresh, %self[%table_slot] : memref<?xi64>
+    memref.store %min_mask, %self[%mask_slot] : memref<?xi64>
+    memref.store %zero, %self[%fill_slot] : memref<?xi64>
+    func.call @free_raw_i64_ptr(%old_table) : (i64) -> ()
     func.return
   }
 
@@ -20433,6 +21214,9 @@ module attributes {
     }
     %items_word = memref.load %self[%items_slot] : memref<?xi64>
     func.call @free_raw_i64_ptr(%items_word) : (i64) -> ()
+    %table_slot = arith.constant 5 : index
+    %table_word = memref.load %self[%table_slot] : memref<?xi64>
+    func.call @free_raw_i64_ptr(%table_word) : (i64) -> ()
     func.return
   }
 
@@ -20461,10 +21245,15 @@ module attributes {
     func.return %view : memref<?xi64>
   }
 
-  func.func private @__ly_set_copy_alloc(%src_len: i64, %src_items: memref<?xi64>) -> memref<11xi64> attributes {ly.ownership.owned_results = [0]} {
-    %self = func.call @__ly_set_alloc(%src_len) : (i64) -> memref<11xi64>
-    %items = func.call @__ly_set_items(%self) : (memref<11xi64>) -> memref<?xi64>
-    func.call @__ly_seq_fill_copy(%items, %src_len, %src_items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
+  // set_copy: an empty set of the MINIMUM table size, then set_merge. The
+  // empty-and-same-mask branch of the merge is what makes a small copy come out
+  // byte-identical; going through a bulk fill of the dense array instead would
+  // give the copy no table at all.
+  func.func private @__ly_set_copy_alloc(%src: memref<?xi64>) -> memref<11xi64> attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %self = func.call @__ly_set_alloc(%zero) : (i64) -> memref<11xi64>
+    %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
+    func.call @__ly_set_raw_merge_set(%raw, %src) : (memref<?xi64>, memref<?xi64>) -> ()
     func.return %self : memref<11xi64>
   }
 
@@ -20498,35 +21287,20 @@ module attributes {
   // duplicate element consumes it here. Void and non-transferring: the growth
   // publishes the new items base through the handle.
   func.func @LySet_AddBox(%self: memref<11xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.set", ly.runtime.primitive = "add_box"} {
-    %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
     %minus_one = arith.constant -1 : i64
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
     %c15 = arith.constant 15 : index
-    %c16 = arith.constant 16 : index
-    %handle_words = arith.constant 16 : i64
-    %length_slot = arith.constant 2 : index
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
     %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
     memref.store %hash, %elem_box[%c15] : memref<16xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
-    %found = func.call @__ly_set_raw_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
-    %missing = arith.cmpi eq, %found, %minus_one : i64
+    %src = memref.cast %elem_box : memref<16xi64> to memref<?xi64>
+    %probe:3 = func.call @__ly_set_table_add_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> (i64, i64, i1)
+    %missing = arith.cmpi eq, %probe#0, %minus_one : i64
     scf.if %missing {
-      %len = memref.load %self[%length_slot] : memref<11xi64>
-      %required = arith.addi %len, %one : i64
-      func.call @__ly_set_raw_ensure_capacity(%raw, %required) : (memref<?xi64>, i64) -> ()
-      %items = func.call @__ly_set_items(%self) : (memref<11xi64>) -> memref<?xi64>
-      %slot_base_i64 = arith.muli %len, %handle_words : i64
-      %slot_base = arith.index_cast %slot_base_i64 : i64 to index
-      scf.for %w = %c0 to %c16 step %c1 {
-        %word = memref.load %elem_box[%w] : memref<16xi64>
-        %dst = arith.addi %slot_base, %w : index
-        memref.store %word, %items[%dst] : memref<?xi64>
-      }
-      memref.store %required, %self[%length_slot] : memref<11xi64>
+      %entity = func.call @__ly_set_raw_place(%raw, %probe#1, %probe#2, %src, %zero, %hash) : (memref<?xi64>, i64, i1, memref<?xi64>, i64, i64) -> i64
     } else {
       // Duplicate: consume the caller's retained box.
       func.call @LyObject_ReleaseBoxedPayloadRaw(%elem_box) : (memref<16xi64>) -> ()
@@ -20588,63 +21362,87 @@ module attributes {
   }
 
   func.func @LySet_Copy(%self: memref<11xi64> {ly.ownership.object_header}) -> memref<11xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.set"} {
-    %length_slot = arith.constant 2 : index
-    %len = memref.load %self[%length_slot] : memref<11xi64>
-    %items = func.call @__ly_set_items(%self) : (memref<11xi64>) -> memref<?xi64>
-    %copy = func.call @__ly_set_copy_alloc(%len, %items) : (i64, memref<?xi64>) -> memref<11xi64>
+    %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
+    %copy = func.call @__ly_set_copy_alloc(%raw) : (memref<?xi64>) -> memref<11xi64>
     func.return %copy : memref<11xi64>
   }
 
+  // set_union: a copy of the receiver, then set_merge of the argument.
   func.func @LySet_Union(%lhs: memref<11xi64> {ly.ownership.object_header}, %rhs: memref<11xi64> {ly.ownership.object_header}) -> memref<11xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "union", ly.runtime.result_contract = "builtins.set"} {
-    %length_slot = arith.constant 2 : index
-    %llen = memref.load %lhs[%length_slot] : memref<11xi64>
-    %li = func.call @__ly_set_items(%lhs) : (memref<11xi64>) -> memref<?xi64>
-    %result = func.call @__ly_set_copy_alloc(%llen, %li) : (i64, memref<?xi64>) -> memref<11xi64>
-    %rlen = memref.load %rhs[%length_slot] : memref<11xi64>
-    %ri = func.call @__ly_set_items(%rhs) : (memref<11xi64>) -> memref<?xi64>
+    %lraw = memref.cast %lhs : memref<11xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<11xi64> to memref<?xi64>
+    %result = func.call @__ly_set_copy_alloc(%lraw) : (memref<?xi64>) -> memref<11xi64>
     %raw = memref.cast %result : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_merge(%raw, %rlen, %ri) : (memref<?xi64>, i64, memref<?xi64>) -> ()
+    func.call @__ly_set_raw_merge_set(%raw, %rraw) : (memref<?xi64>, memref<?xi64>) -> ()
     func.return %result : memref<11xi64>
   }
 
+  // set_intersection scans the SMALLER operand and probes the larger, and the
+  // scan order is the result's insertion order -- so the swap is not only the
+  // faster arrangement, it is which answer CPython prints (44 of 2000 measured
+  // pairs disagree without it).
   func.func @LySet_Intersection(%lhs: memref<11xi64> {ly.ownership.object_header}, %rhs: memref<11xi64> {ly.ownership.object_header}) -> memref<11xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "intersection", ly.runtime.result_contract = "builtins.set"} {
     %zero = arith.constant 0 : i64
     %true = arith.constant true
     %length_slot = arith.constant 2 : index
     %result = func.call @__ly_set_alloc(%zero) : (i64) -> memref<11xi64>
     %llen = memref.load %lhs[%length_slot] : memref<11xi64>
-    %li = func.call @__ly_set_items(%lhs) : (memref<11xi64>) -> memref<?xi64>
     %rlen = memref.load %rhs[%length_slot] : memref<11xi64>
-    %ri = func.call @__ly_set_items(%rhs) : (memref<11xi64>) -> memref<?xi64>
+    %lraw = memref.cast %lhs : memref<11xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<11xi64> to memref<?xi64>
     %raw = memref.cast %result : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_select(%raw, %llen, %li, %rlen, %ri, %true) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>, i1) -> ()
+    %rhs_bigger = arith.cmpi sgt, %rlen, %llen : i64
+    scf.if %rhs_bigger {
+      func.call @__ly_set_raw_select(%raw, %lraw, %rraw, %true) : (memref<?xi64>, memref<?xi64>, memref<?xi64>, i1) -> ()
+    } else {
+      func.call @__ly_set_raw_select(%raw, %rraw, %lraw, %true) : (memref<?xi64>, memref<?xi64>, memref<?xi64>, i1) -> ()
+    }
     func.return %result : memref<11xi64>
   }
 
+  // set_difference. When the receiver is more than four times the argument,
+  // CPython copies it and discards the common part instead of rebuilding --
+  // and a discard leaves a dummy where a rebuild leaves nothing, so the two
+  // spellings print different orders (195 of 2000 measured pairs).
   func.func @LySet_Difference(%lhs: memref<11xi64> {ly.ownership.object_header}, %rhs: memref<11xi64> {ly.ownership.object_header}) -> memref<11xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "difference", ly.runtime.result_contract = "builtins.set"} {
     %zero = arith.constant 0 : i64
+    %two = arith.constant 2 : i64
     %false = arith.constant false
+    %true = arith.constant true
     %length_slot = arith.constant 2 : index
-    %result = func.call @__ly_set_alloc(%zero) : (i64) -> memref<11xi64>
     %llen = memref.load %lhs[%length_slot] : memref<11xi64>
-    %li = func.call @__ly_set_items(%lhs) : (memref<11xi64>) -> memref<?xi64>
     %rlen = memref.load %rhs[%length_slot] : memref<11xi64>
-    %ri = func.call @__ly_set_items(%rhs) : (memref<11xi64>) -> memref<?xi64>
-    %raw = memref.cast %result : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_select(%raw, %llen, %li, %rlen, %ri, %false) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>, i1) -> ()
+    %lraw = memref.cast %lhs : memref<11xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<11xi64> to memref<?xi64>
+    %quarter = arith.shrsi %llen, %two : i64
+    %much_bigger = arith.cmpi sgt, %quarter, %rlen : i64
+    %result = scf.if %much_bigger -> (memref<11xi64>) {
+      %copied = func.call @__ly_set_copy_alloc(%lraw) : (memref<?xi64>) -> memref<11xi64>
+      %craw = memref.cast %copied : memref<11xi64> to memref<?xi64>
+      func.call @__ly_set_raw_drop_matching(%craw, %rraw, %true) : (memref<?xi64>, memref<?xi64>, i1) -> ()
+      scf.yield %copied : memref<11xi64>
+    } else {
+      %fresh = func.call @__ly_set_alloc(%zero) : (i64) -> memref<11xi64>
+      %fraw = memref.cast %fresh : memref<11xi64> to memref<?xi64>
+      func.call @__ly_set_raw_select(%fraw, %lraw, %rraw, %false) : (memref<?xi64>, memref<?xi64>, memref<?xi64>, i1) -> ()
+      scf.yield %fresh : memref<11xi64>
+    }
     func.return %result : memref<11xi64>
   }
 
+  // set_symmetric_difference: a copy of the ARGUMENT, then the receiver's
+  // entries toggled into it one at a time.
+  //
+  // ⛔ Why NOT difference(l, r) followed by difference(r, l), which is what
+  // this used to do and what the identity suggests: the two halves are two
+  // independent build orders concatenated, and CPython's is one build order
+  // through a single table.
   func.func @LySet_SymmetricDifference(%lhs: memref<11xi64> {ly.ownership.object_header}, %rhs: memref<11xi64> {ly.ownership.object_header}) -> memref<11xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "symmetric_difference", ly.runtime.result_contract = "builtins.set"} {
-    %false = arith.constant false
-    %length_slot = arith.constant 2 : index
-    %result = func.call @LySet_Difference(%lhs, %rhs) : (memref<11xi64>, memref<11xi64>) -> memref<11xi64>
-    %llen = memref.load %lhs[%length_slot] : memref<11xi64>
-    %li = func.call @__ly_set_items(%lhs) : (memref<11xi64>) -> memref<?xi64>
-    %rlen = memref.load %rhs[%length_slot] : memref<11xi64>
-    %ri = func.call @__ly_set_items(%rhs) : (memref<11xi64>) -> memref<?xi64>
+    %lraw = memref.cast %lhs : memref<11xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<11xi64> to memref<?xi64>
+    %result = func.call @__ly_set_copy_alloc(%rraw) : (memref<?xi64>) -> memref<11xi64>
     %raw = memref.cast %result : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_select(%raw, %rlen, %ri, %llen, %li, %false) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>, i1) -> ()
+    func.call @__ly_set_raw_toggle(%raw, %lraw) : (memref<?xi64>, memref<?xi64>) -> ()
     func.return %result : memref<11xi64>
   }
 
@@ -20747,78 +21545,56 @@ module attributes {
   }
 
   // In-place update family. All four are VOID and declare no transfer_args:
-  // the growth publishes through the handle and the filters compact in place,
-  // so there is no renamed representation to hand back. These four plus
-  // LySet_AddBox and LyFrozenSet_Init were the six transfer_args declarations
-  // this block owned.
+  // the growth publishes through the handle and the removals leave the handle
+  // naming the same entity, so there is no renamed representation to hand back.
+  // These four plus LySet_AddBox and LyFrozenSet_Init were the six
+  // transfer_args declarations this block owned.
+  //
+  // Each one is CPython's, and the three that REMOVE are not the same shape:
+  // intersection_update builds the intersection and swaps bodies (so the
+  // receiver ends up with the intersection's table), while difference_update
+  // and symmetric_difference_update mutate the receiver's own table and leave
+  // the dummies where they fall.
   func.func @LySet_UpdateM(%self: memref<11xi64> {ly.ownership.object_header}, %other: memref<11xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.set", ly.runtime.method = "update"} {
-    %length_slot = arith.constant 2 : index
-    %olen = memref.load %other[%length_slot] : memref<11xi64>
-    %oi = func.call @__ly_set_items(%other) : (memref<11xi64>) -> memref<?xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_merge(%raw, %olen, %oi) : (memref<?xi64>, i64, memref<?xi64>) -> ()
+    %oraw = memref.cast %other : memref<11xi64> to memref<?xi64>
+    func.call @__ly_set_raw_merge_set(%raw, %oraw) : (memref<?xi64>, memref<?xi64>) -> ()
     func.return
   }
 
   func.func @LySet_IntersectionUpdate(%self: memref<11xi64> {ly.ownership.object_header}, %other: memref<11xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.set", ly.runtime.method = "intersection_update"} {
-    %true = arith.constant true
-    %length_slot = arith.constant 2 : index
-    %olen = memref.load %other[%length_slot] : memref<11xi64>
-    %oi = func.call @__ly_set_items(%other) : (memref<11xi64>) -> memref<?xi64>
-    %len_now = memref.load %self[%length_slot] : memref<11xi64>
+    %fresh = func.call @LySet_Intersection(%self, %other) : (memref<11xi64>, memref<11xi64>) -> memref<11xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_filter_in_place(%raw, %olen, %oi, %true, %len_now) : (memref<?xi64>, i64, memref<?xi64>, i1, i64) -> ()
+    %fraw = memref.cast %fresh : memref<11xi64> to memref<?xi64>
+    func.call @__ly_set_raw_swap_bodies(%raw, %fraw) : (memref<?xi64>, memref<?xi64>) -> ()
+    // The temporary now holds what the receiver dropped, so releasing it is
+    // the discard -- exactly what set_swap_bodies + Py_DECREF does.
+    func.call @LySet_DecRef(%fresh) : (memref<11xi64>) -> ()
     func.return
   }
 
   func.func @LySet_DifferenceUpdate(%self: memref<11xi64> {ly.ownership.object_header}, %other: memref<11xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.set", ly.runtime.method = "difference_update"} {
-    %false = arith.constant false
-    %length_slot = arith.constant 2 : index
-    %olen = memref.load %other[%length_slot] : memref<11xi64>
-    %oi = func.call @__ly_set_items(%other) : (memref<11xi64>) -> memref<?xi64>
-    %len_now = memref.load %self[%length_slot] : memref<11xi64>
+    %true = arith.constant true
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
-    func.call @__ly_set_raw_filter_in_place(%raw, %olen, %oi, %false, %len_now) : (memref<?xi64>, i64, memref<?xi64>, i1, i64) -> ()
+    %oraw = memref.cast %other : memref<11xi64> to memref<?xi64>
+    func.call @__ly_set_raw_drop_matching(%raw, %oraw, %true) : (memref<?xi64>, memref<?xi64>, i1) -> ()
+    func.call @__ly_set_raw_shed_dummies(%raw) : (memref<?xi64>) -> ()
     func.return
   }
 
   func.func @LySet_SymmetricDifferenceUpdate(%self: memref<11xi64> {ly.ownership.object_header}, %other: memref<11xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.set", ly.runtime.method = "symmetric_difference_update"} {
-    // other-only elements first (probing a snapshot of the ORIGINAL receiver
-    // membership: drop the common part after collecting), then drop common.
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
-    %minus_one = arith.constant -1 : i64
-    %false = arith.constant false
-    %length_slot = arith.constant 2 : index
-    %olen = memref.load %other[%length_slot] : memref<11xi64>
-    %oi = func.call @__ly_set_items(%other) : (memref<11xi64>) -> memref<?xi64>
-    %olen_index = arith.index_cast %olen : i64 to index
-    %oi_idx = memref.extract_aligned_pointer_as_index %oi : memref<?xi64> -> index
-    %oi_i64 = arith.index_cast %oi_idx : index to i64
-    %oi_ptr = llvm.inttoptr %oi_i64 : i64 to !llvm.ptr
-    // Original receiver length: additions land past it, so both the membership
-    // probe and the common-drop filter below only see the original prefix. The
-    // three-lane form had to save and restore the length word in the meta lane
-    // to bound the probe; the one-lane probe takes the bound BY VALUE instead.
-    %orig_len = memref.load %self[%length_slot] : memref<11xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
-    scf.for %i = %c0 to %olen_index step %c1 {
-      %ii = arith.index_cast %i : index to i64
-      %off = arith.muli %ii, %c16_i64 : i64
-      %entry = llvm.getelementptr %oi_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
-      // Derived inside the loop: a preceding iteration may have grown the set.
-      %items = func.call @__ly_set_items(%self) : (memref<11xi64>) -> memref<?xi64>
-      %in_orig = func.call @__ly_set_probe(%orig_len, %items, %entry, %entry_hash) : (i64, memref<?xi64>, !llvm.ptr, i64) -> i64
-      %absent = arith.cmpi eq, %in_orig, %minus_one : i64
-      scf.if %absent {
-        func.call @__ly_set_raw_insert_slot(%raw, %oi, %i) : (memref<?xi64>, memref<?xi64>, index) -> ()
-      }
+    %oraw = memref.cast %other : memref<11xi64> to memref<?xi64>
+    %self_idx = memref.extract_aligned_pointer_as_index %self : memref<11xi64> -> index
+    %other_idx = memref.extract_aligned_pointer_as_index %other : memref<11xi64> -> index
+    %same = arith.cmpi eq, %self_idx, %other_idx : index
+    scf.if %same {
+      // s ^= s is a clear, and it has to be spelled: the toggle loop would
+      // walk the very array it is emptying.
+      func.call @__ly_set_raw_clear(%raw) : (memref<?xi64>) -> ()
+    } else {
+      func.call @__ly_set_raw_toggle(%raw, %oraw) : (memref<?xi64>, memref<?xi64>) -> ()
     }
-    // Drop the common part from the ORIGINAL prefix only: the appended entries
-    // came from `other`, so an unbounded filter would delete them right back.
-    func.call @__ly_set_raw_filter_in_place(%raw, %olen, %oi, %false, %orig_len) : (memref<?xi64>, i64, memref<?xi64>, i1, i64) -> ()
     func.return
   }
 
@@ -20980,17 +21756,23 @@ module attributes {
     func.return %ne : i1
   }
 
+  // The frozenset algebra is the set algebra with the other handle width; each
+  // one is the same CPython function, so the shapes are kept side by side
+  // rather than each simplified on its own.
+  func.func private @__ly_frozenset_copy_alloc(%src: memref<?xi64>) -> memref<13xi64> attributes {ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %self = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<13xi64>
+    %raw = memref.cast %self : memref<13xi64> to memref<?xi64>
+    func.call @__ly_set_raw_merge_set(%raw, %src) : (memref<?xi64>, memref<?xi64>) -> ()
+    func.return %self : memref<13xi64>
+  }
+
   func.func @LyFrozenSet_Union(%lhs: memref<13xi64> {ly.ownership.object_header}, %rhs: memref<13xi64> {ly.ownership.object_header}) -> memref<13xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "union", ly.runtime.result_contract = "builtins.frozenset"} {
-    %length_slot = arith.constant 2 : index
-    %llen = memref.load %lhs[%length_slot] : memref<13xi64>
-    %li = func.call @__ly_frozenset_items(%lhs) : (memref<13xi64>) -> memref<?xi64>
-    %result = func.call @__ly_frozenset_alloc(%llen) : (i64) -> memref<13xi64>
-    %ritems = func.call @__ly_frozenset_items(%result) : (memref<13xi64>) -> memref<?xi64>
-    func.call @__ly_seq_fill_copy(%ritems, %llen, %li) : (memref<?xi64>, i64, memref<?xi64>) -> ()
-    %rlen = memref.load %rhs[%length_slot] : memref<13xi64>
-    %ri = func.call @__ly_frozenset_items(%rhs) : (memref<13xi64>) -> memref<?xi64>
+    %lraw = memref.cast %lhs : memref<13xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<13xi64> to memref<?xi64>
+    %result = func.call @__ly_frozenset_copy_alloc(%lraw) : (memref<?xi64>) -> memref<13xi64>
     %raw = memref.cast %result : memref<13xi64> to memref<?xi64>
-    func.call @__ly_set_raw_merge(%raw, %rlen, %ri) : (memref<?xi64>, i64, memref<?xi64>) -> ()
+    func.call @__ly_set_raw_merge_set(%raw, %rraw) : (memref<?xi64>, memref<?xi64>) -> ()
     func.return %result : memref<13xi64>
   }
 
@@ -21000,38 +21782,51 @@ module attributes {
     %length_slot = arith.constant 2 : index
     %result = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<13xi64>
     %llen = memref.load %lhs[%length_slot] : memref<13xi64>
-    %li = func.call @__ly_frozenset_items(%lhs) : (memref<13xi64>) -> memref<?xi64>
     %rlen = memref.load %rhs[%length_slot] : memref<13xi64>
-    %ri = func.call @__ly_frozenset_items(%rhs) : (memref<13xi64>) -> memref<?xi64>
+    %lraw = memref.cast %lhs : memref<13xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<13xi64> to memref<?xi64>
     %raw = memref.cast %result : memref<13xi64> to memref<?xi64>
-    func.call @__ly_set_raw_select(%raw, %llen, %li, %rlen, %ri, %true) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>, i1) -> ()
+    %rhs_bigger = arith.cmpi sgt, %rlen, %llen : i64
+    scf.if %rhs_bigger {
+      func.call @__ly_set_raw_select(%raw, %lraw, %rraw, %true) : (memref<?xi64>, memref<?xi64>, memref<?xi64>, i1) -> ()
+    } else {
+      func.call @__ly_set_raw_select(%raw, %rraw, %lraw, %true) : (memref<?xi64>, memref<?xi64>, memref<?xi64>, i1) -> ()
+    }
     func.return %result : memref<13xi64>
   }
 
   func.func @LyFrozenSet_Difference(%lhs: memref<13xi64> {ly.ownership.object_header}, %rhs: memref<13xi64> {ly.ownership.object_header}) -> memref<13xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "difference", ly.runtime.result_contract = "builtins.frozenset"} {
     %zero = arith.constant 0 : i64
+    %two = arith.constant 2 : i64
     %false = arith.constant false
+    %true = arith.constant true
     %length_slot = arith.constant 2 : index
-    %result = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<13xi64>
     %llen = memref.load %lhs[%length_slot] : memref<13xi64>
-    %li = func.call @__ly_frozenset_items(%lhs) : (memref<13xi64>) -> memref<?xi64>
     %rlen = memref.load %rhs[%length_slot] : memref<13xi64>
-    %ri = func.call @__ly_frozenset_items(%rhs) : (memref<13xi64>) -> memref<?xi64>
-    %raw = memref.cast %result : memref<13xi64> to memref<?xi64>
-    func.call @__ly_set_raw_select(%raw, %llen, %li, %rlen, %ri, %false) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>, i1) -> ()
+    %lraw = memref.cast %lhs : memref<13xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<13xi64> to memref<?xi64>
+    %quarter = arith.shrsi %llen, %two : i64
+    %much_bigger = arith.cmpi sgt, %quarter, %rlen : i64
+    %result = scf.if %much_bigger -> (memref<13xi64>) {
+      %copied = func.call @__ly_frozenset_copy_alloc(%lraw) : (memref<?xi64>) -> memref<13xi64>
+      %craw = memref.cast %copied : memref<13xi64> to memref<?xi64>
+      func.call @__ly_set_raw_drop_matching(%craw, %rraw, %true) : (memref<?xi64>, memref<?xi64>, i1) -> ()
+      scf.yield %copied : memref<13xi64>
+    } else {
+      %fresh = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<13xi64>
+      %fraw = memref.cast %fresh : memref<13xi64> to memref<?xi64>
+      func.call @__ly_set_raw_select(%fraw, %lraw, %rraw, %false) : (memref<?xi64>, memref<?xi64>, memref<?xi64>, i1) -> ()
+      scf.yield %fresh : memref<13xi64>
+    }
     func.return %result : memref<13xi64>
   }
 
   func.func @LyFrozenSet_SymmetricDifference(%lhs: memref<13xi64> {ly.ownership.object_header}, %rhs: memref<13xi64> {ly.ownership.object_header}) -> memref<13xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "symmetric_difference", ly.runtime.result_contract = "builtins.frozenset"} {
-    %false = arith.constant false
-    %length_slot = arith.constant 2 : index
-    %result = func.call @LyFrozenSet_Difference(%lhs, %rhs) : (memref<13xi64>, memref<13xi64>) -> memref<13xi64>
-    %llen = memref.load %lhs[%length_slot] : memref<13xi64>
-    %li = func.call @__ly_frozenset_items(%lhs) : (memref<13xi64>) -> memref<?xi64>
-    %rlen = memref.load %rhs[%length_slot] : memref<13xi64>
-    %ri = func.call @__ly_frozenset_items(%rhs) : (memref<13xi64>) -> memref<?xi64>
+    %lraw = memref.cast %lhs : memref<13xi64> to memref<?xi64>
+    %rraw = memref.cast %rhs : memref<13xi64> to memref<?xi64>
+    %result = func.call @__ly_frozenset_copy_alloc(%rraw) : (memref<?xi64>) -> memref<13xi64>
     %raw = memref.cast %result : memref<13xi64> to memref<?xi64>
-    func.call @__ly_set_raw_select(%raw, %rlen, %ri, %llen, %li, %false) : (memref<?xi64>, i64, memref<?xi64>, i64, memref<?xi64>, i1) -> ()
+    func.call @__ly_set_raw_toggle(%raw, %lraw) : (memref<?xi64>, memref<?xi64>) -> ()
     func.return %result : memref<13xi64>
   }
 

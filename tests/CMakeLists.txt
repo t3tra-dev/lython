@@ -624,6 +624,15 @@ set(LYTHON_LEAK_GATE_CASES
     # (deferred past the field borrow's retain), the frame lane's absorbed
     # token, and the retain on a borrowed argument the clone returns as owned.
     generator_instance_yield
+    # The set's hash table. Three references the printed order cannot count:
+    # the dense shift an insert-at-rank performs (the same box words end up in
+    # a different slot, and only one of the two writes owns them), the entries
+    # a resize moves into a freshly allocated array while the old one is freed
+    # under them, and the wholesale table copy in set_merge's fast path, which
+    # is the only place a reference is taken by a bulk word copy rather than by
+    # an insert. The table itself is a second allocation per set, so a missed
+    # free here is invisible to every other check.
+    set_table_order
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
