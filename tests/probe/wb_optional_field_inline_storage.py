@@ -55,13 +55,30 @@
 #     function exit without release". The union's lanes alias the instance's,
 #     so a use of the slice is not a use of the group.
 #
-# (4) OVERWRITING A str MEMBER LEAKS THE OLD ONE, and this is the one that
-#     COMPILES. `h.name = "b"` over `"a"`: net 1 alloc / 41 B on
-#     `tests/leak_gate.py`, identical on the binary before the repair above, so
-#     it is exposed by that repair rather than caused by it. `list[int] | None`
-#     and `int | None` overwrite at net 0 -- the splice releases a one-memref
-#     member and not a two-lane one. The boxed path has no such gap: it
-#     releases whatever the box owned before overwriting.
+# (4) OVERWRITING THE FIELD LEAKS THE WHOLE INSTANCE, and this is the one that
+#     COMPILES. Measured with `tests/leak_gate.py`, one store over a
+#     constructor-set value, every member type:
+#
+#         str            net 1 alloc  /    41 B
+#         bytes          net 1 alloc  /    65 B
+#         list[int]      net 2 allocs /  8264 B
+#         dict[str, int] net 5 allocs / 17001 B
+#
+#     ⛔ AND THE FIRST READING WAS WRONG, which is why the numbers are here.
+#     "The splice releases a one-memref member and not a two-lane one" fitted
+#     the first two rows and is false: the IR contains BOTH retains and BOTH
+#     releases for the member, correctly paired
+#     (`aggregate_retain = "builtins.str:class.f"` twice,
+#     `aggregate_release` for the old slot and for the source). What is missing
+#     is the call to `__ly_dealloc_H` -- the deallocator exists, releases the
+#     member, and is never reached. The store RE-ROOTS the instance's lane
+#     tuple (that is what a splice is), and the release planner's identity is
+#     the tuple, so the instance it was tracking no longer has a death. Same
+#     cause as (3), and the leak scales with what the instance holds rather
+#     than with the field.
+#
+#     Identical on the binary before the repair above, so it is exposed by that
+#     repair rather than caused by it.
 #
 # ⭐ THE MECHANISM IS THE ONE `lowerAttrSet` ALREADY NAMES: "Refusing is the
 # floor until the field is stored behind a handle the way every other field
