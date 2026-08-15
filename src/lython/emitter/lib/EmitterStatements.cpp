@@ -64,6 +64,71 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     bindImportStatement(statement, /*diagnoseUnsupported=*/true);
   } else if (statement.kind == "Assign") {
     const parser::Node *rhs = ast::node(statement, "value");
+    // ⭐ `a, b = b, a + b` BUILDS NO TUPLE. Both sides are written out here, so
+    // the general path's "materialize the right, then index it once per
+    // target" makes an object whose whole life is the statement -- and in a
+    // loop that object is what the ownership placement cannot resolve:
+    //
+    //     a, b = 0, 1
+    //     while i < n:
+    //         a, b = b, a + b     # "operand #0 does not dominate this use"
+    //                             # or "released owned resource ... is used
+    //                             #     after release" inside a function
+    //
+    // which is the fibonacci idiom and every loop-carried swap with it. The
+    // same statement outside a loop worked, and the three-statement spelling
+    // with an explicit temporary always did.
+    //
+    // Python evaluates the WHOLE right side before assigning any target, so
+    // emitting every element first and then assigning is the semantics, not an
+    // approximation -- it is also what CPython's ROT_TWO does with no tuple.
+    //
+    // ⛔ Arity must match exactly and neither side may be starred: `a, b = xs`
+    // has no elements here to pair, and `a, *rest = 1, 2, 3` takes a
+    // statically unknown number. Both fall through to the general path, which
+    // is where the arity check and the starred refusal live.
+    //
+    // ⛔ AND EVERY TARGET MUST BE A BARE NAME, which is not tidiness. A
+    // subscript target LEAKS on this path -- measured, 2 allocations / 104 B
+    // for `grid[0] = 3; grid[1] = 4; grid[0], grid[1] = grid[1], grid[0]`,
+    // against 0 through the tuple. The tuple is doing ownership work there:
+    // it takes a reference to each element it materializes and gives it up
+    // when it dies, so the element read out of it arrives at the store owned.
+    // Handing the READ's borrow straight to the store instead leaves a
+    // reference nobody accounts for. A bare name binds rather than stores, so
+    // it has no such edge -- and the loop-carried swap of locals is the whole
+    // defect. Widening this needs the store side to take the reference the
+    // tuple used to.
+    if (rhs && (rhs->kind == "Tuple" || rhs->kind == "List")) {
+      const auto *targets = ast::nodeList(statement, "targets");
+      const auto *sources = ast::nodeList(*rhs, "elts");
+      if (targets && targets->size() == 1 && targets->front() &&
+          (targets->front()->kind == "Tuple" ||
+           targets->front()->kind == "List") &&
+          sources) {
+        const auto *elts = ast::nodeList(*targets->front(), "elts");
+        auto noneStarred = [](const std::vector<parser::NodePtr> &nodes) {
+          return llvm::all_of(nodes, [](const parser::NodePtr &node) {
+            return node && node->kind != "Starred";
+          });
+        };
+        auto allNames = [](const std::vector<parser::NodePtr> &nodes) {
+          return llvm::all_of(nodes, [](const parser::NodePtr &node) {
+            return node && node->kind == "Name";
+          });
+        };
+        if (elts && elts->size() == sources->size() && !elts->empty() &&
+            allNames(*elts) && noneStarred(*sources)) {
+          llvm::SmallVector<Value, 4> parts;
+          parts.reserve(sources->size());
+          for (const parser::NodePtr &source : *sources)
+            parts.push_back(emitExpr(source.get()));
+          for (auto [index, elt] : llvm::enumerate(*elts))
+            emitAssignTarget(*elt, parts[index]);
+          return;
+        }
+      }
+    }
     Value value{{}, {}};
     bool emittedWithContext = false;
     if (rhs && rhs->kind == "Lambda") {

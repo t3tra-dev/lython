@@ -656,6 +656,12 @@ set(LYTHON_LEAK_GATE_CASES
     # releases, so a read that took one reference too many is invisible to
     # stdout and shows up only as a count.
     unannotated_module_globals
+    # The loop-carried swap: the tuple the general path materializes is doing
+    # ownership work, and skipping it for bare-name targets must not drop a
+    # release. The subscript and attribute swaps here still go through the
+    # tuple and are the control -- a subscript target on the no-tuple path
+    # leaked 104 B, which no printed value showed.
+    tuple_swap_in_loop
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior
