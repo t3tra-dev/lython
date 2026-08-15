@@ -41,10 +41,21 @@
 #           `RuntimeBundle::Kind::TypeObject`, and its `contractName()` prints
 #           empty, so whatever the attr.set sees has already lost the kind.
 #
-# So the count is FOUR layers, not three, and the fourth is the one to start
-# from: find what `bundleFor(op.getValue())` holds for a type object at an
-# attr.set, because the answer is neither a TypeObject bundle nor a named
-# contract. Reverted rather than left in: three layers of gate changes that
+# ⭐ AND THE FOURTH LAYER IS ANSWERED, cheaply, which changes the shape of the
+# whole item. The attr.set's value is not a `py.type.object` result at all:
+#
+#     py.attr.set %arg0["_cls"] = %arg1 ... : !py.contract<"Holder">,
+#                                             !py.type<!py.contract<"Inner">>
+#
+# `%arg1` is `Holder.__init__`'s PARAMETER. `lowerTypeObject` makes a
+# `RuntimeBundle::typeObject` for a `py.type.object` op, and nothing makes one
+# for an entry argument, so the store was never going to see the kind.
+#
+# So this is not "a field cannot hold a type object". It is that `type[X]` has a
+# runtime representation at a CALL OPERAND and nowhere else -- not in a
+# parameter, not in a field, not in a local. Four layers found and the parameter
+# ABI is only the next; expect a read side and a call site behind it. Scope it as
+# "give type[X] a representation end to end", not as a field repair. Reverted rather than left in: three layers of gate changes that
 # still refuse the program are untested surface, which is the same rule that
 # sent back the `consumeSites` variant and the insertion-block walk today.
 #
