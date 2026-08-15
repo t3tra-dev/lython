@@ -787,6 +787,12 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     sourceName =
         source.sourceName.empty() ? source.moduleName : source.sourceName;
     activePackageName = source.packageName;
+    // The pair `emitInDefiningModuleScope` already uses for a specialization
+    // emitted in its own module. This walk pushed a scope but left the
+    // importer's below it, which is a scope that shadows rather than one that
+    // isolates.
+    ImporterModuleScope importerScope(*this);
+    TypeSystem::ScopeIsolation isolation = types.isolateScopes();
     auto moduleScope = types.pushScope();
     std::size_t importDiagnosticStart = diagnostics.size();
     bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/true);

@@ -915,6 +915,48 @@ private:
   // references re-emit the literal, so a function body can read them
   // (collectModuleGlobals). The node is owned by the parse tree.
   llvm::StringMap<const parser::Node *> moduleConstantBindings;
+
+  // ⭐ The three module-scope VALUE bindings above, hidden for the duration of
+  // a walk that emits ANOTHER module's code. `TypeSystem::ScopeIsolation` does
+  // the same for the type scopes and these are the rest of it: one
+  // `ModuleEmitter` emits the program and every module it imports, so a name
+  // registered here is otherwise in scope inside every stdlib body.
+  //
+  // ⛔ What that cost, since "the importer's names are merely also visible"
+  // sounds harmless: they SHADOW at the type level. `iterdir` has a local
+  // `names`, and a program with any annotated `names` global failed inside
+  // pathlib -- "'builtins.int' does not provide manifest method 'sort'",
+  // reported against a file the program never wrote, naming neither the
+  // global nor the collision.
+  //
+  // Python resolves a function's globals in the module that DEFINES it, so
+  // there is nothing here to reconcile: the importer's module scope simply is
+  // not in scope. Restored on the way out, because the importer's own bodies
+  // are emitted after.
+  class ImporterModuleScope {
+  public:
+    explicit ImporterModuleScope(ModuleEmitter &emitter)
+        : emitter(&emitter), globals(std::move(emitter.moduleGlobals)),
+          constants(std::move(emitter.moduleConstantBindings)),
+          primitives(std::move(emitter.primitiveConstants)) {
+      emitter.moduleGlobals.clear();
+      emitter.moduleConstantBindings.clear();
+      emitter.primitiveConstants.clear();
+    }
+    ImporterModuleScope(const ImporterModuleScope &) = delete;
+    ImporterModuleScope &operator=(const ImporterModuleScope &) = delete;
+    ~ImporterModuleScope() {
+      emitter->moduleGlobals = std::move(globals);
+      emitter->moduleConstantBindings = std::move(constants);
+      emitter->primitiveConstants = std::move(primitives);
+    }
+
+  private:
+    ModuleEmitter *emitter;
+    llvm::StringMap<mlir::Type> globals;
+    llvm::StringMap<const parser::Node *> constants;
+    llvm::StringMap<PrimitiveConstant> primitives;
+  };
   // Names whose flow type a branch narrowing replaced, and what it was before.
   // A WRITE inside the branch is not constrained by the narrowing -- `xs = []`
   // under `if xs is None:` wants the declared `list[int] | None`, not the

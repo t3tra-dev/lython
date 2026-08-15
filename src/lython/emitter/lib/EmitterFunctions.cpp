@@ -271,6 +271,7 @@ void ModuleEmitter::emitInDefiningModuleScope(
   });
   std::size_t diagnosticStart = diagnostics.size();
   {
+    ImporterModuleScope importerScope(*this);
     TypeSystem::ScopeIsolation isolation = types.isolateScopes();
     auto moduleScope = types.pushScope();
     bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);

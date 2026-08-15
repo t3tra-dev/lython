@@ -2547,6 +2547,16 @@ Value ModuleEmitter::emitInlineMethodBody(
       sourceModuleForClass(method.definingClass);
   std::size_t crossModuleDiagnosticStart = diagnostics.size();
   std::optional<TypeSystem::ScopeIsolation> isolation;
+  // ⛔ `values.clear()` and the scope isolation below are NOT the whole
+  // environment. The module-scope value bindings live in three maps of their
+  // own, and leaving the use site's in place is how an inlined stdlib method
+  // read the PROGRAM's globals: `iterdir` has a local `names`, and any
+  // annotated `names` in the program made line 264 of pathlib.py report
+  // "'builtins.int' does not provide manifest method 'sort'". The read
+  // resolved to the global because `isModuleGlobalRead` consults a map this
+  // walk never swapped -- and at module scope the ASSIGNMENT above it went to
+  // the global's cell too, so the local was never bound at all.
+  std::optional<ImporterModuleScope> importerScope;
   std::optional<llvm::SaveAndRestore<std::string>> savedSourceName;
   std::optional<llvm::SaveAndRestore<std::string>> savedPackageName;
   llvm::SmallVector<LoopControlContext, 4> savedLoopContexts;
@@ -2564,6 +2574,7 @@ Value ModuleEmitter::emitInlineMethodBody(
   std::optional<TypeSystem::Scope> moduleScope;
   if (methodSource) {
     values.clear();
+    importerScope.emplace(*this);
     isolation.emplace(types.isolateScopes());
     savedSourceName.emplace(sourceName, methodSource->sourceName.empty()
                                             ? methodSource->moduleName
