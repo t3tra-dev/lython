@@ -50,9 +50,13 @@
 #      second class moved the retain from the instance header onto its field
 #      box. Now it reads the declared `ly.ownership.owned_results`.
 #
-# ⭐ WHAT IS STILL REFUSED, and it is a different item: a generator whose body
-# has a loop or another region op, and a generator that CONSTRUCTS instances at
-# two or more yields. The second one is the type-object item
+# ⭐ WHAT IS STILL REFUSED, and both are LIVE-VALUE lane questions rather than
+# yield questions. A generator that iterates a list (`for x in xs: yield x`)
+# keeps a protocol-typed iterator live across the yield and protocols have no
+# lane -- localized in tests/probe/known_class_generator_method.py, where the
+# range and while spellings that RUN are recorded beside it. And a generator
+# that CONSTRUCTS instances at two or more yields keeps the shared
+# `py.type.object` live across the first one; that is the type-object item
 # (tests/probe/wb_type_object_field.py): `py.type.object` is emitted once and
 # used by every construction, so with two constructions it is live across a
 # yield, and `type[X]` has no lane. One construction is fine because the value
