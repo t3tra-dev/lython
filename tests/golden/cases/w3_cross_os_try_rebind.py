@@ -13,6 +13,13 @@
 # Every path is RELATIVE so the OSError messages, which carry the failing
 # path, are host-independent and match CPython 3.14 byte for byte. The tree is
 # never created: the case only needs paths that cannot exist.
+#
+# One line does NOT match CPython, and it is a recorded port deviation rather
+# than anything this case is pinning: `print(parts)` renders a list where
+# CPython renders a tuple, because pathlib.py documents `parts` as list[str]
+# ("the count is not static"). Noted here because a differential run over the
+# golden corpus reads this file's stdout as a divergence and there is no other
+# way to tell a deviation from a defect. Same deviation as stdlib_pathlib.py.
 import os
 from pathlib import Path
 
