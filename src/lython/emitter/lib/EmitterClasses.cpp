@@ -8,6 +8,7 @@
 #include "Contracts.h"
 #include "ExceptionTaxonomy.h"
 #include "PyProtocols.h"
+#include "TypeSystemSolver.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -2601,6 +2602,90 @@ Value ModuleEmitter::emitInlineMethodBody(
     bound.insert(name);
   };
 
+  // ⭐ THE DECLARED PARAMETER TYPE IS CHECKED HERE, and nowhere else can. An
+  // inlined body binds the argument VALUE, so an argument of the wrong type is
+  // substituted into the body and the call succeeds or fails on whatever the
+  // body happens to do with it. `def take(self, xs: list[str])` reached by
+  // `c.take({"a": 1})` compiled and answered `len(dict)`; `collections.Counter`
+  // is the same shape and it is the reason this was found --
+  // `Counter({"x": 2, "y": 1})` has `list[str] | None` declared, iterated the
+  // dict's KEYS, and every count came out 1 (CPython: 2 and 1). Silent, and a
+  // free function of the same signature has always refused it
+  // ("call arguments do not match the Callable contract").
+  //
+  // ⛔ Why CHECK and not COERCE: `x: float` reached by `3` must keep the int.
+  // CPython leaves an annotation inert at a parameter, and the numeric tower
+  // makes int assignable to float, so this passes it through unchanged --
+  // which is what `tests/probe/wb_argument_boundary_numeric_tower.py` measures
+  // and what the free-function specializer preserves at its own boundary.
+  //
+  // ⛔ Why an UNGROUND declared type is skipped rather than unified: a generic
+  // class's method still spells `T` here even after `bindClassTypeArguments`
+  // when the receiver's own arguments did not reach it, and refusing on
+  // `list[int]` vs `list[T]` would reject the specializations this walk exists
+  // to emit. A type parameter that IS bound has already been substituted, so
+  // the skip costs only the cases the class table could not ground.
+  //
+  // ⛔ Why a SYNTHESIZED method is exempt: its signature is this compiler's
+  // spelling, not the program's. `@dataclass`/`NamedTuple` give `__eq__` the
+  // parameter type `Self`, and Python's data model gives it `object` --
+  // `TupleA(1) == TupleB(1)` is True in CPython and
+  // `inherited_post_init_and_cross_class_equality` pins it. Checking a
+  // signature nobody wrote against a rule nobody stated is how a correct
+  // program gets refused.
+  bool methodIsSynthesized = llvm::any_of(
+      synthesizedClassMethods, [&](const parser::NodePtr &synthesized) {
+        return synthesized.get() == method.method;
+      });
+  auto checkArgument = [&](llvm::StringRef name, mlir::Type declared,
+                           Value argument) {
+    if (methodIsSynthesized || !declared || !argument.type)
+      return;
+    mlir::Type expected = types.widenLiteral(declared);
+    mlir::Type actual = types.widenLiteral(argument.type);
+    if (!expected || !actual || unboundStaticParameterCount(expected) != 0 ||
+        unboundStaticParameterCount(actual) != 0)
+      return;
+    if (isAssignableWithStaticEvidence(actual, expected, module))
+      return;
+    // ⭐ The numeric tower is admitted HERE and not by `isAssignableTo`, which
+    // answers false for int against float. A free function refuses the same
+    // call and `emitArgumentSpecializedCall` then emits a SECOND BODY at the
+    // argument's rung; an inlined method re-emits its body at every call site
+    // already, so the specialization it would need is the emission that is
+    // about to happen. Refusing here would take away a shape that works.
+    auto rung = [&](mlir::Type type) {
+      if (type == types.boolType())
+        return 0;
+      if (type == types.intType())
+        return 1;
+      if (type == types.floatType())
+        return 2;
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+      if (contract && contract.getArguments().empty() &&
+          contract.getContractName() == "builtins.complex")
+        return 3;
+      return -1;
+    };
+    int actualRung = rung(actual);
+    int expectedRung = rung(expected);
+    if (actualRung >= 0 && expectedRung >= 0 && actualRung <= expectedRung)
+      return;
+    auto spell = [](mlir::Type type) {
+      std::string text;
+      llvm::raw_string_ostream stream(text);
+      stream << type;
+      return text;
+    };
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "argument '" + name.str() + "' of '" +
+            std::string(ast::string(*method.method, "name")
+                            .value_or(std::string_view("method"))) +
+            "' is declared " + spell(expected) + " and this call gives it " +
+            spell(actual)});
+  };
+
   unsigned parameterIndex = 0;
   if (bindDescriptorReceiver && !sig.positionalNames.empty()) {
     bind(sig.positionalNames.front(), receiver);
@@ -2614,11 +2699,14 @@ Value ModuleEmitter::emitInlineMethodBody(
           "too many positional arguments for inlined class method"});
       break;
     }
+    if (parameterIndex < sig.positionalTypes.size())
+      checkArgument(sig.positionalNames[parameterIndex],
+                    sig.positionalTypes[parameterIndex], argument);
     bind(sig.positionalNames[parameterIndex++], argument);
   }
 
   auto bindKeyword = [&](llvm::StringRef name, Value value) {
-    for (llvm::StringRef positionalName : sig.positionalNames) {
+    for (auto [index, positionalName] : llvm::enumerate(sig.positionalNames)) {
       if (positionalName != name)
         continue;
       if (bound.contains(name)) {
@@ -2628,12 +2716,16 @@ Value ModuleEmitter::emitInlineMethodBody(
                 "'"});
         return;
       }
+      if (index < sig.positionalTypes.size())
+        checkArgument(name, sig.positionalTypes[index], value);
       bind(name, value);
       return;
     }
-    for (llvm::StringRef kwOnlyName : sig.kwOnlyNames) {
+    for (auto [index, kwOnlyName] : llvm::enumerate(sig.kwOnlyNames)) {
       if (kwOnlyName != name)
         continue;
+      if (index < sig.kwOnlyTypes.size())
+        checkArgument(name, sig.kwOnlyTypes[index], value);
       bind(name, value);
       return;
     }
