@@ -25,6 +25,26 @@
 namespace lython::emitter {
 namespace {
 
+// CPython's numeric tower as a total order on the four rungs that are
+// implicitly acceptable where a higher one is declared (PEP 484 §"The numeric
+// tower"). -1 is "not on the tower", which never compares.
+int numericTowerRung(const TypeSystem &types, mlir::Type type) {
+  if (!type)
+    return -1;
+  if (type == types.boolType())
+    return 0;
+  if (type == types.intType())
+    return 1;
+  if (type == types.floatType())
+    return 2;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (contract && contract.getArguments().empty() &&
+      contract.getContractName() == "builtins.complex")
+    return 3;
+  return -1;
+}
+
+
 mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
                        bool value) {
   return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
@@ -183,6 +203,69 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
   }
 
   return operands;
+}
+
+// A rewritten call whose positional arguments are widened along the numeric
+// tower to the declared parameter, or null when nothing needs widening. Only
+// for a MANIFEST export -- see the ⭐ at the caller for why that is the whole
+// question. The returned node owns its rewritten arguments and must outlive
+// the operand emission, which is why it is handed back rather than emitted.
+parser::NodePtr ModuleEmitter::widenNumericArgumentsForManifestCall(
+    const parser::Node &expr, llvm::StringRef binding,
+    py::CallableType declared) {
+  if (!declared || binding.empty())
+    return nullptr;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  if (!table.freeFunctionContract(binding))
+    return nullptr;
+  const auto *args = ast::nodeList(expr, "args");
+  if (!args || args->empty())
+    return nullptr;
+  // Keywords and starred arguments do not line up positionally with the
+  // declared parameters here, and a partial rewrite would widen the wrong one.
+  if (const auto *keywords = ast::nodeList(expr, "keywords"))
+    if (!keywords->empty())
+      return nullptr;
+  llvm::ArrayRef<mlir::Type> parameters = declared.getPositionalTypes();
+  if (args->size() != parameters.size())
+    return nullptr;
+
+  auto spelling = [&](mlir::Type type) -> llvm::StringRef {
+    if (type == types.floatType())
+      return "float";
+    if (type == types.intType())
+      return "int";
+    return {};
+  };
+  std::vector<parser::NodePtr> rewritten;
+  rewritten.reserve(args->size());
+  bool changed = false;
+  for (auto [index, argument] : llvm::enumerate(*args)) {
+    if (!argument || argument->kind == "Starred")
+      return nullptr;
+    mlir::Type supplied = types.widenLiteral(types.inferExpr(argument.get()));
+    int suppliedRung = numericTowerRung(types, supplied);
+    int declaredRung = numericTowerRung(types, parameters[index]);
+    llvm::StringRef constructor = spelling(parameters[index]);
+    if (suppliedRung < 0 || declaredRung < 0 || suppliedRung >= declaredRung ||
+        constructor.empty()) {
+      rewritten.push_back(argument);
+      continue;
+    }
+    rewritten.push_back(synth::call(synth::name(constructor, argument->range),
+                                    std::vector<parser::NodePtr>{argument},
+                                    argument->range));
+    changed = true;
+  }
+  if (!changed)
+    return nullptr;
+  parser::NodePtr call = parser::makeNode("Call", expr.range);
+  parser::addField(*call, "func",
+                   std::get<parser::NodePtr>(
+                       parser::findField(expr, "func")->value));
+  parser::addField(*call, "args", std::move(rewritten));
+  parser::addField(*call, "keywords", std::vector<parser::NodePtr>{});
+  return call;
 }
 
 Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
@@ -882,11 +965,34 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       mlir::Type resultOverride =
           binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
       Value callee = emitBindingRef(*calleeNode, binding, *symbol);
+      auto declaredCallable =
+          mlir::dyn_cast_if_present<py::CallableType>(callee.type);
+      // ⭐ `math.sqrt(16)` CONVERTS, and `def p(x: float)` reached by `p(3)`
+      // does not. Both were refused with "call arguments do not match the
+      // Callable contract" and only one of them should have been.
+      //
+      // The difference is what is on the other side of the parameter. A Python
+      // body keeps whatever it was handed -- CPython leaves the annotation
+      // inert, so `p(3)` sees an int, which is why THAT boundary is answered
+      // by emitting a second body at the argument's rung
+      // (`emitArgumentSpecializedCall`) and never by converting
+      // (tests/probe/wb_argument_boundary_numeric_tower.py). A manifest export
+      // is C against a double: there is no Python-visible parameter to keep an
+      // int in, and CPython converts through `__float__` at the boundary. So
+      // the two rules agree rather than compete, and this is the arm for the
+      // second one.
+      //
+      // ⛔ Why `freeFunctionContract` is the discriminator and not "the
+      // binding has a dot in it": a source module's function is reached
+      // through the same qualified path and must keep the Python rule. That
+      // table holds exactly the manifest's `ly.typing.function_contracts`, so
+      // asking it IS asking whether the callee is one.
+      parser::NodePtr widened =
+          widenNumericArgumentsForManifestCall(expr, binding, declaredCallable);
       return emitCallableDispatch(
           expr, callee,
-          emitCallOperands(expr, {}, /*includeAstArguments=*/true,
-                           mlir::dyn_cast_if_present<py::CallableType>(
-                               callee.type)),
+          emitCallOperands(widened ? *widened : expr, {},
+                           /*includeAstArguments=*/true, declaredCallable),
           resultOverride);
     }
   }
@@ -1210,24 +1316,6 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
 namespace {
 
-// CPython's numeric tower as a total order on the four rungs that are
-// implicitly acceptable where a higher one is declared (PEP 484 §"The numeric
-// tower"). -1 is "not on the tower", which never compares.
-int numericTowerRung(const TypeSystem &types, mlir::Type type) {
-  if (!type)
-    return -1;
-  if (type == types.boolType())
-    return 0;
-  if (type == types.intType())
-    return 1;
-  if (type == types.floatType())
-    return 2;
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-  if (contract && contract.getArguments().empty() &&
-      contract.getContractName() == "builtins.complex")
-    return 3;
-  return -1;
-}
 
 } // namespace
 

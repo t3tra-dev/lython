@@ -1,13 +1,15 @@
-# Three findings from gridding forty small programs against CPython 3.14 --
+# Findings from gridding forty small programs against CPython 3.14 --
 # slicing, strings, dicts, comprehensions, builtins, exceptions, closures,
 # inheritance, sorting with keys, match, dataclasses, generators, sets,
 # unpacking, f-strings, dunders, recursion, list methods, math, Optional. Two
 # more from the same grid were repaired (the lambda callee and the loop-carried
-# tuple swap); thirty-five agreed outright. These three are what is left.
+# tuple swap); thirty-five agreed outright. Of the three recorded here, the
+# first has since been repaired and its measurement is kept because the reason
+# it is NOT the Python-parameter rule is the reusable part; two are open.
 #
 # ============================================================
-# (1) `math.sqrt(16)` IS REFUSED. An int where a manifest function declares a
-#     float parameter.
+# (1) FIXED. `math.sqrt(16)` was refused -- an int where a manifest function
+#     declares a float parameter.
 # ============================================================
 #     static type !py.callable<[!py.contract<"builtins.float">], ...>
 #     is not callable: call arguments do not match the Callable contract
@@ -21,13 +23,19 @@
 # an int in. So a manifest float parameter SHOULD coerce where a Python one
 # must not, and the two rules are consistent rather than in tension.
 #
-# ⛔ What is missing is the discriminator, not the coercion. `coerceValue`
+# ⛔ The missing piece was the discriminator, not the coercion. `coerceValue`
 # deliberately no longer retypes between the numeric contracts ("that retyping
 # was a lie" -- module-global stores report the mismatch instead), so the
-# conversion has to be an emitted `float(x)`, and the emitter has to know it is
-# calling a manifest export rather than a source function. Every math contract
-# is in `ly.typing.function_contracts`; nothing carries that fact to the call
-# site today. Same shape for every `float` parameter in the manifest surface.
+# conversion is an emitted `float(x)` and the emitter has to know it is calling
+# a manifest export rather than a source function. `freeFunctionContract` is
+# that question asked directly: the table holds exactly the manifest's
+# `ly.typing.function_contracts`, and a source module's function is reached
+# through the same qualified path but is not in it.
+#
+# golden: tests/golden/cases/manifest_float_parameter_takes_an_int.py
+# (red-checked), which keeps `p(3)` printing 3 beside `math.sqrt(16)` printing
+# 4.0 -- a repair that converted at both boundaries, or at neither, compiles
+# and gets one of them wrong.
 #
 # ============================================================
 # (2) `x, y = z = (1, 2)` IS A PARSE ERROR: "expected end of statement".

@@ -516,6 +516,13 @@ private:
   Value emitCallableDispatch(const parser::Node &anchor, Value callee,
                              const CallOperands &operands,
                              mlir::Type resultOverride = {});
+  // A manifest export is C behind its declared parameter, so an argument on a
+  // lower numeric rung converts there (EmitterCalls.cpp). Null when nothing
+  // needs widening; the returned node owns the rewritten arguments.
+  parser::NodePtr
+  widenNumericArgumentsForManifestCall(const parser::Node &expr,
+                                       llvm::StringRef binding,
+                                       py::CallableType declared);
   std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,
                                              const parser::Node *calleeNode);
   // int(s, base): a synthesized module function, memoized by symbol. The
