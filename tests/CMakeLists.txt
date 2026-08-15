@@ -651,6 +651,11 @@ set(LYTHON_LEAK_GATE_CASES
     # right whether the read retained or not, and whether the rebinding
     # released the old holder or leaked it.
     container_module_globals
+    # The same cell reached without an annotation, plus an instance singleton
+    # a function mutates: the read retains and the module-lifetime cell never
+    # releases, so a read that took one reference too many is invisible to
+    # stdout and shows up only as a count.
+    unannotated_module_globals
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

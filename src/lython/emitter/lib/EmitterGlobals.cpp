@@ -106,6 +106,96 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
       continue;
     moduleConstantBindings[name] = value;
   }
+
+  // ⭐ And a plain `NAME = <not a literal>` bound once gets a CELL, which is
+  // the same argument one step on: re-emitting is only cheaper when there is
+  // something to re-emit, and a container or an instance cannot be re-emitted
+  // at all -- a second `{"a": 1}` is a second dict, so a mutation through one
+  // name would not be visible through the other. That left every unannotated
+  // module-level table and singleton unreachable from a function:
+  //
+  //     T = {"a": 1}
+  //     def look(k: str) -> int:
+  //         return T[k]          # emit error: unresolved name 'T'
+  //
+  //     O = C(4)
+  //     def get() -> int:
+  //         return O.n           # emit error: unresolved name 'O'
+  //
+  // ⛔ Why BOUND ONCE and not every plain assignment: a cell has ONE runtime
+  // representation, fixed at the declaration, and `x = 1` followed by
+  // `x = "a"` is legal Python that a cell cannot hold. The annotated form
+  // reports that as a diagnostic because the annotation is the promise; a
+  // plain rebinding promises nothing, so it keeps its value binding instead of
+  // becoming a new refusal. Names bound once are also what
+  // `moduleConstantBindings` above already restricts itself to.
+  //
+  // ⛔ Why the value's INFERRED type and not an annotation: there is none.
+  // `registerModule`'s fixpoint has run by the time this is called, so the
+  // inference is the same one the module body will use; a name whose value
+  // does not infer to a contract is skipped and stays value-bound, which is
+  // the pre-existing behaviour rather than a refusal.
+  //
+  // ⛔ AND ONLY NAMES A FUNCTION ACTUALLY READS, which is the whole difference
+  // between this and a change that broke 80 of 716 tests. A cell is an opaque
+  // handle: the module body's own reads lose the bundle's evidence (a
+  // sequence's element types, a literal's precision, a concrete contract
+  // behind an erased annotation), and `data = b"hello"` followed by
+  // `data + b" world"` at module scope then fails with "cannot pass concrete
+  // object builtins.bytes as builtins.object". Value binding is strictly
+  // better for a name nothing else can see, so the cell is only worth it where
+  // a function would otherwise be unable to see the name at all.
+  //
+  // `lexicalCaptureNames` is the right question because it asks for FREE
+  // names: a function with its own local `data` does not put `data` in this
+  // set, so the module's `data` keeps its evidence.
+  llvm::StringSet<> readFromAFunction;
+  {
+    llvm::SmallVector<const parser::Node *, 8> callables;
+    auto collectCallables = [&](const parser::Node &scope,
+                                auto &&recurse) -> void {
+      const auto *statements = ast::nodeList(scope, "body");
+      if (!statements)
+        return;
+      for (const parser::NodePtr &statement : *statements) {
+        if (!statement)
+          continue;
+        if (statement->kind == "FunctionDef" ||
+            statement->kind == "AsyncFunctionDef") {
+          callables.push_back(statement.get());
+          continue;
+        }
+        if (statement->kind == "ClassDef")
+          recurse(*statement, recurse);
+      }
+    };
+    collectCallables(moduleNode, collectCallables);
+    for (const parser::Node *callable : callables)
+      for (const std::string &capture : lexicalCaptureNames(*callable))
+        readFromAFunction.insert(capture);
+  }
+
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Assign")
+      continue;
+    const auto *targets = ast::nodeList(*statement, "targets");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name")
+      continue;
+    llvm::StringRef name = ast::nameSpelling(*targets->front());
+    if (!boundOnce.contains(name) || moduleGlobals.count(name) ||
+        moduleConstantBindings.count(name) ||
+        !readFromAFunction.contains(name))
+      continue;
+    const parser::Node *value = ast::node(*statement, "value");
+    if (!value)
+      continue;
+    mlir::Type inferred = types.widenLiteral(types.inferExpr(value));
+    if (!mlir::isa_and_nonnull<py::ContractType>(inferred))
+      continue;
+    moduleGlobals[name] = inferred;
+    types.bindSymbol(name, inferred);
+  }
 }
 
 void ModuleEmitter::markBoxedModuleGlobal(mlir::Operation *op) const {
