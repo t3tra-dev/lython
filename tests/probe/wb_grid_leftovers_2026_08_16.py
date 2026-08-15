@@ -57,6 +57,23 @@
 # better.
 #
 # ============================================================
+# (4) AN EMPTY LITERAL SEEDED BY ANOTHER EMPTY LITERAL is still out of reach.
+# ============================================================
+#     rows = []
+#     for i in range(2):
+#         inner = []
+#         inner.append(i)
+#         rows.append(inner)      # 'builtins.object' has no '__getitem__'
+#
+# `emptyLiteralSeedType` decides `rows` by scanning forward for what seeds it,
+# and the seed is `inner`, whose own type is being decided by the same scan one
+# level down. The scan pre-binds CONSTANT assignments for exactly this reason
+# -- `out = []; k = 0; while ...: out.append(k + 1)` needs `k` -- and a
+# container is not a constant. Closing it means iterating the scan to a
+# fixpoint, or moving the whole question into the HM engine where an empty
+# literal's element is a unification variable that survives to its use.
+#
+# ============================================================
 # (3) `f = lambda v: v * 2` STILL NEEDS AN ANNOTATION.
 # ============================================================
 #     lambda requires a Callable annotation because its type contains

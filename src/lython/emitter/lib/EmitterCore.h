@@ -242,6 +242,11 @@ private:
   void collectModuleGlobals(const parser::Node &moduleNode);
   // Every name any function in `scope` declares `global`, at any depth.
   llvm::StringSet<> moduleGlobalDeclarations(const parser::Node &scope) const;
+  // The element/key/value type an empty `[]`, `{}` or `set()` bound to `name`
+  // is seeded with by the rest of the suite, or null when the seeds disagree
+  // or there are none (EmitterStatements.cpp).
+  mlir::Type emptyLiteralSeedType(llvm::StringRef name,
+                                  llvm::StringRef literalKind);
   bool isModuleGlobalRead(llvm::StringRef name) const;
   bool isModuleGlobalWrite(llvm::StringRef name) const;
   // Where a structural mutation's re-described receiver goes: a local's
@@ -930,6 +935,12 @@ private:
   // references re-emit the literal, so a function body can read them
   // (collectModuleGlobals). The node is owned by the parse tree.
   llvm::StringMap<const parser::Node *> moduleConstantBindings;
+  // The suite `emitStatements` is walking and how far it has got, so an EMPTY
+  // container literal can look FORWARD for the operations that seed it
+  // (`emptyLiteralSeedType`). Nothing else may read these: they describe where
+  // the walk is, not what it has decided.
+  const std::vector<parser::NodePtr> *currentSuite = nullptr;
+  std::size_t currentSuiteIndex = 0;
 
   // ⭐ The three module-scope VALUE bindings above, hidden for the duration of
   // a walk that emits ANOTHER module's code. `TypeSystem::ScopeIsolation` does

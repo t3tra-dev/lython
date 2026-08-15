@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 #include <string>
 
@@ -22,9 +23,16 @@ void ModuleEmitter::emitStatements(
     const std::vector<parser::NodePtr> *statements, bool skipDeclarations) {
   if (!statements)
     return;
+  // The suite being emitted, so an EMPTY container literal can look forward
+  // for the operations that seed it (`emptyLiteralSeedType`). Saved and
+  // restored because suites nest.
+  llvm::SaveAndRestore<const std::vector<parser::NodePtr> *> savedSuite(
+      currentSuite, statements);
+  llvm::SaveAndRestore<std::size_t> savedSuiteIndex(currentSuiteIndex, 0);
   for (const parser::NodePtr &statement : *statements) {
     if (insertionBlockTerminated(builder))
       break;
+    ++currentSuiteIndex;
     if (statement && (!skipDeclarations || !isTopLevelDecl(*statement)))
       emitStatement(*statement);
     else if (statement && skipDeclarations) {
@@ -40,6 +48,228 @@ void ModuleEmitter::emitStatements(
       emitPendingDefaultCells(*statement);
     }
   }
+}
+
+
+// ⭐ `xs = []` LEARNS ITS ELEMENT TYPE FROM WHAT SEEDS IT. An empty literal has
+// nothing of its own to infer from, so it typed as `list[object]` and the very
+// next line stopped compiling:
+//
+//     xs = []
+//     xs.append(1)
+//     print(xs[0] + 1)   # 'builtins.object' does not provide '__add__'
+//
+// which is the most common way a Python program builds a list, a dict or a
+// set. The annotated spelling (`xs: list[int] = []`) always worked, and so did
+// an empty literal assigned into a name that already had a declared type --
+// this is the same expectation, read from the operations that FOLLOW instead
+// of from an annotation.
+//
+// ⛔ EVERY SEED MUST AGREE, and that is what keeps this from being a new
+// refusal. `xs = []; xs.append(1); xs.append("s")` compiles today at
+// `list[object]` and CPython allows it; committing to `list[int]` from the
+// first append would reject the second. Disagreement -- or no seed at all --
+// leaves the literal exactly as it was.
+//
+// ⛔ Why a syntactic forward scan and not the HM fixpoint, which is where an
+// empty literal's element type WANTS to be a unification variable: the emitter
+// decides the literal's type when it emits it, and the statements after it
+// have not been emitted. Making the variable survive to the point of use is a
+// representation change in the bundle, not an inference change. The scan is a
+// bounded approximation of the answer that change would give, and it declines
+// wherever it is unsure.
+//
+// ⛔ Nested FUNCTION bodies are not scanned. A `def` that appends to a name
+// this suite binds is reading a closure variable whose seeding order this walk
+// does not know, and the scan has no way to say "later" about it.
+mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
+                                               llvm::StringRef literalKind) {
+  if (!currentSuite || currentSuiteIndex > currentSuite->size())
+    return {};
+  bool isMapping = literalKind == "Dict";
+  mlir::Type element;
+  mlir::Type key;
+  bool disagreed = false;
+
+  // ⭐ Constant bindings in the rest of the suite are pre-bound, because the
+  // seed usually mentions one and the walk has not reached it:
+  //
+  //     out = []          <- deciding here
+  //     k = 0
+  //     while k < n:
+  //         out.append(k + 1)
+  //
+  // `k` is not bound yet, so `k + 1` infers object and the whole scan
+  // declines. A CONSTANT's type depends on nothing, so binding it early is
+  // the same answer the walk will reach, just sooner -- and any name whose
+  // value is not a constant is left alone rather than guessed at.
+  TypeSystem::Scope seedScope = types.pushScope();
+  {
+    auto preBind = [&](const parser::Node &node, auto &&recurse) -> void {
+      if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+          node.kind == "ClassDef")
+        return;
+      if (node.kind == "Assign") {
+        const parser::Node *value = ast::node(node, "value");
+        const auto *targets = ast::nodeList(node, "targets");
+        if (value && value->kind == "Constant" && targets &&
+            targets->size() == 1 && targets->front() &&
+            targets->front()->kind == "Name")
+          if (mlir::Type constantType =
+                  types.widenLiteral(types.inferExpr(value)))
+            types.bindLocalSymbol(ast::nameSpelling(*targets->front()),
+                                  constantType);
+      }
+      for (const parser::Field &field : node.fields) {
+        if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+          if (*child)
+            recurse(**child, recurse);
+          continue;
+        }
+        if (const auto *children =
+                std::get_if<std::vector<parser::NodePtr>>(&field.value))
+          for (const parser::NodePtr &child : *children)
+            if (child)
+              recurse(*child, recurse);
+      }
+    };
+    for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
+         ++index)
+      if ((*currentSuite)[index])
+        preBind(*(*currentSuite)[index], preBind);
+  }
+
+  // ⛔ A seed that MENTIONS the name is unknowable here and is skipped rather
+  // than counted as disagreement. `d[w] = d[w] + 1` beside `d[w] = 1` is the
+  // frequency-count idiom, and the first of those two reads `d` at the type
+  // this scan is trying to decide -- object -- so counting it would make the
+  // pair disagree and leave the whole thing at object, which is where it
+  // started.
+  auto mentionsName = [&](const parser::Node *node, auto &&recurse) -> bool {
+    if (!node)
+      return false;
+    if (node->kind == "Name" &&
+        llvm::StringRef(ast::nameSpelling(*node)) == name)
+      return true;
+    for (const parser::Field &field : node->fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (recurse(child->get(), recurse))
+          return true;
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (recurse(child.get(), recurse))
+            return true;
+    }
+    return false;
+  };
+  auto noteExpr = [&](mlir::Type &slot, const parser::Node *expr,
+                      auto &&noteType) {
+    if (!expr || mentionsName(expr, mentionsName))
+      return;
+    noteType(slot, types.inferExpr(expr));
+  };
+  auto note = [&](mlir::Type &slot, mlir::Type seen) {
+    if (!seen || disagreed)
+      return;
+    mlir::Type widened = types.widenLiteral(seen);
+    if (!widened || widened == types.object()) {
+      disagreed = true;
+      return;
+    }
+    if (!slot) {
+      slot = widened;
+      return;
+    }
+    if (slot != widened)
+      disagreed = true;
+  };
+
+  auto visit = [&](const parser::Node &node, auto &&recurse) -> void {
+    if (disagreed)
+      return;
+    // A nested function has its own binding order; see the note above.
+    if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+        node.kind == "ClassDef")
+      return;
+    if (node.kind == "Expr") {
+      const parser::Node *call = ast::node(node, "value");
+      if (call && call->kind == "Call") {
+        const parser::Node *callee = ast::node(*call, "func");
+        if (callee && callee->kind == "Attribute") {
+          const parser::Node *receiver = ast::node(*callee, "value");
+          std::optional<std::string_view> method =
+              ast::string(*callee, "attr");
+          const auto *args = ast::nodeList(*call, "args");
+          if (receiver && receiver->kind == "Name" &&
+              llvm::StringRef(ast::nameSpelling(*receiver)) == name &&
+              method && args &&
+              args->size() == 1 && args->front() &&
+              (*method == "append" || *method == "add"))
+            noteExpr(element, args->front().get(), note);
+        }
+      }
+    }
+    if (node.kind == "Assign") {
+      if (const auto *targets = ast::nodeList(node, "targets"))
+        for (const parser::NodePtr &target : *targets) {
+          if (!target || target->kind != "Subscript")
+            continue;
+          const parser::Node *receiver = ast::node(*target, "value");
+          if (!receiver || receiver->kind != "Name" ||
+              llvm::StringRef(ast::nameSpelling(*receiver)) != name)
+            continue;
+          if (!isMapping) {
+            disagreed = true;
+            return;
+          }
+          noteExpr(key, ast::node(*target, "slice"), note);
+          noteExpr(element, ast::node(node, "value"), note);
+        }
+    }
+    // ⭐ A `for` target is BOUND while its body is scanned. The seed is
+    // usually the loop variable -- `for i in range(3): xs.append(i)` and
+    // `for w in words: d[w] = 1` are the two commonest shapes -- and nothing
+    // has bound it yet at the point of the empty literal, so without this the
+    // scan infers `object` from a name that is plainly an int or a str.
+    std::optional<TypeSystem::Scope> loopScope;
+    if (node.kind == "For" || node.kind == "AsyncFor") {
+      const parser::Node *loopTarget = ast::node(node, "target");
+      if (loopTarget && loopTarget->kind == "Name")
+        if (mlir::Type item =
+                types.iterationElementType(ast::node(node, "iter"))) {
+          loopScope.emplace(types.pushScope());
+          types.bindLocalSymbol(ast::nameSpelling(*loopTarget), item);
+        }
+    }
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, recurse);
+    }
+  };
+
+  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
+       ++index)
+    if ((*currentSuite)[index])
+      visit(*(*currentSuite)[index], visit);
+
+  if (disagreed || !element)
+    return {};
+  if (isMapping)
+    return key ? types.contract("builtins.dict", {key, element}) : mlir::Type();
+  if (literalKind == "Set")
+    return types.contract("builtins.set", {element});
+  return types.contract("builtins.list", {element});
 }
 
 void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
@@ -218,6 +448,11 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
             if (!declared)
               if (auto flow = types.lookupSymbol(target))
                 declared = *flow;
+            // Nothing declared it: ask what the rest of the suite seeds it
+            // with (`emptyLiteralSeedType`).
+            if (!declared || types.widenLiteral(declared) == types.object())
+              if (mlir::Type seeded = emptyLiteralSeedType(target, rhs->kind))
+                declared = seeded;
             if (declared) {
               value = emitExprExpected(rhs, declared);
               emittedWithContext = true;
