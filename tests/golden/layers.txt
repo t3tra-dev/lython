@@ -41,8 +41,6 @@
 errors/parse_error parse
 errors/annotation_forward_ref_complex emit
 errors/class_attr_instance_shadow_write emit
-errors/class_method_mutual_recursion emit
-errors/class_method_recursion emit
 errors/class_mro_conflict emit
 errors/complex_mixed_runtime emit
 errors/constructor_arity emit

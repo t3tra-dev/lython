@@ -2512,25 +2512,60 @@ Value ModuleEmitter::emitInlineMethodBody(
   // at this boundary instead of recursing until the emitter's own stack
   // overflows. The check is on the body node, so the same method inlined
   // twice side by side is unaffected.
+  // ⭐ A RECURSIVE METHOD CALLS THE EMITTED SYMBOL instead of expanding. Every
+  // class-method call is inlined at its call site, which has no base case
+  // around a cycle, so `Node.total()` summing over `self.kids` -- the tree
+  // traversal every recursive data structure is walked with -- was refused:
+  // "recursive class method call is not supported (total -> total)".
+  //
+  // The method is ALREADY emitted as a `func.func` under `symbolName` (the
+  // class's `method_symbols`); inlining is what call sites do, not the only
+  // thing they can do. So the cycle is broken by taking the other path: a
+  // `py.binding.ref` to that symbol, called with the receiver as the leading
+  // positional, which is exactly how a free function recurses today.
+  //
+  // ⛔ Only inside the cycle, and that is deliberate rather than conservative.
+  // Inlining is what lets a base method's `self.who()` bind to the RECEIVER's
+  // real class at each site (see `lookupClassMethod`), and a symbol call fixes
+  // the callee at the defining class. Taking it everywhere would turn every
+  // overridden method into a base-class call. Here the callee is the method
+  // already being inlined, so its class is the one the recursion is in.
   if (llvm::is_contained(methodsBeingInlined, method.method)) {
-    std::string cycle;
-    bool inCycle = false;
-    for (const parser::Node *active : methodsBeingInlined) {
-      if (active == method.method)
-        inCycle = true;
-      if (!inCycle)
-        continue;
-      if (auto activeName = ast::string(*active, "name"))
-        cycle += std::string(*activeName) + " -> ";
+    py::CallableType recursive =
+        method.signature.publicCallable
+            ? mlir::dyn_cast<py::CallableType>(method.signature.publicCallable)
+            : mlir::dyn_cast_if_present<py::CallableType>(
+                  method.signature.callable);
+    if (!recursive || method.symbolName.empty() || !bindDescriptorReceiver ||
+        !keywords.empty()) {
+      std::string cycle;
+      bool inCycle = false;
+      for (const parser::Node *active : methodsBeingInlined) {
+        if (active == method.method)
+          inCycle = true;
+        if (!inCycle)
+          continue;
+        if (auto activeName = ast::string(*active, "name"))
+          cycle += std::string(*activeName) + " -> ";
+      }
+      if (auto selfName = ast::string(*method.method, "name"))
+        cycle += std::string(*selfName);
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "recursive class method call is not supported (" + cycle +
+              "): class method bodies are inlined at their call sites, so a "
+              "call cycle has no base case to stop the expansion"});
+      return emitNone(anchor);
     }
-    if (auto selfName = ast::string(*method.method, "name"))
-      cycle += std::string(*selfName);
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, anchor.range.start,
-        "recursive class method call is not supported (" + cycle +
-            "): class method bodies are inlined at their call sites, so a "
-            "call cycle has no base case to stop the expansion"});
-    return emitNone(anchor);
+    Value callee = emitBindingRef(anchor, method.symbolName, recursive);
+    llvm::SmallVector<Value, 8> arguments{receiver};
+    arguments.append(positional.begin(), positional.end());
+    CallOperands operands;
+    operands.positional.assign(arguments.begin(), arguments.end());
+    for (Value argument : arguments)
+      operands.positionalTypes.push_back(argument.type);
+    operands.positionalUnpacked.assign(arguments.size(), false);
+    return emitCallableDispatch(anchor, callee, operands);
   }
   const FunctionSignature &sig =
       method.bodySignature.callable ? method.bodySignature : method.signature;
