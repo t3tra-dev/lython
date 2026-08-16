@@ -170,15 +170,31 @@
 # what a freed payload looks like. An int element survived the same treatment,
 # which is why `["a", 1]` printed 1 and looked like a working tag.
 #
-# ⛔ SO THE REPAIR IS AN OWNERSHIP CHANGE, not a lane change, and that is why
-# it is still not shipped. The element has to take a reference on its ACTIVE
-# MEMBER -- `retainAggregateSlot` already does exactly that for a union, via
-# `forEachActiveUnionMember` -- and then be bound as OWNED so the frame
-# releases it. `bindOwnedEvidenceValue` needs an anchor and refuses without
-# one, and a union's defining ops are a constant and a chain of selects. That
-# is the piece to write, and it is the piece that must not be half-verified:
-# one reference too many leaks per read, one too few is the use-after-free
-# above, and neither shows in what a passing suite prints.
+# ⭐ THAT REPAIR WAS WRITTEN AND THE VALUES ARE NOW RIGHT. Retaining through
+# `retainAggregateSlot(op, unionType, values, ...)` -- which consults the tag
+# via `forEachActiveUnionMember` -- and binding the bundle with
+# `makeObjectBundleWithOwnership(..., Own)` gives CPython's answer everywhere
+# the refusal used to be:
+#
+#     [1, "a"]       read twice -> 1 a / a
+#     ["a", 1]                   -> a 1 / 1
+#     [1, 2.5]                   -> 1 2.5 / 2.5
+#     [1, "a", 2.5, None]        -> all three lines, and both isinstance arms
+#
+# ⛔ AND IT LEAKS 2 ALLOCATIONS / 81 B, BOUNDED. Measured on
+# `tests/leak_gate.py`: the same at 2000 and at 8000 iterations, so it is not
+# per-read; zero without a loop; and zero for the identical program over a
+# HOMOGENEOUS list, on this binary and on the one before the repair. So the
+# leak is the repair's, and its shape is the LAST iteration's owned union
+# locals -- three locals (int, str, float) leaking two objects, which is the
+# two that are not immortal.
+#
+# Not shipped for that: the project's leak gate is a clean baseline, and a
+# golden that leaks would either break it or have to be left out of it, which
+# is worse. The suspect is the EXIT RELEASE of an owned union local, mirroring
+# the retain-side guard this whole trail started at -- if the release planner
+# also asks `isObjectHeaderLikeType(values.front())` anywhere, a union fails it
+# for the same reason, and the fix is the same shape twice.
 #
 # ⛔ A repair here must be red-checked against VALUES, not against compiling.
 # The refusal it replaces is loud; the wrong answer it produced is not, and
