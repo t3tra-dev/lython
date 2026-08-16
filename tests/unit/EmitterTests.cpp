@@ -309,6 +309,15 @@ TEST(EmitterTest, DeclaredParameterCheckStillAdmitsTheseThree) {
                          "print(Holder().take(D()))\n",
                          context)
                   .ok());
+  // A BARE generic contract accepts any instantiation of itself, which is the
+  // fourth admitted shape and the one this check got wrong: a generic class's
+  // own methods spell the receiver WITHOUT arguments, so
+  // `def __add__(self, other: "Counter")` reached by `Counter[str] + ...` was
+  // refused ("declared Counter and this call gives it Counter[str]"). It is
+  // pinned by tests/golden/cases/counter_views_and_bare_generic_self.py rather
+  // than here: it needs a generic class from the embedded modules, and
+  // `emitSource` carries none -- `typing.Generic` is not importable without
+  // them, so a synthetic Box cannot stand in.
   // A synthesized signature: NamedTuple's __eq__ declares Self, and CPython
   // compares across classes.
   EXPECT_TRUE(emitSource("from typing import NamedTuple\n"

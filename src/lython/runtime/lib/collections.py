@@ -143,6 +143,24 @@ class Counter:
             else:
                 self.data[elem] = -1
 
+    def keys(self) -> list[str]:
+        result: list[str] = []
+        for key in self.data:
+            result.append(key)
+        return result
+
+    def values(self) -> list[int]:
+        result: list[int] = []
+        for key in self.data:
+            result.append(self.data[key])
+        return result
+
+    def items(self) -> list[tuple[str, int]]:
+        result: list[tuple[str, int]] = []
+        for key in self.data:
+            result.append((key, self.data[key]))
+        return result
+
     def total(self) -> int:
         result = 0
         for key in self.data:

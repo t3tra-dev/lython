@@ -2683,6 +2683,24 @@ Value ModuleEmitter::emitInlineMethodBody(
       return;
     if (isAssignableWithStaticEvidence(actual, expected, module))
       return;
+    // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
+    // class's own methods spell the receiver without its arguments --
+    // `def __add__(self, other: "Counter") -> "Counter"` -- and the argument
+    // arrives as `Counter[str]`, which `isAssignableTo` answers false for
+    // because the argument lists differ. `c + c` on a `Counter[str]` was
+    // therefore refused by this very check: "argument 'other' of '__add__' is
+    // declared Counter and this call gives it Counter[str]".
+    //
+    // ⛔ One direction only. Declared WITH arguments and supplied without is a
+    // real mismatch -- the parameter promises an instantiation the argument
+    // does not name -- and stays refused.
+    if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
+      if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
+        if (expectedContract.getArguments().empty() &&
+            !actualContract.getArguments().empty() &&
+            expectedContract.getContractName() ==
+                actualContract.getContractName())
+          return;
     // ⭐ The numeric tower is admitted HERE and not by `isAssignableTo`, which
     // answers false for int against float. A free function refuses the same
     // call and `emitArgumentSpecializedCall` then emits a SECOND BODY at the
