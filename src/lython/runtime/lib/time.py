@@ -19,9 +19,10 @@ Deviations from CPython:
     of the SAME `seconds` argument, so the result is internally consistent;
     `localtime()` with no argument reads the clock once, here, and passes that
     fixed value down.
-  - `strftime(format, t)` requires the struct_time argument; CPython defaults
-    it to `localtime()`. Formatting is libc strftime's in the process locale,
-    and a result longer than 1023 bytes comes back as ''.
+  - `strftime(format)` defaults `t` to `localtime()`, as CPython does; only a
+    bare 9-tuple is rejected, because struct_time is a class here and not a
+    structseq (the deviation above). Formatting is libc strftime's in the
+    process locale, and a result longer than 1023 bytes comes back as ''.
   - `sleep()` does not retry on EINTR (PEP 475); an interrupted sleep raises
     InterruptedError.
   - `perf_counter` is `monotonic` (see the manifest docstring).
@@ -94,11 +95,18 @@ def gmtime(seconds: int = -9223372036854775808) -> struct_time:
     return struct_time(when, 1)
 
 
-def strftime(format: str, t: struct_time) -> str:
-    """Format a struct_time through the platform's strftime."""
-    return _time.strftime(format, t.tm_sec, t.tm_min, t.tm_hour, t.tm_mday,
-                          t.tm_mon - 1, t.tm_year - 1900,
-                          (t.tm_wday + 1) % 7, t.tm_yday - 1, t.tm_isdst)
+def strftime(format: str, t: struct_time | None = None) -> str:
+    """Format a struct_time through the platform's strftime.
+
+    Omitting `t` means "now", as `t=None` does in CPython.
+    """
+    when = t
+    if when is None:
+        when = localtime()
+    return _time.strftime(format, when.tm_sec, when.tm_min, when.tm_hour,
+                          when.tm_mday, when.tm_mon - 1, when.tm_year - 1900,
+                          (when.tm_wday + 1) % 7, when.tm_yday - 1,
+                          when.tm_isdst)
 
 
 def mktime(t: struct_time) -> int:

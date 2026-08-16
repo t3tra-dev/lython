@@ -59,6 +59,18 @@ print(0 <= now.tm_hour and now.tm_hour <= 23)
 print(0 <= now.tm_wday and now.tm_wday <= 6)
 print(1 <= now.tm_yday and now.tm_yday <= 366)
 
+# --- strftime with no struct_time means NOW, as it does in CPython ---------
+# It used to require the argument, recorded as a deviation in time.py's
+# docstring, and `time.strftime("%Y")` -- the shape a log line is written in --
+# was "call arguments do not match the Callable contract". Only the properties
+# that do not depend on when the case runs can be pinned, so this checks the
+# width and that the default agrees with an explicit localtime().
+stamp = time.strftime("%Y-%m-%d")
+print(len(stamp) == 10, stamp[4] == "-", stamp[7] == "-")
+print(int(stamp[0:4]) >= 2026)
+print(time.strftime("%Y") == time.strftime("%Y", time.localtime()))
+print(len(time.strftime("%H:%M:%S")) == 8)
+
 # --- a negative sleep is a ValueError, with CPython's message --------------
 try:
     time.sleep(-1.0)
