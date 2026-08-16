@@ -2,3 +2,9 @@ app: app-level
 config: bad config
 value: parse failed: line 3
 exc: caught as Exception
+bare value: ''
+bare config: ''
+bare key: ''
+bare stop: ''
+guard raised: ''
+guard: 2

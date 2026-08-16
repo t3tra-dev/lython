@@ -858,7 +858,29 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     emitWith(statement, true);
   } else if (statement.kind == "Raise") {
     if (const parser::Node *exception = ast::node(statement, "exc")) {
-      Value value = emitExpr(exception);
+      // ⭐ `raise E` IS `raise E()`. CPython instantiates a raised CLASS with
+      // no arguments, and the walk handed the type object straight to
+      // `py.raise`, which asks the runtime for a `.raise` primitive on it:
+      //
+      //     raise ValueError
+      //     # runtime manifest has no .raise primitive
+      //
+      // `raise ValueError("x")` was always fine, so the refusal was the
+      // no-argument spelling only -- which is the one `raise StopIteration`
+      // inside a hand-written `__next__` is written in.
+      const parser::Node *raised = exception;
+      parser::NodePtr constructed;
+      if (mlir::isa_and_nonnull<py::TypeType>(
+              types.widenLiteral(types.inferExpr(exception))))
+        if (const parser::Field *field = parser::findField(statement, "exc"))
+          if (const auto *node =
+                  std::get_if<parser::NodePtr>(&field->value);
+              node && *node) {
+            constructed = synth::call(*node, std::vector<parser::NodePtr>{},
+                                      statement.range);
+            raised = constructed.get();
+          }
+      Value value = emitExpr(raised);
       mlir::Value cause;
       bool fromNone = false;
       if (const parser::Node *causeNode = ast::node(statement, "cause")) {
