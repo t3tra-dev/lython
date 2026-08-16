@@ -266,6 +266,29 @@ TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
 // exempt because it is this compiler's spelling rather than the program's
 // (`TupleA(1) == TupleB(1)` is True in CPython while the synthesized `__eq__`
 // declares Self).
+TEST(EmitterTest, NamesThePrintKeywordItCannotTake) {
+  mlir::MLIRContext context(testRegistry());
+  // `end` needs a write that does not append the newline, and the only builtin
+  // sink does; say which keyword and why rather than reporting the whole
+  // contract as unmatched.
+  lython::emitter::EmitResult end =
+      emitSource("print(\"a\", end=\"\")\n", context);
+  EXPECT_FALSE(end.ok());
+  EXPECT_TRUE(reportsDiagnostic(end, "print(end=...) is not supported"));
+
+  lython::emitter::EmitResult flush =
+      emitSource("print(\"a\", flush=True)\n", context);
+  EXPECT_FALSE(flush.ok());
+  EXPECT_TRUE(
+      reportsDiagnostic(flush, "does not take the keyword argument 'flush'"));
+
+  lython::emitter::EmitResult unknown =
+      emitSource("print(\"a\", file=None)\n", context);
+  EXPECT_FALSE(unknown.ok());
+  EXPECT_TRUE(
+      reportsDiagnostic(unknown, "does not take the keyword argument 'file'"));
+}
+
 TEST(EmitterTest, RejectsMethodArgumentThatViolatesTheDeclaredParameter) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult method = emitSource(

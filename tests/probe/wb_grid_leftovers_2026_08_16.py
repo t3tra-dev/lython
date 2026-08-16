@@ -424,25 +424,31 @@
 #   releases across a suspension.
 #
 # ============================================================
-# (10) `print(x, end="")` AND `sep=` ARE REFUSED, and the sink is why.
+# (10) `print(x, end="")` IS REFUSED, and the SINK is why (sep= is fixed).
 # ============================================================
 #     static type !py.callable<[], vararg = tuple[object], returns = [None]>
 #     is not callable: call arguments do not match the Callable contract
 #
 # `builtins.print`'s contract has no keyword parameters, and `tryEmitPrintCall`
-# declines the moment it sees one. The joining half is free -- the emitter
-# already builds the space-joined string and `sep=` is only a different
-# separator -- but `end=` needs a sink that does NOT append the newline, and
-# there is exactly one: `LyUnicode_PrintLine` (`ly.runtime.builtin = "print"`,
-# `builtin_lowering = "method_sink"`). `LyUnicode_Print` next to it is the
-# no-newline write, and nothing names it as a builtin, so the emitter cannot
-# reach it. Closing this means a second builtin sink (a manifest entry plus a
-# TypeSystem binding plus a synthesized callee), or routing through
-# `sys.stdout.write`, which the emitter would have to reach without an import.
+# declined the moment it saw one -- so the report named neither the keyword nor
+# the reason. `sep=` was free (the emitter already builds the space-joined
+# string; a different separator is a different constant) and is now supported.
+#
+# ⛔ `end=` is not, and the blocker is the SINK rather than the join. There is
+# exactly one builtin write, `LyUnicode_PrintLine`
+# (`ly.runtime.builtin = "print"`, `builtin_lowering = "method_sink"`), and it
+# appends the newline. `LyUnicode_Print` next to it does not, and nothing names
+# it as a builtin, so the emitter cannot reach it. Closing this means a second
+# builtin sink -- a manifest entry, a TypeSystem binding and a synthesized
+# callee, which puts a pseudo-builtin name in the user's namespace -- or
+# routing through `sys.stdout.write`, which the emitter would have to reach
+# without an import. Both are design calls, not wiring. Until then the refusal
+# says which keyword and why (EmitterTests.NamesThePrintKeywordItCannotTake).
 #
 # Grouped with the missing modules rather than with the defects: `re`,
-# `collections.defaultdict` and `itertools.islice`-as-a-value are refused the
-# same way and for the same reason -- nobody wrote them yet.
+# `collections.deque` / `namedtuple` / `defaultdict` and
+# `itertools.islice`-as-a-value are refused the same way and for the same
+# reason -- nobody wrote them yet.
 #
 import math
 

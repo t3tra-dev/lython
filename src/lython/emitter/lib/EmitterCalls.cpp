@@ -2246,7 +2246,48 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
     return std::nullopt;
   const auto *printArgs = ast::nodeList(expr, "args");
   const auto *printKeywords = ast::nodeList(expr, "keywords");
-  bool noPrintKeywords = !printKeywords || printKeywords->empty();
+  // ⭐ `sep=` IS THIS LADDER'S OWN SEPARATOR. The join below already builds the
+  // space-separated string CPython's default produces, so a different one is a
+  // different constant and nothing else. Any keyword at all used to make the
+  // whole ladder decline, and the call then landed on `builtins.print`'s
+  // contract -- which has no keyword parameters, so the report was "call
+  // arguments do not match the Callable contract" with the offending keyword
+  // named nowhere in it.
+  //
+  // ⛔ `end=` is NOT here, and the reason is the sink rather than the join.
+  // The only builtin write is `LyUnicode_PrintLine`, which appends the
+  // newline; `LyUnicode_Print` next to it does not, and nothing names it as a
+  // builtin, so the emitter cannot reach it. Saying that by name beats the
+  // contract mismatch, which is what the diagnostic below is for.
+  const parser::Node *separatorNode = nullptr;
+  std::string refusedKeyword;
+  if (printKeywords)
+    for (const parser::NodePtr &keyword : *printKeywords) {
+      if (!keyword) {
+        refusedKeyword = "**";
+        break;
+      }
+      std::optional<llvm::StringRef> name = ast::string(*keyword, "arg");
+      if (name && *name == "sep" && !separatorNode) {
+        separatorNode = ast::node(*keyword, "value");
+        if (separatorNode)
+          continue;
+      }
+      refusedKeyword = name ? name->str() : "**";
+      break;
+    }
+  if (!refusedKeyword.empty()) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        refusedKeyword == "end"
+            ? std::string("print(end=...) is not supported: the only runtime "
+                          "write appends the newline, so a different "
+                          "terminator has no sink to reach")
+            : "print() does not take the keyword argument '" + refusedKeyword +
+                  "'"});
+    return emitNone(expr);
+  }
+  bool noPrintKeywords = !separatorNode;
   if (noPrintKeywords && (!printArgs || printArgs->empty())) {
     mlir::Type emptyType = types.literal("\"\"");
     auto empty = py::StrConstantOp::create(builder, loc(expr), emptyType,
@@ -2271,8 +2312,12 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
       printArgs->front()->kind != "Starred" &&
       mlir::isa<py::UnionType>(
           types.widenLiteral(types.inferExpr(printArgs->front().get())));
-  bool plainArguments = printArgs && noPrintKeywords &&
-                        (printArgs->size() >= 2 || singleUnionArgument);
+  // With an explicit separator the join is the whole point, so one argument
+  // takes this path too -- there is nothing to separate, and routing it to the
+  // manifest print would silently drop the keyword.
+  bool plainArguments =
+      printArgs && (printArgs->size() >= 2 || singleUnionArgument ||
+                    (separatorNode && !printArgs->empty()));
   if (plainArguments)
     for (const parser::NodePtr &argument : *printArgs)
       if (!argument || argument->kind == "Starred")
@@ -2330,12 +2375,19 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         joined = *piece;
         continue;
       }
-      mlir::Type separatorType = types.literal("\" \"");
-      auto separator = py::StrConstantOp::create(
-          builder, loc(expr), separatorType, builder.getStringAttr(" "));
-      joined = emitBinarySpecial<py::AddOp>(
-          expr, "__add__", joined,
-          Value{separator.getResult(), separatorType}, strType);
+      Value separator;
+      if (separatorNode) {
+        separator = coerceValue(emitExpr(separatorNode), strType, expr);
+      } else {
+        mlir::Type separatorType = types.literal("\" \"");
+        separator = Value{py::StrConstantOp::create(
+                              builder, loc(expr), separatorType,
+                              builder.getStringAttr(" "))
+                              .getResult(),
+                          separatorType};
+      }
+      joined = emitBinarySpecial<py::AddOp>(expr, "__add__", joined, separator,
+                                            strType);
       joined = emitBinarySpecial<py::AddOp>(expr, "__add__", joined, *piece,
                                             strType);
     }

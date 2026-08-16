@@ -18,5 +18,19 @@ def main() -> None:
     print("plain", "strings")
     print(max("a", "b"))
 
+    # ⭐ `sep=` is this ladder's own separator. Any keyword at all used to make
+    # the whole ladder decline, and the call then landed on `builtins.print`'s
+    # contract -- which has no keyword parameters, so the report was "call
+    # arguments do not match the Callable contract" with `sep` named nowhere.
+    # The join here already builds the space-separated string CPython's default
+    # produces; a different separator is a different constant.
+    print("a", "b", sep="-")
+    print(1, 2, 3, sep="")
+    print(1, 2, sep=" | ")
+    print("only", sep="-")
+    dash = "=="
+    print("x", "y", sep=dash)
+    print(max("a", "b"), 1, sep="/")
+
 
 main()
