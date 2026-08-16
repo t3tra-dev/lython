@@ -74,11 +74,52 @@
 # literal's element is a unification variable that survives to its use.
 #
 # ============================================================
-# (5) A SECOND UNION-TYPED READ of the same container is refused.
+# (5) FIXED, AND THE PREMISE BELOW WAS WRONG: A SECOND UNION-TYPED READ.
 # ============================================================
 #     xs = [1, "a"]
-#     print(xs[0], xs[1])
-#     first = xs[0]        # runtime manifest has no builtins.list.__getitem__
+#     print(xs[0])
+#     print(xs[1])         # runtime manifest has no builtins.list.__getitem__
+#
+# ⭐ IT WAS NEVER THE READ THAT DEMOTED. Everything from here to the end of
+# this section was built on "the first read hands out an alias, so the
+# description cannot travel with it", and that rule (`bindRetainedEvidenceBundle`)
+# demotes the ELEMENT's contents, not the container's. What demoted the
+# container was `demoteCrossBlockContainerEvidence`, which drops the evidence at
+# every op outside the block defining the storage -- and printing a union
+# branches on the tag, so the second read is in a successor block. Two reads in
+# ONE block always worked; that is why `print(xs[0], xs[1])` was fine and
+# `print(xs[0]); print(xs[1])` was not, a distinction the reading below never
+# accounted for.
+#
+# The cross-block rule is right for a container something can mutate and vacuous
+# for one nothing can. A container whose every use is a read describes the same
+# contents in every block, and that is now the exemption
+# (`containerContentsAreUnreachableByMutation`). It is a whitelist of uses, not a
+# list of mutators, and it reads the same before and after any op is lowered --
+# the two properties the cross-block rule was chosen for.
+#
+# ⛔ Two things had to come with it. Every read must HIT: the evidence tier's
+# miss RAISES, spliced into the read's own block, and `i, j = [1]` (where the
+# arity check raises first and `[1][1]` is dead) then released a repr twice on
+# one path. And the element is in the SLOT's form -- `bool` is stored boxed, its
+# ABI is the bare i1, and the union injection counts values rather than checking
+# them, so the header went into the i1 lane. bool is the only contract with a
+# `box` primitive, which is why every other element type worked.
+#
+# ⛔ WHAT IS STILL REFUSED: a heterogeneous container MUTATED across a block
+# boundary. The exemption declines (correctly -- the contents did change), the
+# evidence goes, and the runtime tier still has no `__getitem__` that can
+# produce a union. That is the switch the trail below describes, and it is still
+# unbuilt. So is iteration: `for x in [1, "a"]` asks for rank-1 memref physical
+# values and a union's lane 0 is an i64 tag.
+#
+# THE TRAIL BELOW IS KEPT AS WRITTEN. It is a correct and expensive
+# investigation of a mechanism that was not the cause, and the reason it is
+# worth keeping is the second paragraph of it: the ownership kernel really does
+# have three guards that assume a single object, and whoever builds the runtime
+# switch will meet all three.
+#
+# ---- the trail, as written before the cause was found ----
 #
 # The first read demotes the container's contents evidence -- a read hands out
 # an ALIAS, so the description cannot travel with it (`bindRetainedEvidenceBundle`
@@ -266,6 +307,10 @@ print((lambda v: v * 2)(5))
 named = lambda v: v * 2
 print(named(5))
 print(max([("b", 2), ("a", 3)], key=lambda p: p[1]))
+mixed = [1, "a", True]
+print(mixed[0])
+print(mixed[1])
+print(mixed[2])
 a, b = 0, 1
 i = 0
 while i < 10:

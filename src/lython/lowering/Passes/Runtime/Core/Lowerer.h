@@ -768,6 +768,10 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
   slotStorageShapesFor(mlir::Operation *op, mlir::Type contract,
                        llvm::StringRef purpose);
+  // Rewrites a container element from the form the SLOT stores it in to the
+  // form its contract's ABI names, so a union read can lane it (GetItemOps.cpp).
+  mlir::LogicalResult canonicalizeSlotElementBundle(mlir::Operation *op,
+                                                    RuntimeBundle &bundle);
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   unboxSlotElementValues(mlir::Operation *op, mlir::Type contract,
                          llvm::ArrayRef<mlir::Value> values);
@@ -867,6 +871,12 @@ private:
   // container's physical storage (SpecialMethodOps.cpp).
   static bool crossesStorageDefiningBlock(mlir::Operation *op,
                                           const RuntimeBundle &bundle);
+  // True when nothing in this function can change the container's contents and
+  // its evidence values all dominate `op`, so the description is the same in
+  // every block (SpecialMethodOps.cpp).
+  bool containerContentsAreUnreachableByMutation(mlir::Operation *op,
+                                                 mlir::Value containerValue,
+                                                 const RuntimeBundle &bundle);
   // Drops a mutable container's compile-time contents evidence at an op the
   // walk cannot answer from it, and mirrors the drop into a field-alias
   // owner's cache (SpecialMethodOps.cpp).

@@ -323,6 +323,108 @@ bool RuntimeBundleLowerer::crossesStorageDefiningBlock(
 // ⛔ Why NOT writeBackFieldAlias for the field-alias mirror: the writeback
 // re-roots the owner's owned-local marker at this op, and a root created
 // inside a branch is itself the non-dominating value this demotion removes.
+// ⭐ A CONTAINER NOTHING CAN MUTATE DESCRIBES THE SAME CONTENTS IN EVERY BLOCK.
+// The demotion above is stated as "a different block" because it must not
+// depend on the walk's order, and a mutation-site rule did. A rule over the
+// container's WHOLE USE LIST has that property too: it reads the same before
+// and after any op is lowered, and a back edge cannot smuggle anything past it
+// because there is nothing to smuggle.
+//
+// It has to be a whitelist rather than a list of mutators. The two callers that
+// enumerated mutators disagreed, and an op the enumeration missed was a silent
+// wrong answer; an op this list has not heard of is merely a slower read.
+// Storing the container anywhere, passing it to a call, or forwarding it to a
+// block argument are all uses that are not on the list, so an alias that could
+// be mutated behind the walk's back cannot form.
+//
+// Why this is worth a rule of its own: for a container whose element type is a
+// UNION the runtime tier cannot answer the read at all -- there is no
+// `builtins.list.__getitem__` that returns a union -- so the demotion turns a
+// slower answer into a refusal:
+//
+//     xs = [1, "a"]
+//     print(xs[0])
+//     print(xs[1])   # runtime manifest has no builtins.list.__getitem__ method
+//
+// Printing a union branches on the tag, so the second read is in a successor
+// block and lost evidence it could still have used. A record literal --
+// `{"name": "ann", "age": 30}` read field by field -- is the same program.
+bool RuntimeBundleLowerer::containerContentsAreUnreachableByMutation(
+    mlir::Operation *op, mlir::Value containerValue,
+    const RuntimeBundle &bundle) {
+  bool mapping = !bundle.mappingKeys.empty();
+  for (mlir::Operation *user : containerValue.getUsers()) {
+    if (mlir::isa<py::LenOp, py::ContainsOp>(user))
+      continue;
+    auto read = mlir::dyn_cast<py::GetItemOp>(user);
+    if (!read || read.getContainer() != containerValue)
+      return false;
+    // ⛔ And every read must HIT. A miss raises, and the raise the evidence
+    // tier emits is not the runtime tier's: it is spliced into the block the
+    // read is in, which is what the demotion used to keep it out of. In
+    // `i, j = [1]` the arity check raises first and `[1][1]` is dead code, but
+    // the walk still lowers it -- and an IndexError raise inside a `try` left
+    // the repr of the never-reached print released twice on one path.
+    if (mapping) {
+      std::optional<std::string> key =
+          RuntimeBundleLowerer::keywordNameFromValue(read.getIndex());
+      if (!key || !llvm::is_contained(bundle.mappingKeys, *key))
+        return false;
+      continue;
+    }
+    std::optional<std::int64_t> literal =
+        integerLiteralFromValue(read.getIndex());
+    if (!literal)
+      return false;
+    if (!bundle.sequenceIndices.empty()) {
+      if (!llvm::is_contained(bundle.sequenceIndices, *literal))
+        return false;
+      continue;
+    }
+    std::int64_t size = static_cast<std::int64_t>(bundle.sequenceElements.size());
+    std::int64_t normalized = *literal < 0 ? *literal + size : *literal;
+    if (normalized < 0 || normalized >= size)
+      return false;
+  }
+
+  // `containerValue` is an operand of `op`, so its defining block dominates
+  // op's -- and the two blocks differ, or the caller would not be asking. Every
+  // op of a strictly dominating block therefore dominates `op`, which is why
+  // "defined in that block" is the whole test and no DominanceInfo is built.
+  mlir::Value anchor = bundle.physicalValues().front();
+  mlir::Block *defBlock = nullptr;
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(anchor))
+    defBlock = argument.getOwner();
+  else if (mlir::Operation *definition = anchor.getDefiningOp())
+    defBlock = definition->getBlock();
+  if (!defBlock)
+    return false;
+  auto reaches = [&](mlir::Value value) {
+    if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value))
+      return argument.getOwner() == defBlock;
+    mlir::Operation *definition = value.getDefiningOp();
+    return definition && definition->getBlock() == defBlock;
+  };
+  auto valuesReach = [&](llvm::ArrayRef<RuntimeValue> values) {
+    return llvm::all_of(values, [&](const RuntimeValue &value) {
+      return llvm::all_of(value.values, reaches);
+    });
+  };
+  auto bundlesReach =
+      [&](llvm::ArrayRef<std::shared_ptr<RuntimeBundle>> bundles) {
+        return llvm::all_of(
+            bundles, [&](const std::shared_ptr<RuntimeBundle> &element) {
+              return !element || llvm::all_of(element->physicalValues(), reaches);
+            });
+      };
+  return valuesReach(bundle.sequenceElements) &&
+         bundlesReach(bundle.sequenceElementBundles) &&
+         valuesReach(bundle.mappingValues) &&
+         bundlesReach(bundle.mappingKeyBundles) &&
+         bundlesReach(bundle.mappingValueBundles) &&
+         llvm::all_of(bundle.mappingPresent, reaches);
+}
+
 bool RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(
     mlir::Operation *op, mlir::Value containerValue) {
   RuntimeBundle *bundle = nullptr;
@@ -340,6 +442,9 @@ bool RuntimeBundleLowerer::demoteCrossBlockContainerEvidence(
   if (!describesContents)
     return false;
   if (!RuntimeBundleLowerer::crossesStorageDefiningBlock(op, *bundle))
+    return false;
+  if (RuntimeBundleLowerer::containerContentsAreUnreachableByMutation(
+          op, containerValue, *bundle))
     return false;
   RuntimeBundleLowerer::demoteMutableContainerEvidence(*bundle);
   if (bundle->fieldAliasOwner && !bundle->fieldAliasName.empty()) {

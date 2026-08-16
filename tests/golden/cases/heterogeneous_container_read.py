@@ -19,13 +19,20 @@
 # printed values say which member the tag names, and the isinstance narrowing
 # says the tag is readable at all.
 #
-# ⛔ Each element is read ONCE here, and that is a boundary rather than a
-# style. The first read demotes the container's contents evidence (a read
-# hands out an alias, so the description cannot travel with it), and a LATER
-# union-typed read then falls to the runtime path, which has no
-# `builtins.list.__getitem__` that can produce a union -- it would have to
-# widen from the stored class id at run time. Recorded in
-# tests/probe/wb_grid_leftovers_2026_08_16.py.
+# Reading the SAME container in more than one block is the second half. The
+# contents evidence used to be dropped at every op outside the block that
+# defines the container's storage, which is right for a container something can
+# mutate and wrong for one nothing can: printing a union branches on the tag, so
+# `print(xs[0]); print(xs[1])` puts the second read in a successor block, and
+# the runtime tier it fell to has no `builtins.list.__getitem__` that can
+# produce a union. A container every use of which is a read describes the same
+# contents everywhere.
+#
+# And an element is stored in the SLOT's form, which for `bool` is a boxed
+# header rather than the canonical i1 its ABI names. The union lane is the i1
+# and the injection counts values rather than checking them, so the header went
+# into the lane -- bool is the only contract with a `box` primitive, which is
+# why every other element type worked.
 #
 # Every expected line is python3.14's.
 
@@ -92,3 +99,67 @@ ints = [10, 20]
 print(ints[0] + ints[1])
 counts = {"a": 1, "b": 2}
 print(counts["a"] + counts["b"])
+
+
+# --- the same container read from more than one block ---------------------
+# Every print between these reads branches on a tag, so each later read is in a
+# block the container's definition merely dominates.
+row = [1, "ann", 2.5, True]
+print(row[0])
+print(row[1])
+print(row[2])
+print(row[3])
+print(row[-1])
+print(len(row))
+
+card = {"name": "ann", "age": 30, "score": 9.5, "member": True}
+print(card["name"])
+print(card["age"])
+print(card["score"])
+print(card["member"])
+print(len(card))
+
+lv = card["age"]
+if isinstance(lv, int):
+    print(lv + 1)
+
+
+# --- a bool member, which is the boxed one --------------------------------
+flags = [True, "on"]
+print(flags[0])
+print(flags[1])
+
+single = {"ok": True, "why": "fine"}
+print(single["ok"])
+print(single["why"])
+
+
+# --- inside a function, called twice --------------------------------------
+def show(tag: str) -> None:
+    rec = {"k": 1, "v": "x", "f": False}
+    print(tag, rec["k"])
+    print(tag, rec["v"])
+    print(tag, rec["f"])
+
+
+show("a")
+show("b")
+
+
+# --- THE CONTROL: a container something MUTATES still reads through the
+# runtime, so the evidence may not survive the block it was built in --------
+# ⛔ The mutated one here is HOMOGENEOUS, and that is the remaining boundary
+# rather than a simplification: a heterogeneous container mutated across a
+# block boundary has nowhere to go. Its evidence is gone by the rule above and
+# the runtime tier still has no `__getitem__` that can produce a union --
+# closing that means widening from the stored class id at run time. Recorded in
+# tests/probe/wb_grid_leftovers_2026_08_16.py.
+grow = [1, "a"]
+grow.append(2)
+print(grow[0])
+print(len(grow))
+
+counts2 = {"a": 1, "b": 2}
+print(counts2["a"])
+counts2["c"] = 3
+print(len(counts2), counts2["c"])

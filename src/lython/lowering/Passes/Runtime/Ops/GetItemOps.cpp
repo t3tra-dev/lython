@@ -25,6 +25,56 @@ bool sameValueTypes(llvm::ArrayRef<mlir::Value> lhs,
 
 } // namespace
 
+// ⭐ AN ELEMENT IS IN SLOT FORM, WHICH IS NOT ALWAYS ITS ABI FORM. A slot holds
+// a header-fronted group, so `bool` is stored BOXED (its canonical i1 has no
+// header) and the contents evidence records the box. The union lane for bool is
+// the i1, and the injection that builds the lanes checks only how MANY values a
+// member takes -- one either way -- so the header went into the lane and the
+// shape check downstream reported it as the union's:
+//
+//     row = [True, "a"]
+//     print(row[0])
+//     # runtime bundle value 1 for '!py.union<bool, str>' has type
+//     # 'memref<3xi64>', but ABI expects 'i1'
+//
+// bool is the only contract with a `box` primitive today, which is why this
+// went unseen: every other element is stored in the form it is read in.
+//
+// ⛔ Why NOT check the types inside `appendUnionRuntimeValues` instead: its
+// other callers hand it values that are already in ABI form, and a mismatch
+// there is a real defect that should stay loud. Only a read out of a slot knows
+// its operand came from storage.
+mlir::LogicalResult
+RuntimeBundleLowerer::canonicalizeSlotElementBundle(mlir::Operation *op,
+                                                    RuntimeBundle &bundle) {
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> abiTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, bundle.objectValue.contract,
+                                                 "container element union ABI");
+  if (mlir::failed(abiTypes))
+    return mlir::failure();
+  if (bundle.physicalValues().size() != abiTypes->size() ||
+      llvm::all_of(llvm::zip_equal(bundle.physicalValues(), *abiTypes),
+                   [](const auto &pair) {
+                     return std::get<0>(pair).getType() == std::get<1>(pair);
+                   }))
+    return mlir::success();
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> unboxed =
+      RuntimeBundleLowerer::unboxSlotElementValues(
+          op, bundle.objectValue.contract,
+          llvm::SmallVector<mlir::Value, 4>(bundle.physicalValues().begin(),
+                                            bundle.physicalValues().end()));
+  if (mlir::failed(unboxed))
+    return mlir::failure();
+  RuntimeBundle canonical = RuntimeBundle::objectWithOwnership(
+      bundle.objectValue.contract, *unboxed,
+      ownership::logicalOwnershipKind(bundle.objectValue.contract,
+                                      /*ownsObject=*/false));
+  canonical.copyEvidenceFrom(bundle);
+  bundle = std::move(canonical);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
     mlir::Operation *op, mlir::Value resultValue, llvm::StringRef label,
     const RuntimeValue &value) {
@@ -49,6 +99,9 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
   // `__getitem__` result type is `str | int`.
   if (auto resultUnion = mlir::dyn_cast<py::UnionType>(resultValue.getType());
       resultUnion && !mlir::isa<py::UnionType>(bundleContract)) {
+    if (mlir::failed(
+            RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, bound)))
+      return mlir::failure();
     mlir::FailureOr<RuntimeBundle> widened =
         RuntimeBundleLowerer::materializeObjectBundleForStorage(
             op, bound, resultUnion, "container element union ABI");
@@ -85,6 +138,9 @@ mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
           mlir::dyn_cast<py::UnionType>(resultValue.getType());
       resultUnion && bundle.kind == RuntimeBundle::Kind::Object &&
       !mlir::isa<py::UnionType>(bundle.objectValue.contract)) {
+    if (mlir::failed(
+            RuntimeBundleLowerer::canonicalizeSlotElementBundle(op, bundle)))
+      return mlir::failure();
     mlir::FailureOr<RuntimeBundle> widened =
         RuntimeBundleLowerer::materializeObjectBundleForStorage(
             op, bundle, resultUnion, "container element union ABI");
