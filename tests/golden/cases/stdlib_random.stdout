@@ -21,6 +21,13 @@
 3
 17
 772246
+ValueError empty range in randrange(5, 0)
+ValueError empty range in randrange(5, 0)
+-5
+ValueError empty range in randrange(5, 0, 2)
+ValueError zero step for randrange()
+ValueError empty range for randrange()
+-10
 10
 a
 [5, 2, 7]

@@ -45,6 +45,35 @@ print(random.randrange(0, 20, 3))
 print(random.randrange(20, 0, -3))
 print(random.randrange(1000000))
 
+# ⛔ ZERO IS A RANGE BOUND LIKE ANY OTHER. `stop` was `int = 0` with
+# `stop == 0 and step == 1` standing in for "omitted", because an Optional int
+# parameter was out of reach when random.py was ported -- so the three
+# spellings below did not merely refuse, they ANSWERED, and two of them
+# answered a number where CPython raises. Every message here is CPython's,
+# including the arguments it interpolates.
+try:
+    print(random.randrange(5, 0))
+except ValueError as exc:
+    print("ValueError", exc)
+try:
+    print(random.randrange(5, 0, 1))
+except ValueError as exc:
+    print("ValueError", exc)
+print(random.randrange(-5, 0))
+try:
+    print(random.randrange(5, 0, 2))
+except ValueError as exc:
+    print("ValueError", exc)
+try:
+    print(random.randrange(1, 10, 0))
+except ValueError as exc:
+    print("ValueError", exc)
+try:
+    print(random.randrange(0))
+except ValueError as exc:
+    print("ValueError", exc)
+print(random.randrange(-10, -2, 2))
+
 # --- sequences --------------------------------------------------------------
 random.seed(42)
 print(random.choice([10, 20, 30, 40, 50]))

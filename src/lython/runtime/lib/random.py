@@ -30,9 +30,11 @@ Deviations from CPython:
   - `seed(a)` takes an int whose magnitude fits 64 bits; `getrandbits(k)`
     takes 0 <= k <= 63, so `randrange`/`randint`/`choice`/`sample` cover
     ranges below 2**63. CPython has no such bound.
-  - `randrange(start, stop, step)` takes three positional ints;
-    `randrange(stop)` is spelled by passing `stop` alone. CPython's
-    `stop=None` sentinel needs an Optional int parameter.
+  - `randrange` takes ints (not objects with `__index__`); the `stop=None`
+    sentinel is CPython's, and every one-, two- and three-argument spelling
+    answers as CPython does. This said until 2026-08-17 that the sentinel was
+    out of reach and `stop = 0` stood in for it, which answered three programs
+    WRONGLY -- zero is a range bound like any other.
   - `shuffle(x)` takes a `list[T]` and no `random=` argument (CPython's is
     deprecated and removed in 3.11+ anyway). The swap loop is CPython's, so the
     permutation for a given seed is CPython's.
@@ -59,23 +61,28 @@ __all__ = [
     "shuffle", "sample", "uniform", "gauss",
 ]
 
-def randrange(start: int, stop: int = 0, step: int = 1) -> int:
+def randrange(start: int, stop: int | None = None, step: int = 1) -> int:
     """Choose a random item from range(start, stop[, step]).
 
-    Pass `stop` alone for CPython's one-argument `randrange(stop)`; the
-    `stop=None` sentinel needs an Optional int parameter.
+    ⛔ `stop` was `int = 0` with `stop == 0 and step == 1` standing in for
+    "omitted", because an Optional int parameter was out of reach when this was
+    ported. Zero is a range bound like any other, so the sentinel answered
+    three programs wrongly rather than merely refusing them:
+    `randrange(5, 0)` and `randrange(5, 0, 1)` returned a number where CPython
+    raises on the empty range, and `randrange(-5, 0)` raised where CPython
+    returns.
     """
-    if stop == 0 and step == 1:
+    if stop is None:
         # The one-argument form: randrange(n) picks from range(n).
         if start > 0:
             return _random.randbelow(start)
         raise ValueError("empty range for randrange()")
-    if step == 0:
-        raise ValueError("zero step for randrange()")
     if step == 1:
         if stop - start > 0:
             return start + _random.randbelow(stop - start)
-        raise ValueError("empty range in randrange()")
+        raise ValueError(f"empty range in randrange({start}, {stop})")
+    if step == 0:
+        raise ValueError("zero step for randrange()")
     # CPython branches on the step's sign to compute the element count as
     # (width + step - 1) // step or (width + step + 1) // step. Both are
     # ceil(width / step), and -((-width) // step) is that in one expression --
@@ -83,7 +90,7 @@ def randrange(start: int, stop: int = 0, step: int = 1) -> int:
     # branches leaks its box past the ownership verifier.
     count = -((start - stop) // step)
     if count <= 0:
-        raise ValueError("empty range in randrange()")
+        raise ValueError(f"empty range in randrange({start}, {stop}, {step})")
     return start + step * _random.randbelow(count)
 
 
