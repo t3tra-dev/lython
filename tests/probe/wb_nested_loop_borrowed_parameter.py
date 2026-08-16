@@ -1,5 +1,5 @@
-# OPEN, and the repair was attempted and REVERTED. A borrowed int parameter
-# rebound inside a NESTED loop is refused, and the refusal is provably wrong:
+# FIXED, on the second attempt. A borrowed int parameter rebound inside a
+# NESTED loop was refused, and the refusal was provably wrong:
 #
 #     def f(n: int) -> int:
 #         i = 0
@@ -48,23 +48,28 @@
 # before it ever reaches a return. The exemption has to be at the point the
 # count stops meaning anything, not at the point it is read.
 #
-# ⛔ Two mechanisms, and choosing between them is the work:
+# ⭐ THE SHIPPED REPAIR CREDITS THE RELEASE, which is what the code actually
+# does. `BorrowedPathState` keeps the namings the group held earlier on the
+# path, and a consuming call that matches one of them decrements. Bounded at
+# four namings and kept out of the visited key -- a path-dependent set in the
+# key lets nested loops defeat the dedup, and dropping the oldest naming can
+# only lose a credit (a missed detection), never invent one.
 #
-#   END THE PATH at the rename, the way `groupRedefined` already ends one for
-#   a back edge that rebinds the merge argument. Cheap, and it stops checking
-#   a borrowed parameter after its first rebinding -- which is a real
-#   weakening of a memory-safety verifier, not a tidy-up.
+# ⛔ The OTHER mechanism -- end the path at the rename, the way `groupRedefined`
+# already ends one for a back edge that rebinds the merge argument -- would
+# have stopped checking a borrowed parameter after its first rebinding. That is
+# a real weakening of a memory-safety verifier, not a tidy-up.
 #
-#   CREDIT A RELEASE UNDER A PRE-MERGE NAME, which is what the code actually
-#   does. That means `BorrowedPathState` keeping the group's previous names
-#   and deciding which one a release cancels. It is the same forward-only
-#   rename family as `wb_generator_resume_raise_unwind.py`, whose four-part
-#   repair refused 80 of 490 tests -- but that was `verifyResourceOnCFGPaths`
-#   (owned resources) and this is `verifyBorrowedEntryOnCFGPaths`, a smaller
-#   and separate walk, so the count there is not evidence about this one.
+# ⛔ AND THE NEGATIVE CONTROL, because this walk has none in the suite and a
+# verifier that accepts more needs one. With `insertBlockArgMergeBorrowRetains`
+# temporarily made to skip emitting the lend (a one-line env-gated ablation,
+# reverted), the same program is still refused -- "borrowed entry argument 0 of
+# @f is returned as owned without a dominating retain" -- so the check still
+# catches a real imbalance rather than having been switched off.
 #
-# Reverted rather than shipped because a verifier this one is a root of the
-# memory-safety proof, and the first attempt was measured to be wrong.
+# golden: tests/golden/cases/nested_loop_rebinds_a_parameter.py (red-checked,
+# and in the leak gate: one credit too many frees the caller's argument, one
+# too few leaks it per call, and neither shows in what is printed).
 
 def f(n: int) -> int:
     i = 0

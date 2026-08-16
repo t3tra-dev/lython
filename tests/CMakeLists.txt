@@ -662,6 +662,11 @@ set(LYTHON_LEAK_GATE_CASES
     # tuple and are the control -- a subscript target on the no-tuple path
     # leaked 104 B, which no printed value showed.
     tuple_swap_in_loop
+    # A borrowed parameter rebound in nested loops: the repair CREDITS a
+    # merge-borrow lend returned under a pre-merge name, so one credit too many
+    # frees the caller's argument and one too few leaks it per call. 200 calls
+    # here, and neither shows in what is printed.
+    nested_loop_rebinds_a_parameter
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

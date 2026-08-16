@@ -470,10 +470,26 @@ struct BorrowedPathState {
   // structs calling one thing by two names is how they read as three
   // different models of a resource when they are one.
   llvm::SmallVector<mlir::Value, 4> group;
+  // ⭐ Names the group HELD EARLIER on this path, most recent last. A
+  // merge-borrow lend is taken on the pre-merge name and returned on it too
+  // (the retain branch below already says so), while the group has moved on to
+  // the merge argument by the time the release is reached -- so without these
+  // the release is invisible and the balance climbs one lend per rename.
+  //
+  // Deliberately NOT part of the visited key, for the same reason
+  // `AffinePathState::previous` is not: a path-dependent set in the key lets
+  // nested loops defeat the dedup. Missing a state can only miss a detection.
+  llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 4> previousGroups;
   // Path entered through an exceptional (unwind) edge. Retain balance is
   // required on these paths like any other (rfc/stdlib-semantics.md R2).
   bool exceptional = false;
 };
+
+// How many pre-merge namings one path keeps. A loop renames the group once per
+// iteration and the walk explores several, so this is bounded rather than
+// complete: the oldest naming is dropped, which can only lose a release
+// crediting (a missed detection), never invent one.
+constexpr unsigned kMaxBorrowedPreviousGroups = 4;
 
 bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
   // `stale`, `previous` and `views` are deliberately NOT compared: they only
@@ -2074,6 +2090,38 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                   callTransfersGroupToOwnedResult(contracts, call, state.group,
                                                   aliases))
             state.group = std::move(*replacement);
+        } else if (state.retained > 0) {
+          // ⭐ THE MERGE-BORROW LEND COMES BACK UNDER THE PRE-MERGE NAME. The
+          // retain branch below has always said so -- "a token that a loop-edge
+          // decref later returns through the pre-merge name" -- and counted the
+          // lend; nothing credited the return, because the group had been
+          // remapped to the merge argument by then. One lend per rename
+          // survived, so a NESTED loop over a borrowed parameter
+          //
+          //     def f(n: int) -> int:
+          //         i = 0
+          //         while i < 2:
+          //             while n >= 10:
+          //                 n -= 10
+          //             i += 1
+          //         return n
+          //
+          // was refused with "returned with 2 retained ownership tokens", and
+          // the `-> str` spelling with "reaches function exit with 1". Both are
+          // sound: with the verifier off they print CPython's answer, and 2000
+          // calls measure at net 0 allocations / 0 B.
+          //
+          // ⛔ Why crediting here and not exempting the exit check, which was
+          // tried first: the balance climbs on the way round, so the walk hits
+          // "retain balance exceeded 64" before it reaches any return. The
+          // count has to stop being wrong, not stop being read.
+          for (const llvm::SmallVector<mlir::Value, 4> &earlier :
+               llvm::reverse(state.previousGroups)) {
+            if (!callConsumesGroup(contracts, call, earlier, aliases))
+              continue;
+            --state.retained;
+            break;
+          }
         }
 
         if (mentionsTracked &&
@@ -2190,6 +2238,13 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       llvm::SmallVector<bool, 4> mappedMask;
       next.group = remapGroupForSuccessor(op, index, successor, state.group,
                                           aliases, &mappedMask);
+      // A rename: remember what the group was called, so the lend taken on
+      // that name can be credited when it is returned there.
+      if (next.group != state.group) {
+        next.previousGroups.push_back(state.group);
+        if (next.previousGroups.size() > kMaxBorrowedPreviousGroups)
+          next.previousGroups.erase(next.previousGroups.begin());
+      }
       // A group name that is a block argument of the successor but was NOT
       // forwarded on this edge is REDEFINED by the edge (a loop back edge
       // rebinding the merge argument to a fresh value): the borrowed token's
