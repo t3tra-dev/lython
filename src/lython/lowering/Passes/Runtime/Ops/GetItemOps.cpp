@@ -39,15 +39,59 @@ mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
       objectShapeMatches(resultContract, value.values))
     bundleContract = resultValue.getType();
 
-  valueBundles[resultValue] = RuntimeBundle::objectWithOwnership(
+  RuntimeBundle bound = RuntimeBundle::objectWithOwnership(
       bundleContract, value.values,
       ownership::logicalOwnershipKind(bundleContract,
                                       /*ownsObject=*/false));
+  // The union widening `bindSelectedEvidenceObjectResult` explains, on the
+  // other binder. A heterogeneous DICT read arrives here rather than there --
+  // `{"name": "ann", "age": 30}` is how a record literal is written, and its
+  // `__getitem__` result type is `str | int`.
+  if (auto resultUnion = mlir::dyn_cast<py::UnionType>(resultValue.getType());
+      resultUnion && !mlir::isa<py::UnionType>(bundleContract)) {
+    mlir::FailureOr<RuntimeBundle> widened =
+        RuntimeBundleLowerer::materializeObjectBundleForStorage(
+            op, bound, resultUnion, "container element union ABI");
+    if (mlir::failed(widened))
+      return mlir::failure();
+    bound = std::move(*widened);
+    bound.setObjectLogicalOwnership(/*ownsObject=*/false);
+  }
+  valueBundles[resultValue] = std::move(bound);
   return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::bindSelectedEvidenceObjectResult(
     mlir::Operation *op, mlir::Value resultValue, RuntimeBundle bundle) {
+  // ⭐ A UNION-TYPED READ GETS THE UNION'S LANES, not the member's. Evidence
+  // selection knows exactly which element it picked -- an int for `xs[0]` of
+  // `[1, "a"]` -- and handing that bundle back where the result type is
+  // `int | str` gives every consumer of a union a member where it reads the
+  // TAG from lane 0. `arith.cmpi` then infers its result shape from the
+  // operand it was given:
+  //
+  //     xs = [1, "a"]
+  //     print(xs[0])
+  //     # runtime bundle value 0 for 'builtins.bool' has type 'memref<2xi1>',
+  //     # but ABI expects 'i1'
+  //
+  // and the same for a heterogeneous dict, which is how a record literal
+  // (`{"name": "ann", "age": 30}`) is written. Same defect as the union FIELD
+  // read; that one had the union's lanes already spliced into the instance and
+  // only had to stop consulting the cache, and this one has to BUILD them --
+  // `materializeObjectBundleForStorage` is the widening that already exists,
+  // and it records the active member so the slot's reference stays nameable.
+  if (auto resultUnion =
+          mlir::dyn_cast<py::UnionType>(resultValue.getType());
+      resultUnion && bundle.kind == RuntimeBundle::Kind::Object &&
+      !mlir::isa<py::UnionType>(bundle.objectValue.contract)) {
+    mlir::FailureOr<RuntimeBundle> widened =
+        RuntimeBundleLowerer::materializeObjectBundleForStorage(
+            op, bundle, resultUnion, "container element union ABI");
+    if (mlir::failed(widened))
+      return mlir::failure();
+    bundle = std::move(*widened);
+  }
   bundle.setObjectLogicalOwnership(/*ownsObject=*/false);
   valueBundles[resultValue] = std::move(bundle);
   erase.push_back(op);

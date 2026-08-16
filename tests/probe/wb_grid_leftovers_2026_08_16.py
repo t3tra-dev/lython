@@ -74,6 +74,21 @@
 # literal's element is a unification variable that survives to its use.
 #
 # ============================================================
+# (5) A SECOND UNION-TYPED READ of the same container is refused.
+# ============================================================
+#     xs = [1, "a"]
+#     print(xs[0], xs[1])
+#     first = xs[0]        # runtime manifest has no builtins.list.__getitem__
+#
+# The first read demotes the container's contents evidence -- a read hands out
+# an ALIAS, so the description cannot travel with it (`bindRetainedEvidenceBundle`
+# has the measurement) -- and the later read falls to the runtime path. That
+# path returns a boxed object, and nothing widens it into the union: doing so
+# means branching on the STORED CLASS ID at run time to pick the tag, which is
+# the same switch a boxed union field would need. Reading each element once
+# works, which is what `heterogeneous_container_read.py` does.
+#
+# ============================================================
 # (3) `f = lambda v: v * 2` STILL NEEDS AN ANNOTATION.
 # ============================================================
 #     lambda requires a Callable annotation because its type contains
