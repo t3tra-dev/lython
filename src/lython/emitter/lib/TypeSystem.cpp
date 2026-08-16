@@ -2562,6 +2562,40 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // manifest __getitem__ behind it to infer through.
     if (auto tensor = mlir::dyn_cast_or_null<mlir::RankedTensorType>(container))
       return tensor.getElementType();
+    // ⭐ A SLICE IS `__getslice__`, NOT `__getitem__`. The emitter has always
+    // known this (EmitterExpressions.cpp), and inference did not: it recursed
+    // into the `Slice` node for an index type and resolved `__getitem__`,
+    // which for `list[int]` answers the ELEMENT. Anything that types an
+    // expression without emitting it therefore saw `xs[0:2]` as an int, and
+    // the generator's yield-type walk is exactly that:
+    //
+    //     def chunks(xs: list[int], n: int) -> Iterator[list[int]]:
+    //         yield xs[i:i + n]
+    //     # annotated Iterator[list[int]] but yields builtins.int
+    //
+    // The same slice in a plain `return` compiled, because that goes through
+    // the emitter.
+    //
+    // ⛔ STRICT ONLY, and the lenient answer is left exactly as it was. It is
+    // load-bearing somewhere this walk does not own: with the correction
+    // applied to both, `a[bump():3] += [99]` stopped splicing and printed
+    // `[1, 2, 3, 4, 5]` where CPython gives `[1, 2, 3, 99, 4, 5]` -- a SILENT
+    // wrong answer, caught by `augmented_assignment_evaluates_once`. The
+    // lenient reading feeds the augmented-assignment slice route, and what it
+    // wants there is not the slice's own type. Correcting that too means
+    // finding what the route actually needs, which is a separate question
+    // from the one this fixes.
+    if (const parser::Node *sliceNode = ast::node(*node, "slice");
+        strict && sliceNode && sliceNode->kind == "Slice") {
+      mlir::Type intType = this->intType();
+      mlir::Type widened = widenLiteral(container);
+      CallInferenceResult sliced = inferMethodCallWithEvidence(
+          widened, "__getslice__", {intType, intType, intType, intType});
+      if (sliced)
+        return sliced.resultType;
+      if (strict)
+        return fail(sliced.failureReason);
+    }
     mlir::Type index = recurse(ast::node(*node, "slice"));
     if (strict) {
       if (!container || !index)
