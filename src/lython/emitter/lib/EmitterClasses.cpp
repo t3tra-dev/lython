@@ -1592,6 +1592,11 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                           std::string(),
                           statement->kind == "AsyncFunctionDef",
                           std::string(contractName)};
+        // The getter's RETURN type is what `instance.name` reads as. Without
+        // it the attribute inference answers `builtins.object`.
+        if (kind == "property" && methodName)
+          types.bindClassPropertyType(contractName, *methodName,
+                                      bodySig.resultType);
         continue;
       }
       methodNames.push_back(std::string(*methodName));

@@ -1871,6 +1871,23 @@ TypeSystem::lookupClassStaticAttrType(llvm::StringRef className,
   return found->second;
 }
 
+void TypeSystem::bindClassPropertyType(llvm::StringRef className,
+                                       llvm::StringRef propertyName,
+                                       mlir::Type type) {
+  if (className.empty() || propertyName.empty() || !type)
+    return;
+  classPropertyTypes[(className + "." + propertyName).str()] = type;
+}
+
+std::optional<mlir::Type>
+TypeSystem::lookupClassPropertyType(llvm::StringRef className,
+                                    llvm::StringRef propertyName) const {
+  auto found = classPropertyTypes.find((className + "." + propertyName).str());
+  if (found == classPropertyTypes.end())
+    return std::nullopt;
+  return found->second;
+}
+
 void TypeSystem::bindClassStaticMethod(llvm::StringRef className,
                                        llvm::StringRef methodName,
                                        mlir::Type callable) {
@@ -2589,10 +2606,22 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 mlir::dyn_cast_if_present<py::TypeType>(receiverInstance))
           receiverInstance = typeObjectType.getInstanceType();
         if (auto contractType =
-                mlir::dyn_cast_if_present<py::ContractType>(receiverInstance))
+                mlir::dyn_cast_if_present<py::ContractType>(receiverInstance)) {
           if (std::optional<mlir::Type> staticAttr = lookupClassStaticAttrType(
                   contractType.getContractName(), *attr))
             return *staticAttr;
+          // ⭐ A @property is neither a field nor a manifest method, so this
+          // walk used to fall past it to `object()` below. That answer is what
+          // `str(x)` reads to choose its dispatch, and an erased object routes
+          // to the manifest `object.__str__`, which reads a payload class id a
+          // source instance's header does not carry -- `str(Path("/x").parent)`
+          // SEGFAULTED. The emitter already resolves the read itself, which is
+          // why binding it to a name first worked and using it directly did
+          // not.
+          if (std::optional<mlir::Type> property = lookupClassPropertyType(
+                  contractType.getContractName(), *attr))
+            return *property;
+        }
         if (std::optional<CallSolution> method =
                 tryManifestMethod(*this, widenLiteral(objectType), *attr, {}))
           return method->result;

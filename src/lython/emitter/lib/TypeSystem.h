@@ -295,6 +295,17 @@ public:
   std::optional<mlir::Type>
   lookupClassStaticAttrType(llvm::StringRef className,
                             llvm::StringRef attrName) const;
+  // ⭐ Property getters (`@property`) resolve `instance.name` to the getter's
+  // RETURN type. They are neither a field nor a manifest method, so the
+  // attribute inference had nothing to answer with and returned
+  // `builtins.object` — which routed `str(p.parent)` into the erased-object
+  // dispatch and SEGFAULTED. The emitter registers them per class, the same
+  // channel static attributes use.
+  void bindClassPropertyType(llvm::StringRef className,
+                             llvm::StringRef propertyName, mlir::Type type);
+  std::optional<mlir::Type>
+  lookupClassPropertyType(llvm::StringRef className,
+                          llvm::StringRef propertyName) const;
   // Static methods (`@staticmethod`) take no receiver, so the method-contract
   // channel — which binds parameter 0 to the receiver — cannot resolve them.
   // The emitter registers their signatures here as it emits the class.
@@ -414,6 +425,7 @@ private:
   // a field: it needs its own inference channel so `C.attr` types as the
   // declared attribute rather than falling back to the erased object.
   llvm::StringMap<mlir::Type> classStaticAttrTypes;
+  llvm::StringMap<mlir::Type> classPropertyTypes;
   // Static-method signatures, keyed "<class>.<method>".
   llvm::StringMap<mlir::Type> classStaticMethodTypes;
   llvm::StringMap<std::string> canonicalBindings;

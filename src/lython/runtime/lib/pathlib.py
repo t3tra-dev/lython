@@ -155,6 +155,13 @@ class Path:
         # ONE construction site: a property (or method) returning a user class
         # instance from two different `return` statements segfaults at runtime
         # (reported to the Wave 3 foundation track).
+        #
+        # ⛔ That note is about the two-return shape and was NOT what made
+        # `str(Path("/x/y").parent)` crash until 2026-08-17. The attribute
+        # inference had no channel for a property, answered `builtins.object`,
+        # and `str()` then took the erased-object dispatch. Fixed in the
+        # emitter; kept here because the one-return rule has not been
+        # re-measured since.
         head = posixpath.dirname(self._raw)
         if head == "":
             head = "."
