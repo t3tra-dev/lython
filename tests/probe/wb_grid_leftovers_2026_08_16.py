@@ -155,12 +155,30 @@
 #     only `builtins.bool` has a `box`/`unbox` primitive, so str, int and
 #     float take neither.
 #
-# What is left is the BINDING: the non-union path hands
-# `bindRetainedEvidenceValue` an element whose contract is `builtins.str`,
-# and this one hands it a UNION. `retainEvidenceElement` and
-# `evidenceElementAnchor` are written for a single object -- a union's active
-# member is chosen by a tag, and its "defining ops" are a constant and a chain
-# of selects. START THERE.
+# ⭐ AND IT IS THE BINDING, found by reading the one place left rather than by
+# another build. `retainEvidenceElement` (GetItemOps.cpp) opens with
+#
+#     if (!ownership::isObjectHeaderLikeType(value.values.front().getType()))
+#       return std::nullopt;
+#
+# and a union's lane 0 is the i64 TAG, not a header. So the retain is skipped,
+# `bindRetainedEvidenceValue` binds a plain BORROW of the container's slot, and
+# the only thing holding the container past the read is `pinContainerLiveness`
+# -- which pins to just after the read, not past the print. The list is freed
+# and the str's bytes are read from freed memory, which is why the wrong answer
+# is an EMPTY string and a 0.0 rather than garbage: the dead-value shape is
+# what a freed payload looks like. An int element survived the same treatment,
+# which is why `["a", 1]` printed 1 and looked like a working tag.
+#
+# ⛔ SO THE REPAIR IS AN OWNERSHIP CHANGE, not a lane change, and that is why
+# it is still not shipped. The element has to take a reference on its ACTIVE
+# MEMBER -- `retainAggregateSlot` already does exactly that for a union, via
+# `forEachActiveUnionMember` -- and then be bound as OWNED so the frame
+# releases it. `bindOwnedEvidenceValue` needs an anchor and refuses without
+# one, and a union's defining ops are a constant and a chain of selects. That
+# is the piece to write, and it is the piece that must not be half-verified:
+# one reference too many leaks per read, one too few is the use-after-free
+# above, and neither shows in what a passing suite prints.
 #
 # ⛔ A repair here must be red-checked against VALUES, not against compiling.
 # The refusal it replaces is loud; the wrong answer it produced is not, and
