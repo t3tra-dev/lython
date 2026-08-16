@@ -189,12 +189,34 @@
 # locals -- three locals (int, str, float) leaking two objects, which is the
 # two that are not immortal.
 #
-# Not shipped for that: the project's leak gate is a clean baseline, and a
-# golden that leaks would either break it or have to be left out of it, which
-# is worse. The suspect is the EXIT RELEASE of an owned union local, mirroring
-# the retain-side guard this whole trail started at -- if the release planner
-# also asks `isObjectHeaderLikeType(values.front())` anywhere, a union fails it
-# for the same reason, and the fix is the same shape twice.
+# ⭐ THE SUSPECT WAS RIGHT AND THERE IS A THIRD GUARD. `rootOwnedEvidenceElement`
+# opens with the same `isObjectHeaderLikeType(values.front())` line, so marking
+# the element frame-owned failed for the same reason the retain did, and the
+# reference the fix takes was never given back -- that IS the 81 B. Relaxing
+# that guard for a union whose lanes include a header gets past it and lands on
+# the gate that governs the marker:
+#
+#     ly.ownership.owned_local_object marks a value this frame never acquired:
+#     it is not a fresh allocation, not a call result the contract declares
+#     owned, and NO RETAIN ROOTS IT. A value read out of a slot is BORROWED --
+#     the slot still holds it -- so the release this token earns would
+#     discharge a reference the frame does not have.
+#
+# Which is correct and is the whole remaining problem stated by the compiler
+# itself: `retainAggregateSlot` retained the ACTIVE MEMBER, a lane INSIDE the
+# union, and the gate looks for a retain that roots the value the marker names.
+#
+# ⛔ SO THE MECHANISM IS THREE PLACES IN THE OWNERSHIP KERNEL, not one:
+# `retainEvidenceElement`, `rootOwnedEvidenceElement`, and the marker gate,
+# each written for a single object and each needing to accept "the retain of a
+# union's active member roots the union". That is an extension of the safety
+# kernel and belongs in a round of its own -- with the whole trail above as its
+# starting point, and with the leak gate as its acceptance test, because the
+# two ways of getting it wrong are a use-after-free and a leak and neither
+# shows in what a passing suite prints.
+#
+# The value work is done and reproducible: retain through `retainAggregateSlot`
+# plus a bound owned element gives CPython's answer for every program above.
 #
 # ⛔ A repair here must be red-checked against VALUES, not against compiling.
 # The refusal it replaces is loud; the wrong answer it produced is not, and
