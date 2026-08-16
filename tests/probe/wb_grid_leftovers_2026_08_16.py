@@ -116,15 +116,28 @@
 # member 0 is the only real member. So the failure is in the SELECTION, not in
 # the lane rebuild: with four members, nothing after member 0 was chosen.
 #
-# ⛔ AND THE FIRST HYPOTHESIS WAS CHECKED AND IS FALSE, which is why it is
-# written down. "The class ids do not agree" -- `runtimeClassIdForContract`
-# against the word the box holds -- does not survive: `LyUnicode_FromBytes`
-# declares `ly.runtime.class_id = 4` and `__ly_unicode_alloc` stores
-# `layout_str = 4` into word 1. They are the same number. So the next attempt
-# should NOT start there; it should start by printing what the box's word 1
-# actually holds at each slot, because the other reading of `1 1 0.0 None` is
-# that `b` read SLOT 0 -- it printed `a`'s value -- which would make the slot
-# base, not the tag, the thing that is wrong.
+# ⛔ AND THE SLOT BASE IS NOT IT EITHER. The second attempt dumped the emitted
+# IR: the base is `index * 16`, the class-id load is `slot + 1`, and the
+# comparison constants are the right ones (`cmpi eq %83, 1` for int, `4` for
+# str). Every piece the first two hypotheses blamed is correct.
+#
+# ⭐ WHAT THE VALUES SAY, three programs, each reading the SECOND element after
+# a first read has demoted the evidence:
+#
+#     xs = ["a", 1]  ; b = xs[1]   ->  1     CORRECT   (int is member 1)
+#     xs = [1, "a"]  ; b = xs[1]   ->  ""    wrong     (str is member 1)
+#     xs = [1, 2.5]  ; b = xs[1]   ->  0.0   wrong     (float is member 1)
+#
+# The INT match fires -- member 1 is not the tag's default, so `1` can only
+# come from the comparison succeeding. The str and float matches do not: their
+# lanes come back as the dead value, which is what an empty str and a 0.0 are.
+#
+# So the compiler's side is right and the discrepancy is in WHAT THE BOX HOLDS
+# at word 1 for a str and a float element -- `objectPayloadHandleWords` copies
+# it from the payload's own header word 1, and `__ly_unicode_alloc` stores 4
+# there while `LyUnicode_FromBytes` declares `ly.runtime.class_id = 4`. Two
+# places that agree on paper and a third that does not agree at run time.
+# START BY MAKING THE PROGRAM PRINT THAT WORD.
 #
 # ⛔ A repair here must be red-checked against VALUES, not against compiling.
 # The refusal it replaces is loud; the wrong answer it produced is not, and
