@@ -1,8 +1,7 @@
 # probe: REPORTED loud: a generator method on a class
 # axes: op=generator-method flow=for
 # CLASSIFICATION @ 2026-08-17: 3 loud 拒否 (診断)
-#   source generator next lowering currently supports yields whose runtime
-#   value is a single lane, and '!py.contract<"builtins.int">' has 3
+#   a generator cannot carry a value of contract 'Bag' across a suspension yet
 #
 # ⛔ RECLASSIFIED TWICE ON 2026-08-17, and the pair is the useful part. It was
 # "generator function return annotation is incompatible with inferred Generator
@@ -14,10 +13,40 @@
 #
 # The `for x in b.xs` loop is rewritten into an index loop now, so the position
 # survives -- `known_module_generator_over_field`, the same program with the
-# generator at module level, RUNS. What is left is the RECEIVER: this one is a
-# method, so `self` is live across the yield, and a source-class instance has
-# no frame lane. That is the last layer and it is a different mechanism from
-# all three above.
+# generator at module level, RUNS. What is left is the RECEIVER.
+#
+# ⭐ AND IT IS NOT "a user class has no lane", which is what the diagnostic
+# says. Measured four ways on 2026-08-17:
+#
+#   class E: (no fields at all)  def each(self): ... yield ... -> REFUSED
+#   self.n read into a local BEFORE the first yield ............ REFUSED
+#   self.xs likewise ........................................... REFUSED
+#   the same body as a module-level function ................... RUNS
+#
+# An empty class refusing kills the layout reading, and the diagnostic's own
+# advice ("read the value into an int local before the first yield") does not
+# work, which is worth fixing on its own.
+#
+# ⭐ WHAT IT ACTUALLY IS: the receiver of a generator METHOD arrives as a
+# CLOSURE CAPTURE, not as a positional. The bound form in the frontend IR is
+#
+#     func.func private @__ly_method$E$each$...$bound$... ()
+#       attributes {callable_type = !py.callable<[], returns = ...>,
+#                   closure_names = ["self"], closure_types = [!py.contract<"E">]}
+#
+# -- no positionals at all. `GeneratorStateMachine.cpp` builds `argumentLanes`
+# by walking `callable.getPositionalTypes()` (around the `argumentsEligible`
+# loop), so the capture gets no lane; the clone's parameter list, built by
+# `callableLogicalInputTypes` in ABI/CallableABI.cpp, is positionals ++ kwonly
+# ++ vararg ++ kwarg ++ CLOSURES, so the capture IS a clone parameter and
+# reaches the "must be builtins.int" check that prints the message above.
+#
+# `generatorLaneParts` already answers for a source class (a `py.class` in the
+# module plus an all-rank-1 layout), so the lane exists -- nothing computes one
+# for a capture. The change is to build `argumentLanes` over the same list the
+# clone is built from. It touches the suspension ABI's parameter accounting,
+# so its acceptance test is the leak gate plus values over the generator
+# shapes, not a compile.
 # CPython 3.14 expects: 6
 #
 # ⭐ LOCALIZED 2026-08-15, and it is NOT the method, the class, or the loop.
