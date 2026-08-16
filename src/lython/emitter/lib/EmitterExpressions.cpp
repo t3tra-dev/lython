@@ -2710,6 +2710,30 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                         value.value);
       return {op.getResult(), targetType};
     }
+    // ⭐ A NARROWER UNION INJECTS INTO A WIDER ONE. `hasMember` asks whether
+    // the whole source type is one member, and a union never is; the member
+    // loop below then asks whether it is assignable TO a member, which it also
+    // is not. So the coercion returned the value untouched and the mismatch
+    // surfaced where the value was used:
+    //
+    //     doc = {"id": 1, "name": "x"}
+    //     print(doc.get("id"))
+    //     # type mismatch for bb argument #0 of successor #0
+    //
+    // `dict.get` merges the present arm (`int | str`) with a None into
+    // `int | str | None`, and only the None arm was wrapped. `py.union.wrap`
+    // already performs the injection -- it remaps the source tag member by
+    // member -- so this is the emitter asking for what the lowering can do.
+    if (auto sourceUnion =
+            mlir::dyn_cast_if_present<py::UnionType>(value.type)) {
+      if (llvm::all_of(sourceUnion.getMemberTypes(), [&](mlir::Type member) {
+            return unionType.hasMember(member);
+          })) {
+        auto op = py::UnionWrapOp::create(builder, loc(anchor), targetType,
+                                          value.value);
+        return {op.getResult(), targetType};
+      }
+    }
     mlir::Type actual = types.widenLiteral(value.type);
     for (mlir::Type member : unionType.getMemberTypes()) {
       if (!isAssignableWithStaticEvidence(actual, member, module))

@@ -326,6 +326,57 @@
 # would additionally need the loop variable to carry the union's lanes across
 # the back edge.
 #
+# ============================================================
+# (8) `.get` ON A RECORD: FOUR SHAPES STILL REFUSED.
+# ============================================================
+# The union-to-union coercion (2026-08-16) closed the common one --
+# `doc.get("id")` on `{"id": 1, "name": "x"}` -- and reading the same dict four
+# more ways found four separate mechanisms behind it. Each is a REFUSAL; none
+# is a wrong answer.
+#
+#   THE SAME KEY TWICE in one function:
+#     doc = {"id": 1, "name": "x"}
+#     print(doc.get("id")); print(doc.get("id"))
+#     # owned resource from builtin.unrealized_conversion_cast result 0
+#     # reaches function exit without release, transfer, or owned return
+#   Different keys are fine at any count, so it is the second retain of the
+#   SAME object on a second merge edge that has no matching release. Same
+#   family as the borrowed-path credit in verifier/runtime/AffineOwnership.cpp:
+#   a value lent on two edges is returned once.
+#
+#   A FLOAT (or any heap-backed) VALUE, with no union in sight:
+#     doc = {"s": 2.5}
+#     print(doc.get("s"))
+#     # ownership: this block-argument merge needs a retain on the edge and
+#     # the header prefix cannot be spelled at the point the retain must go
+#   ⛔ THE REPAIR WAS BUILT AND REVERTED, and the measurement is the point.
+#   The absent arm carries the DEAD placeholder --
+#   `memref.get_global @__ly_dead_header_memref_3xi64_`, a CONSTANT whose
+#   initializer is the prefix with word 0 = INT64_MAX -- and
+#   `prefixIsInitializedAtDefinition` declines it because it is neither a call
+#   result nor a block argument. Accepting an immortal constant global (the
+#   initializer, not the symbol name: a `dense<0>` global has the same producer
+#   and a retain there reads a zero refcount) makes `{"s": 2.5}.get("s")`,
+#   `{"s": 2.5, "n": "x"}.get("s")` and a three-member record all print
+#   CPython's answer, and the suite stays green except that it moves the
+#   SAME-KEY refusal above from "two gets" to "two gets", unchanged. It was
+#   reverted because it only converts one refusal into another at a boundary
+#   nobody can predict -- 1 get accepted, 2 refused -- and the same-key
+#   accounting has to be fixed first for it to mean anything.
+#
+#   A COMPUTED KEY: "dict __getitem__ evidence candidate 1 has a different
+#   physical ABI shape". The dynamic evidence arm selects between candidates
+#   with an scf.if chain that yields one shape, and a heterogeneous dict's
+#   values do not have one. Each candidate would have to be widened to the
+#   union's lanes BEFORE the chain -- the same widening (7) and the mutated
+#   container in (5) need.
+#
+#   AN ABSENT LITERAL KEY (`doc.get("zz")`): the read is statically a miss, and
+#   `containerContentsAreUnreachableByMutation` declines a container any of
+#   whose reads misses -- because the evidence tier's miss RAISES into the
+#   read's own block. Here the raise is dead code under `if k in doc`, which is
+#   exactly the `i, j = [1]` shape that rule exists for.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible
@@ -342,6 +393,8 @@ print(mixed[2])
 print(mixed[0] == 1, mixed[1] == 1, mixed[2] == True)
 if mixed[0]:
     print("truthy")
+record = {"id": 1, "name": "x"}
+print(record.get("id"), record.get("name"))
 a, b = 0, 1
 i = 0
 while i < 10:

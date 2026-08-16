@@ -374,7 +374,17 @@ bool RuntimeBundleLowerer::containerContentsAreUnreachableByMutation(
     auto read = mlir::dyn_cast<py::GetItemOp>(user);
     if (!read || read.getContainer() != containerValue)
       return false;
-    // ⛔ And every read must HIT. A miss raises, and the raise the evidence
+    // ⛔ And every read must be one the evidence can ANSWER: a literal index
+    // or key, and one that hits.
+    //
+    // A computed index has a dynamic evidence arm, and admitting it was tried
+    // and reverted: for a heterogeneous container that arm cannot select at
+    // all -- "dict __getitem__ evidence candidate 1 has a different physical
+    // ABI shape" -- because the candidates would each have to be widened to
+    // the union's lanes before the select chain. That is the same widening the
+    // mutated-container read needs, and it is unbuilt.
+    //
+    // A miss raises, and the raise the evidence
     // tier emits is not the runtime tier's: it is spliced into the block the
     // read is in, which is what the demotion used to keep it out of. In
     // `i, j = [1]` the arity check raises first and `[1][1]` is dead code, but
