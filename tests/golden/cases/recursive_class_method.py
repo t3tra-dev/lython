@@ -108,6 +108,47 @@ class Math:
 print(Math().fact(5), Math().fact(10), Math().fib(10))
 
 
+# --- keyword arguments in the recursive call ------------------------------
+# The symbol call packs positionals, and a recursive call names a signature
+# this walk already has -- so a keyword that names a positional parameter is
+# that parameter's slot. Carrying a setting down a recursion this way is
+# ordinary, and refusing it sent the whole method back to the refusal above.
+class Scaled:
+    def __init__(self, v: int) -> None:
+        self.v = v
+        self.kids: list["Scaled"] = []
+
+    def add(self, child: "Scaled") -> "Scaled":
+        self.kids.append(child)
+        return self
+
+    def total(self, scale: int = 1, offset: int = 0) -> int:
+        s = self.v * scale + offset
+        for k in self.kids:
+            s += k.total(scale=scale, offset=offset)
+        return s
+
+
+scaled = Scaled(1)
+scaled.add(Scaled(2))
+scaled.add(Scaled(3))
+print(scaled.total(), scaled.total(scale=10))
+print(scaled.total(scale=2, offset=1), scaled.total(2, offset=1))
+
+
+class Step:
+    def __init__(self, floor: int) -> None:
+        self.floor = floor
+
+    def down(self, n: int, step: int = 1) -> int:
+        if n <= 0:
+            return self.floor
+        return 1 + self.down(n - step, step=step)
+
+
+print(Step(0).down(6, step=2), Step(0).down(6, 3), Step(9).down(0))
+
+
 # --- THE CONTROL: a non-recursive call still inlines, so an override wins --
 class Shape:
     def name(self) -> str:

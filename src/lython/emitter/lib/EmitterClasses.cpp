@@ -2536,8 +2536,54 @@ Value ModuleEmitter::emitInlineMethodBody(
             ? mlir::dyn_cast<py::CallableType>(method.signature.publicCallable)
             : mlir::dyn_cast_if_present<py::CallableType>(
                   method.signature.callable);
+    // ⭐ KEYWORDS ARE PLACED, not refused. The symbol call packs positionals,
+    // and a recursive call names a signature this walk already has -- so a
+    // keyword that names a positional parameter is that parameter's slot, and
+    // `self.down(n - step, step=step)` is the ordinary way to write a
+    // recursion that carries a setting. Refusing it sent the whole method back
+    // to "recursive class method call is not supported".
+    //
+    // ⛔ Every parameter must end up filled, and by exactly one thing. A gap
+    // would have to be closed from the callee's defaults, and this is a real
+    // call rather than an inlining, so nothing here evaluates them; a
+    // duplicate is the program's error and belongs to the ordinary path's
+    // diagnostic. Either way the refusal below still answers.
+    const FunctionSignature &recursiveSig =
+        method.bodySignature.callable ? method.bodySignature : method.signature;
+    llvm::SmallVector<Value, 8> placed;
+    bool keywordsPlaced = true;
+    if (!keywords.empty()) {
+      // Slot 0 is `self`, which the receiver fills.
+      llvm::ArrayRef<std::string> names = recursiveSig.positionalNames;
+      if (names.empty() || positional.size() + keywords.size() + 1 !=
+                               names.size()) {
+        keywordsPlaced = false;
+      } else {
+        placed.assign(names.size() - 1, Value{});
+        for (auto [index, argument] : llvm::enumerate(positional))
+          placed[index] = argument;
+        for (const auto &entry : keywords) {
+          auto found = llvm::find(names, entry.getKey().str());
+          if (found == names.end() || found == names.begin()) {
+            keywordsPlaced = false;
+            break;
+          }
+          std::size_t slot =
+              static_cast<std::size_t>(std::distance(names.begin(), found)) - 1;
+          if (slot < positional.size() || placed[slot].value) {
+            keywordsPlaced = false;
+            break;
+          }
+          placed[slot] = entry.getValue();
+        }
+        if (keywordsPlaced)
+          for (Value slot : placed)
+            if (!slot.value)
+              keywordsPlaced = false;
+      }
+    }
     if (!recursive || method.symbolName.empty() || !bindDescriptorReceiver ||
-        !keywords.empty()) {
+        !keywordsPlaced) {
       std::string cycle;
       bool inCycle = false;
       for (const parser::Node *active : methodsBeingInlined) {
@@ -2559,7 +2605,10 @@ Value ModuleEmitter::emitInlineMethodBody(
     }
     Value callee = emitBindingRef(anchor, method.symbolName, recursive);
     llvm::SmallVector<Value, 8> arguments{receiver};
-    arguments.append(positional.begin(), positional.end());
+    if (keywords.empty())
+      arguments.append(positional.begin(), positional.end());
+    else
+      arguments.append(placed.begin(), placed.end());
     CallOperands operands;
     operands.positional.assign(arguments.begin(), arguments.end());
     for (Value argument : arguments)
