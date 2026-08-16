@@ -484,19 +484,25 @@
 # was this.
 #
 # ============================================================
-# (12) `.items()` ON A COMPREHENSION RESULT, USED DIRECTLY.
+# (12) FIXED: `.items()` ON A COMPREHENSION RESULT, USED DIRECTLY.
 # ============================================================
 #     xs = [1, 2]
 #     print(sorted({x: x * x for x in xs}.items()))
 #     # runtime manifest has no builtins.dict.items method
 #
-# Binding the comprehension to a name first works, and so does the same call on
-# a dict LITERAL temporary (`sorted({1: 2}.items())`), so it is not the
-# temporary and it is not `items` -- it is the comprehension's result arriving
-# without the mapping evidence the method needs. `len()` of the same
-# comprehension is fine, which says the handle is there and the DESCRIPTION is
-# not. Found while pinning the uniform-tuple collapse (2026-08-17) and
-# unchanged by it.
+# ⛔ THE FIRST READING WAS WRONG and is kept here because it looked right: "the
+# comprehension's result arrives without the mapping EVIDENCE the method
+# needs". It is not evidence. `keys`/`values`/`items` have no runtime object at
+# all -- they are sugar the emitter answers by iterating the dict -- and the
+# sugar asks `isDictTypedExpr(receiver)`. The type walk had NO ARM for a
+# comprehension, so every question about one used directly answered
+# `builtins.object`.
+#
+# The three measurements that should have pointed there: binding it to a name
+# first works (the SYMBOL carries the type), a dict LITERAL temporary works
+# (the literal has an arm), and `len()` works (its own sugar rewrites
+# `len(d.items())` to `len(d)` before asking). All three are about the TYPE,
+# and "evidence" was a guess that fit two of them.
 #
 # ============================================================
 # (13) `type(x)` IS UNBOUND, and implementing it statically would be wrong.
@@ -563,18 +569,22 @@
 # int)` has no `py.class` schema to match against, so it would still refuse.
 #
 # ============================================================
-# (15) `set.update` / `frozenset.update` ARE NOT DECLARED.
+# (15) `set.update` TAKES A SET, NOT AN ITERABLE.
 # ============================================================
 #     s = {1}
 #     s.update([2, 3])
 #     # static type !py.contract<"builtins.set", [...]> does not provide
 #     # manifest method 'update'
 #
-# It is not the element type: an ANNOTATED `set[int]` refuses it too, and
-# `add`, `discard`, `remove`, `issubset`, `isdisjoint` and the operators all
-# work. The method is simply absent from builtins.mlir's set contract. Found
-# while closing the `set()` constructor seed (2026-08-17), which is a different
-# defect that this one hides in the obvious test program.
+# ⛔ CORRECTING THIS NOTE, which first said the method was "not declared". It
+# is: `builtins.mlir`'s set contract has `update` at index 9, declared
+# `Callable[[set, set[$T]], None]`, and `LySet_UpdateM` takes a second
+# `memref<11xi64>` -- another SET. `s.update({2, 3})` works, and so do `|=`,
+# `difference_update` and the rest. What is missing is CPython's "any iterable"
+# argument, which needs either a native that walks a list payload (the element
+# ABI varies, which is why it does not exist) or an emitter desugaring into a
+# loop of `add`. The diagnostic names the receiver, not the argument, which is
+# what made the first reading look right.
 #
 import math
 

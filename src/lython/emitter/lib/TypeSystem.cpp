@@ -2554,6 +2554,60 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
   // interpolation is statically formattable.
   if (node->kind == "JoinedStr" || node->kind == "FormattedValue")
     return contract("builtins.str");
+  // ⭐ A COMPREHENSION HAS A TYPE. This walk had no arm for one, so every
+  // question about a comprehension USED DIRECTLY got `object`, and the sugar
+  // that answers `keys()`/`values()`/`items()` asks exactly that question:
+  //
+  //     print(sorted({x: x * x for x in xs}.items()))
+  //     # runtime manifest has no builtins.dict.items method
+  //
+  // Binding it to a name first worked, and so did the same call on a dict
+  // LITERAL temporary -- the receiver's TYPE is the whole difference. The
+  // emitter builds the value correctly either way; nothing could say what it
+  // was.
+  //
+  // ⛔ Only Name targets, and only when every part infers to something
+  // concrete: a chained comprehension's second `iter` may mention the first
+  // target, which this does not bind, so it falls back to `object` rather
+  // than guessing. That is the answer it gave before.
+  if (node->kind == "ListComp" || node->kind == "SetComp" ||
+      node->kind == "DictComp") {
+    const auto *generators = ast::nodeList(*node, "generators");
+    if (!generators || generators->empty())
+      return object();
+    llvm::StringMap<mlir::Type> bound;
+    if (ctx && ctx->localSymbols)
+      bound = *ctx->localSymbols;
+    for (const parser::NodePtr &generator : *generators) {
+      if (!generator)
+        return object();
+      const parser::Node *target = ast::node(*generator, "target");
+      mlir::Type element = iterationElementType(ast::node(*generator, "iter"));
+      if (!target || target->kind != "Name" || !element ||
+          widenLiteral(element) == object())
+        return object();
+      bound[ast::nameSpelling(*target)] = element;
+    }
+    static const llvm::StringMap<mlir::Type> kNoCallables;
+    ExprInferenceContext inner{ctx ? ctx->localCallables : kNoCallables,
+                               nullptr, &bound, /*strict=*/false};
+    auto part = [&](const parser::Node *child) -> mlir::Type {
+      mlir::Type inferred = widenLiteral(inferExprImpl(child, &inner));
+      return inferred == object() ? mlir::Type() : inferred;
+    };
+    if (node->kind == "DictComp") {
+      mlir::Type key = part(ast::node(*node, "key"));
+      mlir::Type value = part(ast::node(*node, "value"));
+      if (!key || !value)
+        return object();
+      return contract("builtins.dict", {key, value});
+    }
+    mlir::Type element = part(ast::node(*node, "elt"));
+    if (!element)
+      return object();
+    return node->kind == "ListComp" ? listOf(element)
+                                    : contract("builtins.set", {element});
+  }
   // Platform constants type as string literals of the CURRENT TARGET, so
   // `sys.platform == "win32"` branches fold statically (the platform switch
   // idiom runtime lib modules rely on).
