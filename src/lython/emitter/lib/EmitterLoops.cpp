@@ -566,6 +566,66 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
   }
 }
 
+// The index rewrite the note in `emitFor` describes. Returns false when the
+// source is not one this may rewrite, leaving the ordinary path to run.
+bool ModuleEmitter::emitGeneratorIndexedFor(const parser::Node &statement,
+                                            const parser::Node &iterNode) {
+  if (!exprHasContract(&iterNode, "builtins.list") &&
+      !exprHasContract(&iterNode, "builtins.tuple"))
+    return false;
+  const parser::Field *targetField = parser::findField(statement, "target");
+  const parser::Field *iterField = parser::findField(statement, "iter");
+  const auto *body = ast::nodeList(statement, "body");
+  if (!targetField || !iterField || !body ||
+      !std::holds_alternative<parser::NodePtr>(targetField->value) ||
+      !std::holds_alternative<parser::NodePtr>(iterField->value))
+    return false;
+  parser::NodePtr target = std::get<parser::NodePtr>(targetField->value);
+  parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
+  if (!target || !source)
+    return false;
+  const auto *orelse = ast::nodeList(statement, "orelse");
+  parser::SourceRange range = statement.range;
+  unsigned serial = ++listCompCounter;
+  std::string sourceName = "__lygfor" + std::to_string(serial) + "_s";
+  std::string indexName = "__lygfor" + std::to_string(serial) + "_i";
+
+  std::vector<parser::NodePtr> loopBody;
+  loopBody.push_back(synth::assign(
+      target,
+      synth::subscript(synth::name(sourceName, range),
+                       synth::name(indexName, range), range),
+      range));
+  // The increment goes BEFORE the body so a `continue` still advances.
+  loopBody.push_back(synth::assign(
+      synth::name(indexName, range),
+      synth::binOp(synth::name(indexName, range), "Add",
+                   synth::intConstant(1, range), range),
+      range));
+  for (const parser::NodePtr &each : *body)
+    if (each)
+      loopBody.push_back(each);
+
+  std::vector<parser::NodePtr> elseBody;
+  if (orelse)
+    for (const parser::NodePtr &each : *orelse)
+      if (each)
+        elseBody.push_back(each);
+
+  parser::NodePtr loop = synth::whileStmt(
+      synth::compare(synth::name(indexName, range), "Lt",
+                     synth::lenCall(synth::name(sourceName, range), range),
+                     range),
+      std::move(loopBody), std::move(elseBody), range);
+  runWithScratchNames({sourceName, indexName}, [&] {
+    emitStatement(*synth::assign(synth::name(sourceName, range), source, range));
+    emitStatement(*synth::assign(synth::name(indexName, range),
+                                 synth::intConstant(0, range), range));
+    emitStatement(*loop);
+  });
+  return true;
+}
+
 void ModuleEmitter::emitFor(const parser::Node &statement) {
   const auto *orelse = ast::nodeList(statement, "orelse");
   bool hasElse = orelse && !orelse->empty();
@@ -595,6 +655,35 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       iterNode && iterNode->kind == "Call" &&
       tryEmitItertoolsFor(statement, *iterNode))
     return;
+  // ⭐ INSIDE A GENERATOR, A `for` OVER AN INDEXABLE SOURCE BECOMES AN INDEX
+  // LOOP. A for loop keeps its position in a function-local cell, and a cell
+  // cannot survive a suspension -- so the state machine declines the body and
+  // it falls to the non-suspending path, which carries one lane per yield:
+  //
+  //     def each(b: Bag):
+  //         for x in b.xs:
+  //             yield x
+  //     # source generator next lowering currently supports yields whose
+  //     # runtime value is a single lane, and 'builtins.int' has 3
+  //
+  // `for i in range(n): yield i` runs because a range element rides an i64
+  // frame lane. The rewrite here is the one the lazy-iterator VALUE synthesis
+  // already uses for exactly this reason (EmitterIterators.cpp: "Bodies use
+  // index-based while loops on purpose"), applied to the loop the program
+  // wrote: an int index rides a frame lane where an iterator's position
+  // cannot.
+  //
+  // CPython's list iterator is an index too, so a mutation during iteration
+  // observes the same elements it does.
+  //
+  // ⛔ Only list and tuple sources. A str or a range already has a manifest
+  // iterator that survives (`str_iterator`, `range_iterator`), a dict or set
+  // has no index, and rewriting a loop that already works would trade a
+  // working path for an untested one.
+  if (currentGeneratorSendType)
+    if (const parser::Node *iterNode = ast::node(statement, "iter"))
+      if (emitGeneratorIndexedFor(statement, *iterNode))
+        return;
   // A loop over an empty container literal statically runs zero iterations:
   // emit nothing (the body never executes; the target stays unbound, matching
   // CPython's observable behavior). This also covers the reducer desugars

@@ -380,6 +380,10 @@ private:
   // dict method sugar (EmitterIterators.cpp): get(k) / setdefault / popitem
   // / dict.fromkeys compose over existing dict primitives.
   bool isDictTypedExpr(const parser::Node *expr);
+  // Rewrites a generator body's `for` over an indexable source into an
+  // index loop, whose position rides a frame lane (EmitterLoops.cpp).
+  bool emitGeneratorIndexedFor(const parser::Node &statement,
+                               const parser::Node &iterNode);
   bool exprHasContract(const parser::Node *expr, llvm::StringRef contractName);
   std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
                                               const parser::Node *calleeNode);

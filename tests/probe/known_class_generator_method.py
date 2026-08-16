@@ -4,14 +4,20 @@
 #   source generator next lowering currently supports yields whose runtime
 #   value is a single lane, and '!py.contract<"builtins.int">' has 3
 #
-# ⛔ RECLASSIFIED. It used to be "generator function return annotation is
-# incompatible with inferred Generator or AsyncGenerator contract", which was
-# the SIGNATURE being computed before the class contracts existed -- fixed
-# 2026-08-17, and the probe moved one layer down to the real blocker. The yield
-# type is now `int`; what stops it is that an int read out of a LIST is the
-# 3-lane object form, while the generator frame carries a single lane. That is
-# the int-only yield plan recorded on the seven-gap cluster, and
-# `for i in range(n): yield i` works because a range element rides an i64 lane.
+# ⛔ RECLASSIFIED TWICE ON 2026-08-17, and the pair is the useful part. It was
+# "generator function return annotation is incompatible with inferred Generator
+# contract" (the signature computed before the class contracts existed); then
+# the single-lane yield refusal, once the yield type was right; and now the
+# frame:
+#
+#   a generator cannot carry a value of contract 'Bag' across a suspension
+#
+# The `for x in b.xs` loop is rewritten into an index loop now, so the position
+# survives -- `known_module_generator_over_field`, the same program with the
+# generator at module level, RUNS. What is left is the RECEIVER: this one is a
+# method, so `self` is live across the yield, and a source-class instance has
+# no frame lane. That is the last layer and it is a different mechanism from
+# all three above.
 # CPython 3.14 expects: 6
 #
 # ⭐ LOCALIZED 2026-08-15, and it is NOT the method, the class, or the loop.
