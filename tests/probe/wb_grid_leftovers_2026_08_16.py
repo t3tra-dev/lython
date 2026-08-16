@@ -97,6 +97,33 @@
 # Building the union from the slot's class id closes both at once: the second
 # read above, and the cell.
 #
+# ⛔ IT WAS BUILT AND REVERTED, and the measurement is the useful part. A
+# `unionElementFromSlotBox` that reads word 1 of the payload box, compares it
+# against each member's `runtimeClassIdForContract`, selects the tag and
+# selects each member's lanes against a dead value, COMPILES the shapes that
+# were refused -- the second read, the module-global cell, `list[int | None]`
+# -- and gets one of them SILENTLY WRONG:
+#
+#     xs = [1, "a", 2.5, None]
+#     print(xs[0], xs[1], xs[2], xs[3])   # 1 a 2.5 None   (evidence path)
+#     a = xs[0]; b = xs[1]; c = xs[2]; d = xs[3]
+#     print(a, b, c, d)                   # 1 1 0.0 None   <- this path
+#                                         # CPython: 1 a 2.5 None
+#
+# ⭐ AND THE PATTERN NAMES THE BUG. Every union with ONE non-None member came
+# out right (`int | None`, `str | None`), and those are exactly the ones where
+# the tag's DEFAULT is already the answer -- the select chain starts at 0 and
+# member 0 is the only real member. The None member matched (its stored class
+# id is 0, which is what the all-zero handle writes). So what fails is the
+# comparison against a NON-None member's class id: `runtimeClassIdForContract`
+# and the word the payload box actually holds are not the same number for at
+# least str and float. That is one discrepancy to find, not a design problem.
+#
+# ⛔ A repair here must be red-checked against VALUES, not against compiling.
+# The refusal it replaces is loud; the wrong answer it produced is not, and
+# every test in the suite passed while it was in place because no golden reads
+# a heterogeneous container twice.
+#
 # ============================================================
 # (3) `f = lambda v: v * 2` STILL NEEDS AN ANNOTATION.
 # ============================================================
