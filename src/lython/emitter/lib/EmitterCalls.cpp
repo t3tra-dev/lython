@@ -1093,10 +1093,55 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           bool suspendable = method->async ||
                              method->bodySignature.isGeneratorFunction ||
                              method->bodySignature.isAsyncGeneratorFunction;
-          if (suspendable && !method->symbolName.empty())
+          if (suspendable && !method->symbolName.empty()) {
+            // ⭐ A DIRECT CALL TAKES THE SYMBOL, with the receiver as the
+            // leading positional -- the same route a recursive method takes.
+            // The bound object captures the receiver in a CLOSURE, and a
+            // generator's resume clone has no lane for a capture: its argument
+            // lanes are built from the callable's POSITIONALS, so
+            //
+            //     class Bag:
+            //         def each(self):
+            //             for x in self.xs:
+            //                 yield x
+            //     # a generator cannot carry a value of contract 'Bag' across
+            //     # a suspension yet ... and a user class has neither
+            //
+            // -- and an EMPTY class refused too, which is what says the layout
+            // was never the problem. As a positional the receiver rides the
+            // argument lane that already exists for a source class.
+            //
+            // ⛔ Only a direct call with no keywords, and only an instance
+            // method. `m = b.each` still builds the bound object (there is no
+            // call to attach the receiver to), and a keyword would need the
+            // slot placement the recursive path does; both keep the old route,
+            // which is correct wherever the frame does not have to carry the
+            // receiver.
+            const auto *callKeywords = ast::nodeList(expr, "keywords");
+            // The PUBLIC callable: the symbol's own `callable_type` returns
+            // the body result (None for a generator), and the value a call
+            // produces is the generator object.
+            py::CallableType directCallable =
+                mlir::dyn_cast_if_present<py::CallableType>(
+                    method->signature.publicCallable);
+            if (directCallable && method->kind == "instance" &&
+                methodBindingBindsReceiver(*method) &&
+                (!callKeywords || callKeywords->empty()) &&
+                !mlir::isa<py::TypeType>(receiver.type)) {
+              Value callee =
+                  emitBindingRef(*calleeNode, method->symbolName, directCallable);
+              CallOperands operands = emitCallOperands(expr);
+              operands.positional.insert(operands.positional.begin(), receiver);
+              operands.positionalTypes.insert(operands.positionalTypes.begin(),
+                                              receiver.type);
+              operands.positionalUnpacked.insert(
+                  operands.positionalUnpacked.begin(), 0);
+              return emitCallableDispatch(expr, callee, operands);
+            }
             return emitCallableDispatch(
                 expr, emitMethodObject(*calleeNode, receiver, *method),
                 emitCallOperands(expr));
+          }
           return emitInlineMethodCall(expr, receiver, *method);
         }
         if (*methodName == "__str__") {
