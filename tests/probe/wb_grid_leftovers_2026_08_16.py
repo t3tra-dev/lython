@@ -334,15 +334,30 @@
 # more ways found four separate mechanisms behind it. Each is a REFUSAL; none
 # is a wrong answer.
 #
-#   THE SAME KEY TWICE in one function:
+#   TWO LIVE READS OF ONE ELEMENT, one of them a `.get`:
 #     doc = {"id": 1, "name": "x"}
-#     print(doc.get("id")); print(doc.get("id"))
-#     # owned resource from builtin.unrealized_conversion_cast result 0
-#     # reaches function exit without release, transfer, or owned return
-#   Different keys are fine at any count, so it is the second retain of the
-#   SAME object on a second merge edge that has no matching release. Same
-#   family as the borrowed-path credit in verifier/runtime/AffineOwnership.cpp:
-#   a value lent on two edges is returned once.
+#     g = doc.get("id"); v = doc["id"]; print(g, v)
+#     # owned resource from builtin.unrealized_conversion_cast result 0 is
+#     # still owned when a call to 'LyUnicode_FromBytes' may unwind
+#   ⭐ THE GRID NARROWS IT TO ONE SENTENCE, and none of the obvious readings
+#   survive it:
+#     doc.get("id") twice ................ FAILS
+#     doc.get("id") then doc["id"] ....... FAILS
+#     doc["id"] then doc.get("id") ....... works   <- ORDER MATTERS
+#     doc["id"] twice .................... works   <- the `.get` is required
+#     .get("a") and .get("b") ............ works   <- same OBJECT, not same key
+#     .get then an UNUSED doc["id"] ...... works
+#     .get bound, printed, then read ..... works   <- not both LIVE
+#   So it is two live borrows of ONE element where one is a merge-edge lend,
+#   and the lend is returned once. Same family as the borrowed-path credit in
+#   verifier/runtime/AffineOwnership.cpp (`previousGroups`), which credits a
+#   lend returned under a PRE-merge name -- this one is a lend still out when a
+#   second name for the same entity is taken.
+#
+#   ⛔ The order asymmetry is the part a repair has to explain. A retain
+#   inserted for the merge DOMINATES the later read's consume point and is
+#   counted by `aggregateRetainsHeldAt`; inserted after, it is not. Any repair
+#   that only adds a release will pass this program and change the other order.
 #
 #   A FLOAT (or any heap-backed) VALUE, with no union in sight:
 #     doc = {"s": 2.5}
@@ -376,6 +391,37 @@
 #   whose reads misses -- because the evidence tier's miss RAISES into the
 #   read's own block. Here the raise is dead code under `if k in doc`, which is
 #   exactly the `i, j = [1]` shape that rule exists for.
+#
+# ============================================================
+# (9) THE GENERATOR UNPACK BINDING MOVED FOUR REFUSALS ONE LAYER DEEPER.
+# ============================================================
+# `a, b = 0, 1` in a generator body now types its yield (2026-08-16); the four
+# shapes below were failing BEFORE that change and still fail, each with a
+# different message than it had. None became a wrong answer, and the new
+# messages are the useful part -- they name the next mechanism instead of the
+# yield type:
+#
+#   def pairs() -> Iterator[tuple[int, str]]:
+#       for i, s in [(1, "a"), (2, "b")]: yield i, s
+#   was "generator function is annotated Iterator[...] but yields ...";
+#   now "source generator next lowering currently supports only straight-line"
+#   -- the recorded for-in-generator limit, which is what it really needs.
+#
+#   for k, v in sorted(d.items()): yield k    -- same limit, unchanged message.
+#
+#   for a, b in zip(xs, ys): yield b * a
+#   was that limit; now "static type builtins.object is not callable". The
+#   lenient walk cannot infer `zip(...)`, so the tuple distribution has nothing
+#   to distribute. Typing the lazy-iterator builtins in that walk is a
+#   contained follow-up.
+#
+#   (a, b), c = (1, 2), 3      -- NESTED unpack
+#   a, b = xs                  -- unpack from a LIST
+#   were both "runtime bundle for builtins.object has 5 values"; now
+#   "owned resource from @LyTuple_FromLength / @LyList_FromLength result 0
+#   reaches function exit without release". The names are typed; what is left
+#   is the temporary the unpack builds inside a generator frame, which nothing
+#   releases across a suspension.
 #
 import math
 

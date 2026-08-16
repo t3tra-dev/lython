@@ -302,6 +302,75 @@ mlir::Type lenientWalkInfer(const TypeSystem &types, const parser::Node *node,
                                  &analysis.localSymbols, /*strict=*/false});
 }
 
+// ⭐ A GENERATOR'S LOCAL MAY BE BOUND BY AN UNPACK. This walk binds the names
+// a `yield` will read, and it only ever looked at a bare `Name` target -- so
+// the most common generator there is went out with `object` as its yield type:
+//
+//     def fib():
+//         a, b = 0, 1
+//         while True:
+//             yield a
+//             a, b = b, a + b
+//     # static type builtins.object does not provide manifest method '__gt__'
+//
+// `a = 0` followed by `b = 1` worked, which is the whole difference.
+//
+// The RHS is read positionally when it is a literal of the same arity, because
+// that is exact and does not depend on how a heterogeneous tuple happens to be
+// spelled. Otherwise the value's TYPE is distributed: a positional
+// `tuple[A, B]` by position, and a one-argument container (`tuple[T]`,
+// `list[T]`) to every name. A shape this cannot read binds nothing, which is
+// the answer it gave before.
+void bindGeneratorAnalysisTarget(const TypeSystem &types,
+                                 const parser::Node *target,
+                                 mlir::Type valueType,
+                                 const parser::Node *valueNode,
+                                 const llvm::StringMap<mlir::Type> &localCallables,
+                                 GeneratorFunctionAnalysis &analysis) {
+  if (!target)
+    return;
+  if (target->kind == "Name") {
+    analysis.localSymbols[ast::nameSpelling(*target)] =
+        valueType ? valueType : types.object();
+    return;
+  }
+  if (target->kind != "Tuple" && target->kind != "List")
+    return;
+  const auto *elements = ast::nodeList(*target, "elts");
+  if (!elements || elements->empty())
+    return;
+  if (valueNode && (valueNode->kind == "Tuple" || valueNode->kind == "List"))
+    if (const auto *valueElements = ast::nodeList(*valueNode, "elts");
+        valueElements && valueElements->size() == elements->size()) {
+      for (auto [index, element] : llvm::enumerate(*elements)) {
+        const parser::Node *source = (*valueElements)[index].get();
+        mlir::Type elementType = inferExprWithLocalCallables(
+            types, source, localCallables, nullptr, &analysis.localSymbols);
+        bindGeneratorAnalysisTarget(
+            types, element.get(),
+            elementType ? types.widenLiteral(elementType) : mlir::Type(),
+            source, localCallables, analysis);
+      }
+      return;
+    }
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(valueType));
+  if (!contract)
+    return;
+  llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+  if (contract.getContractName() == "builtins.tuple" &&
+      arguments.size() == elements->size()) {
+    for (auto [index, element] : llvm::enumerate(*elements))
+      bindGeneratorAnalysisTarget(types, element.get(), arguments[index],
+                                  nullptr, localCallables, analysis);
+    return;
+  }
+  if (arguments.size() == 1)
+    for (const parser::NodePtr &element : *elements)
+      bindGeneratorAnalysisTarget(types, element.get(), arguments.front(),
+                                  nullptr, localCallables, analysis);
+}
+
 void collectGeneratorFunctionAnalysis(
     const TypeSystem &types, const parser::Node *node,
     const llvm::StringMap<mlir::Type> &localCallables,
@@ -379,13 +448,10 @@ void collectGeneratorFunctionAnalysis(
     }
     if (!valueType)
       valueType = lenientWalkInfer(types, value, analysis);
-    if (const auto *targets = ast::nodeList(*node, "targets")) {
-      for (const parser::NodePtr &target : *targets) {
-        if (target && target->kind == "Name")
-          analysis.localSymbols[ast::nameSpelling(*target)] =
-              valueType ? valueType : types.object();
-      }
-    }
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        bindGeneratorAnalysisTarget(types, target.get(), valueType, value,
+                                    localCallables, analysis);
     return;
   }
   if (node->kind == "AnnAssign") {
@@ -421,7 +487,7 @@ void collectGeneratorFunctionAnalysis(
     // child walk reaches the body, so yields over the target infer correctly.
     const parser::Node *target = ast::node(*node, "target");
     const parser::Node *iter = ast::node(*node, "iter");
-    if (target && target->kind == "Name" && iter) {
+    if (target && iter) {
       mlir::Type iterableType =
           inferExprWithLocalCallables(types, iter, localCallables,
                                       &analysis.failureReasons,
@@ -435,8 +501,8 @@ void collectGeneratorFunctionAnalysis(
                           : CallInferenceResult{};
         if (nextInference) {
           mlir::Type element = types.widenLiteral(nextInference.resultType);
-          analysis.localSymbols[ast::nameSpelling(*target)] =
-              element ? element : types.object();
+          bindGeneratorAnalysisTarget(types, target, element, nullptr,
+                                      localCallables, analysis);
         }
       }
     }
