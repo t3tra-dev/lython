@@ -384,6 +384,12 @@ private:
   // index loop, whose position rides a frame lane (EmitterLoops.cpp).
   bool emitGeneratorIndexedFor(const parser::Node &statement,
                                const parser::Node &iterNode);
+  // `__len__` + `__getitem__` with no `__iter__` is CPython's fallback
+  // iteration protocol, which is the same index loop (EmitterLoops.cpp).
+  bool emitSequenceProtocolFor(const parser::Node &statement,
+                               const parser::Node &iterNode);
+  bool emitIndexedFor(const parser::Node &statement,
+                      const parser::Node &iterNode);
   bool exprHasContract(const parser::Node *expr, llvm::StringRef contractName);
   std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
                                               const parser::Node *calleeNode);

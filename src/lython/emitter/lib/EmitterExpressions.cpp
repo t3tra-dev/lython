@@ -1981,14 +1981,29 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
       mlir::Type iterableType = types.inferExpr(entry.iter.get());
       CallInferenceResult iterInference =
           types.inferMethodCallWithEvidence(iterableType, "__iter__", {});
-      if (!requireStaticEvidence(expr, iterInference))
-        return emitNone(expr);
-      CallInferenceResult nextInference = types.inferMethodCallWithEvidence(
-          iterInference.resultType, "__next__", {});
-      if (!requireStaticEvidence(expr, nextInference))
-        return emitNone(expr);
-      mlir::Type iterationElement =
-          types.widenLiteral(nextInference.resultType);
+      // ⭐ THE SEQUENCE PROTOCOL, the same fallback the for statement takes:
+      // `__len__` + `__getitem__` with no `__iter__` is iterable, and the
+      // element is what the subscript answers. `types.iterationElementType`
+      // knows this rule; this walk asks the two questions itself because it
+      // needs the iterator type as well, so it needs the fallback too.
+      mlir::Type iterationElement;
+      if (!iterInference) {
+        if (types.inferMethodCallWithEvidence(types.widenLiteral(iterableType),
+                                              "__len__", {}))
+          if (CallInferenceResult indexed = types.inferMethodCallWithEvidence(
+                  types.widenLiteral(iterableType), "__getitem__",
+                  {types.intType()}))
+            iterationElement = types.widenLiteral(indexed.resultType);
+      }
+      if (!iterationElement) {
+        if (!requireStaticEvidence(expr, iterInference))
+          return emitNone(expr);
+        CallInferenceResult nextInference = types.inferMethodCallWithEvidence(
+            iterInference.resultType, "__next__", {});
+        if (!requireStaticEvidence(expr, nextInference))
+          return emitNone(expr);
+        iterationElement = types.widenLiteral(nextInference.resultType);
+      }
       if (!entry.tupleTarget) {
         types.bindLocalSymbol(entry.targetNames.front(), iterationElement);
       } else {

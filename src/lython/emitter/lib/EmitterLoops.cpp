@@ -573,6 +573,44 @@ bool ModuleEmitter::emitGeneratorIndexedFor(const parser::Node &statement,
   if (!exprHasContract(&iterNode, "builtins.list") &&
       !exprHasContract(&iterNode, "builtins.tuple"))
     return false;
+  return emitIndexedFor(statement, iterNode);
+}
+
+// ⭐ THE SEQUENCE PROTOCOL. A class with `__len__` and `__getitem__` and no
+// `__iter__` is iterable in Python -- CPython's `iter()` falls back to indexing
+// from 0 -- and this walk asked for `__iter__` and refused:
+//
+//     class Seq:
+//         def __len__(self) -> int: ...
+//         def __getitem__(self, i: int) -> int: ...
+//     for v in Seq([1, 2, 3]):
+//     # static type !py.contract<"Seq"> does not provide manifest method
+//     # '__iter__'
+//
+// while `s[0]` and `len(s)` both worked. The fallback IS the index loop this
+// file already builds for a generator's list iteration, so it is the same
+// rewrite with a different reason to reach it.
+//
+// ⛔ Only when the class has no `__iter__` of its own: one that does is
+// iterated through it, which is where a stateful iterator's own position
+// lives. CPython's fallback has the same precedence.
+bool ModuleEmitter::emitSequenceProtocolFor(const parser::Node &statement,
+                                            const parser::Node &iterNode) {
+  mlir::Type sourceType = types.widenLiteral(types.inferExpr(&iterNode));
+  if (!mlir::isa_and_nonnull<py::ContractType>(sourceType))
+    return false;
+  if (lookupClassMethod(sourceType, "__iter__"))
+    return false;
+  if (!lookupClassMethod(sourceType, "__len__") ||
+      !lookupClassMethod(sourceType, "__getitem__"))
+    return false;
+  return emitIndexedFor(statement, iterNode);
+}
+
+// The rewrite both callers share: bind the source to a scratch name, walk an
+// int index, and subscript per iteration.
+bool ModuleEmitter::emitIndexedFor(const parser::Node &statement,
+                                   const parser::Node &iterNode) {
   const parser::Field *targetField = parser::findField(statement, "target");
   const parser::Field *iterField = parser::findField(statement, "iter");
   const auto *body = ast::nodeList(statement, "body");
@@ -684,6 +722,9 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     if (const parser::Node *iterNode = ast::node(statement, "iter"))
       if (emitGeneratorIndexedFor(statement, *iterNode))
         return;
+  if (const parser::Node *iterNode = ast::node(statement, "iter"))
+    if (emitSequenceProtocolFor(statement, *iterNode))
+      return;
   // A loop over an empty container literal statically runs zero iterations:
   // emit nothing (the body never executes; the target stays unbound, matching
   // CPython's observable behavior). This also covers the reducer desugars

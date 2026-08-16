@@ -2984,7 +2984,40 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
         "instantiate that instead"});
     return emitNone(expr);
   }
-  CallOperands operands = emitCallOperands(expr);
+  // ⭐ A CONSTRUCTOR ARGUMENT IS EMITTED AGAINST THE PARAMETER IT FILLS, the
+  // same way a free function's is. Without the expectation an empty literal
+  // came out `list[object]` and the declared-parameter check refused the call
+  // it was written for:
+  //
+  //     class C:
+  //         def __init__(self, xs: list[int]) -> None: ...
+  //     C([])
+  //     # argument 'xs' of '__init__' is declared list[int] and this call
+  //     # gives it list[object]
+  //
+  // `def f(xs: list[int])` called as `f([])` was always fine, because
+  // `emitCallOperands` distributes the callee's positional types there. The
+  // constructor asked for the operands with no contract at all.
+  //
+  // `self` is dropped from the front: the call site writes the arguments after
+  // it.
+  py::CallableType initExpectation;
+  if (std::optional<MethodBinding> declaredInit =
+          lookupClassMethod(instanceType, "__init__"))
+    if (auto declared = mlir::dyn_cast_if_present<py::CallableType>(
+            declaredInit->bodySignature.callable
+                ? declaredInit->bodySignature.callable
+                : declaredInit->signature.callable)) {
+      llvm::ArrayRef<mlir::Type> declaredPositional =
+          declared.getPositionalTypes();
+      if (!declaredPositional.empty() &&
+          methodBindingBindsReceiver(*declaredInit))
+        initExpectation = py::CallableType::get(
+            &context, declaredPositional.drop_front(), declared.getKwOnlyTypes(),
+            {}, {}, declared.getResultTypes());
+    }
+  CallOperands operands = emitCallOperands(expr, {}, /*includeAstArguments=*/true,
+                                           initExpectation);
   if (!operands.valid) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start, operands.failureReason});
