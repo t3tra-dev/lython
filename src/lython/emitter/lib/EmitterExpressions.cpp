@@ -1202,6 +1202,123 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   // Folded at the comparison instead of guarding inside the body: both classes
   // are known here, which is the whole question, and CPython's answer for a
   // class mismatch is a constant.
+  // ⭐ `==` ACROSS TWO FAMILIES IS A CONSTANT, not a call that does not exist.
+  // CPython answers it with the NotImplemented rule -- neither side's __eq__
+  // accepts the other, so the comparison falls back to identity and is False --
+  // and Lython went looking for a runtime method with the other side's shape:
+  //
+  //     print("a" == 1)
+  //     # cannot adapt builtins.int to runtime input 2 of builtins.str.__eq__
+  //
+  // The manifest is RIGHT to have only `str.__eq__(str, str)`; there is no
+  // runtime question here. Both types are known at this point, which is the
+  // whole question, exactly as for the dataclass fold below.
+  //
+  // ⛔ Only families whose cross-family answer is unconditionally False. NOT
+  // container kinds: `{1} == frozenset({1})` is True, and a set and a
+  // frozenset are as different as a str and an int look from here. NOT source
+  // classes: a hand-written __eq__ answers whatever it likes, which is the
+  // measurement recorded on the dataclass fold below.
+  if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
+    auto valueFamily = [&](mlir::Type type) -> llvm::StringRef {
+      // None is a family of one. `x == None` for a concrete x is False, and
+      // under a union's tag it is the arm the other members leave: without it
+      // the int arm of `int | None` went looking for `int.__eq__(NoneType)`.
+      if (isNoneTypeLike(type))
+        return "none";
+      auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(type));
+      if (!contract)
+        return {};
+      llvm::StringRef name = contract.getContractName();
+      if (name == "builtins.bool" || name == "builtins.int" ||
+          name == "builtins.float" || name == "builtins.complex")
+        return "number";
+      if (name == "builtins.str")
+        return "text";
+      if (name == "builtins.bytes" || name == "builtins.bytearray")
+        return "binary";
+      return {};
+    };
+    llvm::StringRef lhsFamily = valueFamily(lhs.type);
+    llvm::StringRef rhsFamily = valueFamily(rhs.type);
+    // Two Nones are the one WITHIN-family pair that is also a constant: the
+    // type has a single inhabitant, so identity settles it. Without this the
+    // pair reached `types.NoneType.__eq__`, "declared by the standard-library
+    // contract but has no implementation in Lython".
+    bool bothNone = lhsFamily == "none" && rhsFamily == "none";
+    if (!lhsFamily.empty() && !rhsFamily.empty() &&
+        (lhsFamily != rhsFamily || bothNone)) {
+      bool equal = bothNone;
+      mlir::Value bit = mlir::arith::ConstantIntOp::create(
+                            builder, loc(expr),
+                            ast::isOperator(op, "NotEq") ? !equal : equal, 1)
+                            .getResult();
+      auto pyBool = py::CastFromPrimOp::create(builder, loc(expr),
+                                               types.boolType(), bit);
+      return Value{pyBool.getResult(), types.boolType()};
+    }
+  }
+
+  // ⭐ AND A UNION COMPARES PER MEMBER, decided by the tag. `emitOptionalCompare`
+  // above answers the two-way shape (None plus exactly one member) and declines
+  // everything else, so `rec["age"] == 30` on a `str | int` record went to the
+  // manifest -- "static type !py.union<int, str> does not provide manifest
+  // method '__eq__'". Under the tag each member is concrete, and the arms whose
+  // member is a different family from the other operand fold to the constant
+  // above rather than needing a runtime method that does not exist.
+  if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
+    auto lhsUnion = mlir::dyn_cast_if_present<py::UnionType>(lhs.type);
+    auto rhsUnion = mlir::dyn_cast_if_present<py::UnionType>(rhs.type);
+    // One side at a time: the recursion below hands the other union straight
+    // back to this arm with a concrete operand on the near side.
+    if (lhsUnion || rhsUnion) {
+      bool onLeft = static_cast<bool>(lhsUnion);
+      py::UnionType unionType = onLeft ? lhsUnion : rhsUnion;
+      llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+      mlir::Type resultType = types.boolType();
+      Value subject = onLeft ? lhs : rhs;
+      auto compareMember = [&](mlir::Type member) -> mlir::Value {
+        // None has no header to unwrap; against a concrete operand it is
+        // unequal, and against another None `emitOptionalCompare` has already
+        // answered.
+        Value projected;
+        if (isNoneTypeLike(member)) {
+          projected = Value{mlir::Value{}, member};
+        } else {
+          auto unwrap = py::UnionUnwrapOp::create(builder, loc(expr), member,
+                                                  subject.value);
+          projected = Value{unwrap.getResult(), member};
+        }
+        if (!projected.value) {
+          bool unequal = !isNoneTypeLike(onLeft ? rhs.type : lhs.type);
+          bool bit = ast::isOperator(op, "NotEq") ? unequal : !unequal;
+          mlir::Value constant =
+              mlir::arith::ConstantIntOp::create(builder, loc(expr), bit, 1)
+                  .getResult();
+          return py::CastFromPrimOp::create(builder, loc(expr), resultType,
+                                            constant)
+              .getResult();
+        }
+        Value compared = onLeft ? emitScalarCompare(expr, projected, rhs, op)
+                                : emitScalarCompare(expr, lhs, projected, op);
+        return coerceValue(compared, resultType, expr).value;
+      };
+      auto dispatch = [&](unsigned index, auto &&recurse) -> mlir::Value {
+        if (index + 1 >= members.size())
+          return compareMember(members[index]);
+        auto test = py::UnionTestOp::create(
+            builder, loc(expr), builder.getI1Type(), subject.value,
+            mlir::TypeAttr::get(members[index]));
+        return emitValueDiamond(
+            loc(expr), test.getResult(), resultType,
+            [&] { return compareMember(members[index]); },
+            [&] { return recurse(index + 1, recurse); });
+      };
+      return Value{dispatch(0, dispatch), resultType};
+    }
+  }
+
   if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
     auto lhsContract =
         mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(lhs.type));

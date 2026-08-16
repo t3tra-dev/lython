@@ -298,6 +298,34 @@
 #     argument-position expectation back to the binding, which is a third
 #     mechanism.
 
+# ============================================================
+# (6) `{1} == frozenset({1})` IS REFUSED, and it is True in CPython.
+# ============================================================
+#     cannot adapt builtins.frozenset to runtime input 1 of builtins.set.__eq__
+#
+# Found while folding cross-family `==` (2026-08-16) and deliberately NOT
+# folded with it: a set and a frozenset look exactly as different from the
+# fold's vantage as a str and an int, and their answer is the opposite one.
+# CPython compares them by CONTENTS because both are set objects, so this needs
+# `set.__eq__` to accept a frozenset receiver -- a manifest variant, not an
+# emitter rule. `[1] == (1,)` is the other direction (False, and a list and a
+# tuple really are unequal), so container kinds cannot take one blanket answer
+# either way.
+#
+# ============================================================
+# (7) ITERATION over a heterogeneous container is refused.
+# ============================================================
+#     for x in [1, "a"]:
+#     # iteration over a runtime-mode list of '!py.union<int, str>' requires
+#     # rank-1 memref physical values, got 'i64'
+#
+# A union's lane 0 is the i64 TAG, so the iterator's physical-value check
+# rejects it. Reading the same elements by index now works, which makes this
+# the remaining half of the same shape -- and the same runtime class-id switch
+# section (5) describes is what a mutated container's read needs. Iteration
+# would additionally need the loop variable to carry the union's lanes across
+# the back edge.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible
@@ -311,6 +339,9 @@ mixed = [1, "a", True]
 print(mixed[0])
 print(mixed[1])
 print(mixed[2])
+print(mixed[0] == 1, mixed[1] == 1, mixed[2] == True)
+if mixed[0]:
+    print("truthy")
 a, b = 0, 1
 i = 0
 while i < 10:
