@@ -43,10 +43,27 @@
 #
 # `generatorLaneParts` already answers for a source class (a `py.class` in the
 # module plus an all-rank-1 layout), so the lane exists -- nothing computes one
-# for a capture. The change is to build `argumentLanes` over the same list the
-# clone is built from. It touches the suspension ABI's parameter accounting,
-# so its acceptance test is the leak gate plus values over the generator
-# shapes, not a compile.
+# for a capture.
+#
+# ⛔ BUILDING THE LANE IS NOT ENOUGH, measured 2026-08-17 and reverted. Adding
+# the capture to `argumentLanes` (the same loop, over
+# `callableClosureTypes(body)`) makes the state machine ACCEPT the bound form:
+#
+#     [dbg] fn=...$bound$... pos=0 clos=1 argEligible=1 lanes=1
+#     [dbg] livesEligible=1
+#
+# and the identical message then comes from the resume CLONE instead:
+#
+#     [dbg] clone=...$bound$..._gen_resume inputIndex=4 ctrl=3
+#           frameLanes=1 argLanes=1
+#
+# That walk (ABI/CallableABI.cpp) finds a frame lane with
+# `inputIndex - generatorControlCount < frameLanes.size()`, which for input 4
+# with a control count of 3 asks for frame lane 1 of 1 and misses. It never
+# consults `argumentLanes` at all. So the accounting between the three groups
+# -- control, argument, frame -- is what has to be settled first, and guessing
+# at it is not something to do in the suspension ABI. The lane change was
+# reverted whole: it moves the refusal without changing what any program does.
 # CPython 3.14 expects: 6
 #
 # ⭐ LOCALIZED 2026-08-15, and it is NOT the method, the class, or the loop.
