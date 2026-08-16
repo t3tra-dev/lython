@@ -516,6 +516,52 @@
 # and mapping it to a name at run time, which is a runtime table this tree does
 # not expose. Left unbound deliberately, with this note as the reason.
 #
+# ============================================================
+# (14) `isinstance(o, C)` ON AN `object` PARAMETER: the test works, the
+#      NARROWED VALUE does not.
+# ============================================================
+#     def __eq__(self, o: object) -> bool:
+#         if isinstance(o, Money): return self.cents == o.cents
+#         return False
+#     # isinstance on an object-typed value requires dynamic object
+#     # inspection, which is excluded from the static evidence kernel
+#
+# That is the shape typeshed declares for `__eq__` and every hand-written
+# comparison copies, so a class cannot implement equality the way Python is
+# written. The refusal reads as policy and is guarding something narrower.
+#
+# ⛔ IT WAS BUILT AND REVERTED, and the measurement is the point. `py.class.test`
+# is a CLASS-ID comparison -- the one a base-typed receiver tested for a
+# subclass already uses -- and an erased `object` is header-fronted for the
+# reason `object.__str__` can dispatch on it. Letting an object top reach that
+# arm (gated on a source-class target, since a manifest contract has no
+# `py.class` schema) makes the TEST right everywhere:
+#
+#     class C:
+#         def __init__(self, a: int) -> None: self.a = a
+#         def peek(self, o: object) -> int:
+#             if isinstance(o, C): return o.a
+#             return -1
+#     print(C(1).peek(C(7)))          # 7   CORRECT
+#
+#     def f(o: object) -> int:
+#         if isinstance(o, C): return o.a
+#         return -1
+#     print(f(C(1)))                  # 40622248832   <- a POINTER
+#
+# ⭐ METHOD vs FREE FUNCTION is the whole difference, and both were measured on
+# the same class. Inside a method the receiver's class is in hand and the
+# narrowed value gets the layout; in a free function the erased object has none
+# to recover, and the field read walks the wrong words. A silent wrong answer,
+# so the change was reverted whole.
+#
+# What it needs: the narrowing must RE-MATERIALIZE the value from the erased
+# payload (the unbox the diagnostic calls "dynamic object inspection"), not
+# merely re-type it. The class test itself is ready.
+#
+# ⛔ And a BUILTIN target is a second, smaller gap even then: `isinstance(o,
+# int)` has no `py.class` schema to match against, so it would still refuse.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible
