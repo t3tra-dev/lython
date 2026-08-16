@@ -132,12 +132,35 @@
 # come from the comparison succeeding. The str and float matches do not: their
 # lanes come back as the dead value, which is what an empty str and a 0.0 are.
 #
-# So the compiler's side is right and the discrepancy is in WHAT THE BOX HOLDS
-# at word 1 for a str and a float element -- `objectPayloadHandleWords` copies
-# it from the payload's own header word 1, and `__ly_unicode_alloc` stores 4
-# there while `LyUnicode_FromBytes` declares `ly.runtime.class_id = 4`. Two
-# places that agree on paper and a third that does not agree at run time.
-# START BY MAKING THE PROGRAM PRINT THAT WORD.
+# ⭐ THE THIRD ATTEMPT PRINTED THAT WORD, by boxing it through
+# `LyLong_FromI64` and letting the union's int arm print it. It is 4 for a str
+# element and 1 for an int element -- the class ids DO agree at run time, so
+# the tag comparison was never the problem either.
+#
+# ⭐ AND A SECOND PROBE ISOLATED THE HALVES: with the tag FORCED to the str
+# member and its lanes read from the box words, the read still printed empty.
+# So the LANES are what come back wrong, not the tag.
+#
+# ⛔ WHICH LEAVES ONE PLACE, because everything around it is now eliminated by
+# measurement rather than by argument:
+#
+#   the class ids agree (4 and 1, printed at run time);
+#   the slot base is `index * 16` and the class word is `slot + 1` (read off
+#     the emitted IR);
+#   the lane offsets are `kPointerWordBase + lane` / `kSizeWordBase + lane`,
+#     the SAME arithmetic the working homogeneous path uses -- and a
+#     homogeneous `["a", "b"]` read through that path after demotion prints
+#     `b` correctly;
+#   `slotStorageShapesFor` and `unboxSlotElementValues` are identity here --
+#     only `builtins.bool` has a `box`/`unbox` primitive, so str, int and
+#     float take neither.
+#
+# What is left is the BINDING: the non-union path hands
+# `bindRetainedEvidenceValue` an element whose contract is `builtins.str`,
+# and this one hands it a UNION. `retainEvidenceElement` and
+# `evidenceElementAnchor` are written for a single object -- a union's active
+# member is chosen by a tag, and its "defining ops" are a constant and a chain
+# of selects. START THERE.
 #
 # ⛔ A repair here must be red-checked against VALUES, not against compiling.
 # The refusal it replaces is loud; the wrong answer it produced is not, and
