@@ -2578,15 +2578,47 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     llvm::StringMap<mlir::Type> bound;
     if (ctx && ctx->localSymbols)
       bound = *ctx->localSymbols;
+    // A TUPLE target is the `for i, n in rows` shape, which is most of the
+    // comprehensions written over a list of pairs. Distributed the same way
+    // the generator walk distributes one: positionally from a positional
+    // tuple, uniformly from a one-argument container.
+    auto bindTarget = [&](const parser::Node *target, mlir::Type element,
+                          auto &&recurse) -> bool {
+      if (!target || !element || widenLiteral(element) == object())
+        return false;
+      if (target->kind == "Name") {
+        bound[ast::nameSpelling(*target)] = element;
+        return true;
+      }
+      if (target->kind != "Tuple" && target->kind != "List")
+        return false;
+      const auto *elements = ast::nodeList(*target, "elts");
+      if (!elements || elements->empty())
+        return false;
+      auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(widenLiteral(element));
+      if (!contract)
+        return false;
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.size() == elements->size()) {
+        for (auto [index, part] : llvm::enumerate(*elements))
+          if (!recurse(part.get(), arguments[index], recurse))
+            return false;
+        return true;
+      }
+      if (arguments.size() != 1)
+        return false;
+      for (const parser::NodePtr &part : *elements)
+        if (!recurse(part.get(), arguments.front(), recurse))
+          return false;
+      return true;
+    };
     for (const parser::NodePtr &generator : *generators) {
       if (!generator)
         return object();
-      const parser::Node *target = ast::node(*generator, "target");
       mlir::Type element = iterationElementType(ast::node(*generator, "iter"));
-      if (!target || target->kind != "Name" || !element ||
-          widenLiteral(element) == object())
+      if (!bindTarget(ast::node(*generator, "target"), element, bindTarget))
         return object();
-      bound[ast::nameSpelling(*target)] = element;
     }
     static const llvm::StringMap<mlir::Type> kNoCallables;
     ExprInferenceContext inner{ctx ? ctx->localCallables : kNoCallables,

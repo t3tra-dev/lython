@@ -17,10 +17,15 @@
 # print differently sorted. A comprehension inferred at the wrong element type
 # compiles and reorders the output.
 #
-# ⛔ Only Name targets, and only when every part infers to something concrete.
-# A chained comprehension's second `iter` may mention the first target, which
-# the arm does not bind, so it falls back to `object` -- the answer it gave
-# before -- rather than guessing.
+# A TUPLE target -- `for i, n in rows` -- is distributed the way the generator
+# walk distributes one: positionally from a positional tuple, uniformly from a
+# one-argument container. That is most of the comprehensions written over a
+# list of pairs.
+#
+# ⛔ Every part must infer to something concrete. A chained comprehension's
+# second `iter` may mention the first target, which the arm does not bind, so
+# it falls back to `object` -- the answer it gave before -- rather than
+# guessing.
 #
 # Every expected line is python3.14's.
 
@@ -41,6 +46,17 @@ print(sorted({x % 2 for x in xs}))
 print([x for x in xs].count(2))
 print(max([len(w) for w in words]))
 print(sorted([w.upper() for w in words]))
+
+# --- a TUPLE target, over a list of pairs ---------------------------------
+rows = [(1, "a"), (2, "b"), (3, "c")]
+print(sorted([i for i, _ in rows], reverse=True))
+print(sorted([n for _, n in rows]))
+print(sorted({i: n for i, n in rows}.items()))
+print(sorted({n: i for i, n in rows}.keys()))
+pairs = {"a": 1, "b": 2}
+print(sorted([k for k, v in pairs.items() if v > 1]))
+print(sorted({v: k for k, v in pairs.items()}.items()))
+
 
 # --- nested, where the inner one is the VALUE ------------------------------
 ys = ["a", "b"]
