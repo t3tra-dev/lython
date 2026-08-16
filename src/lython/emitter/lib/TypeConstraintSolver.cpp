@@ -630,6 +630,36 @@ mlir::Type substituteType(const TypeSystem &types, mlir::Type type,
         if (auto callable = mlir::dyn_cast<py::CallableType>(node))
           return mlir::Type(
               substituteCallable(types, callable, bindings, eraseUnbound));
+        // ⭐ A UNIFORM TUPLE HAS ONE SPELLING, and substitution was minting the
+        // other one. `tupleOfMembers` collapses `(1, 2)` to the arity-erased
+        // `tuple[int]` and keeps `(1, "a")` positional, so `sorted([(1, 2)])`
+        // works -- but `dict.items()`'s contract is `list[tuple[$K, $V]]`, and
+        // binding K = V = int rebuilt it positionally as `tuple[int, int]`. The
+        // manifest lookup has the homogeneous spelling only:
+        //
+        //     d = {1: 2}
+        //     print(sorted(d.items()))
+        //     # static type list[tuple[int, int]] does not provide manifest
+        //     # method 'append'
+        //
+        // `{"a": 1}.items()` was fine, because its members differ and the
+        // positional spelling IS the right one there. Collapsing here rather
+        // than at the lookup keeps the two producers agreeing, which is the
+        // property that made the literal path work in the first place.
+        if (auto contract = mlir::dyn_cast<py::ContractType>(node);
+            contract && contract.getContractName() == "builtins.tuple" &&
+            contract.getArguments().size() > 1) {
+          llvm::SmallVector<mlir::Type, 4> arguments;
+          arguments.reserve(contract.getArguments().size());
+          for (mlir::Type argument : contract.getArguments())
+            arguments.push_back(
+                substituteType(types, argument, bindings, eraseUnbound));
+          if (llvm::all_of(arguments, [&](mlir::Type argument) {
+                return argument == arguments.front();
+              }))
+            return types.tupleOf(arguments.front());
+          return types.contract("builtins.tuple", arguments);
+        }
         return std::nullopt;
       });
 }

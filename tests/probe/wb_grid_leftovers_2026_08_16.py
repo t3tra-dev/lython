@@ -483,6 +483,21 @@
 # still returns a str -- the None never crosses the boundary. What was missing
 # was this.
 #
+# ============================================================
+# (12) `.items()` ON A COMPREHENSION RESULT, USED DIRECTLY.
+# ============================================================
+#     xs = [1, 2]
+#     print(sorted({x: x * x for x in xs}.items()))
+#     # runtime manifest has no builtins.dict.items method
+#
+# Binding the comprehension to a name first works, and so does the same call on
+# a dict LITERAL temporary (`sorted({1: 2}.items())`), so it is not the
+# temporary and it is not `items` -- it is the comprehension's result arriving
+# without the mapping evidence the method needs. `len()` of the same
+# comprehension is fine, which says the handle is there and the DESCRIPTION is
+# not. Found while pinning the uniform-tuple collapse (2026-08-17) and
+# unchanged by it.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible
