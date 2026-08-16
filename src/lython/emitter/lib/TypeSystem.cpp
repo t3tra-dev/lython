@@ -245,6 +245,49 @@ std::optional<mlir::Type> generatorYieldFromElementType(
   return std::nullopt;
 }
 
+
+// ⭐ An EMPTY container literal contributes NOTHING to a sibling join. It has
+// no element type of its own, so it types as `list[object]`, and joining that
+// with a sibling's `list[int]` gives `list[int] | list[object]` -- a union of
+// two list types that nothing accepts:
+//
+//     g = {0: [1, 2], 1: []}
+//     len(g[0])
+//     # '!py.union<list[int], list[object]>' does not provide '__len__'
+//
+// which is every adjacency map, bucket table and grouping with an empty entry
+// in its literal. The sibling IS the element type here, the same way an
+// annotation is when there is one; an empty literal beside a typed one is not
+// evidence of heterogeneity, it is an absence of evidence.
+//
+// ⛔ Only when a non-empty sibling exists. `[[], []]` and `{0: []}` have
+// nothing to take a type from and keep the erased element they always had.
+bool isEmptyContainerLiteral(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "List" || node->kind == "Tuple" || node->kind == "Set") {
+    const auto *elements = ast::nodeList(*node, "elts");
+    return !elements || elements->empty();
+  }
+  if (node->kind == "Dict") {
+    const auto *keys = ast::nodeList(*node, "keys");
+    return !keys || keys->empty();
+  }
+  return false;
+}
+
+// The join over `types`, with the entries whose node is an empty container
+// literal dropped when anything else contributed.
+mlir::Type joinIgnoringEmptyLiterals(
+    const TypeSystem &types, llvm::ArrayRef<mlir::Type> collected,
+    llvm::ArrayRef<const parser::Node *> nodes) {
+  llvm::SmallVector<mlir::Type, 8> kept;
+  for (auto [index, type] : llvm::enumerate(collected))
+    if (index >= nodes.size() || !isEmptyContainerLiteral(nodes[index]))
+      kept.push_back(type);
+  return types.join(kept.empty() ? collected : kept);
+}
+
 const llvm::StringMap<mlir::Type> &noLocalCallables() {
   static const llvm::StringMap<mlir::Type> empty;
   return empty;
@@ -2493,6 +2536,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
   }
   if (node->kind == "List" || node->kind == "Tuple") {
     llvm::SmallVector<mlir::Type, 8> elementTypes;
+    llvm::SmallVector<const parser::Node *, 8> elementNodes;
     if (const auto *elements = ast::nodeList(*node, "elts")) {
       elementTypes.reserve(elements->size());
       for (const parser::NodePtr &element : *elements) {
@@ -2500,10 +2544,12 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (strict && !elementType)
           return {};
         elementTypes.push_back(widenLiteral(elementType));
+        elementNodes.push_back(element.get());
       }
     }
     if (node->kind == "List")
-      return listOf(join(elementTypes));
+      return listOf(joinIgnoringEmptyLiterals(*this, elementTypes,
+                                              elementNodes));
     // Both paths type heterogeneous tuples positionally: the joined
     // (homogeneous-union) view made `yield (i, "x")` infer as
     // tuple[int | str], whose literal-index __getitem__ result is a union
@@ -2531,6 +2577,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       return dictOf(object(), object());
     llvm::SmallVector<mlir::Type, 8> keyTypes;
     llvm::SmallVector<mlir::Type, 8> valueTypes;
+    llvm::SmallVector<const parser::Node *, 8> valueNodes;
     keyTypes.reserve(keys->size());
     valueTypes.reserve(values->size());
     for (auto [index, key] : llvm::enumerate(*keys)) {
@@ -2545,9 +2592,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (strict && !valueType)
           return {};
         valueTypes.push_back(widenLiteral(valueType));
+        valueNodes.push_back((*values)[index].get());
       }
     }
-    return dictOf(join(keyTypes), join(valueTypes));
+    return dictOf(join(keyTypes),
+                  joinIgnoringEmptyLiterals(*this, valueTypes, valueNodes));
   }
   if (node->kind == "Subscript") {
     if (std::optional<PrimitiveTypeSpec> primitive =

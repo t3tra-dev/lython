@@ -2260,6 +2260,46 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
   return emitExpr(expr);
 }
 
+// ⭐ An EMPTY container literal inside another literal takes its element type
+// from its SIBLINGS. `inferExpr` already ignores it when joining them (see
+// `joinIgnoringEmptyLiterals`), so the literal's own inferred type is the
+// answer -- but the element still had to be EMITTED at it, or the recorded
+// evidence stays `list[object]` while the container says `list[int]`:
+//
+//     buckets = {"a": [1], "b": []}
+//     buckets["b"].append(2)
+//     # dict __getitem__ evidence contract 'list[object]' is not assignable
+//     # to result 'list[int]'
+//
+// ⛔ Only for an element that IS an empty container literal, and only when no
+// expectation reached it. Handing every element the literal's joined type
+// would retype the ones that decided it -- `[1, 2.5]` would emit its `1` as a
+// float -- which is a different change and a wrong one.
+mlir::Type ModuleEmitter::siblingExpectationFor(const parser::Node &literal,
+                                                const parser::Node *element,
+                                                bool forKey) {
+  if (!element)
+    return {};
+  bool elementIsEmptyLiteral =
+      (element->kind == "List" || element->kind == "Tuple" ||
+       element->kind == "Set" || element->kind == "Dict") &&
+      [&] {
+        const auto *elts = ast::nodeList(*element, "elts");
+        const auto *keys = ast::nodeList(*element, "keys");
+        return (!elts || elts->empty()) && (!keys || keys->empty());
+      }();
+  if (!elementIsEmptyLiteral)
+    return {};
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.inferExpr(&literal));
+  if (!contract)
+    return {};
+  llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+  if (literal.kind == "Dict")
+    return arguments.size() == 2 ? arguments[forKey ? 0 : 1] : mlir::Type();
+  return arguments.size() == 1 ? arguments.front() : mlir::Type();
+}
+
 Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
                                           mlir::Type expected) {
   // The expectation only distributes when its container class matches the
@@ -2296,6 +2336,8 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
       mlir::Type eltExpected = index < positionalExpected.size()
                                    ? positionalExpected[index]
                                    : elementExpected;
+      if (!eltExpected)
+        eltExpected = siblingExpectationFor(expr, elt.get(), /*forKey=*/false);
       valuesToPack.push_back(emitExprExpected(elt.get(), eltExpected));
     }
   }
@@ -2313,9 +2355,15 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
       empty = false;
       if (key)
         valuesToPack.push_back(emitExprExpected(key.get(), keyExpected));
-      if (vals && index < vals->size())
+      if (vals && index < vals->size()) {
+        mlir::Type thisValueExpected = valueExpected;
+        if (!thisValueExpected)
+          thisValueExpected =
+              siblingExpectationFor(expr, (*vals)[index].get(),
+                                    /*forKey=*/false);
         valuesToPack.push_back(
-            emitExprExpected((*vals)[index].get(), valueExpected));
+            emitExprExpected((*vals)[index].get(), thisValueExpected));
+      }
     }
   }
   // An empty literal synthesizes its top-erased element type, which the

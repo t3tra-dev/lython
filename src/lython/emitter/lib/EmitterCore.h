@@ -735,6 +735,11 @@ private:
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable);
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable,
                        const AwaitInferenceResult &inference);
+  // The element type an EMPTY container literal inside `literal` takes from
+  // its siblings; null unless `element` is one (EmitterExpressions.cpp).
+  mlir::Type siblingExpectationFor(const parser::Node &literal,
+                                   const parser::Node *element,
+                                   bool forKey);
   Value emitContainerLiteral(const parser::Node &expr,
                              mlir::Type expected = {});
   Value emitSetLiteral(const parser::Node &expr, mlir::Type expected = {});
