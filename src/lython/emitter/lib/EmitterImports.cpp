@@ -1005,7 +1005,67 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
   return true;
 }
 
+namespace {
+
+// A `yield` anywhere in this function's own body -- nested defs, lambdas and
+// classes have their own. Same rule `containsYieldExpression` applies inside
+// EmitterExceptions.cpp; kept local because that one is file-static there.
+bool functionBodyContainsYield(const parser::Node &node) {
+  if (node.kind == "Yield" || node.kind == "YieldFrom")
+    return true;
+  auto ownScope = [](const parser::Node &child) {
+    return child.kind == "FunctionDef" || child.kind == "AsyncFunctionDef" ||
+           child.kind == "Lambda" || child.kind == "ClassDef";
+  };
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && !ownScope(**child) && functionBodyContainsYield(**child))
+        return true;
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &each : *children)
+        if (each && !ownScope(*each) && functionBodyContainsYield(*each))
+          return true;
+  }
+  return false;
+}
+
+} // namespace
+
 void ModuleEmitter::emitTopLevelDeclarations() {
+  // ⭐ A TOP-LEVEL GENERATOR'S YIELD TYPE IS RECOMPUTED HERE. `registerModule`
+  // memoized every top-level signature before any class contract existed --
+  // it has to run first, because a signature may name a class and the class's
+  // bodies are typed against the function symbols. For an ordinary function
+  // that order is fine: only its annotations matter. A generator's signature
+  // also depends on its BODY, and a body reading a source class inferred
+  // `builtins.object`:
+  //
+  //     class C:
+  //         def __init__(self) -> None: self.n = 5
+  //     def gen(c: C):
+  //         yield c.n
+  //     print(list(gen(C())))
+  //     # runtime bundle for 'builtins.object' has 5 values, but ABI expects 1
+  //
+  // The same generator NESTED inside a function worked, because its signature
+  // is computed during body emission, after the classes. Dropping the memo
+  // makes the walk below recompute each one at the point it is declared, with
+  // every class ABOVE it in the file published.
+  //
+  // ⛔ A generator textually BEFORE the class it reads (only reachable with a
+  // string annotation) still gets the early answer: this respects source
+  // order rather than emitting all classes first, because a class body may
+  // reference a module-level function and reordering the two would trade this
+  // defect for that one.
+  if (const auto *declarations = ast::nodeList(moduleNode, "body"))
+    for (const parser::NodePtr &statement : *declarations)
+      if (statement && (statement->kind == "FunctionDef" ||
+                        statement->kind == "AsyncFunctionDef") &&
+          functionBodyContainsYield(*statement))
+        types.forgetSignature(statement.get());
   if (const auto *body = ast::nodeList(moduleNode, "body")) {
     for (const parser::NodePtr &statement : *body) {
       if (!statement)

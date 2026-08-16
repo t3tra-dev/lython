@@ -318,6 +318,12 @@ public:
   bool bindImportedName(llvm::StringRef module, llvm::StringRef exportedName,
                         llvm::StringRef localName);
 
+  // ⭐ Drops a memoized signature so the next ask recomputes it. `registerModule`
+  // runs before any class contract exists -- it has to, because a signature may
+  // name a class and the class's own bodies are typed against the function
+  // symbols. A GENERATOR's signature is the one that also depends on its BODY,
+  // and a body that reads `c.n` on a source class inferred `object` there.
+  void forgetSignature(const parser::Node *function);
   mlir::Type annotationType(const parser::Node *node) const;
   // Diagnostics recorded while resolving annotations (string forward
   // references whose text is not a simple name). Drained once by the

@@ -498,6 +498,24 @@
 # not. Found while pinning the uniform-tuple collapse (2026-08-17) and
 # unchanged by it.
 #
+# ============================================================
+# (13) `type(x)` IS UNBOUND, and implementing it statically would be wrong.
+# ============================================================
+#     print(type(e).__name__)          # unresolved name 'type'
+#     print(e.__class__.__name__)      # attr.get object type has no class schema
+#
+# `type(x)` for a statically known, unsubclassed x IS computable here --
+# `py.type.object` exists and `type[X]` carries no value -- but the commonest
+# use is the one that would be WRONG:
+#
+#     except Exception as e: print(type(e).__name__)
+#
+# CPython answers with the RUNTIME class (ValueError); the static type is the
+# caught one (Exception). Answering statically would print "Exception" and
+# never say so. Doing it properly means reading the class id out of the header
+# and mapping it to a name at run time, which is a runtime table this tree does
+# not expose. Left unbound deliberately, with this note as the reason.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible

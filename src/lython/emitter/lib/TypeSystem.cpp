@@ -1428,6 +1428,11 @@ void collectModuleCallNodes(const parser::Node *node,
 
 } // namespace
 
+void TypeSystem::forgetSignature(const parser::Node *function) {
+  if (function)
+    signatureMemo.erase(function);
+}
+
 void TypeSystem::registerModule(const parser::Node &moduleNode) {
   const auto *body = ast::nodeList(moduleNode, "body");
   if (!body)
