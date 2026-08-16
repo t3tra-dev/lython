@@ -562,6 +562,20 @@
 # ⛔ And a BUILTIN target is a second, smaller gap even then: `isinstance(o,
 # int)` has no `py.class` schema to match against, so it would still refuse.
 #
+# ============================================================
+# (15) `set.update` / `frozenset.update` ARE NOT DECLARED.
+# ============================================================
+#     s = {1}
+#     s.update([2, 3])
+#     # static type !py.contract<"builtins.set", [...]> does not provide
+#     # manifest method 'update'
+#
+# It is not the element type: an ANNOTATED `set[int]` refuses it too, and
+# `add`, `discard`, `remove`, `issubset`, `isdisjoint` and the operators all
+# work. The method is simply absent from builtins.mlir's set contract. Found
+# while closing the `set()` constructor seed (2026-08-17), which is a different
+# defect that this one hides in the obvious test program.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible

@@ -548,6 +548,37 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         const auto *keys = ast::nodeList(*rhs, "keys");
         emptyLiteral = !keys || keys->empty();
       }
+      // ⭐ AND THE CONSTRUCTOR SPELLING OF THE SAME THING. `set()` is a Call,
+      // not a Set literal, so it never reached the scan and kept `object`:
+      //
+      //     s = set()
+      //     s.add(1)
+      //     # a type-erased `object` value cannot be stored in a runtime
+      //     # container
+      //
+      // while `s = {1}` and `xs = []` were both fine. `set()` is the ONLY way
+      // to write an empty set, so this is not an alternative spelling for that
+      // one -- it is the only one.
+      llvm::StringRef constructedKind;
+      if (!emptyLiteral && rhs->kind == "Call") {
+        const parser::Node *callee = ast::node(*rhs, "func");
+        const auto *callArguments = ast::nodeList(*rhs, "args");
+        const auto *callKeywords = ast::nodeList(*rhs, "keywords");
+        if (callee && callee->kind == "Name" &&
+            (!callArguments || callArguments->empty()) &&
+            (!callKeywords || callKeywords->empty())) {
+          llvm::StringRef calleeName = ast::nameSpelling(*callee);
+          if (!programBindsName(calleeName)) {
+            if (calleeName == "set")
+              constructedKind = "Set";
+            else if (calleeName == "list")
+              constructedKind = "List";
+            else if (calleeName == "dict")
+              constructedKind = "Dict";
+          }
+        }
+        emptyLiteral = !constructedKind.empty();
+      }
       if (emptyLiteral)
         if (const auto *targets = ast::nodeList(statement, "targets"))
           if (targets->size() == 1 && targets->front() &&
@@ -563,11 +594,42 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                 declared = *flow;
             // Nothing declared it: ask what the rest of the suite seeds it
             // with (`emptyLiteralSeedType`).
-            if (!declared || types.widenLiteral(declared) == types.object())
-              if (mlir::Type seeded = emptyLiteralSeedType(target, rhs->kind))
+            //
+            // ⛔ "Nothing" includes a container whose element is the erased
+            // top. `s = set()` at module scope arrives with `set[object]`
+            // already bound -- the module-global collection inferred it from
+            // the RHS -- and that is not a declaration, it is the same absence
+            // the seed exists to fill. A literal never hit this because an
+            // empty one infers nothing to bind.
+            auto onlyErasedArguments = [&](mlir::Type type) {
+              auto contract =
+                  mlir::dyn_cast_if_present<py::ContractType>(type);
+              if (!contract || contract.getArguments().empty())
+                return false;
+              return llvm::all_of(contract.getArguments(),
+                                  [&](mlir::Type argument) {
+                                    return types.widenLiteral(argument) ==
+                                           types.object();
+                                  });
+            };
+            if (!declared || types.widenLiteral(declared) == types.object() ||
+                onlyErasedArguments(types.widenLiteral(declared)))
+              if (mlir::Type seeded = emptyLiteralSeedType(
+                      target,
+                      constructedKind.empty() ? llvm::StringRef(rhs->kind)
+                                              : constructedKind))
                 declared = seeded;
             if (declared) {
               value = emitExprExpected(rhs, declared);
+              // ⛔ The CONSTRUCTOR spelling needs the coercion too, and the
+              // literal does not. `set()` is a call whose result type is
+              // decided by the callee contract, so the expectation reaches the
+              // emission and the VALUE still comes back `set[object]`; an
+              // empty literal is built at whatever it is handed. AnnAssign has
+              // always coerced for exactly this reason, which is why
+              // `s: set[int] = set()` worked while `s = set()` did not.
+              if (!constructedKind.empty())
+                value = coerceValue(value, declared, statement);
               emittedWithContext = true;
             }
           }

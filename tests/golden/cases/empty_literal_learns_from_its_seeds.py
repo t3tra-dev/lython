@@ -93,3 +93,47 @@ print(len(mixed))
 declared: list[int] = []
 declared.append(7)
 print(declared, declared[0] + 1)
+
+
+# --- the CONSTRUCTOR spelling of the same thing ---------------------------
+# `set()` is a Call, not a Set literal, so it never reached the scan and kept
+# `object`: `s = set(); s.add(1)` was "a type-erased `object` value cannot be
+# stored in a runtime container" while `s = {1}` and `xs = []` were both fine.
+# It is not an alternative spelling for the empty set -- it is the only one.
+#
+# ⛔ It needs the COERCION as well as the expectation, and the literal does
+# not: a call's result type comes from the callee contract, so the expectation
+# reaches the emission and the value still comes back `set[object]`. AnnAssign
+# has always coerced, which is why `s: set[int] = set()` worked throughout.
+s = set()
+s.add(1)
+s.add(2)
+print(sorted(s), len(s), 1 in s)
+
+built = list()
+built.append("a")
+built.append("b")
+print(built, ", ".join(built))
+
+table = dict()
+table["a"] = 1
+table["b"] = 2
+print(sorted(table.items()), table["a"] + 1)
+
+
+def in_a_function() -> list[int]:
+    inner = set()
+    inner.add(3)
+    inner.add(1)
+    return sorted(inner)
+
+
+print(in_a_function())
+
+
+# --- the control: a constructor WITH an argument is what it says it is -----
+seeded = set([1, 2])
+print(sorted(seeded))
+annotated: set[str] = set()
+annotated.add("x")
+print(sorted(annotated))
