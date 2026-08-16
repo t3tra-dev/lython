@@ -69,6 +69,31 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     // signal handler may read and what an `int` global deliberately no longer
     // is (see lowerGlobalGet).
     bool storageBacked = mlir::isa<py::ContractType>(annotated);
+    // ⛔ EXCEPT a container whose ELEMENT type is a union. A cell hands back
+    // the handle and nothing else, and a union-typed element read needs the
+    // per-element evidence the literal recorded -- the runtime read declines a
+    // union (its tag lane is an i64, not a memref) and the read is then
+    // "runtime manifest has no builtins.list.__getitem__ method". So
+    //
+    //     xs: list[int | None] = [1, None, 3]
+    //     print(xs[0])
+    //
+    // was refused at module scope while the same three lines inside a function
+    // ran. Value binding keeps the evidence, which is the pre-existing
+    // behaviour for every container and is strictly better than a cell here.
+    //
+    // The cost is the cell's own benefit: such a global is not readable from a
+    // function, exactly as no container global was before it had cells. The
+    // real repair is the runtime read learning to build a union from the
+    // slot's payload class id, which would also close the second-read case
+    // (tests/probe/wb_grid_leftovers_2026_08_16.py).
+    if (storageBacked)
+      if (auto contract = mlir::dyn_cast<py::ContractType>(annotated))
+        for (mlir::Type argument : contract.getArguments())
+          if (mlir::isa<py::UnionType>(argument)) {
+            storageBacked = false;
+            break;
+          }
     if (!storageBacked)
       continue;
     llvm::StringRef name = ast::nameSpelling(*target);

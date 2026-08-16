@@ -88,6 +88,15 @@
 # the same switch a boxed union field would need. Reading each element once
 # works, which is what `heterogeneous_container_read.py` does.
 #
+# ⭐ AND THE SAME MISSING SWITCH IS WHY A UNION-ELEMENT CONTAINER GETS NO
+# MODULE-GLOBAL CELL. `lowerRuntimeSequenceGetItem` declines a union element
+# outright -- `slotStorageShapesFor` puts the tag first and it is an i64, not
+# a memref -- so any read that has lost its per-element evidence has nowhere
+# to go. A cell hands back the handle and nothing else, which is exactly that
+# loss, so `collectModuleGlobals` excludes the shape and it stays value-bound.
+# Building the union from the slot's class id closes both at once: the second
+# read above, and the cell.
+#
 # ============================================================
 # (3) `f = lambda v: v * 2` STILL NEEDS AN ANNOTATION.
 # ============================================================

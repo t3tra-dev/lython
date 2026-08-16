@@ -65,8 +65,30 @@ if isinstance(c, float):
     print("f", c)
 
 
+# --- an ANNOTATED union element type, at module scope and in a function ---
+# The annotation is what made this different: an annotated container gets a
+# module-global CELL, and a cell hands back the handle without the per-element
+# evidence a union read needs. Value binding keeps it.
+opt: list[int | None] = [1, None, 3]
+print(len(opt), opt[0], opt[1])
+
+table: dict[str, int | None] = {"a": 1, "b": None}
+print(len(table), table["a"], table["b"])
+
+
+def local_union() -> str:
+    inner: list[str | None] = ["a", None]
+    head = inner[0]
+    if isinstance(head, str):
+        return head.upper()
+    return "-"
+
+
+print(local_union())
+
+
 # --- the control: a HOMOGENEOUS read is not a union and is unchanged ------
 ints = [10, 20]
 print(ints[0] + ints[1])
-table = {"a": 1, "b": 2}
-print(table["a"] + table["b"])
+counts = {"a": 1, "b": 2}
+print(counts["a"] + counts["b"])
