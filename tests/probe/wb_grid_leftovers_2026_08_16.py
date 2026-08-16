@@ -450,6 +450,39 @@
 # `itertools.islice`-as-a-value are refused the same way and for the same
 # reason -- nobody wrote them yet.
 #
+# ============================================================
+# (11) A BORROWED UNION PARAMETER RETURNED AS AN OWNED UNION RESULT LEAKS.
+# ============================================================
+#     def f(k: str, d: str | None = None) -> str | None:
+#         if k == "a":
+#             return k + "-x"
+#         return d              # <- the borrowed parameter
+#     print(f("a"))             # leaks 43 B, one allocation
+#
+# And the same value used twice is a REFUSAL rather than a leak:
+#     v = f("a"); print(v); if v: ...
+#     # released owned resource from @f is used after release (by call to
+#     # 'LyUnicode_Bool')
+#
+# ⭐ FOUR MEASUREMENTS BOUND IT, and each kills a wider reading:
+#     return None instead of `return d` ............ clean  (the PARAMETER arm)
+#     `-> str` with `d: str = "z"` ................. clean  (the UNION)
+#     `list[int] | None` with the same shape ....... clean  (the STR member)
+#     `if d is None: return None` / `return d` ..... clean  (the NARROWING)
+#
+# So it is one shape: a union-typed parameter forwarded WHOLE as a union-typed
+# result, where a member owns a reference. Returning the narrowed member
+# instead re-wraps it and the ownership is consistent again, which is why
+# `os.getenv` is written with the two-line arm and a ⛔ note pointing here.
+# The caller's contract says the result is owned; the borrowed-parameter path
+# never took a reference for it to release.
+#
+# ⛔ This is what blocked `os.getenv` returning None, and os.py's docstring had
+# the reason wrong: it said an `Optional[str]` return "has no physical layout
+# across the native boundary yet". The layout is fine and the native call
+# still returns a str -- the None never crosses the boundary. What was missing
+# was this.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible

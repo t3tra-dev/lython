@@ -10,6 +10,8 @@ True
 False
 fallback
 True
+False
+False True
 True
 LYTHON_GOLDEN_OS_ENV=in-vector
 True

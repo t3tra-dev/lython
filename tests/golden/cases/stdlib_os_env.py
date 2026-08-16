@@ -31,10 +31,18 @@ print(os.getenv(name, "fallback") == "")
 os.unsetenv(name)
 print(os.has_env(name))
 print(os.getenv(name, "fallback"))
-# The documented deviation: an unset variable reads back as '' rather than
-# None, because an Optional[str] has no physical layout across the native
-# boundary yet.
+# ⛔ An UNSET variable reads back as None, which is CPython's answer and was
+# not this port's: `getenv` defaulted to '' on the reasoning that an
+# Optional[str] return had no physical layout across the native boundary. That
+# made an unset variable indistinguishable from one set to the empty string --
+# the very distinction `has_env` exists for -- and `os.getenv(k) is None`
+# answered False where CPython answers True. The native call still returns a
+# str; the None is the Python-level default and never crosses the boundary.
+print(os.getenv(name) is None)
 print(os.getenv(name) == "")
+os.putenv(name, "")
+print(os.getenv(name) is None, os.getenv(name) == "")
+os.unsetenv(name)
 
 # The raw vector, every entry of which is a "KEY=VALUE" string. Scanned from a
 # helper: the list has to be bound before the loop reads it, and the matched

@@ -29,9 +29,13 @@ Deviations from CPython:
     `unsetenv` read and write the process environment directly, so they stay
     consistent with each other; `environ_entries()` exposes the raw
     "KEY=VALUE" vector for callers that need to enumerate.
-  - `getenv(key, default='')` defaults to `''` rather than `None`: an
-    `Optional[str]` return has no physical layout across the native boundary
-    yet. Use `has_env(key)` to tell an unset variable from an empty one.
+  - `getenv(key, default=None)` is CPython's, including the None. This said
+    until 2026-08-17 that an `Optional[str]` return had no physical layout
+    across the native boundary and defaulted to `''` -- which made an UNSET
+    variable indistinguishable from one set to the empty string, so
+    `os.getenv(k) is None` answered False where CPython answers True. The
+    native call still returns a str; the None is the Python-level default and
+    never crosses the boundary. `has_env(key)` remains the direct question.
   - `stat()` returns the `stat_result` class below, a plain class with the
     ten `st_*` attributes rather than a structseq (no tuple indexing, no
     `st_atime_ns` family, no `st_birthtime`). Each attribute read costs one
@@ -141,10 +145,20 @@ def replace(src: str, dst: str) -> None:
     rename(src, dst)
 
 
-def getenv(key: str, default: str = "") -> str:
-    """Get an environment variable, returning `default` if it doesn't exist."""
+def getenv(key: str, default: str | None = None) -> str | None:
+    """Get an environment variable, returning `default` if it doesn't exist.
+
+    ⛔ The last two lines are `if default is None: return None` / `return
+    default` rather than one `return default`, and that is not a style. A
+    borrowed union PARAMETER returned as an owned union RESULT leaks its str
+    member -- 43 B, measured -- while the same function returning the narrowed
+    member does not. Reproducer and the shape of the underlying defect are in
+    tests/probe/wb_grid_leftovers_2026_08_16.py.
+    """
     if posix._has_env(key):
         return posix._getenv(key)
+    if default is None:
+        return None
     return default
 
 
