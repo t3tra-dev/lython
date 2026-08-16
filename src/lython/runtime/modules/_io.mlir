@@ -63,7 +63,7 @@ module attributes {
   //   [6] closed     [7] reserved
   py.class @TextIOWrapper attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["write", "read", "readline", "flush", "close", "fileno", "readable", "writable", "seek", "tell", "seekable"],
+    method_names = ["write", "read", "readline", "flush", "close", "fileno", "readable", "writable", "seek", "tell", "seekable", "__enter__", "__exit__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
       !py.callable<[!py.contract<"_io.TextIOWrapper">, !py.contract<"builtins.int">], arg_names = ["self", "size"], arg_defaults = [false, true], returns = [!py.contract<"builtins.str">]>,
@@ -75,9 +75,11 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.bool">]>,
       !py.callable<[!py.contract<"_io.TextIOWrapper">, !py.contract<"builtins.int">, !py.contract<"builtins.int">], arg_names = ["self", "cookie", "whence"], arg_defaults = [false, false, true], returns = [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"_io.TextIOWrapper">]>,
+      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.literal<None>>, !py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"builtins.bool">]>
     ],
-    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @UnsupportedOperation attributes {base_names = ["OSError"]} {}
@@ -620,6 +622,30 @@ module attributes {
       memref.store %one, %self[%closed_slot] : memref<8xi64>
     }
     func.return
+  }
+
+  // `with open(...) as f` is how a file is used, and TextIOWrapper declared no
+  // __enter__/__exit__ at all -- so the canonical spelling was refused while
+  // every method it wraps worked. CPython's IOBase.__enter__ checks for a
+  // closed file and returns SELF (not a new object), and __exit__ closes and
+  // returns None, so an exception inside the block propagates.
+  //
+  // Why the incref: the `with` statement binds the result to a name whose
+  // release the frame plans, and returning the receiver hands out a second
+  // reference to one object.
+  func.func @LyTextIO_Enter(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "__enter__", ly.runtime.result_contract = "_io.TextIOWrapper"} {
+    %sub = memref.subview %self[0] [2] [1] : memref<8xi64> to memref<2xi64, strided<[1]>>
+    %view = memref.cast %sub : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %self : memref<8xi64>
+  }
+
+  // False, not None: the emitter reads the answer as the suppression decision,
+  // and a file never swallows the exception raised inside its block.
+  func.func @LyTextIO_Exit(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "__exit__", ly.runtime.result_contract = "builtins.bool"} {
+    func.call @LyTextIO_Close(%self) : (memref<8xi64>) -> ()
+    %false = arith.constant false
+    func.return %false : i1
   }
 
   func.func @LyTextIO_Fileno(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "fileno", ly.runtime.result_contract = "builtins.int"} {

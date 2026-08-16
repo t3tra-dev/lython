@@ -10,5 +10,9 @@ True
 fnf
 unsupported
 b'first'
+True False
+True
+raised inside
+partial
 6
 hello buffer

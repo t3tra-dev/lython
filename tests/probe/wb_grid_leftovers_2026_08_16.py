@@ -423,6 +423,27 @@
 #   is the temporary the unpack builds inside a generator frame, which nothing
 #   releases across a suspension.
 #
+# ============================================================
+# (10) `print(x, end="")` AND `sep=` ARE REFUSED, and the sink is why.
+# ============================================================
+#     static type !py.callable<[], vararg = tuple[object], returns = [None]>
+#     is not callable: call arguments do not match the Callable contract
+#
+# `builtins.print`'s contract has no keyword parameters, and `tryEmitPrintCall`
+# declines the moment it sees one. The joining half is free -- the emitter
+# already builds the space-joined string and `sep=` is only a different
+# separator -- but `end=` needs a sink that does NOT append the newline, and
+# there is exactly one: `LyUnicode_PrintLine` (`ly.runtime.builtin = "print"`,
+# `builtin_lowering = "method_sink"`). `LyUnicode_Print` next to it is the
+# no-newline write, and nothing names it as a builtin, so the emitter cannot
+# reach it. Closing this means a second builtin sink (a manifest entry plus a
+# TypeSystem binding plus a synthesized callee), or routing through
+# `sys.stdout.write`, which the emitter would have to reach without an import.
+#
+# Grouped with the missing modules rather than with the defects: `re`,
+# `collections.defaultdict` and `itertools.islice`-as-a-value are refused the
+# same way and for the same reason -- nobody wrote them yet.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible
