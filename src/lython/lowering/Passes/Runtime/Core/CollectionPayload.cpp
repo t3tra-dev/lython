@@ -259,6 +259,19 @@ void RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(
 
 void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
     py::CallOp op) {
+  auto elementCanBeMutated = [&](mlir::Value element) {
+    const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(element);
+    if (!bundle || !bundle->objectValue.contract)
+      return true;
+    auto mutableContract = [&](mlir::Type contract) {
+      return RuntimeBundleLowerer::isMutableContainerContractName(
+          runtimeContractName(contract));
+    };
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(
+            bundle->objectValue.contract))
+      return llvm::any_of(unionType.getMemberTypes(), mutableContract);
+    return mutableContract(bundle->objectValue.contract);
+  };
   auto demotePack = [&](mlir::Value packValue) {
     const RuntimeBundle *pack = RuntimeBundleLowerer::bundleFor(packValue);
     if (!pack || pack->kind != RuntimeBundle::Kind::Aggregate)
@@ -281,13 +294,30 @@ void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
       // one-element description of the inner one. Demoting the argument alone
       // does not reach that copy. Binding the element to a local first was
       // correct, because then the local is what the walk tracks.
-      for (mlir::Value outer = operand; outer;) {
-        auto read = outer.getDefiningOp<py::GetItemOp>();
-        if (!read)
-          break;
-        outer = read.getContainer();
-        demoteMutableContainerEvidenceFor(outer);
-      }
+      //
+      // ⛔ ONLY when the element the callee received can BE mutated. The walk
+      // used to run for every subscript argument, and an immutable element
+      // took its container's description with it:
+      //
+      //     def render(v: int | str) -> str: ...
+      //     vals = [1, "b"]
+      //     print(render(vals[0]))
+      //     print(vals[1])   # runtime manifest has no builtins.list.__getitem__
+      //
+      // A callee cannot mutate an int or a str, so the outer element map is
+      // still true after the call -- and for a UNION element the demotion is
+      // not a slower read but a refusal, because the runtime tier has no
+      // `__getitem__` that returns one. A union whose member is a mutable
+      // container still counts as mutable: the tag decides which, and either
+      // way the callee holds something it can change.
+      if (elementCanBeMutated(operand))
+        for (mlir::Value outer = operand; outer;) {
+          auto read = outer.getDefiningOp<py::GetItemOp>();
+          if (!read)
+            break;
+          outer = read.getContainer();
+          demoteMutableContainerEvidenceFor(outer);
+        }
     }
   };
   demotePack(op.getPosargs());

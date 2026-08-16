@@ -354,7 +354,22 @@ bool RuntimeBundleLowerer::containerContentsAreUnreachableByMutation(
     const RuntimeBundle &bundle) {
   bool mapping = !bundle.mappingKeys.empty();
   for (mlir::Operation *user : containerValue.getUsers()) {
-    if (mlir::isa<py::LenOp, py::ContainsOp>(user))
+    // `py.iter` is how `cfg.keys()` and `for k in cfg` both arrive, and it
+    // hands out an iterator rather than the container -- there is no path from
+    // the iterator back to a mutation of this value, so the description
+    // survives it.
+    //
+    // ⛔ `py.repr` is NOT here even though printing a container plainly does
+    // not change it. The exemption keeps the evidence, and an evidence read
+    // hands back a BORROW of the slot where the runtime accessor hands back an
+    // owned reference -- so a later mutation THROUGH such a read is refused:
+    // `print(rows, ...)` followed by `rows[1].append(9)` became "list.append on
+    // a field or borrowed list is not supported inside a branch or loop body".
+    // The repr of a list expands into a loop, which is what put the append in
+    // another block to begin with. Admitting repr means teaching the mutation
+    // path to take an owned handle from an evidence element, which is a
+    // different change.
+    if (mlir::isa<py::LenOp, py::ContainsOp, py::IterOp>(user))
       continue;
     auto read = mlir::dyn_cast<py::GetItemOp>(user);
     if (!read || read.getContainer() != containerValue)
