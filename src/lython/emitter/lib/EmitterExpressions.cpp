@@ -2665,67 +2665,87 @@ mlir::Value ModuleEmitter::emitBoolValue(Value value,
     return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1)
         .getResult();
   }
-  // Optional[T]: None is falsy, a present member re-enters truthiness under
-  // the not-None guard (so Optional[container] composes emptiness correctly).
+  // ⭐ A UNION IS TRUE OR FALSE PER MEMBER, decided by the tag. Optional[T] was
+  // the only shape handled here -- None falsy, the single present member
+  // re-entering truthiness under the not-None guard -- and every other union
+  // reached the manifest evidence below, which has no answer:
+  //
+  //     cfg = {"debug": True, "level": 3, "name": "app"}
+  //     if cfg["debug"]:
+  //     # static type !py.union<bool, int, str> does not provide manifest
+  //     # method '__bool__'
+  //
+  // A union has no class and no manifest contract of its own, which is the
+  // same reason `emitStringifyValue` renders one through its tag rather than
+  // through the dunder ladder. This is that dispatch for truthiness, and
+  // Optional[T] is now one case of it rather than a rule of its own.
+  //
+  // ⛔ A NUMERIC MEMBER RE-ENTERS AS `!= 0` rather than being rejected the way
+  // a bare numeric is above. The deviation is about a numeric the writer could
+  // have compared explicitly; there is no comparison that covers `bool | int |
+  // str`, so refusing here would only make the record literal unusable in a
+  // condition. Under the tag the member is known, and `x != 0` is exactly
+  // CPython's bool(x) -- the argument the Optional arm already made.
   if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened)) {
-    if (unionType.hasMember(types.none())) {
-      mlir::Type member;
-      for (mlir::Type candidate : unionType.getMemberTypes()) {
-        if (isNoneTypeLike(candidate))
-          continue;
-        if (member) {
-          member = {};
-          break;
-        }
-        member = candidate;
-      }
-      if (member) {
+    llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+    auto memberAnswersTruth = [&](mlir::Type member) {
+      mlir::Type widenedMember = types.widenLiteral(member);
+      if (isNoneTypeLike(member) || widenedMember == types.intType() ||
+          widenedMember == types.floatType() ||
+          widenedMember == types.boolType())
+        return true;
+      // Asked of the MEMBER, not of the union: this is the question the code
+      // below asks of a concrete type, and it is the one that has an answer.
+      return static_cast<bool>(
+                 types.inferMethodCallWithEvidence(member, "__bool__", {})) ||
+             static_cast<bool>(
+                 types.inferMethodCallWithEvidence(member, "__len__", {}));
+    };
+    if (!members.empty() && llvm::all_of(members, memberAnswersTruth)) {
+      auto truthOfMember = [&](mlir::Type member) -> mlir::Value {
+        // None has no header to unwrap and its truth is a constant.
+        if (isNoneTypeLike(member))
+          return mlir::arith::ConstantIntOp::create(builder, loc(anchor), 0, 1)
+              .getResult();
+        auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,
+                                                value.value);
+        Value unwrapped{unwrap.getResult(), member};
         mlir::Type widenedMember = types.widenLiteral(member);
-        auto isNone = py::UnionTestOp::create(builder, loc(anchor),
-                                              builder.getI1Type(), value.value,
-                                              mlir::TypeAttr::get(types.none()));
-        auto one =
-            mlir::arith::ConstantIntOp::create(builder, loc(anchor), 1, 1);
-        mlir::Value present = mlir::arith::XOrIOp::create(
-            builder, loc(anchor), isNone.getResult(), one);
+        if (widenedMember == types.intType() ||
+            widenedMember == types.floatType()) {
+          Value zero;
+          if (widenedMember == types.intType()) {
+            mlir::Type zeroType = types.literal("0");
+            zero = Value{py::IntConstantOp::create(builder, loc(anchor),
+                                                   zeroType,
+                                                   builder.getStringAttr("0"))
+                             .getResult(),
+                         zeroType};
+          } else {
+            zero = Value{py::FloatConstantOp::create(builder, loc(anchor),
+                                                     types.floatType(),
+                                                     builder.getF64FloatAttr(0.0))
+                             .getResult(),
+                         types.floatType()};
+          }
+          Value nonzero = emitBinarySpecial<py::NeOp>(
+              anchor, "__ne__", unwrapped, zero, types.boolType());
+          return emitBoolValue(nonzero, anchor);
+        }
+        return emitBoolValue(unwrapped, anchor);
+      };
+      auto dispatch = [&](unsigned index, auto &&recurse) -> mlir::Value {
+        if (index + 1 >= members.size())
+          return truthOfMember(members[index]);
+        auto test = py::UnionTestOp::create(
+            builder, loc(anchor), builder.getI1Type(), value.value,
+            mlir::TypeAttr::get(members[index]));
         return emitValueDiamond(
-            loc(anchor), present, builder.getI1Type(),
-            [&]() -> mlir::Value {
-              auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor),
-                                                      member, value.value);
-              Value unwrapped{unwrap.getResult(), member};
-              // A numeric member re-enters truthiness as the explicit
-              // comparison R1 demands of BARE numerics: under the not-None
-              // guard, `opt != 0` is exactly CPython's bool(opt).
-              if (widenedMember == types.intType() ||
-                  widenedMember == types.floatType()) {
-                Value zero;
-                if (widenedMember == types.intType()) {
-                  mlir::Type zeroType = types.literal("0");
-                  zero = Value{py::IntConstantOp::create(
-                                   builder, loc(anchor), zeroType,
-                                   builder.getStringAttr("0"))
-                                   .getResult(),
-                               zeroType};
-                } else {
-                  zero = Value{py::FloatConstantOp::create(
-                                   builder, loc(anchor), types.floatType(),
-                                   builder.getF64FloatAttr(0.0))
-                                   .getResult(),
-                               types.floatType()};
-                }
-                Value nonzero = emitBinarySpecial<py::NeOp>(
-                    anchor, "__ne__", unwrapped, zero, types.boolType());
-                return emitBoolValue(nonzero, anchor);
-              }
-              return emitBoolValue(unwrapped, anchor);
-            },
-            [&]() -> mlir::Value {
-              return mlir::arith::ConstantIntOp::create(builder, loc(anchor),
-                                                        0, 1)
-                  .getResult();
-            });
-      }
+            loc(anchor), test.getResult(), builder.getI1Type(),
+            [&] { return truthOfMember(members[index]); },
+            [&] { return recurse(index + 1, recurse); });
+      };
+      return dispatch(0, dispatch);
     }
   }
   // Source-class truthiness walks CPython's ladder — __bool__, then __len__,
