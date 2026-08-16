@@ -110,14 +110,21 @@
 #     print(a, b, c, d)                   # 1 1 0.0 None   <- this path
 #                                         # CPython: 1 a 2.5 None
 #
-# ⭐ AND THE PATTERN NAMES THE BUG. Every union with ONE non-None member came
-# out right (`int | None`, `str | None`), and those are exactly the ones where
-# the tag's DEFAULT is already the answer -- the select chain starts at 0 and
-# member 0 is the only real member. The None member matched (its stored class
-# id is 0, which is what the all-zero handle writes). So what fails is the
-# comparison against a NON-None member's class id: `runtimeClassIdForContract`
-# and the word the payload box actually holds are not the same number for at
-# least str and float. That is one discrepancy to find, not a design problem.
+# ⭐ THE PATTERN NARROWS IT. Every union with ONE non-None member came out
+# right (`int | None`, `str | None`), and those are exactly the ones where the
+# tag's DEFAULT is already the answer -- the select chain starts at 0 and
+# member 0 is the only real member. So the failure is in the SELECTION, not in
+# the lane rebuild: with four members, nothing after member 0 was chosen.
+#
+# ⛔ AND THE FIRST HYPOTHESIS WAS CHECKED AND IS FALSE, which is why it is
+# written down. "The class ids do not agree" -- `runtimeClassIdForContract`
+# against the word the box holds -- does not survive: `LyUnicode_FromBytes`
+# declares `ly.runtime.class_id = 4` and `__ly_unicode_alloc` stores
+# `layout_str = 4` into word 1. They are the same number. So the next attempt
+# should NOT start there; it should start by printing what the box's word 1
+# actually holds at each slot, because the other reading of `1 1 0.0 None` is
+# that `b` read SLOT 0 -- it printed `a`'s value -- which would make the slot
+# base, not the tag, the thing that is wrong.
 #
 # ⛔ A repair here must be red-checked against VALUES, not against compiling.
 # The refusal it replaces is loud; the wrong answer it produced is not, and
