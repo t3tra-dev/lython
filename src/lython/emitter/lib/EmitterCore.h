@@ -245,6 +245,13 @@ private:
   // The element/key/value type an empty `[]`, `{}` or `set()` bound to `name`
   // is seeded with by the rest of the suite, or null when the seeds disagree
   // or there are none (EmitterStatements.cpp).
+  // Binds every `NAME = <constant>` in the rest of the current suite into the
+  // scope the caller just pushed; both forward scans need it.
+  void preBindSuiteConstants();
+  // The Callable an unannotated lambda bound to `name` takes from the calls
+  // that follow it in this suite; null when they disagree or there are none.
+  py::CallableType lambdaCallSeedContract(llvm::StringRef name,
+                                          const parser::Node &lambda);
   mlir::Type emptyLiteralSeedType(llvm::StringRef name,
                                   llvm::StringRef literalKind);
   bool isModuleGlobalRead(llvm::StringRef name) const;

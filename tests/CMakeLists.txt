@@ -667,6 +667,12 @@ set(LYTHON_LEAK_GATE_CASES
     # frees the caller's argument and one too few leaks it per call. 200 calls
     # here, and neither shows in what is printed.
     nested_loop_rebinds_a_parameter
+    # The named lambda's parameters come from the call, and the parameter TYPE
+    # is what decides whether the body borrows or owns. `shout(s)` compiled
+    # against str takes a reference the caller still holds; the same body
+    # compiled against a guess would release one the caller owns. The printed
+    # HI! is the same either way.
+    named_lambda_learns_from_its_calls
     hello dict_build str_compare iterate list_methods
     dict_literal_source_move_frequency dict_methods_complete
     tuple_boxed_slot_read container_slot_reread tuple_one_lane_interior

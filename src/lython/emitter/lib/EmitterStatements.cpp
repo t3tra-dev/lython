@@ -82,6 +82,150 @@ void ModuleEmitter::emitStatements(
 // ⛔ Nested FUNCTION bodies are not scanned. A `def` that appends to a name
 // this suite binds is reading a closure variable whose seeding order this walk
 // does not know, and the scan has no way to say "later" about it.
+// Bind every `NAME = <constant>` in the rest of the current suite into the
+// scope the caller has just pushed. A constant's type depends on nothing, so
+// binding it early is the same answer the walk reaches later; anything that is
+// not a constant is left alone rather than guessed at. Both forward scans need
+// it, because both are asked about an expression that mentions a local the
+// walk has not reached.
+void ModuleEmitter::preBindSuiteConstants() {
+  if (!currentSuite || currentSuiteIndex > currentSuite->size())
+    return;
+  auto walk = [&](const parser::Node &node, auto &&recurse) -> void {
+    if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+        node.kind == "ClassDef")
+      return;
+    if (node.kind == "Assign") {
+      const parser::Node *value = ast::node(node, "value");
+      const auto *targets = ast::nodeList(node, "targets");
+      if (value && value->kind == "Constant" && targets &&
+          targets->size() == 1 && targets->front() &&
+          targets->front()->kind == "Name")
+        if (mlir::Type constantType =
+                types.widenLiteral(types.inferExpr(value)))
+          types.bindLocalSymbol(ast::nameSpelling(*targets->front()),
+                                constantType);
+    }
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, recurse);
+    }
+  };
+  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
+       ++index)
+    if ((*currentSuite)[index])
+      walk(*(*currentSuite)[index], walk);
+}
+
+// ⭐ `f = lambda v: v * 2` LEARNS ITS PARAMETERS FROM THE CALL. An unannotated
+// lambda has no type of its own -- "lambda requires a Callable annotation
+// because its type contains unresolved Unknown" -- and the callee-position
+// repair reads the parameter types off the arguments, which an ASSIGNMENT does
+// not have. The call does, and it is in the same suite:
+//
+//     f = lambda v: v * 2
+//     print(f(5))
+//
+// so the forward scan that decides an empty literal's element type
+// (`emptyLiteralSeedType`) answers this one too, on the same terms.
+//
+// ⛔ Every call of the name must agree on the argument types, and there must be
+// at least one. Disagreeing calls leave the lambda unannotated, which is the
+// refusal it already had -- a lambda emitted at one call's types and used at
+// another's would be a wrong program rather than a refused one.
+//
+// ⛔ Nested FUNCTION bodies are not scanned, for the reason the literal scan
+// gives: a `def` that calls the name reads a closure variable whose binding
+// order this walk does not know.
+py::CallableType
+ModuleEmitter::lambdaCallSeedContract(llvm::StringRef name,
+                                      const parser::Node &lambda) {
+  if (!currentSuite || currentSuiteIndex > currentSuite->size())
+    return {};
+  llvm::SmallVector<mlir::Type, 4> agreed;
+  bool seen = false;
+  bool disagreed = false;
+  // The same pre-binding the literal scan needs, for the same reason: the call
+  // usually mentions a local the walk has not reached. `step = lambda v: v + 1`
+  // is followed by `total = 0` and then `step(total)`, and without `total`
+  // bound the argument infers as object and the scan declines.
+  TypeSystem::Scope seedScope = types.pushScope();
+  preBindSuiteConstants();
+  auto visit = [&](const parser::Node &node, auto &&recurse) -> void {
+    if (disagreed)
+      return;
+    if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+        node.kind == "ClassDef" || node.kind == "Lambda")
+      return;
+    if (node.kind == "Call") {
+      const parser::Node *callee = ast::node(node, "func");
+      if (callee && callee->kind == "Name" &&
+          llvm::StringRef(ast::nameSpelling(*callee)) == name) {
+        const auto *args = ast::nodeList(node, "args");
+        const auto *keywords = ast::nodeList(node, "keywords");
+        if (!args || (keywords && !keywords->empty())) {
+          disagreed = true;
+          return;
+        }
+        llvm::SmallVector<mlir::Type, 4> here;
+        for (const parser::NodePtr &argument : *args) {
+          if (!argument || argument->kind == "Starred") {
+            disagreed = true;
+            return;
+          }
+          mlir::Type argumentType =
+              types.widenLiteral(types.inferExpr(argument.get()));
+          if (!argumentType || argumentType == types.object()) {
+            disagreed = true;
+            return;
+          }
+          here.push_back(argumentType);
+        }
+        if (!seen) {
+          agreed = here;
+          seen = true;
+        } else if (agreed != here) {
+          disagreed = true;
+          return;
+        }
+      }
+    }
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, recurse);
+    }
+  };
+  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
+       ++index)
+    if ((*currentSuite)[index])
+      visit(*(*currentSuite)[index], visit);
+  if (disagreed || !seen || agreed.empty())
+    return {};
+  py::CallableType parameters =
+      py::CallableType::get(&context, agreed, {}, {}, {}, {});
+  mlir::Type resultType =
+      types.functionSignature(lambda, std::nullopt, parameters).resultType;
+  if (!resultType)
+    return {};
+  return py::CallableType::get(&context, agreed, {}, {}, {}, {resultType});
+}
+
 mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
                                                llvm::StringRef literalKind) {
   if (!currentSuite || currentSuiteIndex > currentSuite->size())
@@ -104,40 +248,7 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
   // the same answer the walk will reach, just sooner -- and any name whose
   // value is not a constant is left alone rather than guessed at.
   TypeSystem::Scope seedScope = types.pushScope();
-  {
-    auto preBind = [&](const parser::Node &node, auto &&recurse) -> void {
-      if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
-          node.kind == "ClassDef")
-        return;
-      if (node.kind == "Assign") {
-        const parser::Node *value = ast::node(node, "value");
-        const auto *targets = ast::nodeList(node, "targets");
-        if (value && value->kind == "Constant" && targets &&
-            targets->size() == 1 && targets->front() &&
-            targets->front()->kind == "Name")
-          if (mlir::Type constantType =
-                  types.widenLiteral(types.inferExpr(value)))
-            types.bindLocalSymbol(ast::nameSpelling(*targets->front()),
-                                  constantType);
-      }
-      for (const parser::Field &field : node.fields) {
-        if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-          if (*child)
-            recurse(**child, recurse);
-          continue;
-        }
-        if (const auto *children =
-                std::get_if<std::vector<parser::NodePtr>>(&field.value))
-          for (const parser::NodePtr &child : *children)
-            if (child)
-              recurse(*child, recurse);
-      }
-    };
-    for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
-         ++index)
-      if ((*currentSuite)[index])
-        preBind(*(*currentSuite)[index], preBind);
-  }
+  preBindSuiteConstants();
 
   // ⛔ A seed that MENTIONS the name is unknowable here and is skipped rather
   // than counted as disagreement. `d[w] = d[w] + 1` beside `d[w] = 1` is the
@@ -366,13 +477,15 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         if (targets->size() == 1 && targets->front() &&
             targets->front()->kind == "Name") {
           llvm::StringRef name = ast::nameSpelling(*targets->front());
-          if (auto expectedType = types.lookupSymbol(name)) {
-            if (auto expectedCallable =
-                    mlir::dyn_cast_if_present<py::CallableType>(
-                        *expectedType)) {
-              value = emitLambda(*rhs, expectedCallable);
-              emittedWithContext = true;
-            }
+          py::CallableType expectedCallable;
+          if (auto expectedType = types.lookupSymbol(name))
+            expectedCallable =
+                mlir::dyn_cast_if_present<py::CallableType>(*expectedType);
+          if (!expectedCallable)
+            expectedCallable = lambdaCallSeedContract(name, *rhs);
+          if (expectedCallable) {
+            value = emitLambda(*rhs, expectedCallable);
+            emittedWithContext = true;
           }
         }
       }

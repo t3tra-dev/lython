@@ -224,16 +224,38 @@
 # a heterogeneous container twice.
 #
 # ============================================================
-# (3) `f = lambda v: v * 2` STILL NEEDS AN ANNOTATION.
+# (3) FIXED: `f = lambda v: v * 2` LEARNS FROM THE CALL.
 # ============================================================
 #     lambda requires a Callable annotation because its type contains
 #     unresolved Unknown
 #
 # The callee-position repair (2026-08-16) reads the parameter types off the
-# ARGUMENTS, and an assignment has none. `f: Callable[[int], int] = lambda v:
-# v * 2` works, and so does every applied form. Closing this needs the
-# assignment to defer the lambda's emission until a call site fixes its
-# parameters, which is a different mechanism from an expectation.
+# ARGUMENTS, and an assignment has none. The CALL does, and it is in the same
+# suite -- so the assignment scans forward for calls of the name it is binding
+# and takes the parameters from them, the way an empty literal takes its
+# element type from its seeds. Pinned by
+# tests/golden/cases/named_lambda_learns_from_its_calls.py.
+#
+# ⛔ Two shapes are still refused, and both are the scan DECLINING rather than
+# a gap in it:
+#
+#   x = lambda v: v * 2
+#   print(x(1)); print(x("a"))
+#     The calls disagree. One body, two parameter types -- emitting it at the
+#     first call's types and using it at the second's is a wrong program, not a
+#     refused one. CPython accepts this and Lython does not, which is the same
+#     line every unannotated generic is on.
+#
+#   key = lambda p: p[1]
+#   print(sorted(pairs, key=key))
+#     The name is PASSED, never called. There are no arguments anywhere to read
+#     the parameters off; what fixes them is the CALLEE's declared parameter
+#     (`sorted`'s `key: Callable[[T], U]`), which is an expectation flowing the
+#     other way -- into an argument position, from a manifest contract. The
+#     inline form `key=lambda p: p[1]` already works because the expectation
+#     reaches the lambda directly. Closing the named form means propagating an
+#     argument-position expectation back to the binding, which is a third
+#     mechanism.
 
 import math
 
@@ -241,6 +263,8 @@ import math
 # as comments rather than as a refusal.
 print(math.sqrt(16.0))
 print((lambda v: v * 2)(5))
+named = lambda v: v * 2
+print(named(5))
 print(max([("b", 2), ("a", 3)], key=lambda p: p[1]))
 a, b = 0, 1
 i = 0
