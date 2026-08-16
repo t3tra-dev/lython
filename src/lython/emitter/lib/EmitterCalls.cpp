@@ -6,6 +6,7 @@
 #include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
 #include "PyProtocols.h"
+#include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
 
@@ -145,6 +146,50 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
   llvm::ArrayRef<mlir::Type> expectedPositional =
       expectedContract ? expectedContract.getPositionalTypes()
                        : llvm::ArrayRef<mlir::Type>();
+  // ⭐ A LAMBDA'S EXPECTED CALLABLE MAY MENTION A TYPEVAR A LATER ARGUMENT
+  // DECIDES. Arguments are emitted left to right against the callee's
+  // contract as written, and a generic one still has its parameters in it:
+  //
+  //     functools.reduce(lambda a, b: a + b, [1, 2, 3])
+  //     # static type !py.typevar<"T"> does not provide manifest method
+  //     # '__add__'
+  //
+  // `reduce[T](function: Callable[[T, T], T], sequence: list[T])` binds T from
+  // the SECOND argument, and the lambda is the first -- so its body was
+  // compiled against T. The call itself then specialized correctly, which is
+  // why the second diagnostic already names `Callable[[int, int], int]`: the
+  // types were known, just not yet when the body needed them.
+  //
+  // So the parameters are bound from the arguments that can be typed WITHOUT
+  // being emitted, and the formals are substituted before the walk starts. A
+  // lambda is skipped on that pass for the same reason it needs this: it has
+  // no type until an expectation gives it one.
+  //
+  // ⛔ Only when a lambda is actually present. `types.inferExpr` over every
+  // argument of every call is a second full walk of each one, and nothing else
+  // here needs it -- an ordinary argument reaches the same bindings through
+  // `tryCallableApplication` after it is emitted.
+  TypeBindingMap lambdaBindings;
+  const auto *positionalArgs = ast::nodeList(expr, "args");
+  if (expectedContract && positionalArgs &&
+      llvm::any_of(*positionalArgs,
+                   [](const parser::NodePtr &arg) {
+                     return arg && arg->kind == "Lambda";
+                   }) &&
+      llvm::any_of(expectedPositional, [](mlir::Type formal) {
+        return formal && unboundStaticParameterCount(formal) > 0;
+      })) {
+    for (auto [index, arg] : llvm::enumerate(*positionalArgs)) {
+      if (index >= expectedPositional.size())
+        break;
+      if (!arg || arg->kind == "Lambda" || arg->kind == "Starred")
+        continue;
+      if (mlir::Type actual = types.inferExpr(arg.get()))
+        bindExpectedType(types, expectedPositional[index],
+                         types.widenLiteral(actual), lambdaBindings);
+    }
+  }
+
   // A static type parameter as formal means the expectation is the CALL's
   // output (the argument determines it), not an input to distribute; a
   // starred argument breaks positional alignment for everything after it.
@@ -154,6 +199,8 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
     mlir::Type formal = expectedPositional[index];
     if (formal && py::isStaticTypeParameter(formal))
       return {};
+    if (formal && !lambdaBindings.empty())
+      formal = substituteType(types, formal, lambdaBindings);
     return formal;
   };
 

@@ -23,11 +23,11 @@ Deviations from CPython, pending language surface:
   - no `key=` argument: it is keyword-only and Optional-callable, and
     calling through an Optional callable parameter is not statically
     resolvable yet. Pass a decorated sequence instead
-  - insort_left / insort_right are declared with CPython's semantics but
-    cannot be CALLED yet: inserting into a caller-owned list through a
-    parameter needs borrowed-container mutation, which the ownership layer
-    rejects. A call site gets an explicit diagnostic (never a silent
-    mis-insert); bisect_left / bisect_right are unaffected
+  - insort_left / insort_right CAN be called (this said they could not until
+    2026-08-17: the borrowed-container mutation they need -- inserting into a
+    caller-owned list through a parameter -- was rejected by the ownership
+    layer when this port was written, and is not any more). Pinned by
+    tests/golden/cases/generic_call_with_a_lambda.py
 """
 
 __all__ = ["bisect_left", "bisect_right", "bisect", "insort_left",
