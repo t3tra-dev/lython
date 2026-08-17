@@ -766,11 +766,25 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         {"BitAnd", "builtins.set", "intersection_update"},
         {"BitXor", "builtins.set", "symmetric_difference_update"},
     };
+    // ⭐ A SLICE TARGET TAKES NO IN-PLACE ROUTE. `a[i:j] += [99]` is
+    // `a[i:j] = a[i:j] + [99]` in CPython -- a slice ASSIGNMENT -- and reading
+    // `a[i:j]` produces a new list, so `a[i:j].extend([99])` extends a copy and
+    // the splice disappears. The old lenient inference hid this by answering
+    // "int" for the slice, which matched no contract in the table; correcting
+    // that answer (TypeSystem.cpp) made `a[bump():3] += [99]` print
+    // `[1, 2, 3, 4, 5]` where CPython gives `[1, 2, 3, 99, 4, 5]`, caught by
+    // `augmented_assignment_evaluates_once`. This is the condition that note
+    // deferred: the route does not want a different TYPE, it wants not to run.
+    bool sliceTargetSubscript = false;
+    if (target->kind == "Subscript")
+      if (const parser::Node *targetSliceNode = ast::node(*target, "slice"))
+        sliceTargetSubscript = targetSliceNode->kind == "Slice";
     llvm::StringRef inPlaceMethod;
-    for (const InPlaceRewrite &rewrite : kInPlaceRewrites)
-      if (op->kind == rewrite.opKind &&
-          exprHasContract(target.get(), rewrite.contract))
-        inPlaceMethod = rewrite.method;
+    if (!sliceTargetSubscript)
+      for (const InPlaceRewrite &rewrite : kInPlaceRewrites)
+        if (op->kind == rewrite.opKind &&
+            exprHasContract(target.get(), rewrite.contract))
+          inPlaceMethod = rewrite.method;
     if (!inPlaceMethod.empty()) {
       parser::NodePtr updateAttr = synth::attribute(target, std::string(inPlaceMethod), statement.range);
       parser::NodePtr updateCall = synth::call(std::move(updateAttr), std::vector<parser::NodePtr>{rhs}, statement.range);
@@ -804,7 +818,7 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         {"MatMult", "__imatmul__"},
     };
     for (const auto &entry : kInPlaceDunders) {
-      if (op->kind != entry.opKind)
+      if (op->kind != entry.opKind || sliceTargetSubscript)
         continue;
       mlir::Type targetType = types.inferExpr(target.get());
       std::optional<MethodBinding> inPlace =

@@ -656,6 +656,82 @@
 # in three places.
 #
 # ============================================================
+# (29) FIXED: A SLICE OF INSTANCES WAS TYPED AS ITS ELEMENT.
+# ============================================================
+#     class V:
+#         def __repr__(self) -> str: return "v"
+#     vs = [V(), V()]
+#     print(vs[0:2])      # printed v; CPython prints [v, v]
+#
+# ⭐ FIXED 2026-08-18. Byte-identical to `print(vs[0])`: the print/repr dispatch
+# asked the LENIENT inference walk, got `V` -- the element -- found `V.__repr__`
+# and inlined it with the slice's list handle as the receiver. The element's
+# `__repr__` ran exactly once for a three-element slice, `vs[0:0]` printed an
+# element where CPython prints `[]`, `list(vs[0:2])` did not compile, and
+# `vs[0:2].k` reached the lowering as a field read.
+#
+# ⭐ THE STRICT WALK WAS ALREADY RIGHT, and the note there said why the lenient
+# one was left wrong: correcting both made `a[bump():3] += [99]` print
+# `[1, 2, 3, 4, 5]` instead of `[1, 2, 3, 99, 4, 5]`. That deferred question has an
+# answer now, and it is not about the type: a slice target's `+=` is a slice
+# ASSIGNMENT in CPython, reading `a[i:j]` produces a NEW list, so the in-place
+# rewrite `a[i:j].extend([99])` extends a copy. The route does not want a
+# different type, it wants not to run -- so it declines slice targets and the
+# lenient walk is corrected for everyone.
+#
+# ⛔ `list[int]` slices always printed correctly, which is why this survived: an
+# int element reaches no source-class method, so the wrong answer selects nothing.
+# It takes a user class to become visible. The same reason the first fix attempt
+# (re-inferring strictly at the print/repr site only) was thrown away: it left
+# `list(vs[0:2])` and the attribute path still wrong, and the root was one answer
+# in one walk.
+#
+# ⛔ Found by a 40-agent parallel sweep over ten domains, then reproduced by hand
+# before touching anything. 43 of 48 programs in the earlier serial sweeps had
+# agreed; this needed a domain (classes) crossed with a construct (slicing) that
+# neither sweep had crossed before.
+#
+# Pinned by tests/golden/cases/slice_of_instances_is_a_list.py, whose
+# augmented-slice sections are the regression guard for the deferred question, and
+# by the existing augmented_assignment_evaluates_once.
+#
+# ============================================================
+# (30) OPEN, MEASURED: PRINTING AN INSTANCE OF A CLASS WITH NO __repr__
+#      INSIDE A CONTAINER ABORTS.
+# ============================================================
+#     class V:
+#         def __init__(self, n: int) -> None:
+#             self.n = n
+#     print([V(1)])
+#     # cf.assert: repr: boxed element has no conforming __repr__
+#     # exit code 134, with an LLVM stack trace
+#
+# CPython prints `[<__main__.V object at 0x...>]`. And Lython already prints
+# `<__main__.V object at 0x...>` for the SCALAR -- `print(V(1))`, `repr(V(1))` and
+# `str(V(1))` all match CPython's form, class name included, through
+# `materializeDefaultObjectRepr`. So the machinery exists and the container's
+# element dispatch cannot reach it: `generateBoxedMethodHook` registers a class id
+# only when `classMethodSymbol(classOp, "__repr__")` finds a symbol, and a class
+# with no `__repr__` anywhere in its MRO has none, so the table has a hole and the
+# element walk asserts.
+#
+# ⛔ A class that defines only `__str__` aborts the same way (the hook is keyed on
+# `__repr__`, and CPython also uses `__repr__` for elements inside a container, so
+# the abort -- not a `__str__` fallback -- is the shape to fix).
+#
+# ⛔ Three ways to close it, and the choice is not obvious:
+#   1. synthesize a per-class default-repr function and register it in the hook --
+#      matches CPython including the class name, and is the most work;
+#   2. fall back to `LyObject_BoxedRepr`'s existing default arm -- one edit in
+#      builtins.mlir, but its prefix is the generic `<object object at 0x`, so the
+#      class NAME would be wrong, which is a silent wrong answer;
+#   3. refuse at emit when the element contract is statically a source class with
+#      no `__repr__` -- the earliest static boundary, and it rejects a program
+#      CPython runs.
+# Not shipped: an abort is worse than all three, but picking between them is the
+# feature-boundary question this file already records.
+#
+# ============================================================
 # (28) FIXED: `C.__name__`. AND WHAT IT MEASURED ABOUT THE TYPE-OBJECT SURFACE.
 # ============================================================
 #     class C: pass

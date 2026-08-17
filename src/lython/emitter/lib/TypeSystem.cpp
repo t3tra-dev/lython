@@ -2851,7 +2851,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     // finding what the route actually needs, which is a separate question
     // from the one this fixes.
     if (const parser::Node *sliceNode = ast::node(*node, "slice");
-        strict && sliceNode && sliceNode->kind == "Slice") {
+        sliceNode && sliceNode->kind == "Slice") {
       mlir::Type intType = this->intType();
       mlir::Type widened = widenLiteral(container);
       CallInferenceResult sliced = inferMethodCallWithEvidence(
