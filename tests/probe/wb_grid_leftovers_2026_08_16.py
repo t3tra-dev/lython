@@ -678,8 +678,33 @@
 # The precedent is the module-global container, which was closed the same way it
 # would have to be here: give it a CELL and let the reads hand back the handle
 # (`16c2b736 feat(globals): a container module global has a cell, because the
-# handle is what a cell holds`). A class attribute needs one cell per
-# class+name, created where the class is emitted.
+# handle is what a cell holds`).
+#
+# ⭐ THE MECHANISM ALREADY EXISTS AND IS ONE PREDICATE AWAY -- and the predicate
+# is not the whole change. `EmitterClasses.cpp` has `classAttrSlots`: "attributes
+# of main-module classes whose widened type has module-global cell storage become
+# slot-backed (reads and writes go through the cells; the initializer expression
+# is no longer restricted to constants). Container-typed attributes stay on the
+# constant channel: their storage cells would go stale against reallocation, the
+# same reason collectModuleGlobals excludes them."
+#
+# ⛔ THAT REASON IS STALE -- `collectModuleGlobals` does NOT exclude containers
+# any more ("Every contract gets a cell; the file header has the measurement that
+# replaced the container exclusion"), because the growth writes THROUGH the
+# handle. But widening the `storable` predicate to list/dict/set/tuple was tried
+# on 2026-08-17 and does not land:
+#
+#   - the runtime lib stops building: `stackguard_support.py:96` becomes
+#     "runtime lib module must not run module-level code; only imports and
+#     function definitions are allowed", because a slot-backed attribute needs an
+#     initialization statement and a runtime-internal module may not have one;
+#   - and the user programs still refuse, so the READ path does not consult the
+#     slots for these -- `lowerAttrGet`'s constant channel is still what answers.
+#
+# So it is three pieces: the predicate, an initialization site that the
+# runtime-lib rule allows (or an exemption for those modules), and the read path
+# learning the slot. Four attempts, four different walls; recorded so the fifth
+# starts past them.
 #
 import math
 
