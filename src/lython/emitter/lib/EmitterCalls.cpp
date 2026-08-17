@@ -1216,7 +1216,59 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           return emitNone(expr);
         }
 
-        CallOperands operands = emitCallOperands(expr);
+        // ⭐ A GENERATOR ARGUMENT TO A MANIFEST METHOD IS MATERIALIZED. Every
+        // manifest method that takes an iterable consumes the whole of it --
+        // `join`, `extend`, `update` -- and none of them takes a generator's
+        // physical shape:
+        //
+        //     "-".join(g())
+        //     # cannot adapt types.GeneratorType to runtime input 2 of
+        //     # builtins.str.join
+        //
+        // `"-".join(list(g()))` and `"-".join(x for x in xs)` (the genexpr
+        // fuses) both worked, so the gap was the generator OBJECT. `list(...)`
+        // is surface that already compiles, and because the callee consumes
+        // everything the rewrite is exact rather than a change of semantics.
+        //
+        // ⛔ Manifest receivers only. A source class's method may hold the
+        // generator and consume it lazily, which is its own business, and
+        // nothing in the manifest does.
+        const parser::Node *methodCallNode = &expr;
+        parser::NodePtr rewrittenCall;
+        if (mlir::isa_and_nonnull<py::ContractType>(
+                types.widenLiteral(receiver.type)))
+          if (const auto *methodArgs = ast::nodeList(expr, "args");
+              methodArgs && !methodArgs->empty()) {
+            std::vector<parser::NodePtr> materialized;
+            bool anyMaterialized = false;
+            for (const parser::NodePtr &argument : *methodArgs) {
+              if (argument && argument->kind != "Starred")
+                if (auto actual = mlir::dyn_cast_if_present<py::ContractType>(
+                        types.widenLiteral(types.inferExpr(argument.get())));
+                    actual &&
+                    actual.getContractName() == "types.GeneratorType") {
+                  materialized.push_back(synth::call(
+                      synth::name(std::string("list"), argument->range),
+                      std::vector<parser::NodePtr>{argument}, argument->range));
+                  anyMaterialized = true;
+                  continue;
+                }
+              materialized.push_back(argument);
+            }
+            if (anyMaterialized) {
+              rewrittenCall = parser::makeNode("Call", expr.range);
+              for (const parser::Field &field : expr.fields) {
+                if (field.name == "args") {
+                  parser::addField(*rewrittenCall, "args",
+                                   std::move(materialized));
+                  continue;
+                }
+                rewrittenCall->fields.push_back(field);
+              }
+              methodCallNode = rewrittenCall.get();
+            }
+          }
+        CallOperands operands = emitCallOperands(*methodCallNode);
         if (!operands.valid) {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, expr.range.start,
