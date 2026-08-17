@@ -1684,6 +1684,31 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   auto attr = ast::string(expr, "attr");
   if (!attr)
     return emitNone(expr);
+  // ⭐ `C.__name__` IS A COMPILE-TIME STRING. It was "attr.get type object has
+  // no static runtime attribute '__name__'", for a user class and for `int`
+  // alike, and the name is the one thing a type object cannot fail to know.
+  //
+  // ⛔ The last dotted component, not the contract name: the contract is
+  // `builtins.int` and CPython's answer is `int`. A user class has no dot and is
+  // its own answer.
+  //
+  // ⛔ Folded here rather than given a runtime attribute, because there is no
+  // type-object surface to hang it on -- `print(int)`, `int is int` and
+  // `C.__class__` are all still refused, and this fold deliberately does not
+  // pretend otherwise.
+  if (*attr == "__name__")
+    if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(object.type))
+      if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+              typeObject.getInstanceType())) {
+        llvm::StringRef qualified = contract.getContractName();
+        llvm::StringRef simple = qualified;
+        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
+          simple = qualified.drop_front(dot + 1);
+        mlir::Type type = types.literal("\"" + simple.str() + "\"");
+        auto constant = py::StrConstantOp::create(
+            builder, loc(expr), type, builder.getStringAttr(simple));
+        return Value{constant.getResult(), type};
+      }
   // Property reads inline the getter (before general attribute inference,
   // which knows nothing about accessor bindings).
   if (std::optional<MethodBinding> property =

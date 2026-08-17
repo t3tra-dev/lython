@@ -2697,6 +2697,24 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (mlir::Type objectType = lenientRecurse(ast::node(*node, "value"))) {
       const py::protocols::Table &table = py::protocols::Table::get(context);
       if (auto attr = ast::string(*node, "attr")) {
+        // ⭐ `C.__name__` is the string constant the emitter folds it to, and
+        // this channel has to say so too. Without it the emitter's fold was
+        // invisible to every consumer that asks the TYPE first: a list of two of
+        // them joined to `list[object]` ("a type-erased `object` value cannot be
+        // stored in a runtime container slot"), because the join is computed from
+        // the inferred element types, not from the emitted values.
+        if (*attr == "__name__")
+          if (auto typeObjectType = mlir::dyn_cast_if_present<py::TypeType>(
+                  widenLiteral(objectType)))
+            if (auto contractType = mlir::dyn_cast_if_present<py::ContractType>(
+                    typeObjectType.getInstanceType())) {
+              llvm::StringRef qualifiedName = contractType.getContractName();
+              llvm::StringRef simple = qualifiedName;
+              if (auto dot = qualifiedName.rfind('.');
+                  dot != llvm::StringRef::npos)
+                simple = qualifiedName.drop_front(dot + 1);
+              return literal("\"" + simple.str() + "\"");
+            }
         if (std::optional<py::protocols::FieldResolution> field =
                 table.resolveFieldContractWithEvidence(widenLiteral(objectType),
                                                        *attr))

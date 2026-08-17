@@ -1,0 +1,9 @@
+Registry
+Base Child
+Child:Base
+int str float bool
+Registry REGISTRY 8 True
+Registry/Child
+Base-Child
+[('Base', 1), ('Child', 2)]
+['Registry', 'Base'] 2 True
