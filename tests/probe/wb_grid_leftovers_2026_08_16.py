@@ -656,6 +656,66 @@
 # in three places.
 #
 # ============================================================
+# (23) FIXED: AN UNBOUND BASE METHOD DID NOT ACCEPT `self`.
+# ============================================================
+#     class Child(Base):
+#         def __init__(self, n: int) -> None:
+#             Base.__init__(self, "c")
+#     # argument 'self' of '__init__' is declared Base and this call gives it
+#     # Child
+#
+# ⭐ FIXED 2026-08-17. `Base.__init__(c, "z")` at module scope worked and
+# `Base.greet(c, "x")` worked, which is what named the cause: by then
+# `py.class @Child` is in the module with its `mro_names`, and inside Child's own
+# method it is not, so the assignability walk found no bases and called a subtype
+# unrelated. The emitter's `classMros` has the hierarchy before any body is
+# emitted; the check reads it when the module cannot answer.
+#
+# ⛔ Still refused, correctly: a base method that assigns a field the BASE does
+# not declare is "class Base has no field 'name'". Fixing the MRO check moved
+# that program from a wrong diagnostic to the right one.
+#
+# Pinned by tests/golden/cases/unbound_base_method_takes_self.py.
+#
+# ============================================================
+# (24) OPEN, LOCALISED: A NARROWED UNION FIELD RETURNED FROM A METHOD.
+# ============================================================
+#     class Opt:
+#         def __init__(self) -> None:
+#             self.value: int | None = None
+#         def get_or(self, default: int) -> int:
+#             v = self.value
+#             if v is None:
+#                 return default
+#             return v            # <-- this
+#     print(Opt().get_or(7))
+#     # error: owned resource from builtin.unrealized_conversion_cast result 0
+#     # reaches function exit without release, transfer, or owned return
+#
+# The measurements that place it (2026-08-17):
+#
+#   the same code as a FREE function taking the object      -> works
+#   passing `c.v` to a free function that narrows           -> works
+#   `return v + 0` / `return str(v)` / `return 0`           -> works
+#   returning a NON-union field (`return self.name`)        -> works
+#   `if v is not None: return v` (arms swapped)             -> same failure
+#   `str | None` instead of `int | None`                    -> same failure
+#
+# So it is not narrowing, not the union, and not the return: it is returning the
+# union field's LANES. A union field is the one shape that still takes the
+# pre-4a lane splice in `lowerAttrSet` ("Union fields are the only shape that
+# reaches it"), so the instance's owned-local marker COVERS the member's lanes --
+# the runtime-lowering dump shows the marker as
+# `(memref<16xi64>, i64, memref<2xi64>, memref<2xi64>, memref<?xi32>)` -- and the
+# non-None arm forwards those very values out as the result. The pass then sees
+# the marker's own values escape and reports the marker unreleased.
+#
+# ⛔ Two fixes, both bigger than a patch: box-front the union field like every
+# other object field (the kernel change the residual path is waiting for), or
+# retain the member where a narrowed union escapes a frame. This is the same
+# family as the recorded `float | int` return, and the same conclusion.
+#
+# ============================================================
 # (22) FIXED: THE LOWERING READ ITS OWN FREED BUNDLE.
 # ============================================================
 #     class Pool:

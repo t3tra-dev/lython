@@ -2854,6 +2854,32 @@ Value ModuleEmitter::emitInlineMethodBody(
       return;
     if (isAssignableWithStaticEvidence(actual, expected, module))
       return;
+    // ⭐ THE EMITTER'S OWN MRO, because the module's may not exist yet. An
+    // unbound base-method call inside a subclass method passes `self`:
+    //
+    //     class Child(Base):
+    //         def __init__(self, n: int) -> None:
+    //             Base.__init__(self, "c")
+    //     # argument 'self' of '__init__' is declared Base and this call gives
+    //     # it Child
+    //
+    // `Base.__init__(c, "z")` at module scope works, and so does
+    // `Base.greet(c, "x")`, because by then `py.class @Child` carries its
+    // `mro_names` and `isAssignableTo` can walk it. Inside Child's own method
+    // the class op is not in the module yet, so the walk finds no bases and
+    // answers "not a subtype" for a subtype. `classMros` is populated before any
+    // body is emitted -- it is what `resolveMroMethod` already reads.
+    //
+    // ⛔ Only for source-defined contracts on both sides. A manifest contract's
+    // assignability is the manifest's business, and `isAssignableTo` is the one
+    // that knows the protocol and subtype relations there.
+    if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
+      if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
+        if (!expectedContract.getContractName().contains('.') &&
+            !actualContract.getContractName().contains('.') &&
+            llvm::is_contained(classMro(actualContract.getContractName()),
+                               expectedContract.getContractName()))
+          return;
     // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
     // class's own methods spell the receiver without its arguments --
     // `def __add__(self, other: "Counter") -> "Counter"` -- and the argument
