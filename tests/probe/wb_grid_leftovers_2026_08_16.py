@@ -655,6 +655,32 @@
 # All three are the union meeting a declared float, which is one question asked
 # in three places.
 #
+# ============================================================
+# (19) A CLASS ATTRIBUTE HOLDING A CONTAINER CANNOT EVEN BE READ.
+# ============================================================
+#     class R:
+#         items: list[str] = []
+#     print(R.items)
+#     # unsupported static class attribute expression for 'items'
+#
+# ⭐ MEASURED BOUNDS, 2026-08-17. The four SCALAR kinds work
+# (`n: int = 0`, `s: str = "a"`, `f: float = 1.5`, `b: bool = True`) and
+# `cls.n += 1` in a classmethod works. Every container refuses -- list, dict and
+# even a `tuple[int, int]` -- on the READ, before any mutation. `R.items = [...]`
+# has its own message ("class static attribute mutation is not supported").
+#
+# The channel is the reason: `classStaticValue` stores the attribute as a
+# compile-time constant EXPRESSION and `lowerAttrGet` re-materializes it per
+# read, with arms for constant.none/bool/int/float/str and nothing else. A
+# container cannot be re-materialized per read, because every read has to be the
+# SAME object -- a mutation through one read must be visible through the next.
+#
+# The precedent is the module-global container, which was closed the same way it
+# would have to be here: give it a CELL and let the reads hand back the handle
+# (`16c2b736 feat(globals): a container module global has a cell, because the
+# handle is what a cell holds`). A class attribute needs one cell per
+# class+name, created where the class is emitted.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible
