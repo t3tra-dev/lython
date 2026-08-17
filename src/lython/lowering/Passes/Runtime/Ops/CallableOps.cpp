@@ -427,8 +427,40 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
   return mlir::success();
 }
 
+// ⭐ THE RECEIVER ARRIVES BY VALUE. It used to be a reference, and the caller's
+// reference points INTO `valueBundles` -- a DenseMap this function inserts into
+// on nearly every path (`bindRetainedEvidenceValue`, `assignObjectBundle`, every
+// evidence demotion). An insertion that rehashes moves the entry, and every use
+// of `receiver` after it read freed memory:
+//
+//     class P:
+//         def __init__(self) -> None:
+//             self.free: list[int] = [1, 2, 3]
+//             self.used: list[int] = []
+//         def take(self) -> int:
+//             v = self.free.pop()          # <-- reported here
+//             self.used.append(v)
+//             return v
+//         def give(self, v: int) -> None:
+//             self.used.remove(v)
+//             self.free.append(v)
+//     p = P(); p.take(); p.give(3); print(p.free, p.used)
+//     # cannot adapt builtins.list to runtime input 0 of builtins.list.__len__
+//     # [values:, expected 'memref<9xi64>']
+//
+// The pop's liveness pin read the dangling receiver and found no physical
+// values. Nothing about the pop was wrong: `p.give`'s two statements and the
+// final print are what pushed the map over a rehash boundary, which is why
+// removing either one, swapping the two fields, or printing only ONE of them
+// made it compile. A defect whose trigger is the number of bundles in the
+// program cannot be localised by reading the failing line.
+//
+// ⛔ Why NOT copy at each use site instead: the hazard is every path in a
+// 600-line function, and it is silent -- freed memory can also read back as a
+// PLAUSIBLE bundle, which is a wrong answer rather than a diagnostic. One copy
+// at the boundary retires the whole class.
 mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
-    py::CallOp op, const RuntimeBundle &receiver, llvm::StringRef methodName) {
+    py::CallOp op, RuntimeBundle receiver, llvm::StringRef methodName) {
   if (receiver.kind == RuntimeBundle::Kind::TypeObject) {
     // Builtin classmethods (bytes.fromhex, ...) are manifest initializers
     // named after the method; the ctypes type-object surface keeps its own

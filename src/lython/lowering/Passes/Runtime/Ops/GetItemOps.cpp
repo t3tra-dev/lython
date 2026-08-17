@@ -1132,9 +1132,17 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerSequenceEvidenceGetItem(
 }
 
 mlir::FailureOr<bool>
-RuntimeBundleLowerer::lowerDictEvidenceGetItem(py::GetItemOp op,
-                                               const RuntimeBundle &container,
-                                               const RuntimeBundle &index) {
+RuntimeBundleLowerer::lowerDictEvidenceGetItem(
+    py::GetItemOp op, const RuntimeBundle &containerRef,
+    const RuntimeBundle &indexRef) {
+  // Copies: this function inserts into `valueBundles` and then keeps reading its
+  // operand bundles, and the caller's arguments are references INTO that
+  // DenseMap -- an insertion that rehashes moves the entry and every later read
+  // is freed memory. Found as a live defect on `lowerBoundMethodCall`'s receiver
+  // (see CallableOps.cpp); these are the rest of the same audit. Neither of
+  // these keys is ever rewritten here, so the copy changes nothing else.
+  RuntimeBundle container = containerRef;
+  RuntimeBundle index = indexRef;
   if (container.contractName() != "builtins.dict" ||
       container.mappingKeys.empty())
     return false;

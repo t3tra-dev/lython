@@ -1250,8 +1250,11 @@ private:
   mlir::LogicalResult emitTracebackFrame(mlir::Operation *op,
                                          bool stashCurrentException = true);
   mlir::LogicalResult lowerCall(py::CallOp op);
+  // BY VALUE, deliberately: `valueBundles` is a DenseMap and this function
+  // inserts into it on nearly every path, which invalidates any reference into
+  // it -- including the one the caller passes. See the definition.
   mlir::LogicalResult lowerBoundMethodCall(py::CallOp op,
-                                           const RuntimeBundle &receiver,
+                                           RuntimeBundle receiver,
                                            llvm::StringRef methodName);
   mlir::LogicalResult
   lowerRuntimeListPop(py::CallOp op, const RuntimeBundle &receiver,

@@ -656,6 +656,61 @@
 # in three places.
 #
 # ============================================================
+# (22) FIXED: THE LOWERING READ ITS OWN FREED BUNDLE.
+# ============================================================
+#     class Pool:
+#         def __init__(self) -> None:
+#             self.free: list[int] = [1, 2, 3]
+#             self.used: list[int] = []
+#         def take(self) -> int:
+#             v = self.free.pop()        # <-- reported here
+#             self.used.append(v)
+#             return v
+#         def give(self, v: int) -> None:
+#             self.used.remove(v)
+#             self.free.append(v)
+#     p = Pool(); p.take(); p.give(3); print(p.free, p.used)
+#     # cannot adapt builtins.list to runtime input 0 of builtins.list.__len__
+#     # [values:, expected 'memref<9xi64>']
+#
+# ⭐ FIXED 2026-08-17, and it is the defect in this file whose LOCATION lies the
+# most. `lowerBoundMethodCall` took its receiver as `const RuntimeBundle &`, the
+# caller passed a reference INTO `valueBundles`, and the function inserts into
+# that DenseMap on nearly every path. A rehash moves the entry; the liveness pin
+# emitted after the pop then read freed memory.
+#
+# ⛔ NEIGHBOURS THAT COMPILED, all of them one edit from the failing program.
+# Each is a bundle-count change, not a semantic one:
+#
+#   drop `self.used.remove(v)` from give                -> compiles
+#   drop `self.free.append(v)` from give                -> compiles
+#   swap those two statements                           -> compiles
+#   declare `used` before `free`                        -> compiles
+#   `self.used: list[int] = [0]` instead of `[]`        -> compiles
+#   `print(p.free)` or `print(p.used)`, not both        -> compiles
+#   never call `p.give`                                 -> compiles
+#   two more classes in the same FILE                   -> compiles
+#
+# The last one is why the golden is small and its shape exact: the first version
+# of tests/golden/cases/two_fields_mutated_in_two_methods.py had three classes
+# and redcheck reported "GREEN <-- cannot be made to fail".
+#
+# ⭐ The general lesson, and the reason this is worth the space: NO AMOUNT OF
+# READING THE REPORTED LINE CAN LOCALISE THIS. What found it was gridding one
+# axis at a time and noticing that every neighbour compiled -- a defect whose
+# trigger is "how many bundles exist" has no cause at the failing statement.
+#
+# An audit for the same mechanism (a `const RuntimeBundle &` parameter that
+# aliases the map, used after an insertion) found six more functions:
+# lowerDictEvidenceGetItem, materializePayloadObjectBundle,
+# materializeObjectBundleForStorage, lowerFunctionTargetCall,
+# lowerSourceGeneratorNext, lowerStaticCtypesCall. None of them rewrites its own
+# operand key, so a local copy is a pure UB fix; all six now copy. ⛔ The audit
+# is not a proof of absence: it only covers parameters spelled
+# `const RuntimeBundle &`, and only where an insertion is syntactically visible
+# in the same function.
+#
+# ============================================================
 # (21) FIXED: A LOCAL STORED INTO A FIELD WAS FREED AT THE STORE.
 # ============================================================
 #     seed = [3, 1, 2]
