@@ -940,28 +940,6 @@ them in.
 # in real code); one statement vs two (inlining the key as a literal is the
 # only thing that helps).
 
-# ⭐ LOCALISED 2026-08-18, cause exact. `postTryLanesAvailable` is
-# `!hasElse && !hasFinally && !usesFinallyCompletion && handlers`, and a `return`
-# ANYWHERE in the statement sets `protectedBodyHasReturn`, which with a non-None
-# return type sets `supportsValueReturnThroughFinally` and therefore
-# `usesFinallyCompletion`. So the post-try lanes -- the only channel that carries
-# a try-body binding to the continuation -- are switched off by the presence of
-# the return, and the name reads as unresolved.
-#
-# That is why the `raise` spelling of the same handler WORKS: `raise` does not set
-# `handlerBodyHasReturn`, the lanes stay on, and the lane carries `n`.
-#
-# ⛔ Publishing the try-end bindings directly is not available: they are SSA
-# values inside the try region and do not dominate the continuation, which is why
-# the lanes exist at all. The fix is to let the post-try lanes coexist with the
-# completion machinery (append them after the completion flags and the return
-# payload) -- result-index accounting in the area this tree's fragile invariants
-# already name, so its own round rather than a patch.
-#
-# ⛔ The storage promotion cannot substitute: it deliberately skips a name NOT
-# bound before the try ("the handler cannot observe a value the body may never
-# have produced"), and `n` is first bound inside it.
-#
 # ==========================================================================
 # [FALSE-REFUSAL] controlflow
 # An `except` handler that ends in `return` is not treated as a terminator, so
@@ -1011,20 +989,30 @@ them in.
 # through leaves `n` unresolved (n4_module_return.py), while assigning in both
 # arms works (r_tryname.py). Statement-count axis: adding `print("skip")`
 # before the `return` changes n
+#
+# ⭐ LOCALISED 2026-08-18, cause exact. `postTryLanesAvailable` is
+# `!hasElse && !hasFinally && !usesFinallyCompletion && handlers`, and a `return`
+# ANYWHERE in the statement sets `protectedBodyHasReturn`, which with a non-None
+# return type sets `supportsValueReturnThroughFinally` and therefore
+# `usesFinallyCompletion`. So the post-try lanes -- the only channel that carries
+# a try-body binding to the continuation -- are switched off by the presence of
+# the return, and the name reads as unresolved.
+#
+# That is why the `raise` spelling of the same handler WORKS: `raise` does not set
+# `handlerBodyHasReturn`, the lanes stay on, and the lane carries `n`.
+#
+# ⛔ Publishing the try-end bindings directly is not available: they are SSA
+# values inside the try region and do not dominate the continuation, which is why
+# the lanes exist at all. The fix is to let the post-try lanes coexist with the
+# completion machinery (append them after the completion flags and the return
+# payload) -- result-index accounting in the area this tree's fragile invariants
+# already name, so its own round rather than a patch.
+#
+# ⛔ The storage promotion cannot substitute: it deliberately skips a name NOT
+# bound before the try ("the handler cannot observe a value the body may never
+# have produced"), and `n` is first bound inside it.
+#
 
-# ⭐ MEASURED 2026-08-18, and the honest part is what it CANNOT be. The loop target
-# is bound inside the body's scope and dropped at the end; making it a carried
-# local would publish the last iteration's value, which is CPython's answer -- for
-# a loop that RAN. `for i in []: pass` then `print(i)` is a NameError in CPython,
-# and a static binding cannot express "bound only if the loop ran" without a
-# definedness flag, which is the cell-with-a-sentinel feature this tree does not
-# have. Binding it unconditionally would print a seed value where CPython raises:
-# a silent wrong answer traded for a false refusal.
-#
-# ⛔ The sound SUBSET is a name already bound before the loop (`i = 0;
-# for i in ...`), which the carried-local machinery already handles as an ordinary
-# rebind -- and which is not the idiom that motivates the finding.
-#
 # ==========================================================================
 # [FALSE-REFUSAL] controlflow
 # A for-loop target is not readable after the loop finishes; `for i in ...`
@@ -1069,6 +1057,20 @@ them in.
 # `i = 0` and never reads a for-target after its loop. Break axis: present
 # with and without `break` in the body. This is the idiom `for i in ...: if
 # ...: break` / `return i`, and also bre
+#
+# ⭐ MEASURED 2026-08-18, and the honest part is what it CANNOT be. The loop target
+# is bound inside the body's scope and dropped at the end; making it a carried
+# local would publish the last iteration's value, which is CPython's answer -- for
+# a loop that RAN. `for i in []: pass` then `print(i)` is a NameError in CPython,
+# and a static binding cannot express "bound only if the loop ran" without a
+# definedness flag, which is the cell-with-a-sentinel feature this tree does not
+# have. Binding it unconditionally would print a seed value where CPython raises:
+# a silent wrong answer traded for a false refusal.
+#
+# ⛔ The sound SUBSET is a name already bound before the loop (`i = 0;
+# for i in ...`), which the carried-local machinery already handles as an ordinary
+# rebind -- and which is not the idiom that motivates the finding.
+#
 
 # ==========================================================================
 # [FALSE-REFUSAL] dataflow
