@@ -284,6 +284,33 @@ bool containsBreakOrContinueStatement(
   return false;
 }
 
+bool containsContinueStatement(
+    const std::vector<parser::NodePtr> *statements) {
+  if (!statements)
+    return false;
+  for (const parser::NodePtr &statement : *statements) {
+    if (!statement)
+      continue;
+    if (statement->kind == "Continue")
+      return true;
+    if (statement->kind == "FunctionDef" ||
+        statement->kind == "AsyncFunctionDef" ||
+        statement->kind == "ClassDef" || statement->kind == "For" ||
+        statement->kind == "AsyncFor" || statement->kind == "While")
+      continue;
+    if (containsContinueStatement(ast::nodeList(*statement, "body")) ||
+        containsContinueStatement(ast::nodeList(*statement, "orelse")) ||
+        containsContinueStatement(ast::nodeList(*statement, "finalbody")))
+      return true;
+    if (const auto *handlers = ast::nodeList(*statement, "handlers"))
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler &&
+            containsContinueStatement(ast::nodeList(*handler, "body")))
+          return true;
+  }
+  return false;
+}
+
 bool containsObjectTop(mlir::Type type, const TypeSystem &types) {
   if (!type)
     return true;

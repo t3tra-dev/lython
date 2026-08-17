@@ -54,6 +54,10 @@ bool insertionBlockTerminated(const mlir::OpBuilder &builder);
 bool containsReturnStatement(const std::vector<parser::NodePtr> *statements);
 bool containsBreakOrContinueStatement(
     const std::vector<parser::NodePtr> *statements);
+// `continue` only. The break edge and the continue edge leave a try in
+// different directions, and one of them scales where the other does not --
+// see the nested-loop guard in EmitterExceptions.cpp.
+bool containsContinueStatement(const std::vector<parser::NodePtr> *statements);
 void collectAssignedNameTargets(const parser::Node *node,
                                 llvm::StringSet<> &names);
 void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names);

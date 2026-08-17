@@ -656,6 +656,104 @@
 # in three places.
 #
 # ============================================================
+# (28) FIXED: `C.__name__`. AND WHAT IT MEASURED ABOUT THE TYPE-OBJECT SURFACE.
+# ============================================================
+#     class C: pass
+#     print(C.__name__)
+#     # attr.get type object has no static runtime attribute '__name__'
+#
+# ⭐ FIXED 2026-08-17 as a fold to a string constant -- the last dotted component
+# of the contract name, so `int` answers "int" and not "builtins.int".
+#
+# ⭐ TWO CHANNELS, and the first attempt only did one. The emitter's fold was
+# invisible to every consumer that asks the TYPE first: `[C.__name__,
+# Base.__name__]` joined to `list[object]` ("a type-erased `object` value cannot
+# be stored in a runtime container slot"), because a literal's join is computed
+# from the inferred element types and not from the emitted values. Same shape as
+# the three-channel note on `TypeSystem::inferExpr` elsewhere in this file: an
+# emitter fold with no inference arm is half a feature.
+#
+# ⛔ THE REST OF THE TYPE-OBJECT SURFACE IS STILL REFUSED, measured 2026-08-17:
+#
+#   print(int)               -> runtime method receiver has no concrete contract
+#   int is int               -> `is` requires reference-typed operands that
+#                               resolve statically
+#   c.__class__              -> class C has no field '__class__'
+#   type(x)                  -> unresolved name 'type'
+#   list.__name__            -> unresolved name 'list'  (the CONTAINER builtins
+#                               are not bound as names at all; int/str/float/bool
+#                               are)
+#
+# So `type(x) is C`, which is what the sweep found, needs a type-object VALUE and
+# not another fold. Recorded rather than half-built.
+#
+# Pinned by tests/golden/cases/class_name_attribute.py.
+#
+# ============================================================
+# (27) FIXED: break/continue INSIDE A TRY, IN A LOOP THAT CARRIES A LOCAL.
+# ============================================================
+#     total = 0
+#     for s in ["1", "x", "3"]:
+#         try:
+#             total += int(s)
+#         except ValueError:
+#             continue
+#     # break/continue through try/finally in a loop with carried (reassigned)
+#     # locals is not implemented yet
+#
+# ⭐ FIXED 2026-08-17. That is the canonical parse-and-skip loop; the refusal
+# covered every accumulator loop with a jump inside a try. The SAME statement
+# without the accumulator always compiled, which is what named the piece: the
+# completion branches emitted after `py.try` forward the loop's carried operands,
+# and in SSA they could only forward pre-try values.
+#
+# The fix is that they stop reading SSA. A local the try body rebinds is already
+# promoted to an R6 cell for the extent of the statement -- and the promotion was
+# extended to loop-carried names earlier, with its own note -- so the branches
+# LOAD the cell. Two pieces:
+#
+#   1. the completion branches load and forward (EmitterExceptions.cpp)
+#   2. the operand count is asked of the TARGET, not of the carried set: both
+#      completion checks are emitted whenever either jump appears, and a loop with
+#      no `break` gives its after-block no arguments. Without that, every
+#      `continue`-only program failed with "branch has 1 operands for successor
+#      #0, but target block has 0".
+#
+# Measured: 12 shapes (for/while x break/continue x body/handler/finally), 5 with
+# an OWNED accumulator (str and list), all agreeing with python3.14 and all
+# net 0 allocs / 0 B on the leak gate.
+#
+# ⛔ `continue` inside a `finally` behaves correctly but CPython 3.14 prints
+# "SyntaxWarning: 'continue' in a 'finally' block" and Lython prints nothing, so
+# that spelling is out of the golden. Lython emits no SyntaxWarnings at all --
+# one item, not one per warning.
+#
+# ⛔ TWO NESTED SHAPES STAY REFUSED, and finding them is the reason to grid a fix
+# outward as well as inward. Both were refused before this fix; what changed is
+# that the message names the shape:
+#
+#   nested loops, `total` carried by BOTH, `continue` in the inner try
+#       -> "ownership CFG exploration exceeded 20000 states" on the first cut of
+#          this fix. A resource limit is not a diagnostic, and the shape was a
+#          clean refusal before, so it is refused again -- by a guard that asks
+#          for a CONTINUE and for two or more carriers, because the three
+#          neighbours all compile: the same program with `break`, an accumulator
+#          carried by the inner loop alone, and a `continue` outside the try.
+#
+#   nested try whose OUTER arm has a finally
+#       -> the inner try promotes the name, the outer statement sees it already
+#          rebound and does not, and the outer completion branch has nothing to
+#          forward. This is what reaches the residue guard below.
+#
+# ⛔ The residue guard was written for in-place mutation receivers, and those do
+# NOT reach it: four attempts (`xs.append(v)`, `xs += [v]`, each with and without
+# `xs = xs + [v]` to force the carry) all compiled, because an in-place mutation
+# is not a reassignment and the name never enters the carried set. The nested-try
+# shape above is what reaches it.
+#
+# Pinned by tests/golden/cases/loop_control_inside_try.py.
+#
+# ============================================================
 # (25) FIXED: `assert`.
 # ============================================================
 #     assert n > 0, "must be positive"

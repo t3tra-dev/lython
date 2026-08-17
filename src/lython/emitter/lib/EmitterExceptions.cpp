@@ -474,17 +474,34 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         "not implemented yet"});
     return;
   }
-  if (supportsLoopControlThroughFinally &&
-      !loopControlContexts.back().carriedLocals.empty()) {
-    // The break/continue completion branches after the op cannot see the try
-    // region's SSA values, so they could only forward STALE pre-try carried
-    // values — reject instead of silently mis-executing.
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, statement.range.start,
-        "break/continue through try/finally in a loop with carried "
-        "(reassigned) locals is not implemented yet"});
-    return;
-  }
+  // ⭐ A CARRIED LOCAL IS NO LONGER A BLANKET REFUSAL. This used to reject the
+  // whole statement:
+  //
+  //     total = 0
+  //     for s in ["1", "x", "3"]:
+  //         try:
+  //             total += int(s)
+  //         except ValueError:
+  //             continue
+  //     # break/continue through try/finally in a loop with carried
+  //     # (reassigned) locals is not implemented yet
+  //
+  // which is the canonical parse-and-skip loop, and every accumulator loop with
+  // a `break` inside a `try` with it. The reason given was that the completion
+  // branches after the op cannot see the try region's SSA values, so they could
+  // only forward stale pre-try values. True of SSA -- and the statement no
+  // longer carries such a name in SSA: a local the body rebinds is promoted to
+  // an R6 cell for the extent of the statement, and the promotion now covers
+  // loop-carried names too. The completion branches LOAD the cell (see
+  // `carriedCompletionOperands` below), so what they forward is the value the
+  // body last stored.
+  //
+  // What is still refused is the residue, and it is checked where the answer is
+  // known -- after the promotion set is computed, below. A carried local that is
+  // rebound inside the statement and NOT promoted (a structural mutation
+  // receiver, `xs += other` on a container) keeps its rebind in a `values[name]`
+  // write from a block inside the try region, and forwarding that from after the
+  // op is a dominance violation rather than a stale answer.
   if ((tryBodyHasLoopControl || handlerBodyHasLoopControl) &&
       !supportsLoopControlThroughFinally) {
     diagnostics.push_back(parser::Diagnostic{
@@ -690,6 +707,95 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       laneRequiredNames.erase(entry.getKey());
     for (const auto &entry : augAssignTargets)
       laneRequiredNames.erase(entry.getKey());
+    // The residue of the carried-local refusal lifted above: a name an
+    // enclosing loop carries, rebound somewhere in this statement, that the
+    // promotion above declined. Its rebind lives in a `values[name]` write from
+    // a block inside the try region, so a completion branch after the op cannot
+    // forward it at all -- not stale, undefined. Refuse here, where the
+    // promotion set is known, rather than refusing every carried local up front.
+    //
+    // ⛔ Reached by a NESTED try whose outer arm has a finally: the inner try
+    // promotes the name, the outer statement sees it already rebound and does
+    // not, and the outer completion branch then has nothing to forward. The
+    // in-place-mutation shapes this was written for do NOT reach it -- four
+    // attempts (`xs.append(v)`, `xs += [v]`, each with and without
+    // `xs = xs + [v]` to force the carry) all compiled, because an in-place
+    // mutation is not a reassignment and the name never enters the carried set.
+    if (supportsLoopControlThroughFinally) {
+      llvm::StringSet<> promoted;
+      for (const std::string &name : storagePromotedNames)
+        promoted.insert(name);
+      // ⭐ A CONTINUE EDGE OUT OF AN INNER LOOP whose accumulator the OUTER loop
+      // carries too does not scale: the ownership walk explores the promoted
+      // cell's alias states across both back edges and gives up --
+      //
+      //     total = 0
+      //     for a in [1, 2]:
+      //         for b in [10, 20]:
+      //             try:
+      //                 if b == 20:
+      //                     continue
+      //                 total += a * b
+      //             except ValueError:
+      //                 pass
+      //     # ownership CFG exploration exceeded 20000 states
+      //
+      // which is a resource limit, not something a reader can act on, and the
+      // shape was a clean refusal before this fix. So it stays refused, with a
+      // message that names the shape.
+      //
+      // ⛔ CONTINUE only, and one loop only, both measured: the same program with
+      // `break` compiles (the break edge leaves the inner loop instead of
+      // re-entering it), an accumulator carried by the inner loop ALONE compiles,
+      // and a `continue` outside the try compiles. Refusing any of those three
+      // would give back ground this fix just took.
+      bool continueCrossesTry =
+          containsContinueStatement(ast::nodeList(statement, "body")) ||
+          containsContinueStatement(finalbody);
+      if (handlers)
+        for (const parser::NodePtr &handler : *handlers)
+          if (handler)
+            continueCrossesTry =
+                continueCrossesTry ||
+                containsContinueStatement(ast::nodeList(*handler, "body"));
+      if (continueCrossesTry) {
+        for (const std::string &name : storagePromotedNames) {
+          unsigned carriers = 0;
+          for (const LoopControlContext &context : loopControlContexts)
+            for (const CarriedLoopLocal &carried : context.carriedLocals)
+              if (carried.name == name)
+                ++carriers;
+          if (carriers < 2)
+            continue;
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement.range.start,
+              "`continue` through this try would carry local '" + name +
+                  "', which " + std::to_string(carriers) +
+                  " enclosing loops each carry, and the ownership walk does not "
+                  "scale to that shape. Accumulate into a local of the inner "
+                  "loop and add it to '" +
+                  name + "' after the inner loop, or use `break`"});
+          return;
+        }
+      }
+      for (const LoopControlContext &context : loopControlContexts)
+        for (const CarriedLoopLocal &carried : context.carriedLocals) {
+          if (!reboundInBody.contains(carried.name) ||
+              promoted.contains(carried.name))
+            continue;
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement.range.start,
+              "break/continue through this try would carry local '" +
+                  carried.name +
+                  "' out of the loop, and this statement rebinds it in a way "
+                  "that cannot leave the try region (an in-place container "
+                  "mutation, or `" +
+                  carried.name +
+                  " += ...` on a container). Move the mutation out of the try, "
+                  "or bind its result to a new name inside the block"});
+          return;
+        }
+    }
     for (const std::string &name : storagePromotedNames) {
       Value cell = emitCellAlloc(statement, values.find(name)->second);
       if (!isCellContract(cell.type))
@@ -1549,10 +1655,46 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                                      breakBlock, mlir::ValueRange{},
                                      afterBreakCheck, mlir::ValueRange{});
 
+      // ⭐ THE CELL, not the pre-try SSA value. While the promotion stands a
+      // carried name resolves to its cell, so the operands this edge owes the
+      // loop are loads emitted in THIS block -- which is what makes
+      // `total += int(s)` inside a try with `except: continue` representable at
+      // all. The binding is put back afterwards because the statement is not
+      // over: the else body and the finally dispatch still read through the cell.
+      auto carriedCompletionOperands =
+          [&](mlir::Block *target) -> llvm::SmallVector<mlir::Value, 4> {
+        // ⛔ Asked of the TARGET, not of the carried set. Both completion checks
+        // are emitted whenever either jump appears, so a `continue`-only
+        // statement still gets a break branch -- and a loop with no `break`
+        // gives its after-block no arguments (`breakForwardsCarried`). Forwarding
+        // the carried set there was "branch has 1 operands for successor #0, but
+        // target block has 0". The branch is dead, so emitting no operands and no
+        // refcount traffic for it is also the honest shape.
+        if (!target || target->getNumArguments() == 0)
+          return {};
+        const LoopControlContext &loop = loopControlContexts.back();
+        llvm::SmallVector<std::pair<std::string, Value>, 4> restore;
+        for (const CarriedLoopLocal &carried : loop.carriedLocals) {
+          auto bound = values.find(carried.name);
+          if (bound == values.end() || !isCellContract(bound->second.type))
+            continue;
+          restore.emplace_back(carried.name, bound->second);
+          values[carried.name] = emitCellLoad(statement, bound->second);
+        }
+        llvm::SmallVector<mlir::Value, 4> operands =
+            loopCarriedBranchOperands(statement, loop, target);
+        for (const auto &entry : restore)
+          values[entry.first] = entry.second;
+        return operands;
+      };
+
       builder.setInsertionPointToStart(breakBlock);
       discardInactiveReturnPayload();
-      mlir::cf::BranchOp::create(builder, loc(statement),
-                                 loopControlContexts.back().breakTarget);
+      {
+        mlir::Block *target = loopControlContexts.back().breakTarget;
+        mlir::cf::BranchOp::create(builder, loc(statement), target,
+                                   carriedCompletionOperands(target));
+      }
 
       builder.setInsertionPointToStart(afterBreakCheck);
       mlir::cf::CondBranchOp::create(builder, loc(statement), continueFlag,
@@ -1561,8 +1703,11 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
 
       builder.setInsertionPointToStart(continueBlock);
       discardInactiveReturnPayload();
-      mlir::cf::BranchOp::create(builder, loc(statement),
-                                 loopControlContexts.back().continueTarget);
+      {
+        mlir::Block *target = loopControlContexts.back().continueTarget;
+        mlir::cf::BranchOp::create(builder, loc(statement), target,
+                                   carriedCompletionOperands(target));
+      }
 
       builder.setInsertionPointToStart(afterContinueCheck);
     }
