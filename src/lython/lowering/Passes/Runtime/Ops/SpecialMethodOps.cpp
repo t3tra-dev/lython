@@ -1371,7 +1371,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
   bool sequenceContainer = container.kind == RuntimeBundle::Kind::Object &&
                            (container.contractName() == "builtins.list" ||
                             container.contractName() == "builtins.tuple");
-  if (sequenceContainer && !container.sequenceElementBundles.empty()) {
+  // ⭐ A SECOND HOLDER'S MUTATION IS NOT IN THE EVIDENCE, so a shared sequence
+  // probes the payload like a runtime one. `b = Bag(seed); b.xs[0] = 9;
+  // print(9 in seed, 3 in seed)` answered `False True` -- the pre-store slots,
+  // constant-folded. The `[i]` read side of this is in GetItemOps.cpp, with the
+  // measurements and the reason the evidence is kept rather than dropped.
+  if (sequenceContainer && !container.sequenceElementBundles.empty() &&
+      !container.sharedWithHolder) {
     // Constant-fold evidence membership when every element compares
     // statically; otherwise probe the published payload at runtime.
     bool allKnown = true;

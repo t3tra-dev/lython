@@ -17,8 +17,9 @@
 #
 # The mark for this already existed and was already set at every absorption
 # (`sharedWithHolder`, set when a container goes into a literal, a slot or a
-# field). Nothing consulted it on the READ side. It does now: a list with a
-# second holder answers `[i]` from the payload.
+# field). Nothing consulted it on the READ side. It does now, on all three read
+# paths that had a compile-time answer: `[i]` on a sequence, `d[k]` for a
+# literal key, and `x in xs`.
 #
 # Why this needs to run rather than assert on a diagnostic: three of the four
 # shapes printed a plausible number. The list itself printed correctly in every
@@ -104,6 +105,47 @@ s8 = [3, 1, 2]
 by_name = {"a": s8}
 by_name["a"][1] = 9
 print(s8[1], s8)
+
+
+# --- a dict, whose LITERAL-KEY reads had the same hole --------------------
+# `d[k]` for a literal key answers from the recorded keys, so a key ADDED
+# through the other name was not among them: this raised KeyError.
+class Box:
+    def __init__(self, d: dict[str, int]) -> None:
+        self.d: dict[str, int] = d
+
+
+d1 = {"a": 1}
+x1 = Box(d1)
+x1.d["a"] = 9
+print(d1["a"], sorted(d1.items()))
+
+d2 = {"a": 1}
+x2 = Box(d2)
+x2.d["z"] = 5
+print(d2["z"], len(d2), sorted(d2.items()))
+
+d3 = {"a": 1}
+x3 = Box(d3)
+x3.d.update({"a": 9, "q": 4})
+print(d3["a"], d3["q"], sorted(d3.items()))
+
+d4 = {"a": 1}
+holder3 = [d4]
+holder3[0]["a"] = 9
+print(d4["a"], d4.get("a"), "a" in d4)
+
+
+# --- membership, which constant-folded against the pre-store slots ---------
+s9 = [3, 1, 2]
+b9 = Bag(s9)
+b9.xs[0] = 9
+print(9 in s9, 3 in s9, 1 in s9)
+
+s10 = [3, 1, 2]
+b10 = Bag(s10)
+b10.xs.append(4)
+print(4 in s10, len(s10))
 
 
 # --- THE CONTROL: an unaliased list still reads from its evidence ----------

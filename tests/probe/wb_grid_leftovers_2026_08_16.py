@@ -656,6 +656,48 @@
 # in three places.
 #
 # ============================================================
+# (21) FIXED: A LOCAL STORED INTO A FIELD WAS FREED AT THE STORE.
+# ============================================================
+#     seed = [3, 1, 2]
+#     b = Bag(seed)            # __init__ does self.xs = xs
+#     for v in seed:           # SIGSEGV
+#     [v for v in seed]        # []
+#     max(seed)                # ValueError: max() iterable argument is empty
+#     while i < 3: print(len(seed))   # 0 0 0
+#
+# ⭐ FIXED 2026-08-17. A use-after-free, and the most valuable thing about it is
+# how it hid. The field store retains for the slot and releases the value's own
+# token -- correct for a temporary, since the two cancel and the slot inherits
+# the single reference. For a local the caller keeps reading, the entity is freed
+# at the store, and the read finds whatever the NEXT allocation wrote there. So:
+#
+#   `print(len(seed))` at module scope right after the store  -> 3   (nothing
+#                                                                    allocated)
+#   `print(len(seed), len(b.xs))`                             -> 3 3
+#   a later `print(b.xs)` anywhere after the loop             -> whole program
+#                                                                right
+#   the same read with an allocation in between               -> 0
+#
+# Three of those four make the defect invisible, and two of them are what you
+# would naturally write to probe it. ⭐ THE PROBE THAT FOUND IT was the exit
+# code: rc=139 on `for v in seed`, which no amount of stdout-diffing sees.
+#
+# ⛔ The test is "does this store dominate a use of the value", asked on the
+# PY-LEVEL operand. Asking the bundle's physical values answers "nothing
+# outlives this" for every shape above: the walk lowers in program order, so a
+# later read is still an unlowered `py.len` and the handle has no uses yet.
+# Measured -- the first version of the fix used physicalValues() and changed
+# nothing at all.
+#
+# The read side of the same alias (12 shapes) needed `sharedWithHolder` on three
+# more read paths: `d[k]` for a literal key (KeyError for a key added through the
+# other name) and `x in xs` (constant-folded against the pre-store slots), on top
+# of the sequence `[i]` from (20).
+#
+# Pinned by tests/golden/cases/field_store_keeps_the_local_alive.py and the
+# extended mutation_through_an_alias.py.
+#
+# ============================================================
 # (20) FIXED: STRUCTURAL MUTATION THROUGH A NON-LOCAL RECEIVER,
 #      AND THE ALIAS READ UNDER IT.
 # ============================================================

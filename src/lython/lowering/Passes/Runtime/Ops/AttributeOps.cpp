@@ -4,6 +4,7 @@
 #include "Runtime/ABI/BoxLayout.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 
 namespace py::lowering {
 
@@ -546,6 +547,58 @@ mlir::LogicalResult RuntimeBundleLowerer::promoteInteriorViewForTransfer(
 // already reallocated. `writeBackFieldAlias` reached exactly one combination --
 // an evidence-backed list one level below a field -- and every other
 // (container kind x depth x acquisition path) silently went without.
+// ⭐ A STORE INTO A SLOT IS NOT THE SOURCE'S DEATH when the source is still
+// read afterwards. `self.xs = xs` retains for the slot and then releases the
+// value's own token, which is right for a temporary (`self.xs = [1, 2, 3]`):
+// the two cancel and the slot inherits the one reference. When the source is a
+// LOCAL the caller keeps reading, the release is premature, and every later
+// read through that name is a use-after-free:
+//
+//     seed = [3, 1, 2]
+//     b = Bag(seed)          # __init__ does self.xs = xs
+//     i = 0
+//     while i < 3:
+//         print(len(seed))   # printed 0 0 0; CPython prints 3 3 3
+//         i += 1
+//
+// `for v in seed` over the same list SIGSEGV'd, `[v for v in seed]` answered
+// `[]`, and `max(seed)` raised "max() iterable argument is empty" -- all three
+// are len-then-index. It reads as intact whenever nothing allocates between the
+// release and the read, which is why `print(len(seed))` at module scope, or a
+// second read through the field in the same statement, made it look fine.
+//
+// So ask whether the value has a use this store DOMINATES. Dominance rather
+// than block membership: a read in a loop body or a branch arm is a later use
+// even though it is not in this block, and that is the shape that failed.
+//
+// ⛔ Why NOT keep the release and re-root the local's binding on the slot's
+// reference: the slot's reference dies with the OBJECT, and the local outliving
+// the object is the ordinary case (`b = Bag(seed)` inside a function, `seed`
+// returned). Skipping the release leaves the frame group with its own token and
+// the exit release the insertion pass already plans for it.
+//
+// ⛔ The PY-level operand, not the bundle's physical values. The walk lowers in
+// program order, so a later read is still an unlowered `py.len` / `py.getitem`
+// over the same py value -- the physical handle has no uses past this point yet,
+// and asking it answered "nothing outlives this" for every shape above.
+bool RuntimeBundleLowerer::storedSourceOutlivesStore(mlir::Operation *op,
+                                                     mlir::Value source) {
+  if (!source)
+    return false;
+  mlir::Operation *function = op->getParentOfType<mlir::func::FuncOp>();
+  if (!function)
+    return false;
+  mlir::DominanceInfo dominance(function);
+  for (mlir::OpOperand &use : source.getUses()) {
+    mlir::Operation *user = use.getOwner();
+    if (user == op)
+      continue;
+    if (dominance.properlyDominates(op, user))
+      return true;
+  }
+  return false;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::rebindMutatedContainer(
     mlir::Operation *op, const RuntimeBundle &receiver, mlir::ValueRange values,
     RuntimeBundle &rebound) {
@@ -1420,7 +1473,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
       releaseOwnedSource =
           source->kind == RuntimeBundle::Kind::Object &&
           source->objectValue.ownership == ownership::OwnershipKind::Own &&
-          !source->physicalValues().empty();
+          !source->physicalValues().empty() &&
+          !RuntimeBundleLowerer::storedSourceOutlivesStore(op, op.getValue());
     }
     mlir::FailureOr<RuntimeBundle> stored =
         RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(op, box, *value,

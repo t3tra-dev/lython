@@ -193,6 +193,8 @@ private:
                                        unsigned fieldIndex);
   mlir::LogicalResult writeBackFieldAlias(mlir::Operation *op,
                                           const RuntimeBundle &updatedField);
+  static bool storedSourceOutlivesStore(mlir::Operation *op,
+                                        mlir::Value source);
   mlir::LogicalResult rebindMutatedContainer(mlir::Operation *op,
                                              const RuntimeBundle &receiver,
                                              mlir::ValueRange values,

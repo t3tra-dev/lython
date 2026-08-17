@@ -1506,7 +1506,24 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
   // Evidence-backed dicts qualify only for RUNTIME keys (an int variable, a
   // frozenset): a literal key stays on the evidence tier below, which owns
   // the literal-key semantics (and this runtime path runs first).
-  if (container.mappingEvidenceBacked || !container.mappingKeys.empty()) {
+  //
+  // ⭐ UNLESS A SECOND HOLDER CAN MUTATE IT, and then even a literal key comes
+  // from the payload. This is the mapping half of `sharedWithHolder`'s read
+  // side; the sequence half is in lowerRuntimeSequenceGetItem, with the
+  // measurements. Same four shapes, same silence:
+  //
+  //     seed = {"a": 1}
+  //     b = Bag(seed)          # self.d = d -- one object, two names
+  //     b.d["a"] = 9
+  //     print(seed["a"])       # printed 1; CPython prints 9
+  //     b.d["z"] = 5
+  //     print(seed["z"])       # KeyError; CPython prints 5
+  //
+  // The literal-key semantics this defers to are exactly what goes wrong: the
+  // evidence tier answers a literal key from the keys it recorded, and a key
+  // ADDED through the other name is not among them.
+  if ((container.mappingEvidenceBacked || !container.mappingKeys.empty()) &&
+      !container.sharedWithHolder) {
     std::optional<std::string> literalKey =
         RuntimeBundleLowerer::keywordNameFromValue(op.getIndex());
     if (!literalKey && index.literalText)
