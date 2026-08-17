@@ -698,6 +698,10 @@ private:
                                                   Value receiver,
                                                   llvm::StringRef dunder,
                                                   bool &refused);
+  // Adopts a declared container type for an argument that came back with
+  // erased arguments -- the `set()` spelling (EmitterClasses.cpp).
+  Value adoptDeclaredContainer(Value value, mlir::Type declared,
+                               const parser::Node &anchor);
   Value emitInlineMethodCall(const parser::Node &expr, Value receiver,
                              const MethodBinding &method);
   Value emitInlineMethodBody(const parser::Node &anchor, Value receiver,

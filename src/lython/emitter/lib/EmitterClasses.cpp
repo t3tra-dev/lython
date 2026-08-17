@@ -2465,11 +2465,77 @@ Value ModuleEmitter::emitInlineOperatorCall(const parser::Node &anchor,
                               positional, keywords);
 }
 
+// ⛔ The CONSTRUCTOR spelling of an empty container needs the coercion as well
+// as the expectation, and a literal does not. `set()` is a call whose result
+// type comes from the callee contract, so the expectation reaches the emission
+// and the value still comes back `set[object]` -- the same reason AnnAssign has
+// always coerced. Only an erased container of the SAME contract is adopted: a
+// genuinely different type is the declared-parameter check's business.
+Value ModuleEmitter::adoptDeclaredContainer(Value value, mlir::Type declared,
+                                            const parser::Node &anchor) {
+  auto actual = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(value.type));
+  auto expected = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(declared));
+  if (!actual || !expected ||
+      actual.getContractName() != expected.getContractName() ||
+      actual.getArguments().empty() ||
+      actual.getArguments().size() != expected.getArguments().size())
+    return value;
+  if (!llvm::all_of(actual.getArguments(), [&](mlir::Type argument) {
+        return types.widenLiteral(argument) == types.object();
+      }))
+    return value;
+  return coerceValue(value, declared, anchor);
+}
+
 Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
                                           Value receiver,
                                           const MethodBinding &method) {
   if (!method.method)
     return emitNone(expr);
+
+  // ⭐ AN ARGUMENT IS EMITTED AGAINST THE PARAMETER IT FILLS, the same way a
+  // free function's and a constructor's are. Without the expectation an empty
+  // literal came out `list[object]` and the declared-parameter check refused
+  // the call it was written for:
+  //
+  //     class C:
+  //         def take(self, xs: list[int]) -> int: ...
+  //     C().take([])
+  //     # argument 'xs' of 'take' is declared list[int] and this call gives it
+  //     # list[object]
+  //
+  // `def f(xs: list[int])` called as `f([])` was always fine, because
+  // `emitCallOperands` distributes the callee's positional types there. Slot 0
+  // is the receiver, so the written arguments start one past it.
+  const FunctionSignature &argumentSig =
+      method.bodySignature.callable ? method.bodySignature : method.signature;
+  bool receiverTakesSlotZero = methodBindingBindsReceiver(method);
+  auto declaredPositional = [&](std::size_t index) -> mlir::Type {
+    std::size_t slot = receiverTakesSlotZero ? index + 1 : index;
+    if (slot >= argumentSig.positionalTypes.size())
+      return {};
+    mlir::Type declared = argumentSig.positionalTypes[slot];
+    return declared && py::isStaticTypeParameter(declared) ? mlir::Type()
+                                                           : declared;
+  };
+  auto declaredKeyword = [&](llvm::StringRef name) -> mlir::Type {
+    for (auto [index, parameter] :
+         llvm::enumerate(argumentSig.positionalNames))
+      if (parameter == name && index < argumentSig.positionalTypes.size()) {
+        mlir::Type declared = argumentSig.positionalTypes[index];
+        return declared && py::isStaticTypeParameter(declared) ? mlir::Type()
+                                                               : declared;
+      }
+    for (auto [index, parameter] : llvm::enumerate(argumentSig.kwOnlyNames))
+      if (parameter == name && index < argumentSig.kwOnlyTypes.size()) {
+        mlir::Type declared = argumentSig.kwOnlyTypes[index];
+        return declared && py::isStaticTypeParameter(declared) ? mlir::Type()
+                                                               : declared;
+      }
+    return {};
+  };
 
   llvm::SmallVector<Value, 8> positional;
   if (const auto *args = ast::nodeList(expr, "args")) {
@@ -2480,7 +2546,12 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
             "starred arguments are not supported for inlined class methods"});
         continue;
       }
-      positional.push_back(emitExpr(arg.get()));
+      mlir::Type expected = declaredPositional(positional.size());
+      positional.push_back(expected
+                               ? adoptDeclaredContainer(
+                                     emitExprExpected(arg.get(), expected),
+                                     expected, *arg)
+                               : emitExpr(arg.get()));
     }
   }
 
@@ -2488,7 +2559,13 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
   if (const auto *keywordNodes = ast::nodeList(expr, "keywords")) {
     for (const parser::NodePtr &keyword : *keywordNodes) {
       if (auto name = ast::string(*keyword, "arg")) {
-        keywords[*name] = emitExpr(ast::node(*keyword, "value"));
+        mlir::Type expected = declaredKeyword(*name);
+        keywords[*name] =
+            expected ? adoptDeclaredContainer(
+                           emitExprExpected(ast::node(*keyword, "value"),
+                                            expected),
+                           expected, *keyword)
+                     : emitExpr(ast::node(*keyword, "value"));
         continue;
       }
       diagnostics.push_back(parser::Diagnostic{
