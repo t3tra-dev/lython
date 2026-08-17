@@ -1459,8 +1459,48 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         if (auto attrContract =
                 mlir::dyn_cast_if_present<py::ContractType>(widened)) {
           llvm::StringRef attrContractName = attrContract.getContractName();
-          storable = attrContractName == "builtins.bytes" ||
-                     !attrContractName.contains('.');
+          // ⭐ A CONTAINER IS SLOT-BACKED TOO, and the reason it was not is a
+          // paragraph that stopped being true. The note above said container
+          // cells "would go stale against reallocation, the same reason
+          // collectModuleGlobals excludes them" -- and that exclusion is gone:
+          // `builtins.mlir`'s growth writes THROUGH the handle, so the cell
+          // holds what stays valid. Without this a container class attribute
+          // could not even be READ:
+          //
+          //     class R:
+          //         items: list[str] = []
+          //     print(R.items)
+          //     # unsupported static class attribute expression for 'items'
+          //
+          // because the constant channel re-materializes the value per read and
+          // has no arm for a container -- and could not have one, since every
+          // read of a mutable attribute must be the SAME object.
+          //
+          // ⛔ EXCEPT a container whose ELEMENT type is a union, which
+          // `collectModuleGlobals` still excludes for its own measured reason: a
+          // cell hands back the handle, and a union-typed element read needs the
+          // literal's per-element evidence.
+          //
+          // ⛔ And EXCEPT a `_dunder_` name. `ctypes.Structure._fields_` is a
+          // list the COMPILER consumes, not a runtime value; slotting it emits a
+          // module-level store, and a runtime-internal lib module may not run
+          // module-level code (`stackguard_support.py` stopped building).
+          bool erasedElement = false;
+          for (mlir::Type argument : attrContract.getArguments())
+            if (mlir::isa<py::UnionType>(argument))
+              erasedElement = true;
+          llvm::StringRef attrSpelling(attrName);
+          bool compilerConsumed = attrSpelling.size() > 2 &&
+                                  attrSpelling.starts_with("_") &&
+                                  attrSpelling.ends_with("_");
+          storable = !erasedElement && !compilerConsumed &&
+                     (attrContractName == "builtins.bytes" ||
+                      attrContractName == "builtins.list" ||
+                      attrContractName == "builtins.dict" ||
+                      attrContractName == "builtins.set" ||
+                      attrContractName == "builtins.tuple" ||
+                      attrContractName == "builtins.frozenset" ||
+                      !attrContractName.contains('.'));
         }
       }
       if (storable)

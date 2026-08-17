@@ -656,7 +656,38 @@
 # in three places.
 #
 # ============================================================
-# (19) A CLASS ATTRIBUTE HOLDING A CONTAINER CANNOT EVEN BE READ.
+# (19) FIXED: A CLASS ATTRIBUTE HOLDING A CONTAINER.
+# ============================================================
+#     class R:
+#         items: list[str] = []
+#     print(R.items)
+#     # unsupported static class attribute expression for 'items'
+#
+# ⭐ FIXED 2026-08-17, and it took four attempts that each hit a different wall
+# -- worth keeping, because the first three readings all looked right.
+#
+#   1. "give it a cell like a module global" -- the cell mechanism already
+#      existed (`classAttrSlots`), so this was never the work.
+#   2. "the exclusion's reason is stale, so widen the predicate" -- true (the
+#      note said container cells go stale against reallocation, and
+#      collectModuleGlobals stopped excluding containers when the measurement
+#      showed the growth writes THROUGH the handle) but not sufficient.
+#   3. Widening it broke the runtime lib: `ctypes.Structure._fields_` is a list
+#      the COMPILER consumes, and slotting it emits a module-level store, which
+#      a runtime-internal lib module may not have. `_dunder_` names stay on the
+#      constant channel.
+#   4. "and the read path does not consult the slots" -- WRONG, and this is the
+#      reading to be most careful of. It does; the earlier probes failed for
+#      reason 3, and once that was excluded both the class-object read
+#      (`R.items`) and the instance read (`r.items`) answered.
+#
+# ⛔ What is still refused: `cls.tags.add(x)` on a SET attribute -- "set.add
+# requires a rebindable local receiver", because that mutation rebinds and the
+# receiver is an attribute read rather than a name. The same set as a MODULE
+# global works, where the receiver is a name. `list.append` and `d[k] = v` are
+# unaffected: they write through the handle. Pinned by
+# tests/golden/cases/class_attribute_container.py.
+#
 # ============================================================
 #     class R:
 #         items: list[str] = []
