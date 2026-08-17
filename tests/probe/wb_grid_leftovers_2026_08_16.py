@@ -656,6 +656,57 @@
 # in three places.
 #
 # ============================================================
+# (25) FIXED: `assert`.
+# ============================================================
+#     assert n > 0, "must be positive"
+#     # emit error: unsupported statement kind 'Assert'
+#
+# ⭐ FIXED 2026-08-17, as a rewrite: `if not test: raise AssertionError(msg)`.
+# Nothing new reaches the dialect, and both halves already worked --
+# `builtins.AssertionError` was in the runtime taxonomy and `raise E` with no
+# arguments had already been fixed on the Raise arm.
+#
+# ⛔ Not elided under any flag: CPython drops asserts under -O, Lython has no -O,
+# and the CPython DEFAULT is that they run.
+#
+# ⛔ An uncaught assert's traceback still differs from CPython's, and not because
+# of assert: CPython underlines the failing expression with `^^^^` markers and
+# Lython prints no caret line for any statement. Same difference shows on
+# `p.give(1)` and every other frame, so it is one item, not one per statement.
+# The golden catches its failures for that reason.
+#
+# Pinned by tests/golden/cases/assert_statement.py.
+#
+# ============================================================
+# (26) OPEN: THE FOUR REFUSALS THE 2026-08-17 SWEEP FOUND BESIDE assert.
+# ============================================================
+# Six batches of eight realistic programs; 43 of 48 agreed with python3.14 on
+# stdout AND exit code. What the other five were:
+#
+#   `fs = [outer(i) for i in range(3)]; [g(10) for g in fs]`
+#       -> TypeError: callable target is not available (at RUNTIME, not a
+#          diagnostic). `add5 = outer(5); add5(1)` works, so it is a closure
+#          stored in a CONTAINER and called through the element read. A refusal
+#          that only appears at runtime is the worst kind here -- it should be an
+#          emit diagnostic at least.
+#
+#   `[*vals, 4]` and `{**d, "b": 2}`
+#       -> unsupported expression kind 'Starred'. Feature.
+#
+#   `type(1) is int`
+#       -> unresolved name 'type'. Feature.
+#
+#   `isinstance(other, Vec)` on an `object` parameter, inside `__eq__`
+#       -> "isinstance on an object-typed value requires dynamic object
+#          inspection". Already recorded; this is the shape that makes it matter,
+#          because `__eq__`'s signature is `object` by convention.
+#
+#   a subclass overriding a method, called through the base type
+#       -> "'area' is overridden by a subclass of 'Shape', so this call cannot be
+#          resolved from the static type of the receiver". This is the DESIGN
+#          boundary (no dynamic dispatch), not a defect.
+#
+# ============================================================
 # (23) FIXED: AN UNBOUND BASE METHOD DID NOT ACCEPT `self`.
 # ============================================================
 #     class Child(Base):

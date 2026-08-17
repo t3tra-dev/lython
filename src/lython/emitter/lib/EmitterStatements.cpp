@@ -1005,6 +1005,39 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         }
       }
     return;
+  } else if (statement.kind == "Assert") {
+    // ⭐ `assert t, m` IS `if not t: raise AssertionError(m)`, so it is written
+    // as that and nothing new reaches the dialect. Both halves already work:
+    // `raise AssertionError` instantiates a raised class with no arguments, and
+    // `raise AssertionError(m)` is an ordinary raise.
+    //
+    // ⛔ Why NOT elide them like CPython's -O: -O is a flag Lython does not
+    // have, and the default in CPython is that asserts run. An assert that
+    // silently did not check would be the opposite of "never silently
+    // mis-execute".
+    const parser::Field *testField = parser::findField(statement, "test");
+    const auto *testNode =
+        testField ? std::get_if<parser::NodePtr>(&testField->value) : nullptr;
+    if (!testNode || !*testNode) {
+      diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                               statement.range.start,
+                                               "assert has no test expression"});
+      return;
+    }
+    std::vector<parser::NodePtr> messageArguments;
+    if (const parser::Field *messageField = parser::findField(statement, "msg"))
+      if (const auto *message =
+              std::get_if<parser::NodePtr>(&messageField->value);
+          message && *message)
+        messageArguments.push_back(*message);
+    parser::NodePtr guard = synth::ifStmt(
+        synth::notOp(*testNode, statement.range),
+        std::vector<parser::NodePtr>{synth::raiseStmt(
+            synth::call(synth::name("AssertionError", statement.range),
+                        std::move(messageArguments), statement.range),
+            statement.range)},
+        {}, statement.range);
+    emitStatement(*guard);
   } else if (statement.kind == "Pass") {
     return;
   } else if (statement.kind == "Match") {

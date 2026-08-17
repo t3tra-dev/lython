@@ -1,0 +1,10 @@
+passed
+bare: ''
+with message: arithmetic broke
+6 2
+caught: must be positive
+computed: n=5
+total 6
+loop: bad -2
+failures 1
+as Exception: broad
