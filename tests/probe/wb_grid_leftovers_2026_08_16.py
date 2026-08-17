@@ -627,6 +627,34 @@
 # infers the method's contract from the actual argument types after emitting
 # them. Same structural gap as the manifest-parameter expectation.
 #
+# ============================================================
+# (18) THREE SHAPES THE `float | int` UNION STILL REFUSES.
+# ============================================================
+# `1.5 if c else 0` types as `float | int`, which is RIGHT -- CPython's false
+# arm is the int 0. The merge itself was fixed 2026-08-17 (the immortal constant
+# global the converted literal lives in is now accepted as prefix-initialized,
+# tests/golden/cases/float_merge_needs_a_retain.py). What the union cannot do
+# yet:
+#
+#   bound = 1.5 if c else 0
+#   bound + 1
+#   # union<float, int> does not provide manifest method '__add__'
+#     -- the per-member dispatch `==` got, for the arithmetic operators. The
+#     result types differ per member (float + int is float, int + int is int),
+#     so the arm has to join them the way the tower does.
+#
+#   values: list[float] = [1.5 if c else 0]
+#   # runtime object header has invalid type 'i64'
+#     -- the tower conversion at a CONTAINER boundary. The element is declared
+#     float and the union arrives whole.
+#
+#   def f(c: bool) -> float: return 1.5 if c else 0
+#   # cannot adapt  return value to callable return ABI 0
+#     -- the same conversion at the RETURN boundary.
+#
+# All three are the union meeting a declared float, which is one question asked
+# in three places.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible

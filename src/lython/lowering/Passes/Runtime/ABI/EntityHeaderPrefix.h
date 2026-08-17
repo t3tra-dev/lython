@@ -63,11 +63,13 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 
 #include <cstdint>
+#include <limits>
 
 namespace py::lowering::entity_header {
 
@@ -161,6 +163,39 @@ inline bool prefixIsInitializedAtDefinition(mlir::Value handle) {
   // exists is already past whatever initialised it in every predecessor.
   if (mlir::isa<mlir::BlockArgument>(root))
     return true;
+  // ⭐ AN IMMORTAL CONSTANT GLOBAL. Its initializer IS the prefix -- word 0 is
+  // INT64_MAX, which is how "immortal" is spelled here -- so the words a retain
+  // reads are written by construction, and the retain it authorises is a no-op
+  // on a refcount nothing can drive to zero.
+  //
+  // Without it a merge whose arms are a float and a converted int literal was
+  // refused, which is the plainest conditional expression there is:
+  //
+  //     print(1.5 if c else 0)
+  //     # ownership: this block-argument merge needs a retain on the edge and
+  //     # the header prefix cannot be spelled at the point the retain must go
+  //
+  // `1.5 if c else 0.0` was fine, so it was the numeric-tower conversion that
+  // produced the constant.
+  //
+  // ⛔ Why the INITIALIZER and not the name: a `dense<0>` global has the same
+  // shape and the same producer, and a retain there reads a zero refcount --
+  // the abort this predicate exists to prevent. The immortal word is the
+  // evidence.
+  if (auto getGlobal =
+          mlir::dyn_cast_or_null<mlir::memref::GetGlobalOp>(
+              root.getDefiningOp()))
+    if (auto module = getGlobal->getParentOfType<mlir::ModuleOp>())
+      if (auto global = module.template lookupSymbol<mlir::memref::GlobalOp>(
+              getGlobal.getName()))
+        if (global.getConstant())
+          if (auto initial = llvm::dyn_cast_if_present<mlir::DenseElementsAttr>(
+                  global.getInitialValueAttr()))
+            if (initial.getElementType().isInteger(64) &&
+                initial.getNumElements() >= kPrefixWordCount &&
+                (*initial.value_begin<llvm::APInt>()).getSExtValue() ==
+                    std::numeric_limits<std::int64_t>::max())
+              return true;
   // A call result is an entity the callee finished before returning. This is the
   // producer the shipped over-release needed and did not have: a one-lane
   // container handle comes out of its contract's allocator as a call result, not
