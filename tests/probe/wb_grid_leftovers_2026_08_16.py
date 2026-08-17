@@ -586,6 +586,27 @@
 # loop of `add`. The diagnostic names the receiver, not the argument, which is
 # what made the first reading look right.
 #
+# ============================================================
+# (16) A NAME BOUND INSIDE A `try` DOES NOT REACH ITS `else`.
+# ============================================================
+#     try:
+#         n = v
+#     except ValueError:
+#         return "raised"
+#     else:
+#         if n > 0:          # unresolved name 'n'
+#
+# CPython runs the else in the enclosing scope, so `n` is bound there. Here a
+# binding CREATED inside a try body does not escape it -- the same rule the
+# `next(it, default)` desugar works around by pre-binding its result name, and
+# the same one that forced the source-iterator loop rewrite to put its body in
+# the try's ELSE rather than after it. Rebinding a PRE-EXISTING local works, so
+# `n = 0` before the try is the workaround, and it is what
+# tests/golden/cases/try_else_with_a_nested_statement.py does.
+#
+# Found 2026-08-17 while writing that golden, which pins a different defect (an
+# `if` in the else clause was "empty block: expect at least a terminator").
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible

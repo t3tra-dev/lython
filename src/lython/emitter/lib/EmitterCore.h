@@ -394,10 +394,6 @@ private:
   // is written as the try/except the protocol is (EmitterLoops.cpp).
   bool emitSourceIteratorFor(const parser::Node &statement,
                              const parser::Node &iterNode);
-  // Set while a reducer's synthesized loop is emitted: its body is a seen-flag
-  // switch over scratch names, and the source-iterator rewrite turns that into
-  // a block with no terminator (EmitterCalls.cpp / EmitterLoops.cpp).
-  bool emittingReducerLoop = false;
   bool exprHasContract(const parser::Node *expr, llvm::StringRef contractName);
   std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
                                               const parser::Node *calleeNode);

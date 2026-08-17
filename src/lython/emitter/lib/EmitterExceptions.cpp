@@ -1594,7 +1594,24 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       }
       emitStatements(orelse);
     }
-    if (!blockHasTerminator(*elseBlock))
+    // ⭐ THE BLOCK THE BODY ENDED IN, not the one it started in. An `if`, a
+    // `while` or a `for` in the else clause splits the block, so the builder
+    // is somewhere else by now -- `elseBlock` already had its terminator from
+    // that split, and the block actually holding the insertion point got
+    // none:
+    //
+    //     try:
+    //         x = 1
+    //     except ValueError:
+    //         pass
+    //     else:
+    //         if x > 0:
+    //             print("a")
+    //     # empty block: expect at least a terminator
+    //
+    // A straight-line else body always worked, which is why this stood: with
+    // no split the two blocks are the same one.
+    if (!insertionBlockTerminated(builder))
       mlir::cf::BranchOp::create(builder, loc(statement), afterElseBlock);
     builder.setInsertionPointToStart(afterElseBlock);
   }

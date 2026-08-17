@@ -710,14 +710,6 @@ bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
   // refusal, which is a diagnostic; the alternative was a crash report.
   if (containsLoopLevelJump(body))
     return false;
-  // ⛔ And only a loop the PROGRAM wrote. `max()`/`min()` desugar into a loop
-  // whose target is a scratch name and whose body is a seen-flag switch, and
-  // running that through this rewrite produced "empty block: expect at least a
-  // terminator" -- a crash report where the old path gives a diagnostic. The
-  // synthesized reducers keep the old path until that is understood; `sum()`
-  // and the comprehensions, whose targets the program wrote, do not.
-  if (emittingReducerLoop)
-    return false;
   parser::NodePtr target = std::get<parser::NodePtr>(targetField->value);
   parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
   if (!target || !source)

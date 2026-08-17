@@ -34,12 +34,12 @@
 # both compile. `Pairs` below returns a tuple so the target unpacking is
 # checked too.
 #
-# ⛔ `sum()`, `max()`, `min()`, `any()` and `all()` keep the old refusal. They
-# desugar into their own synthesized loop -- a seen-flag switch over scratch
-# names -- and running that through this rewrite produced "empty block: expect
-# at least a terminator", a crash report where the old path gives a diagnostic.
-# The emitter marks its reducer loops so they stay on it. `list()`, `sorted()`
-# and the comprehensions are not reducers and do work.
+# ⭐ `max()` and `min()` found a SECOND defect, and it is not theirs. Their
+# desugar puts an `if` in the loop body, the body goes in a try's else, and an
+# `if` in a try's else was "empty block: expect at least a terminator" for any
+# program -- the walk terminated the block the else STARTED in, and a nested
+# statement had since split it. Fixed with this; the reducers need no special
+# case.
 #
 # ⛔ A `break` or `continue` the body writes keeps the old refusal. It would
 # leave the try's else, and that is unsupported below the emitter -- with a
@@ -116,6 +116,7 @@ for v in Count(1):
 # --- comprehensions and reducers ------------------------------------------
 print([x for x in Count(3)])
 print(list(Count(4)))
+print(sum(Count(5)), max(Count(3)), min(Count(3)))
 print(sorted(Count(3), reverse=True))
 print({v: v * 2 for v in Count(2)})
 print(sorted({v % 2 for v in Count(4)}))
