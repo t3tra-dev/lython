@@ -17728,13 +17728,42 @@ module attributes {
     func.return %normalized : i64
   }
 
+  // ⭐ THE OUT-OF-RANGE PATH RELEASES THE VALUE BOX before it raises, which is
+  // why this does not just call `__ly_list_normalize_assign_index`. The caller
+  // retained the value for the slot and handed this function a box that owns that
+  // reference; raising from inside the normalizer left it with nowhere to go:
+  //
+  //     xs: list[int] = []
+  //     xs.append(1)
+  //     try:
+  //         xs[5] = 9
+  //     except IndexError:
+  //         pass
+  //     # leaked 52 B, one allocation, per execution
+  //
+  // The delete path keeps the shared normalizer: it has no value box to own.
   func.func @LyList_SetItemBox(%self: memref<9xi64> {ly.ownership.object_header}, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
-    %normalized = func.call @__ly_list_normalize_assign_index(%len, %raw_index) : (i64, i64) -> i64
+    %zero_i = arith.constant 0 : i64
+    %is_neg = arith.cmpi slt, %raw_index, %zero_i : i64
+    %adjusted = arith.addi %raw_index, %len : i64
+    %normalized = arith.select %is_neg, %adjusted, %raw_index : i1, i64
+    %lower_ok = arith.cmpi sge, %normalized, %zero_i : i64
+    %upper_ok = arith.cmpi slt, %normalized, %len : i64
+    %in_range = arith.andi %lower_ok, %upper_ok : i1
+    scf.if %in_range {
+    } else {
+      func.call @LyObject_ReleaseBoxedPayloadRaw(%value_box) : (memref<16xi64>) -> ()
+      %index_error = arith.constant 55 : i64
+      %msg_static = memref.get_global @__ly_list_msg_assign_range : memref<34xi8>
+      %msg = memref.cast %msg_static : memref<34xi8> to memref<?xi8>
+      %msg_len = arith.constant 34 : i64
+      func.call @__ly_long_raise_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+    }
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %normalized) : (memref<?xi64>, i64) -> ()
     %slot = arith.index_cast %normalized : i64 to index

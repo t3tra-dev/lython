@@ -656,6 +656,44 @@
 # in three places.
 #
 # ============================================================
+# (31) FIXED: STORING INTO A LIST HELD IN A FIELD.
+# ============================================================
+#     class Box:
+#         def __init__(self) -> None:
+#             self.items: list[int] = []
+#     b = Box()
+#     b.items.append(1)
+#     b.items[0] = 9
+#     # IndexError: list assignment index out of range
+#
+# ⭐ FIXED 2026-08-18. `sequenceEvidenceBacked` is a flag about the container's
+# KIND, not a promise that the bundle describes the contents, and a field read
+# strips the contents it did know. Zero recorded elements read as length zero, so
+# an in-range store raised; `del b.items[0]` had it too.
+#
+# ⭐ AND THE SEEDED CASE, which the empty one only hinted at: a field seeded
+# `[0]` and grown by one append still describes one element, so `items[1] = 9`
+# took the evidence arm with stale contents and double-booked the slot ("owned
+# resource ... released or transferred more than once"). The rule is one rule --
+# the evidence tier is sound only where the walk sees EVERY mutation, and through
+# a field it cannot, because each read builds a fresh bundle from the owner. So an
+# interior view stores through the payload and a local keeps the evidence arm.
+#
+# ⭐ THE LEAK THE FIX EXPOSED, and it was NOT caused by it: routing field stores
+# onto the runtime path made `xs[5] = 9` inside a try leak 52 B -- and the same
+# program on a LOCAL list leaked 52 B on every binary in this session. The caller
+# retains the value for the slot and hands `LyList_SetItemBox` a box that owns
+# that reference; the raise happened inside the shared index normalizer, which has
+# no box to release. SetItemBox now range-checks itself, releases the box, then
+# raises. The delete path keeps the shared normalizer: it has no value box.
+#
+# ⛔ "Exposed" and "caused" are different, and the leak gate is what told them
+# apart: measured on the pre-fix binary for the LOCAL spelling, which the fix does
+# not touch.
+#
+# Pinned by tests/golden/cases/store_into_a_field_list.py.
+#
+# ============================================================
 # (29) FIXED: A SLICE OF INSTANCES WAS TYPED AS ITS ELEMENT.
 # ============================================================
 #     class V:

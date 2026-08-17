@@ -644,7 +644,38 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
     // element evidence; treating its absent evidence as "length 0" here
     // mis-raised IndexError for every store, so those lists go through the
     // runtime payload path below instead.
-    if (rawIndex && container.sequenceEvidenceBacked) {
+    // ⭐ AND ONLY WHEN IT RECORDS ELEMENTS. `sequenceEvidenceBacked` is a flag
+    // about the container's KIND, not a promise that this bundle describes the
+    // contents, and a field read deliberately strips the contents
+    // (`bindRetainedEvidenceBundle` does not let them cross the read):
+    //
+    //     class Box:
+    //         def __init__(self) -> None:
+    //             self.items: list[int] = []
+    //     b = Box()
+    //     b.items.append(1)
+    //     b.items[0] = 9
+    //     # IndexError: list assignment index out of range
+    //     del b.items[0]        # the same mis-raise on the delete path
+    //
+    // The store read "backed, zero elements" as length zero and raised for an
+    // index that is in range -- the mis-raise the paragraph above was written
+    // against, one case further in: not a list with NO evidence, but a list whose
+    // evidence says nothing about its contents. The read side already draws the
+    // line here ("an evidence-BACKED container with no recorded elements ... reads
+    // through the payload too", lowerRuntimeSequenceGetItem).
+    //
+    // ⭐ AND NOT THROUGH A FIELD AT ALL, which the empty case only hinted at. A
+    // field seeded with `[0]` and grown by one append still describes one element,
+    // and `items[1] = 9` then took the evidence arm and double-booked the slot
+    // ("owned resource ... is released or transferred more than once"). The
+    // evidence tier is only sound where the walk sees EVERY mutation of the
+    // container, and it cannot see them through a field: the read strips the
+    // contents it did know, and each read builds a fresh bundle from the owner.
+    // So an interior view stores through the payload, which is authoritative.
+    if (rawIndex && container.sequenceEvidenceBacked &&
+        !container.sequenceElementBundles.empty() &&
+        !container.fieldAliasOwner) {
       builder.setInsertionPoint(op);
       if (mlir::failed(RuntimeBundleLowerer::touchContainerEvidenceUse(
               op, container, "list setitem")))
@@ -1039,7 +1070,32 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
     // Same evidence-authority rule as lowerSetItem: absent evidence is not
     // an empty list, so only evidence-backed lists take the compile-time
     // path.
-    if (rawIndex && container.sequenceEvidenceBacked) {
+    // ⭐ AND ONLY WHEN IT RECORDS ELEMENTS. `sequenceEvidenceBacked` is a flag
+    // about the container's KIND, not a promise that this bundle describes the
+    // contents, and a field read deliberately strips the contents
+    // (`bindRetainedEvidenceBundle` does not let them cross the read):
+    //
+    //     class Box:
+    //         def __init__(self) -> None:
+    //             self.items: list[int] = []
+    //     b = Box()
+    //     b.items.append(1)
+    //     b.items[0] = 9
+    //     # IndexError: list assignment index out of range
+    //     del b.items[0]        # the same mis-raise on the delete path
+    //
+    // The store read "backed, zero elements" as length zero and raised for an
+    // index that is in range -- the mis-raise the paragraph above was written
+    // against, one case further in: not a list with NO evidence, but a list whose
+    // evidence says nothing about its contents. The read side already draws the
+    // line here ("an evidence-BACKED container with no recorded elements ... reads
+    // through the payload too", lowerRuntimeSequenceGetItem).
+    //
+    // ⭐ AND NOT THROUGH A FIELD AT ALL: see `lowerSetItem` above for the case
+    // that showed why (a seeded field grown by one append double-booked the slot).
+    if (rawIndex && container.sequenceEvidenceBacked &&
+        !container.sequenceElementBundles.empty() &&
+        !container.fieldAliasOwner) {
       RuntimeBundle updated = container;
       std::int64_t size =
           static_cast<std::int64_t>(updated.sequenceElementBundles.size());
