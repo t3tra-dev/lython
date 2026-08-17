@@ -142,6 +142,44 @@ bool containsLoopLevelBreak(const parser::Node *node) {
   return false;
 }
 
+// Break OR continue targeting this loop. The source-iterator rewrite puts the
+// body inside a `try`'s else, and both forms of jump out of one are
+// "break/continue through try/finally in a loop with carried locals is not
+// supported" -- or, worse, a block with no terminator. Asking here keeps that
+// out of the rewrite rather than out of the lowering.
+bool containsLoopLevelJump(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "Break" || node->kind == "Continue")
+    return true;
+  if (node->kind == "For" || node->kind == "While" ||
+      node->kind == "AsyncFor" || node->kind == "FunctionDef" ||
+      node->kind == "AsyncFunctionDef" || node->kind == "ClassDef" ||
+      node->kind == "Lambda")
+    return false;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (containsLoopLevelJump(child->get()))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (containsLoopLevelJump(item.get()))
+          return true;
+    }
+  }
+  return false;
+}
+
+bool containsLoopLevelJump(const std::vector<parser::NodePtr> *body) {
+  if (!body)
+    return false;
+  for (const parser::NodePtr &item : *body)
+    if (containsLoopLevelJump(item.get()))
+      return true;
+  return false;
+}
+
 bool containsLoopLevelBreak(const std::vector<parser::NodePtr> *body) {
   if (!body)
     return false;
@@ -607,6 +645,144 @@ bool ModuleEmitter::emitSequenceProtocolFor(const parser::Node &statement,
   return emitIndexedFor(statement, iterNode);
 }
 
+// ⭐ A USER-DEFINED ITERATOR. A class with `__iter__` and `__next__` is the
+// iterator protocol itself, and it could not be iterated at all:
+//
+//     class R:
+//         def __iter__(self) -> "R": return self
+//         def __next__(self) -> int:
+//             if self.i >= self.n: raise StopIteration
+//             ...
+//     for v in R(4):
+//     # runtime manifest has no R.__next__ method
+//
+// The loop resolves `__iter__` through the class (`tryEmitClassDunder`) and
+// then asks the MANIFEST for `__next__`, which a source class has no entry in.
+// The protocol's own shape is a try/except, and that is what this writes:
+//
+//     __lyiter = <source>.__iter__()
+//     while True:
+//         try:
+//             <target> = __lyiter.__next__()
+//         except StopIteration:
+//             break
+//         <body>
+//
+// -- ordinary surface the walk already compiles, so `__next__` is inlined the
+// way every other source method is and StopIteration goes through the real
+// handler.
+//
+// ⛔ No `else` clause. `while/else` cannot tell the exhaustion break from a
+// break the body wrote, and a for's `else` means "no break by the BODY"; a
+// flag would work and is not written, so that shape keeps the old refusal.
+bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
+                                          const parser::Node &iterNode) {
+  mlir::Type sourceType = types.widenLiteral(types.inferExpr(&iterNode));
+  if (!mlir::isa_and_nonnull<py::ContractType>(sourceType))
+    return false;
+  std::optional<MethodBinding> iterMethod =
+      lookupClassMethod(sourceType, "__iter__");
+  if (!iterMethod || !iterMethod->method)
+    return false;
+  mlir::Type iteratorType = iterMethod->signature.resultType
+                                ? types.widenLiteral(iterMethod->signature.resultType)
+                                : mlir::Type();
+  if (!iteratorType)
+    return false;
+  std::optional<MethodBinding> nextMethod =
+      lookupClassMethod(iteratorType, "__next__");
+  if (!nextMethod || !nextMethod->method)
+    return false;
+  const auto *orelse = ast::nodeList(statement, "orelse");
+  if (orelse && !orelse->empty())
+    return false;
+  const parser::Field *targetField = parser::findField(statement, "target");
+  const parser::Field *iterField = parser::findField(statement, "iter");
+  const auto *body = ast::nodeList(statement, "body");
+  if (!targetField || !iterField || !body ||
+      !std::holds_alternative<parser::NodePtr>(targetField->value) ||
+      !std::holds_alternative<parser::NodePtr>(iterField->value))
+    return false;
+  // ⛔ A `break` or `continue` the body writes would leave the try's else, and
+  // that is unsupported below the emitter -- a carried local turns it into
+  // "break/continue through try/finally", and without one it reached the
+  // lowering as a block with no terminator. Declining leaves the original
+  // refusal, which is a diagnostic; the alternative was a crash report.
+  if (containsLoopLevelJump(body))
+    return false;
+  // ⛔ And only a loop the PROGRAM wrote. `max()`/`min()` desugar into a loop
+  // whose target is a scratch name and whose body is a seen-flag switch, and
+  // running that through this rewrite produced "empty block: expect at least a
+  // terminator" -- a crash report where the old path gives a diagnostic. The
+  // synthesized reducers keep the old path until that is understood; `sum()`
+  // and the comprehensions, whose targets the program wrote, do not.
+  if (emittingReducerLoop)
+    return false;
+  parser::NodePtr target = std::get<parser::NodePtr>(targetField->value);
+  parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
+  if (!target || !source)
+    return false;
+
+  parser::SourceRange range = statement.range;
+  unsigned serial = ++listCompCounter;
+  std::string iteratorName = "__lysrciter" + std::to_string(serial);
+
+  // ⛔ The handler sets a FLAG rather than breaking. `break` out of an except
+  // handler is "break/continue through try/finally in a loop with carried
+  // locals is not supported", and a loop that accumulates anything has a
+  // carried local -- which is every loop worth writing. The flag costs one
+  // extra test per iteration and keeps the user's own break/continue on the
+  // ordinary path, where they are not inside a try at all.
+  std::string doneName = "__lysrcdone" + std::to_string(serial);
+  parser::NodePtr handler = parser::makeNode("ExceptHandler", range);
+  parser::addField(*handler, "type",
+                   synth::name(std::string("StopIteration"), range));
+  parser::addField(*handler, "body",
+                   std::vector<parser::NodePtr>{synth::assign(
+                       synth::name(doneName, range),
+                       synth::boolConstant(true, range), range)});
+  parser::NodePtr tryNode = parser::makeNode("Try", range);
+  parser::addField(
+      *tryNode, "body",
+      std::vector<parser::NodePtr>{synth::assign(
+          target,
+          synth::methodCall(synth::name(iteratorName, range), "__next__", {},
+                            range),
+          range)});
+  parser::addField(*tryNode, "handlers",
+                   std::vector<parser::NodePtr>{std::move(handler)});
+  // The body goes in the try's ELSE, not after it: a name BOUND inside a try
+  // does not escape to the statements that follow, so `for v in it:` left `v`
+  // unresolved one line later. The else runs in the try's own scope and only
+  // when no exception was raised, which is also exactly the iteration
+  // condition.
+  std::vector<parser::NodePtr> guarded;
+  for (const parser::NodePtr &each : *body)
+    if (each)
+      guarded.push_back(each);
+  // An empty else region is a block with no terminator by the time the
+  // lowering sees it; a `pass` is what the source form of an empty suite is.
+  if (guarded.empty())
+    guarded.push_back(parser::makeNode("Pass", range));
+  parser::addField(*tryNode, "orelse", std::move(guarded));
+  parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
+
+  std::vector<parser::NodePtr> loopBody{std::move(tryNode)};
+
+  parser::NodePtr loop = synth::whileStmt(
+      synth::notOp(synth::name(doneName, range), range), std::move(loopBody),
+      {}, range);
+  runWithScratchNames({iteratorName, doneName}, [&] {
+    emitStatement(*synth::assign(synth::name(doneName, range),
+                                 synth::boolConstant(false, range), range));
+    emitStatement(*synth::assign(
+        synth::name(iteratorName, range),
+        synth::methodCall(source, "__iter__", {}, range), range));
+    emitStatement(*loop);
+  });
+  return true;
+}
+
 // The rewrite both callers share: bind the source to a scratch name, walk an
 // int index, and subscript per iteration.
 bool ModuleEmitter::emitIndexedFor(const parser::Node &statement,
@@ -722,9 +898,12 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     if (const parser::Node *iterNode = ast::node(statement, "iter"))
       if (emitGeneratorIndexedFor(statement, *iterNode))
         return;
-  if (const parser::Node *iterNode = ast::node(statement, "iter"))
+  if (const parser::Node *iterNode = ast::node(statement, "iter")) {
     if (emitSequenceProtocolFor(statement, *iterNode))
       return;
+    if (emitSourceIteratorFor(statement, *iterNode))
+      return;
+  }
   // A loop over an empty container literal statically runs zero iterations:
   // emit nothing (the body never executes; the target stays unbound, matching
   // CPython's observable behavior). This also covers the reducer desugars

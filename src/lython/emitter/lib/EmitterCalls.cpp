@@ -13,6 +13,7 @@
 #include <functional>
 
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "EmitterOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -2836,7 +2837,10 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     std::optional<Value> priorElement;
     if (auto found = values.find(element); found != values.end())
       priorElement = found->second;
-    emitFor(*loop);
+    {
+      llvm::SaveAndRestore<bool> reducerLoop(emittingReducerLoop, true);
+      emitFor(*loop);
+    }
     emitStatement(*emptyGuard);
     auto built = values.find(tmp);
     if (built == values.end() || !built->second.value) {
@@ -2952,7 +2956,10 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     std::optional<Value> priorElement;
     if (auto found = values.find(element); found != values.end())
       priorElement = found->second;
-    emitFor(*loop);
+    {
+      llvm::SaveAndRestore<bool> reducerLoop(emittingReducerLoop, true);
+      emitFor(*loop);
+    }
     auto built = values.find(tmp);
     if (built == values.end() || !built->second.value) {
       diagnostics.push_back(parser::Diagnostic{
