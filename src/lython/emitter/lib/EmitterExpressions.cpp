@@ -2814,6 +2814,42 @@ Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
       widened != targetType && isNumericPrimitiveContract(widened) &&
       isNumericPrimitiveContract(targetType))
     return value;
+  // ⭐ AND THE SAME LIE ONE LEVEL IN. A container's ELEMENT type is its storage,
+  // so retyping `list[int]` to `list[float]` leaves int boxes in float slots:
+  //
+  //     xs: list[float] = [1]
+  //     print(xs[0])                      # printed 5e-324; CPython prints 1
+  //     t: tuple[float, float] = (1, 2)
+  //     print(t[0] + 0.5)                 # printed 0.5; CPython prints 1.5
+  //     def f() -> list[float]: return [1]
+  //     print(sum(f()))                   # printed 5e-324; CPython prints 1
+  //
+  // The upcast is what made those compile. Every shape that printed CPython's
+  // answer did so because nothing had decoded an element yet -- `print(t)` gave
+  // `(1, 2)` and `t[0] + 0.5` gave 0.5 in the same program -- so declining the
+  // retyping gives back no working ground; it turns silent wrong answers into a
+  // mismatch the store or the call reports.
+  //
+  // ⛔ Same-name containers only, argument-wise, and only between two NUMERIC
+  // element contracts. `list[Derived]` to `list[Base]` is a real retyping with
+  // one representation, and this must not touch it.
+  if (auto targetContract = mlir::dyn_cast<py::ContractType>(targetType))
+    if (auto valueContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(value.type));
+        valueContract && targetContract.getContractName() ==
+                             valueContract.getContractName()) {
+      llvm::ArrayRef<mlir::Type> targetArgs = targetContract.getArguments();
+      llvm::ArrayRef<mlir::Type> valueArgs = valueContract.getArguments();
+      if (!targetArgs.empty() && targetArgs.size() == valueArgs.size())
+        for (auto [targetArg, valueArg] : llvm::zip(targetArgs, valueArgs)) {
+          mlir::Type targetElement = types.widenLiteral(targetArg);
+          mlir::Type valueElement = types.widenLiteral(valueArg);
+          if (targetElement != valueElement &&
+              isNumericPrimitiveContract(targetElement) &&
+              isNumericPrimitiveContract(valueElement))
+            return value;
+        }
+    }
   if (mlir::isa<py::ContractType, py::LiteralType, py::CallableType,
                 py::TypeType, py::SelfType, py::TypeVarType, py::ParamSpecType>(
           targetType)) {

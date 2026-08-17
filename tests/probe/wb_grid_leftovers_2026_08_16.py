@@ -656,6 +656,62 @@
 # in three places.
 #
 # ============================================================
+# (32) PARTLY FIXED: A CONTAINER OF INTS WHERE FLOATS ARE DECLARED.
+# ============================================================
+#     def f() -> list[float]:
+#         return [1]
+#     print(sum(f()))              # printed 5e-324; CPython prints 1
+#     class C:
+#         def __init__(self) -> None:
+#             self.xs: list[float] = [1]
+#     print(C().xs[0])             # printed 5e-324
+#     t: tuple[float, float] = (1, 2)
+#     print(t[0] + 0.5)            # printed 0.5; CPython prints 1.5
+#     xs: list[float] = [1]        # module scope
+#     print(xs[0])                 # printed 5e-324
+#
+# ⭐ FIXED 2026-08-18 for the RETURN, the FIELD and the dict-in-a-function paths:
+# `coerceValue` no longer retypes a container between two numeric element
+# contracts. It already declined the SCALAR retyping for the same reason ("int,
+# float and bool share no representation") and the container case is that lie one
+# level in -- the element type IS the storage, so int boxes sat in float slots.
+#
+# ⭐ THE MEASUREMENT THAT SETTLED THE POLICY. Two of these shapes printed
+# CPython's answer, so refusing looked like giving back working ground -- until
+# the same program was asked to DECODE an element:
+#
+#     print(t)          -> (1, 2)     matches CPython
+#     print(t[0] + 0.5) -> 0.5        CPython 1.5      SAME PROGRAM
+#     return [1]        -> [1]        matches CPython
+#     sum(f())          -> 5e-324     CPython 1        SAME PROGRAM
+#
+# Nothing was working; nothing had decoded yet. A refusal is strictly better than
+# either half.
+#
+# ⛔ Why NOT convert to 1.0: CPython does not convert at an annotation, so it
+# would print 1.0 where CPython prints 1 -- and the first attempt at this fix DID
+# convert at the container-literal element site, which regressed `[1.0, 2]` from
+# CPython's `[1.0, 2]` to `[1.0, 2.0]` and the tuple from `(1, 2)` to
+# `(1.0, 2.0)`. Reverted. The `float | int` union element that a MIXED literal
+# already builds is the representation that would print CPython's answer for all
+# of them, and giving an ALL-int literal that representation under a float
+# expectation is the open question.
+#
+# ⛔ TWO CHANNELS STILL MIS-EXECUTE, each measured:
+#   `xs: list[float] = [1]` at MODULE scope     -> 5e-324. Goes through the static
+#       attribute initializer (`ly.module_static_attr_values`), not coerceValue.
+#       The class-attribute spelling of it (`class P: v: float = 1`) is the same
+#       channel and RuntimeErrors with "referenced before assignment" instead.
+#   `t: tuple[float, float] = (1, 2)`           -> t[0] + 0.5 gives 0.5. The tuple
+#       literal builds `tuple[float, float]` directly from the positional
+#       expectations, so there is no retyping for coerceValue to decline.
+#
+# Pinned by tests/golden/errors/int_element_in_a_float_container.py. ⛔ redcheck
+# cannot red-check an errors golden (it asks whether the CASE fails), so the check
+# was run with the real runner: `run_case.py --expect-layer lower` FAILS on the
+# pre-fix binary, which exits 0 and prints 5e-324.
+#
+# ============================================================
 # (31) FIXED: STORING INTO A LIST HELD IN A FIELD.
 # ============================================================
 #     class Box:

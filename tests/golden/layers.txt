@@ -1,46 +1,41 @@
-# Which pipeline stage each golden case is expected to stop at.
 #
-# Format: <cases|errors>/<case name> <parse|emit|lower>
-#
-#   parse  the vendored CPython frontend rejects it; nothing else runs
 #   emit   the emitter rejects it; the lowering pipeline never starts
 #   lower  a lowering phase rejects it; the program is never executed
-#
+#   parse  the vendored CPython frontend rejects it; nothing else runs
+# .stderr-re so that a case failing for an unrelated reason would be reported
 # A case absent from this file is expected to reach execution. That is the
-# default because it is what most cases are for, and declaring it would assert
-# nothing.
-#
+# Adding an entry is therefore a claim about cost that the suite checks. A
+# Entries are verified at configure time: naming a case that does not exist is a
+# Format: <cases|errors>/<case name> <parse|emit|lower>
+# It was 49 over 109: `errors/try_loop_carried_entity_rebind` moved to cases/
+# LYTHON_PERF=1 and classified by the deepest phase the compiler reported
+# The count is 48 over 108 errors/ cases (1 parse + 36 emit + 11 lower + 60 e2e).
+# The entries below were measured, not guessed: every errors/*.py was run under
+# Which pipeline stage each golden case is expected to stop at.
 # Why this file exists, given that the .exitcode / .stderr-re sidecars already
-# say the case must fail: they say the compiler must refuse the program, not
-# where it refuses it. rfc/test-suite-debt.md measured the difference to be a
+# because its refusal was a false one. A stage entry disappearing is the expected
+# compiler's own phase trace and fails if the case stopped stopping there.
+# default because it is what most cases are for, and declaring it would assert
+# entering. The sweep also re-checked each case's own .exitcode / .stdout /
+# every one of the 278 carries a .stdout sidecar, so every one must execute to
+# expectation still holds -- so nothing else in the suite would report it.
 # factor of ~50 in cost -- 0.05 s to bail before lowering, 0.34 s to bail inside
+# hard error, because a stale entry would silently stop labelling anything.
+# instead of classified (0 such). cases/ is absent on purpose and needs no sweep:
 # it, 2.55 s mean to compile and run -- and ctest could not see it. A case
 # listed here gets the matching ctest label, so `ctest -L fast` runs the cheap
-# refusals and nothing else, and `run_case.py --expect-layer` reads the
-# compiler's own phase trace and fails if the case stopped stopping there.
-#
-# Adding an entry is therefore a claim about cost that the suite checks. A
-# rejection that moves from `emit` to `lower` is not a wrong answer -- every
-# expectation still holds -- so nothing else in the suite would report it.
-#
-# Entries are verified at configure time: naming a case that does not exist is a
-# hard error, because a stale entry would silently stop labelling anything.
-#
-# The entries below were measured, not guessed: every errors/*.py was run under
-# LYTHON_PERF=1 and classified by the deepest phase the compiler reported
-# entering. The sweep also re-checked each case's own .exitcode / .stdout /
-# .stderr-re so that a case failing for an unrelated reason would be reported
-# instead of classified (0 such). cases/ is absent on purpose and needs no sweep:
-# every one of the 278 carries a .stdout sidecar, so every one must execute to
+# nothing.
 # produce it.
-#
-# The count is 48 over 108 errors/ cases (1 parse + 36 emit + 11 lower + 60 e2e).
-# It was 49 over 109: `errors/try_loop_carried_entity_rebind` moved to cases/
-# because its refusal was a false one. A stage entry disappearing is the expected
+# refusals and nothing else, and `run_case.py --expect-layer` reads the
+# rejection that moves from `emit` to `lower` is not a wrong answer -- every
+# say the case must fail: they say the compiler must refuse the program, not
 # shape of that repair -- the case still exists, it just no longer stops early.
-errors/parse_error parse
+# where it refuses it. rfc/test-suite-debt.md measured the difference to be a
 errors/annotation_forward_ref_complex emit
+errors/boxed_payload_too_wide_fields lower
 errors/class_attr_instance_shadow_write emit
+errors/class_erased_object_field lower
+errors/class_erased_object_field_int lower
 errors/class_mro_conflict emit
 errors/complex_mixed_runtime emit
 errors/constructor_arity emit
@@ -48,18 +43,29 @@ errors/del_attribute emit
 errors/del_variable emit
 errors/eq_without_hash_unhashable emit
 errors/except_star_local_rebind emit
+errors/exit_reads_the_exception_class emit
 errors/float_truthiness emit
 errors/for_over_a_subclass_overridden_iter emit
+errors/generator_handler_local_yield lower
 errors/generator_returned_from_a_function lower
 errors/generic_bare_reference emit
 errors/generic_class_no_class_object emit
 errors/generic_class_pack_parameter emit
 errors/generic_class_ungrounded emit
+errors/global_declaration_without_storage emit
+errors/int_element_in_a_float_container lower
 errors/int_truthiness emit
 errors/is_value_type emit
+errors/len_takes_no_keyword_arguments emit
+errors/module_global_numeric_representation emit
+errors/module_missing_attribute emit
 errors/object_constructor_rejected emit
 errors/object_default_not_implemented emit
+errors/override_behind_a_base_typed_receiver emit
+errors/override_inherited_from_a_mixin emit
+errors/override_reached_before_the_subclass emit
 errors/param_annotation_required emit
+errors/parse_error parse
 errors/prim_factory_on_scalar emit
 errors/prim_factory_unknown emit
 errors/prim_tensor_index_not_integer emit
@@ -68,25 +74,13 @@ errors/prim_tensor_int_div emit
 errors/prim_tensor_int_float_broadcast emit
 errors/prim_tensor_loop_break emit
 errors/prim_to_prim_float_to_int emit
+errors/print_unrenderable_argument emit
 errors/property_no_setter emit
+errors/self_referential_union_field lower
 errors/set_of_int emit
+errors/starred_assignment_target emit
 errors/try_handler_rebind_no_lane emit
 errors/try_union_local_rebind emit
 errors/unknown_decorator emit
 errors/unresolved_name emit
 errors/unsupported_import emit
-errors/boxed_payload_too_wide_fields lower
-errors/class_erased_object_field lower
-errors/class_erased_object_field_int lower
-errors/generator_handler_local_yield lower
-errors/len_takes_no_keyword_arguments emit
-errors/starred_assignment_target emit
-errors/override_behind_a_base_typed_receiver emit
-errors/override_inherited_from_a_mixin emit
-errors/override_reached_before_the_subclass emit
-errors/global_declaration_without_storage emit
-errors/self_referential_union_field lower
-errors/exit_reads_the_exception_class emit
-errors/module_global_numeric_representation emit
-errors/print_unrenderable_argument emit
-errors/module_missing_attribute emit
