@@ -656,6 +656,32 @@
 # in three places.
 #
 # ============================================================
+# (33) THE STANDING WORK LIST: wb_sweep_findings_2026_08_18.py
+# ============================================================
+# Forty agents over ten domains, 30 verified findings, 27 still live after this
+# session's twelve rounds. They are written out one per entry -- program, both
+# outputs, a working neighbour, the verifier's notes -- in
+# tests/probe/wb_sweep_findings_2026_08_18.py, ordered silent-wrong-answer,
+# crash, false-refusal, missing-feature.
+#
+# ⭐ Re-checked against the current binary rather than trusted: 3 of the 30 were
+# already closed by this session and are not repeated. Do that again before
+# picking -- and note that finding 8's SYMPTOM had moved (a mis-raised IndexError
+# became an ownership error), which only bisecting the session's saved pre-fix
+# binaries showed was not a regression.
+#
+# ⭐ The four the next round should start from, by value:
+#   a loop-carried accumulator resets across a `yield` in a for-loop over a LIST
+#     (silent; `range` works, `["a"]` works, so it is same-contract lives at the
+#     suspension -- and with two elements it becomes a garbage bigint)
+#   `for i in range(3): ...` then `print(i)` -- unresolved name (the loop target
+#     is not readable after the loop; CPython leaves it bound, and the empty-loop
+#     case is a NameError no static binding can express, which is the open part)
+#   an `except` handler ending in `return` is not a terminator, so a name bound
+#     only in the try body reads as unresolved
+#   two SIGSEGVs in the ownership/classes domains, each with a one-edit neighbour
+#
+# ============================================================
 # (32) PARTLY FIXED: A CONTAINER OF INTS WHERE FLOATS ARE DECLARED.
 # ============================================================
 #     def f() -> list[float]:
