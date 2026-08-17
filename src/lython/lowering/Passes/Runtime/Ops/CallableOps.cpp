@@ -397,11 +397,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
   insertOperands.push_back(*box);
   RuntimeBundleLowerer::createRuntimeCall(loc, *insertBox, insertOperands);
 
-  // Only the rebind result is published, not the receiver's old binding: the
-  // grown triple is defined inside this block, so a loop-carried receiver's
-  // post-loop uses would not be dominated by it (append's runtime path takes
-  // the same care).
-  valueBundles[op.getResult(1)] = std::move(updated);
+  // ⭐ DEMOTED, and until 2026-08-17 it was not: `xs = [1, 3];
+  // xs.insert(1, 2); print(xs[1])` printed 3 where CPython prints 2, and
+  // `print(xs[0], xs[1], xs[2])` aborted in the ownership verifier ("released
+  // or transferred more than once"). An insert SHIFTS every slot at or past the
+  // index, and a handle-fronted contract's mutators are void, so the rebind
+  // hands the receiver straight back -- carrying element evidence that names
+  // the pre-insert slots. `__setslice__` already records this exact trap; it is
+  // the same one, on the sibling that changes a length.
+  //
+  // Why NOT keep the evidence and shift it: an insert index is a runtime value
+  // (`rawSequenceIndexValue`), so which slots moved is not known here. The
+  // published payload is authoritative and the runtime read answers from it.
+  RuntimeBundleLowerer::demoteMutableContainerEvidence(updated);
+
+  // The rebind result is published, and the receiver's own binding too: a
+  // structural mutation is spelled as an SSA reassignment, but a later read
+  // through the PRE-mutation name must not answer from evidence this insert
+  // invalidated. An interior view (a field, a class attribute, a container
+  // element) has no local to reassign, so for it that second publication is
+  // the only one -- and `getResult(1)` does not exist.
+  if (op.getNumResults() == 2)
+    valueBundles[op.getResult(1)] = updated;
+  valueBundles[op.getCallable()] = std::move(updated);
   if (mlir::failed(RuntimeBundleLowerer::assignObjectBundle(
           op, op.getResult(0), runtimeContractType(context, "types.NoneType"),
           mlir::ValueRange{})))
@@ -773,15 +791,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     return mlir::success();
   }
 
-  // list.insert(i, x): growth means the payload may move, so the receiver is
-  // grown through `ensure_capacity` and the rebind result carries the (possibly
-  // reallocated) triple, exactly like append's runtime path.
+  // list.insert(i, x): the receiver is grown through `ensure_capacity` and the
+  // runtime shifts, exactly like append's runtime path. No rebindable local is
+  // required -- see set.add below for why that requirement retired.
   if (listReceiverWithPayload && methodName == "insert" &&
       sources.size() == 3) {
-    if (!structuralMutation)
-      return op.emitError()
-             << "list.insert requires a rebindable local receiver; bind the "
-                "list to a local variable and insert into the local instead";
     if (mlir::failed(lowerRuntimeListInsert(op, receiver, sources)))
       return mlir::failure();
     erase.push_back(op);
@@ -901,14 +915,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   if (receiver.kind == RuntimeBundle::Kind::Object &&
       receiver.contractName() == "builtins.set" && methodName == "add") {
     // Runtime set insert with dedup: box the element and let the runtime
-    // probe/insert (the rebind result carries the possibly reallocated
-    // triple). Sets are always runtime-mode (their packs carry no element
+    // probe/insert. Sets are always runtime-mode (their packs carry no element
     // evidence).
+    //
+    // ⭐ A REBINDABLE LOCAL IS NOT REQUIRED, and the requirement was a
+    // paragraph that outlived its era: it read "the rebind result carries the
+    // possibly reallocated triple", which was true while a set travelled as
+    // lanes beside its handle. `LySet_AddBox` is void now -- the growth writes
+    // the new items address THROUGH the handle, so every holder observes it
+    // with no further action and the mutation has nothing to rename
+    // (builtins.mlir, `__ly_list_alloc`'s note). `rebindMutatedContainer` says
+    // so itself for an empty result range: it hands the receiver back.
+    //
+    // Why NOT keep the guard for safety: it did not guard anything reachable.
+    // It refused `self.tags.add(x)`, `cls.tags.add(x)`, `xs[0].add(x)` and
+    // `d[k].add(x)` -- the four ways a set is held by something other than a
+    // local -- while `s.add(x)` on a name and a parameter went through the
+    // identical call.
     if (sources.size() != 2 || !sources[1] ||
         sources[1]->kind != RuntimeBundle::Kind::Object)
       return op.emitError() << "set.add expects one Python object argument";
-    if (!structuralMutation)
-      return op.emitError() << "set.add requires a rebindable local receiver";
     if (!RuntimeBundleLowerer::containerHasRuntimePayload(receiver))
       return op.emitError() << "set runtime object has no physical payload";
     std::optional<RuntimeSymbol> addBox =
@@ -943,7 +969,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
             op, receiver, call.getResults(), updated)))
       return mlir::failure();
-    valueBundles[op.getResult(1)] = std::move(updated);
+    // A rebind names the re-description under the local's new SSA value; an
+    // interior view has no local, so the receiver VALUE learns it instead --
+    // the same split `list.append`'s runtime arm makes, and for the same reason
+    // (a root created in a branch does not dominate the reads that join after).
+    if (structuralMutation)
+      valueBundles[op.getResult(1)] = std::move(updated);
+    else
+      valueBundles[op.getCallable()] = std::move(updated);
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(0),
             runtimeContractType(context, "types.NoneType"),
@@ -966,9 +999,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // the receiver straight back -- carrying element evidence that names the
     // pre-splice contents. That read as a correct list on the print right
     // after the splice and then mis-executed the NEXT delete.
-    if (!structuralMutation)
-      return op.emitError()
-             << "list slice mutation requires a rebindable local receiver";
+    // No rebindable local required, for set.add's reason above: the splice
+    // writes through the handle. The emitter hands an interior-view target a
+    // one-result call, so `getResult(1)` is what must be guarded, not the shape.
     if (!RuntimeBundleLowerer::containerHasRuntimePayload(receiver))
       return op.emitError() << "list runtime object has no physical payload";
     builder.setInsertionPoint(op);
@@ -982,7 +1015,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
             op, receiver, emitted->call.getResults(), updated)))
       return mlir::failure();
     RuntimeBundleLowerer::demoteMutableContainerEvidence(updated);
-    valueBundles[op.getResult(1)] = updated;
+    if (op.getNumResults() == 2)
+      valueBundles[op.getResult(1)] = updated;
     // The receiver's own binding learns it too: a slice mutation is spelled as
     // an SSA reassignment, but a later read through the pre-mutation name must
     // not answer from evidence the mutation invalidated.

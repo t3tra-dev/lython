@@ -79,7 +79,6 @@ errors/boxed_payload_too_wide_fields lower
 errors/class_erased_object_field lower
 errors/class_erased_object_field_int lower
 errors/generator_handler_local_yield lower
-errors/list_insert_on_field lower
 errors/len_takes_no_keyword_arguments emit
 errors/starred_assignment_target emit
 errors/override_behind_a_base_typed_receiver emit

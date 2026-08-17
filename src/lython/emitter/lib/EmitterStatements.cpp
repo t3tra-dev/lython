@@ -1094,17 +1094,27 @@ void ModuleEmitter::emitSliceMutation(const parser::Node &target,
                 .concat(reason)
                 .str()});
   };
-  if (!containerNode || containerNode->kind != "Name") {
-    unsupported("requires a named local list target (field containers are "
-                "not supported yet)");
+  if (!containerNode) {
+    unsupported("has no target expression");
     return;
   }
   Value container = emitExpr(containerNode);
-  llvm::StringRef containerName = ast::nameSpelling(*containerNode);
-  if (!isStructuralMutationRebindable(containerName, container.value)) {
-    unsupported("requires a rebindable local or module-global list target");
-    return;
-  }
+  // ⭐ A NAME IS NOT REQUIRED. `self.rows[:n] = [9]` and `del self.rows[:n]`
+  // were "requires a named local list target (field containers are not
+  // supported yet)", and `g[0][:1] = [9]` with them. A list is handle-fronted:
+  // the splice writes the new items address THROUGH the handle, so a holder
+  // that is a field slot, a class-attribute cell or a container element
+  // observes it with nothing to rename -- which is exactly why the LOWERING
+  // stopped needing the rebind (Runtime/Ops/CallableOps.cpp). What the rebind
+  // still buys where it applies is the demotion of the local's element
+  // evidence, so the two shapes stay distinct here rather than collapsing:
+  // a name gets the two-result rebinding call, anything else the plain one.
+  llvm::StringRef containerName;
+  if (containerNode->kind == "Name")
+    containerName = ast::nameSpelling(*containerNode);
+  bool rebindable =
+      !containerName.empty() &&
+      isStructuralMutationRebindable(containerName, container.value);
 
   const parser::Node *lower = ast::node(sliceNode, "lower");
   const parser::Node *upper = ast::node(sliceNode, "upper");
@@ -1147,12 +1157,15 @@ void ModuleEmitter::emitSliceMutation(const parser::Node &target,
   Value posPack = emitPack(arguments);
   Value namePack = emitPack({});
   Value valuePack = emitPack({});
-  auto op = py::CallOp::create(
-      builder, loc(target),
-      mlir::TypeRange{inference.resultType, container.value.getType()},
-      callProtocolFor(inference), container.value, posPack.value,
-      namePack.value, valuePack.value);
+  llvm::SmallVector<mlir::Type, 2> resultTypes{inference.resultType};
+  if (rebindable)
+    resultTypes.push_back(container.value.getType());
+  auto op = py::CallOp::create(builder, loc(target), resultTypes,
+                               callProtocolFor(inference), container.value,
+                               posPack.value, namePack.value, valuePack.value);
   op->setAttr("ly.bound_method", builder.getStringAttr(methodName));
+  if (!rebindable)
+    return;
   op->setAttr("ly.structural_mutation", builder.getUnitAttr());
   rebindStructuralMutation(target, containerName,
                            Value{op.getResult(1), container.type});

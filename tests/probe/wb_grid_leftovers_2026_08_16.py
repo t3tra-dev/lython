@@ -656,6 +656,48 @@
 # in three places.
 #
 # ============================================================
+# (20) FIXED: STRUCTURAL MUTATION THROUGH A NON-LOCAL RECEIVER,
+#      AND THE ALIAS READ UNDER IT.
+# ============================================================
+#     self.seen.add(n)         # set.add requires a rebindable local receiver
+#     self.rows.insert(i, v)   # list.insert requires a rebindable local ...
+#     self.rows[:n] = [9]      # slice assignment requires a named local list
+#     del self.rows[:n]        #   target (field containers are not supported)
+#
+# ⭐ FIXED 2026-08-17. Four refusals, one expired premise: "a mutation may
+# reallocate, so it hands back a re-description only a local can hold".
+# `LySet_AddBox`, `LyList_EnsureCapacity`, `LyList_SetSlice` and
+# `LyList_DelSlice` are all VOID now -- the growth writes the new items address
+# through the handle. Checking the manifest signature rather than reasoning
+# about the era is what found all four at once.
+#
+# Two further defects fell out of the grid rather than out of the refusals, and
+# both were SILENT:
+#
+#   `xs = [1, 3]; xs.insert(1, 2); print(xs[1])` printed 3 (CPython: 2), and
+#   three live reads aborted the ownership verifier. An insert shifts every slot
+#   at or past the index; `__setslice__` already demoted its evidence for
+#   exactly this and `insert` did not.
+#
+#   `b = Bag(seed); b.xs[0] = 9; print(seed[0])` printed 3 (CPython: 9) -- the
+#   alias read. `b.xs.sort()`, `holder[0][0] = 9` and `by_name["a"][1] = 9` were
+#   wrong the same way, and `b.xs.append(9); seed[3]` did not compile. The mark
+#   (`sharedWithHolder`) was already set at every absorption and nothing
+#   consulted it on the read side.
+#
+# ⛔ The alias fix is the READ moving to the payload, not the evidence being
+# dropped: dropping it at the absorption was measured three ways and takes
+# 145-146 tests down, because the evidence is where the slot's owned reference
+# is booked.
+#
+# The 75-cell grid (15 mutators x 5 receiver kinds: local, field, field from
+# outside, class attribute, container element) is clean.
+#
+# Pinned by tests/golden/cases/structural_mutation_through_a_view.py,
+# list_insert_shifts_the_reads.py, mutation_through_an_alias.py (which replaces
+# errors/list_insert_on_field, whose own note asked to be retired this way).
+#
+# ============================================================
 # (19) FIXED: A CLASS ATTRIBUTE HOLDING A CONTAINER.
 # ============================================================
 #     class R:

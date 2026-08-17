@@ -1326,9 +1326,30 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   RuntimeBundle index = indexRef;
   // An evidence-BACKED container with no recorded elements (an annotated
   // empty literal grown by loop appends) reads through the payload too.
+  //
+  // ⭐ AND ONE WITH A SECOND HOLDER, whatever its evidence says:
+  //
+  //     seed = [3, 1, 2]
+  //     b = Bag(seed)          # self.xs = xs -- one object, two names
+  //     b.xs[0] = 9
+  //     print(seed[0])         # printed 3; CPython prints 9
+  //
+  // The write landed (`print(seed)` was right) and only the ELEMENT read was
+  // wrong: it answered from `seed`'s compile-time slot evidence, which no
+  // mutation through the other name had any way to update. `b.xs.sort()` and
+  // `holder[0][0] = 9` were wrong the same way, so this is the read side of
+  // `sharedWithHolder` rather than one mutator's omission.
+  //
+  // ⛔ Why NOT demote the evidence at the absorption instead: measured three
+  // ways and it takes 145-146 tests down, aborting at runtime -- the evidence
+  // is where the slot's owned reference is BOOKED, not only what it describes
+  // (`markAbsorbedContainerAsShared`). So the evidence stays and the read moves.
+  bool secondHolderMayHaveMutated =
+      container.sharedWithHolder &&
+      container.contractName() == "builtins.list";
   if ((container.contractName() != "builtins.list" &&
        container.contractName() != "builtins.tuple") ||
-      !container.sequenceElements.empty() ||
+      (!container.sequenceElements.empty() && !secondHolderMayHaveMutated) ||
       !RuntimeBundleLowerer::containerHasRuntimePayload(container))
     return false;
   mlir::Type elementContract = op.getResult().getType();
