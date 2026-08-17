@@ -645,6 +645,63 @@ bool ModuleEmitter::emitSequenceProtocolFor(const parser::Node &statement,
   return emitIndexedFor(statement, iterNode);
 }
 
+// ⭐ `__iter__` WRITTEN AS A GENERATOR. It is the ordinary way to make a tree
+// iterable --
+//
+//     def __iter__(self):
+//         yield self.v
+//         for k in self.kids:
+//             for x in k:
+//                 yield x
+//
+// -- and the loop asked the class for `__iter__` and got its BODY result, which
+// for a generator is None:
+//
+//     # static type !py.literal<None> does not provide manifest method
+//     # '__next__'
+//
+// The value a call to it produces is the generator object, and `for v in
+// <generator>` already runs. So the loop iterates the CALL: rewriting the
+// iterable to `<source>.__iter__()` hands the ordinary path a generator, and
+// the direct-call route takes the method symbol with the receiver as its
+// leading positional.
+bool ModuleEmitter::emitGeneratorDunderIterFor(const parser::Node &statement,
+                                               const parser::Node &iterNode) {
+  mlir::Type sourceType = types.widenLiteral(types.inferExpr(&iterNode));
+  if (!mlir::isa_and_nonnull<py::ContractType>(sourceType))
+    return false;
+  std::optional<MethodBinding> iterMethod =
+      lookupClassMethod(sourceType, "__iter__");
+  if (!iterMethod || !iterMethod->method ||
+      !iterMethod->bodySignature.isGeneratorFunction)
+    return false;
+  const parser::Field *iterField = parser::findField(statement, "iter");
+  if (!iterField || !std::holds_alternative<parser::NodePtr>(iterField->value))
+    return false;
+  parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
+  if (!source)
+    return false;
+  const parser::Field *targetField = parser::findField(statement, "target");
+  const auto *body = ast::nodeList(statement, "body");
+  if (!targetField || !body ||
+      !std::holds_alternative<parser::NodePtr>(targetField->value))
+    return false;
+  std::vector<parser::NodePtr> loopBody;
+  for (const parser::NodePtr &each : *body)
+    if (each)
+      loopBody.push_back(each);
+  std::vector<parser::NodePtr> elseBody;
+  if (const auto *orelse = ast::nodeList(statement, "orelse"))
+    for (const parser::NodePtr &each : *orelse)
+      if (each)
+        elseBody.push_back(each);
+  emitFor(*synth::forStmt(
+      std::get<parser::NodePtr>(targetField->value),
+      synth::methodCall(source, "__iter__", {}, statement.range),
+      std::move(loopBody), std::move(elseBody), statement.range));
+  return true;
+}
+
 // ⭐ A USER-DEFINED ITERATOR. A class with `__iter__` and `__next__` is the
 // iterator protocol itself, and it could not be iterated at all:
 //
@@ -891,6 +948,8 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       if (emitGeneratorIndexedFor(statement, *iterNode))
         return;
   if (const parser::Node *iterNode = ast::node(statement, "iter")) {
+    if (emitGeneratorDunderIterFor(statement, *iterNode))
+      return;
     if (emitSequenceProtocolFor(statement, *iterNode))
       return;
     if (emitSourceIteratorFor(statement, *iterNode))

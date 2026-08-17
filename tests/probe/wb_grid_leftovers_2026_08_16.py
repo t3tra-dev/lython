@@ -607,6 +607,26 @@
 # Found 2026-08-17 while writing that golden, which pins a different defect (an
 # `if` in the else clause was "empty block: expect at least a terminator").
 #
+# ============================================================
+# (17) `"-".join(w)` WHERE `w` IS AN ITERABLE SOURCE CLASS.
+# ============================================================
+#     static type !py.contract<"builtins.str"> does not provide manifest
+#     method 'join'
+#
+# CPython's join takes any iterable; no manifest parameter declares a user
+# class, so the inference for the ARGUMENT fails and the message blames the
+# receiver. `"-".join(list(w))` works, and a GENERATOR argument is materialized
+# for exactly this reason (2026-08-17).
+#
+# ⛔ EXTENDING THAT REWRITE TO SOURCE CLASSES WAS TRIED AND REVERTED: gating on
+# "has `__iter__`, or `__len__` and `__getitem__`" took out 8 goldens
+# (json_value_repr, stdlib_json_accessors, stdlib_json_build and five more).
+# `json.JSONValue` satisfies the predicate and is passed to manifest methods
+# that want the OBJECT, not a list of its elements -- so the predicate has to be
+# the PARAMETER's declared type rather than the argument's shape, and that path
+# infers the method's contract from the actual argument types after emitting
+# them. Same structural gap as the manifest-parameter expectation.
+#
 import math
 
 # The forms that DO work, so this file runs and the three above stay visible

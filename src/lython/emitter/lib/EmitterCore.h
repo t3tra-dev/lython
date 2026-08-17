@@ -394,6 +394,10 @@ private:
   // is written as the try/except the protocol is (EmitterLoops.cpp).
   bool emitSourceIteratorFor(const parser::Node &statement,
                              const parser::Node &iterNode);
+  // `__iter__` written as a generator: the loop iterates the CALL, whose value
+  // is the generator object (EmitterLoops.cpp).
+  bool emitGeneratorDunderIterFor(const parser::Node &statement,
+                                  const parser::Node &iterNode);
   bool exprHasContract(const parser::Node *expr, llvm::StringRef contractName);
   std::optional<Value> tryEmitDictMethodSugar(const parser::Node &expr,
                                               const parser::Node *calleeNode);
