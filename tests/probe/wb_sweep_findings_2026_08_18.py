@@ -301,6 +301,27 @@ them in.
 # `self.rows = {}`) agrees. (5) module scope: inlining the method body at
 # module scope (`old = t.rows` / `t.rows = {}`) reproduces identically (0,1 vs
 # 2,2), so the method is not required.
+#
+# ⭐ ONE ROOT WITH THE OTHER OWNERSHIP FINDING, localised 2026-08-18: rebinding a
+# field RELEASES the object a live local alias still names. `old = t.rows` binds a
+# BORROW, `t.rows = {}` (or `= []`) releases the slot's reference, and the alias is
+# then a dangling handle. The neighbours place it exactly:
+#
+#     old = t.rows; print(len(old))                 -> correct
+#     old = t.rows; t.rows = []; print(len(old))    -> correct (nothing decoded yet)
+#     old = t.rows; t.rows = []; old[0] = 9         -> IndexError / SIGSEGV
+#
+# ⛔ JIT AND AOT DISAGREE on the dict spelling, which no sweep column would show:
+# `lyc jit` prints 0 then 1 (silent wrong answer) and the AOT binary segfaults, 3/3
+# each, from the same source. Measure both when the finding is about lifetime.
+#
+# ⛔ The sound repair is that a field read of a mutable container OWNS its
+# reference rather than borrowing -- a change to the ownership model with a
+# retain/release per field read, not a patch. Routing the field's dict stores
+# through the runtime payload (the same repair the list store took) was tried and
+# REVERTED: it changed nothing measurable on three field-dict programs and turned
+# this one's silent wrong answer into a deterministic crash.
+#
 
 # ==========================================================================
 # [SILENT-WRONG-ANSWER] strings
@@ -670,6 +691,27 @@ them in.
 # function: the same body inside `def go(t: Table) -> int` does not segv, it
 # raises a spurious `IndexError: list assignment index out of range` (rc 1) ->
 # same wrong container, different symptom. (
+#
+# ⭐ ONE ROOT WITH THE OTHER OWNERSHIP FINDING, localised 2026-08-18: rebinding a
+# field RELEASES the object a live local alias still names. `old = t.rows` binds a
+# BORROW, `t.rows = {}` (or `= []`) releases the slot's reference, and the alias is
+# then a dangling handle. The neighbours place it exactly:
+#
+#     old = t.rows; print(len(old))                 -> correct
+#     old = t.rows; t.rows = []; print(len(old))    -> correct (nothing decoded yet)
+#     old = t.rows; t.rows = []; old[0] = 9         -> IndexError / SIGSEGV
+#
+# ⛔ JIT AND AOT DISAGREE on the dict spelling, which no sweep column would show:
+# `lyc jit` prints 0 then 1 (silent wrong answer) and the AOT binary segfaults, 3/3
+# each, from the same source. Measure both when the finding is about lifetime.
+#
+# ⛔ The sound repair is that a field read of a mutable container OWNS its
+# reference rather than borrowing -- a change to the ownership model with a
+# retain/release per field read, not a patch. Routing the field's dict stores
+# through the runtime payload (the same repair the list store took) was tried and
+# REVERTED: it changed nothing measurable on three field-dict programs and turned
+# this one's silent wrong answer into a deterministic crash.
+#
 
 # ==========================================================================
 # [CRASH] stdlib
