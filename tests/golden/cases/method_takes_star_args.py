@@ -24,9 +24,11 @@
 # three-argument calls are all present because the boundary between "declared
 # positional" and "packed" is where a mistake would sit.
 #
-# ⛔ `**kwargs` on a method is still "unexpected keyword argument 'b' for inlined
-# class method": collecting the unmatched keywords needs a dict built from values
-# that are already emitted, which is a different mechanism than packing a tuple.
+# `**kwargs` is the mirror of it and took the same round. The extras are collected
+# into the dict the callee would have received, built through `LyValueRef` because
+# the values are already EMITTED and a dict literal is written in AST -- the same
+# machinery the augmented-assignment rewrite uses to name a subexpression it must
+# not evaluate twice.
 #
 # ⛔ `self.xs = list(xs)` with NO field annotation leaves the field typed
 # `builtins.object` for readers outside the class, so `len(r.xs)` is refused there
@@ -93,6 +95,27 @@ b = Bag(1, 2, 3)
 print(b.xs, b.n, len(b.xs))
 empty = Bag()
 print(empty.xs, empty.n)
+
+
+# --- **kwargs, and the empty dict --------------------------------------
+class Options:
+    def set(self, **opts: int) -> int:
+        return len(opts)
+
+    def total(self, **opts: int) -> int:
+        t = 0
+        for k in sorted(opts):
+            t += opts[k]
+        return t
+
+    def with_base(self, base: int, **opts: int) -> int:
+        return base + len(opts)
+
+
+o = Options()
+print(o.set(), o.set(a=1), o.set(a=1, b=2))
+print(o.total(a=1, b=2), o.total())
+print(o.with_base(1, a=2), o.with_base(base=1))
 
 
 # --- THE CONTROL: the free function, which was always right ---------------

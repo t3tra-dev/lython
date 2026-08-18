@@ -2994,6 +2994,8 @@ Value ModuleEmitter::emitInlineMethodBody(
     bind(*sig.varargName, packed);
   }
 
+  llvm::SmallVector<std::string, 4> variadicKeywordNames;
+  llvm::SmallVector<Value, 4> variadicKeywordValues;
   auto bindKeyword = [&](llvm::StringRef name, Value value) {
     for (auto [index, positionalName] : llvm::enumerate(sig.positionalNames)) {
       if (positionalName != name)
@@ -3018,6 +3020,19 @@ Value ModuleEmitter::emitInlineMethodBody(
       bind(name, value);
       return;
     }
+    // ⭐ `**kwargs` ON A METHOD collects what no parameter claimed. Without this
+    // the extras were "unexpected keyword argument 'b'", while the same body as a
+    // free function bound them -- the mirror of the `*args` gap above.
+    //
+    // ⛔ Built through `LyValueRef`, because the values are already EMITTED and a
+    // dict literal is written in AST: each value goes into `pendingValueRefs` and
+    // the synthesized Dict names it by slot, which is the same machinery the
+    // augmented-assignment rewrite uses to avoid evaluating a subexpression twice.
+    if (sig.kwargName) {
+      variadicKeywordNames.push_back(name.str());
+      variadicKeywordValues.push_back(value);
+      return;
+    }
     diagnostics.push_back(
         parser::Diagnostic{parser::Severity::Error, anchor.range.start,
                            "unexpected keyword argument '" + name.str() +
@@ -3025,6 +3040,34 @@ Value ModuleEmitter::emitInlineMethodBody(
   };
   for (auto &entry : keywords)
     bindKeyword(entry.getKey(), entry.getValue());
+  if (sig.kwargName) {
+    // The dict the callee would have received: string keys, and values named
+    // through `LyValueRef` because they are already emitted. An EMPTY one takes
+    // the declared type from the expectation, the same way the empty vararg
+    // tuple above does.
+    std::size_t refStart = pendingValueRefs.size();
+    auto releaseRefs = llvm::make_scope_exit(
+        [&] { pendingValueRefs.resize(refStart); });
+    std::vector<parser::NodePtr> keyNodes;
+    std::vector<parser::NodePtr> valueNodes;
+    for (auto [index, name] : llvm::enumerate(variadicKeywordNames)) {
+      keyNodes.push_back(synth::strConstant(name, anchor.range));
+      parser::NodePtr ref = parser::makeNode("LyValueRef", anchor.range);
+      parser::addField(*ref, "slot",
+                       static_cast<std::int64_t>(pendingValueRefs.size()));
+      pendingValueRefs.push_back(variadicKeywordValues[index]);
+      valueNodes.push_back(std::move(ref));
+    }
+    parser::NodePtr dictNode = parser::makeNode("Dict", anchor.range);
+    parser::addField(*dictNode, "keys", std::move(keyNodes));
+    parser::addField(*dictNode, "values", std::move(valueNodes));
+    Value packedKeywords = sig.kwargType
+                               ? emitExprExpected(dictNode.get(), sig.kwargType)
+                               : emitExpr(dictNode.get());
+    if (sig.kwargType && packedKeywords.type != sig.kwargType)
+      packedKeywords = coerceValue(packedKeywords, sig.kwargType, anchor);
+    bind(*sig.kwargName, packedKeywords);
+  }
 
   const parser::Node *arguments = ast::node(*method.method, "args");
   llvm::SmallVector<const parser::Node *, 8> positionalNodes;

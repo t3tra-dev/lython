@@ -676,11 +676,14 @@
 # must still produce. `for x in ()` at module scope always worked because a
 # literal empty tuple takes the RUNTIME path, where a length of zero is ordinary.
 #
-# ⛔ Two things it did NOT fix, both measured:
-#   `**kwargs` on a method -- "unexpected keyword argument 'b'". Collecting the
-#     unmatched keywords needs a dict built from already-emitted values, a
-#     different mechanism than packing a tuple (the `LyValueRef` machinery the
-#     augmented-assignment route uses is the likely shape).
+# ⭐ `**kwargs` CAME WITH IT, in the same round: the unmatched keywords are
+# collected into the dict the callee would have received, built through
+# `LyValueRef` because the values are already EMITTED and a dict literal is
+# written in AST -- the machinery the augmented-assignment rewrite uses to name a
+# subexpression it must not evaluate twice. The guess recorded here about which
+# mechanism it would need turned out to be the right one.
+#
+# ⛔ One thing it did NOT fix:
 #   `self.xs = list(xs)` with no field annotation -- the field reads as
 #     `builtins.object` OUTSIDE the class, so `len(r.xs)` is refused there while
 #     the body's own `len(xs)` is fine. The class-field pre-pass types fields
