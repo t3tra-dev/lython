@@ -1376,6 +1376,41 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
               methodCallNode = rewrittenCall.get();
             }
           }
+        // ⭐ A DICT VIEW OUTSIDE A CONSUMER, named where the program can be
+        // fixed. `ks = d.keys()` reached the manifest lookup and reported
+        // "runtime manifest has no builtins.dict.keys method" -- a sentence
+        // about the manifest for a program that did nothing to it, while
+        // `len(d.keys())`, `sorted(d.keys())`, `list(d.keys())` and
+        // `for k in d.keys()` all work, because each of those unwraps the view
+        // before emitting it.
+        //
+        // ⛔ Refused rather than snapshotted: CPython's view TRACKS later
+        // mutations of the dict, and `ks = list(d.keys())` does not. Binding a
+        // list where the program asked for a view is a silent wrong answer the
+        // moment anything inserts, so the message says what to write and lets
+        // the author decide whether a snapshot is what they meant.
+        if (mlir::isa_and_nonnull<py::ContractType>(
+                types.widenLiteral(receiver.type)) &&
+            mlir::cast<py::ContractType>(types.widenLiteral(receiver.type))
+                    .getContractName() == "builtins.dict" &&
+            (*methodName == "keys" || *methodName == "values" ||
+             *methodName == "items")) {
+          const auto *viewArgs = ast::nodeList(expr, "args");
+          const auto *viewKeywords = ast::nodeList(expr, "keywords");
+          if ((!viewArgs || viewArgs->empty()) &&
+              (!viewKeywords || viewKeywords->empty())) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, expr.range.start,
+                "a dict view ('" + std::string(*methodName) +
+                    "()') has no value here: it is supported where it is "
+                    "CONSUMED (len, sorted, list, tuple, set, a for statement, "
+                    "'in'), because those read it without keeping it. Binding it "
+                    "to a name would need a live view -- write list(d." +
+                    std::string(*methodName) + "()) if a snapshot is what you "
+                    "mean, and note that it does not track later mutations"});
+            return emitNone(expr);
+          }
+        }
         CallOperands operands = emitCallOperands(*methodCallNode);
         if (!operands.valid) {
           diagnostics.push_back(parser::Diagnostic{

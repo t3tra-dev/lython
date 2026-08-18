@@ -656,6 +656,27 @@
 # in three places.
 #
 # ============================================================
+# (40) FIXED (AS A DIAGNOSTIC): A DICT VIEW BOUND TO A NAME.
+# ============================================================
+#     d: dict[str, int] = {"a": 1}
+#     ks = d.keys()
+#     # runtime manifest has no builtins.dict.keys method
+#
+# ⭐ 2026-08-18. Every CONSUMING spelling works -- `len(d.keys())`,
+# `sorted(d.keys())`, `list(d.keys())`, `for k in d.keys()` -- because each
+# unwraps the view before emitting it. What has no representation is the view as
+# a VALUE, and the old message said so in terms of the manifest, which the program
+# never touched.
+#
+# ⛔ REFUSED RATHER THAN SNAPSHOTTED, and that is the whole decision: CPython's
+# view TRACKS later mutations and `list(d.keys())` does not, so binding a list
+# where the program asked for a view is a silent wrong answer the moment anything
+# inserts. The diagnostic names the consuming positions, the snapshot spelling,
+# and what the snapshot gives up -- which leaves the choice with the author.
+#
+# Pinned by tests/golden/errors/dict_view_needs_a_consumer.py.
+#
+# ============================================================
 # (39) FIXED: `from os import path` -- AN ALIAS THAT SHADOWED A STDLIB LOCAL.
 # ============================================================
 #     from os import path
