@@ -653,7 +653,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildRuntimeCallOperands(
         return mlir::failure();
       continue;
     }
-    if (sourceIndex >= sources.size()) {
+    // A NULL entry is a parameter the call skipped -- a keyword call that
+    // supplied a later one and left this at its default. Without it the sources
+    // could only run out at the END, so `isclose(a, b, abs_tol=...)` had nowhere
+    // to say that rel_tol keeps its own value.
+    if (sourceIndex >= sources.size() || !sources[sourceIndex]) {
+      if (sourceIndex < sources.size())
+        ++sourceIndex;
       if (mlir::failed(
               appendImplicitRuntimeArgument(op, symbol, inputIndex, operands)))
         return mlir::failure();

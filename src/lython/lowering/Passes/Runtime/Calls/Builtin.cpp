@@ -209,15 +209,85 @@ RuntimeBundleLowerer::lowerDirectBuiltinCall(py::CallOp op,
     return op.emitError() << "builtin callable '" << symbol.builtinName
                           << "' direct lowering must produce one result";
 
-  if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
-      mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
-    return mlir::failure();
-
   llvm::SmallVector<const RuntimeBundle *, 4> sources;
   llvm::SmallVector<RuntimeBundle, 4> unpackedSources;
   if (mlir::failed(collectPackedObjectSources(
           op, op.getPosargs(), "positional args", sources, &unpackedSources)))
     return mlir::failure();
+
+  // ⭐ KEYWORD ARGUMENTS TO A MANIFEST FREE FUNCTION. Every one of them used to
+  // stop here -- "kw names lowering is not keyword-aware yet" -- so a parameter
+  // CPython makes keyword-only was unreachable by construction:
+  // `math.isclose(a, b, rel_tol=1e-6)` had no spelling that compiled.
+  //
+  // The call carries what the mapping needs: the contract's arg_names followed
+  // by its kw_names are the parameter ORDER, which is the order the manifest
+  // function declares its inputs in. A keyword resolves to a position there,
+  // and the positions nobody supplied stay null and take the function's own
+  // ly.runtime.default_* value.
+  const RuntimeBundle *kwNames = RuntimeBundleLowerer::bundleFor(op.getKwnames());
+  const RuntimeBundle *kwValues =
+      RuntimeBundleLowerer::bundleFor(op.getKwvalues());
+  if (!kwNames || kwNames->kind != RuntimeBundle::Kind::Aggregate ||
+      !kwValues || kwValues->kind != RuntimeBundle::Kind::Aggregate)
+    return op.emitError() << "builtin callable '" << symbol.builtinName
+                          << "' keyword packs must be lowered aggregates";
+  if (!kwNames->aggregateOperands.empty()) {
+    if (kwNames->aggregateOperands.size() != kwValues->aggregateOperands.size())
+      return op.emitError() << "builtin callable '" << symbol.builtinName
+                            << "' keyword name/value count mismatch";
+    auto contract =
+        mlir::dyn_cast_if_present<py::CallableType>(op.getCallContract());
+    if (!contract)
+      return op.emitError() << "builtin callable '" << symbol.builtinName
+                            << "' keyword call has no Callable contract";
+    llvm::SmallVector<llvm::StringRef, 8> order;
+    for (mlir::StringAttr parameter : contract.getPositionalNames())
+      order.push_back(parameter.getValue());
+    for (mlir::StringAttr parameter : contract.getKwOnlyNames())
+      order.push_back(parameter.getValue());
+    if (order.size() < sources.size())
+      return op.emitError() << "builtin callable '" << symbol.builtinName
+                            << "' contract names fewer parameters than the "
+                               "call supplies";
+    llvm::SmallVector<const RuntimeBundle *, 8> byPosition(order.size(),
+                                                           nullptr);
+    for (auto [index, source] : llvm::enumerate(sources))
+      byPosition[index] = source;
+    for (auto [index, nameValue] : llvm::enumerate(kwNames->aggregateOperands)) {
+      std::optional<std::string> keyword =
+          RuntimeBundleLowerer::keywordNameFromValue(nameValue);
+      if (!keyword)
+        return op.emitError() << "builtin callable '" << symbol.builtinName
+                              << "' keyword name must be statically known";
+      auto slot = llvm::find(order, llvm::StringRef(*keyword));
+      if (slot == order.end())
+        return op.emitError() << "builtin callable '" << symbol.builtinName
+                              << "' has no parameter named '" << *keyword
+                              << "'";
+      unsigned position = static_cast<unsigned>(slot - order.begin());
+      if (byPosition[position])
+        return op.emitError() << "builtin callable '" << symbol.builtinName
+                              << "' got two values for '" << *keyword << "'";
+      mlir::Value keywordValue = kwValues->aggregateOperands[index];
+      if (mlir::failed(
+              RuntimeBundleLowerer::ensureValueBundle(op, keywordValue)))
+        return mlir::failure();
+      const RuntimeBundle *bundle =
+          RuntimeBundleLowerer::bundleFor(keywordValue);
+      if (!bundle)
+        return op.emitError() << "builtin callable '" << symbol.builtinName
+                              << "' keyword value has no lowered runtime "
+                                 "bundle";
+      byPosition[position] = bundle;
+    }
+    // Trailing parameters nobody supplied are not gaps, they are absent: the
+    // operand walk fills them from the same defaults a short positional call
+    // gets, and leaving them in the vector would ask it to do that twice.
+    while (!byPosition.empty() && !byPosition.back())
+      byPosition.pop_back();
+    sources.assign(byPosition.begin(), byPosition.end());
+  }
 
   builder.setInsertionPoint(op);
   llvm::SmallVector<mlir::Value, 4> operands;

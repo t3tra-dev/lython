@@ -7,6 +7,10 @@ nan 2.0
 True True
 False True
 True False
+True True
+True True
+True False
+isclose: tolerances must be non-negative
 log2: expected a positive input, got 0.0
 log10: expected a positive input, got -1.0
 fmod: math domain error

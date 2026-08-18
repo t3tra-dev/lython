@@ -39,10 +39,15 @@
 # double-double instead of calling libm. Wiring libm would print a different
 # last digit for one input in six.
 #
+# The keyword spellings run because the call carries the mapping: the contract's
+# arg_names followed by its kw_names are the parameter order, which is the order
+# the manifest function declares its inputs in, so a keyword resolves to a
+# position and the positions nobody supplied take the function's own default.
+# Both orders are here because a keyword call is order-free and the operand walk
+# is not.
+#
 # ⛔ Also missing: gcd / lcm / comb / perm / prod are int work rather than libm
-# calls, and `math.isclose(a, b, rel_tol=1e-6)` reaches "kw names lowering is
-# not keyword-aware yet" -- the keyword path for a manifest free function, which
-# is a lowering gap and not this one.
+# calls.
 import math
 
 print(math.log2(8.0), math.log10(100.0), math.exp2(3.0), math.exp2(0.5))
@@ -55,6 +60,15 @@ print(math.degrees(1.0), math.radians(1.0), math.degrees(math.pi))
 print(math.isclose(1.0, 1.0), math.isclose(1.0, 1.0000000001))
 print(math.isclose(1.0, 1.1), math.isclose(0.1 + 0.2, 0.3))
 print(math.isclose(math.inf, math.inf), math.isclose(math.nan, math.nan))
+print(math.isclose(1.0, 1.1, rel_tol=0.2), math.isclose(1.0, 1.1, abs_tol=0.2))
+print(math.isclose(1.0, 1.1, rel_tol=0.0, abs_tol=0.2),
+      math.isclose(1.0, 1.1, abs_tol=0.2, rel_tol=0.0))
+print(math.isclose(0.0, 1e-12, abs_tol=1e-9), math.isclose(0.0, 1e-8, abs_tol=1e-9))
+
+try:
+    math.isclose(1.0, 1.1, rel_tol=-1.0)
+except ValueError as e:
+    print("isclose:", e)
 
 try:
     math.log2(0.0)

@@ -772,9 +772,20 @@
 # callable type make the tolerances keyword-only, so `isclose(a, b, 0.2)` is
 # refused here exactly as CPython refuses it. The body is math_isclose verbatim.
 #
-# ⛔ `math.isclose(a, b, rel_tol=1e-6)` still reaches "kw names lowering is not
-# keyword-aware yet": the keyword path for a manifest FREE FUNCTION is a lowering
-# gap of its own, and the two-argument form is what works.
+# ⭐ AND THE KEYWORD PATH ITSELF, the same day: "kw names lowering is not
+# keyword-aware yet" stopped EVERY keyword argument to a manifest free function,
+# which made a parameter CPython declares keyword-only unreachable by
+# construction. The call already carries the mapping -- the contract's arg_names
+# followed by its kw_names are the parameter order, which is the order the
+# manifest function declares its inputs in -- so a keyword resolves to a position
+# and the positions nobody supplied stay null. The operand walk learned that a
+# null source means "take this parameter's own ly.runtime.default_*", which is
+# what a GAP needs and what running out at the end could not express.
+#
+# ⛔ Trailing nulls are popped rather than passed: the walk already fills a short
+# call from the same defaults, and leaving them in would ask it to do that twice.
+# ⛔ A misspelled keyword is a static refusal here (CPython raises TypeError at
+# run time), and two values for one parameter is refused too.
 #
 # ⛔ hypot and dist stay out, now MEASURED rather than asserted: libm's hypot
 # disagrees with CPython's on 32,071 of 200,000 random pairs (1 ulp, worst
