@@ -320,8 +320,13 @@ static void collectImportedModuleRequests(
       std::optional<std::string> moduleName = stringField(*statement, "module");
       if (level == 0) {
         if (moduleName) {
-          appendIfLocal(*moduleName,
-                        localSourceModulePath(baseDir, *moduleName));
+          // ⭐ The PREFIXES too, for the reason the Import branch needs them:
+          // `from os.path import join` imports from a module that is a member
+          // of `os`, so os.py has to be compiled for anything to resolve `path`
+          // -- and asking only for "os.path", which names no source, asked for
+          // nothing at all.
+          appendDottedImportSourceRequests(requests, baseDir, *moduleName,
+                                           &requestedModules);
           const auto *aliases = nodeListField(*statement, "names");
           if (!aliases)
             continue;

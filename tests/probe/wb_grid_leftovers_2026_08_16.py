@@ -675,10 +675,13 @@
 # four of them were binding a module that did not exist yet. When a binding
 # "does nothing at all", ask who was supposed to create the thing being bound.
 #
-# ⛔ Still unsupported and a different mechanism: `import os.path as p` and
-# `from os.path import join` bind the SUBMODULE itself, which needs a module
-# value -- `path` is a name inside os.py's scope, not a module the resolver
-# knows.
+# ⭐ AND THE OTHER TWO SPELLINGS, once the first was understood. `import os.path
+# as p` and `from os.path import join` bind the SUBMODULE rather than the root,
+# and the submodule is a name inside the root's own body (`import posixpath as
+# path`) -- so asking the root what it publishes under that name turns both into
+# a namespace binding the emitter already had. The from-import needed the same
+# prefix request in the driver: asking only for "os.path", which names no source,
+# asked for nothing at all.
 #
 # Pinned by tests/golden/cases/dotted_import_binds_the_root.py.
 #

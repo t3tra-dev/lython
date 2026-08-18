@@ -21,13 +21,18 @@
 # and splitext come from posixpath through os.path; dirname is here because the
 # separator handling is where a half-loaded module would still answer.
 #
-# ⛔ Two spellings stay unsupported and are a different mechanism: `import
-# os.path as p` and `from os.path import join` both bind the SUBMODULE itself,
-# which needs a module value the emitter does not have -- `os.path` is a name
-# inside os.py's scope, not a module the resolver knows.
+# The other two spellings bind the SUBMODULE rather than the root, and they work
+# by asking the root what it publishes under that name: `path` is a name inside
+# os.py's own body (`import posixpath as path`), so the dotted form resolves to a
+# namespace this emitter already knows how to bind. `from os.path import join`
+# needed the same prefix request in the driver -- asking only for "os.path",
+# which names no source, asked for nothing at all.
 import os.path
+import os.path as ospath
+from os.path import join
 
 p = os.path.join("a", "b", "c.txt")
 print(p)
 print(os.path.basename(p), os.path.dirname(p), os.path.splitext(p)[1])
 print(os.path.join("/x", "y"), os.path.basename("/x/"))
+print(ospath.join("a", "b"), join("c", "d"))

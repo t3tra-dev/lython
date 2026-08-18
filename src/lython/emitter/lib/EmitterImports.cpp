@@ -124,6 +124,30 @@ std::optional<std::string_view> importAliasLocalName(const parser::Node &alias) 
   return asname ? asname : name;
 }
 
+// Module-level `import X as member` (or `import X`): the member IS a module,
+// which is how os.py publishes `path` (`import posixpath as path`). Returns X.
+std::optional<std::string_view>
+moduleMemberModule(const std::vector<parser::NodePtr> &body,
+                   llvm::StringRef member) {
+  for (const parser::NodePtr &statement : body) {
+    if (!statement || statement->kind != "Import")
+      continue;
+    const auto *names = ast::nodeList(*statement, "names");
+    if (!names)
+      continue;
+    for (const parser::NodePtr &alias : *names) {
+      if (!alias)
+        continue;
+      std::optional<std::string_view> imported = ast::string(*alias, "name");
+      std::optional<std::string_view> local = importAliasLocalName(*alias);
+      if (imported && local && llvm::StringRef(*local) == member)
+        return imported;
+    }
+  }
+  return std::nullopt;
+}
+
+
 std::string joinModuleName(llvm::StringRef prefix, llvm::StringRef suffix) {
   if (prefix.empty())
     return suffix.str();
@@ -942,6 +966,24 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
         if (types.bindImportedModule(root, root))
           continue;
       }
+      // ⭐ `import os.path as p` binds the SUBMODULE, not the root, and the
+      // submodule is a name inside the root's own body (`import posixpath as
+      // path`). Asking the root what it publishes under that name is what turns
+      // the dotted spelling into one this emitter already has: a namespace.
+      if (asname && llvm::StringRef(*name).contains('.')) {
+        std::pair<llvm::StringRef, llvm::StringRef> split =
+            llvm::StringRef(*name).rsplit('.');
+        if (const EmitOptions::SourceModule *rootModule =
+                lookupSourceModule(split.first))
+          if (rootModule->moduleNode)
+            if (const auto *rootBody = ast::nodeList(*rootModule->moduleNode,
+                                                     "body"))
+              if (std::optional<std::string_view> published =
+                      moduleMemberModule(*rootBody, split.second))
+                if (bindSourceModuleNamespace(llvm::StringRef(*published),
+                                              llvm::StringRef(local)))
+                  continue;
+      }
       if (bindSourceModuleNamespace(llvm::StringRef(*name),
                                     llvm::StringRef(local))) {
         continue;
@@ -1003,6 +1045,24 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
     std::string submodule = joinModuleName(*resolvedModule, *name);
     if (bindSourceModuleNamespace(submodule, local))
       continue;
+    // ⭐ `from os.path import join`: the module being imported FROM is itself a
+    // member of another module (os publishes `path` as posixpath), so the name
+    // resolves against what that member names. Same question as the `import
+    // os.path as p` branch above, asked of the tail instead of the root.
+    if (llvm::StringRef(*resolvedModule).contains('.')) {
+      std::pair<llvm::StringRef, llvm::StringRef> split =
+          llvm::StringRef(*resolvedModule).rsplit('.');
+      if (const EmitOptions::SourceModule *rootModule =
+              lookupSourceModule(split.first))
+        if (rootModule->moduleNode)
+          if (const auto *rootBody =
+                  ast::nodeList(*rootModule->moduleNode, "body"))
+            if (std::optional<std::string_view> published =
+                    moduleMemberModule(*rootBody, split.second))
+              if (bindSourceModuleName(llvm::StringRef(*published),
+                                       llvm::StringRef(*name), local))
+                continue;
+    }
     if (!types.bindImportedName(*resolvedModule, llvm::StringRef(*name),
                                 local) &&
         diagnoseUnsupported) {
