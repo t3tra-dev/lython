@@ -608,6 +608,50 @@ them in.
 # alias a parameter. Return axis: replacing 'return x' with 'return 0' still
 # fails, so the return is not the trigger, only the reporting site. Type axis:
 # identical failure for (a: str, b: str),
+#
+# ⭐ BIGGER THAN REPORTED, and localised 2026-08-18: EUCLID'S ALGORITHM is
+# refused by this, not just the `while False` reduction.
+#
+#     def gcd(a: int, b: int) -> int:
+#         while b != 0:
+#             t = b; b = a % b; a = t
+#         return a
+#     # borrowed entry argument 1 of @gcd is returned as owned without a
+#     # dominating retain
+#
+# The boundary, gridded: `return a` compiles, `x = a; return x` compiles,
+# `x = a; if b > 0: x = b; return x` compiles -- a merge has no back edge to
+# release on -- and `x = a; while ...: x = b; return x` does not. `x = 0; while
+# ...: x = b; return x` compiles too, so the trigger is a PARAMETER as the
+# carried local's initial value.
+#
+# The IR names the imbalance:
+#
+#     Ly_IncRef(%arg0)              // only after the first repair below
+#     cf.br ^bb1(%arg0, %arg1)
+#   ^bb1(%0, %1):
+#     cond_br ..., ^bb2, ^bb3
+#   ^bb2:
+#     LyUnicode_DecRef(%0)          // the edge releases the carried value
+#     cf.br ^bb1(%arg2, %arg3)      // and forwards the OTHER parameter, no retain
+#
+# ⛔ TWO REPAIRS TRIED, both reverted:
+#   1. acquire the loop's token on the ENTRY edge when the initial carried value
+#      is a parameter -- the same thing `acquireUnionCarriedTokens` does for a
+#      union, whose note says every other type is the ownership pass's job. It is
+#      not: that pass seeds only from OWNED groups and a parameter is a borrow.
+#      The retain appears in the IR and the programs stay refused.
+#   2. plus: make a parameter bring NO token to a loop lane in
+#      `carriedLoopEdgeOperands`'s acquire ledger, which currently reads any
+#      block argument as bringing one ("a block argument's token belongs to
+#      whichever lane already owns it"). That is wrong for a parameter -- the
+#      token belongs to the CALLER -- but changing it alone REGRESSED
+#      `x = 0; while False: x = b; return x` from working to refused.
+#
+# So the ledger and the verifier disagree about who owns a parameter inside a
+# loop, and closing it means stating that rule in one place rather than patching
+# either end.
+#
 
 # ==========================================================================
 # [CRASH] numbers
