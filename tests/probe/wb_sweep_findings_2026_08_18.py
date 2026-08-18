@@ -315,6 +315,23 @@ them in.
 # `lyc jit` prints 0 then 1 (silent wrong answer) and the AOT binary segfaults, 3/3
 # each, from the same source. Measure both when the finding is about lifetime.
 #
+# ⛔ THREE REPAIRS TRIED 2026-08-18, all reverted, each measured:
+#   1. retain the alias at the field read (`retainAggregateSlot`, then bind the
+#      bundle as Own) when the read is separated from one of its uses by a store
+#      to the same field -- read < store < use in dominance order. The programs
+#      became CORRECT in both backends, and every one of them leaked: 2 allocs /
+#      8264 B for the list case, 7 / 17094 B for the dict one. Nothing discharges
+#      an aggregate-slot retain that has no slot.
+#   2. the same plus `markOwnedLocalObjectBundle` on the read's result, so the
+#      insertion pass would give it an exit release. No change: still leaking.
+#   3. `bindOwnedEvidenceValue` instead, which is how an owned container ELEMENT
+#      read is bound. Two neighbouring programs stopped compiling
+#      ("ly.ownership.owned_local_object marks a ...") and the leak stayed.
+#
+# So the retain is the easy half and the discharge is the defect: at a field read
+# there is no resource for a frame-lifetime reference to attach to. That is the
+# thing to build, and it is why this is a kernel item and not a patch.
+#
 # ⛔ The sound repair is that a field read of a mutable container OWNS its
 # reference rather than borrowing -- a change to the ownership model with a
 # retain/release per field read, not a patch. Routing the field's dict stores
