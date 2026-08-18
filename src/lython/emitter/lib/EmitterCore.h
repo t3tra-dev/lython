@@ -1049,6 +1049,14 @@ private:
   llvm::DenseMap<const parser::Node *,
                  llvm::SmallVector<PendingDefaultCell, 2>>
       pendingDefaultCells;
+  // The cell a METHOD's non-constant default was parked in, per (def node,
+  // slot). An inlined method call reads this instead of re-emitting the
+  // expression -- which is what made `def add(self, into: list[int] = [])`
+  // build a fresh list per call. Module-level FUNCTIONS need no such map: their
+  // call sites go through the callable's default-value attributes.
+  llvm::DenseMap<const parser::Node *,
+                 llvm::SmallVector<std::pair<unsigned, std::string>, 2>>
+      methodDefaultCells;
   // Non-constant defaults of NESTED defs: evaluated once when the enclosing
   // execution reaches the def statement, carried as synthetic closure
   // captures (slot -> capture index) shared by every call in that execution.

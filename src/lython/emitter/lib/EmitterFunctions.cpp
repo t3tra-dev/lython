@@ -640,13 +640,57 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
   llvm::SmallVector<mlir::Attribute, 8> slots(
       positionalCount + sig.kwOnlyTypes.size(), builder.getUnitAttr());
 
+  // ⭐ A METHOD'S DEFAULT IS EVALUATED ONCE TOO, and it was not:
+  //
+  //     class Bag:
+  //         def add(self, into: list[int] = []) -> int:
+  //             into.append(1)
+  //             return len(into)
+  //     b = Bag(); print(b.add(), b.add())   # printed 1 1; CPython prints 1 2
+  //
+  //     def make() -> int:
+  //         print("eval"); return 1
+  //     class Bag:
+  //         def get(self, n: int = make()) -> int: ...
+  //     Bag().get(); Bag().get()             # printed eval twice
+  //
+  // The FREE-function spelling of both was already right. The cell path was
+  // gated on the def being a direct child of the module body, so a method fell
+  // to the zero-argument PROVIDER fallback, which is called at every
+  // omitted-argument site -- a fresh list per call, and the side effect again.
+  // CPython evaluates a method's defaults once, when the class body executes.
+  //
+  // ⛔ The owner is the CLASS statement, not the def: the module walk flushes
+  // pending cells at the statement it skipped, and for a method that statement
+  // is the ClassDef. The note at that call site already said so ("Not
+  // ClassDef-exclusive: method defaults registered under a class statement flow
+  // through the same cells") -- nothing had ever registered one.
+  //
+  // ⛔ One level only. A def inside a def keeps the capture path, which is the
+  // CPython semantics for it (the inner def re-executes per enclosing call, so
+  // its defaults re-evaluate); a class nested in a function is not a
+  // module-lifetime cell either.
   bool isModuleLevelDef = false;
+  const parser::Node *defaultCellOwner = nullptr;
   if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
-    for (const parser::NodePtr &statement : *moduleBody)
+    for (const parser::NodePtr &statement : *moduleBody) {
       if (statement.get() == &function) {
         isModuleLevelDef = true;
+        defaultCellOwner = statement.get();
         break;
       }
+      if (!statement || statement->kind != "ClassDef")
+        continue;
+      if (const auto *classBody = ast::nodeList(*statement, "body"))
+        for (const parser::NodePtr &member : *classBody)
+          if (member.get() == &function) {
+            isModuleLevelDef = true;
+            defaultCellOwner = statement.get();
+            break;
+          }
+      if (isModuleLevelDef)
+        break;
+    }
   auto declaredSlotType = [&](unsigned slot) -> mlir::Type {
     if (slot < positionalCount)
       return types.widenLiteral(sig.positionalTypes[slot]);
@@ -693,8 +737,10 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
         std::string cellName = (llvm::Twine("__ly.defaultcell.") + symbolName +
                                 "." + llvm::Twine(slot))
                                    .str();
-        pendingDefaultCells[&function].push_back(
+        pendingDefaultCells[defaultCellOwner].push_back(
             PendingDefaultCell{cellName, expr, declared});
+        if (defaultCellOwner != &function)
+          methodDefaultCells[&function].push_back({slot, cellName});
         llvm::SmallVector<mlir::NamedAttribute, 2> attrs;
         attrs.push_back(
             builder.getNamedAttr("kind", builder.getStringAttr("global")));

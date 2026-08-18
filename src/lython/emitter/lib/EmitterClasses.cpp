@@ -3013,12 +3013,60 @@ Value ModuleEmitter::emitInlineMethodBody(
                            "missing required argument '" + name.str() +
                                "' for inlined class method"});
   };
+  // ⭐ THE DEFAULT'S CELL, not the default's EXPRESSION. An omitted argument
+  // used to re-emit the expression here, at the call site:
+  //
+  //     class Bag:
+  //         def add(self, into: list[int] = []) -> int:
+  //             into.append(1)
+  //             return len(into)
+  //     b = Bag(); print(b.add(), b.add())   # printed 1 1; CPython prints 1 2
+  //
+  // -- a fresh list per call, and a side-effecting default (`n: int = make()`)
+  // firing once per call as well. CPython evaluates a def's defaults ONCE, when
+  // the def statement executes, and for a method that is class-body time. The
+  // free-function spelling was already right because its call sites read the
+  // callable's default-value attributes, where the cell lives; an inlined method
+  // has no such call, so it reads the cell by name.
+  auto defaultCellFor = [&](unsigned slot) -> const std::string * {
+    auto found = methodDefaultCells.find(method.method);
+    if (found == methodDefaultCells.end())
+      return nullptr;
+    for (const auto &entry : found->second)
+      if (entry.first == slot)
+        return &entry.second;
+    return nullptr;
+  };
+  auto slotType = [&](unsigned slot) -> mlir::Type {
+    if (slot < sig.positionalTypes.size())
+      return sig.positionalTypes[slot];
+    unsigned kwIndex = slot - static_cast<unsigned>(sig.positionalTypes.size());
+    if (kwIndex < sig.kwOnlyTypes.size())
+      return sig.kwOnlyTypes[kwIndex];
+    return types.object();
+  };
+  auto emitDefaultFor = [&](unsigned slot,
+                            const parser::Node *defaultNode) -> Value {
+    if (const std::string *cellName = defaultCellFor(slot)) {
+      // ⛔ NOT `markBoxedModuleGlobal`: a default cell is not a module global
+      // even though both are py.global.get/set, and the lowering says so at the
+      // read ("this population is never marked `ly.global.boxed`, so an int
+      // default stays in the native word cell"). Marking it made an int default
+      // fail with "module global ... referenced before assignment", because the
+      // store the class statement emitted went to the other cell.
+      auto get = py::GlobalGetOp::create(builder, loc(anchor), slotType(slot),
+                                         builder.getStringAttr(*cellName));
+      return Value{get.getResult(), get.getResult().getType()};
+    }
+    return emitExpr(defaultNode);
+  };
   for (auto [index, name] : llvm::enumerate(sig.positionalNames)) {
     if (bound.contains(name))
       continue;
     if (const parser::Node *defaultNode =
             positionalDefault(static_cast<unsigned>(index))) {
-      Value defaultValue = emitExpr(defaultNode);
+      Value defaultValue =
+          emitDefaultFor(static_cast<unsigned>(index), defaultNode);
       bind(name, coerceValue(defaultValue, sig.positionalTypes[index], anchor));
       continue;
     }
@@ -3032,7 +3080,12 @@ Value ModuleEmitter::emitInlineMethodBody(
     if (kwDefaults && index < kwDefaults->size())
       defaultNode = (*kwDefaults)[index].get();
     if (defaultNode) {
-      Value defaultValue = emitExpr(defaultNode);
+      // Keyword-only slots are numbered after the positionals, the same way
+      // `emitCallableDefaultValues` numbered them when it parked the cell.
+      Value defaultValue =
+          emitDefaultFor(static_cast<unsigned>(sig.positionalNames.size() +
+                                               index),
+                         defaultNode);
       bind(name, coerceValue(defaultValue, sig.kwOnlyTypes[index], anchor));
       continue;
     }

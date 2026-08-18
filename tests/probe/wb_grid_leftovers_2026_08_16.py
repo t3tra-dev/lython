@@ -656,6 +656,49 @@
 # in three places.
 #
 # ============================================================
+# (34) FIXED: A METHOD'S DEFAULT IS EVALUATED ONCE.
+# ============================================================
+#     class Bag:
+#         def add(self, into: list[int] = []) -> int:
+#             into.append(1)
+#             return len(into)
+#     print(Bag().add(), Bag().add())   # printed 1 1; CPython prints 1 2
+#
+# ⭐ FIXED 2026-08-18. The FREE-function spelling was already right, which is the
+# whole localisation: the evaluate-once cell was gated on the def being a direct
+# child of the MODULE body, so a method fell to the per-call provider -- a fresh
+# list every call, and a side-effecting default (`n: int = make()`) firing again
+# each time.
+#
+# Two halves, and the first alone was not enough (it added a THIRD "eval" rather
+# than removing the second):
+#   1. register the cell under the CLASS statement, because the module walk
+#      flushes pending cells at the statement it skipped. The note at that call
+#      site already promised this ("method defaults registered under a class
+#      statement flow through the same cells") and nothing had ever registered one.
+#   2. make the INLINED call read the cell instead of re-emitting the expression.
+#      An inlined method has no call for the callable's default-value attributes
+#      to serve, so it reads the cell by name.
+#
+# ⛔ NOT `markBoxedModuleGlobal` on that read: a default cell is not a module
+# global even though both are py.global.get/set, and the lowering says so ("this
+# population is never marked `ly.global.boxed`, so an int default stays in the
+# native word cell"). Marking it produced "module global ... referenced before
+# assignment" for an int default -- the store had gone to the other cell.
+#
+# ⛔ A @classmethod's default is still per-call: its body is emitted from a node
+# that is not the one in the class body, so the scan never registers a cell for
+# it. @staticmethod and keyword-only defaults are fixed and are golden sections.
+#
+# ⛔ AND A COLLISION FOUND WHILE WRITING THE GOLDEN: a module-level
+# `def free(...)` stops the whole program with "redefinition of reserved function
+# 'free' of different type is prohibited", 34 times over, because the name meets
+# the C library symbol. Any Python program may define a function called `free`;
+# the emitted symbol should not be its bare name. Not fixed -- recorded here.
+#
+# Pinned by tests/golden/cases/method_default_evaluated_once.py.
+#
+# ============================================================
 # (33) THE STANDING WORK LIST: wb_sweep_findings_2026_08_18.py
 # ============================================================
 # Forty agents over ten domains, 30 verified findings, 27 still live after this
