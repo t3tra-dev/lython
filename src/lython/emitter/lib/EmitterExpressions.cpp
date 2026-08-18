@@ -274,6 +274,50 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         }
       return emitNone(*expr);
     }
+    // ⭐ `yield from X` IS `for v in X: yield v`, and writing it that way is
+    // what makes it compile for anything but a literal:
+    //
+    //     def g() -> Iterator[int]:
+    //         yield from range(2)
+    //     # source generator next lowering currently supports yields whose ...
+    //
+    // A range, a parameter's list and a str all landed there, while the loop
+    // spelling of each has always worked -- so the gap was `py.yield.from` in the
+    // state machine, not the iteration. The literal arm above stays: it unrolls
+    // into one yield per element and needs no loop at all.
+    //
+    // ⛔ Exact for an ITERABLE, which is what these operands are: `yield from`
+    // over one evaluates to None (there is no StopIteration value to forward),
+    // and that is what the loop leaves behind. Delegating to a SUB-GENERATOR is
+    // more than this -- `send` and `throw` pass through it, and `res = yield from
+    // g()` takes the return value -- and that shape does not reach here: a
+    // generator operand is refused earlier, by the resume-target rule.
+    // ⛔ NOT for a sub-GENERATOR: `py.yield.from` is what the state machine
+    // implements for delegation, and rewriting those to a loop turned two
+    // passing goldens into "a generator returned out of a function cannot be
+    // resumed" -- the loop iterates a generator VALUE, which is a different
+    // (and refused) shape. The rewrite is for the iterables that had no path.
+    auto sourceContract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(source)));
+    bool delegatesToGenerator =
+        sourceContract &&
+        sourceContract.getContractName() == "types.GeneratorType";
+    if (source && !delegatesToGenerator) {
+      std::string element = "__ly_yieldfrom_" +
+                            std::to_string(syntheticFunctionCounter++);
+      parser::NodePtr yielded = parser::makeNode("Yield", expr->range);
+      parser::addField(*yielded, "value",
+                       synth::name(element, expr->range));
+      parser::NodePtr loop = synth::forStmt(
+          synth::name(element, expr->range),
+          parser::NodePtr(const_cast<parser::Node *>(source),
+                          [](parser::Node *) {}),
+          std::vector<parser::NodePtr>{
+              synth::exprStmt(std::move(yielded), expr->range)},
+          {}, expr->range);
+      runWithScratchNames({element}, [&] { emitStatement(*loop); });
+      return emitNone(*expr);
+    }
     Value delegated = emitExpr(source);
     YieldFromInferenceResult yieldFromInference =
         types.inferYieldFromWithEvidence(delegated.type);

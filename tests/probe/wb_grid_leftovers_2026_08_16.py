@@ -656,6 +656,32 @@
 # in three places.
 #
 # ============================================================
+# (41) FIXED: `yield from` OVER ANYTHING BUT A LIST LITERAL.
+# ============================================================
+#     def g() -> Iterator[int]:
+#         yield from range(2)
+#     # source generator next lowering currently supports yields whose ...
+#
+# ⭐ FIXED 2026-08-18 by writing it as the loop it means: `for v in X: yield v`.
+# A range, a parameter's list and a str all failed while the LOOP spelling of
+# each had always worked, so the gap was `py.yield.from` in the state machine and
+# not the iteration. The list/tuple literal arm is untouched -- it unrolls into
+# one yield per element and needs no loop.
+#
+# ⛔ NOT for a sub-GENERATOR, and the suite is what said so: rewriting those too
+# took `generator_yield_from` and `generator_bigint` down with "a generator
+# returned out of a function cannot be resumed", because the loop iterates a
+# generator VALUE -- a different, separately refused shape. `py.yield.from` IS
+# the delegation implementation (send and throw pass through it), so the rewrite
+# is gated on the operand's type.
+#
+# ⭐ The gate is also the reason this is exact: over an ITERABLE, `yield from`
+# evaluates to None, which is what the loop leaves behind; over a generator it
+# forwards a return value, which the loop cannot.
+#
+# Pinned by tests/golden/cases/yield_from_any_iterable.py.
+#
+# ============================================================
 # (40) FIXED (AS A DIAGNOSTIC): A DICT VIEW BOUND TO A NAME.
 # ============================================================
 #     d: dict[str, int] = {"a": 1}
