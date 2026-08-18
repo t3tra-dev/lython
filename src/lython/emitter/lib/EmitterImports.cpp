@@ -908,38 +908,22 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
         continue;
       std::optional<std::string_view> asname = ast::string(*alias, "asname");
       std::string local = importBindingName(*name, asname);
-      // ⛔ KNOWN DEFECT, measured: only `import os` works. The other three
-      // spellings of the same thing do not --
+      // ⭐ FIXED 2026-08-19, and the cause was not here at all. `os` IS NOT A
+      // SOURCE MODULE at this point was the true observation the old note
+      // recorded; what it did not ask is WHY. The driver decides which stdlib
+      // sources to compile from the import statements, and for a dotted name it
+      // requested only prefixes that are PACKAGE DIRECTORIES -- so `import
+      // os.path` requested nothing for `os`, os.py was never compiled, and
+      // every repair attempted in this function was binding a module that did
+      // not exist yet. Requesting each prefix that resolves to a source at all
+      // (Frontend.cpp, appendDottedImportSourceRequests) is the whole fix, and
+      // then the source-module branch below binds `os` the way `import os`
+      // does.
       //
-      //     import os.path          # os.path.join: builtins.object has no 'join'
-      //     import os.path as p     # p.join: literal<None> has no 'join'
-      //     from os import path     # fails in the lowering
-      //
-      // while `import os; os.path.join(...)` is fine, and so is
-      // `import os.path` FOLLOWED by `import os`. importBindingName truncates
-      // a dotted name at the dot, so the fallback below binds the SUBMODULE's
-      // members under the ROOT name (os.join, os.basename) and leaves os.path
-      // on the object placeholder. Binding the root namespace first instead,
-      // with and without the dotted binding that follows it, was tried and
-      // does not restore it: something else in the `import os` path is what
-      // makes the name usable, and this pre-pass is not all of it.
-      //
-      // ⭐ WHY THOSE ATTEMPTS COULD NOT WORK, measured 2026-08-18 by printing
-      // the conditions: `os` IS NOT A SOURCE MODULE HERE.
-      // `lookupSourceModule("os")` is null, so every repair spelled with
-      // `bindSourceModuleNamespace` -- the three above among them -- did
-      // nothing at all for it. `import os` succeeds through
-      // `types.bindImportedModule`, the manifest route at the bottom of this
-      // function.
-      //
-      // ⛔ And binding the ROOT that way is still not enough: with
-      // `types.bindImportedModule("os", "os")` here, `import os.path` is
-      // accepted and `os.path.basename(...)` then fails with "static type
-      // builtins.object does not provide" -- something binds `os.path` itself
-      // to the object placeholder before the use, which `import os` never does.
-      // That binding is the thing to find; neither `lookupSymbol("os.path")`
-      // nor `lookupSymbol("os.path.basename")` exists at this point, because a
-      // manifest member is resolved at the USE site.
+      // ⛔ Still unsupported, and a different mechanism: `import os.path as p`
+      // and `from os.path import join` bind the SUBMODULE itself, which needs a
+      // module value -- `path` is a name inside os.py's scope, not a module the
+      // resolver knows.
       if (!asname && llvm::StringRef(*name).contains('.')) {
         if (bindSourceModuleNamespace(llvm::StringRef(*name),
                                       llvm::StringRef(*name))) {
@@ -948,6 +932,15 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
           bindSourceModuleNamespace(split.first, split.first);
           continue;
         }
+        // `import os.path` binds ONLY `os` in CPython -- the submodule is
+        // reached as an attribute of it -- so when the dotted name is not a
+        // source module but its root is importable, importing the root IS the
+        // statement, and nothing here binds the dotted name to anything.
+        llvm::StringRef root = llvm::StringRef(*name).split('.').first;
+        if (bindSourceModuleNamespace(root, root))
+          continue;
+        if (types.bindImportedModule(root, root))
+          continue;
       }
       if (bindSourceModuleNamespace(llvm::StringRef(*name),
                                     llvm::StringRef(local))) {

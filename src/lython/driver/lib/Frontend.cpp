@@ -247,7 +247,16 @@ static void appendDottedImportSourceRequests(
     prefix = joinModuleName(prefix, parts[index]);
     std::optional<LocalSourceModulePath> sourcePath =
         localSourceModulePath(baseDir, prefix);
-    if (sourcePath && sourcePath->isPackage)
+    // ⭐ A PREFIX THAT IS A MODULE, not only one that is a package directory.
+    // `import os.path` names no local file, so nothing was requested for `os`
+    // either -- and `os` is the module CPython actually binds, with `path` as
+    // an attribute of it (os.py does `import posixpath as path`). The emitter
+    // then found no source module for `os`, fell back to the manifest route,
+    // and `os.path` came out as the erased object placeholder: "builtins.object
+    // does not provide manifest method 'join'". Requesting the prefix makes
+    // `import os.path` load exactly what `import os` loads, which is what the
+    // statement means.
+    if (sourcePath)
       appendLocalSourceRequest(requests, prefix, sourcePath, requestedModules);
   }
 

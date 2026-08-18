@@ -656,6 +656,33 @@
 # in three places.
 #
 # ============================================================
+# (51) FIXED: import os.path.
+# ============================================================
+#     import os.path
+#     print(os.path.join("a", "b"))    # unsupported import 'os.path'
+#
+# ⭐ FIXED 2026-08-19, and the cause was in the DRIVER, not in the emitter where
+# every earlier attempt went. The driver decides which stdlib sources to compile
+# from the import statements, and for a dotted name it requested only prefixes
+# that are PACKAGE DIRECTORIES. `os` is a module (os.py, which does `import
+# posixpath as path`), so `import os.path` requested nothing for it, os.py was
+# never compiled, and the emitter's `lookupSourceModule("os")` was null -- which
+# is exactly what the old note observed without asking why. Requesting every
+# prefix that resolves to a source at all is the fix; the emitter then binds the
+# root the way `import os` always did.
+#
+# ⛔ The old note's list of failed repairs is worth keeping in mind as a shape:
+# four of them were binding a module that did not exist yet. When a binding
+# "does nothing at all", ask who was supposed to create the thing being bound.
+#
+# ⛔ Still unsupported and a different mechanism: `import os.path as p` and
+# `from os.path import join` bind the SUBMODULE itself, which needs a module
+# value -- `path` is a name inside os.py's scope, not a module the resolver
+# knows.
+#
+# Pinned by tests/golden/cases/dotted_import_binds_the_root.py.
+#
+# ============================================================
 # (50) FIXED: int(s, base=16) -- THE KEYWORD SPELLING.
 # ============================================================
 #     print(int("ff", base=16))
