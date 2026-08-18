@@ -656,6 +656,38 @@
 # in three places.
 #
 # ============================================================
+# (47) FIXED: complex(...) -- THE NAME AND THE CONSTRUCTORS.
+# ============================================================
+#     print(complex(1, 2))     # unresolved name 'complex'
+#     print(1 + 2j)            # (1+2j) -- the SAME type, one line up
+#
+# ⭐ FIXED 2026-08-19. The type was fully there: the manifest carries add / sub /
+# mul / truediv / neg / pos / abs / eq / ne / repr / str and a __new__ taking two
+# f64 with defaults, and literals reach all of it. What was missing was the name
+# binding plus the class's own __new__ / __init__ declarations -- so the spelling
+# a CPython user reaches for first was the only one that did not work.
+#
+# ⛔ The empty __init__ is load-bearing. __new__ builds the whole value, but the
+# constructor path emits py.new AND py.init, and with no __init__ of its own the
+# MRO's next provider is builtins.object's, whose input is a boxed object:
+# "cannot pass concrete object builtins.complex as builtins.object runtime input
+# 0 of builtins.object.__init__". range gets away without one because its bases
+# are protocols; complex's base IS object.
+#
+# ⛔ Seven __new__/__init__ pairs (0 args, float, int, and the four two-argument
+# combinations) rather than one with a union parameter: an int argument DOES
+# reach the f64 input, through int's unbox.f64 in the ABI adapter, but the
+# overload is chosen by the DECLARED type first -- and a union parameter would
+# arrive as a union value (tag plus lanes) instead of a number. The same asymmetry
+# is why `math.sqrt(4)` already worked: a free function has one contract and the
+# coercion happens at the call, while a constructor picks an overload first.
+#
+# ⛔ Still missing on complex: `.real` / `.imag` (attributes, not methods, so they
+# need the attribute surface) and `.conjugate()`, plus complex(str).
+#
+# Pinned by tests/golden/cases/complex_constructor.py.
+#
+# ============================================================
 # (46) FIXED: EIGHT MISSING math FUNCTIONS.
 # ============================================================
 #     import math

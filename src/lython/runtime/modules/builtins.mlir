@@ -284,10 +284,32 @@ module attributes {
 
   py.class @complex attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["__add__", "__sub__", "__mul__", "__truediv__",
+    // ⭐ The three __new__ arities are what makes the NAME callable: the
+    // runtime has had LyComplex_FromParts (two f64 with defaults) all along, so
+    // `1 + 2j` ran while `complex(1, 2)` was "unresolved name 'complex'" and,
+    // once the name bound, "builtins.complex does not provide manifest method
+    // '__init__'". Declared the way range declares its three, because the
+    // arities are what the call site resolves against.
+    method_names = ["__new__", "__new__", "__new__", "__new__", "__new__", "__new__", "__new__",
+                    "__init__", "__init__", "__init__", "__init__", "__init__", "__init__", "__init__",
+                    "__add__", "__sub__", "__mul__", "__truediv__",
                     "__neg__", "__pos__", "__eq__", "__ne__",
                     "__repr__", "__str__", "__abs__"],
     method_contracts = [
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>, !py.contract<"builtins.float">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>, !py.contract<"builtins.int">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>, !py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>, !py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>, !py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.float">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.float">, !py.contract<"builtins.float">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.float">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.int">, !py.contract<"builtins.float">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.complex">] -> [!py.contract<"builtins.complex">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.complex">] -> [!py.contract<"builtins.complex">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">, !py.contract<"builtins.complex">] -> [!py.contract<"builtins.complex">]>,
@@ -300,7 +322,11 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.float">]>
     ],
-    method_kinds = ["instance", "instance", "instance", "instance",
+    method_kinds = ["classmethod", "classmethod", "classmethod", "classmethod",
+                    "classmethod", "classmethod", "classmethod",
+                    "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance"]
   } {}
@@ -14907,6 +14933,15 @@ module attributes {
     memref.store %real_bits, %header[%real_slot] : memref<7xi64>
     memref.store %imag_bits, %header[%imag_slot] : memref<7xi64>
     func.return %header : memref<7xi64>
+  }
+
+  // ⛔ An empty __init__ is not a placeholder: LyComplex_FromParts is the
+  // __new__ and it builds the whole value, but the constructor path calls both
+  // and the MRO's next __init__ provider is builtins.object's, whose input is a
+  // boxed object -- "cannot pass concrete object builtins.complex as
+  // builtins.object". Declaring complex's own is what stops the lookup here.
+  func.func @LyComplex_Init(%self: memref<7xi64> {ly.ownership.object_header}, %real: f64 {ly.runtime.default_f64 = 0.0 : f64}, %imag: f64 {ly.runtime.default_f64 = 0.0 : f64}) attributes {ly.runtime.contract = "builtins.complex", ly.runtime.method = "__init__"} {
+    func.return
   }
 
   func.func @LyComplex_DecRef(%header: memref<7xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.complex", ly.runtime.deallocator} {

@@ -1301,6 +1301,11 @@ void TypeSystem::seedBuiltins() {
   bindClass("float", floatType());
   bindClass("str", strType());
   bindClass("bytes", contract("builtins.bytes"));
+  // ⭐ complex was reachable only as a LITERAL: `1 + 2j` runs, and the manifest
+  // has the whole arithmetic surface plus a __new__ that takes two f64 with
+  // defaults -- but the NAME was never bound, so `complex(1, 2)` was
+  // "unresolved name 'complex'" while the same value one line up was fine.
+  bindClass("complex", contract("builtins.complex"));
   bindClass("frozenset", contract("builtins.frozenset"));
   // The whole builtin exception taxonomy binds from the shared table so the
   // emitter's name surface cannot drift from the class-id hierarchy the
