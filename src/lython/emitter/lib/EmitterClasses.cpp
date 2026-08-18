@@ -2942,8 +2942,30 @@ Value ModuleEmitter::emitInlineMethodBody(
     parameterIndex = 1;
   }
 
+  // ⭐ `*args` ON A METHOD. The extras used to be "too many positional arguments
+  // for inlined class method":
+  //
+  //     class Registry:
+  //         def many(self, *items: str) -> int:
+  //             return len(items)
+  //     Registry().many("p", "q")
+  //
+  // while the free-function spelling of the same body had always worked -- a
+  // real function binds its vararg parameter to the tuple the call packed, and
+  // the inlined path had no such step. It has one now: what the declared
+  // positionals do not take is packed into a tuple and bound to the vararg name,
+  // which is exactly what the callee would have received.
+  //
+  // ⛔ The name is bound even when nothing is left over, because CPython binds
+  // an EMPTY tuple there and `len(items)` must answer 0 rather than "unresolved
+  // name". An empty `emitPack` is the empty tuple.
+  llvm::SmallVector<Value, 4> variadic;
   for (Value argument : positional) {
     if (parameterIndex >= sig.positionalNames.size()) {
+      if (sig.varargName) {
+        variadic.push_back(argument);
+        continue;
+      }
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, anchor.range.start,
           "too many positional arguments for inlined class method"});
@@ -2953,6 +2975,23 @@ Value ModuleEmitter::emitInlineMethodBody(
       checkArgument(sig.positionalNames[parameterIndex],
                     sig.positionalTypes[parameterIndex], argument);
     bind(sig.positionalNames[parameterIndex++], argument);
+  }
+  if (sig.varargName) {
+    // ⛔ An EMPTY pack has no element type to infer, so `emitPack({})` gives
+    // `tuple[object]` and the body's `for n in rest` then reports "list
+    // iteration evidence match/value count mismatch". An empty tuple LITERAL
+    // under the declared vararg type takes that type instead -- the same
+    // expectation machinery an annotated `xs: list[int] = []` uses.
+    Value packed;
+    if (variadic.empty() && sig.varargType)
+      packed = emitExprExpected(
+          synth::tuple(std::vector<parser::NodePtr>{}, anchor.range).get(),
+          sig.varargType);
+    else
+      packed = emitPack(variadic);
+    if (sig.varargType && packed.type != sig.varargType)
+      packed = coerceValue(packed, sig.varargType, anchor);
+    bind(*sig.varargName, packed);
   }
 
   auto bindKeyword = [&](llvm::StringRef name, Value value) {

@@ -1695,6 +1695,36 @@ RuntimeBundleLowerer::lowerListEvidenceNext(py::NextOp op,
       mlir::arith::AddIOp::create(builder, loc, position, one);
   mlir::memref::StoreOp::create(builder, loc, advanced, cell, slot);
 
+  // ⭐ AN EMPTY EVIDENCE SEQUENCE ITERATES ZERO TIMES. With no elements there is
+  // nothing to select between, and the selection below reported "list iteration
+  // evidence match/value count mismatch" -- an internal sentence for a loop that
+  // simply does not run:
+  //
+  //     class R:
+  //         def tag(self, prefix: str, *rest: int) -> str:
+  //             for n in rest: ...
+  //     R().tag("p")          # no extras, so `rest` is the empty tuple
+  //
+  // `valid` is already false here (position < 0 is false), so the element is
+  // never read; it needs a value only because the op has a result. The same
+  // program with one extra argument worked, and so does `for x in ()` at module
+  // scope -- that literal takes the runtime path, which handles empty because a
+  // runtime length can be zero.
+  if (iterator.sequenceElements.empty()) {
+    mlir::FailureOr<RuntimeValue> dead =
+        RuntimeBundleLowerer::materializeDeadObjectValue(
+            op, op.getElement().getType(), "empty sequence iteration");
+    if (mlir::failed(dead))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::bindEvidenceObjectResult(
+            op, op.getElement(), "list iteration", *dead)))
+      return mlir::failure();
+    op.getValid().replaceAllUsesWith(valid);
+    valueBundles[op.getNext()] = iterator;
+    erase.push_back(op);
+    return mlir::success();
+  }
+
   llvm::SmallVector<mlir::Value, 8> matches;
   matches.reserve(iterator.sequenceElements.size());
   for (unsigned index = 0, end = iterator.sequenceElements.size(); index < end;

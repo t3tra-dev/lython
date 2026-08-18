@@ -656,6 +656,40 @@
 # in three places.
 #
 # ============================================================
+# (36) FIXED: `*args` ON A METHOD, AND AN EMPTY EVIDENCE SEQUENCE.
+# ============================================================
+#     class Registry:
+#         def many(self, *items: str) -> int:
+#             return len(items)
+#     Registry().many("p", "q")
+#     # too many positional arguments for inlined class method
+#
+# ⭐ FIXED 2026-08-18. The free-function spelling always worked: a real function
+# binds its vararg to the tuple the call packed, and the inlined method path had
+# no such step -- it walked the declared positionals and refused the rest.
+#
+# ⭐ THE EMPTY CASE IS A SECOND DEFECT, and it only showed once the first was
+# fixed: `R().tag("p")` binds an empty tuple and ITERATING it reported "list
+# iteration evidence match/value count mismatch". An evidence sequence with no
+# elements has nothing to select between, and `valid` is already false there, so
+# it now iterates zero times and binds a dead placeholder for the element the op
+# must still produce. `for x in ()` at module scope always worked because a
+# literal empty tuple takes the RUNTIME path, where a length of zero is ordinary.
+#
+# ⛔ Two things it did NOT fix, both measured:
+#   `**kwargs` on a method -- "unexpected keyword argument 'b'". Collecting the
+#     unmatched keywords needs a dict built from already-emitted values, a
+#     different mechanism than packing a tuple (the `LyValueRef` machinery the
+#     augmented-assignment route uses is the likely shape).
+#   `self.xs = list(xs)` with no field annotation -- the field reads as
+#     `builtins.object` OUTSIDE the class, so `len(r.xs)` is refused there while
+#     the body's own `len(xs)` is fine. The class-field pre-pass types fields
+#     without a call site and a vararg has no type until one exists. Annotating
+#     the field is the working spelling.
+#
+# Pinned by tests/golden/cases/method_takes_star_args.py.
+#
+# ============================================================
 # (35) FIXED: extend/join TAKE ANY ITERABLE, NOT ONLY A LIST.
 # ============================================================
 #     xs: list[int] = []
