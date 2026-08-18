@@ -656,6 +656,31 @@
 # in three places.
 #
 # ============================================================
+# (45) FIXED: isinstance(x, (A, B)) -- THE TUPLE FORM.
+# ============================================================
+#     if isinstance(v, (int, float)):
+#     # second argument to isinstance must be a statically resolved class type
+#
+# ⭐ FIXED 2026-08-19. The target was read as ONE class, and a tuple is not one,
+# so CPython's own spelling for "any of these" was refused whole. Each element
+# still has to be a statically resolved class; what was missing is looking
+# inside. The per-target analyses merge: any AlwaysTrue wins, AlwaysFalse drops
+# out, and the UnionTest member sets union -- which is exactly what the emitted
+# code already does (one py.union.test per member, ORed).
+#
+# ⛔ The merge is only reachable for MORE than one target: with one target the
+# call goes straight to analyzeIsInstance, because the ClassTest and
+# UnionClassTest kinds carry a runtime test the merge cannot combine, and
+# routing the single case through the merge would change every program that has
+# one. A tuple element needing such a test is refused with that reason.
+#
+# The narrowing follows in both directions: the true arm holds the union of the
+# selected members and the false arm holds the single member none selected,
+# which is what makes `x + 0.5` resolve in an else branch.
+#
+# Pinned by tests/golden/cases/isinstance_takes_a_tuple.py.
+#
+# ============================================================
 # (44) FIXED: bool IS an int, TO isinstance AND issubclass.
 # ============================================================
 #     print(issubclass(bool, int))   # False; CPython True

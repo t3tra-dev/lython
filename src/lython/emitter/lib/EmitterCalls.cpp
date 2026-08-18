@@ -1812,19 +1812,19 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     return emitNone(expr);
   }
 
-  std::optional<mlir::Type> target =
-      isinstanceTargetType((*args)[1].get(), types);
-  if (!target) {
+  std::optional<llvm::SmallVector<mlir::Type, 4>> targets =
+      isinstanceTargetTypes((*args)[1].get(), types);
+  if (!targets) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
         "second argument to isinstance must be a statically resolved class "
-        "type"});
+        "type, or a tuple of them"});
     return emitNone(expr);
   }
 
   Value input = emitExpr(args->front().get());
   IsInstanceAnalysis analysis =
-      analyzeIsInstance(input.type, *target, types, module);
+      analyzeIsInstanceAny(input.type, *targets, types, module);
   if (analysis.kind == IsInstanceAnalysis::Kind::Unsupported) {
     std::string reason = analysis.failureReason.empty()
                              ? "unsupported isinstance evidence"

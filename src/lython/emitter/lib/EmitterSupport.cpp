@@ -400,6 +400,32 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
   return instance;
 }
 
+std::optional<llvm::SmallVector<mlir::Type, 4>>
+isinstanceTargetTypes(const parser::Node *node, TypeSystem &types) {
+  // `isinstance(x, (int, str))` is CPython's own spelling for "any of these",
+  // and it was refused as "not a statically resolved class type" -- the tuple is
+  // not a class, and nothing looked inside it. Each element still has to be one.
+  llvm::SmallVector<mlir::Type, 4> targets;
+  if (node && node->kind == "Tuple") {
+    const auto *elements = ast::nodeList(*node, "elts");
+    if (!elements || elements->empty())
+      return std::nullopt;
+    for (const parser::NodePtr &element : *elements) {
+      std::optional<mlir::Type> target =
+          isinstanceTargetType(element.get(), types);
+      if (!target)
+        return std::nullopt;
+      targets.push_back(*target);
+    }
+    return targets;
+  }
+  if (std::optional<mlir::Type> single = isinstanceTargetType(node, types)) {
+    targets.push_back(*single);
+    return targets;
+  }
+  return std::nullopt;
+}
+
 bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
                       mlir::Operation *from) {
   if (isAssignableWithStaticEvidence(sub, super, from))
@@ -525,6 +551,71 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
   return analysis;
 }
 
+IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
+                                        llvm::ArrayRef<mlir::Type> targetTypes,
+                                        TypeSystem &types,
+                                        mlir::Operation *from) {
+  // One target is the whole existing question, and answering it through the
+  // merge below would change the answer for every program that has one: the
+  // ClassTest and UnionClassTest kinds carry a runtime test the merge cannot
+  // combine, so they are only reachable on this path.
+  if (targetTypes.size() == 1)
+    return analyzeIsInstance(sourceType, targetTypes.front(), types, from);
+
+  IsInstanceAnalysis merged;
+  merged.sourceType = types.widenLiteral(sourceType);
+  llvm::SmallVector<mlir::Type, 4> selected;
+  for (mlir::Type target : targetTypes) {
+    IsInstanceAnalysis one = analyzeIsInstance(sourceType, target, types, from);
+    if (one.kind == IsInstanceAnalysis::Kind::AlwaysTrue) {
+      merged.kind = IsInstanceAnalysis::Kind::AlwaysTrue;
+      merged.trueType = merged.sourceType;
+      return merged;
+    }
+    if (one.kind == IsInstanceAnalysis::Kind::AlwaysFalse)
+      continue;
+    if (one.kind != IsInstanceAnalysis::Kind::UnionTest) {
+      // ⛔ A tuple element that needs a RUNTIME class test is refused rather
+      // than merged: the tests are per-member ops over one union value, and a
+      // class test is not one of them. Splitting the tuple by hand still works.
+      merged.kind = IsInstanceAnalysis::Kind::Unsupported;
+      merged.failureReason =
+          one.failureReason.empty()
+              ? "isinstance over a tuple of classes cannot combine a dynamic "
+                "class test"
+              : one.failureReason;
+      return merged;
+    }
+    for (mlir::Type member : one.unionMembers)
+      if (!llvm::is_contained(selected, member))
+        selected.push_back(member);
+  }
+  if (selected.empty()) {
+    merged.kind = IsInstanceAnalysis::Kind::AlwaysFalse;
+    merged.falseType = merged.sourceType;
+    return merged;
+  }
+  auto unionType = mlir::dyn_cast<py::UnionType>(merged.sourceType);
+  if (unionType && selected.size() == unionType.getMemberTypes().size()) {
+    merged.kind = IsInstanceAnalysis::Kind::AlwaysTrue;
+    merged.trueType = merged.sourceType;
+    return merged;
+  }
+  merged.kind = IsInstanceAnalysis::Kind::UnionTest;
+  merged.unionMembers.assign(selected.begin(), selected.end());
+  if (selected.size() == 1)
+    merged.trueType = selected.front();
+  if (unionType) {
+    llvm::SmallVector<mlir::Type, 4> remaining;
+    for (mlir::Type member : unionType.getMemberTypes())
+      if (!llvm::is_contained(selected, member))
+        remaining.push_back(member);
+    if (remaining.size() == 1)
+      merged.falseType = remaining.front();
+  }
+  return merged;
+}
+
 struct IsInstanceBranchAnalysis {
   std::string name;
   IsInstanceAnalysis analysis;
@@ -549,13 +640,14 @@ optionalIsInstanceBranchAnalysis(const parser::Node &test, TypeSystem &types,
 
   llvm::StringRef name = ast::nameSpelling(*args->front());
   std::optional<mlir::Type> sourceType = types.lookupSymbol(name);
-  std::optional<mlir::Type> targetType =
-      isinstanceTargetType((*args)[1].get(), types);
-  if (!sourceType || !targetType)
+  std::optional<llvm::SmallVector<mlir::Type, 4>> targetTypes =
+      isinstanceTargetTypes((*args)[1].get(), types);
+  if (!sourceType || !targetTypes)
     return std::nullopt;
 
   return IsInstanceBranchAnalysis{
-      name.str(), analyzeIsInstance(*sourceType, *targetType, types, from)};
+      name.str(),
+      analyzeIsInstanceAny(*sourceType, *targetTypes, types, from)};
 }
 
 const parser::Node *nameComparedWithNone(const parser::Node *left,

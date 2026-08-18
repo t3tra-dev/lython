@@ -114,6 +114,9 @@ std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
                                               mlir::Operation *from);
 std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
                                                TypeSystem &types);
+// The same question for `isinstance(x, (A, B))`: one class, or a tuple of them.
+std::optional<llvm::SmallVector<mlir::Type, 4>>
+isinstanceTargetTypes(const parser::Node *node, TypeSystem &types);
 bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
                                     mlir::Operation *from);
 // Does Python's class hierarchy say `sub` is a subclass of `super`? Wider than
@@ -124,6 +127,11 @@ bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
                                      mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from);
+// "is it any of these": the tuple form, merged into one answer.
+IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
+                                        llvm::ArrayRef<mlir::Type> targetTypes,
+                                        TypeSystem &types,
+                                        mlir::Operation *from);
 mlir::Type widenInferredLiterals(mlir::Type type, const TypeSystem &types);
 bool hasUnexpectedObjectTop(mlir::Type actual, mlir::Type expected,
                             const TypeSystem &types);
