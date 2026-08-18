@@ -2361,6 +2361,27 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
   auto strClass = types.lookupClass("str");
   std::optional<llvm::StringRef> strSymbol =
       strClass ? contractName(*strClass) : std::nullopt;
+  // ⭐ `str(b, "utf-8")` IS `b.decode("utf-8")`: CPython's str() takes the
+  // bytes-and-encoding form, and the runtime has all three decode arities
+  // already. Without this the class-instantiation path claimed the call and
+  // reported "builtins.str does not provide manifest method '__init__'" -- a
+  // message about str, when it is the ARGUMENT that decides which str() this
+  // is. The one-argument spelling stays the __str__ dispatch below, which is
+  // why `str(b"ab")` correctly prints the repr and this form does not.
+  if (strArgs && strArgs->size() >= 2 && strArgs->size() <= 3 &&
+      (!strKeywords || strKeywords->empty()) &&
+      llvm::all_of(*strArgs,
+                   [](const parser::NodePtr &argument) {
+                     return argument && argument->kind != "Starred";
+                   }) &&
+      types.widenLiteral(types.inferExpr(strArgs->front().get())) ==
+          types.contract("builtins.bytes")) {
+    std::vector<parser::NodePtr> rest(strArgs->begin() + 1, strArgs->end());
+    parser::NodePtr decoded = synth::methodCall(strArgs->front(), "decode",
+                                                std::move(rest), expr.range);
+    synthesizedIteratorDefs.push_back(decoded);
+    return emitExpr(decoded.get());
+  }
   if (strSymbol && *strSymbol == "builtins.str" && strArgs &&
       strArgs->size() == 1 && (!strKeywords || strKeywords->empty())) {
     mlir::Type argumentType =

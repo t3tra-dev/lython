@@ -656,6 +656,30 @@
 # in three places.
 #
 # ============================================================
+# (48) FIXED: str(b, "utf-8") IS b.decode("utf-8").
+# ============================================================
+#     print(str(b"ab", "utf-8"))
+#     # static type !py.contract<"builtins.str"> does not provide manifest
+#     # method '__init__'
+#
+# ⭐ FIXED 2026-08-19. The diagnostic named str, and str was not what was
+# unsupported: a second argument makes the call a DECODE, and the runtime has had
+# decode in all three arities (no-arg, encoding, encoding+errors) all along. The
+# one-argument spelling stays the __str__ dispatch, which is why `str(b"ab")`
+# was already right (it prints the repr, b'ab') while this form was not.
+#
+# ⛔ Positional only. A keyword spelling (`str(b, encoding="utf-8")`) still falls
+# through to the class path; CPython accepts it, so that is a remaining gap
+# rather than a decision.
+#
+# ⛔ `str(5, "utf-8")` is refused statically where CPython raises TypeError at
+# run time -- the project's rule, since the argument type is known at the call.
+#
+# Pinned by tests/golden/cases/str_of_bytes_with_encoding.py, whose "hé" is two
+# bytes in and one character out: a decode that is a memcpy prints the same
+# thing for pure ASCII.
+#
+# ============================================================
 # (47) FIXED: complex(...) -- THE NAME AND THE CONSTRUCTORS.
 # ============================================================
 #     print(complex(1, 2))     # unresolved name 'complex'
