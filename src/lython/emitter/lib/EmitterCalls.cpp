@@ -1239,19 +1239,105 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 types.widenLiteral(receiver.type)))
           if (const auto *methodArgs = ast::nodeList(expr, "args");
               methodArgs && !methodArgs->empty()) {
+            // ⭐ AND ANY OTHER ITERABLE THE METHOD WILL NOT TAKE. Same
+            // rewrite, asked by TYPE rather than by name:
+            //
+            //     xs: list[int] = []
+            //     xs.extend((1, 2))
+            //     # cannot adapt builtins.tuple to runtime input 1 of
+            //     # builtins.list.extend
+            //
+            // and the same for `range(3)`, for a str, and for every other
+            // iterable that is not a list. `xs.extend(list(t))` compiles, which
+            // is the whole repair: the callee consumes the argument entirely, so
+            // materializing it is exact.
+            //
+            // ⛔ Only where the call is OTHERWISE REFUSED, and only if
+            // materializing makes it resolve -- both asked on TYPES, with no
+            // emission, so nothing is evaluated twice. A method that genuinely
+            // wants a tuple still gets one: its inference succeeds first and this
+            // never runs. That is what replaces an enumeration of the consuming
+            // methods, which would have been wrong for some receiver nobody
+            // tested.
+            llvm::SmallVector<mlir::Type, 4> argumentTypes;
+            bool haveAllTypes = true;
+            for (const parser::NodePtr &argument : *methodArgs) {
+              mlir::Type actual =
+                  argument ? types.widenLiteral(types.inferExpr(argument.get()))
+                           : mlir::Type();
+              if (!actual)
+                haveAllTypes = false;
+              argumentTypes.push_back(actual);
+            }
+            // The DECLARED parameter, from the resolved callable contract. The
+            // type check accepts a tuple for `extend` -- the manifest spells the
+            // parameter as a list and `isAssignableTo` lets an iterable through
+            // -- and the refusal comes later, from the runtime ABI ("cannot adapt
+            // builtins.tuple to runtime input 1"). So "the call does not resolve"
+            // is the wrong trigger; "the parameter says list and this is not one"
+            // is the right one.
+            llvm::SmallVector<mlir::Type, 4> declaredTypes;
+            if (haveAllTypes)
+              if (CallInferenceResult resolved =
+                      types.inferMethodCallWithEvidence(receiver.type,
+                                                        *methodName,
+                                                        argumentTypes))
+                if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+                        resolved.evidence.callableContract)) {
+                  llvm::ArrayRef<mlir::Type> positional =
+                      callable.getPositionalTypes();
+                  // The manifest's receiver occupies slot 0 of the contract.
+                  unsigned skip = positional.size() == methodArgs->size() + 1
+                                      ? 1u
+                                      : 0u;
+                  for (unsigned index = 0; index < methodArgs->size(); ++index)
+                    declaredTypes.push_back(index + skip < positional.size()
+                                                ? positional[index + skip]
+                                                : mlir::Type());
+                }
+
             std::vector<parser::NodePtr> materialized;
             bool anyMaterialized = false;
-            for (const parser::NodePtr &argument : *methodArgs) {
+            for (auto [index, argument] : llvm::enumerate(*methodArgs)) {
               if (argument && argument->kind != "Starred")
                 if (auto actual = mlir::dyn_cast_if_present<py::ContractType>(
                         types.widenLiteral(types.inferExpr(argument.get())));
-                    actual &&
-                    actual.getContractName() == "types.GeneratorType") {
-                  materialized.push_back(synth::call(
-                      synth::name(std::string("list"), argument->range),
-                      std::vector<parser::NodePtr>{argument}, argument->range));
-                  anyMaterialized = true;
-                  continue;
+                    actual) {
+                  bool generator =
+                      actual.getContractName() == "types.GeneratorType";
+                  // The declared parameter is the PROTOCOL `Iterable`, not a
+                  // list: the manifest promises to consume any iterable and the
+                  // runtime implements the list case, which is why the refusal
+                  // arrives from the ABI ("cannot adapt builtins.tuple to runtime
+                  // input 1") and not from the type check.
+                  //
+                  // ⛔ Except an argument of the RECEIVER's own contract, which
+                  // is the shape the runtime does implement directly
+                  // (`s.update(other_set)`, `xs.extend(other_list)`).
+                  // Materializing those would take a working call and break it.
+                  bool wantsList = false;
+                  if (!generator && index < declaredTypes.size() &&
+                      actual.getContractName() != "builtins.list")
+                    if (auto declared = mlir::dyn_cast_if_present<py::ProtocolType>(
+                            declaredTypes[index])) {
+                      auto receiverContract =
+                          mlir::dyn_cast_if_present<py::ContractType>(
+                              types.widenLiteral(receiver.type));
+                      wantsList =
+                          declared.getProtocolName() == "Iterable" &&
+                          types.iterationElementType(argument.get()) &&
+                          (!receiverContract ||
+                           receiverContract.getContractName() !=
+                               actual.getContractName());
+                    }
+                  if (generator || wantsList) {
+                    materialized.push_back(synth::call(
+                        synth::name(std::string("list"), argument->range),
+                        std::vector<parser::NodePtr>{argument},
+                        argument->range));
+                    anyMaterialized = true;
+                    continue;
+                  }
                 }
               materialized.push_back(argument);
             }

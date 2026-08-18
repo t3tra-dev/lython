@@ -656,6 +656,37 @@
 # in three places.
 #
 # ============================================================
+# (35) FIXED: extend/join TAKE ANY ITERABLE, NOT ONLY A LIST.
+# ============================================================
+#     xs: list[int] = []
+#     xs.extend((1, 2))
+#     # cannot adapt builtins.tuple to runtime input 1 of builtins.list.extend
+#     #   [values: 'memref<14xi64>', expected 'memref<9xi64>']
+#
+# ⭐ FIXED 2026-08-18, as the rewrite a GENERATOR argument already took: the callee
+# consumes the whole iterable, so `list(...)` around it is exact.
+#
+# ⭐ THE TRIGGER TOOK THREE READINGS, and the first two were wrong in an
+# instructive way:
+#   1. "materialize when the call does not resolve" -- it resolves. The manifest
+#      declares the parameter as the PROTOCOL `Iterable`, so a tuple type-checks.
+#   2. "materialize when the declared parameter is builtins.list" -- it is not; the
+#      declared parameter IS the protocol. Instrumenting the condition is what
+#      showed it: `declared=!py.protocol<"Iterable", [int]> actual=tuple[int]`.
+#      The refusal comes from the runtime ABI, which implements the list case only.
+#   3. the protocol itself is the trigger.
+#
+# ⛔ EXCEPT an argument of the RECEIVER's own contract: `s.update(other_set)` and
+# `xs.extend(other_list)` are the shapes the runtime implements directly, and
+# materializing those would break a working call.
+#
+# ⛔ `s.update((1, 2))` stays refused: the rewrite hands set.update a list and its
+# runtime wants a set. It was refused before, so nothing regressed -- closing it
+# needs the manifest to implement the other cases.
+#
+# Pinned by tests/golden/cases/extend_takes_any_iterable.py.
+#
+# ============================================================
 # (34) FIXED: A METHOD'S DEFAULT IS EVALUATED ONCE.
 # ============================================================
 #     class Bag:
