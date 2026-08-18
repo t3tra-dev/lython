@@ -656,6 +656,45 @@
 # in three places.
 #
 # ============================================================
+# (52) FIXED: type(x), AND IDENTITY BETWEEN TYPE OBJECTS.
+# ============================================================
+#     print(type(x).__name__)     # unresolved name 'type'
+#     print(type(x) is C)         # `is` requires reference-typed operands
+#
+# ⭐ FIXED 2026-08-19. The name was unbound, which took the standard "what did I
+# get" idiom with it. `type(x)` is answerable statically exactly when nothing can
+# put a SUBCLASS instance in x -- a manifest contract is its own runtime class
+# here (a bool is a truth bit, not an int), and a source class is too unless the
+# program declares a subclass of it. The subclass scan over classMros IS the
+# soundness of the fold, not a nicety: `x: A = B()` makes the static class A and
+# the runtime class B.
+#
+# ⛔ NOT bound as the `type` CLASS: that would make `type(x)` an instantiation,
+# and a type object built from an instance is not what CPython returns.
+#
+# ⛔ The argument still runs -- `type(f())` calls f, once, which the golden's
+# counter is there to show.
+#
+# ⭐ AND `is` BETWEEN TWO TYPE OBJECTS folds: a class has exactly one type object
+# in CPython, so the answer is whether they name the same class. `C is C` was
+# refused too, which is how the exact-class test lost both of its spellings.
+#
+# ⛔ `type(e).__name__` in an except handler stays refused, and correctly: the
+# handler's static class is the one CAUGHT, not the one raised, so folding it
+# would print "Exception" where CPython prints "E". The repair with somewhere to
+# go: the runtime DOES carry the dynamic class id for exceptions
+# (__ly_exception_repr_by_id reads it, exception_class_name maps it), so a
+# BaseException method returning the name would answer this one exactly. What
+# stops it today is that there is no generic "call this named manifest method"
+# op in the emitter -- repr/str/int/float each have their own -- so the method
+# would have to be exposed on the Python surface to be reachable.
+#
+# ⛔ `print(C)` (a type object as a printed value) is still refused: "runtime
+# method receiver has no concrete contract".
+#
+# Pinned by tests/golden/cases/type_of_a_value.py.
+#
+# ============================================================
 # (51) FIXED: import os.path.
 # ============================================================
 #     import os.path

@@ -1153,6 +1153,21 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
           builder, loc(expr), literalType, builder.getBoolAttr(truth));
       return Value{constant.getResult(), literalType};
     }
+    // ⭐ TWO TYPE OBJECTS COMPARE BY CONTRACT, at compile time. A class has
+    // exactly one type object in CPython, so `type(x) is C` and `C is C` are
+    // decided by which classes they name -- and both were refused as "no stable
+    // identity", which took the standard exact-class test with them. This is
+    // the same fold `C.__name__` gets, and for the same reason: the answer
+    // cannot depend on anything the program does at run time.
+    if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
+      if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
+        bool same = lhsType.getInstanceType() == rhsType.getInstanceType();
+        bool truth = negatedIdentity ? !same : same;
+        mlir::Type literalType = types.literal(truth ? "True" : "False");
+        auto constant = py::BoolConstantOp::create(
+            builder, loc(expr), literalType, builder.getBoolAttr(truth));
+        return Value{constant.getResult(), literalType};
+      }
     // R6: identity on value types has no stable meaning (interning is an
     // implementation detail even in CPython); require the equality operator.
     auto isValueType = [&](mlir::Type type) {

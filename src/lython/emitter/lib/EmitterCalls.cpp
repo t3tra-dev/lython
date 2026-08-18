@@ -805,6 +805,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     }
   }
 
+  if (std::optional<Value> v = tryEmitTypeCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntBaseCall(expr, calleeNode))
@@ -1792,6 +1794,69 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   Value callee = emitBindingRef(calleeNode, specialization->first,
                                 specialization->second);
   return emitCallableDispatch(expr, callee, operands);
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
+                               const parser::Node *calleeNode) {
+  // ⭐ `type(x)` is the class of x, and the class of x is a STATIC fact here
+  // exactly when nothing can put a subclass instance in x. That is the whole
+  // condition: a manifest contract is its own runtime class (a bool is not
+  // stored as an int here, it is a truth bit), and a source class is too unless
+  // the program declares a subclass of it.
+  //
+  // Until now the name was simply unbound -- "unresolved name 'type'" -- which
+  // took `type(e).__name__` with it, the idiom for reporting what was caught.
+  //
+  // ⛔ NOT bound as the `type` CLASS: that would make `type(x)` an
+  // instantiation, and a type object built from an instance is not what CPython
+  // returns. The interception happens before any class binding for the same
+  // reason int() and str() are intercepted.
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "type" || programBindsName("type"))
+    return std::nullopt;
+  const auto *typeArgs = ast::nodeList(expr, "args");
+  const auto *typeKeywords = ast::nodeList(expr, "keywords");
+  if (!typeArgs || typeArgs->size() != 1 || !typeArgs->front() ||
+      typeArgs->front()->kind == "Starred" ||
+      (typeKeywords && !typeKeywords->empty()))
+    return std::nullopt;
+  const parser::Node *subjectNode = typeArgs->front().get();
+  mlir::Type subject = types.widenLiteral(types.inferExpr(subjectNode));
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             expr.range.start,
+                                             std::move(reason)});
+    return emitNone(expr);
+  };
+  if (!contract)
+    return refuse("type(x) needs a statically resolved class, and " +
+                  typeText(subject) + " is not one");
+  llvm::StringRef contractName = contract.getContractName();
+  if (contractName == "builtins.object" || contractName == "typing.Any")
+    return refuse(
+        "type(x) on a type-erased value would need the runtime class, which is "
+        "excluded from the static evidence kernel");
+  // ⛔ The SUBCLASS check is the soundness of the whole fold. `x: A = B()`
+  // makes the static class A and the runtime class B, and answering A there is
+  // a wrong answer with no diagnostic -- which is what the default repr does
+  // today and is recorded separately.
+  for (const auto &entry : classMros) {
+    if (entry.getKey() == contractName)
+      continue;
+    if (llvm::is_contained(entry.second, contractName))
+      return refuse("type(x) is not supported for '" + contractName.str() +
+                    "': '" + entry.getKey().str() +
+                    "' derives from it, so a value of this type can hold an "
+                    "instance of the subclass and the answer would name the "
+                    "static class instead");
+  }
+  // The argument still runs: `type(f())` calls f.
+  (void)emitExpr(subjectNode);
+  mlir::Type typeType = types.typeObject(contract);
+  auto object = py::TypeObjectOp::create(builder, loc(expr), typeType, contract);
+  return Value{object.getResult(), typeType};
 }
 
 std::optional<Value>
