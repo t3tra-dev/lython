@@ -656,6 +656,32 @@
 # in three places.
 #
 # ============================================================
+# (38) FIXED: A METHOD'S UNION PARAMETER CALLED WITH ONE MEMBER.
+# ============================================================
+#     class Box:
+#         def take(self, n: int | None) -> int:
+#             if n is None: return -1
+#             return n
+#     Box().take(None)
+#     # cannot adapt runtime bundle types.NoneType with physical values ...
+#
+# ⭐ FIXED 2026-08-18. An inlined body binds the argument VALUE, so the parameter
+# held a `literal<None>` and the body's `n is None` narrowing had nothing to
+# narrow -- the union it was written against never existed at that call site. The
+# FREE-function spelling works because its call emits operands against the
+# declared callable, which wraps the member, and a DEFAULT of None works for the
+# same reason. The inlined path wraps too now, for positionals, keywords and
+# keyword-only parameters.
+#
+# ⭐ `collections.Counter.most_common(None)` is this defect reached through the
+# SHIPPED STDLIB -- the parameter is `int | None` and passing None explicitly is
+# how CPython's own signature is exercised. A defect that only a library call
+# reaches is the argument for gridding stdlib usage, which this file already
+# records under the sweep notes.
+#
+# Pinned by tests/golden/cases/union_parameter_takes_a_member.py.
+#
+# ============================================================
 # (37) FIXED: A float CLASS ATTRIBUTE WITH AN int INITIALIZER.
 # ============================================================
 #     class P:

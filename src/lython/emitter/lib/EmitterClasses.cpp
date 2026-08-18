@@ -3008,6 +3008,23 @@ Value ModuleEmitter::emitInlineMethodBody(
     if (parameterIndex < sig.positionalTypes.size())
       checkArgument(sig.positionalNames[parameterIndex],
                     sig.positionalTypes[parameterIndex], argument);
+    // ⭐ A UNION PARAMETER TAKES THE UNION, not the member the call happened to
+    // pass. An inlined body binds the argument VALUE, so `b.take(None)` against
+    // `def take(self, n: int | None)` bound a `literal<None>` and the body's
+    // `n is None` narrowing then had nothing to narrow:
+    //
+    //     cannot adapt runtime bundle types.NoneType with physical values ...
+    //
+    // The free-function spelling works because its call emits operands against
+    // the declared callable, which wraps; a DEFAULT of None works for the same
+    // reason. `Counter.most_common(None)` is this defect reached through the
+    // shipped stdlib.
+    if (parameterIndex < sig.positionalTypes.size())
+      if (mlir::isa_and_nonnull<py::UnionType>(
+              sig.positionalTypes[parameterIndex]) &&
+          !mlir::isa_and_nonnull<py::UnionType>(argument.type))
+        argument = coerceValue(argument, sig.positionalTypes[parameterIndex],
+                               anchor);
     bind(sig.positionalNames[parameterIndex++], argument);
   }
   if (sig.varargName) {
@@ -3041,16 +3058,25 @@ Value ModuleEmitter::emitInlineMethodBody(
                 "'"});
         return;
       }
-      if (index < sig.positionalTypes.size())
+      if (index < sig.positionalTypes.size()) {
         checkArgument(name, sig.positionalTypes[index], value);
+        // Keywords take the same union wrap as the positionals above.
+        if (mlir::isa_and_nonnull<py::UnionType>(sig.positionalTypes[index]) &&
+            !mlir::isa_and_nonnull<py::UnionType>(value.type))
+          value = coerceValue(value, sig.positionalTypes[index], anchor);
+      }
       bind(name, value);
       return;
     }
     for (auto [index, kwOnlyName] : llvm::enumerate(sig.kwOnlyNames)) {
       if (kwOnlyName != name)
         continue;
-      if (index < sig.kwOnlyTypes.size())
+      if (index < sig.kwOnlyTypes.size()) {
         checkArgument(name, sig.kwOnlyTypes[index], value);
+        if (mlir::isa_and_nonnull<py::UnionType>(sig.kwOnlyTypes[index]) &&
+            !mlir::isa_and_nonnull<py::UnionType>(value.type))
+          value = coerceValue(value, sig.kwOnlyTypes[index], anchor);
+      }
       bind(name, value);
       return;
     }
