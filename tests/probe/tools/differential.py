@@ -10,6 +10,7 @@ unless someone happens to run that exact program both ways.
 This runs the loop over a whole corpus and sorts the outcomes into buckets:
 
     AGREE      same stdout, both exited 0
+    WRONG-DECLARED  stdout differs, and the program says why (expect-wrong)
     WRONG      both ran to completion, stdout differs      <-- the bad one
     GAP        CPython ran it, lyc refused it
     EXTRA      lyc ran it, CPython refused it
@@ -53,7 +54,8 @@ from pathlib import Path
 
 # The buckets, worst first: report order, and the order that decides which
 # transition counts as a regression (a move DOWN this list is an improvement).
-BUCKETS = ["WRONG", "TIMEOUT", "EXTRA", "GAP", "BOTH-FAIL", "AGREE", "SKIP"]
+BUCKETS = ["WRONG", "WRONG-DECLARED", "TIMEOUT", "EXTRA", "GAP", "BOTH-FAIL",
+           "AGREE", "SKIP"]
 IMPROVEMENT_RANK = {name: index for index, name in enumerate(BUCKETS)}
 
 
@@ -65,10 +67,30 @@ class Outcome:
 
 
 def skip_reason(source: Path) -> str | None:
+    return marker_reason(source, "skip")
+
+
+def declared_wrong(source: Path) -> str | None:
+    """Does the program itself say its divergence is the point?
+
+    `# differential: expect-wrong <reason>` was already being written in the
+    corpus before anything read it, so wb_const_set_literal_fold.py -- forty
+    lines documenting a CPython codegen fold this compiler does not do -- was
+    reported as a fresh WRONG and, being newer than the baseline, as a
+    REGRESSION. A survey that calls a documented difference a regression is the
+    failure mode these tools exist to avoid, so the marker is honoured: it is
+    still a difference and still printed, but under its own heading, and only a
+    CHANGE in it moves the exit code.
+    """
+    return marker_reason(source, "expect-wrong")
+
+
+def marker_reason(source: Path, marker: str) -> str | None:
+    needle = f"# differential: {marker}"
     for line in source.read_text(errors="replace").splitlines():
-        marker = line.find("# differential: skip")
-        if marker >= 0:
-            return line[marker + len("# differential: skip") :].strip() or "no reason given"
+        found = line.find(needle)
+        if found >= 0:
+            return line[found + len(needle) :].strip() or "no reason given"
     return None
 
 
@@ -117,7 +139,10 @@ def classify(lyc: Path, interpreter: str, source: Path, workdir: Path,
     if subject_code != 0:
         return Outcome(source.name, "GAP", f"lyc rc {subject_code}")
     if reference_out != subject_out:
-        return Outcome(source.name, "WRONG", first_difference(reference_out, subject_out))
+        difference = first_difference(reference_out, subject_out)
+        if (declared := declared_wrong(source)) is not None:
+            return Outcome(source.name, "WRONG-DECLARED", f"{difference} [{declared}]")
+        return Outcome(source.name, "WRONG", difference)
     return Outcome(source.name, "AGREE")
 
 
@@ -242,6 +267,7 @@ def main() -> int:
         print(f"\n{len(outcomes)} programs, {len(by_bucket['AGREE'])} agree")
         return 1 if by_bucket["WRONG"] else 0
 
+
     baseline = read_baseline(args.baseline)
     regressions: list[str] = []
     improvements: list[str] = []
@@ -251,6 +277,8 @@ def main() -> int:
             # A program the baseline has never seen is not a regression, but a
             # new one that is already WRONG is worth the same attention.
             if outcome.bucket == "WRONG":
+                # WRONG-DECLARED is deliberately not here: the file it came
+                # from is where the difference is explained.
                 regressions.append(f"{outcome.name}: new, and {outcome.bucket}")
             continue
         if was == outcome.bucket:

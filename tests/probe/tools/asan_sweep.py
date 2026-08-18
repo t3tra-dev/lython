@@ -32,7 +32,12 @@ files = sorted(p for p in corpus.glob("*.py"))
 
 def run(path):
     try:
-        r = subprocess.run([lyc, "jit", str(path)], capture_output=True,
+        # Resolved, because the run happens in the PROGRAM's directory (a case
+        # that writes a file must not write into the repo root): a relative
+        # corpus path then names nothing from there, and every program comes
+        # back rc=1 -- a whole corpus reported "not clean" for a reason that has
+        # nothing to do with memory.
+        r = subprocess.run([lyc, "jit", str(path.resolve())], capture_output=True,
                            text=True, timeout=300, stdin=subprocess.DEVNULL,
                            env=env, cwd=str(path.parent))
     except subprocess.TimeoutExpired:
