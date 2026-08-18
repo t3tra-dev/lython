@@ -342,6 +342,28 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
 Value ModuleEmitter::emitCall(const parser::Node &expr) {
   const parser::Node *calleeNode = ast::node(expr, "func");
   std::string calleeQualified = ast::qualifiedName(calleeNode);
+  // ⭐ A LOCAL WINS OVER AN IMPORTED NAMESPACE. `from os import path` binds the
+  // canonical symbol `path`, and that binding is visible while the STDLIB module
+  // is compiled -- where posixpath's own `def normpath(path: str)` has a
+  // parameter of that name:
+  //
+  //     from os import path
+  //     print(path.basename("a/b.py"))
+  //     # <stdlib>/posixpath.py:221:12: unresolved runtime binding 'path.split'
+  //
+  // Line 221 is `comps = path.split("/")`, a str method on that parameter, read
+  // as a member of the importer's module alias. `import os` never collides
+  // because nothing in the stdlib is called `os`; the collision is what the alias
+  // brings.
+  //
+  // ⛔ The ROOT only. `a.b.c` where `a` is a local is a local's attribute chain
+  // whatever `b` is, and a qualified symbol table cannot answer it.
+  if (!calleeQualified.empty()) {
+    llvm::StringRef root =
+        llvm::StringRef(calleeQualified).split('.').first;
+    if (!root.empty() && values.find(root) != values.end())
+      calleeQualified.clear();
+  }
 
   if (std::optional<Value> v = tryEmitSuperCall(expr, calleeNode))
     return *v;

@@ -656,6 +656,33 @@
 # in three places.
 #
 # ============================================================
+# (39) FIXED: `from os import path` -- AN ALIAS THAT SHADOWED A STDLIB LOCAL.
+# ============================================================
+#     from os import path
+#     print(path.basename("a/b.py"))
+#     # <stdlib>/posixpath.py:221:12: unresolved runtime binding 'path.split'
+#
+# ⭐ FIXED 2026-08-18, and the diagnosis is the whole story: the failure was inside
+# the compiler's OWN posixpath.py, at `comps = path.split("/")` -- a str method on
+# `normpath`'s parameter, which happens to be named `path`. Binding the importer's
+# alias put a canonical symbol named `path` in scope while that module compiled,
+# and the qualified-name route claimed the parameter's attribute chain.
+#
+# `import os` never collides because nothing in the stdlib is named `os`. The
+# collision is what the ALIAS brings, which is why the three failing spellings all
+# involve one and the working spelling does not.
+#
+# The rule: a local wins over an imported namespace, asked on the ROOT of the
+# dotted name -- `a.b.c` where `a` is a local is a local's attribute chain whatever
+# `b` is, and a qualified symbol table cannot answer it.
+#
+# ⛔ `import os.path` and `from os.path import basename` remain "unsupported
+# import": a dotted module NAME is a separate gap in the resolver, and the note
+# there records the attempts that did not close it.
+#
+# Pinned by tests/golden/cases/imported_namespace_versus_a_local.py.
+#
+# ============================================================
 # (38) FIXED: A METHOD'S UNION PARAMETER CALLED WITH ONE MEMBER.
 # ============================================================
 #     class Box:
