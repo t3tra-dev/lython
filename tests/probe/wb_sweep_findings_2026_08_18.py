@@ -1685,3 +1685,41 @@ them in.
 # touching, and the round it needs is the one that reconciles the two liveness
 # models rather than a patch on either.
 
+# ==========================================================================
+# [GAP BATCH] shipped stdlib, ten realistic programs   FOUND 2026-08-19
+# Five of ten programs that use a shipped module do not compile. Each is
+# reduced, and each is a different mechanism -- the point of listing them
+# together is that none of the five is about the module it appears in.
+#
+# 1. json.dumps of a CONCRETE dict.  `json.dumps({"a": 1})` ->
+#    "!py.callable<[json.JSONValue, ...]> is not callable: call arguments do
+#    not match the Callable contract". dumps takes JSONValue (the recursive
+#    union), and dict[str, int] is not dict[str, JSONValue] -- a mutable
+#    container is invariant, and CPython's own type checkers say the same
+#    thing about it (typeshed declares obj: Any). What would make the call
+#    work is BUILDING a union tree at run time, which is the union mechanism
+#    already recorded above. json.loads and its subscripts work.
+#
+# 2. collections.defaultdict and collections.deque are simply absent, and
+#    collections.py says why in its docstring: CPython implements both in C,
+#    so the layering rule puts them in runtime/modules/*.mlir, and no
+#    _collections manifest exists. That is a new native container each --
+#    header, allocator, deallocator, methods -- not a lib/*.py addition.
+#
+# 3. itertools.islice over a non-indexable: "islice() as a value requires
+#    indexable sequences (list/str/tuple/bytes); iterate non-indexable sources
+#    directly". `itertools.islice(itertools.count(5), 3)` is the canonical use
+#    (bounding an infinite iterator) and is exactly what it refuses.
+#
+# 4. functools.lru_cache as a decorator: "decorator 'functools.lru_cache' is
+#    not supported (unrecognized decorators are rejected instead of silently
+#    ignored)". The refusal is deliberate and the message is right; what is
+#    missing is the feature.
+#
+# 5. `import os.path` -- FIXED the same day, see wb_grid_leftovers (51).
+#
+# The five that pass are worth naming too, because they are the ones a reader
+# would expect to break first: dataclasses with a default_factory field, an
+# Enum iterated and looked up by value, string.maketrans/translate, bisect
+# insort, and io.StringIO.
+
