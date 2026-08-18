@@ -1185,6 +1185,33 @@ them in.
 # choice, same loop: `d[c] = 0` AGREES (working neighbour), `d.get(c, 0)`
 # AGREES, `d.pop(c, 0)` AGREES, `d.update(other)` AGREES -- setdefault is the
 # only dict method that break
+#
+# ⭐ LOCALISED 2026-08-18, and two repairs measured and reverted. `setdefault`
+# lowers to a conditional insert whose two arms branch to ONE merge block passing
+# the same dict, so everything after the merge names the block argument. Inside a
+# loop that argument is loop-carried, and the return then hands back a name the
+# owned-return check cannot relate to the `LyDict_FromLength` result. Neighbours:
+#
+#     module scope, no return          -> compiles
+#     setdefault with no loop          -> compiles
+#     `d[c] = 0` in the same loop      -> compiles   (keeps the original name)
+#     setdefault in a loop + return    -> refused
+#
+#   1. Union every uniform merge argument with its incoming value in
+#      `AliasAnalysis::build` -- the natural home for a rename. 36 TESTS DOWN at
+#      once: the alias relation feeds release PLACEMENT everywhere, and making two
+#      names one moves releases that were correct.
+#   2. Resolve the rename only in `returnTransfersGroup`, additively (try the raw
+#      operands first, the resolved ones second, so it can only accept MORE).
+#      Sound -- the suite stays green -- and it fixes nothing: the loop case's
+#      returned name is a LOOP-CARRIED argument, whose incoming values differ by
+#      construction, so the resolver correctly declines. Reverted as no-effect
+#      surface.
+#
+# What is left is the group following a loop-carried argument, which the pass
+# already does for a self-forwarding continue edge ("neither a use nor a death")
+# and not for a value that ENTERS the loop from the preheader.
+#
 
 # ==========================================================================
 # [FALSE-REFUSAL] dataflow
