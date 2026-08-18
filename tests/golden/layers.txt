@@ -34,6 +34,7 @@
 errors/annotation_forward_ref_complex emit
 errors/boxed_payload_too_wide_fields lower
 errors/class_attr_instance_shadow_write emit
+errors/class_attribute_numeric_representation emit
 errors/class_erased_object_field lower
 errors/class_erased_object_field_int lower
 errors/class_mro_conflict emit

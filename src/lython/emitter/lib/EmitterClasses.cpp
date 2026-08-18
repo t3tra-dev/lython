@@ -670,6 +670,40 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
     if (slot == slots->second.end())
       continue;
     Value initial = emitExprExpected(value, slot->second);
+    // ⭐ THE SAME REFUSAL THE MODULE-GLOBAL WRITE MAKES, and this channel was
+    // missing it:
+    //
+    //     class P:
+    //         v: float = 1
+    //     print(P.v)
+    //     # RuntimeError: module global 'P.v' referenced before assignment
+    //
+    // `x: float = 1` at module scope says so at EMIT ("a module global has one
+    // runtime representation and these two do not share one"), because
+    // `coerceValue` deliberately declines to retype between the numeric
+    // contracts. The class-attribute cell is the same storage with the same
+    // rule, and without the check the store of an int into a float cell was
+    // dropped further down -- leaving the cell unassigned and the failure to
+    // the reader at RUNTIME, naming an internal cell name.
+    if (mlir::Type declared = types.widenLiteral(slot->second),
+        supplied = types.widenLiteral(initial.type);
+        declared && supplied && declared != supplied &&
+        isNumericPrimitiveContract(declared) &&
+        isNumericPrimitiveContract(supplied)) {
+      auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
+        if (numeric == types.boolType())
+          return "bool";
+        return numeric == types.intType() ? "int" : "float";
+      };
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement->range.start,
+          "class attribute '" + std::string(*name) + "." + attrName.str() +
+              "' holds " + spell(declared).str() +
+              " and this initializer gives it " + spell(supplied).str() +
+              "; the attribute's cell has one runtime representation and these "
+              "two do not share one, so write the value in the declared type"});
+      continue;
+    }
     Value coerced = coerceValue(initial, slot->second, *statement);
     std::string cellName = (llvm::Twine(*name) + "." + attrName).str();
     py::GlobalSetOp::create(builder, loc(*statement),

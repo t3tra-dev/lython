@@ -656,6 +656,31 @@
 # in three places.
 #
 # ============================================================
+# (37) FIXED: A float CLASS ATTRIBUTE WITH AN int INITIALIZER.
+# ============================================================
+#     class P:
+#         v: float = 1
+#     print(P.v)
+#     # RuntimeError: module global 'P.v' referenced before assignment
+#
+# ⭐ FIXED 2026-08-18 by giving this channel the refusal the MODULE-GLOBAL write
+# already makes. `x: float = 1` at module scope says so at emit -- `coerceValue`
+# declines to retype between the numeric contracts, and the write reports it --
+# while the class-attribute cell, the same storage under the same rule, had no
+# check at all: the store of an int into a float cell was dropped further down,
+# leaving the cell unassigned and the failure to the reader at RUNTIME, naming an
+# internal cell name.
+#
+# ⛔ Still a deviation from CPython, and the same one the module global documents:
+# CPython prints 1 there, because its annotation is inert and the value stays an
+# int. A cell whose representation is fixed by the declaration cannot hold that,
+# so the answer is a refusal that names the attribute and what to write.
+#
+# Pinned by tests/golden/errors/class_attribute_numeric_representation.py.
+# ⛔ redcheck cannot red-check an errors golden; `run_case.py --expect-layer emit`
+# fails on the pre-fix binary, which reaches the RuntimeError instead.
+#
+# ============================================================
 # (36) FIXED: `*args` ON A METHOD, AND AN EMPTY EVIDENCE SEQUENCE.
 # ============================================================
 #     class Registry:
