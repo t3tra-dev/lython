@@ -923,6 +923,23 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
       // with and without the dotted binding that follows it, was tried and
       // does not restore it: something else in the `import os` path is what
       // makes the name usable, and this pre-pass is not all of it.
+      //
+      // ⭐ WHY THOSE ATTEMPTS COULD NOT WORK, measured 2026-08-18 by printing
+      // the conditions: `os` IS NOT A SOURCE MODULE HERE.
+      // `lookupSourceModule("os")` is null, so every repair spelled with
+      // `bindSourceModuleNamespace` -- the three above among them -- did
+      // nothing at all for it. `import os` succeeds through
+      // `types.bindImportedModule`, the manifest route at the bottom of this
+      // function.
+      //
+      // ⛔ And binding the ROOT that way is still not enough: with
+      // `types.bindImportedModule("os", "os")` here, `import os.path` is
+      // accepted and `os.path.basename(...)` then fails with "static type
+      // builtins.object does not provide" -- something binds `os.path` itself
+      // to the object placeholder before the use, which `import os` never does.
+      // That binding is the thing to find; neither `lookupSymbol("os.path")`
+      // nor `lookupSymbol("os.path.basename")` exists at this point, because a
+      // manifest member is resolved at the USE site.
       if (!asname && llvm::StringRef(*name).contains('.')) {
         if (bindSourceModuleNamespace(llvm::StringRef(*name),
                                       llvm::StringRef(*name))) {
