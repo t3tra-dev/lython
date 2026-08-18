@@ -1622,3 +1622,66 @@ them in.
 # cascade from one cause: the vararg parameter is not entered into the
 # method's scope at all, so it resolves to the None literal.
 
+# ==========================================================================
+# [FALSE-REFUSAL] generators + ownership   FOUND 2026-08-19, batch of 20
+#                                          realistic programs
+# A generator that iterates an ITERATOR OBJECT (range, or a list) and has any
+# branch containing a may-raise call is refused: the iterator "is still owned
+# when a call may unwind out of the function"
+#
+#     --- program
+#     def evens(n: int):
+#         for i in range(n):
+#             if i % 2 == 0:
+#                 yield i
+#
+#     print(list(evens(6)))
+#
+# lyc: exit 1, loc(...def...): error: owned resource from @LyRange_Iter result 0
+# is still owned when a call to 'LyLong_FromI64' may unwind out of the function;
+# the unwind path must release, transfer, or return it
+# py : [0, 2, 4]
+#
+#     --- a neighbour that AGREES
+#     def evens(n: int):
+#         i = 0
+#         while i < n:
+#             if i % 2 == 0:
+#                 yield i
+#             i += 1
+#
+# axes, all measured:
+#   - no branch at all (`for i in range(n): yield i`) -> AGREES. The branch is
+#     required.
+#   - the branch need not contain the YIELD: a branch containing `print(x)`
+#     with the yield after it is refused too (v1), and `yield` then a branch
+#     with a print is refused with a DIFFERENT producer
+#     (@__ly_generator_claim_builtins_range_iterator, v2), so the token is the
+#     frame's claim on the iterator either way.
+#   - `continue` inside the branch instead of a yield -> refused (v3).
+#   - `for i in list(range(n))` -> refused, producer @LyList_FromLength (w2).
+#     `it = range(n); for i in it` -> refused (w1). So it is the iterator
+#     OBJECT, not range specifically.
+#   - `for i in xs` over a list PARAMETER -> AGREES (u2): that walk is
+#     evidence-backed and claims no iterator object.
+#   - a plain (non-generator) function with the same loop and branch -> AGREES
+#     (u3). The generator's resume clone is where it happens.
+#   - `for i in range(len(xs))` with `xs[i]` in the CONDITION -> AGREES (v5),
+#     which is the one axis I cannot explain and the one a repair should look
+#     at first.
+#   - a while loop with the same branch -> AGREES (w3), which is the workaround.
+#
+# ⭐ WHERE IT IS. The resume clone DOES get marker/anchor wiring: the IR after
+# refcount-insertion has LyEH_TryCallSiteMarker before some may-raise calls and
+# not before others, and the verifier fires on one of the unmarked ones. So this
+# is the insertion pass and the verifier disagreeing about which groups are held
+# at a may-raise call, not a missing phase -- the iterator is a BLOCK ARGUMENT
+# threaded around the loop (^bb4(%5: memref<5xi64>)), and
+# insertUnwindCleanupReleases takes its block-argument groups as a separate
+# input (`blockArgGroups`).
+#
+# ⛔ NOT attempted on 2026-08-19: this is the generator frame, which
+# [[lython-fragile-invariants]] says to write the invariant down before
+# touching, and the round it needs is the one that reconciles the two liveness
+# models rather than a patch on either.
+
