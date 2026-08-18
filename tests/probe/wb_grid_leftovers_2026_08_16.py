@@ -656,6 +656,29 @@
 # in three places.
 #
 # ============================================================
+# (50) FIXED: int(s, base=16) -- THE KEYWORD SPELLING.
+# ============================================================
+#     print(int("ff", base=16))
+#     # static type !py.contract<"builtins.int"> does not provide manifest
+#     # method '__init__'
+#
+# ⭐ FIXED 2026-08-19, found by asking which OTHER keyword calls the manifest
+# keyword path (49b) had unlocked. This one is not a manifest call at all: the
+# two-argument int() is an emitter interception that synthesises a helper, and it
+# read the base POSITIONALLY -- it declined the moment a keyword appeared, so the
+# call fell through to class instantiation and the diagnostic talked about int's
+# missing __init__ rather than about the argument.
+#
+# Also checked in the same sweep and already working: sorted(reverse=True),
+# xs.sort(reverse=True), round(x, ndigits=2). Still refused with its own
+# documented diagnostic: print(sep=..., end=...).
+#
+# Pinned by tests/golden/cases/int_base_keyword.py, whose bases are 2 and 16 so
+# the digit set is consulted, and whose third call keeps the whitespace-and-
+# prefix form -- forwarding the keyword to the wrong parameter would still print
+# a number for "ff".
+#
+# ============================================================
 # (49) FIXED: THE COUNTING IDIOM SEEDS ITS OWN DICT.
 # ============================================================
 #     counts = {}

@@ -1908,11 +1908,29 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
-  if (!args || args->size() != 2 || !args->front() || !(*args)[1] ||
-      args->front()->kind == "Starred" || (*args)[1]->kind == "Starred" ||
-      (keywords && !keywords->empty()))
+  // ⭐ `int(s, base=16)` is the same call as `int(s, 16)`, and CPython names
+  // that parameter, so the keyword spelling is the one a reader writes. It
+  // reached the class-instantiation path instead ("builtins.int does not
+  // provide manifest method '__init__'"), because this interception took the
+  // base positionally and declined the moment a keyword appeared.
+  const parser::Node *subject = nullptr;
+  const parser::Node *base = nullptr;
+  if (args && args->size() == 2 && (!keywords || keywords->empty())) {
+    subject = args->front().get();
+    base = (*args)[1].get();
+  } else if (args && args->size() == 1 && keywords && keywords->size() == 1 &&
+             keywords->front()) {
+    std::optional<std::string_view> keyword =
+        ast::string(*keywords->front(), "arg");
+    if (keyword && *keyword == "base") {
+      subject = args->front().get();
+      base = ast::node(*keywords->front(), "value");
+    }
+  }
+  if (!subject || !base || subject->kind == "Starred" ||
+      base->kind == "Starred")
     return std::nullopt;
-  mlir::Type subjectType = types.widenLiteral(types.inferExpr(args->front().get()));
+  mlir::Type subjectType = types.widenLiteral(types.inferExpr(subject));
   if (subjectType != types.contract("builtins.str"))
     return std::nullopt;
 
@@ -2052,8 +2070,7 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     intBaseHelperCallable = sig.publicCallable;
   }
 
-  llvm::SmallVector<Value, 2> arguments{emitExpr(args->front().get()),
-                                        emitExpr((*args)[1].get())};
+  llvm::SmallVector<Value, 2> arguments{emitExpr(subject), emitExpr(base)};
   Value callee =
       emitBindingRef(expr, intBaseHelperSymbol, intBaseHelperCallable);
   return emitCallableDispatch(
