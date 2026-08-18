@@ -24,7 +24,8 @@ module attributes {
     "math.fmod",
     "math.copysign",
     "math.degrees",
-    "math.radians"
+    "math.radians",
+    "math.isclose"
   ],
   ly.typing.function_names = [
     "math.floor",
@@ -43,7 +44,8 @@ module attributes {
     "math.fmod",
     "math.copysign",
     "math.degrees",
-    "math.radians"
+    "math.radians",
+    "math.isclose"
   ],
   ly.typing.float_constant_names = ["math.pi", "math.e", "math.tau", "math.inf", "math.nan"],
   ly.typing.float_constant_values = [3.141592653589793 : f64, 2.718281828459045 : f64, 6.283185307179586 : f64, 0x7FF0000000000000 : f64, 0x7FF8000000000000 : f64],
@@ -64,7 +66,8 @@ module attributes {
     !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["x", "y"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["x", "y"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
-    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["a", "b"], arg_defaults = [false, false], kwonly = [!py.contract<"builtins.float">, !py.contract<"builtins.float">], kw_names = ["rel_tol", "abs_tol"], kw_defaults = [true, true], returns = [!py.contract<"builtins.bool">]>
   ]
 } {
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
@@ -371,6 +374,81 @@ module attributes {
     %result = arith.mulf %value, %factor : f64
     %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
     func.return %out_header : memref<3xi64>
+  }
+
+
+  // "tolerances must be non-negative"
+  memref.global "private" constant @__ly_math_msg_negative_tolerance : memref<31xi8> = dense<[116, 111, 108, 101, 114, 97, 110, 99, 101, 115, 32, 109, 117, 115, 116, 32, 98, 101, 32, 110, 111, 110, 45, 110, 101, 103, 97, 116, 105, 118, 101]>
+
+  func.func private @__ly_math_negative_tolerance_error() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 31 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_msg_negative_tolerance : memref<31xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<31xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  // ⭐ The RAW f64 parameters are what let the two tolerances have defaults:
+  // ly.runtime.default_f64 fills a missing scalar, and a float OBJECT parameter
+  // has no such spelling. A float argument reaches an f64 input through float's
+  // unbox.f64 in the ABI adapter, which is the same road complex(...) takes.
+  //
+  // The body is CPython's math_isclose verbatim (Modules/mathmodule.c), and
+  // each line of it is load-bearing: `a == b` first so infinities compare equal
+  // to themselves, the isinf check so inf vs finite is False rather than
+  // inf <= inf, both relative tests because the tolerance is relative to
+  // EITHER operand, and no NaN case at all -- every comparison is false for a
+  // NaN, which is the answer.
+  func.func @LyMath_IsClose(%a: f64, %b: f64, %rel_tol: f64 {ly.runtime.default_f64 = 1.000000e-09 : f64}, %abs_tol: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> i1 attributes {ly.runtime.builtin = "math.isclose", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_isclose", ly.runtime.result_contract = "builtins.bool"} {
+    %zero = arith.constant 0.0 : f64
+    %rel_negative = arith.cmpf olt, %rel_tol, %zero : f64
+    %abs_negative = arith.cmpf olt, %abs_tol, %zero : f64
+    %negative = arith.ori %rel_negative, %abs_negative : i1
+    cf.cond_br %negative, ^tolerance_error, ^compare
+
+  ^tolerance_error:
+    func.call @__ly_math_negative_tolerance_error() : () -> ()
+    cf.br ^compare
+
+  ^compare:
+    %equal = arith.cmpf oeq, %a, %b : f64
+    cf.cond_br %equal, ^exact, ^finite_check
+
+  ^exact:
+    %true_bit = arith.constant true
+    func.return %true_bit : i1
+
+  ^finite_check:
+    %inf = arith.constant 0x7FF0000000000000 : f64
+    %abs_a = math.absf %a : f64
+    %abs_b = math.absf %b : f64
+    %a_infinite = arith.cmpf oeq, %abs_a, %inf : f64
+    %b_infinite = arith.cmpf oeq, %abs_b, %inf : f64
+    %either_infinite = arith.ori %a_infinite, %b_infinite : i1
+    cf.cond_br %either_infinite, ^apart, ^tolerances
+
+  ^apart:
+    %false_bit = arith.constant false
+    func.return %false_bit : i1
+
+  ^tolerances:
+    %delta = arith.subf %b, %a : f64
+    %diff = math.absf %delta : f64
+    %scaled_b = arith.mulf %rel_tol, %b : f64
+    %scaled_a = arith.mulf %rel_tol, %a : f64
+    %bound_b = math.absf %scaled_b : f64
+    %bound_a = math.absf %scaled_a : f64
+    %within_b = arith.cmpf ole, %diff, %bound_b : f64
+    %within_a = arith.cmpf ole, %diff, %bound_a : f64
+    %within_abs = arith.cmpf ole, %diff, %abs_tol : f64
+    %relative = arith.ori %within_b, %within_a : i1
+    %result = arith.ori %relative, %within_abs : i1
+    func.return %result : i1
   }
 
   func.func @LyMath_Radians(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.radians", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_radians", ly.runtime.result_contract = "builtins.float"} {

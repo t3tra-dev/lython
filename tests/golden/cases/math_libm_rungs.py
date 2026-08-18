@@ -24,10 +24,25 @@
 # NaN -- rather than a list of cases, which is why fmod(nan, 1.0) still returns
 # nan here and fmod(inf, 2.0) raises.
 #
-# ⛔ Not added, and each for a reason: hypot and dist need the scaling CPython
-# does to stay exact near the extremes, isclose has keyword-only tolerances the
-# manifest cannot spell a default for yet, and gcd/lcm/comb/perm/prod are int
-# work rather than libm calls.
+# isclose comes with them and is not libm's: it is CPython's math_isclose
+# verbatim, and every line of that is load-bearing -- `a == b` first so an
+# infinity is close to itself, the isinf check so inf against a finite number is
+# False rather than inf <= inf, BOTH relative tests because the tolerance is
+# relative to either operand, and no NaN case at all, since every comparison is
+# false for a NaN and that is the answer. Its tolerances are keyword-only, which
+# is why the manifest declares them under `kwonly`: `isclose(a, b, 0.2)` is a
+# TypeError in CPython and is refused here too.
+#
+# ⛔ hypot and dist are still missing, and now measured rather than asserted:
+# libm's hypot disagrees with CPython's on 32,071 of 200,000 random pairs (1
+# ulp, worst relative 2.2e-16), because CPython 3.14 accumulates the squares in
+# double-double instead of calling libm. Wiring libm would print a different
+# last digit for one input in six.
+#
+# ⛔ Also missing: gcd / lcm / comb / perm / prod are int work rather than libm
+# calls, and `math.isclose(a, b, rel_tol=1e-6)` reaches "kw names lowering is
+# not keyword-aware yet" -- the keyword path for a manifest free function, which
+# is a lowering gap and not this one.
 import math
 
 print(math.log2(8.0), math.log10(100.0), math.exp2(3.0), math.exp2(0.5))
@@ -36,6 +51,10 @@ print(math.fmod(7.0, 3.0), math.fmod(-7.0, 3.0), math.fmod(7.0, -3.0))
 print(math.fmod(math.nan, 1.0), math.fmod(2.0, math.inf))
 print(math.copysign(3.0, -0.0), math.copysign(-2.5, 1.0))
 print(math.degrees(1.0), math.radians(1.0), math.degrees(math.pi))
+
+print(math.isclose(1.0, 1.0), math.isclose(1.0, 1.0000000001))
+print(math.isclose(1.0, 1.1), math.isclose(0.1 + 0.2, 0.3))
+print(math.isclose(math.inf, math.inf), math.isclose(math.nan, math.nan))
 
 try:
     math.log2(0.0)

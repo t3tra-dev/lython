@@ -765,11 +765,22 @@
 # ⛔ degrees/radians multiply by a constant rounded ONCE (what CPython does);
 # dividing by pi lands an ulp away on inputs near a tie.
 #
-# ⛔ Still missing, each for a reason worth writing down: hypot and dist need
-# CPython's scaling to stay exact near the extremes; isclose has KEYWORD-ONLY
-# tolerances and the manifest can spell a default only for a raw i64/f64
-# parameter, not for a float OBJECT one, so its contract has no default to
-# carry; gcd/lcm/comb/perm/prod are int work rather than libm calls.
+# ⭐ isclose LANDED TOO (same day, after the note below turned out to be wrong):
+# the manifest CAN carry the defaults, because a manifest function may take RAW
+# f64 parameters and a float argument reaches them through float's unbox.f64 --
+# the road complex(...) takes. `kwonly` / `kw_names` / `kw_defaults` in the
+# callable type make the tolerances keyword-only, so `isclose(a, b, 0.2)` is
+# refused here exactly as CPython refuses it. The body is math_isclose verbatim.
+#
+# ⛔ `math.isclose(a, b, rel_tol=1e-6)` still reaches "kw names lowering is not
+# keyword-aware yet": the keyword path for a manifest FREE FUNCTION is a lowering
+# gap of its own, and the two-argument form is what works.
+#
+# ⛔ hypot and dist stay out, now MEASURED rather than asserted: libm's hypot
+# disagrees with CPython's on 32,071 of 200,000 random pairs (1 ulp, worst
+# relative 2.2e-16), because CPython 3.14 accumulates in double-double instead of
+# calling libm. Wiring libm would print a different last digit for one input in
+# six. gcd/lcm/comb/perm/prod are int work rather than libm calls.
 #
 # Pinned by tests/golden/cases/math_libm_rungs.py.
 #
