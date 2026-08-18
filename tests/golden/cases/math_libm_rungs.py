@@ -1,0 +1,55 @@
+# What this pins: the eight math functions added beside the nine that were
+# there, and -- for each one that has one -- the error CPython raises instead of
+# a silent inf/nan.
+#
+#     import math
+#     print(math.log2(8.0))
+#     # module 'math' has no attribute 'log2' in this runtime
+#
+# Why this must run: the point of each of these is the BITS. log2 / log10 /
+# exp2 / atan2 / fmod / copysign are libm's, which is where CPython gets them
+# too, so the printed repr is the check that the kernel calls the operation it
+# names and unboxes the operands in the right ORDER -- atan2 is (y, x) and fmod
+# is (x, y), and a swap still prints a plausible number. degrees and radians are
+# the two CPython computes as a single multiply by a constant rounded once, so
+# the repr also checks that this does not divide by pi instead.
+#
+# The domain and range checks are the other half. CPython's math_1 wrapper reads
+# errno and raises: log2(0.0) and log10(-1.0) name the constraint and the
+# operand, fmod(1.0, 0.0) is the generic "math domain error", exp2(10000.0) is
+# an OverflowError. Returning -inf, nan or inf silently is what this refuses to
+# do, and only running it says which happened.
+#
+# ⛔ fmod's rule is CPython's own -- a NaN result from operands that were not
+# NaN -- rather than a list of cases, which is why fmod(nan, 1.0) still returns
+# nan here and fmod(inf, 2.0) raises.
+#
+# ⛔ Not added, and each for a reason: hypot and dist need the scaling CPython
+# does to stay exact near the extremes, isclose has keyword-only tolerances the
+# manifest cannot spell a default for yet, and gcd/lcm/comb/perm/prod are int
+# work rather than libm calls.
+import math
+
+print(math.log2(8.0), math.log10(100.0), math.exp2(3.0), math.exp2(0.5))
+print(math.atan2(1.0, 1.0), math.atan2(-0.0, -1.0))
+print(math.fmod(7.0, 3.0), math.fmod(-7.0, 3.0), math.fmod(7.0, -3.0))
+print(math.fmod(math.nan, 1.0), math.fmod(2.0, math.inf))
+print(math.copysign(3.0, -0.0), math.copysign(-2.5, 1.0))
+print(math.degrees(1.0), math.radians(1.0), math.degrees(math.pi))
+
+try:
+    math.log2(0.0)
+except ValueError as e:
+    print("log2:", e)
+try:
+    math.log10(-1.0)
+except ValueError as e:
+    print("log10:", e)
+try:
+    math.fmod(1.0, 0.0)
+except ValueError as e:
+    print("fmod:", e)
+try:
+    math.exp2(10000.0)
+except OverflowError as e:
+    print("exp2:", e)

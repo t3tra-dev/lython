@@ -1,0 +1,10 @@
+3.0 2.0 8.0 1.4142135623730951
+0.7853981633974483 -3.141592653589793
+1.0 -1.0 1.0
+nan 2.0
+-3.0 2.5
+57.29577951308232 0.017453292519943295 180.0
+log2: expected a positive input, got 0.0
+log10: expected a positive input, got -1.0
+fmod: math domain error
+exp2: math range error

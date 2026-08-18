@@ -16,7 +16,15 @@ module attributes {
     "math.log",
     "math.cos",
     "math.sin",
-    "math.exp"
+    "math.exp",
+    "math.log2",
+    "math.log10",
+    "math.exp2",
+    "math.atan2",
+    "math.fmod",
+    "math.copysign",
+    "math.degrees",
+    "math.radians"
   ],
   ly.typing.function_names = [
     "math.floor",
@@ -27,7 +35,15 @@ module attributes {
     "math.log",
     "math.cos",
     "math.sin",
-    "math.exp"
+    "math.exp",
+    "math.log2",
+    "math.log10",
+    "math.exp2",
+    "math.atan2",
+    "math.fmod",
+    "math.copysign",
+    "math.degrees",
+    "math.radians"
   ],
   ly.typing.float_constant_names = ["math.pi", "math.e", "math.tau", "math.inf", "math.nan"],
   ly.typing.float_constant_values = [3.141592653589793 : f64, 2.718281828459045 : f64, 6.283185307179586 : f64, 0x7FF0000000000000 : f64, 0x7FF8000000000000 : f64],
@@ -39,6 +55,14 @@ module attributes {
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["y", "x"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["x", "y"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["x", "y"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>
   ]
@@ -215,6 +239,144 @@ module attributes {
     cf.br ^ok
 
   ^ok:
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  // The libm-backed rungs CPython also gets from libm, so the bits agree:
+  // log2 / log10 / exp2 / atan2 / fmod / copysign, plus the two conversions
+  // CPython computes as a single multiply (Modules/mathmodule.c m_degrees,
+  // m_radians) rather than as a division.
+  //
+  // ⛔ Domain and range checks are NOT optional decoration: CPython's math_1
+  // wrapper reads errno and raises, so `log2(0.0)` is a ValueError naming the
+  // constraint and the operand, `fmod(1.0, 0.0)` is the generic "math domain
+  // error", and `exp2(10000.0)` is an OverflowError. Returning -inf / nan / inf
+  // silently is the one thing none of them do.
+  memref.global "private" constant @__ly_math_domain_msg : memref<17xi8> = dense<[109, 97, 116, 104, 32, 100, 111, 109, 97, 105, 110, 32, 101, 114, 114, 111, 114]>
+
+  func.func private @__ly_math_generic_domain_error() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 17 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_domain_msg : memref<17xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<17xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  func.func @LyMath_Log2(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.log2", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_log2", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %zero = arith.constant 0.0 : f64
+    %nonpositive = arith.cmpf ole, %value, %zero : f64
+    cf.cond_br %nonpositive, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_positive_error(%value) : (f64) -> ()
+    cf.br ^ok
+
+  ^ok:
+    %result = math.log2 %value : f64
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Log10(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.log10", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_log10", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %zero = arith.constant 0.0 : f64
+    %nonpositive = arith.cmpf ole, %value, %zero : f64
+    cf.cond_br %nonpositive, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_positive_error(%value) : (f64) -> ()
+    cf.br ^ok
+
+  ^ok:
+    %result = math.log10 %value : f64
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Exp2(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.exp2", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_exp2", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %result = math.exp2 %value : f64
+    %inf = arith.constant 0x7FF0000000000000 : f64
+    %overflowed = arith.cmpf oeq, %result, %inf : f64
+    %finite_input = arith.cmpf one, %value, %inf : f64
+    %range_error = arith.andi %overflowed, %finite_input : i1
+    cf.cond_br %range_error, ^range, ^ok
+
+  ^range:
+    func.call @__ly_math_range_error() : () -> ()
+    cf.br ^ok
+
+  ^ok:
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Atan2(%y_header: memref<3xi64> {ly.ownership.object_header}, %x_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.atan2", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_atan2", ly.runtime.result_contract = "builtins.float"} {
+    %y = func.call @LyFloat_AsF64(%y_header) : (memref<3xi64>) -> f64
+    %x = func.call @LyFloat_AsF64(%x_header) : (memref<3xi64>) -> f64
+    // Defined on the whole plane, signed zeros included, which is why there is
+    // no check here and why the operand order is (y, x) like CPython's.
+    %result = math.atan2 %y, %x : f64
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Fmod(%x_header: memref<3xi64> {ly.ownership.object_header}, %y_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.fmod", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_fmod", ly.runtime.result_contract = "builtins.float"} {
+    %x = func.call @LyFloat_AsF64(%x_header) : (memref<3xi64>) -> f64
+    %y = func.call @LyFloat_AsF64(%y_header) : (memref<3xi64>) -> f64
+    %result = arith.remf %x, %y : f64
+    // ⭐ CPython's own test, not a list of the cases that reach it: a NaN
+    // result from operands that were not NaN is EDOM (Modules/mathmodule.c
+    // math_fmod), which covers fmod(inf, 2.0) and fmod(1.0, 0.0) together and
+    // leaves fmod(nan, 1.0) returning nan the way it does there.
+    %true = arith.constant true
+    %result_is_nan = arith.cmpf uno, %result, %result : f64
+    %x_is_nan = arith.cmpf uno, %x, %x : f64
+    %y_is_nan = arith.cmpf uno, %y, %y : f64
+    %operand_is_nan = arith.ori %x_is_nan, %y_is_nan : i1
+    %operands_are_numbers = arith.xori %operand_is_nan, %true : i1
+    %domain = arith.andi %result_is_nan, %operands_are_numbers : i1
+    cf.cond_br %domain, ^domain_error, ^ok
+
+  ^domain_error:
+    func.call @__ly_math_generic_domain_error() : () -> ()
+    cf.br ^ok
+
+  ^ok:
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Copysign(%x_header: memref<3xi64> {ly.ownership.object_header}, %y_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.copysign", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_copysign", ly.runtime.result_contract = "builtins.float"} {
+    %x = func.call @LyFloat_AsF64(%x_header) : (memref<3xi64>) -> f64
+    %y = func.call @LyFloat_AsF64(%y_header) : (memref<3xi64>) -> f64
+    %result = math.copysign %x, %y : f64
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Degrees(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.degrees", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_degrees", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    // ⛔ The CONSTANT is 180/pi rounded once, not a division at run time: that
+    // is what CPython multiplies by, and dividing instead lands an ulp away on
+    // inputs whose product is near a tie.
+    %factor = arith.constant 57.29577951308232 : f64
+    %result = arith.mulf %value, %factor : f64
+    %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  func.func @LyMath_Radians(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.radians", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_radians", ly.runtime.result_contract = "builtins.float"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %factor = arith.constant 0.017453292519943295 : f64
+    %result = arith.mulf %value, %factor : f64
     %out_header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
     func.return %out_header : memref<3xi64>
   }

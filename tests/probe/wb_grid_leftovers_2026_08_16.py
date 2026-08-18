@@ -656,6 +656,35 @@
 # in three places.
 #
 # ============================================================
+# (46) FIXED: EIGHT MISSING math FUNCTIONS.
+# ============================================================
+#     import math
+#     print(math.log2(8.0))
+#     # module 'math' has no attribute 'log2' in this runtime
+#
+# ⭐ FIXED 2026-08-19. The manifest had nine functions -- the ones random.gauss
+# needed -- and a probe of twenty found seventeen missing. Added the ones whose
+# answer is libm's, because that is where CPython gets them too and the bits then
+# agree exactly: log2, log10, exp2, atan2, fmod, copysign, degrees, radians.
+#
+# ⛔ Each domain/range check is CPython's, not decoration: math_1 reads errno and
+# raises. log2(0.0)/log10(-1.0) name the constraint and the operand, fmod(1.0,
+# 0.0) is the generic "math domain error", exp2(10000.0) is an OverflowError.
+# fmod's test is CPython's own -- a NaN result from non-NaN operands -- so
+# fmod(nan, 1.0) still returns nan and fmod(inf, 2.0) raises.
+#
+# ⛔ degrees/radians multiply by a constant rounded ONCE (what CPython does);
+# dividing by pi lands an ulp away on inputs near a tie.
+#
+# ⛔ Still missing, each for a reason worth writing down: hypot and dist need
+# CPython's scaling to stay exact near the extremes; isclose has KEYWORD-ONLY
+# tolerances and the manifest can spell a default only for a raw i64/f64
+# parameter, not for a float OBJECT one, so its contract has no default to
+# carry; gcd/lcm/comb/perm/prod are int work rather than libm calls.
+#
+# Pinned by tests/golden/cases/math_libm_rungs.py.
+#
+# ============================================================
 # (45) FIXED: isinstance(x, (A, B)) -- THE TUPLE FORM.
 # ============================================================
 #     if isinstance(v, (int, float)):
