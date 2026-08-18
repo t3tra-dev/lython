@@ -119,7 +119,13 @@ print(card["score"])
 print(card["member"])
 print(len(card))
 
-lv = card["age"]
+# The narrowing that reads the tag: `card` has a bool member, and in Python a
+# bool IS an int, so `isinstance(lv, int)` is true for BOTH members and narrows
+# to `bool | int` -- which no `__add__` accepts. Narrowing out of a union with no
+# bool in it is the same test with one answer, and it is the one that can go on
+# to use the value.
+plain = {"name": "ann", "age": 30, "score": 9.5}
+lv = plain["age"]
 if isinstance(lv, int):
     print(lv + 1)
 
@@ -128,6 +134,16 @@ if isinstance(lv, int):
 flags = [True, "on"]
 print(flags[0])
 print(flags[1])
+
+# A bool member answering `isinstance(v, int)` is the rung: the union has one
+# member a bool can be, so the narrowing lands on bool and the addition is
+# bool's. It printed "no" before -- the test was asked through assignability,
+# where a bool is not an int.
+v = flags[0]
+if isinstance(v, int):
+    print(v + 1)
+else:
+    print("no")
 
 single = {"ok": True, "why": "fine"}
 print(single["ok"])

@@ -656,6 +656,40 @@
 # in three places.
 #
 # ============================================================
+# (44) FIXED: bool IS an int, TO isinstance AND issubclass.
+# ============================================================
+#     print(issubclass(bool, int))   # False; CPython True
+#     print(isinstance(True, int))   # False; CPython True
+#
+# ⭐ FIXED 2026-08-19, and it is the WRONG bucket, not a refusal: both predicates
+# answered through assignability and printed a wrong truth value with no
+# diagnostic. Assignability is deliberately narrower -- a bool is one truth bit,
+# an int is a three-value bundle, so a bool VALUE needs emitIntFromBool to be
+# stored where an int is expected. The predicates ask about the CLASS hierarchy,
+# where bool's base is int. One rung, added in the hierarchy direction only.
+#
+# ⛔ The numeric tower is not the rule and the rung is not symmetric:
+# `issubclass(int, float)` stays False (CPython's answer too, though the tower
+# converts), `isinstance(1, bool)` stays False, and the reverse-direction branch
+# in analyzeIsInstance -- the runtime ClassTest -- still asks assignability,
+# because an int value's runtime class is int.
+#
+# ⛔ It changes a UNION narrowing, and that is the point rather than a side
+# effect: `xs: list[bool | str]` with `if isinstance(xs[0], int)` printed "no"
+# before and prints 2 now. Where the union has BOTH bool and int, the narrowing
+# is now `bool | int` and `+` on it is refused -- CPython would print 31 --
+# because a union has no __add__. That trade is in the project's direction: the
+# old answer was silently wrong for the bool member.
+#
+# ⛔ redcheck could not validate this golden at first: its sentinel guard read
+# only the exit code, so a wrong-answer defect (exit 0, wrong stdout) looked
+# like a binary that does not exhibit its defect and the run aborted. The tool
+# now counts a differing .stdout as failing.
+#
+# Pinned by tests/golden/cases/bool_is_an_int_to_isinstance.py and the two new
+# blocks in heterogeneous_container_read.py.
+#
+# ============================================================
 # (43) FIXED: int() OVER bytes.
 # ============================================================
 #     print(int(b"12"))

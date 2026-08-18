@@ -2215,7 +2215,7 @@ ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
     return rejectIssubclass(
         "issubclass() requires statically resolvable class names");
   bool truth = *subClass == *superClass ||
-               py::isAssignableTo(*subClass, *superClass, module);
+               pythonSubclassOf(*subClass, *superClass, types, module);
   mlir::Type literalType = types.literal(truth ? "True" : "False");
   auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
                                              builder.getBoolAttr(truth));

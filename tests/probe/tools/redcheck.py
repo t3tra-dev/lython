@@ -85,14 +85,25 @@ def main():
             return 2
 
     rc, out, err = run(old, args.sentinel)
-    if rc == 0:
+    # A sentinel exhibits the defect either by REFUSING the program or by
+    # answering it wrongly, and only the first was checked. A fix for a silent
+    # wrong answer -- the bucket this project's rule exists to make impossible --
+    # has a sentinel that exits 0 and prints the wrong thing, so the guard
+    # aborted the run and no golden could be validated at all. When a `.stdout`
+    # sits next to the sentinel (a golden used as its own sentinel always has
+    # one), a differing stdout counts as failing.
+    sentinel_expect = args.sentinel.with_suffix(".stdout")
+    wrong_output = sentinel_expect.exists() and out != sentinel_expect.read_text()
+    if rc == 0 and not wrong_output:
         print(f"SENTINEL PASSED on {old}", file=sys.stderr)
         print("The old binary does not exhibit the defect it is supposed to, so "
               "it cannot tell you whether a test catches it. Check that the "
               "build really came from the pre-fix tree and that nothing changed "
               "the source while it was compiling.", file=sys.stderr)
         return 2
-    print(f"sentinel fails as required ({why(rc, out, err)}) -- binary usable\n")
+    detail = (f"wrong output ({out.strip()[:40]!r})" if rc == 0
+              else why(rc, out, err))
+    print(f"sentinel fails as required ({detail}) -- binary usable\n")
 
     green = []
     for name in args.names:

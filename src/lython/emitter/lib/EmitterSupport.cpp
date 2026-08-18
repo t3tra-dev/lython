@@ -400,6 +400,32 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
   return instance;
 }
 
+bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
+                      mlir::Operation *from) {
+  if (isAssignableWithStaticEvidence(sub, super, from))
+    return true;
+  // ⭐ Python's CLASS hierarchy, which is not this compiler's assignability.
+  // `bool` is a subclass of `int` there -- `isinstance(True, int)` and
+  // `issubclass(bool, int)` are both True -- while the ABI keeps them apart on
+  // purpose: a bool is one truth bit and an int is a three-value bundle, so a
+  // bool VALUE cannot be stored where an int is expected without the conversion
+  // emitIntFromBool exists to make. Both predicates asked the question through
+  // assignability and answered False, silently, for the one pair where CPython
+  // says True.
+  //
+  // ⛔ Only that rung, and the numeric tower is NOT the rule: `issubclass(int,
+  // float)` is False in CPython too, even though the tower converts one to the
+  // other. What decides is the class hierarchy, and int's bases do not include
+  // float.
+  auto subContract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(sub));
+  auto superContract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(super));
+  return subContract && superContract &&
+         subContract.getContractName() == "builtins.bool" &&
+         superContract.getContractName() == "builtins.int";
+}
+
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
                                      mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from) {
@@ -422,8 +448,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     analysis.falseType = analysis.sourceType;
   };
 
-  if (isAssignableWithStaticEvidence(analysis.sourceType, analysis.targetType,
-                                     from)) {
+  if (pythonSubclassOf(analysis.sourceType, analysis.targetType, types, from)) {
     setAlwaysTrue();
     return analysis;
   }
@@ -434,7 +459,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     bool sawUnsupportedMember = false;
     for (mlir::Type rawMember : unionType.getMemberTypes()) {
       mlir::Type member = types.widenLiteral(rawMember);
-      if (isAssignableWithStaticEvidence(member, analysis.targetType, from)) {
+      if (pythonSubclassOf(member, analysis.targetType, types, from)) {
         analysis.unionMembers.push_back(rawMember);
       } else if (containsObjectTop(member, types)) {
         sawUnsupportedMember = true;

@@ -116,6 +116,11 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
                                                TypeSystem &types);
 bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
                                     mlir::Operation *from);
+// Does Python's class hierarchy say `sub` is a subclass of `super`? Wider than
+// assignability by exactly one rung (bool < int); see the definition.
+bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
+                      mlir::Operation *from);
+
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
                                      mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from);
