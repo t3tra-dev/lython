@@ -943,6 +943,57 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   // iterator that survives (`str_iterator`, `range_iterator`), a dict or set
   // has no index, and rewriting a loop that already works would trade a
   // working path for an untested one.
+  // ⭐ INSIDE A GENERATOR, `for x in G(): yield x` IS `yield from G()`. The loop
+  // form was refused with advice the program already follows:
+  //
+  //     def relay() -> Iterator[int]:
+  //         for x in src():
+  //             yield x
+  //     # a generator returned out of a function cannot be resumed ... Call the
+  //     # generator in the for statement, bind it to a local in the same
+  //     # function, or return a list
+  //
+  // -- and it IS called in the for statement. The same loop in a plain function
+  // or at module scope runs, and `yield from src()` inside a generator runs, so
+  // what has no path is a nested generator resumed across the OUTER generator's
+  // own suspensions. When the body is exactly one bare `yield` of the loop
+  // target, delegation is what the program means, and delegation has a path.
+  //
+  // ⛔ The body must be that and nothing else: any other statement, or a yield of
+  // something else, is not delegation, and `py.yield.from` cannot carry it.
+  if (currentGeneratorSendType)
+    if (const parser::Node *iterNode = ast::node(statement, "iter"))
+      if (const parser::Node *target = ast::node(statement, "target");
+          target && target->kind == "Name" &&
+          (!ast::nodeList(statement, "orelse") ||
+           ast::nodeList(statement, "orelse")->empty())) {
+        auto generatorContract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(types.inferExpr(iterNode)));
+        const auto *body = ast::nodeList(statement, "body");
+        const parser::Node *only =
+            body && body->size() == 1 ? body->front().get() : nullptr;
+        const parser::Node *yielded =
+            only && only->kind == "Expr" ? ast::node(*only, "value") : nullptr;
+        const parser::Node *yieldedValue =
+            yielded && yielded->kind == "Yield" ? ast::node(*yielded, "value")
+                                               : nullptr;
+        if (generatorContract &&
+            generatorContract.getContractName() == "types.GeneratorType" &&
+            yieldedValue && yieldedValue->kind == "Name" &&
+            ast::nameSpelling(*yieldedValue) == ast::nameSpelling(*target)) {
+          parser::NodePtr delegation =
+              parser::makeNode("YieldFrom", statement.range);
+          if (const parser::Field *iterField =
+                  parser::findField(statement, "iter"))
+            if (const auto *node =
+                    std::get_if<parser::NodePtr>(&iterField->value);
+                node && *node) {
+              parser::addField(*delegation, "value", *node);
+              emitExpr(delegation.get());
+              return;
+            }
+        }
+      }
   if (currentGeneratorSendType)
     if (const parser::Node *iterNode = ast::node(statement, "iter"))
       if (emitGeneratorIndexedFor(statement, *iterNode))

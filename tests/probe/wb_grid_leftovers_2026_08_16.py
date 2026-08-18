@@ -656,6 +656,36 @@
 # in three places.
 #
 # ============================================================
+# (42) FIXED: `for x in G(): yield x` INSIDE A GENERATOR.
+# ============================================================
+#     def relay() -> Iterator[int]:
+#         for x in src():
+#             yield x
+#     # a generator returned out of a function cannot be resumed: ... Call the
+#     # generator in the for statement, bind it to a local in the same function,
+#     # or return a list
+#
+# ⭐ FIXED 2026-08-18. The advice was ALREADY FOLLOWED -- the generator is called
+# in the for statement -- which is what marked this as a defect and not a
+# boundary. The same loop in a plain function and at module scope runs, and
+# `yield from src()` inside a generator runs; what had no path is a nested
+# generator resumed across the OUTER generator's suspensions. When the body is
+# exactly one bare `yield` of the loop target, delegation is what the program
+# means, and delegation has a path, so the loop is written as `yield from`.
+#
+# ⛔ `ast::nodeList(statement, "orelse")` returns a non-null EMPTY list for a
+# for with no else, so `!nodeList(...)` never fired and the whole rewrite was
+# dead. Two builds went by before instrumenting the condition showed it. Check
+# emptiness, not presence.
+#
+# ⛔ Still refused, and both are the nested-generator frame work: a body that is
+# not delegation (`yield x * 2`), and `for x in list(src(n))` INSIDE a generator
+# -- which is the materialization the diagnostic suggests, and it has the same
+# problem. Materializing in the CALLER works and is what the golden shows.
+#
+# Pinned by tests/golden/cases/for_over_a_generator_inside_one.py.
+#
+# ============================================================
 # (41) FIXED: `yield from` OVER ANYTHING BUT A LIST LITERAL.
 # ============================================================
 #     def g() -> Iterator[int]:
