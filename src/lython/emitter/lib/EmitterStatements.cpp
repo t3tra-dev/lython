@@ -298,6 +298,53 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
       disagreed = true;
   };
 
+  // ⭐ THE COUNTING IDIOM SEEDS ITSELF THROUGH `get`, and it is the one shape
+  // where the ONLY store mentions the name:
+  //
+  //     counts = {}
+  //     for w in words:
+  //         counts[w] = counts.get(w, 0) + 1
+  //     # !py.union<int, object> does not provide manifest method '__add__'
+  //
+  // The skip above is right in general -- a seed that reads the name reads it
+  // at the type being decided -- but a `.get(key, default)` on that same name
+  // carries the answer in its DEFAULT: that is what the value is when the key
+  // is absent. Binding it provisionally and re-inferring the whole stored
+  // expression is what keeps `... + 1.5` a float instead of the default's int.
+  mlir::Type deferredElement;
+  auto getDefaultOnName = [&](const parser::Node *expr,
+                              auto &&recurse) -> const parser::Node * {
+    if (!expr)
+      return nullptr;
+    if (expr->kind == "Call") {
+      const parser::Node *callee = ast::node(*expr, "func");
+      const auto *callArgs = ast::nodeList(*expr, "args");
+      const auto *callKeywords = ast::nodeList(*expr, "keywords");
+      if (callee && callee->kind == "Attribute" && callArgs &&
+          callArgs->size() == 2 && (!callKeywords || callKeywords->empty())) {
+        const parser::Node *receiver = ast::node(*callee, "value");
+        std::optional<std::string_view> method = ast::string(*callee, "attr");
+        if (receiver && receiver->kind == "Name" && method &&
+            *method == "get" &&
+            llvm::StringRef(ast::nameSpelling(*receiver)) == name)
+          return (*callArgs)[1].get();
+      }
+    }
+    for (const parser::Field &field : expr->fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (const parser::Node *found = recurse(child->get(), recurse))
+          return found;
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (const parser::Node *found = recurse(child.get(), recurse))
+            return found;
+    }
+    return nullptr;
+  };
+
   auto visit = [&](const parser::Node &node, auto &&recurse) -> void {
     if (disagreed)
       return;
@@ -337,7 +384,27 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
             return;
           }
           noteExpr(key, ast::node(*target, "slice"), note);
-          noteExpr(element, ast::node(node, "value"), note);
+          const parser::Node *stored = ast::node(node, "value");
+          // ⛔ Inside the walk, not after it: the stored expression usually
+          // mentions the LOOP TARGET, which is bound by the scope this walk
+          // pushes and gone by the time the walk returns.
+          if (key && stored && !deferredElement &&
+              mentionsName(stored, mentionsName))
+            if (const parser::Node *fallback =
+                    getDefaultOnName(stored, getDefaultOnName)) {
+              mlir::Type provisional =
+                  types.widenLiteral(types.inferExpr(fallback));
+              if (provisional && provisional != types.object()) {
+                TypeSystem::Scope provisionalScope = types.pushScope();
+                types.bindLocalSymbol(
+                    name, types.contract("builtins.dict", {key, provisional}));
+                mlir::Type seeded =
+                    types.widenLiteral(types.inferExpr(stored));
+                if (seeded && seeded != types.object())
+                  deferredElement = seeded;
+              }
+            }
+          noteExpr(element, stored, note);
         }
     }
     // ⭐ A `for` target is BOUND while its body is scanned. The seed is
@@ -374,6 +441,11 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
     if ((*currentSuite)[index])
       visit(*(*currentSuite)[index], visit);
 
+  // The provisional seed answers only when nothing else did: a store that does
+  // not mention the name is better evidence, and two of those that disagree is
+  // still a disagreement.
+  if (!disagreed && !element)
+    element = deferredElement;
   if (disagreed || !element)
     return {};
   if (isMapping)

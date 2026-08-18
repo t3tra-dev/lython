@@ -656,6 +656,39 @@
 # in three places.
 #
 # ============================================================
+# (49) FIXED: THE COUNTING IDIOM SEEDS ITS OWN DICT.
+# ============================================================
+#     counts = {}
+#     for w in words:
+#         counts[w] = counts.get(w, 0) + 1
+#     # !py.union<int, object> does not provide manifest method '__add__'
+#
+# ⭐ FIXED 2026-08-19. An empty literal has no element type, so the emitter scans
+# the suite for a store that says what goes in -- and that scan SKIPS any stored
+# expression mentioning the name, because reading `counts` while deciding what
+# `counts` holds reads it at the type being decided. In this idiom the
+# self-referential store is the only one there is, so the dict stayed at object.
+#
+# The `.get(key, default)` inside it carries the answer: the default is the value
+# when the key is absent. Bind that provisionally, re-infer the WHOLE stored
+# expression, and `+ 1` seeds int while `+ 1.5` seeds float -- taking the
+# default's type directly would have got the second one wrong.
+#
+# ⛔ Inside the walk, not after it: the stored expression mentions the LOOP
+# TARGET, which the walk binds in a scope that is gone by the time it returns.
+#
+# ⛔ A fallback, not a preference. A store that does not mention the name is
+# better evidence and still wins, and two disagreeing stores are still a
+# disagreement.
+#
+# ⛔ `counts.get(w, 0) + 1.5` over a dict of FLOATS stays refused, and did before
+# this too (an annotated dict[str, float] fails identically): get's third overload
+# answers `V | D`, and `float | int` has no __add__. `0.0` as the default is the
+# fix and is what CPython's typing says as well.
+#
+# Pinned by tests/golden/cases/counting_idiom_seeds_the_dict.py.
+#
+# ============================================================
 # (48) FIXED: str(b, "utf-8") IS b.decode("utf-8").
 # ============================================================
 #     print(str(b"ab", "utf-8"))
