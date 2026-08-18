@@ -656,6 +656,39 @@
 # in three places.
 #
 # ============================================================
+# (43) FIXED: int() OVER bytes.
+# ============================================================
+#     print(int(b"12"))
+#     # static type !py.contract<"builtins.int"> does not provide manifest
+#     # method '__init__'
+#
+# ⭐ FIXED 2026-08-19. int(x) is intercepted before the class-instantiation paths
+# claim builtins.int, and the interception knew int / bool / str / float only;
+# bytes fell through to instantiation, so the diagnostic named the TARGET's
+# missing `__init__` when the unsupported thing was the ARGUMENT. CPython takes
+# bytes anywhere int() takes str, over the same ASCII scan.
+#
+# The scan was already byte-indexed (LyLong_FromStr works on memref<?xi8>), so
+# nothing had to be re-derived -- but the two callers must report DIFFERENT
+# reprs (b'ab' vs 'ab'), so the parse is now a shared helper returning a
+# validity bit and each caller owns its raiser.
+#
+# ⛔ The first version of that split leaked: the helper hands back an owned zero
+# on failure and the caller raised while still holding it.
+# RuntimeRaisePathTest.NoOwnedObjectIsHeldAcrossARaise named both functions and
+# both call edges. The release has to precede the raise -- the raise does not
+# return, so a release after it is unreachable, which is exactly what the old
+# single function did by building its unreachable zero AFTER the raise.
+#
+# ⛔ Out of scope and measured: `float(b"1.5")` is the same gap one type over
+# (the float parse is unicode-indexed via __ly_unicode_get, so it needs a
+# byte-indexed variant, not a shared helper), and `bytearray` is not a bound
+# name at all ("unresolved name 'bytearray'"), so int(bytearray) is a missing
+# type and not this defect.
+#
+# Pinned by tests/golden/cases/int_of_bytes_parses_digits.py.
+#
+# ============================================================
 # (42) FIXED: `for x in G(): yield x` INSIDE A GENERATOR.
 # ============================================================
 #     def relay() -> Iterator[int]:

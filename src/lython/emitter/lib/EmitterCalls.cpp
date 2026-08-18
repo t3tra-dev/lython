@@ -2091,11 +2091,12 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
     // int(True) == 1 / int(False) == 0: widen the truth bit.
     return emitIntFromBool(expr, emitExpr(intArgs->front().get()));
   }
-  if (argumentType == types.strType() || argumentType == types.floatType()) {
-    // The runtime-level __int__ methods of str (base-10 parse) and float
-    // (truncation) are deliberately not part of the typed manifest surface —
-    // CPython has no str.__int__ — so the contract is built here instead of
-    // going through method inference.
+  if (argumentType == types.strType() || argumentType == types.floatType() ||
+      argumentType == types.contract("builtins.bytes")) {
+    // The runtime-level __int__ methods of str (base-10 parse), bytes (the
+    // same parse over the payload) and float (truncation) are deliberately not
+    // part of the typed manifest surface — CPython has no str.__int__ — so the
+    // contract is built here instead of going through method inference.
     Value argument =
         coerceValue(emitExpr(intArgs->front().get()), argumentType, expr);
     mlir::Type resultType = types.intType();

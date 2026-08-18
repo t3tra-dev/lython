@@ -6678,6 +6678,25 @@ module attributes {
     func.return
   }
 
+  // The same message over a bytes subject: `int(b"x")` reports b'x', so the
+  // repr comes from LyBytes_Repr and the prefix is shared with the str form.
+  func.func private @__ly_bytes_raise_invalid_int_literal(%subject: memref<6xi64> {ly.ownership.object_header}) {
+    %class_id = arith.constant 53 : i64
+    %start = arith.constant 0 : index
+    %prefix_length = arith.constant 40 : i64
+    %prefix_static = memref.get_global @__ly_long_msg_invalid_int_literal_prefix : memref<40xi8>
+    %prefix_bytes = memref.cast %prefix_static : memref<40xi8> to memref<?xi8>
+    %prefix_h, %prefix_b = func.call @LyUnicode_FromBytes(%prefix_bytes, %start, %prefix_length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %quoted_h, %quoted_b = func.call @LyBytes_Repr(%subject) : (memref<6xi64>) -> (memref<2xi64>, memref<?xi8>)
+    %full_h, %full_b = func.call @LyUnicode_Concat(%prefix_h, %prefix_b, %quoted_h, %quoted_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%prefix_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%quoted_h) : (memref<2xi64>) -> ()
+    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %full_h, %full_b) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
   // "could not convert string to float: "
   memref.global "private" constant @__ly_float_msg_invalid_literal_prefix : memref<35xi8> = dense<[99, 111, 117, 108, 100, 32, 110, 111, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 115, 116, 114, 105, 110, 103, 32, 116, 111, 32, 102, 108, 111, 97, 116, 58, 32]>
 
@@ -8242,7 +8261,7 @@ module attributes {
   // __int__ on str (not part of the typed manifest surface: CPython has no
   // str.__int__; only the emitter's int(x) rewrite targets it). Unicode
   // digits are not accepted yet (ASCII only until the UCD tables land).
-  func.func @LyLong_FromStr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__int__", ly.runtime.result_contract = "builtins.int"} {
+  func.func private @__ly_long_from_ascii(%bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>, i1) attributes {ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %neg_one = arith.constant -1 : i64
@@ -8290,9 +8309,9 @@ module attributes {
     cf.cond_br %no_content, ^invalid_early, ^signed
 
   ^invalid_early:
-    func.call @__ly_long_raise_invalid_literal(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
+    %false_bit = arith.constant false
     %eh, %em, %ed = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %eh, %em, %ed : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    func.return %eh, %em, %ed, %false_bit : memref<2xi64>, memref<2xi64>, memref<?xi32>, i1
 
   ^signed:
     %end = arith.addi %last, %one : i64
@@ -8378,14 +8397,51 @@ module attributes {
     cf.cond_br %any_invalid, ^invalid_parsed, ^done
 
   ^invalid_parsed:
+    %parsed_false = arith.constant false
     func.call @LyLong_DecRef(%h) : (memref<2xi64>) -> ()
-    func.call @__ly_long_raise_invalid_literal(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
     %ph, %pm, %pd = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %ph, %pm, %pd : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    func.return %ph, %pm, %pd, %parsed_false : memref<2xi64>, memref<2xi64>, memref<?xi32>, i1
 
   ^done:
+    %done_true = arith.constant true
     func.call @__ly_long_normalize(%m, %d, %capacity) : (memref<2xi64>, memref<?xi32>, i64) -> ()
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    func.return %h, %m, %d, %done_true : memref<2xi64>, memref<2xi64>, memref<?xi32>, i1
+  }
+
+  func.func @LyLong_FromStr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__int__", ly.runtime.result_contract = "builtins.int"} {
+    %zero = arith.constant 0 : i64
+    %parsed:4 = func.call @__ly_long_from_ascii(%bytes) : (memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>, i1)
+    cf.cond_br %parsed#3, ^ok, ^invalid
+
+  ^ok:
+    func.return %parsed#0, %parsed#1, %parsed#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+
+  ^invalid:
+    // The failed parse still returns an owned zero; releasing it BEFORE the
+    // raise is what keeps its release reachable (the raise does not return).
+    func.call @LyLong_DecRef(%parsed#0) : (memref<2xi64>) -> ()
+    func.call @__ly_long_raise_invalid_literal(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
+    %uh, %um, %ud = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %uh, %um, %ud : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  // int(b"12"). CPython takes bytes anywhere int() takes str, over the same
+  // ASCII scan; what differs is the repr the ValueError carries -- 'b' for
+  // bytes -- which is why the digits are a shared helper and the raise is not.
+  func.func @LyBytes_Int(%header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__int__", ly.runtime.result_contract = "builtins.int"} {
+    %zero = arith.constant 0 : i64
+    %payload = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %parsed:4 = func.call @__ly_long_from_ascii(%payload) : (memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>, i1)
+    cf.cond_br %parsed#3, ^ok, ^invalid
+
+  ^ok:
+    func.return %parsed#0, %parsed#1, %parsed#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+
+  ^invalid:
+    func.call @LyLong_DecRef(%parsed#0) : (memref<2xi64>) -> ()
+    func.call @__ly_bytes_raise_invalid_int_literal(%header) : (memref<6xi64>) -> ()
+    %uh, %um, %ud = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %uh, %um, %ud : memref<2xi64>, memref<2xi64>, memref<?xi32>
   }
 
   // Truncating float -> int conversion (runtime-level __int__ on float).
