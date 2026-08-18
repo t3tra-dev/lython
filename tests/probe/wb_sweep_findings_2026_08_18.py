@@ -1106,10 +1106,49 @@ them in.
 #
 # ⛔ Publishing the try-end bindings directly is not available: they are SSA
 # values inside the try region and do not dominate the continuation, which is why
-# the lanes exist at all. The fix is to let the post-try lanes coexist with the
-# completion machinery (append them after the completion flags and the return
-# payload) -- result-index accounting in the area this tree's fragile invariants
-# already name, so its own round rather than a patch.
+# the lanes exist at all.
+#
+# ⭐ THE COEXISTENCE WAS BUILT AND MEASURED 2026-08-19, AND IT IS NOT THE
+# RESULT-INDEX ACCOUNTING THAT BLOCKS IT. The emitter side works: lanes appended
+# after the completion flags and the return payload, completion yields padded
+# with inert lane defaults once the lane set is known, handler-exit yields
+# carrying the completion prefix, `postLaneBase` on every read. Measured on eight
+# programs -- the motivating idiom, two names, a str lane, a `return` in the try
+# body instead, two handlers, a loop around it -- ALL AGREE with CPython. The
+# patch is kept at
+# /private/tmp/.../scratchpad/try-lane-completion.patch (207 lines).
+#
+# What stops it is OWNERSHIP, and the blocker is exact. A return path must put an
+# inert value in every lane and a fall-through must put one in the payload, so
+# each result is owned on one path and dead on the other -- and the continuation
+# then reads `decref(flag ? lane : payload)` next to `return (flag ? payload :
+# lane)`. When there is exactly ONE lane the two arms are structurally identical,
+# py-level canonicalize folds them into six selects over the same pair, and the
+# alias analysis (which sees through a select in both directions, by design)
+# fuses lane and payload into ONE class with TWO consumes. The unfold rule then
+# credits one reference and mints a retain per class: 56 B leaked per successful
+# call of the motivating program, 82 B for the str lane, 112 B for two calls.
+# Two names, or any continuation that does more before returning, does not merge
+# and does not leak -- which is why the leak looks intermittent.
+#
+# ⛔ The tree's own answer for a select over owned handles -- expand it back into
+# the diamond it was folded from (Ownership.cpp, "expand-object-selects") -- does
+# not reach it, because `frameProduces` says no to a BLOCK ARGUMENT, and a py.try
+# result is exactly that once the regions are inlined. Teaching it the edge walk
+# (the one `valueDerivedFromEntryArgument` already does for entry arguments) was
+# measured: the diamond then double-releases, because a SWAP forwards both
+# objects into two destination groups on both arms, so the arms fuse the two
+# groups instead of letting the loser die. "released owned resource from
+# @LyLong_FromStr ... more than once" on all five single-lane programs. Reverted.
+#
+# ⛔ An inert slot that is not owned would end it -- a NULL object handle, which
+# py.incref/py.decref already document as safe to receive. The dialect has no
+# way to spell one, and inventing it is the round this needs.
+#
+# ⛔ A user class or a list lane must stay out of the coexistence for a separate
+# reason: emitDefaultReturnValue spells no inert value for them and falls back to
+# None, which published a None as a Box and aborted in Ly_DecRef ("observed
+# non-positive refcount").
 #
 # ⛔ The storage promotion cannot substitute: it deliberately skips a name NOT
 # bound before the try ("the handler cannot observe a value the body may never
