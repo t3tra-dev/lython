@@ -1623,8 +1623,8 @@ them in.
 # method's scope at all, so it resolves to the None literal.
 
 # ==========================================================================
-# [FALSE-REFUSAL] generators + ownership   FOUND 2026-08-19, batch of 20
-#                                          realistic programs
+# [FIXED 2026-08-19] generators + ownership   FOUND the same day, batch of 20
+#                                             realistic programs
 # A generator that iterates an ITERATOR OBJECT (range, or a list) and has any
 # branch containing a may-raise call is refused: the iterator "is still owned
 # when a call may unwind out of the function"
@@ -1709,6 +1709,24 @@ them in.
 #      green and never fires for the generator, because of the missing group
 #      above. Sound, useless, not shipped.
 # So the repair really is the collection, not the walk.
+#
+# ⭐⭐ FIXED, and the fix is where the last line of this entry said it would be.
+# `forwardedBlockArgGroup` bails when a terminator hands the same values to TWO
+# successors ("group split across successors"), and a suspend is exactly that:
+# `cond_br %susp, ^suspend(%it), ^loop(%it)`. The release side is right to bail --
+# which destination would own it? -- but on an UNWIND both destinations hold the
+# token, so the unwind pass now follows each successor itself and adds the
+# destination groups to its own list only. Six programs that were refused now
+# agree with CPython, including one that raises out of a suspended generator, and
+# every one measures net 0 allocations. Pinned by
+# tests/golden/cases/generator_over_range_with_a_branch.py.
+#
+# ⛔ Unwind-only on purpose: feeding these groups back to
+# insertOwnedBlockArgumentReleases would place a NORMAL-path release for an
+# argument another edge still carries.
+#
+# The trail below is kept because it is four rounds of localisation and the two
+# reverted repairs are the reason the third one was written where it was.
 #
 # ⭐ AND THE COLLECTION'S OWN REASON, one level further: every candidate DOES
 # become an unwind group (insertOwnedBlockArgumentReleases pushes each one), so

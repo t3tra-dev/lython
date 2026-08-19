@@ -4842,6 +4842,83 @@ mlir::LogicalResult insertUnwindCleanupReleases(
              own::collectOwnedLocalObjectGroups(op, deallocators))
           addGroup(g);
       });
+      // ⭐ THE SPLIT FORWARD, which is the one shape the group collection
+      // cannot hand over. `forwardedBlockArgGroup` bails when a group's values
+      // reach TWO successors ("group split across successors"), and a
+      // generator's suspend is exactly that: `cf.cond_br %susp, ^suspend(%it),
+      // ^loop(%it)` hands the iterator to both. The RELEASE side is right to
+      // bail -- which destination would own it? -- but on an UNWIND every
+      // destination holds the token, and without a group at the suspend block
+      // the boxing call before its return had no cleanup: every
+      // `for i in range(n)` with a branch in its body was refused as "still
+      // owned when a call to 'LyLong_FromI64' may unwind".
+      //
+      // ⛔ Unwind-only, and not fed back into insertOwnedBlockArgumentReleases:
+      // adding these to the release side would place a normal-path release for
+      // an argument another edge still carries.
+      auto forwardToSuccessor =
+          [&](llvm::ArrayRef<mlir::Value> values, mlir::Operation *terminator,
+              unsigned successorIndex)
+          -> std::optional<llvm::SmallVector<mlir::Value, 4>> {
+        auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(terminator);
+        if (!branch)
+          return std::nullopt;
+        mlir::Block *successor = terminator->getSuccessor(successorIndex);
+        mlir::SuccessorOperands operands =
+            branch.getSuccessorOperands(successorIndex);
+        unsigned width =
+            std::min<unsigned>(successor->getNumArguments(), operands.size());
+        llvm::SmallVector<mlir::Value, 4> destination(values.size());
+        for (unsigned slot = 0; slot < width; ++slot)
+          for (unsigned index = 0; index < values.size(); ++index)
+            if (operands[slot] && aliases.same(operands[slot], values[index]))
+              destination[index] = successor->getArgument(slot);
+        for (mlir::Value value : destination)
+          if (!value)
+            return std::nullopt;
+        return destination;
+      };
+      llvm::SmallVector<own::ResourceGroup, 8> splitForwarded;
+      {
+        llvm::DenseSet<mlir::Value> known;
+        llvm::SmallVector<own::ResourceGroup, 8> frontier;
+        for (const own::ResourceGroup &g : blockArgGroups) {
+          if (g.values.empty())
+            continue;
+          known.insert(g.values.front());
+          frontier.push_back(g);
+        }
+        for (unsigned round = 0; round < 8 && !frontier.empty(); ++round) {
+          llvm::SmallVector<own::ResourceGroup, 8> next;
+          for (const own::ResourceGroup &g : frontier) {
+            auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
+            if (!blockArg || blockArg.getOwner()->getParent() != region)
+              continue;
+            mlir::Operation *terminator =
+                blockArg.getOwner()->getTerminator();
+            if (!terminator)
+              continue;
+            for (unsigned successorIndex = 0,
+                          end = terminator->getNumSuccessors();
+                 successorIndex < end; ++successorIndex) {
+              std::optional<llvm::SmallVector<mlir::Value, 4>> destination =
+                  forwardToSuccessor(g.values, terminator, successorIndex);
+              if (!destination || known.contains(destination->front()))
+                continue;
+              known.insert(destination->front());
+              own::ResourceGroup forwarded;
+              forwarded.values.assign(destination->begin(), destination->end());
+              forwarded.root = own::entityRootOf(forwarded.values);
+              forwarded.deallocator = g.deallocator;
+              splitForwarded.push_back(forwarded);
+              next.push_back(forwarded);
+            }
+          }
+          frontier = std::move(next);
+        }
+      }
+      for (const own::ResourceGroup &g : splitForwarded)
+        addGroup(g);
       for (const own::ResourceGroup &g : blockArgGroups) {
         if (g.values.empty())
           continue;
