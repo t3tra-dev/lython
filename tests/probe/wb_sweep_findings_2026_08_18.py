@@ -1890,3 +1890,22 @@ them in.
 # inner `deco(fn)` is a NESTED function, which the module-level parameter
 # fixpoint does not cover at all.
 
+# ==========================================================================
+# [GAP x2] exceptions, from a four-program probe            FOUND 2026-08-19
+# Two of four ordinary exception programs do not compile; the other two (a
+# two-argument ValueError read through e.args, and a user class calling
+# super().__init__ with an f-string) do.
+#
+# 1. A NON-STR EXCEPTION ARGUMENT. `raise ValueError(42)` -> "cannot adapt
+#    builtins.int to runtime input 3 of builtins.ValueError.__init__". CPython
+#    stores the argument as it is and renders it in str(e)/repr(e); here the
+#    message slot is a str, so anything else has nowhere to go. `ValueError(str(42))`
+#    is the workaround, and `raise ValueError("m", 2)` works because the FIRST
+#    argument is the message and the rest ride e.args.
+#
+# 2. `type(e.__cause__).__name__` -> "type(x) needs a statically resolved class,
+#    and !py.union<...> is not one". __cause__ is `BaseException | None`, and the
+#    class-name read added today answers a single contract. A union could be
+#    answered per tag (the value carries one), which is the same shape as every
+#    other union read and waits on the same mechanism.
+
