@@ -1964,6 +1964,52 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [GAP] an erased value compared to a literal          FOUND + FIXED 2026-08-19
+# Found chasing `e.args[0] == "x"`, which is refused, and the refusal turned out
+# to have nothing to do with exceptions: it is every read out of a list[object],
+# a dict[..., object] or e.args, compared against anything concrete.
+#
+#     xs: list[object] = [1, "a"]
+#     print(xs[0] == 1)
+#     # cannot pass concrete object builtins.int as builtins.object runtime
+#     # input 1 of builtins.object.__eq__; box the object at the owning ABI
+#     # boundary first
+#
+# ⭐ THE BOX IS ALREADY BUILT NEXT DOOR. object.__eq__ compares two payload
+# boxes and dispatches on the box's class id, and the concrete operand needs
+# exactly the box the container slot beside it makes. Boxing at this boundary
+# was allowed only for a SOURCE-defined class (usesInheritedObjectDunder ended
+# in classForContract), so a builtin was refused for wanting the same thing.
+#
+# ⛔ AND A LITERAL INT WAS REFUSED TWICE, which is why fixing the predicate
+# alone left `xs[0] == 1` failing while `xs[0] == "x"` started working: a lazy
+# primitive int carries its value in an i64 with no handle at all, so the
+# predicate read "no physical values" and the box arm had nothing to box. It has
+# to be materialized into an object first, in the arm, from the same lambda the
+# i64 path already uses.
+#
+# ⛔ AND THE ERASED SIDE HAS TO BE THE RECEIVER: `1 == xs[0]` resolves
+# int.__eq__ and fails on the other operand instead. == and != swap, and only
+# they -- both dispatch on the box and both are symmetric under it. The ORDERING
+# operators keep their refusal, because `<` has no boxed dispatcher to be
+# symmetric under and a swap would reverse the comparison rather than answer it.
+#
+# Pinned by tests/golden/cases/an_erased_value_compared_to_a_literal.py.
+#
+# ⛔ TWO NEIGHBOURS FOUND AND NOT FIXED, both pre-existing (measured against the
+# pre-fix binary):
+#
+# 1. A None IN AN ERASED CONTAINER ABORTS, with no comparison in it at all:
+#    `xs: list[object] = [1, None]; print(xs[1])` -> "Ly_DecRef observed
+#    non-positive refcount". None's box has no header to refcount and something
+#    on the read path decrefs it anyway.
+#
+# 2. `str(v)` ON AN object PARAMETER ABORTS the same way: `def f(v: object) ->
+#    str: return str(v)` called with 1, "a" and None. Same signature as (1) and
+#    likely the same release, but it is a different path (the boxed __str__
+#    dispatcher, not a container read) and neither is diagnosed.
+
+# ==========================================================================
 # [BUG] an exception argument that outlives the raise  FOUND + FIXED 2026-08-19
 # Found while leak-gating the non-str argument fix, on the loop the gate itself
 # wanted, and it predates that fix -- the two-argument form has always gone

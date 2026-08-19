@@ -900,8 +900,13 @@ bool RuntimeBundleLowerer::usesInheritedObjectDunder(
       RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) ||
       source.physicalValues().empty())
     return false;
-  return static_cast<bool>(
-      RuntimeBundleLowerer::classForContract(source.contract));
+  // ⭐ A BUILTIN VALUE NEEDS THE BOX FOR THE SAME REASON A SOURCE INSTANCE DOES.
+  // object.__eq__ compares two payload boxes and dispatches on the box's class
+  // id, so `xs[0] == 1` over a list[object] -- and every other erased read
+  // compared against a literal -- was refused ("cannot pass concrete object
+  // builtins.int as builtins.object runtime input 1") for wanting the one thing
+  // the container slot beside it already builds.
+  return true;
 }
 
 const RuntimeBundle *RuntimeBundleLowerer::concreteObjectForOwnership(

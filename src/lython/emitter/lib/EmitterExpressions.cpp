@@ -1395,6 +1395,22 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     }
   }
 
+  // ⭐ THE ERASED SIDE HAS TO BE THE RECEIVER, and == / != are the two operators
+  // where putting it there costs nothing: both dispatch on the box's class id,
+  // and both are symmetric under that dispatch. `xs[0] == 1` over a
+  // list[object] resolved object.__eq__ and worked; `1 == xs[0]` resolved
+  // int.__eq__ and was refused with "cannot adapt builtins.object to runtime
+  // input 3 of builtins.int.__eq__", which is the same comparison written the
+  // other way round.
+  //
+  // ⛔ Not for the ORDERING operators: `<` on an object has no boxed dispatcher
+  // to be symmetric under, and swapping would silently reverse the comparison
+  // rather than answer it. They keep their refusal.
+  if ((ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) &&
+      types.widenLiteral(rhs.type) == types.object() &&
+      types.widenLiteral(lhs.type) != types.object())
+    std::swap(lhs, rhs);
+
   if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
     auto lhsContract =
         mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(lhs.type));

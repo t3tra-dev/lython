@@ -194,29 +194,43 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
 
   if (source.kind == RuntimeBundle::Kind::Object &&
       isBuiltinsObjectHandleType(expected)) {
+    // A LAZY INT HAS TO BECOME AN OBJECT BEFORE IT CAN BECOME A BOX. It carries
+    // its value in an i64 with no handle at all, so the predicate below reads
+    // "no physical values" and the box arm has nothing to box -- which is why
+    // `xs[0] == 1` was still refused after str started working.
+    RuntimeBundle concreteSource = source;
+    if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source)) {
+      if (mlir::failed(materializeLazySource()))
+        return mlir::failure();
+      concreteSource =
+          RuntimeBundle::object(source.objectValue.contract,
+                                materializedObject->values);
+      concreteSource.copyEvidenceFrom(source);
+    }
+    const RuntimeBundle &boxInput = concreteSource;
     std::optional<RuntimeBundle> boxedSource;
-    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract)) {
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(boxInput.contract)) {
       // A source-class instance reaches an inherited builtins.object method
       // (object.__eq__/__ne__/__hash__) through a payload box, exactly as it
       // reaches a container slot. Its own storage is NOT that handle even
       // though the memref type matches: the boxed-payload entity word the
       // callee reads as the object's identity is only written by the box.
-      if (!RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, source))
+      if (!RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, boxInput))
         return op->emitError()
-               << "cannot pass concrete object " << source.contractName()
+               << "cannot pass concrete object " << boxInput.contractName()
                << " as builtins.object runtime input " << inputIndex << " of "
                << symbol.contract << "." << symbol.name
                << "; box the object at the owning ABI boundary first";
       mlir::FailureOr<RuntimeBundle> boxed =
           RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
-              op, source, /*retainPayload=*/true);
+              op, boxInput, /*retainPayload=*/true);
       if (mlir::failed(boxed))
         return mlir::failure();
       boxedSource = std::move(*boxed);
       sourceValues = boxedSource->physicalValues();
     }
     if (!boxedSource && runtimeInputConsumesObject(symbol, inputIndex))
-      return rejectConsumingObjectView(op, symbol, inputIndex, source,
+      return rejectConsumingObjectView(op, symbol, inputIndex, boxInput,
                                        "borrowed builtins.object handle");
     if (sourceValues.empty())
       return op->emitError() << "builtins.object argument has no boxed handle";
