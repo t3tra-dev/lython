@@ -1846,11 +1846,15 @@ them in.
 # what has been standing between that call and the code after it. The three
 # call sites are restored.
 #
-# ⛔ Not a repr defect to fix in the repr: whatever the hook dereferences on a
-# miss has to be understood first. `__ly_repr_boxed_by_contract`'s miss path
-# returns ub.poison memrefs plus false, which is where to start -- a poison
-# memref returned by value through the caller's struct is the one thing in that
-# call sequence with no defined content.
+# ⛔ Not a repr defect to fix in the repr. What is known: the hook has NO ENTRY
+# for the class (dumped the generated dispatch -- A's id 4294967296 appears in
+# the class-NAME table and nowhere in `__ly_repr_boxed_by_contract`), so the miss
+# path runs and returns ub.poison memrefs plus false. The faulting instruction is
+# `ldr x10, [x9]` followed by `cmp x10, x19` -- a load-and-compare, not a string
+# build -- and it disappears when the call is removed, which also lets the
+# caller's `load box[1]` be dead-code-eliminated. So the next step is to find
+# which of the two (the argument load or the poison return) the optimizer is
+# exploiting, with -O0 codegen and the LLVM IR side by side.
 #
 # The dict variants (`repr: boxed dict key/value has no conforming __repr__`)
 # and the exception-args one have the same shape and the same guard.
