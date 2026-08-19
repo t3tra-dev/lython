@@ -1766,8 +1766,14 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
   if (!contract)
     return std::nullopt;
+  // ⛔ A SOURCE CLASS TOO, not only an exception: its instances carry the same
+  // class-id word, and this is the only answer available when the static class
+  // has subclasses -- which is exactly when tryEmitTypeCall refuses to fold.
+  // A manifest contract keeps the fold: `type(5)` is int by construction, and
+  // an int's header word 1 is not a class id.
   if (!isExceptionContractType(subject) &&
-      !isExceptionBackedClass(contract.getContractName()))
+      !isExceptionBackedClass(contract.getContractName()) &&
+      !classMros.contains(contract.getContractName()))
     return std::nullopt;
   Value receiver = emitExpr(args->front().get());
   mlir::Type strType = types.contract("builtins.str");

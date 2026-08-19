@@ -20,9 +20,15 @@
 # reader of the IR. The union arms are here because narrowing is what makes the
 # static class exact in each of them.
 #
-# ⛔ Refused, and both refusals are the point: `type(a)` where the static class
-# has a subclass (the answer would name the static class, which is what CPython
-# would NOT print), and `type(o)` on a type-erased value.
+# ⛔ Refused, and the refusal is the point: `type(o)` on a type-erased value, and
+# `type(v) is B` where the static class has a subclass -- the type OBJECT there
+# would have to be a runtime value, which is a different mechanism from the name.
+#
+# ⭐ THE NAME ITSELF IS ANSWERABLE FOR A SUBCLASSED CLASS, because the instance
+# header carries its class id in word 1 -- the word isinstance reads -- and the
+# program's class-name table maps it. So `type(shape).__name__` over a list of
+# Shape prints Circle, Square, Shape, which is what CPython prints and what the
+# fold could never say.
 #
 # ⭐ EXCEPT FOR AN EXCEPTION, which is the commonest use of type() and the one
 # the fold cannot answer: a handler's static class is the one CAUGHT and CPython
@@ -63,6 +69,26 @@ print(type(5).__name__, type("a").__name__, type(5) is int, type(5) is str)
 print(kind(1), kind("a"))
 print(type([1]).__name__, type({}).__name__, type((1,)).__name__)
 print(type(make()).__name__, calls)
+
+
+class Shape:
+    pass
+
+
+class Circle(Shape):
+    pass
+
+
+class Square(Shape):
+    pass
+
+
+def name_of(s: Shape) -> str:
+    return type(s).__name__
+
+
+shapes: list[Shape] = [Circle(), Square(), Shape()]
+print([name_of(s) for s in shapes])
 
 
 class AppError(Exception):

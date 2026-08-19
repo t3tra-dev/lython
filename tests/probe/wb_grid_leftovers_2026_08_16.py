@@ -691,8 +691,26 @@
 # ancestor first -- the same retyping the print path does, and what keeps a user
 # class answering its own name (NotFound, not AppError).
 #
-# ⛔ `print(C)` (a type object as a printed value) is still refused: "runtime
-# method receiver has no concrete contract".
+# ⭐ AND THE POLYMORPHIC NAME, 2026-08-19 (evening): a value whose static class
+# has subclasses now answers `type(v).__name__` too, from the class id its header
+# carries in word 1 -- the word isinstance already reads -- through a per-program
+# class-name table the lowering synthesizes beside the user-exception one. So
+# `type(shape).__name__` over a list of Shape prints Circle, Square, Shape.
+#
+# ⛔ The table's generator must REPLACE the manifest's external declaration of
+# the symbol rather than treat it as "already generated": builtins.mlir declares
+# __ly_source_class_name because it calls it, so the naive "if the symbol exists,
+# return" left nothing defined and the JIT said "Symbols not found".
+#
+# ⛔ A manifest EXCEPTION contract keeps the manifest __class_name__ path. Its
+# header carries the class id in a different word than a source instance's, and
+# routing it through the generic reader printed "object" for a caught
+# ValueError.
+#
+# ⛔ `type(v) is B` for a subclassed static class stays refused, and correctly:
+# the type OBJECT would have to be a runtime value, which is a different
+# mechanism from the name. `print(C)` (a type object as a printed value) is
+# still refused too: "runtime method receiver has no concrete contract".
 #
 # Pinned by tests/golden/cases/type_of_a_value.py.
 #

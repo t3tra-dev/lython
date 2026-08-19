@@ -194,14 +194,60 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
   if (!receiver)
     return op.emitError() << "class name operand has no lowered runtime bundle";
   RuntimeBundle methodReceiver = *receiver;
-  if (!manifest.method(methodReceiver.contractName(), "__class_name__"))
+  if (!manifest.method(methodReceiver.contractName(), "__class_name__")) {
     if (std::optional<std::string> ancestor =
             RuntimeBundleLowerer::exceptionAncestorContractFor(
                 methodReceiver.contract)) {
       mlir::Type ancestorType = runtimeContractType(context, *ancestor);
       methodReceiver.contract = ancestorType;
       methodReceiver.objectValue.contract = ancestorType;
+    } else if (!manifest.primitive(methodReceiver.contractName(), "raise")) {
+      // ⭐ NOT AN EXCEPTION: read the class id out of the instance header --
+      // word 1, the word `isinstance` reads -- and look the name up in the
+      // per-program table. This is the only answer available for a value whose
+      // static class has subclasses, which is exactly when the emitter cannot
+      // fold `type(x).__name__`.
+      std::optional<RuntimeSymbol> lookup =
+          manifest.primitive("builtins.object", "class_name_from_id");
+      if (!lookup)
+        return op.emitError() << "runtime manifest has no builtins.object "
+                                 "class_name_from_id primitive";
+      mlir::FailureOr<mlir::Value> header =
+          RuntimeBundleLowerer::objectPhysicalHeader(op,
+                                                    methodReceiver.objectValue);
+      if (mlir::failed(header))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Type dynamicHeaderType =
+          mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                builder.getI64Type());
+      mlir::Value storage = *header;
+      if (storage.getType() != dynamicHeaderType)
+        storage = mlir::memref::CastOp::create(builder, loc, dynamicHeaderType,
+                                               storage)
+                      .getResult();
+      mlir::Value classIdSlot =
+          mlir::arith::ConstantIndexOp::create(builder, loc, 1);
+      mlir::Value classId =
+          mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
+              .getResult();
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          loc, *lookup, mlir::ValueRange{classId});
+      RuntimeBundle named;
+      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+              op, runtimeContractType(context, "builtins.str"), call, named)))
+        return mlir::failure();
+      valueBundles[op.getResult()] = std::move(named);
+      erase.push_back(op);
+      return mlir::success();
     }
+    // ⛔ A manifest EXCEPTION contract (the taxonomy) keeps the manifest path:
+    // it has no exception ANCESTOR to redirect to because it is one, and its
+    // header carries the class id in a different word than a source instance's
+    // -- reading word 1 there looked up an id nothing declares and printed
+    // "object" for a caught ValueError.
+  }
   llvm::SmallVector<const RuntimeBundle *, 1> sources{&methodReceiver};
   if (mlir::failed(lowerManifestMethodResult(
           op, op.getResult(), methodReceiver, "__class_name__", sources,

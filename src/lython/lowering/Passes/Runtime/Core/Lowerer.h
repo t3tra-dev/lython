@@ -111,6 +111,7 @@ private:
   // __ly_user_exception_base_class_id (id -> parent id, 0 unknown) and
   // __ly_user_exception_class_name (id -> C-string ptr, null unknown).
   mlir::LogicalResult synthesizeUserExceptionHooks();
+  mlir::LogicalResult synthesizeSourceClassNameHook();
   // Class id of an except-clause handler type (manifest or source class).
   mlir::FailureOr<std::int64_t> handlerClassId(mlir::Operation *op,
                                                mlir::Type handler) const;

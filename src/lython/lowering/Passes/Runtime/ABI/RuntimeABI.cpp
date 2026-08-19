@@ -508,6 +508,82 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
   return mlir::success();
 }
 
+// ⭐ THE NAME OF EVERY CLASS THE PROGRAM HAS, keyed by the id its instances
+// carry in header word 1 -- the same word `isinstance` reads. Without it the
+// only class name available at run time was the exception taxonomy's, so
+// `type(v).__name__` could answer nothing a base-typed variable holds, and the
+// default repr printed the STATIC class ("<__main__.A object at ...>" where
+// CPython prints B).
+//
+// ⛔ Built like the user-exception name hook next to it, and separately from
+// it: that one keys the taxonomy's parent chain as well and is consumed by the
+// traceback printer, which must keep working whether or not anything asks for a
+// class name.
+mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassNameHook() {
+  struct Entry {
+    std::int64_t classId;
+    std::string name;
+  };
+  llvm::SmallVector<Entry, 16> entries;
+  llvm::SmallDenseSet<std::int64_t, 16> seen;
+  module.walk([&](py::ClassOp classOp) {
+    std::optional<std::int64_t> classId =
+        RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
+    if (!classId || !seen.insert(*classId).second)
+      return;
+    entries.push_back(Entry{
+        *classId,
+        py::contracts::displayClassNameForContract(classOp.getSymName())});
+  });
+
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  mlir::Location loc = module.getLoc();
+  mlir::Type i64 = builder.getI64Type();
+  auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+  // ⛔ The manifest DECLARES this symbol (builtins.mlir calls it), so the
+  // existing lookup is an external declaration and has to be replaced, not
+  // treated as "already generated" -- that mistake linked nothing and the JIT
+  // reported "Symbols not found: ___ly_source_class_name".
+  if (auto existing =
+          module.lookupSymbol<mlir::func::FuncOp>("__ly_source_class_name")) {
+    if (!existing.isExternal())
+      return mlir::success();
+    existing.erase();
+  }
+  auto fn = mlir::func::FuncOp::create(
+      builder, loc, "__ly_source_class_name",
+      builder.getFunctionType({i64}, {ptrType}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(entry);
+  mlir::Value classId = entry->getArgument(0);
+  mlir::Value result = mlir::LLVM::ZeroOp::create(builder, loc, ptrType);
+  for (const Entry &hookEntry : entries) {
+    std::string text = hookEntry.name + '\0';
+    std::string symbol = ".ly_class_name." + std::to_string(hookEntry.classId);
+    if (!module.lookupSymbol(symbol)) {
+      mlir::OpBuilder::InsertionGuard globalGuard(builder);
+      builder.setInsertionPointToEnd(module.getBody());
+      auto arrayType = mlir::LLVM::LLVMArrayType::get(
+          mlir::IntegerType::get(context, 8), text.size());
+      mlir::LLVM::GlobalOp::create(builder, loc, arrayType, /*isConstant=*/true,
+                                   mlir::LLVM::Linkage::Private, symbol,
+                                   builder.getStringAttr(text));
+    }
+    mlir::Value address = mlir::LLVM::AddressOfOp::create(
+        builder, loc, ptrType, mlir::FlatSymbolRefAttr::get(context, symbol));
+    mlir::Value expected =
+        mlir::arith::ConstantIntOp::create(builder, loc, hookEntry.classId, 64);
+    mlir::Value matches = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, classId, expected);
+    result =
+        mlir::arith::SelectOp::create(builder, loc, matches, address, result);
+  }
+  mlir::func::ReturnOp::create(builder, loc, mlir::ValueRange{result});
+  return mlir::success();
+}
+
 std::optional<std::int64_t>
 RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
   if (!classOp)

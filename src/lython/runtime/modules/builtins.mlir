@@ -2516,6 +2516,66 @@ module attributes {
   // fallback hook). Returns a NUL-terminated ASCII name.
   func.func private @exception_class_name(%class_id: i64) -> !llvm.ptr
 
+  // Per-program class-name table (synthesized by the lowering, one entry per
+  // class the program declares, keyed by the id its instances carry in header
+  // word 1). Null for an id the program does not know.
+  func.func private @__ly_source_class_name(%class_id: i64) -> !llvm.ptr
+
+  // ⭐ `type(v).__name__` FOR A VALUE WHOSE STATIC CLASS IS NOT ITS OWN. The
+  // header's word 1 is the class id -- the word `isinstance` reads -- so the
+  // dynamic name is a table lookup, and the only thing that has to happen here
+  // is turning a NUL-terminated pointer into a str.
+  //
+  // ⛔ A null pointer is not an error: it is an id this program never declared
+  // (a manifest object reaching here), and "object" is what CPython would print
+  // for it.
+  func.func @LyObject_ClassNameFromId(%class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "class_name_from_id", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero_i8 = arith.constant 0 : i8
+    %cap = arith.constant 64 : index
+    %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
+    %null = llvm.mlir.zero : !llvm.ptr
+    %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
+    cf.cond_br %is_null, ^unknown, ^known
+
+  ^unknown:
+    %fallback = memref.get_global @__ly_class_name_object : memref<6xi8>
+    %fallback_dyn = memref.cast %fallback : memref<6xi8> to memref<?xi8>
+    %fallback_len = arith.constant 6 : i64
+    %fh, %fb = func.call @LyUnicode_FromBytes(%fallback_dyn, %c0, %fallback_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %fh, %fb : memref<2xi64>, memref<?xi8>
+
+  ^known:
+    %buffer = memref.alloca() : memref<64xi8>
+    %true_scan = arith.constant true
+    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+      %in_bounds = arith.cmpi ult, %i, %cap : index
+      %continue = arith.andi %in_bounds, %go : i1
+      scf.condition(%continue) %i, %go : index, i1
+    } do {
+    ^bb0(%i: index, %go: i1):
+      %i_i64 = arith.index_cast %i : index to i64
+      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %byte = llvm.load %slot : !llvm.ptr -> i8
+      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
+      %true_x = arith.constant true
+      %not_nul = arith.xori %is_nul, %true_x : i1
+      scf.if %not_nul {
+        memref.store %byte, %buffer[%i] : memref<64xi8>
+      }
+      %next = arith.addi %i, %c1 : index
+      %kept = arith.select %is_nul, %i, %next : index
+      scf.yield %kept, %not_nul : index, i1
+    }
+    %name_len = arith.index_cast %scan#0 : index to i64
+    %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
+    %nh, %nb = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %nh, %nb : memref<2xi64>, memref<?xi8>
+  }
+
+  memref.global "private" constant @__ly_class_name_object : memref<6xi8> = dense<[111, 98, 106, 101, 99, 116]>
+
   // ⭐ `type(e).__name__`, keyed by the DYNAMIC class id the way the repr below
   // is: an instance caught through a base-class handler answers the class it
   // WAS RAISED AS, which is the one thing the emitter's static fold cannot do
