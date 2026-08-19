@@ -3,6 +3,7 @@ int str True False
 int str
 list dict tuple
 int 1
+int str float NoneType
 ['Circle', 'Square', 'Shape']
 a
 NotFound missing b

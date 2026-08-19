@@ -737,6 +737,13 @@
 # routing it through the generic reader printed "object" for a caught
 # ValueError.
 #
+# ⭐ AND A UNION ANSWERS BY TAG: `type(v).__name__` over `int | str | float` is
+# the member's name chosen by the same test isinstance uses, written as the
+# conditional expression a reader would have written -- so the tag tests, the
+# narrowing and the string constants all come from paths that already exist. The
+# subject must be a NAME (the chain mentions it once per member), and every
+# member must be exact, which is the same subclass question asked per member.
+#
 # ⛔ `type(v) is B` for a subclassed static class stays refused, and correctly:
 # the type OBJECT would have to be a runtime value, which is a different
 # mechanism from the name. `print(C)` (a type object as a printed value) is

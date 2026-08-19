@@ -1763,6 +1763,72 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
       args->front()->kind == "Starred" || (keywords && !keywords->empty()))
     return std::nullopt;
   mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
+  // ⭐ A UNION KNOWS ITS MEMBERS, and the value carries which one it is -- so
+  // `type(v).__name__` over `int | str` is the member's name selected by the
+  // same tag test `isinstance` uses. It was refused as "needs a statically
+  // resolved class", which is true of the union and false of the value.
+  //
+  // ⛔ Written as the conditional expression a reader would have written, so
+  // the tag tests, the narrowing and the string constants all come from paths
+  // that already exist. That is also why the subject must be a NAME: the chain
+  // mentions it once per member, and re-evaluating a call would run it N times.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject)) {
+    const parser::Node *subjectNode = args->front().get();
+    if (subjectNode->kind != "Name")
+      return std::nullopt;
+    llvm::SmallVector<std::pair<mlir::Type, std::string>, 4> members;
+    for (mlir::Type rawMember : unionType.getMemberTypes()) {
+      mlir::Type member = types.widenLiteral(rawMember);
+      if (isNoneTypeLike(member)) {
+        members.push_back({member, "NoneType"});
+        continue;
+      }
+      auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(member);
+      if (!memberContract)
+        return std::nullopt;
+      llvm::StringRef qualified = memberContract.getContractName();
+      // A member with a subclass would answer the static name, which is the
+      // same wrong answer tryEmitTypeCall refuses for a bare value.
+      for (const auto &entry : classMros)
+        if (entry.getKey() != qualified &&
+            llvm::is_contained(entry.second, qualified))
+          return std::nullopt;
+      llvm::StringRef simple = qualified;
+      if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
+        simple = qualified.drop_front(dot + 1);
+      members.push_back({member, simple.str()});
+    }
+    if (members.size() < 2)
+      return std::nullopt;
+    parser::SourceRange range = expr.range;
+    parser::NodePtr chain =
+        synth::strConstant(members.back().second, range);
+    for (auto it = members.rbegin() + 1; it != members.rend(); ++it) {
+      parser::NodePtr test;
+      if (isNoneTypeLike(it->first)) {
+        test = synth::compare(synth::name(std::string(ast::nameSpelling(*subjectNode)),
+                                          range),
+                              "Is", synth::noneConstant(range), range);
+      } else {
+        auto memberContract = mlir::cast<py::ContractType>(it->first);
+        llvm::StringRef qualified = memberContract.getContractName();
+        llvm::StringRef simple = qualified;
+        if (auto dot = qualified.rfind('.'); dot != llvm::StringRef::npos)
+          simple = qualified.drop_front(dot + 1);
+        test = synth::call(
+            synth::name(std::string("isinstance"), range),
+            std::vector<parser::NodePtr>{
+                synth::name(std::string(ast::nameSpelling(*subjectNode)), range),
+                synth::name(simple.str(), range)},
+            range);
+      }
+      chain = synth::ifExp(std::move(test),
+                           synth::strConstant(it->second, range),
+                           std::move(chain), range);
+    }
+    synthesizedIteratorDefs.push_back(chain);
+    return emitExpr(chain.get());
+  }
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
   if (!contract)
     return std::nullopt;

@@ -20,6 +20,13 @@
 # reader of the IR. The union arms are here because narrowing is what makes the
 # static class exact in each of them.
 #
+# ⭐ A UNION KNOWS ITS MEMBERS and the value carries which one it is, so
+# `type(v).__name__` over `int | str | float` is the member's name selected by
+# the same tag test isinstance uses -- written as the conditional expression a
+# reader would have written, so the tests, the narrowing and the constants all
+# come from paths that already exist. The subject has to be a NAME, because the
+# chain mentions it once per member.
+#
 # ⛔ Refused, and the refusal is the point: `type(o)` on a type-erased value, and
 # `type(v) is B` where the static class has a subclass -- the type OBJECT there
 # would have to be a runtime value, which is a different mechanism from the name.
@@ -69,6 +76,14 @@ print(type(5).__name__, type("a").__name__, type(5) is int, type(5) is str)
 print(kind(1), kind("a"))
 print(type([1]).__name__, type({}).__name__, type((1,)).__name__)
 print(type(make()).__name__, calls)
+
+
+def described(v: int | str | float) -> str:
+    return type(v).__name__
+
+
+maybe: int | None = None
+print(described(1), described("a"), described(2.5), type(maybe).__name__)
 
 
 class Shape:
