@@ -807,6 +807,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 
   if (std::optional<Value> v = tryEmitTypeCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitHasattrCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitCallableCall(expr, calleeNode))
+    return *v;
+  if (std::optional<Value> v = tryEmitGetattrCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntBaseCall(expr, calleeNode))
@@ -1794,6 +1800,159 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
   Value callee = emitBindingRef(calleeNode, specialization->first,
                                 specialization->second);
   return emitCallableDispatch(expr, callee, operands);
+}
+
+// ⭐ `hasattr(x, "v")` AND `callable(f)` ARE COMPILE-TIME QUESTIONS HERE. Both
+// names were simply unbound, and both are decided by the same table the rest of
+// the emitter dispatches through -- the attribute either exists on the static
+// class or it does not, and a value either has a callable contract or it does
+// not.
+//
+// ⛔ A SUBCLASS CAN ONLY ADD, which is what makes the two answers asymmetric: a
+// True stands (the base has it, so every instance does), and a False is refused
+// when the class has a subclass, because the subclass may define exactly that
+// attribute. Answering False there is the silent wrong answer this project
+// exists to avoid; refusing says which class to look at.
+std::optional<Value>
+ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "hasattr" || programBindsName("hasattr"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             expr.range.start,
+                                             std::move(reason)});
+    return emitNone(expr);
+  };
+  if (!args || args->size() != 2 || (keywords && !keywords->empty()) ||
+      !args->front() || !(*args)[1])
+    return refuse("hasattr() takes exactly two arguments");
+  const parser::Node *nameNode = (*args)[1].get();
+  mlir::Type nameType = types.inferExpr(nameNode);
+  auto nameLiteral = mlir::dyn_cast_if_present<py::LiteralType>(nameType);
+  if (!nameLiteral)
+    return refuse("hasattr() needs a literal attribute name: the answer is "
+                  "decided at compile time here");
+  llvm::StringRef spelling = nameLiteral.getSpelling();
+  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
+    return refuse("hasattr() needs a literal attribute name: the answer is "
+                  "decided at compile time here");
+  llvm::StringRef attribute = spelling.drop_front().drop_back();
+  mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
+  if (!contract)
+    return refuse("hasattr() needs a statically resolved receiver, and " +
+                  typeText(subject) + " is not one");
+  bool present = lookupClassField(subject, attribute).has_value() ||
+                 lookupClassMethod(subject, attribute).has_value() ||
+                 lookupClassStaticAttr(subject, attribute).has_value();
+  if (!present) {
+    const py::protocols::Table &table = py::protocols::Table::get(context);
+    present = !table.methodContractCandidatesWithEvidence(subject, attribute)
+                   .empty() ||
+              table.resolveFieldContractWithEvidence(subject, attribute)
+                  .has_value();
+  }
+  if (!present)
+    for (const auto &entry : classMros)
+      if (entry.getKey() != contract.getContractName() &&
+          llvm::is_contained(entry.second, contract.getContractName()))
+        return refuse("hasattr(x, '" + attribute.str() + "') on '" +
+                      contract.getContractName().str() +
+                      "' cannot be answered: '" + entry.getKey().str() +
+                      "' derives from it and may define that attribute");
+  (void)emitExpr(args->front().get());
+  mlir::Type literalType = types.literal(present ? "True" : "False");
+  auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
+                                             builder.getBoolAttr(present));
+  return Value{constant.getResult(), literalType};
+}
+
+// `getattr(x, "v")` with a literal name IS `x.v` -- the same lookup written as a
+// call -- so it is rewritten to the attribute and every rule about attributes
+// applies unchanged. A computed name has no static answer here and says so; the
+// three-argument form would need the hasattr fold to pick an arm and is not
+// built.
+std::optional<Value>
+ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "getattr" || programBindsName("getattr"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             expr.range.start,
+                                             std::move(reason)});
+    return emitNone(expr);
+  };
+  if (!args || args->size() != 2 || (keywords && !keywords->empty()) ||
+      !args->front() || !(*args)[1])
+    return refuse("getattr() takes exactly two arguments here: the default "
+                  "form would need a runtime attribute lookup");
+  mlir::Type nameType = types.inferExpr((*args)[1].get());
+  auto nameLiteral = mlir::dyn_cast_if_present<py::LiteralType>(nameType);
+  llvm::StringRef spelling = nameLiteral ? nameLiteral.getSpelling()
+                                         : llvm::StringRef();
+  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
+    return refuse("getattr() needs a literal attribute name: the lookup is "
+                  "resolved at compile time here");
+  parser::NodePtr attribute =
+      synth::attribute(args->front(),
+                       spelling.drop_front().drop_back().str(), expr.range);
+  synthesizedIteratorDefs.push_back(attribute);
+  return emitExpr(attribute.get());
+}
+
+std::optional<Value>
+ModuleEmitter::tryEmitCallableCall(const parser::Node &expr,
+                                   const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "callable" ||
+      programBindsName("callable"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (!args || args->size() != 1 || (keywords && !keywords->empty()) ||
+      !args->front() || args->front()->kind == "Starred") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "callable() takes exactly one argument"});
+    return emitNone(expr);
+  }
+  mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
+  bool answer = mlir::isa<py::CallableType>(subject) ||
+                mlir::isa<py::TypeType>(subject) ||
+                lookupClassMethod(subject, "__call__").has_value();
+  if (!answer) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
+    if (!contract) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "callable() needs a statically resolved value, and " +
+              typeText(subject) + " is not one"});
+      return emitNone(expr);
+    }
+    for (const auto &entry : classMros)
+      if (entry.getKey() != contract.getContractName() &&
+          llvm::is_contained(entry.second, contract.getContractName())) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "callable(x) on '" + contract.getContractName().str() +
+                "' cannot be answered: '" + entry.getKey().str() +
+                "' derives from it and may define __call__"});
+        return emitNone(expr);
+      }
+  }
+  (void)emitExpr(args->front().get());
+  mlir::Type literalType = types.literal(answer ? "True" : "False");
+  auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
+                                             builder.getBoolAttr(answer));
+  return Value{constant.getResult(), literalType};
 }
 
 std::optional<Value>

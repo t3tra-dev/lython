@@ -656,6 +656,33 @@
 # in three places.
 #
 # ============================================================
+# (54) FIXED: hasattr / getattr / callable.
+# ============================================================
+#     print(hasattr(x, "v"))     # unresolved name 'hasattr'
+#     print(getattr(x, "v"))     # unresolved name 'getattr'
+#     print(callable(f))         # unresolved name 'callable'
+#
+# ⭐ FIXED 2026-08-19 (evening). All three are compile-time questions here: the
+# attribute either exists on the static class or it does not, and a value either
+# has a callable contract or it does not. `getattr` with a literal name IS the
+# attribute lookup written as a call, so it is rewritten to one and inherits
+# every attribute rule.
+#
+# ⛔ A SUBCLASS CAN ONLY ADD, which makes the answers asymmetric: True stands
+# (the base has it, so every instance does), and False is REFUSED when the class
+# has a subclass, because the subclass may define exactly that name. Answering
+# False there is the silent wrong answer; the refusal names the subclass.
+#
+# ⛔ Refused for want of anything static: a computed attribute name, and
+# `getattr(x, "v", default)` (its arm choice would need the hasattr fold).
+#
+# ⛔ `id(x)` is still unbound. It is the object's address, which the default repr
+# already formats, so it wants a manifest primitive returning an int from a
+# header rather than a fold.
+#
+# Pinned by tests/golden/cases/reflection_builtins.py.
+#
+# ============================================================
 # (53) FIXED: THE DEFAULT REPR NAMED THE CLASS THE VALUE WAS HELD AS.
 # ============================================================
 #     class A: pass
