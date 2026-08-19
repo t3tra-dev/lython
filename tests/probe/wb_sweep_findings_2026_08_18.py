@@ -1865,3 +1865,37 @@ them in.
 # The dict variants (`repr: boxed dict key/value has no conforming __repr__`)
 # and the exception-args one have the same shape and the same guard.
 
+# ==========================================================================
+# [GAP] a user-defined decorator                             FOUND 2026-08-19
+# The plain decorator idiom is refused twice over, and the two halves are
+# independent:
+#
+#     def twice(fn):                    # 1. parameter 'fn' requires an
+#         def wrapper(n: int) -> int:   #    annotation
+#             return fn(fn(n))
+#         return wrapper
+#
+#     @twice                            # 2. decorator 'twice' is not supported
+#     def inc(n: int) -> int:           #    (unrecognized decorators are
+#         return n + 1                  #    rejected instead of ignored)
+#
+# ⭐ HALF ONE IS A ONE-PLACE FIX AND WAS MEASURED. An unannotated parameter IS
+# inferred from call sites -- `def g(x): return x + 1` with `g(1)` works, and so
+# does passing a FUNCTION (`apply(fn, n)` called as `apply(inc, 1)`) -- but
+# `collectModuleCallNodes` returns at a FunctionDef, so a decorator application
+# is never collected as a call site. Synthesizing `twice(inc)` there removes the
+# annotation error entirely and leaves only half two. Not shipped, because with
+# half two still refusing there is nothing a test can see.
+#
+# ⛔ HALF TWO IS A FEATURE: checkDecorators keeps a whitelist (staticmethod,
+# classmethod, property, abstractmethod, dataclass, native, typing markers), and
+# anything else is rejected on purpose. Supporting user decorators means
+# desugaring `@deco def f(...)` into `f = deco(f)`: emit the function, take its
+# function OBJECT (emitFunctionObject already exists, and indirect calls work --
+# see `apply` above), call the decorator, and bind the name to the result, which
+# makes every later call of that name indirect.
+#
+# ⛔ The decorator FACTORY shape (`@register("a")`) needs one more thing: the
+# inner `deco(fn)` is a NESTED function, which the module-level parameter
+# fixpoint does not cover at all.
+
