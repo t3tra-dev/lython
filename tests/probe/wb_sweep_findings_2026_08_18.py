@@ -1710,6 +1710,16 @@ them in.
 #      above. Sound, useless, not shipped.
 # So the repair really is the collection, not the walk.
 #
+# ⭐ AND THE COLLECTION'S OWN REASON, one level further: every candidate DOES
+# become an unwind group (insertOwnedBlockArgumentReleases pushes each one), so
+# what is missing is the CANDIDATE. Candidates are seeded from a group's
+# forwarding terminators, and the seed here is the LyRange_Iter result -- whose
+# forwarding edge reaches the loop header's argument, not the suspend block's.
+# The chain stops one hop short: the loop header's argument is never re-seeded,
+# so nothing forwards it to ^bb13. Iterating the seeding to a fixpoint is the
+# repair; doing it for the RELEASE side too would place new releases, so the
+# extra candidates belong to the unwind list alone.
+#
 # ⛔ Still not attempted: this is the generator frame, and
 # [[lython-fragile-invariants]] says to write the invariant down before touching
 # it. What to write first: which values the resume clone owns at each suspend
