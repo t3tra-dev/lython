@@ -384,6 +384,48 @@ TEST(EmitterTest, DeclaredParameterCheckStillAdmitsTheseThree) {
                   .ok());
 }
 
+TEST(EmitterTest, ASetattrNameThatIsNotALiteralIsRefused) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("class C:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.v = 1\n"
+                 "c = C()\n"
+                 "def rename(s: str) -> None:\n"
+                 "    setattr(c, s, 2)\n",
+                 context);
+  EXPECT_FALSE(emitted.ok());
+  bool found = false;
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    found = found || diagnostic.message.find("literal attribute name") !=
+                         std::string::npos;
+  EXPECT_TRUE(found);
+}
+
+TEST(EmitterTest, ASetattrNameFoldedFromOneLiteralIsAccepted) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("class C:\n"
+                 "    def __init__(self) -> None:\n"
+                 "        self.v = 1\n"
+                 "c = C()\n"
+                 "name = \"v\"\n"
+                 "setattr(c, name, 2)\n"
+                 "print(c.v)\n",
+                 context);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+}
+
+TEST(EmitterTest, AUserDefinedSetattrStillWins) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("def setattr(a: int, b: int, c: int) -> int:\n"
+                 "    return a + b + c\n"
+                 "print(setattr(1, 2, 3))\n",
+                 context);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());

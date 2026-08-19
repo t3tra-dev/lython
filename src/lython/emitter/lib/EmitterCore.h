@@ -558,6 +558,8 @@ private:
   std::optional<Value> tryEmitDynamicClassName(const parser::Node &expr);
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
+  std::optional<Value> tryEmitSetattrCall(const parser::Node &expr,
+                                          const parser::Node *calleeNode);
   std::optional<Value> tryEmitGetattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
   std::optional<Value> tryEmitCallableCall(const parser::Node &expr,

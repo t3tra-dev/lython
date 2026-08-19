@@ -813,6 +813,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitGetattrCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitSetattrCall(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntBaseCall(expr, calleeNode))
@@ -1869,6 +1871,42 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
   auto constant = py::BoolConstantOp::create(builder, loc(expr), literalType,
                                              builder.getBoolAttr(present));
   return Value{constant.getResult(), literalType};
+}
+
+// `setattr(x, "v", value)` with a literal name IS `x.v = value` -- the same
+// store written as a call -- so it becomes one, and the field's declared type,
+// the ownership traffic and the refusals all come from the assignment path
+// unchanged. The call's own value is None, which is what CPython returns.
+std::optional<Value>
+ModuleEmitter::tryEmitSetattrCall(const parser::Node &expr,
+                                  const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Name" ||
+      ast::nameSpelling(*calleeNode) != "setattr" || programBindsName("setattr"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  auto refuse = [&](std::string reason) -> std::optional<Value> {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             expr.range.start,
+                                             std::move(reason)});
+    return emitNone(expr);
+  };
+  if (!args || args->size() != 3 || (keywords && !keywords->empty()) ||
+      !args->front() || !(*args)[1] || !(*args)[2])
+    return refuse("setattr() takes exactly three arguments");
+  mlir::Type nameType = types.inferExpr((*args)[1].get());
+  auto nameLiteral = mlir::dyn_cast_if_present<py::LiteralType>(nameType);
+  llvm::StringRef spelling = nameLiteral ? nameLiteral.getSpelling()
+                                         : llvm::StringRef();
+  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
+    return refuse("setattr() needs a literal attribute name: the store is "
+                  "resolved at compile time here");
+  parser::NodePtr target =
+      synth::attribute(args->front(),
+                       spelling.drop_front().drop_back().str(), expr.range);
+  synthesizedIteratorDefs.push_back(target);
+  emitAssignTarget(*target, emitExpr((*args)[2].get()));
+  return emitNone(expr);
 }
 
 // `getattr(x, "v")` with a literal name IS `x.v` -- the same lookup written as a

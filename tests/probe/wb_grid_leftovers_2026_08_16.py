@@ -656,6 +656,37 @@
 # in three places.
 #
 # ============================================================
+# (56) FIXED: setattr(x, "v", value) -- AND WHAT THE WHOLE BUILTIN SURFACE
+#      STILL LACKS, MEASURED RATHER THAN GUESSED.
+# ============================================================
+#     setattr(c, "v", 5)       # unresolved name 'setattr'
+#
+# ⭐ FIXED 2026-08-19. Written as a call, it is the store: with a literal name
+# `setattr(x, "v", v)` IS `x.v = v`, so it becomes one and the field's declared
+# type, the release of the value it replaces and every refusal come from the
+# assignment path rather than from a second implementation of it. The call's own
+# value is None, which is what CPython's returns -- `print(setattr(...))` prints
+# None in both.
+#
+# ⛔ A NAME BOUND TO ONE LITERAL STILL WORKS, because the inference has already
+# folded it: `name = "v"; setattr(c, name, 2)` compiles. What is refused is a
+# name with no static answer (a str PARAMETER), where there would be no field
+# for the store to land on. Both halves are pinned in EmitterTests, since a
+# refusal is not worth an execution.
+#
+# ⭐ AND THE SURFACE WAS MEASURED, not sampled: a generated probe bound every
+# name in CPython's builtins and asked which this compiler rejects. Exactly
+# three were unbound -- `bytearray`, `id`, `setattr` -- and setattr was the one
+# that is a rewrite of something already here. `id` needs an identity notion
+# this compiler has not committed to for unboxed values, and `bytearray` is a
+# mutable type, not a missing name. So "which builtins are missing" is now a
+# closed question with two entries, both of which need something built.
+#
+# Pinned by tests/golden/cases/reflection_builtins.py, alongside the three names
+# from (54) -- the setattr half loops a str field so the replaced value's
+# release is exercised, which an int field would not show.
+#
+# ============================================================
 # (55) FIXED: zip(a, b, strict=True).
 # ============================================================
 #     print(list(zip([1, 2], "ab", strict=False)))
