@@ -1792,9 +1792,16 @@ them in.
 #    "source generator next lowering currently supports yields whose runtime
 #    value is a single lane, and '!py.contract<"builtins.str">' has 2".
 #    Yielding a str is NOT the problem -- `yield "a"` works, and so does
-#    `for s in xs: yield s` over a list[str], with or without a branch. It is
-#    the dict-key walk specifically, whose element arrives in two lanes the
-#    suspend cannot carry.
+#    `for s in xs: yield s` over a list[str], with or without a branch.
+#
+#    ⭐ WHY, read out of the two lowerings: the STATE MACHINE
+#    (GeneratorStateMachine.cpp) carries lane GROUPS and would take this, but
+#    its eligibility scan rejects a body containing any op with regions except
+#    py.try -- and the dict walk is one. The generator then falls to the inline
+#    path in SourceGenerator.cpp, whose SourceYieldPlan holds ONE SSA value per
+#    yield, and a str is two. So the repair is either to let the state machine
+#    accept the dict walk's region op or to give the inline path a lane group;
+#    the note above that refusal already says the second is unbuilt.
 #
 # 2. FIXED THE SAME DAY -- A REBOUND EMPTY LIST ACROSS A YIELD.
 #        buf: list[int] = []
