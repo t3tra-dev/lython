@@ -6,15 +6,12 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/SmallVector.h"
 
-// Host boundary of the native support module: raw write, exit status, argv,
+// Host boundary of the native support module: raw write, argv,
 // FILE* wrappers and the in-memory buffer used by _io. These are NOT moved
 // into the sys.mlir/_io.mlir manifests (where their Python-visible halves
 // live) because they are not cleanly module-owned:
 //  - LyHost_WriteBytes is also called by builtins.mlir's print path, which
 //    must link into every program whether or not _io is imported;
-//  - g_sys_exit_status is read back by LyRunPythonMain (the always-linked
-//    program entry) when a SystemExit reaches the top, so the global cannot
-//    live in a conditionally-imported module;
 //  - the FILE*/buffer wrappers take the post-expansion memref descriptor ABI
 //    and lean on support-private helpers (copy_i8_memref) that the manifest
 //    lowering path cannot see.
@@ -41,30 +38,6 @@ void buildHostWriteBytes(SupportBuilder &b) {
       mlir::ValueRange{entry->getArgument(0), entry->getArgument(2),
                        entry->getArgument(3), entry->getArgument(4),
                        entry->getArgument(5), entry->getArgument(6)});
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
-}
-
-// void LyHost_SetExitStatus(i64 status): records the sys.exit status in
-// g_sys_exit_status. LyRunPythonMain reads it back when a SystemExit reaches
-// the top level; a global (not an exception payload) because the exception
-// object layout has no slot beyond the message string.
-void buildHostSetExitStatus(SupportBuilder &b) {
-  {
-    mlir::OpBuilder::InsertionGuard guard(b.builder);
-    b.builder.setInsertionPointToEnd(b.module.getBody());
-    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i64(),
-                                 /*isConstant=*/false,
-                                 mlir::LLVM::Linkage::Internal,
-                                 "g_sys_exit_status",
-                                 b.builder.getIntegerAttr(b.i64(), 0),
-                                 /*alignment=*/8);
-  }
-  auto fn = b.beginFunction(
-      "LyHost_SetExitStatus", b.builder.getFunctionType({b.i64()}, {}));
-  mlir::Block *entry = fn.addEntryBlock();
-  b.builder.setInsertionPointToEnd(entry);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, entry->getArgument(0),
-                              b.addrOf("g_sys_exit_status"), /*alignment=*/8);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -447,7 +420,6 @@ void buildHostBufferSupport(SupportBuilder &b) {
 
 void buildHostSupport(SupportBuilder &b) {
   buildHostWriteBytes(b);
-  buildHostSetExitStatus(b);
   buildHostArgvSupport(b);
   buildHostFileSupport(b);
   buildHostBufferSupport(b);

@@ -1,0 +1,7 @@
+int 4 (4,) 1
+str bye ('bye',)
+bare '' 0
+sys.exit caught True
+finally ran
+caught after finally
+base handler 1

@@ -2483,6 +2483,35 @@ module attributes {
   // three descriptors) without widening every exception signature in the
   // manifests. The extended words are reached only through
   // @__ly_exc_ext_get / @__ly_exc_ext_set, never through the 3-word view.
+  // SystemExit's exit code, recorded on the object at construction because that
+  // is where its static type is still known: a boxed value in the payload block
+  // cannot be read back as an i64 without a per-class unboxer, and the top-level
+  // runner reads raw words. Biased by one; slot 0 means "no int code".
+  func.func private @__ly_systemexit_set_code(%header: memref<3xi64>, %value_header: memref<2xi64>, %meta: memref<2xi64>, %digits: memref<?xi32>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code"} {
+    %value = func.call @LyLong_AsI64(%value_header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    func.call @__ly_systemexit_set_code_i64(%header, %value) : (memref<3xi64>, i64) -> ()
+    func.return
+  }
+
+  // ⛔ bool NEEDS ITS OWN ENTRY POINT rather than a coercion at the call: a bool
+  // is one i1 lane, not the int triple, so it cannot reach the unboxer above --
+  // and CPython counts it as an int, so `raise SystemExit(True)` exits 1 in
+  // silence rather than printing "True".
+  func.func private @__ly_systemexit_set_code_bool(%header: memref<3xi64>, %boxed: memref<3xi64>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code_bool"} {
+    %value = func.call @LyBool_Unbox(%boxed) : (memref<3xi64>) -> i1
+    %widened = arith.extui %value : i1 to i64
+    func.call @__ly_systemexit_set_code_i64(%header, %widened) : (memref<3xi64>, i64) -> ()
+    func.return
+  }
+
+  func.func private @__ly_systemexit_set_code_i64(%header: memref<3xi64>, %value: i64) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code_i64"} {
+    %one = arith.constant 1 : i64
+    %code_slot = arith.constant 5 : i64
+    %biased = arith.addi %value, %one : i64
+    func.call @__ly_exc_ext_set(%header, %code_slot, %biased) : (memref<3xi64>, i64, i64) -> ()
+    func.return
+  }
+
   func.func @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
@@ -2492,21 +2521,26 @@ module attributes {
     %class_slot = arith.constant 2 : index
     %payload_slot = arith.constant 3 : index
     %fields_slot = arith.constant 4 : index
+    // The exit code rides the exception object, the way CPython's .code does.
+    // It is stored biased by one so that zero means "no code": SystemExit(0)
+    // and SystemExit() are both silent but only one of them is an int.
+    %code_slot = arith.constant 5 : index
     %zero_index = arith.constant 0 : index
     %zero_len = arith.constant 0 : i64
 
-    %block_bytes = arith.constant 40 : index
+    %block_bytes = arith.constant 48 : index
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %header = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
-    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<5xi64>
+    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<6xi64>
     %empty_bytes = memref.alloca(%zero_index) : memref<?xi8>
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%empty_bytes, %zero_index, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
 
     memref.store %one, %header[%refcount_slot] : memref<3xi64>
     memref.store %layout_exception, %header[%layout_slot] : memref<3xi64>
     memref.store %class_id, %header[%class_slot] : memref<3xi64>
-    memref.store %zero, %extended[%payload_slot] : memref<5xi64>
-    memref.store %zero, %extended[%fields_slot] : memref<5xi64>
+    memref.store %zero, %extended[%payload_slot] : memref<6xi64>
+    memref.store %zero, %extended[%fields_slot] : memref<6xi64>
+    memref.store %zero, %extended[%code_slot] : memref<6xi64>
 
     func.return %header, %message_header, %message_bytes : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }

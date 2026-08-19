@@ -1964,36 +1964,53 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
-# [BUG x2] SystemExit's code, both directions                FOUND 2026-08-19
+# [BUG x2] SystemExit's code, both directions          FOUND + FIXED 2026-08-19
 # Found by asking what the non-str exception argument fix above would do to
-# SystemExit, and the answer was "mis-execute", so it is excluded from it. Two
-# defects, one mechanism: the top-level runner reads "the message is empty" as
-# "use the status LyHost_SetExitStatus recorded", which is a PROXY for "this
-# came from sys.exit" and gets both edges of that proxy wrong.
+# SystemExit, and the answer was "mis-execute", so it was excluded from it for
+# one commit and then repaired. Two defects, one mechanism: the top-level runner
+# read "the message is empty" as "use the status LyHost_SetExitStatus recorded",
+# which is a PROXY for "this came from sys.exit" and got both edges wrong.
 #
 # 1. `raise SystemExit(3)` -> refused ("cannot adapt builtins.int to runtime
-#    input 3"). CPython exits 3, silently. If the argument were let into the
-#    payload block the message would render as "3" and the runner would PRINT it
-#    and exit 1 -- a wrong answer where there is a refusal today, which is why
-#    the fix above excludes SystemExit rather than including it.
+#    input 3"). CPython exits 3, silently.
 #
-# 2. `raise SystemExit("")` -> exits 0, silently. CPython prints an empty line
-#    to stderr and exits 1. The empty message is indistinguishable from
-#    `SystemExit()` (which IS exit 0) under the proxy, and this one needs no new
-#    feature to be wrong -- it is wrong today.
+# 2. `raise SystemExit("")` -> exited 0, silently. CPython prints an empty line
+#    to stderr and exits 1. An empty message is indistinguishable from
+#    `SystemExit()` (which IS exit 0) under the proxy, and this half needed no
+#    new feature to be wrong -- it was wrong on its own.
 #
-# ⭐ THE FIX IS ONE CHANGE OF SIGNAL, not two repairs: give the raise path an
-# explicit "silent, use the status" flag (code is None or an int) instead of
-# inferring it from the message length, route SystemExit's argument -- str
-# included -- through the payload block so `SystemExit()` and `SystemExit("")`
-# stop being the same shape, and read the int code at raise time (in the
-# manifest, where LyLong_AsI64 is reachable) rather than in the runner's
-# hand-built LLVM. sys.exit(n) keeps working unchanged: it already sets the
-# status, and it would set the flag with it.
+# ⭐ THE FIX IS ONE CHANGE OF SIGNAL, not two repairs. The exception object grew
+# a sixth word for the code (biased by one, so slot 0 is "no int code" rather
+# than "exit 0"), SystemExit's argument goes into the payload block whether or
+# not it is a str -- which is what makes `SystemExit()` and `SystemExit("")`
+# different shapes -- and the runner asks those two words instead of the message
+# length: a code exits with it in silence, no argument at all exits 0 in
+# silence, anything else prints and exits 1. `g_sys_exit_status` and
+# `LyHost_SetExitStatus` are gone; the status rides the exception now, which is
+# where CPython's .code has always been, so two SystemExits in flight can each
+# carry their own.
 #
-# ⛔ The stale rationale is written down in sys.mlir: "an int code must go
-# through sys.exit (the exception object has no code slot)". The payload block
-# IS that slot, and it has existed since multi-argument exceptions landed.
+# ⛔ THE CODE IS RECORDED AT CONSTRUCTION, not read back at the raise, because
+# the block holds the argument BOXED and pulling an i64 out of a box needs a
+# per-class unboxer the runner cannot call. bool gets its own entry point for
+# the same reason (one i1 lane, not the int triple) -- and it needs one, because
+# CPython counts a bool as an int: `raise SystemExit(True)` exits 1 in silence.
+#
+# ⛔ The stale rationale was written down in sys.mlir: "an int code must go
+# through sys.exit (the exception object has no code slot)". That was true of
+# the 5-word object and stopped being interesting the moment the payload block
+# existed; the slot cost one word.
+#
+# ⛔ WHAT IS STILL DEVIATION: `sys.exit(7)` sets the status but not .args, so a
+# CAUGHT one has str(e) == "" and e.args == () where CPython gives "7" and (7,).
+# Boxing 7 into the block needs the 16-word box layout the LOWERING computes,
+# and no manifest-side store reaches it. Pinned as "was it caught" rather than
+# "what does it carry" in system_exit_is_an_exception.py, with the reason.
+#
+# Pinned by tests/golden/errors/system_exit_int_code.py (exit 3),
+# tests/golden/errors/system_exit_empty_message.py (exit 1, and RED at 0 on the
+# pre-fix binary with no other change), and
+# tests/golden/cases/system_exit_is_an_exception.py.
 
 # ==========================================================================
 # [GAP] a recursive generator, in three stages       FOUND + 2/3 FIXED 2026-08-19

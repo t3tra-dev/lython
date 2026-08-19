@@ -2062,7 +2062,9 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Block *python = b.builder.createBlock(&body);
   mlir::Block *printTraceback = b.builder.createBlock(&body);
   mlir::Block *systemExit = b.builder.createBlock(&body);
+  mlir::Block *systemExitArgs = b.builder.createBlock(&body);
   mlir::Block *exitWithStatus = b.builder.createBlock(&body);
+  mlir::Block *exitSilently = b.builder.createBlock(&body);
   mlir::Block *exitWithMessage = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
@@ -2131,11 +2133,19 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Value stride = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i64(), partsField(b, descriptor, 0, 4),
       /*alignment=*/8);
-  mlir::Value scaled =
-      mlir::LLVM::MulOp::create(b.builder, b.loc, stride, b.iconst(2));
-  mlir::Value classIndex =
-      mlir::LLVM::AddOp::create(b.builder, b.loc, offset, scaled);
-  mlir::Value classId = b.loadI64(b.gepI64(aligned, classIndex));
+  auto headerWord = [&](std::int64_t slot) {
+    mlir::Value scaled =
+        mlir::LLVM::MulOp::create(b.builder, b.loc, stride, b.iconst(slot));
+    mlir::Value index =
+        mlir::LLVM::AddOp::create(b.builder, b.loc, offset, scaled);
+    return b.loadI64(b.gepI64(aligned, index));
+  };
+  mlir::Value classId = headerWord(2);
+  // The two words SystemExit answers with: the payload block (absent means the
+  // exception was raised with no argument at all) and the exit code, biased by
+  // one so that a zero slot is "no int code" rather than "exit 0".
+  mlir::Value payloadBlock = headerWord(3);
+  mlir::Value exitCodeBiased = headerWord(5);
   mlir::Value messageHeader = b.loadPtrVal(partsField(b, descriptor, 1, 1));
   mlir::Value messageData = b.loadPtrVal(partsField(b, descriptor, 2, 1));
   mlir::Value messageOffset = mlir::LLVM::LoadOp::create(
@@ -2180,29 +2190,48 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
-  // SystemExit never prints a traceback (CPython semantics): an empty
-  // message reports the last LyHost_SetExitStatus value, a non-empty message
-  // goes to stderr with exit status 1 (the non-int `SystemExit(code)` path).
+  // SystemExit never prints a traceback (CPython semantics), and CPython's three
+  // answers are read off the object rather than guessed from the message: an int
+  // code exits WITH it in silence, no argument at all exits 0 in silence, and
+  // anything else goes to stderr and exits 1.
+  //
+  // ⛔ THE OLD TEST WAS "the message is empty", a proxy for "this came from
+  // sys.exit", and it was wrong at both edges. `SystemExit("")` has an empty
+  // message and is NOT a status (CPython prints the blank line and exits 1),
+  // and an int argument could not be a status at all, because the code lived in
+  // a process global that only sys.exit wrote.
   b.builder.setInsertionPointToEnd(systemExit);
   mlir::func::CallOp::create(b.builder, b.loc, "release_current_chain",
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  mlir::Value messageEmpty =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, messageLen, b.iconst(0));
-  mlir::LLVM::CondBrOp::create(b.builder, b.loc, messageEmpty, exitWithStatus,
-                               exitWithMessage);
+  mlir::Value hasCode =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, exitCodeBiased, b.iconst(0));
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, hasCode, exitWithStatus,
+                               systemExitArgs);
+
+  b.builder.setInsertionPointToEnd(systemExitArgs);
+  mlir::Value hasArgument =
+      b.cmpi(mlir::arith::CmpIPredicate::ne, payloadBlock, b.iconst(0));
+  mlir::LLVM::CondBrOp::create(b.builder, b.loc, hasArgument, exitWithMessage,
+                               exitSilently);
 
   b.builder.setInsertionPointToEnd(exitWithStatus);
   releaseTaken();
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "__cxa_end_catch", mlir::ValueRange{});
-  mlir::Value status = mlir::LLVM::LoadOp::create(
-      b.builder, b.loc, b.i64(), b.addrOf("g_sys_exit_status"),
-      /*alignment=*/8);
+  mlir::Value status = mlir::LLVM::SubOp::create(b.builder, b.loc,
+                                                 exitCodeBiased, b.iconst(1));
   mlir::Value status32 =
       mlir::arith::TruncIOp::create(b.builder, b.loc, b.i32(), status);
   mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{status32});
+
+  b.builder.setInsertionPointToEnd(exitSilently);
+  releaseTaken();
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(0)});
 
   b.builder.setInsertionPointToEnd(exitWithMessage);
   mlir::Value messageCStr =

@@ -963,23 +963,28 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
   // the lane is one store against a block allocation plus a boxed str render,
   // and str(e) off the lane is the string itself rather than a copy of it.
   //
-  // ⛔ SystemExit IS HELD BACK, and this is the one place it shows. Its exit
-  // STATUS is recorded out of band (LyHost_SetExitStatus) and the top-level
-  // runner reads "the message is empty" as "use that status", so a SystemExit
-  // whose argument moved into the payload block would print its code and exit
-  // 1 where CPython exits WITH it. Refusing (the ABI's own "cannot adapt
-  // builtins.int to runtime input 3") is the honest answer until the runner
-  // learns to read the code; sys.exit(n) is the spelling that works.
-  bool singleNonStringArgument = false;
-  if (exceptionInit && !groupInit && sources.size() == 2 && sources[1] &&
-      !py::isAssignableTo(runtimeContractType(context, initContract),
-                          runtimeContractType(context, "builtins.SystemExit"),
-                          op))
-    singleNonStringArgument = !py::isAssignableTo(
-        sources[1]->objectValue.contract,
-        runtimeContractType(context, "builtins.str"), op);
+  // ⭐ SystemExit PUTS ITS ARGUMENT IN THE BLOCK EVEN WHEN IT IS A str, because
+  // the runner's question is "was there an argument at all" -- `SystemExit()`
+  // exits 0 in silence and `SystemExit("")` prints a blank line and exits 1,
+  // and an empty message lane cannot tell those apart.
+  std::string exceptionRootContract = initContract;
+  if (instanceClassOp)
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContract(instanceClassOp))
+      exceptionRootContract = *ancestor;
+  bool systemExitInit =
+      exceptionInit && !groupInit &&
+      py::isAssignableTo(runtimeContractType(context, exceptionRootContract),
+                         runtimeContractType(context, "builtins.SystemExit"),
+                         op);
+  bool singleArgumentTakesTheBlock = false;
+  if (exceptionInit && !groupInit && sources.size() == 2 && sources[1])
+    singleArgumentTakesTheBlock =
+        systemExitInit ||
+        !py::isAssignableTo(sources[1]->objectValue.contract,
+                            runtimeContractType(context, "builtins.str"), op);
   if (exceptionInit && !groupInit &&
-      (sources.size() > 2 || singleNonStringArgument)) {
+      (sources.size() > 2 || singleArgumentTakesTheBlock)) {
     if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
         mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
       return mlir::failure();
@@ -1048,6 +1053,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       llvm::SmallVector<mlir::Value, 18> storeOperands{blockWord, slot};
       storeOperands.append(words->begin(), words->end());
       RuntimeBundleLowerer::createRuntimeCall(loc, *storeWords, storeOperands);
+      // The exit code is recorded HERE, off the MATERIALIZED argument, because
+      // the block holds it boxed and reading an i64 back out of a box would
+      // need a per-class unboxer the top-level runner has no way to call.
+      if (systemExitInit && sources.size() == 2) {
+        llvm::StringRef codeContract = payload->contractName();
+        if (codeContract == "builtins.int" || codeContract == "builtins.bool") {
+          std::optional<RuntimeSymbol> setCode = manifest.primitive(
+              "builtins.SystemExit",
+              codeContract == "builtins.int" ? "set_code" : "set_code_bool");
+          if (!setCode)
+            return op.emitError()
+                   << "runtime manifest has no SystemExit set_code primitive";
+          llvm::ArrayRef<mlir::Type> codeInputs =
+              setCode->function.getFunctionType().getInputs();
+          llvm::ArrayRef<mlir::Value> codeValues = payload->physicalValues();
+          if (codeInputs.size() != codeValues.size() + 1)
+            return op.emitError()
+                   << "SystemExit set_code ABI mismatch: " << codeInputs.size()
+                   << " inputs, " << codeValues.size() << " values, contract "
+                   << codeContract;
+          llvm::SmallVector<mlir::Value, 4> codeOperands{adaptOperand(
+              instance->physicalValues()[0], codeInputs[0])};
+          for (auto [codeIndex, codeValue] : llvm::enumerate(codeValues))
+            codeOperands.push_back(
+                adaptOperand(codeValue, codeInputs[codeIndex + 1]));
+          RuntimeBundleLowerer::createRuntimeCall(loc, *setCode, codeOperands);
+        }
+      }
       if (payload->objectValue.ownership == ownership::OwnershipKind::Own &&
           mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, *payload, "exception.args.source")))
@@ -1070,6 +1103,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
     if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
             op, op.getInstance().getType(), messageCall, updatedInstance)))
       return mlir::failure();
+
     valueBundles[op.getInstance()] = std::move(updatedInstance);
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(), runtimeContractType(context, "types.NoneType"),

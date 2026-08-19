@@ -22,10 +22,11 @@
 //   the normal unwind path, so `finally` blocks run and `except SystemExit`
 //   / `except BaseException` can observe it, and the top-level runner
 //   converts an unhandled SystemExit into the process exit status.
-// - `SystemExit(...)` constructed directly accepts only a str message (the
-//   shared exception contract); an unhandled one prints the message to
-//   stderr and exits 1, matching CPython's non-int code path. An int code
-//   must go through sys.exit (the exception object has no code slot).
+// - `sys.exit(n)` sets the exit status but not `.args`: a caught one has
+//   str(e) == "" and e.args == () where CPython gives "7" and (7,). Boxing
+//   the status into the payload block needs the 16-word box layout the
+//   lowering computes, which no manifest-side store can reach.
+//   `raise SystemExit(n)` -- constructed with an argument -- carries both.
 // - `argv` materializes a fresh list[str] on every read (there is no cached
 //   module-attribute object); reads are value-identical to CPython's, and
 //   mutating the temporary (`sys.argv.append(...)`) is rejected statically
@@ -99,7 +100,7 @@ module attributes {
   }
   func.func private @LySystemExit_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 64 : i64, ly.runtime.contract = "builtins.SystemExit", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
-  func.func private @LyHost_SetExitStatus(i64)
+  func.func private @__ly_systemexit_set_code(memref<3xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code"}
 
   // sys.argv builds a fresh list[str] from the process argument vector that
   // LyHost_InitArgs recorded before the program body ran. Each element is an
@@ -174,14 +175,14 @@ module attributes {
     func.return %self : memref<9xi64>
   }
 
-  // sys.exit records the status out-of-band (the exception object layout has
-  // no payload slot beyond the message string) and raises SystemExit with an
-  // empty message; LyRunPythonMain maps that back to the process exit status.
+  // sys.exit writes the status into the exception object's code slot and raises
+  // SystemExit with an empty message; LyRunPythonMain reads the slot back as the
+  // process exit status. The status used to travel in a process global, which is
+  // why two SystemExits in flight could not each carry their own.
   func.func @LySys_Exit(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) attributes {ly.runtime.builtin = "sys.exit", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "sys_exit", ly.runtime.result_contract = "types.NoneType"} {
-    %status = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
-    func.call @LyHost_SetExitStatus(%status) : (i64) -> ()
     %class_id = arith.constant 64 : i64
     %exception:3 = func.call @LySystemExit_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @__ly_systemexit_set_code(%exception#0, %header, %meta, %digits) : (memref<3xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> ()
     func.call @LyEH_ThrowException(%exception#0, %exception#1, %exception#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
