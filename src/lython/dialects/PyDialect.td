@@ -1002,6 +1002,26 @@ def Py_ReprOp : Py_Op<"repr", []> {
   let hasVerifier = 1;
 }
 
+def Py_ClassNameOp : Py_Op<"class_name", []> {
+  let summary = "The runtime class name of a value that carries its class id";
+  let description = [{
+    `type(x).__name__` where the answer cannot be folded: the static class is a
+    base of the one the value actually has. Only contracts whose instances carry
+    a dynamic class id can lower this -- the exception representation is the one
+    that does -- and the result contract must instantiate `builtins.str`.
+  }];
+
+  let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$target,
+      TypeAttrOf<Py_ProtocolType>:$callee_contract, Py_ContractType:$input);
+
+  let results = (outs Py_ContractType:$result);
+
+  let assemblyFormat =
+      "$callee_contract `(` $input `:` type($input) `)` attr-dict `->` "
+      "type($result)";
+  let hasVerifier = 1;
+}
+
 def Py_IntOp : Py_Op<"int", []> {
   let summary = "Python integer conversion operation";
   let description = [{

@@ -1147,6 +1147,7 @@ private:
                              op.getResult());
   }
 
+  mlir::LogicalResult lowerClassName(py::ClassNameOp op);
   mlir::LogicalResult lowerPyOp(mlir::Operation *op);
   mlir::LogicalResult lowerStructuredTryOps();
   mlir::LogicalResult lowerTry(py::TryOp op);

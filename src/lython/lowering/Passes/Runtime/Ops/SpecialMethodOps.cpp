@@ -183,6 +183,34 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerReceiverMethodResult(
   return mlir::success();
 }
 
+// ⭐ A SOURCE exception class has no manifest methods of its own, and the class
+// name it must answer is not its static one anyway: the instance header carries
+// the id, and the ancestor's `__class_name__` reads it. This is the same
+// retyping the print path does for `__str__` -- for the same reason and with
+// the same effect on the answer, which is that a user exception keeps its own
+// name.
+mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
+  const RuntimeBundle *receiver = RuntimeBundleLowerer::bundleFor(op.getInput());
+  if (!receiver)
+    return op.emitError() << "class name operand has no lowered runtime bundle";
+  RuntimeBundle methodReceiver = *receiver;
+  if (!manifest.method(methodReceiver.contractName(), "__class_name__"))
+    if (std::optional<std::string> ancestor =
+            RuntimeBundleLowerer::exceptionAncestorContractFor(
+                methodReceiver.contract)) {
+      mlir::Type ancestorType = runtimeContractType(context, *ancestor);
+      methodReceiver.contract = ancestorType;
+      methodReceiver.objectValue.contract = ancestorType;
+    }
+  llvm::SmallVector<const RuntimeBundle *, 1> sources{&methodReceiver};
+  if (mlir::failed(lowerManifestMethodResult(
+          op, op.getResult(), methodReceiver, "__class_name__", sources,
+          /*allowUnusedSources=*/false, /*preferManifestObjectResult=*/true)))
+    return mlir::failure();
+  erase.push_back(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerBool(py::BoolOp op) {
   const RuntimeBundle *input = RuntimeBundleLowerer::bundleFor(op.getInput());
   if (!input)

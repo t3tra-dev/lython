@@ -621,6 +621,10 @@ mlir::LogicalResult ReprOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }
 
+mlir::LogicalResult ClassNameOp::verify() {
+  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
+}
+
 mlir::LogicalResult StrOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }

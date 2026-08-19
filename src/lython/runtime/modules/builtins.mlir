@@ -2516,6 +2516,51 @@ module attributes {
   // fallback hook). Returns a NUL-terminated ASCII name.
   func.func private @exception_class_name(%class_id: i64) -> !llvm.ptr
 
+  // ⭐ `type(e).__name__`, keyed by the DYNAMIC class id the way the repr below
+  // is: an instance caught through a base-class handler answers the class it
+  // WAS RAISED AS, which is the one thing the emitter's static fold cannot do
+  // for an exception (the handler's static class is the one caught).
+  //
+  // ⛔ Not on the typed manifest surface -- CPython has no
+  // BaseException.__class_name__ -- so, like str.__int__, it is reachable only
+  // through the emitter's own op and never appears in the class declaration.
+  func.func @LyBaseException_ClassName(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__class_name__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero_i8 = arith.constant 0 : i8
+    %cap = arith.constant 64 : index
+    %class_id = memref.load %header[%c2] : memref<3xi64>
+    %name_ptr = func.call @exception_class_name(%class_id) : (i64) -> !llvm.ptr
+    // The same bounded copy the repr does: taxonomy names are short ASCII, and
+    // 64 caps a runaway pointer rather than a real name.
+    %buffer = memref.alloca() : memref<64xi8>
+    %true_scan = arith.constant true
+    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+      %in_bounds = arith.cmpi ult, %i, %cap : index
+      %continue = arith.andi %in_bounds, %go : i1
+      scf.condition(%continue) %i, %go : index, i1
+    } do {
+    ^bb0(%i: index, %go: i1):
+      %i_i64 = arith.index_cast %i : index to i64
+      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %byte = llvm.load %slot : !llvm.ptr -> i8
+      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
+      %true_x = arith.constant true
+      %not_nul = arith.xori %is_nul, %true_x : i1
+      scf.if %not_nul {
+        memref.store %byte, %buffer[%i] : memref<64xi8>
+      }
+      %next = arith.addi %i, %c1 : index
+      %kept = arith.select %is_nul, %i, %next : index
+      scf.yield %kept, %not_nul : index, i1
+    }
+    %name_len = arith.index_cast %scan#0 : index to i64
+    %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
+    %name_h, %name_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %name_h, %name_b : memref<2xi64>, memref<?xi8>
+  }
+
   // repr(e) keyed by the DYNAMIC class id in the exception header, so an
   // instance caught through a base-class handler (or a user subclass, once
   // the class hook resolves it) still renders its own class name.

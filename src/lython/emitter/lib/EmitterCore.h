@@ -555,6 +555,7 @@ private:
   widenNumericArgumentsForManifestCall(const parser::Node &expr,
                                        llvm::StringRef binding,
                                        py::CallableType declared);
+  std::optional<Value> tryEmitDynamicClassName(const parser::Node &expr);
   std::optional<Value> tryEmitTypeCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitIsInstanceCall(const parser::Node &expr,

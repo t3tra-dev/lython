@@ -1738,7 +1738,53 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
                             captures);
 }
 
+// ⭐ `type(e).__name__` WHERE THE STATIC CLASS IS NOT THE ANSWER. In an except
+// handler the static class is the one CAUGHT and CPython prints the one RAISED,
+// so the fold `type(x)` uses is unavailable -- and refusing the whole idiom left
+// the commonest use of type() with no spelling at all. An exception instance
+// carries its dynamic class id in its header (it is what the traceback and the
+// repr already read), so this one case has a runtime answer.
+//
+// ⛔ Intercepted BEFORE the receiver is emitted, because `type(...)` on a
+// subclassed static class is refused by tryEmitTypeCall and the refusal would
+// happen first.
+std::optional<Value>
+ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
+  const parser::Node *valueNode = ast::node(expr, "value");
+  if (!valueNode || valueNode->kind != "Call")
+    return std::nullopt;
+  const parser::Node *callee = ast::node(*valueNode, "func");
+  if (!callee || callee->kind != "Name" ||
+      ast::nameSpelling(*callee) != "type" || programBindsName("type"))
+    return std::nullopt;
+  const auto *args = ast::nodeList(*valueNode, "args");
+  const auto *keywords = ast::nodeList(*valueNode, "keywords");
+  if (!args || args->size() != 1 || !args->front() ||
+      args->front()->kind == "Starred" || (keywords && !keywords->empty()))
+    return std::nullopt;
+  mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
+  if (!contract)
+    return std::nullopt;
+  if (!isExceptionContractType(subject) &&
+      !isExceptionBackedClass(contract.getContractName()))
+    return std::nullopt;
+  Value receiver = emitExpr(args->front().get());
+  mlir::Type strType = types.contract("builtins.str");
+  mlir::Type calleeContract =
+      py::CallableType::get(&context, {subject}, {}, {}, {}, {strType});
+  auto op = py::ClassNameOp::create(
+      builder, loc(expr), strType,
+      mlir::FlatSymbolRefAttr::get(&context, "__class_name__"),
+      mlir::TypeAttr::get(calleeContract), receiver.value);
+  return Value{op.getResult(), strType};
+}
+
 Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
+  if (std::optional<std::string_view> dynamicName = ast::string(expr, "attr");
+      dynamicName && *dynamicName == "__name__")
+    if (std::optional<Value> answered = tryEmitDynamicClassName(expr))
+      return *answered;
   Value object = emitExpr(ast::node(expr, "value"));
   auto attr = ast::string(expr, "attr");
   if (!attr)

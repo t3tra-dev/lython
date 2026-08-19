@@ -679,15 +679,17 @@
 # in CPython, so the answer is whether they name the same class. `C is C` was
 # refused too, which is how the exact-class test lost both of its spellings.
 #
-# ⛔ `type(e).__name__` in an except handler stays refused, and correctly: the
-# handler's static class is the one CAUGHT, not the one raised, so folding it
-# would print "Exception" where CPython prints "E". The repair with somewhere to
-# go: the runtime DOES carry the dynamic class id for exceptions
-# (__ly_exception_repr_by_id reads it, exception_class_name maps it), so a
-# BaseException method returning the name would answer this one exactly. What
-# stops it today is that there is no generic "call this named manifest method"
-# op in the emitter -- repr/str/int/float each have their own -- so the method
-# would have to be exposed on the Python surface to be reachable.
+# ⭐ AND THE EXCEPTION CASE, built the same day rather than left. The fold cannot
+# answer it -- a handler's static class is the one CAUGHT and CPython prints the
+# one RAISED -- but an exception instance carries its dynamic class id in its
+# header, which is what the traceback and the repr already read. So
+# `type(e).__name__` lowers to a read of that id: a BaseException
+# `__class_name__` manifest method (off the typed surface, like str.__int__) and
+# a `py.class_name` op beside repr/str/int/float, which is the shape this dialect
+# already uses for "dispatch one named method". A SOURCE exception class has no
+# manifest method of its own, so the receiver is retyped to its exception
+# ancestor first -- the same retyping the print path does, and what keeps a user
+# class answering its own name (NotFound, not AppError).
 #
 # ⛔ `print(C)` (a type object as a printed value) is still refused: "runtime
 # method receiver has no concrete contract".

@@ -22,10 +22,16 @@
 #
 # ⛔ Refused, and both refusals are the point: `type(a)` where the static class
 # has a subclass (the answer would name the static class, which is what CPython
-# would NOT print), and `type(o)` on a type-erased value. The exception idiom
-# `type(e).__name__` falls under the first -- the handler's static class is the
-# one caught, not the one raised -- and the runtime does carry the dynamic class
-# id for exceptions, so that one is a repair with somewhere to go.
+# would NOT print), and `type(o)` on a type-erased value.
+#
+# ⭐ EXCEPT FOR AN EXCEPTION, which is the commonest use of type() and the one
+# the fold cannot answer: a handler's static class is the one CAUGHT and CPython
+# prints the one RAISED. An exception instance carries its dynamic class id in
+# its header -- the traceback and the repr already read it -- so
+# `type(e).__name__` lowers to a read of that id instead of folding. A SOURCE
+# exception class has no manifest method of its own, so the receiver is retyped
+# to its exception ancestor first, which is what keeps a user class answering
+# its own name.
 
 
 class C:
@@ -57,3 +63,29 @@ print(type(5).__name__, type("a").__name__, type(5) is int, type(5) is str)
 print(kind(1), kind("a"))
 print(type([1]).__name__, type({}).__name__, type((1,)).__name__)
 print(type(make()).__name__, calls)
+
+
+class AppError(Exception):
+    pass
+
+
+class NotFound(AppError):
+    pass
+
+
+for key in ["a", "b"]:
+    try:
+        if key == "b":
+            raise NotFound("missing " + key)
+        print(key)
+    except AppError as e:
+        print(type(e).__name__, e)
+
+try:
+    int("x")
+except ValueError as e:
+    print(type(e).__name__)
+try:
+    raise KeyError("k")
+except LookupError as e:
+    print(type(e).__name__, repr(e))
