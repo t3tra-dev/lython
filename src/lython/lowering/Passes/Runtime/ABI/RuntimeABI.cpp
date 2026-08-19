@@ -1574,6 +1574,33 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
       RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
   if (mlir::failed(header))
     return mlir::failure();
+  // ⭐ A SOURCE CLASS ANSWERS WITH THE CLASS IT IS, not the one it is held as.
+  // The prefix below is baked from the STATIC contract, so `x: A = B()` printed
+  // `<__main__.A object at ...>` where CPython prints B -- and nothing could
+  // see it, because the address differs anyway and no output comparison reads
+  // the class name. The id in header word 1 is what the value really is.
+  //
+  // ⛔ Source classes only. A manifest object's header word 1 is not a class id,
+  // and the manifest contracts that reach here have no subclass to be wrong
+  // about.
+  if (RuntimeBundleLowerer::classForContract(object.contract)) {
+    if (std::optional<RuntimeSymbol> dynamic =
+            manifest.primitive("builtins.object", "default_repr_dynamic")) {
+      mlir::FunctionType dynamicType = dynamic->function.getFunctionType();
+      if (dynamicType.getNumInputs() == 1) {
+        mlir::FailureOr<mlir::Value> dynamicHeader =
+            viewRankOneI64Prefix(op, builder, *header, dynamicType.getInput(0),
+                                 "default repr header");
+        if (mlir::failed(dynamicHeader))
+          return mlir::failure();
+        mlir::func::CallOp dynamicCall = RuntimeBundleLowerer::createRuntimeCall(
+            op->getLoc(), *dynamic, mlir::ValueRange{*dynamicHeader});
+        return RuntimeBundleLowerer::bundleRuntimeResults(
+            op, runtimeContractType(context, "builtins.str"), dynamicCall,
+            bundle);
+      }
+    }
+  }
   mlir::FunctionType primitiveType = primitive->function.getFunctionType();
   if (primitiveType.getNumInputs() < 1)
     return primitive->function.emitError()

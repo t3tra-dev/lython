@@ -2575,6 +2575,93 @@ module attributes {
   }
 
   memref.global "private" constant @__ly_class_name_object : memref<6xi8> = dense<[111, 98, 106, 101, 99, 116]>
+  memref.global "private" constant @__ly_repr_prefix_main : memref<10xi8> = dense<[60, 95, 95, 109, 97, 105, 110, 95, 95, 46]>
+  memref.global "private" constant @__ly_repr_prefix_plain : memref<1xi8> = dense<[60]>
+  memref.global "private" constant @__ly_repr_suffix : memref<13xi8> = dense<[32, 111, 98, 106, 101, 99, 116, 32, 97, 116, 32, 48, 120]>
+
+  // ⭐ THE DEFAULT REPR OF A VALUE WHOSE STATIC CLASS IS NOT ITS OWN. The
+  // prefix used to be baked in at compile time from the static contract, so
+  // `x: A = B(); print(x)` printed `<__main__.A object at ...>` where CPython
+  // prints B -- a wrong answer with nothing to diagnose, since the address
+  // differs anyway and no differential can see the class name. The id in header
+  // word 1 says which class it really is.
+  //
+  // ⛔ An unknown id prints `<object object at ...>`, which is what CPython
+  // prints for a bare object(): the table has an entry for every class the
+  // program declares, so a miss means the value is not one of them.
+  func.func @LyObject_DefaultReprDynamic(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c6 = arith.constant 6 : index
+    %c10 = arith.constant 10 : index
+    %c13 = arith.constant 13 : index
+    %c64 = arith.constant 64 : index
+    %zero_i8 = arith.constant 0 : i8
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
+    %ptr = arith.index_cast %ptr_index : index to i64
+    %class_id = memref.load %header[%c1] : memref<2xi64, strided<[1], offset: ?>>
+    %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
+    %buffer = memref.alloca() : memref<128xi8>
+    %null = llvm.mlir.zero : !llvm.ptr
+    %is_null = llvm.icmp "eq" %name_ptr, %null : !llvm.ptr
+    cf.cond_br %is_null, ^unknown, ^known
+
+  ^unknown:
+    %plain = memref.get_global @__ly_repr_prefix_plain : memref<1xi8>
+    %plain_byte = memref.load %plain[%c0] : memref<1xi8>
+    memref.store %plain_byte, %buffer[%c0] : memref<128xi8>
+    %object_name = memref.get_global @__ly_class_name_object : memref<6xi8>
+    scf.for %i = %c0 to %c6 step %c1 {
+      %byte = memref.load %object_name[%i] : memref<6xi8>
+      %slot = arith.addi %i, %c1 : index
+      memref.store %byte, %buffer[%slot] : memref<128xi8>
+    }
+    %unknown_len = arith.constant 7 : index
+    cf.br ^suffix(%unknown_len : index)
+
+  ^known:
+    %main = memref.get_global @__ly_repr_prefix_main : memref<10xi8>
+    scf.for %i = %c0 to %c10 step %c1 {
+      %byte = memref.load %main[%i] : memref<10xi8>
+      memref.store %byte, %buffer[%i] : memref<128xi8>
+    }
+    %true_scan = arith.constant true
+    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+      %in_bounds = arith.cmpi ult, %i, %c64 : index
+      %continue = arith.andi %in_bounds, %go : i1
+      scf.condition(%continue) %i, %go : index, i1
+    } do {
+    ^bb0(%i: index, %go: i1):
+      %i_i64 = arith.index_cast %i : index to i64
+      %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+      %byte = llvm.load %slot : !llvm.ptr -> i8
+      %is_nul = arith.cmpi eq, %byte, %zero_i8 : i8
+      %true_x = arith.constant true
+      %not_nul = arith.xori %is_nul, %true_x : i1
+      scf.if %not_nul {
+        %at = arith.addi %i, %c10 : index
+        memref.store %byte, %buffer[%at] : memref<128xi8>
+      }
+      %next = arith.addi %i, %c1 : index
+      %kept = arith.select %is_nul, %i, %next : index
+      scf.yield %kept, %not_nul : index, i1
+    }
+    %known_len = arith.addi %scan#0, %c10 : index
+    cf.br ^suffix(%known_len : index)
+
+  ^suffix(%len: index):
+    %tail = memref.get_global @__ly_repr_suffix : memref<13xi8>
+    scf.for %i = %c0 to %c13 step %c1 {
+      %byte = memref.load %tail[%i] : memref<13xi8>
+      %slot = arith.addi %i, %len : index
+      memref.store %byte, %buffer[%slot] : memref<128xi8>
+    }
+    %total_index = arith.addi %len, %c13 : index
+    %total = arith.index_cast %total_index : index to i64
+    %buffer_dyn = memref.cast %buffer : memref<128xi8> to memref<?xi8>
+    %h, %b = func.call @__ly_default_repr_from_addr(%ptr, %buffer_dyn, %total) : (i64, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
 
   // ⭐ `type(e).__name__`, keyed by the DYNAMIC class id the way the repr below
   // is: an instance caught through a base-class handler answers the class it

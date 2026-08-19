@@ -656,6 +656,35 @@
 # in three places.
 #
 # ============================================================
+# (53) FIXED: THE DEFAULT REPR NAMED THE CLASS THE VALUE WAS HELD AS.
+# ============================================================
+#     class A: pass
+#     class B(A): pass
+#     x: A = B()
+#     print(x)      # <__main__.A object at 0x...>
+#                   # CPython: <__main__.B object at 0x...>
+#
+# ⭐ FIXED 2026-08-19 (evening), on the class-name table built for
+# type(v).__name__ an hour earlier. The prefix was baked in at compile time from
+# the STATIC contract, so the value reported the class it was HELD as. Nothing
+# could see it: the address differs between runs so no output comparison reads
+# that far, and there was no diagnostic -- the compiler was sure. THIS IS THE
+# SILENT BUCKET, found by writing `print(x)` for a base-typed variable while
+# looking at something else.
+#
+# ⛔ Manifest objects keep the compile-time prefix: their header word 1 is not a
+# class id, and the contracts that reach the default repr have no subclass to be
+# wrong about.
+#
+# ⛔ STILL WRONG, same defect and a different reader: an instance passed through
+# an `object` parameter prints `<object object at ...>`, because that path boxes
+# the value and renders it through the erased manifest dispatch, which reads the
+# BOX rather than the instance header. The box carries a class id too (the
+# release-by-contract hook keys on it), so the same table should answer there.
+#
+# Pinned by tests/golden/cases/default_repr_names_the_real_class.py.
+#
+# ============================================================
 # (52) FIXED: type(x), AND IDENTITY BETWEEN TYPE OBJECTS.
 # ============================================================
 #     print(type(x).__name__)     # unresolved name 'type'
