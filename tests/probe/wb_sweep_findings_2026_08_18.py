@@ -1781,3 +1781,30 @@ them in.
 # Enum iterated and looked up by value, string.maketrans/translate, bisect
 # insort, and io.StringIO.
 
+# ==========================================================================
+# [GAP] generators, two that survive the split-forward fix   FOUND 2026-08-19
+# Four more generator shapes were run once the range+branch refusal was fixed.
+# Two work and are worth naming (a nested double loop yielding a tuple, and an
+# early `return` inside the loop); two do not, and neither is the ownership
+# path:
+#
+# 1. YIELDING A DICT KEY. `for k in d: yield k` inside a generator ->
+#    "source generator next lowering currently supports yields whose runtime
+#    value is a single lane, and '!py.contract<"builtins.str">' has 2".
+#    Yielding a str is NOT the problem -- `yield "a"` works, and so does
+#    `for s in xs: yield s` over a list[str], with or without a branch. It is
+#    the dict-key walk specifically, whose element arrives in two lanes the
+#    suspend cannot carry.
+#
+# 2. A REBOUND EMPTY LIST ACROSS A YIELD.
+#        buf: list[int] = []
+#        buf.append(1)
+#        yield buf
+#        buf = []          <- list[object] here
+#        yield buf
+#    -> "runtime bundle for '!py.union<list[int], list[object]>' has 1 values".
+#    The empty-literal seed that fixes this outside a generator (it takes the
+#    name's declared/flow type) does not reach the rebind inside one, so the two
+#    yields disagree about the element type and the union has no bundle. The
+#    chunking idiom is the shape that hits it.
+
