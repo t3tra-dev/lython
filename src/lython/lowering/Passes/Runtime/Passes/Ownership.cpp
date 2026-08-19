@@ -5116,16 +5116,38 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       // gets a cleanup handler that releases and rethrows. The releases cannot
       // go before the call like the raise-primitive ones -- the call usually
       // returns and the normal path still uses the values.
+      // LYTHON_TRACE_UNWIND_HOLD: print, per (may-raise call, tracked group),
+      // what this pass thinks the token's state is -- 0 Held, 1 NotHeld, 2
+      // Unknown. The verifier prints the same line at its refusal
+      // (AffineOwnership.cpp), so the pair says which group the two models
+      // disagree about, which is the only thing worth knowing when a program is
+      // refused for a cleanup this pass declined to place.
+      static const bool traceUnwindHold =
+          std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
       for (mlir::func::CallOp call : unguardedMayRaiseCalls) {
         UnwindCleanup cleanup{call, /*handler=*/nullptr, call.getOperation(),
                               {}};
         for (const UnwindTrackedGroup &group : groups) {
           if (group.skip || !group.deallocator)
             continue;
-          if (callConsumesGroup(contracts, call, group.values, aliases))
+          if (callConsumesGroup(contracts, call, group.values, aliases)) {
+            if (traceUnwindHold)
+              llvm::errs() << "[unwind] " << function.getSymName() << " call "
+                           << call.getCallee() << " group "
+                           << group.deallocator->contractName << " CONSUMED\n";
             continue; // ownership already moved into the unwinding callee
-          if (groupTokenAtPoint(analysis, group, call.getOperation(),
-                                aliases) != TokenAtPoint::Held)
+          }
+          TokenAtPoint state =
+              groupTokenAtPoint(analysis, group, call.getOperation(), aliases);
+          if (traceUnwindHold)
+            llvm::errs() << "[unwind] " << function.getSymName() << " call "
+                         << call.getCallee() << " op "
+                         << static_cast<const void *>(call.getOperation())
+                         << " group " << group.deallocator->contractName
+                         << " root "
+                         << group.values.front().getAsOpaquePointer()
+                         << " state " << static_cast<int>(state) << "\n";
+          if (state != TokenAtPoint::Held)
             continue;
           cleanup.groups.push_back(&group);
         }

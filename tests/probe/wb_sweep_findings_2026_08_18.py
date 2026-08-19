@@ -1671,19 +1671,35 @@ them in.
 #     at first.
 #   - a while loop with the same branch -> AGREES (w3), which is the workaround.
 #
-# ⭐ WHERE IT IS. The resume clone DOES get marker/anchor wiring: the IR after
-# refcount-insertion has LyEH_TryCallSiteMarker before some may-raise calls and
-# not before others, and the verifier fires on one of the unmarked ones. So this
-# is the insertion pass and the verifier disagreeing about which groups are held
-# at a may-raise call, not a missing phase -- the iterator is a BLOCK ARGUMENT
-# threaded around the loop (^bb4(%5: memref<5xi64>)), and
-# insertUnwindCleanupReleases takes its block-argument groups as a separate
-# input (`blockArgGroups`).
+# ⭐ LOCALISED EXACTLY 2026-08-19, with LYTHON_TRACE_UNWIND_HOLD (added in the
+# same session: the insertion pass prints its per-(call, group) verdict and the
+# verifier prints the group it refuses on, so the pair names the disagreement).
 #
-# ⛔ NOT attempted on 2026-08-19: this is the generator frame, which
-# [[lython-fragile-invariants]] says to write the invariant down before
-# touching, and the round it needs is the one that reconciles the two liveness
-# models rather than a patch on either.
+# THE VERIFIER IS RIGHT, and that is the first thing to know. The call it fires
+# on is the LyLong_FromI64 in the SUSPEND block -- the one that boxes the yielded
+# value just before the resume clone returns. The iterator is transferred out in
+# that return's suspend lanes, so an unwind out of the boxing call leaves the
+# frame with nobody holding it: a real leak on the exception path, not a false
+# refusal about one.
+#
+# WHY NO CLEANUP IS PLACED. At that call NO tracked group answers Held. The
+# producer group (@LyRange_Iter result 0) answers UNKNOWN -- its token moved into
+# the loop's block argument, and the dead-set walk can only say "some paths" --
+# and the block argument that actually carries the iterator INTO the suspend
+# block (^bb13's third argument, the one the return forwards) is not among the
+# tracked groups at all. The pass skips Unknown on purpose: releasing a token it
+# cannot prove held is a double free, which is worse than the leak.
+#
+# So the repair is not "reconcile two models": it is to make the SUSPEND BLOCK's
+# incoming block argument a tracked group, so the pass has something to release
+# on that edge. Every axis below is the same shape reached differently -- the
+# branch is what puts the yield's boxing in a block the producer no longer
+# dominates.
+#
+# ⛔ Still not attempted: this is the generator frame, and
+# [[lython-fragile-invariants]] says to write the invariant down before touching
+# it. What to write first: which values the resume clone owns at each suspend
+# point, and which of them the return transfers.
 
 # ==========================================================================
 # [GAP BATCH] shipped stdlib, ten realistic programs   FOUND 2026-08-19

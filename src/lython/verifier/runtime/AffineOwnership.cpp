@@ -2919,12 +2919,28 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             callInFunctionTopLevelRegion(call) &&
             !walk.guardedByCallSiteMarker(call) &&
             !walk.aliasesAnyRoot(state.group, ambiguousRetainRoots))
+        {
+          // The other half of LYTHON_TRACE_UNWIND_HOLD (see the insertion pass):
+          // this prints the group the verifier believes is held where the pass
+          // placed no cleanup.
+          static const bool traceHold =
+              std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
+          if (traceHold)
+            llvm::errs() << "[verify] holds " << resource.producerLabel
+                         << " at " << call.getCallee() << " op "
+                         << static_cast<const void *>(call.getOperation())
+                         << " group0 "
+                         << (state.group.empty()
+                                 ? static_cast<const void *>(nullptr)
+                                 : state.group.front().getAsOpaquePointer())
+                         << "\n";
           return call.emitError()
                  << "owned resource from " << resource.producerLabel
                  << " result " << resource.resultOffset
                  << " is still owned when a call to '" << call.getCallee()
                  << "' may unwind out of the function; the unwind path "
                     "must release, transfer, or return it";
+        }
       } else if (state.token == AffineTokenState::Released && mentionsTracked &&
                  groupContainsOperand(op, state.group, aliases) &&
                  outstanding() == 0 &&
