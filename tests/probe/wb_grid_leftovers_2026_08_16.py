@@ -676,11 +676,12 @@
 # class id, and the contracts that reach the default repr have no subclass to be
 # wrong about.
 #
-# ⛔ STILL WRONG, same defect and a different reader: an instance passed through
-# an `object` parameter prints `<object object at ...>`, because that path boxes
-# the value and renders it through the erased manifest dispatch, which reads the
-# BOX rather than the instance header. The box carries a class id too (the
-# release-by-contract hook keys on it), so the same table should answer there.
+# ⭐ AND THE ERASED READER, immediately after: an instance passed through an
+# `object` parameter (or held in a list[object]) is boxed and rendered by the
+# manifest dispatch, which reads the BOX -- and the box carries the class id in
+# the same word, so it names the real class too. An int or a str going the same
+# way still prints its own repr, because the hook answers first and only the
+# fallback reaches this.
 #
 # Pinned by tests/golden/cases/default_repr_names_the_real_class.py.
 #

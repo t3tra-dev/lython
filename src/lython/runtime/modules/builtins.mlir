@@ -1129,12 +1129,15 @@ module attributes {
     cf.cond_br %hooked#2, ^done(%hooked#0, %hooked#1 : memref<2xi64>, memref<?xi8>), ^default
 
   ^default:
-    %prefix_static = memref.get_global @__ly_object_repr_prefix : memref<20xi8>
-    %prefix = memref.cast %prefix_static : memref<20xi8> to memref<?xi8>
-    %prefix_len = arith.constant 20 : i64
+    // ⭐ The BOX carries the class id in the same word an instance header does,
+    // so the erased path names the real class too. It used to pass the static
+    // "<object object at 0x" prefix, which is why an instance handed to an
+    // `object` parameter printed <object object ...> where CPython prints its
+    // class -- the same defect the typed path had, read from the box instead of
+    // the header.
     %header_sub = memref.subview %box[0] [2] [1] : memref<16xi64> to memref<2xi64, strided<[1]>>
     %header_view = memref.cast %header_sub : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
-    %dh, %db = func.call @LyObject_DefaultRepr(%header_view, %prefix, %prefix_len) : (memref<2xi64, strided<[1], offset: ?>>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %dh, %db = func.call @LyObject_DefaultReprDynamic(%header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> (memref<2xi64>, memref<?xi8>)
     cf.br ^done(%dh, %db : memref<2xi64>, memref<?xi8>)
 
   ^done(%rh: memref<2xi64>, %rb: memref<?xi8>):

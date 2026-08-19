@@ -23,11 +23,11 @@
 # class id, and the contracts that reach the default repr have no subclass to be
 # wrong about.
 #
-# ⛔ An instance passed through an `object` parameter still prints
-# `<object object at ...>`: that path boxes the value and renders it through the
-# erased manifest dispatch, which reads the BOX rather than the instance header.
-# Same defect, different reader, and it is why this golden does its splitting
-# inline instead of through a helper.
+# The ERASED reader is here too: an instance passed through an `object`
+# parameter, or held in a list[object], is boxed and rendered by the manifest
+# dispatch -- which reads the BOX. The box carries the class id in the same word,
+# so it names the real class as well, and an int or a str going the same way
+# still prints its own repr rather than an address.
 
 
 class A:
@@ -43,9 +43,15 @@ class C:
         self.v = v
 
 
+def erased(v: object) -> str:
+    return str(v).split(" at ")[0]
+
+
 x: A = B()
 y = A()
 z = C(1)
 print(str(x).split(" at ")[0], str(y).split(" at ")[0])
 print(str(z).split(" at ")[0], repr(B()).split(" at ")[0])
 print(type(x).__name__, type(y).__name__)
+print(erased(x), erased(y))
+print(erased(1), erased("s"), erased([1]))
