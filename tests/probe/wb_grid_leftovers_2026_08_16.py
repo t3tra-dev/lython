@@ -656,6 +656,28 @@
 # in three places.
 #
 # ============================================================
+# (55) FIXED: zip(a, b, strict=True).
+# ============================================================
+#     print(list(zip([1, 2], "ab", strict=False)))
+#     # zip() takes no keyword arguments
+#
+# ⭐ FIXED 2026-08-19 (evening). Every keyword was refused, which refused the one
+# Python 3.10 added and tells readers to prefer. False is what zip already does;
+# True adds the length check, and CPython names which argument differs and in
+# which direction -- so the check is per argument, in argument order, and the
+# first mismatch is the one reported. Both messages are matched exactly.
+#
+# ⛔ The flag must be a LITERAL: the two answers are different emitted code, not
+# a different value.
+#
+# ⛔ strict=True needs the FIRST argument to be indexable too, which plain zip
+# does not require of it (it drives the loop with that one and indexes the
+# rest). A leading iterator has no length to compare, and the refusal says so
+# rather than comparing something else.
+#
+# Pinned by tests/golden/cases/zip_strict.py.
+#
+# ============================================================
 # (54) FIXED: hasattr / getattr / callable.
 # ============================================================
 #     print(hasattr(x, "v"))     # unresolved name 'hasattr'

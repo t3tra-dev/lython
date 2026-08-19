@@ -414,8 +414,28 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
 
   // ---- zip(A, B, ...) ------------------------------------------------------
   if (name == "zip") {
-    if (keywords && !keywords->empty())
-      return reject("zip() takes no keyword arguments");
+    // ⭐ `strict=` IS THE MODERN SPELLING (3.10+), and refusing every keyword
+    // refused it too. False is what zip already does; True adds the length
+    // check, and both have to be a LITERAL here because the arms differ in the
+    // code emitted, not in a value.
+    bool strictZip = false;
+    if (keywords && !keywords->empty()) {
+      if (keywords->size() != 1 || !keywords->front())
+        return reject("zip() takes only the `strict` keyword");
+      std::optional<std::string_view> keyword =
+          ast::string(*keywords->front(), "arg");
+      const parser::Node *value = ast::node(*keywords->front(), "value");
+      if (!keyword || *keyword != "strict" || !value)
+        return reject("zip() takes only the `strict` keyword");
+      mlir::Type valueType = types.inferExpr(value);
+      auto literal = mlir::dyn_cast_if_present<py::LiteralType>(valueType);
+      llvm::StringRef spelling = literal ? literal.getSpelling()
+                                         : llvm::StringRef();
+      if (spelling != "True" && spelling != "False")
+        return reject("zip(strict=...) needs a literal True or False: the two "
+                      "answers are different code, not a different value");
+      strictZip = spelling == "True";
+    }
     if (!args || args->size() < 2)
       return reject("zip() in a for loop requires at least two iterables");
     // Drive with the first iterable (CPython pulls arguments left to right,
@@ -428,6 +448,40 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
             "zip() supports one leading iterator; the remaining iterables "
             "must be indexable sequences (list/str/tuple/bytes) — convert "
             "the others with list(...) first");
+
+    // `strict=True` means every input has the same length, and CPython says
+    // which one differs and in which direction. The zip below drives with
+    // argument 1 and indexes the rest, so the check is `len(arg_i) vs
+    // len(arg_1)` in argument order -- the first mismatch is the one CPython
+    // reports.
+    //
+    // ⛔ The driver must be indexable for this, which the indexable-evidence
+    // check above already requires of arguments 2..n but NOT of argument 1: a
+    // leading iterator has no length to compare, so strict is refused there
+    // rather than answered from a length nobody can ask for.
+    llvm::SmallVector<NodePtr, 4> strictChecks;
+    if (strictZip) {
+      if (!hasIndexableEvidence(argAt(0).get()))
+        return reject("zip(strict=True) needs every argument to be an "
+                      "indexable sequence (list/str/tuple/bytes); the leading "
+                      "iterator has no length to compare");
+      for (std::size_t index = 1; index < args->size(); ++index) {
+        std::string longer = "zip() argument " + std::to_string(index + 1) +
+                             " is longer than argument 1";
+        std::string shorter = "zip() argument " + std::to_string(index + 1) +
+                              " is shorter than argument 1";
+        NodePtr driverLength = synth::lenCall(argAt(0), range);
+        NodePtr otherLength = synth::lenCall(argAt(index), range);
+        strictChecks.push_back(synth::ifStmt(
+            synth::compare(synth::lenCall(argAt(index), range), "Gt",
+                           synth::lenCall(argAt(0), range), range),
+            {synth::raiseCall("ValueError", longer, range)}, {}, range));
+        strictChecks.push_back(synth::ifStmt(
+            synth::compare(std::move(otherLength), "Lt",
+                           std::move(driverLength), range),
+            {synth::raiseCall("ValueError", shorter, range)}, {}, range));
+      }
+    }
 
     llvm::SmallVector<std::string, 4> scratchNames;
     std::string indexName = scratch("j");
@@ -464,6 +518,8 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     NodePtr loop =
         synth::forStmt(driverRef, argAt(0), std::move(body), parts->orelse, range);
     runWithScratchNames(scratchNames, [&] {
+      for (const NodePtr &check : strictChecks)
+        emitStatement(*check);
       for (const NodePtr &statementNode : prologue)
         emitStatement(*statementNode);
       emitStatement(*synth::assign(synth::name(indexName, range),
