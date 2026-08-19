@@ -1824,3 +1824,34 @@ them in.
 #    block-argument ones was measured on exactly this program and changed
 #    nothing, so the chain is not what it needs.
 
+# ==========================================================================
+# [CRASH, guarded] `print([A()])` for a class with no __repr__   2026-08-19
+# The container element repr ASSERTS rather than falling back, so a plain class
+# in a list aborts where CPython prints `[<__main__.A object at 0x...>]`:
+#
+#     class A: pass
+#     print([A()])
+#     # repr: boxed element has no conforming __repr__   (abort)
+#
+# ⭐ THE ASSERT IS LOAD-BEARING, and that is the finding. Replacing it with the
+# default-object repr (which now exists, and answers the real class) makes the
+# program SIGSEGV instead: `LyList_Repr + 420`, `ldr x10, [x9]` with x9 = 0xf.
+# Measured down to the cause:
+#   - calling `__ly_repr_boxed_by_contract` and IGNORING its results still
+#     crashes;
+#   - not calling it at all prints `[object]` and exits 0;
+#   - a class WITH fields crashes the same way, so it is not the field layout;
+#   - a class with its own __repr__ never reaches the miss path and is fine.
+# So the fault is in the hook call for a class that misses, and the assert is
+# what has been standing between that call and the code after it. The three
+# call sites are restored.
+#
+# ⛔ Not a repr defect to fix in the repr: whatever the hook dereferences on a
+# miss has to be understood first. `__ly_repr_boxed_by_contract`'s miss path
+# returns ub.poison memrefs plus false, which is where to start -- a poison
+# memref returned by value through the caller's struct is the one thing in that
+# call sequence with no defined content.
+#
+# The dict variants (`repr: boxed dict key/value has no conforming __repr__`)
+# and the exception-args one have the same shape and the same guard.
+

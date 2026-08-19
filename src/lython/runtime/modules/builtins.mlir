@@ -2593,6 +2593,17 @@ module attributes {
   // prints for a bare object(): the table has an entry for every class the
   // program declares, so a miss means the value is not one of them.
   func.func @LyObject_DefaultReprDynamic(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic", ly.runtime.result_contract = "builtins.str"} {
+    %c1_slot = arith.constant 1 : index
+    %ptr_index_outer = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
+    %ptr_outer = arith.index_cast %ptr_index_outer : index to i64
+    %class_id_outer = memref.load %header[%c1_slot] : memref<2xi64, strided<[1], offset: ?>>
+    %h_outer, %b_outer = func.call @__ly_default_repr_dynamic_from_addr(%ptr_outer, %class_id_outer) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h_outer, %b_outer : memref<2xi64>, memref<?xi8>
+  }
+
+  // The address-keyed core, callable from paths that hold only a raw box
+  // pointer (a container rendering its elements).
+  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c6 = arith.constant 6 : index
@@ -2600,9 +2611,6 @@ module attributes {
     %c13 = arith.constant 13 : index
     %c64 = arith.constant 64 : index
     %zero_i8 = arith.constant 0 : i8
-    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
-    %ptr = arith.index_cast %ptr_index : index to i64
-    %class_id = memref.load %header[%c1] : memref<2xi64, strided<[1], offset: ?>>
     %name_ptr = func.call @__ly_source_class_name(%class_id) : (i64) -> !llvm.ptr
     %buffer = memref.alloca() : memref<128xi8>
     %null = llvm.mlir.zero : !llvm.ptr
