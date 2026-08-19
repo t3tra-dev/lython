@@ -1034,13 +1034,46 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       if (!argSource)
         return op.emitError()
                << "exception argument " << (index - 1) << " has no bundle";
+      // ⭐ WHOSE REFERENCE THE BLOCK TAKES depends on what the argument IS, and
+      // the answer has to be read BEFORE this loop emits anything, because
+      // afterwards every argument has the retain and the store among its users.
+      // A temporary (a literal about to be boxed, a freshly built str) has no
+      // other user and hands its one token over. A value that outlives the
+      // raise -- a loop-carried name, a global read back each iteration -- keeps
+      // its own, and taking it was a genuine double free:
+      //
+      //     i = 0
+      //     while i < 5:
+      //         try:
+      //             raise ValueError(i)   <- retained into the block, then the
+      //         except ValueError:        <- SOURCE released, so `i += 1` and
+      //             pass                  <- the loop's own release discharged
+      //         i += 1                    <- one reference twice
+      //
+      // It aborted under --release and the affine verifier refused it otherwise
+      // ("released or transferred more than once on one CFG path"), so the
+      // shape was unreachable rather than wrong -- but the same lowering is what
+      // every `raise E(name)` in a loop goes through.
+      mlir::Value sourceHandle = argSource->physicalValues().empty()
+                                     ? mlir::Value{}
+                                     : argSource->physicalValues().front();
+      bool sourceIsTemporary = !sourceHandle || sourceHandle.use_empty();
       mlir::FailureOr<RuntimeBundle> payload =
           RuntimeBundleLowerer::materializePayloadObjectBundle(op, *argSource);
       if (mlir::failed(payload))
         return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Block *retainBlock = builder.getInsertionBlock();
+      mlir::Operation *retainAnchor = insertionAnchor(builder);
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
               op, *payload, "exception.args")))
         return mlir::failure();
+      // The retain belongs to the EXCEPTION, and saying so is what keeps the
+      // ownership walk finite: a retain with no parent and no local release is
+      // a token the walk carries forward, and around a loop it carries one per
+      // iteration until the state count explodes. It only became unparented
+      // when the source release above stopped firing for non-temporaries.
+      chargeSlotRetainsToParent(builder, retainBlock, retainAnchor, *instance);
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
           RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload);
       if (mlir::failed(words))
@@ -1081,7 +1114,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
           RuntimeBundleLowerer::createRuntimeCall(loc, *setCode, codeOperands);
         }
       }
-      if (payload->objectValue.ownership == ownership::OwnershipKind::Own &&
+      if (sourceIsTemporary &&
+          payload->objectValue.ownership == ownership::OwnershipKind::Own &&
           mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, *payload, "exception.args.source")))
         return mlir::failure();

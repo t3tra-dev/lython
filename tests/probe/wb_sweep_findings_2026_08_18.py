@@ -1964,6 +1964,52 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [BUG] an exception argument that outlives the raise  FOUND + FIXED 2026-08-19
+# Found while leak-gating the non-str argument fix, on the loop the gate itself
+# wanted, and it predates that fix -- the two-argument form has always gone
+# through the same lowering:
+#
+#     i = 0
+#     while i < 5:
+#         try:
+#             raise ValueError(i)     # or ValueError(i, 0), which is older
+#         except ValueError:
+#             pass
+#         i += 1
+#     # owned resource from @LyLong_FromI64 result 0 is released or
+#     # transferred more than once on one CFG path
+#
+# ⭐ IT IS A DOUBLE FREE, not a strict verifier: with --release it aborts. The
+# payload block retains its own reference to each argument AND released the
+# argument's. That pair is exactly right for a TEMPORARY -- one token, nobody
+# else to discharge it -- and wrong for anything that outlives the raise: `i +=
+# 1` releases the old int and the loop's own token releases it again.
+#
+# ⛔ THE PREDICATE IS "does this value already have other users", asked BEFORE
+# the loop emits anything, because afterwards every argument has the retain and
+# the store among its users. It is the same question the sequence-literal path
+# asks with valueIsConsumedOnlyBy; that path has the py-level operand to ask it
+# of, and this one has the lowered handle, which is why the spelling differs.
+#
+# ⛔ DROPPING THE RELEASE ALONE MADE IT WORSE, and the failure named the missing
+# half: `break` inside the handler turned into "ownership CFG exploration
+# exceeded 20000 states (last: retained=1000)". An aggregate retain with no
+# parent and no local release is a token the walk carries forward, one per
+# iteration. chargeSlotRetainsToParent says the retain belongs to the EXCEPTION
+# -- the collection paths already call it, and this one never had to, because
+# the release it no longer emits used to cancel the retain on the spot.
+#
+# ⛔ WHY IT LOOKED LIKE A LOOP BUG: `raise ValueError(i)` outside a loop is fine
+# (the value dies right after), and `for j in range(5)` is fine (j is not
+# rebound by a store that releases the old value). It needs a name that is BOTH
+# reassigned and passed, which is why `while i < n: ... raise E(i) ... i += 1`
+# is the shape and `while n < 5: raise E(i)` is not.
+#
+# Pinned by tests/golden/cases/an_exception_argument_that_outlives_the_raise.py,
+# which reads the argument back out of e.args so a value freed under the block
+# is a read-after-free rather than a leak.
+
+# ==========================================================================
 # [BUG x2] SystemExit's code, both directions          FOUND + FIXED 2026-08-19
 # Found by asking what the non-str exception argument fix above would do to
 # SystemExit, and the answer was "mis-execute", so it was excluded from it for
