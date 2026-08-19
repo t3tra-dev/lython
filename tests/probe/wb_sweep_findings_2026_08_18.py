@@ -1846,6 +1846,12 @@ them in.
 # what has been standing between that call and the code after it. The three
 # call sites are restored.
 #
+# ⛔ AND IT IS HEAP CORRUPTION, not a null dereference: with the fallback in
+# place the abort comes out of libsystem_malloc (rc=134) at both the default and
+# `-jit-codegen-opt=none`, and only turns into a SIGSEGV at `aggressive`. So the
+# optimizer is not the cause -- something on that path frees or writes memory it
+# does not own, and the assert has been preventing it from running at all.
+#
 # ⛔ Not a repr defect to fix in the repr. What is known: the hook has NO ENTRY
 # for the class (dumped the generated dispatch -- A's id 4294967296 appears in
 # the class-NAME table and nowhere in `__ly_repr_boxed_by_contract`), so the miss
