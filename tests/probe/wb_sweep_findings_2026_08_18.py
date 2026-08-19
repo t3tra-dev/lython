@@ -1690,11 +1690,25 @@ them in.
 # tracked groups at all. The pass skips Unknown on purpose: releasing a token it
 # cannot prove held is a double free, which is worse than the leak.
 #
-# So the repair is not "reconcile two models": it is to make the SUSPEND BLOCK's
-# incoming block argument a tracked group, so the pass has something to release
-# on that edge. Every axis below is the same shape reached differently -- the
-# branch is what puts the yield's boxing in a block the producer no longer
-# dominates.
+# THE MISSING GROUP, narrowed further the same evening with the root pointers in
+# the trace: ^bb13's argument -- the one the suspend block's return transfers out
+# -- HAS NO TRACKED GROUP AT ALL. The groups that exist are the loop header's and
+# ^bb7's; the unwind pass gets its block-argument groups from
+# insertOwnedBlockArgumentReleases run analysis-only, and that analysis yields
+# the arguments that need a NORMAL-PATH release. An argument transferred out by a
+# return needs none, so it is never collected -- and it is exactly the one an
+# unwind has to release.
+#
+# ⛔ TWO REPAIRS MEASURED AND REVERTED IN groupTokenAtPoint (the "edge into the
+# point's block" arm):
+#   1. Reading such an edge as "delivered, not killed" fixes all six generator
+#      programs AND turns two goldens into DOUBLE FREES
+#      (except_handler_rebind_carry, method_return_through_try): there the edge
+#      consumes the group and the block's argument belongs to a different one.
+#   2. Narrowing it to "the receiving argument is IN this group" keeps 779/779
+#      green and never fires for the generator, because of the missing group
+#      above. Sound, useless, not shipped.
+# So the repair really is the collection, not the walk.
 #
 # ⛔ Still not attempted: this is the generator frame, and
 # [[lython-fragile-invariants]] says to write the invariant down before touching

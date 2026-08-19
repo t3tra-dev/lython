@@ -3988,6 +3988,12 @@ bool terminatorForwardsGroupToSuccessor(mlir::Operation *terminator,
   return true;
 }
 
+bool traceTokenAtPoint() {
+  static const bool enabled =
+      std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
+  return enabled;
+}
+
 TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
                                const UnwindTrackedGroup &group,
                                mlir::Operation *point,
@@ -4030,6 +4036,21 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
         if (successor == pointBlock) {
           // The dead-token state arrives at the point's block on this edge,
           // but other predecessors may still carry the token.
+          //
+          // ⛔ MEASURED 2026-08-19, twice, because this is where the generator
+          // refusal lands. Answering "delivered, not killed" for every edge
+          // into the point's block turned two goldens into double frees
+          // (except_handler_rebind_carry, method_return_through_try): there the
+          // edge consumes the group and the block's argument belongs to a
+          // different one. Narrowing it to "the receiving argument is IN this
+          // group" is sound but never fires for the shape that needs it -- the
+          // suspend block's argument has no tracked group of its own, which is
+          // the actual gap (see tests/probe/wb_sweep_findings_2026_08_18.py).
+          if (traceTokenAtPoint())
+            llvm::errs() << "[token] root " << root.getAsOpaquePointer()
+                         << " point " << static_cast<const void *>(point)
+                         << " unknown: edge into the point's block from "
+                         << consume->getName() << "\n";
           result = TokenAtPoint::Unknown;
           continue;
         }
@@ -4037,6 +4058,11 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
           continue;
         if (analysis.dominance.dominates(successor, pointBlock))
           return TokenAtPoint::NotHeld;
+        if (traceTokenAtPoint())
+          llvm::errs() << "[token] root " << root.getAsOpaquePointer()
+                       << " point " << static_cast<const void *>(point)
+                       << " unknown: forwarding edge reaches point without "
+                          "dominating it\n";
         result = TokenAtPoint::Unknown;
       }
       continue;
@@ -4061,6 +4087,11 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
     if (consume->getBlock() != pointBlock &&
         analysis.dominance.properlyDominates(consume, point))
       return TokenAtPoint::NotHeld;
+    if (traceTokenAtPoint())
+      llvm::errs() << "[token] root " << root.getAsOpaquePointer() << " point "
+                   << static_cast<const void *>(point) << " unknown: consume "
+                   << consume->getName() << " reaches point without dominating "
+                                            "it\n";
     result = TokenAtPoint::Unknown;
   }
   return result;
@@ -4712,6 +4743,8 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       // Owned groups whose token could be held at an exceptional exit.
       llvm::DenseSet<std::pair<own::Reference, mlir::Value>> seenGroupKeys;
       DeadAfterRaiseCache deadAfterRaise;
+      static const bool traceUnwindHoldGroups =
+          std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
       auto addGroup = [&](const own::ResourceGroup &g) {
         // Only a MINTED reference discriminates here. A received one is the
         // obligation a region merge maps several producers onto, and telling
@@ -4813,6 +4846,13 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         if (g.values.empty())
           continue;
         auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
+        if (traceUnwindHoldGroups)
+          llvm::errs() << "[unwind-arg] " << function.getSymName() << " arg "
+                       << (blockArg ? blockArg.getArgNumber() : 9999u)
+                       << " sameRegion "
+                       << (blockArg && blockArg.getOwner()->getParent() == region)
+                       << " root " << g.values.front().getAsOpaquePointer()
+                       << "\n";
         if (!blockArg || blockArg.getOwner()->getParent() != region)
           continue;
         addGroup(g);
