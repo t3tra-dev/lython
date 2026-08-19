@@ -1152,11 +1152,55 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
         py::CastFromPrimOp::create(builder, loc(expr), types.boolType(), bit);
     return Value{pyBool.getResult(), types.boolType()};
   };
+  // ⛔ AN ERASED object IS THE ONE VALUE THE FOLD BELOW LIES ABOUT. `concrete is
+  // None` is decided at compile time because None is a singleton and a concrete
+  // type is never it -- but `builtins.object` is not a type, it is the absence
+  // of one, and a slot of a list[object] holds None as readily as anything
+  // else. `xs[1] is None` answered False. It used to abort before printing it,
+  // which is why the wrong answer only became visible once the None box was
+  // repaired.
+  //
+  // ⛔ Asked through the ordinary method table rather than a private op: the
+  // dispatch, the bundle and the ownership all come from the path every other
+  // manifest method already takes.
+  auto emitErasedNoneTest = [&](Value candidate,
+                                Value other) -> std::optional<Value> {
+    if (!isNoneTypeLike(other.type) ||
+        types.widenLiteral(candidate.type) != types.object())
+      return std::nullopt;
+    CallInferenceResult inference = types.inferMethodCallWithEvidence(
+        types.object(), "__ly_is_none__", {});
+    if (!inference)
+      return std::nullopt;
+    Value posPack = emitPack({});
+    Value namePack = emitPack({});
+    Value valuePack = emitPack({});
+    auto call = py::CallOp::create(
+        builder, loc(expr), mlir::TypeRange{inference.resultType},
+        callProtocolFor(inference), candidate.value, posPack.value,
+        namePack.value, valuePack.value);
+    call->setAttr("ly.bound_method",
+                  builder.getStringAttr("__ly_is_none__"));
+    Value tested{call.getResults().front(), inference.resultType};
+    if (!ast::isOperator(op, "IsNot"))
+      return tested;
+    mlir::Value bit = emitBoolValue(tested, expr);
+    auto one = mlir::arith::ConstantIntOp::create(builder, loc(expr), 1, 1);
+    mlir::Value flipped =
+        mlir::arith::XOrIOp::create(builder, loc(expr), bit, one);
+    auto pyBool = py::CastFromPrimOp::create(builder, loc(expr),
+                                             types.boolType(), flipped);
+    return Value{pyBool.getResult(), types.boolType()};
+  };
   if (ast::isOperator(op, "Is") || ast::isOperator(op, "IsNot")) {
     if (auto narrowed = emitNoneIdentityTest(lhs, rhs))
       return *narrowed;
     if (auto narrowed = emitNoneIdentityTest(rhs, lhs))
       return *narrowed;
+    if (auto erased = emitErasedNoneTest(lhs, rhs))
+      return *erased;
+    if (auto erased = emitErasedNoneTest(rhs, lhs))
+      return *erased;
     // Identity against None is static once no union is involved: None is a
     // singleton, so `concrete is None` folds to False (True under `is not`).
     bool negatedIdentity = ast::isOperator(op, "IsNot");

@@ -84,7 +84,7 @@ module attributes {
     ly.typing.abstract,
     method_names = ["__init__", "__new__", "__repr__", "__str__", "__bool__",
                     "__eq__", "__ne__", "__hash__", "__getattribute__",
-                    "__setattr__", "__delattr__"],
+                    "__setattr__", "__delattr__", "__ly_is_none__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.object">>] -> [!py.self]>,
@@ -96,11 +96,19 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.object">, !py.contract<"builtins.str">] -> [!py.contract<"typing.Any">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.object">, !py.contract<"builtins.str">, !py.contract<"typing.Any">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.object">, !py.contract<"builtins.str">] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.contract<"builtins.object">, !py.contract<"builtins.str">] -> [!py.literal<None>]>,
+      // ⛔ NOT A CPython DUNDER, and it is on object because that is the only
+      // class whose values can be None without the type saying so. `x is None`
+      // is a compile-time fold everywhere else -- None is a singleton, so a
+      // concrete type is never it -- and an ERASED object is the one place the
+      // fold is a lie. The emitter reaches this by name; a program that writes
+      // `x.__ly_is_none__()` gets the same answer, which is the price of
+      // routing it through the ordinary method table instead of a private op.
+      !py.protocol<"Callable", [!py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "classmethod", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @type attributes {
@@ -1198,6 +1206,20 @@ module attributes {
   // disagree -- and a subclass that does define __eq__/__hash__ is still
   // reached, because those dispatchers consult the per-class-id hook before
   // falling back to identity (CPython's object.__eq__ / object.__hash__).
+  // None inside an erased box: sixteen zero words, so no payload class and no
+  // entity. Every other value in a box has at least one of the two.
+  func.func @LyObject_IsNone(%box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__ly_is_none__"} {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %class_id = memref.load %box[%c1] : memref<16xi64>
+    %entity = memref.load %box[%c2] : memref<16xi64>
+    %no_class = arith.cmpi eq, %class_id, %zero : i64
+    %no_entity = arith.cmpi eq, %entity, %zero : i64
+    %is_none = arith.andi %no_class, %no_entity : i1
+    func.return %is_none : i1
+  }
+
   func.func @LyObject_BoxedEq(%lhs: memref<16xi64>, %rhs: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__eq__"} {
     %lhs_idx = memref.extract_aligned_pointer_as_index %lhs : memref<16xi64> -> index
     %lhs_word = arith.index_cast %lhs_idx : index to i64
@@ -18408,11 +18430,22 @@ module attributes {
       %owned_slot = arith.constant 14 : index
       %hash_slot = arith.constant 15 : index
       memref.store %one, %box[%refcount_slot] : memref<16xi64>
-      memref.store %one, %box[%owned_slot] : memref<16xi64>
       memref.store %zero, %box[%hash_slot] : memref<16xi64>
       %entity_slot = arith.constant 2 : index
       %entity = memref.load %box[%entity_slot] : memref<16xi64>
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
+      // ⛔ THE OWNED FLAG HAS TO SAY WHAT THE RETAIN ABOVE DID. It was stored
+      // as 1 unconditionally, and the retain skips a null or tagged entity, so
+      // a slot holding None -- sixteen zero words -- came back as a box that
+      // owed a release it had never taken. release_payload_slot_ptr then
+      // dispatched __ly_release_boxed_by_contract on class id 0 and
+      // `print(xs[0])` for `xs: list[object] = [None]` aborted in Ly_DecRef.
+      %null_entity = arith.cmpi eq, %entity, %zero : i64
+      %entity_tag = arith.andi %entity, %one : i64
+      %tagged_entity = arith.cmpi eq, %entity_tag, %one : i64
+      %retain_skipped = arith.ori %null_entity, %tagged_entity : i1
+      %owned_flag = arith.select %retain_skipped, %zero, %one : i64
+      memref.store %owned_flag, %box[%owned_slot] : memref<16xi64>
     } else {
       scf.for %w = %c0 to %c16 step %c1 {
         memref.store %zero, %box[%w] : memref<16xi64>

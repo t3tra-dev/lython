@@ -468,8 +468,19 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
   mlir::Value zero = constantI64(builder, loc, 0);
+  // ⛔ WORD 0 IS A REFCOUNT EVEN WHEN THERE IS NOTHING TO COUNT. None's handle
+  // is otherwise all zeros -- no class, no payload pointer, and word 14 says
+  // the slot owns nothing -- but a STANDALONE box (an `object` argument, not a
+  // container slot) keeps its own refcount there, and LyObject_DecRef read the
+  // zero as "already dead": `def f(v: object) -> int: return 1` called with
+  // None aborted in Ly_DecRef without the body touching v. A slot does not read
+  // word 0 at all, and LyObject_FromSlot overwrites it with 1 on the way out,
+  // so the two uses agree on 1 and disagreed only on 0.
+  mlir::Value one = constantI64(builder, loc, 1);
   auto emptyHandle = [&]() {
-    return llvm::SmallVector<mlir::Value, 4>(kPayloadHandleWords, zero);
+    llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
+    words[0] = one;
+    return words;
   };
 
   const RuntimeBundle *concrete =

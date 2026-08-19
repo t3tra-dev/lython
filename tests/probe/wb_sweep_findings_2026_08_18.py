@@ -1964,6 +1964,49 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [BUG x3] None inside an erased object                FOUND + FIXED 2026-08-20
+# The two neighbours the erased-comparison entry below recorded turned out to be
+# one defect in two halves, plus a third that only became visible once they were
+# fixed. All three are the same value: None where the static type is `object`.
+#
+#     xs: list[object] = [1, None]
+#     print(xs[1])              # Ly_DecRef observed non-positive refcount
+#     def f(v: object) -> int: return 1
+#     print(f(None))            # the same abort, and the body never reads v
+#
+# ⭐ NONE'S PAYLOAD HANDLE IS SIXTEEN ZEROS, and two of them were read as
+# something they were not:
+#
+# 1. WORD 0 IS A REFCOUNT when the handle is a standalone BOX rather than a
+#    container slot. objectPayloadHandleWords returns an all-zero handle for
+#    NoneType, so LyObject_DecRef read the zero as "already dead". A slot never
+#    reads word 0 and LyObject_FromSlot overwrites it with 1 on the way out, so
+#    the two uses agreed on 1 and disagreed only on 0. This is the half that
+#    made `f(None)` abort with an untouched parameter -- which is what named it,
+#    because a body that never reads v cannot be where the release comes from.
+#
+# 2. THE OWNED FLAG HAS TO SAY WHAT THE RETAIN DID. LyObject_FromSlot stamped
+#    word 14 to 1 unconditionally, and the retain beside it skips a null or
+#    tagged entity, so a box read out of a None slot owed a release it had never
+#    taken. release_payload_slot_ptr then dispatched
+#    __ly_release_boxed_by_contract on class id 0.
+#
+# 3. `x is None` ON AN ERASED VALUE WAS A COMPILE-TIME FOLD, and answered False.
+#    The fold is right for every other type -- None is a singleton, so a
+#    concrete type is never it -- and `object` is not a type but the absence of
+#    one. It could only be SEEN after (1) and (2): before them the program
+#    aborted before printing the wrong answer, which is the argument for fixing
+#    a crash before trusting the value beside it.
+#
+#    ⛔ Answered by a manifest method (__ly_is_none__ on builtins.object,
+#    reached through the ordinary bound-method path) rather than a private op,
+#    so the dispatch, the bundle and the ownership all come from the path every
+#    other manifest method already takes. The cost is that a program can write
+#    `x.__ly_is_none__()` and get the same answer.
+#
+# Pinned by tests/golden/cases/none_inside_an_erased_object.py.
+
+# ==========================================================================
 # [GAP] an erased value compared to a literal          FOUND + FIXED 2026-08-19
 # Found chasing `e.args[0] == "x"`, which is refused, and the refusal turned out
 # to have nothing to do with exceptions: it is every read out of a list[object],
@@ -1996,18 +2039,7 @@ them in.
 #
 # Pinned by tests/golden/cases/an_erased_value_compared_to_a_literal.py.
 #
-# ⛔ TWO NEIGHBOURS FOUND AND NOT FIXED, both pre-existing (measured against the
-# pre-fix binary):
-#
-# 1. A None IN AN ERASED CONTAINER ABORTS, with no comparison in it at all:
-#    `xs: list[object] = [1, None]; print(xs[1])` -> "Ly_DecRef observed
-#    non-positive refcount". None's box has no header to refcount and something
-#    on the read path decrefs it anyway.
-#
-# 2. `str(v)` ON AN object PARAMETER ABORTS the same way: `def f(v: object) ->
-#    str: return str(v)` called with 1, "a" and None. Same signature as (1) and
-#    likely the same release, but it is a different path (the boxed __str__
-#    dispatcher, not a container read) and neither is diagnosed.
+# ⛔ TWO NEIGHBOURS FOUND HERE were fixed next; see the entry below.
 
 # ==========================================================================
 # [BUG] an exception argument that outlives the raise  FOUND + FIXED 2026-08-19
