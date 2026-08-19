@@ -42,7 +42,33 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionTargetRuntimeSources(
   closureSources.reserve(callable.closureValues.size());
   for (auto [index, closureValue] : llvm::enumerate(callable.closureValues)) {
     mlir::Type expected = closureTypes[index];
-    if (!py::isAssignableTo(closureValue.contract, expected, op.getOperation()))
+    // ⭐ A CAPTURED FUNCTION ARRIVES ERASED. The closure slot's declared type
+    // is the emitter's precise `!py.callable<...>`, while the VALUE carried in
+    // a function object is `builtins.function` -- the one physical shape every
+    // function value has, which is also why calling a callable-typed PARAMETER
+    // works. Comparing the two by assignability refused the capture, which is
+    // the wrapper-closure idiom and therefore every decorator:
+    //
+    //     def wrap(fn: Callable[[int], int]) -> Callable[[int], int]:
+    //         def inner(n: int) -> int:
+    //             return fn(n)
+    //         return inner
+    //
+    //     # function target wrap$inner closure 0 has contract
+    //     # '!py.contract<"builtins.function">', expected '!py.callable<...>'
+    //
+    // ⛔ The emitter has already checked the capture against the declared type;
+    // this is the ABI's own check, and the ABI's question is whether the values
+    // fit the slot. Only this one direction is allowed -- an erased function
+    // into a callable slot -- so nothing else loses its check.
+    bool erasedFunctionIntoCallable = false;
+    if (mlir::isa<py::CallableType>(expected))
+      if (auto actual = mlir::dyn_cast_if_present<py::ContractType>(
+              closureValue.contract))
+        erasedFunctionIntoCallable =
+            actual.getContractName() == "builtins.function";
+    if (!erasedFunctionIntoCallable &&
+        !py::isAssignableTo(closureValue.contract, expected, op.getOperation()))
       return op.emitError()
              << "function target " << targetName << " closure " << index
              << " has contract " << closureValue.contract << ", expected "

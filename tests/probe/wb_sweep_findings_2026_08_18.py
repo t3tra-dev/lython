@@ -1891,6 +1891,44 @@ them in.
 # fixpoint does not cover at all.
 
 # ==========================================================================
+# [BUG] a closure that captures a FUNCTION            FOUND + FIXED 2026-08-19
+# Found while scoping the decorator feature above, and it is the third half of
+# it: what `@deco` desugars to is exactly this program, written by hand.
+#
+#     def wrap(fn: Callable[[int], int]) -> Callable[[int], int]:
+#         def inner(n: int) -> int:
+#             return fn(n)
+#         return inner
+#
+#     # function target wrap$inner$1$5_4 closure 0 has contract
+#     # '!py.contract<"builtins.function">', expected
+#     # '!py.callable<[int], returns=[int]>'
+#
+# ⭐ THE ASYMMETRY IS THE WHOLE DIAGNOSIS: capturing an INT worked (`adder(10)`
+# returning an inner that adds k), and CALLING a callable-typed parameter worked
+# (`apply(fn, n)`). Only the two together failed. A function value has one
+# physical shape in this ABI, `builtins.function` -- which is why the call
+# through a parameter works at all -- while the closure SLOT's declared type is
+# the emitter's precise callable, taken from the annotation. FunctionTargetCalls
+# compared the erased value against the precise slot with isAssignableTo and
+# refused. Relaxed in exactly that one direction, with the comment saying why.
+#
+# ⛔ NOT A HOLE IN THE CHECKING, and this was measured both ways: `wrap(shout)`
+# with `shout: Callable[[str], str]` is still refused, at the EMITTER, with
+# "call arguments do not match the Callable contract" -- and so is an inner that
+# calls the captured fn with the wrong arity. The lowering was re-asking a
+# question the emitter had already answered, at a point where the answer had
+# been erased; only that re-ask is relaxed.
+#
+# Pinned by tests/golden/cases/closure_captures_a_function.py -- twice() calls
+# the captured function twice and compose() threads two of them, which
+# distinguishes "the right function was captured" from "a function was".
+#
+# ⛔ The decorator SYNTAX is still refused (half two above). This closes the
+# thing that would have made the desugar produce a program that does not
+# compile, so that entry now has one fewer unknown rather than one fewer half.
+
+# ==========================================================================
 # [GAP x2] exceptions, from a four-program probe            FOUND 2026-08-19
 # Two of four ordinary exception programs do not compile; the other two (a
 # two-argument ValueError read through e.args, and a user class calling
