@@ -3,3 +3,5 @@
 B A
 <__main__.B object <__main__.A object
 1 s [1]
+[<__main__.A object] (<__main__.A object
+{'k': <__main__.A object} {<__main__.A object}

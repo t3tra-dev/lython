@@ -23,6 +23,15 @@
 # class id, and the contracts that reach the default repr have no subclass to be
 # wrong about.
 #
+# A CONTAINER of such instances used to ABORT -- "repr: boxed element has no
+# conforming __repr__" -- because the element dispatch asserted instead of
+# falling back. It falls back now, and what stood in the way was not the repr:
+# the fallback helper returns an OWNED result, and a hand-written manifest
+# helper without any ly.runtime.* attribute is treated as USER code by the
+# refcount pass, which inserted a release for the hook result on the path that
+# does not use it. The hook's miss returns poison, so that release freed
+# garbage and the program aborted inside malloc.
+#
 # The ERASED reader is here too: an instance passed through an `object`
 # parameter, or held in a list[object], is boxed and rendered by the manifest
 # dispatch -- which reads the BOX. The box carries the class id in the same word,
@@ -55,3 +64,5 @@ print(str(z).split(" at ")[0], repr(B()).split(" at ")[0])
 print(type(x).__name__, type(y).__name__)
 print(erased(x), erased(y))
 print(erased(1), erased("s"), erased([1]))
+print(str([A()]).split(" at ")[0] + "]", str((A(), 1)).split(" at ")[0])
+print(str({"k": A()}).split(" at ")[0] + "}", str({A()}).split(" at ")[0] + "}")

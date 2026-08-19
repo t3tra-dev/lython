@@ -1825,45 +1825,36 @@ them in.
 #    nothing, so the chain is not what it needs.
 
 # ==========================================================================
-# [CRASH, guarded] `print([A()])` for a class with no __repr__   2026-08-19
-# The container element repr ASSERTS rather than falling back, so a plain class
-# in a list aborts where CPython prints `[<__main__.A object at 0x...>]`:
+# [FIXED 2026-08-19] `print([A()])` for a class with no __repr__
+# The container element repr ASSERTED rather than falling back, so a plain class
+# in a list aborted where CPython prints `[<__main__.A object at 0x...>]`. The
+# fallback exists now (the default repr, which names the real class), and what
+# stood in the way was NOT the repr.
 #
-#     class A: pass
-#     print([A()])
-#     # repr: boxed element has no conforming __repr__   (abort)
+# ⭐ THE CAUSE, found by reading the emitted LLVM IR of the fallback helper: a
+# hand-written manifest helper that returns an OWNED result but carries no
+# `ly.runtime.*` attribute is NOT a manifest function to
+# `own::isRuntimeManifestFunction`, so the refcount pass treats it as USER code
+# and inserts a release for the hook result on the path that does not use it.
+# The hook's miss returns `ub.poison`, so that release freed garbage --
+# `call void @LyUnicode_DecRef(...)` right at the top of the fallback block --
+# and the program aborted inside malloc. Adding the attributes fixes it; the
+# assert had been standing between that call and the corruption.
 #
-# ⭐ THE ASSERT IS LOAD-BEARING, and that is the finding. Replacing it with the
-# default-object repr (which now exists, and answers the real class) makes the
-# program SIGSEGV instead: `LyList_Repr + 420`, `ldr x10, [x9]` with x9 = 0xf.
-# Measured down to the cause:
-#   - calling `__ly_repr_boxed_by_contract` and IGNORING its results still
-#     crashes;
-#   - not calling it at all prints `[object]` and exits 0;
-#   - a class WITH fields crashes the same way, so it is not the field layout;
-#   - a class with its own __repr__ never reaches the miss path and is fine.
-# So the fault is in the hook call for a class that misses, and the assert is
-# what has been standing between that call and the code after it. The three
-# call sites are restored.
+# The four measurements that got there, kept because each one ruled something
+# out: calling the hook and IGNORING its results still crashed (so it was not
+# the results), not calling it at all printed and exited 0, a class with fields
+# crashed the same way (not the field layout), and the abort came from
+# libsystem_malloc at `-jit-codegen-opt=none` as well as at the default (so not
+# the optimizer exploiting poison).
 #
-# ⛔ AND IT IS HEAP CORRUPTION, not a null dereference: with the fallback in
-# place the abort comes out of libsystem_malloc (rc=134) at both the default and
-# `-jit-codegen-opt=none`, and only turns into a SIGSEGV at `aggressive`. So the
-# optimizer is not the cause -- something on that path frees or writes memory it
-# does not own, and the assert has been preventing it from running at all.
-#
-# ⛔ Not a repr defect to fix in the repr. What is known: the hook has NO ENTRY
-# for the class (dumped the generated dispatch -- A's id 4294967296 appears in
-# the class-NAME table and nowhere in `__ly_repr_boxed_by_contract`), so the miss
-# path runs and returns ub.poison memrefs plus false. The faulting instruction is
-# `ldr x10, [x9]` followed by `cmp x10, x19` -- a load-and-compare, not a string
-# build -- and it disappears when the call is removed, which also lets the
-# caller's `load box[1]` be dead-code-eliminated. So the next step is to find
-# which of the two (the argument load or the poison return) the optimizer is
-# exploiting, with -O0 codegen and the LLVM IR side by side.
-#
-# The dict variants (`repr: boxed dict key/value has no conforming __repr__`)
-# and the exception-args one have the same shape and the same guard.
+# ⛔ SIXTY-FOUR OTHER HELPERS have the same shape -- owned results, no
+# ly.runtime.* attribute -- across builtins/_io/asyncio/lyrt/unicodedata. They
+# work today because they use their results on every path, but each is one
+# unused path away from the same corruption, and marking them all is NOT a safe
+# sweep: some may rely on the pass's insertion, so removing it would leak. The
+# scan is one `grep` (owned_results without ly.runtime.*), and a round that
+# wants to close this should measure each one rather than annotate them all.
 
 # ==========================================================================
 # [GAP] a user-defined decorator                             FOUND 2026-08-19

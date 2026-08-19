@@ -1144,6 +1144,25 @@ module attributes {
     func.return %rh, %rb : memref<2xi64>, memref<?xi8>
   }
 
+  // ⛔ THE ly.runtime.* ATTRIBUTES ARE LOAD-BEARING, not decoration:
+  // `isRuntimeManifestFunction` keys on them, and a helper without one is
+  // treated as USER code by the refcount pass -- which then inserts a release
+  // for the hook result on the path that does not use it. The hook's miss
+  // returns ub.poison, so that release freed garbage and the program aborted in
+  // malloc. Every hand-written helper that returns an OWNED result needs one.
+  func.func private @__ly_repr_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "repr_boxed_or_default", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+    cf.cond_br %ok, ^hooked, ^fallback
+
+  ^hooked:
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+
+  ^fallback:
+    %addr = llvm.ptrtoint %box_ptr : !llvm.ptr to i64
+    %dh, %db = func.call @__ly_default_repr_dynamic_from_addr(%addr, %class_id) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %dh, %db : memref<2xi64>, memref<?xi8>
+  }
+
   func.func private @__ly_str_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>, i1)
 
   // str() of an erased object box (print's conversion): classes with a
@@ -2603,7 +2622,7 @@ module attributes {
 
   // The address-keyed core, callable from paths that hold only a raw box
   // pointer (a container rendering its elements).
-  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_default_repr_dynamic_from_addr(%ptr: i64, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_dynamic_addr", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c6 = arith.constant 6 : index
@@ -19824,8 +19843,7 @@ module attributes {
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_id = llvm.load %class_gep : !llvm.ptr -> i64
-      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
-      cf.assert %ok, "repr: boxed element has no conforming __repr__"
+      %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%erh) : (memref<2xi64>) -> ()
@@ -19880,8 +19898,7 @@ module attributes {
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_id = llvm.load %class_gep : !llvm.ptr -> i64
-      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
-      cf.assert %ok, "repr: boxed element has no conforming __repr__"
+      %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%erh) : (memref<2xi64>) -> ()
@@ -19989,8 +20006,7 @@ module attributes {
         %kbox = llvm.getelementptr %keys_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %kclass_gep = llvm.getelementptr %kbox[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %kclass = llvm.load %kclass_gep : !llvm.ptr -> i64
-        %krh, %krb, %kok = func.call @__ly_repr_boxed_by_contract(%kbox, %kclass) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
-        cf.assert %kok, "repr: boxed dict key has no conforming __repr__"
+        %krh, %krb = func.call @__ly_repr_boxed_or_default(%kbox, %kclass) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
         %k1h, %k1b = func.call @LyUnicode_Concat(%sep#0, %sep#1, %krh, %krb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
         func.call @LyUnicode_DecRef(%krh) : (memref<2xi64>) -> ()
@@ -20005,8 +20021,7 @@ module attributes {
         %vbox = llvm.getelementptr %values_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %vclass_gep = llvm.getelementptr %vbox[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %vclass = llvm.load %vclass_gep : !llvm.ptr -> i64
-        %vrh, %vrb, %vok = func.call @__ly_repr_boxed_by_contract(%vbox, %vclass) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
-        cf.assert %vok, "repr: boxed dict value has no conforming __repr__"
+        %vrh, %vrb = func.call @__ly_repr_boxed_or_default(%vbox, %vclass) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
         %k3h, %k3b = func.call @LyUnicode_Concat(%k2h, %k2b, %vrh, %vrb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%k2h) : (memref<2xi64>) -> ()
         func.call @LyUnicode_DecRef(%vrh) : (memref<2xi64>) -> ()
@@ -20064,8 +20079,7 @@ module attributes {
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_id = llvm.load %class_gep : !llvm.ptr -> i64
-      %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
-      cf.assert %ok, "repr: boxed element has no conforming __repr__"
+      %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%erh) : (memref<2xi64>) -> ()
