@@ -744,6 +744,13 @@
 # subject must be a NAME (the chain mentions it once per member), and every
 # member must be exact, which is the same subclass question asked per member.
 #
+# ⭐ AND THE TWO OTHER SPELLINGS OF THE SAME QUESTION: `x.__class__` (which
+# reached the FIELD lookup and reported "class C has no field '__class__'") is
+# rewritten to `type(x)` and takes the same road, dynamic read included; and
+# `type(a) == type(b)` folds like the `is` spelling, because a class has exactly
+# one type object and a reader picks either. `==` had reached the manifest
+# dispatch: "!py.type<...> does not provide manifest method '__eq__'".
+#
 # ⛔ `type(v) is B` for a subclassed static class stays refused, and correctly:
 # the type OBJECT would have to be a runtime value, which is a different
 # mechanism from the name. `print(C)` (a type object as a printed value) is

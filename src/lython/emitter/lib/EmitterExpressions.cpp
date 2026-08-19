@@ -1116,6 +1116,23 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
         rhs = emitIntFromBool(expr, rhs);
     }
   }
+  // ⭐ `type(a) == type(b)` IS `type(a) is type(b)`: a class has exactly one
+  // type object, so equality on two of them is which classes they name, and the
+  // `is` spelling already folds that way. Without this the == reached the
+  // manifest dispatch and reported "!py.type<...> does not provide manifest
+  // method '__eq__'", which is true and useless -- the two spellings are the
+  // same question and a reader picks either.
+  if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
+    if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
+      if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
+        bool same = lhsType.getInstanceType() == rhsType.getInstanceType();
+        bool truth = ast::isOperator(op, "NotEq") ? !same : same;
+        mlir::Type literalType = types.literal(truth ? "True" : "False");
+        auto constant = py::BoolConstantOp::create(
+            builder, loc(expr), literalType, builder.getBoolAttr(truth));
+        return Value{constant.getResult(), literalType};
+      }
+  }
   auto emitNoneIdentityTest = [&](Value candidate,
                                   Value other) -> std::optional<Value> {
     auto unionType = mlir::dyn_cast_if_present<py::UnionType>(candidate.type);
@@ -1751,16 +1768,38 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
 std::optional<Value>
 ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   const parser::Node *valueNode = ast::node(expr, "value");
-  if (!valueNode || valueNode->kind != "Call")
+  if (!valueNode)
     return std::nullopt;
-  const parser::Node *callee = ast::node(*valueNode, "func");
-  if (!callee || callee->kind != "Name" ||
-      ast::nameSpelling(*callee) != "type" || programBindsName("type"))
+  // ⭐ `x.__class__` IS `type(x)` -- CPython's two spellings of one question --
+  // so both reach here, and the one written as an attribute is not a field
+  // lookup ("class C has no field '__class__'").
+  std::vector<parser::NodePtr> classAttrArgument;
+  const std::vector<parser::NodePtr> *args = nullptr;
+  if (valueNode->kind == "Attribute") {
+    std::optional<std::string_view> attribute = ast::string(*valueNode, "attr");
+    if (!attribute || *attribute != "__class__")
+      return std::nullopt;
+    if (const parser::Field *field = parser::findField(*valueNode, "value"))
+      if (const auto *held = std::get_if<parser::NodePtr>(&field->value);
+          held && *held)
+        classAttrArgument.push_back(*held);
+    if (classAttrArgument.empty())
+      return std::nullopt;
+    args = &classAttrArgument;
+  } else if (valueNode->kind == "Call") {
+    const parser::Node *callee = ast::node(*valueNode, "func");
+    if (!callee || callee->kind != "Name" ||
+        ast::nameSpelling(*callee) != "type" || programBindsName("type"))
+      return std::nullopt;
+    args = ast::nodeList(*valueNode, "args");
+    const auto *keywords = ast::nodeList(*valueNode, "keywords");
+    if (!args || args->size() != 1 || !args->front() ||
+        args->front()->kind == "Starred" || (keywords && !keywords->empty()))
+      return std::nullopt;
+  } else {
     return std::nullopt;
-  const auto *args = ast::nodeList(*valueNode, "args");
-  const auto *keywords = ast::nodeList(*valueNode, "keywords");
-  if (!args || args->size() != 1 || !args->front() ||
-      args->front()->kind == "Starred" || (keywords && !keywords->empty()))
+  }
+  if (!args || args->size() != 1 || !args->front())
     return std::nullopt;
   mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
   // ⭐ A UNION KNOWS ITS MEMBERS, and the value carries which one it is -- so
@@ -1857,6 +1896,21 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       dynamicName && *dynamicName == "__name__")
     if (std::optional<Value> answered = tryEmitDynamicClassName(expr))
       return *answered;
+  // `x.__class__` is `type(x)`, so it takes the same road: the fold when the
+  // static class is exact, and the same refusal when it is not. Reaching the
+  // field lookup instead reported "class C has no field '__class__'", which is
+  // true of the storage and beside the point.
+  if (std::optional<std::string_view> attribute = ast::string(expr, "attr");
+      attribute && *attribute == "__class__" && !programBindsName("type"))
+    if (const parser::Field *field = parser::findField(expr, "value"))
+      if (const auto *subject = std::get_if<parser::NodePtr>(&field->value);
+          subject && *subject) {
+        parser::NodePtr call =
+            synth::call(synth::name(std::string("type"), expr.range),
+                        std::vector<parser::NodePtr>{*subject}, expr.range);
+        synthesizedIteratorDefs.push_back(call);
+        return emitExpr(call.get());
+      }
   Value object = emitExpr(ast::node(expr, "value"));
   auto attr = ast::string(expr, "attr");
   if (!attr)

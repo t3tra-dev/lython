@@ -27,6 +27,11 @@
 # come from paths that already exist. The subject has to be a NAME, because the
 # chain mentions it once per member.
 #
+# `x.__class__` is the same question spelled as an attribute, so it takes the
+# same road -- including the dynamic read for a subclassed class -- and
+# `type(a) == type(b)` folds like the `is` spelling, because a class has exactly
+# one type object and a reader picks either.
+#
 # ⛔ Refused, and the refusal is the point: `type(o)` on a type-erased value, and
 # `type(v) is B` where the static class has a subclass -- the type OBJECT there
 # would have to be a runtime value, which is a different mechanism from the name.
@@ -84,6 +89,8 @@ def described(v: int | str | float) -> str:
 
 maybe: int | None = None
 print(described(1), described("a"), described(2.5), type(maybe).__name__)
+print(x.__class__.__name__, x.__class__ is C, x.__class__ == C)
+print(type(1) == type(2), type(1) == type("a"), type(1) != type("a"))
 
 
 class Shape:
