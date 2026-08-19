@@ -27,6 +27,17 @@
 #
 # ⛔ The while-loop spelling was the workaround and stays correct; it is here so
 # a future change that "fixes" one and breaks the other is visible.
+#
+# `refilled` is a second defect the same programs walk into: an empty container
+# literal has no element type of its own, so a rebind with one keeps the type the
+# name already has -- the rule the emitter applies outside a generator, which the
+# generator's own frame analysis did not. Overwriting it made the frame slot a
+# union of the two readings ("runtime bundle for '!py.union<list[int],
+# list[object]>' has 1 values"), which is the accumulate-and-flush idiom.
+#
+# ⛔ The same idiom INSIDE A LOOP (append, yield when full, rebind, continue) is
+# still refused, now for an ownership reason rather than a typing one, and is
+# recorded in tests/probe/wb_sweep_findings_2026_08_18.py.
 
 
 def evens(n: int):
@@ -58,6 +69,14 @@ def while_form(n: int):
         i += 1
 
 
+def refilled():
+    buf: list[int] = []
+    buf.append(1)
+    yield buf
+    buf = []
+    yield buf
+
+
 def consume(n: int) -> int:
     total = 0
     for v in evens(n):
@@ -69,6 +88,7 @@ def consume(n: int) -> int:
 
 print(list(evens(6)), list(scaled(4)))
 print(list(skipping(4)), list(while_form(4)))
+print(list(refilled()))
 for v in evens(6):
     print(v)
 try:

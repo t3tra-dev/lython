@@ -4879,10 +4879,13 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         return destination;
       };
       llvm::SmallVector<own::ResourceGroup, 8> splitForwarded;
-      {
+      auto chainSplitForwards = [&](llvm::ArrayRef<own::ResourceGroup> seeds) {
         llvm::DenseSet<mlir::Value> known;
         llvm::SmallVector<own::ResourceGroup, 8> frontier;
-        for (const own::ResourceGroup &g : blockArgGroups) {
+        for (const UnwindTrackedGroup &tracked : groups)
+          if (!tracked.values.empty())
+            known.insert(tracked.values.front());
+        for (const own::ResourceGroup &g : seeds) {
           if (g.values.empty())
             continue;
           known.insert(g.values.front());
@@ -4891,11 +4894,14 @@ mlir::LogicalResult insertUnwindCleanupReleases(
         for (unsigned round = 0; round < 8 && !frontier.empty(); ++round) {
           llvm::SmallVector<own::ResourceGroup, 8> next;
           for (const own::ResourceGroup &g : frontier) {
-            auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(g.values.front());
-            if (!blockArg || blockArg.getOwner()->getParent() != region)
+            mlir::Value root = g.values.front();
+            mlir::Operation *producer = root.getDefiningOp();
+            mlir::Block *definingBlock =
+                producer ? producer->getBlock()
+                         : mlir::cast<mlir::BlockArgument>(root).getOwner();
+            if (!definingBlock || definingBlock->getParent() != region)
               continue;
-            mlir::Operation *terminator =
-                blockArg.getOwner()->getTerminator();
+            mlir::Operation *terminator = definingBlock->getTerminator();
             if (!terminator)
               continue;
             for (unsigned successorIndex = 0,
@@ -4916,7 +4922,13 @@ mlir::LogicalResult insertUnwindCleanupReleases(
           }
           frontier = std::move(next);
         }
-      }
+      };
+      // ⛔ Seeded from the block-argument groups only. Seeding from every
+      // tracked group as well was measured on the shape that would want it (a
+      // list built in a loop, yielded, and rebound) and changed nothing there:
+      // that program fails for a different reason, and the extra seeds are
+      // machinery no test can see.
+      chainSplitForwards(blockArgGroups);
       for (const own::ResourceGroup &g : splitForwarded)
         addGroup(g);
       for (const own::ResourceGroup &g : blockArgGroups) {

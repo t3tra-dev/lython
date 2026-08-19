@@ -330,8 +330,28 @@ void bindGeneratorAnalysisTarget(const TypeSystem &types,
   if (!target)
     return;
   if (target->kind == "Name") {
-    analysis.localSymbols[ast::nameSpelling(*target)] =
-        valueType ? valueType : types.object();
+    llvm::StringRef name = ast::nameSpelling(*target);
+    // ⭐ AN EMPTY CONTAINER LITERAL KEEPS THE TYPE THE NAME ALREADY HAS, which
+    // is the rule the emitter applies to the same rebind outside a generator
+    // (an empty literal has no element type of its own). Overwriting with
+    // `list[object]` here made the frame's slot a union of the two readings:
+    //
+    //     buf: list[int] = []
+    //     ...
+    //     yield buf
+    //     buf = []          # list[object] -> union<list[int], list[object]>
+    //
+    //     # runtime bundle for '!py.union<list[int], list[object]>' has 1 values
+    //
+    // which is the chunking idiom and every accumulate-and-flush generator with
+    // it.
+    if (isEmptyContainerLiteral(valueNode)) {
+      auto existing = analysis.localSymbols.find(name);
+      if (existing != analysis.localSymbols.end() && existing->second &&
+          types.widenLiteral(existing->second) != types.object())
+        return;
+    }
+    analysis.localSymbols[name] = valueType ? valueType : types.object();
     return;
   }
   if (target->kind != "Tuple" && target->kind != "List")

@@ -1796,15 +1796,24 @@ them in.
 #    the dict-key walk specifically, whose element arrives in two lanes the
 #    suspend cannot carry.
 #
-# 2. A REBOUND EMPTY LIST ACROSS A YIELD.
+# 2. FIXED THE SAME DAY -- A REBOUND EMPTY LIST ACROSS A YIELD.
 #        buf: list[int] = []
 #        buf.append(1)
 #        yield buf
 #        buf = []          <- list[object] here
 #        yield buf
 #    -> "runtime bundle for '!py.union<list[int], list[object]>' has 1 values".
-#    The empty-literal seed that fixes this outside a generator (it takes the
-#    name's declared/flow type) does not reach the rebind inside one, so the two
-#    yields disagree about the element type and the union has no bundle. The
-#    chunking idiom is the shape that hits it.
+#    The empty-literal rule the emitter applies outside a generator -- an empty
+#    literal has no element type of its own, so a rebind with one keeps the type
+#    the name already has -- was missing from the generator's frame analysis,
+#    which overwrote the slot with list[object]. Fixed in
+#    bindGeneratorAnalysisTarget; pinned by `refilled` in
+#    tests/golden/cases/generator_over_range_with_a_branch.py.
+#
+#    ⛔ The same idiom INSIDE A LOOP (append, yield when full, rebind, keep
+#    going) is still refused, now for an OWNERSHIP reason: "owned resource from
+#    @LyList_FromLength result 0 is still owned when a call may unwind". Seeding
+#    the split-forward chain from every tracked group as well as from the
+#    block-argument ones was measured on exactly this program and changed
+#    nothing, so the chain is not what it needs.
 
