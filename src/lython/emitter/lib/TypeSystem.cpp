@@ -541,12 +541,71 @@ void collectGeneratorFunctionAnalysis(
   }
 }
 
+// ⭐ A RECURSIVE GENERATOR CALLS ITSELF, and the walk that decides what it
+// yields has to be able to type that call:
+//
+//     def walk(n: Node) -> Iterator[int]:
+//         yield n.v
+//         for k in n.kids:
+//             for v in walk(k):      # walk: literal<None> here
+//                 yield v
+//
+// which is every tree traversal. Unannotated, the self-call is unknowable and
+// stays refused; ANNOTATED, the answer is written right there, so the name is
+// bound to a callable built from the annotations alone.
+//
+// ⛔ Built from the annotations rather than from `functionSignature`: that call
+// is what is running, and its memo is not filled yet, so asking it here
+// recurses forever. Any unannotated parameter skips the binding -- a partial
+// callable would answer the call with the wrong arity rather than not at all.
+llvm::StringMap<mlir::Type>
+selfCallableFromAnnotations(const TypeSystem &types,
+                            const parser::Node &function) {
+  llvm::StringMap<mlir::Type> self;
+  std::optional<std::string_view> name = ast::string(function, "name");
+  const parser::Node *returns = ast::node(function, "returns");
+  if (!name || !returns)
+    return self;
+  mlir::Type resultType = types.annotationType(returns);
+  if (!resultType)
+    return self;
+  llvm::SmallVector<mlir::Type, 4> parameters;
+  const parser::Node *arguments = ast::node(function, "args");
+  if (!arguments)
+    return self;
+  for (llvm::StringRef field : {"posonlyargs", "args"}) {
+    const auto *args = ast::nodeList(*arguments, field);
+    if (!args)
+      continue;
+    for (const parser::NodePtr &arg : *args) {
+      if (!arg)
+        return {};
+      const parser::Node *annotation = ast::node(*arg, "annotation");
+      if (!annotation)
+        return {};
+      mlir::Type parameterType = types.annotationType(annotation);
+      if (!parameterType)
+        return {};
+      parameters.push_back(parameterType);
+    }
+  }
+  if (ast::nodeList(*arguments, "kwonlyargs") &&
+      !ast::nodeList(*arguments, "kwonlyargs")->empty())
+    return {};
+  self[*name] = py::CallableType::get(&types.getContext(), parameters, {},
+                                      mlir::Type(), mlir::Type(), {resultType});
+  return self;
+}
+
 GeneratorFunctionAnalysis
 analyzeGeneratorFunction(const TypeSystem &types, const parser::Node &function,
                          mlir::Type generatorSendHint = {}) {
   GeneratorFunctionAnalysis analysis;
   llvm::StringMap<mlir::Type> localCallables =
       localCallableTypesInFunction(types, function);
+  for (const auto &entry : selfCallableFromAnnotations(types, function))
+    if (!localCallables.count(entry.getKey()))
+      localCallables[entry.getKey()] = entry.getValue();
   if (const auto *body = ast::nodeList(function, "body"))
     for (const parser::NodePtr &statement : *body)
       collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,

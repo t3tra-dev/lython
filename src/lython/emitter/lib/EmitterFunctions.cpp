@@ -379,7 +379,15 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
           ? sig.generatorSendType
           : mlir::Type();
   currentFunctionPrefix = symbolName.str();
-  types.bindSymbol(symbolName, sig.callable);
+  // ⭐ A GENERATOR CALLING ITSELF GETS A GENERATOR, which is `publicCallable`.
+  // `callable` is the body's own signature -- for a generator that is the resume
+  // result, None -- so a self-call inside the body typed as None and every
+  // recursive generator was refused: "static type !py.literal<None> does not
+  // provide manifest method '__iter__'", which is the shape of every tree walk.
+  types.bindSymbol(symbolName, sig.isGeneratorFunction ||
+                                       sig.isAsyncGeneratorFunction
+                                   ? sig.publicCallable
+                                   : sig.callable);
   // A def renamed away from a builtin spelling is still spelled by its source
   // name inside its own body, so bind the spelling as well: self-recursion has
   // to resolve to the same scoped callable a non-renamed def resolves to,

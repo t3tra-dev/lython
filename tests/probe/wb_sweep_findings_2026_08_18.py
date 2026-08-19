@@ -1909,3 +1909,38 @@ them in.
 #    answered per tag (the value carries one), which is the same shape as every
 #    other union read and waits on the same mechanism.
 
+# ==========================================================================
+# [GAP] a recursive generator, in three stages       FOUND + 2/3 FIXED 2026-08-19
+# Every tree walk is written as a recursive generator, and this one failed at
+# three different stages, each hidden behind the one before it:
+#
+#     def walk(n: Node) -> Iterator[int]:
+#         yield n.v
+#         for k in n.kids:
+#             for v in walk(k):
+#                 yield v
+#
+# 1. FIXED. The generator ANALYSIS could not type the self-call, so the yield
+#    type came out `object` and an annotated generator was refused as "annotated
+#    Iterator[int] but yields object". The annotations are right there: the
+#    function's own name is now bound, for that walk, to a callable built from
+#    them. Built from the annotations rather than from functionSignature because
+#    that call is what is running and its memo is not filled yet -- asking it
+#    recurses forever.
+#
+# 2. FIXED. The EMITTER bound the name inside the body to `sig.callable`, which
+#    for a generator is the BODY's signature and returns None -- so the self-call
+#    typed as None and the refusal read "literal<None> does not provide manifest
+#    method '__iter__'", which names nothing the reader wrote. A generator's own
+#    name denotes a GENERATOR: `publicCallable`. Pinned by
+#    EmitterTest.ARecursiveGeneratorTypesAndLeavesTheRefusalToTheLowering.
+#
+# 3. NOT FIXED, and now visible: "yield from delegation exceeded the static
+#    inlining budget (recursive delegation has no static expansion)". Delegation
+#    is expanded by INLINING the delegate, and a self-call has no static
+#    expansion -- this is the nested-generator frame, the same mechanism the
+#    `for x in G(): yield x` rewrite (wb_grid_leftovers (42)) documents. Every
+#    materialising workaround inside a generator (`list(count(n-1))`,
+#    `sum(count(n-1))`) hits the neighbouring wall: "a generator returned out of
+#    a function cannot be resumed".
+

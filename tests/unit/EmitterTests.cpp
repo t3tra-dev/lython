@@ -225,6 +225,37 @@ TEST(EmitterTest, RejectsYieldInsideExceptStar) {
   EXPECT_TRUE(reportsDiagnostic(emitted, "cross the suspension"));
 }
 
+// What this pins: a recursive generator TYPES. Inside its own body a
+// generator's name was bound to the BODY's callable, and a generator body
+// returns None, so `for v in count(n - 1)` was refused at EMIT with
+// "literal<None> does not provide manifest method '__iter__'" -- a message
+// about nothing the reader wrote, on a program whose real obstacle is one
+// stage later. The name denotes a GENERATOR there, which is what
+// `publicCallable` says, and the annotated self-call resolves through the
+// annotations while the signature that would answer it is still being
+// computed.
+//
+// ⛔ The program is still refused, by the LOWERING: "yield from delegation
+// exceeded the static inlining budget (recursive delegation has no static
+// expansion)". That is the nested-generator frame, and it is the honest
+// boundary -- which is the point of this test, since the emitter must stop
+// hiding it behind a type error.
+TEST(EmitterTest, ARecursiveGeneratorTypesAndLeavesTheRefusalToTheLowering) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted = emitSource(
+      "from typing import Iterator\n"
+      "def count(n: int) -> Iterator[int]:\n"
+      "    yield n\n"
+      "    if n > 0:\n"
+      "        for v in count(n - 1):\n"
+      "            yield v\n",
+      context);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+  for (const auto &diagnostic : emitted.diagnostics)
+    EXPECT_EQ(diagnostic.message.find("literal<None>"), std::string::npos)
+        << diagnostic.message;
+}
+
 TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult star = emitSource(
