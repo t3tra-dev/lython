@@ -1742,6 +1742,70 @@ module attributes {
   // repr(args) -- "(r0, r1, ...)". Renders from the payload boxes, replaces
   // the empty construction-time message, and returns the receiver triple.
   func.func @LyBaseException_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "init_payload_message"} {
+    %msg_h, %msg_b = func.call @__ly_exc_render_args(%header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
+    func.return %header, %msg_h, %msg_b : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // str(e) off the payload block. ONE argument renders as str(arg) and only
+  // zero or two-and-up render the "(a, b)" tuple: that is what CPython's
+  // BaseException.__str__ does, and it is why `str(ValueError(42))` is "42"
+  // rather than "(42,)".
+  func.func private @__ly_exc_render_args(%header: memref<3xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "render_args", ly.runtime.result_contract = "builtins.str"} {
+    %sc0 = arith.constant 0 : index
+    %sc1_i64 = arith.constant 1 : i64
+    %spayload_slot = arith.constant 3 : i64
+    %sblock = func.call @__ly_exc_ext_get(%header, %spayload_slot) : (memref<3xi64>, i64) -> i64
+    %scount = func.call @__ly_exc_payload_count(%sblock) : (i64) -> i64
+    %stuple = func.call @__ly_exc_payload_tuple_flag(%sblock) : (i64) -> i1
+    %strue = arith.constant true
+    %snot_tuple = arith.xori %stuple, %strue : i1
+    %sone = arith.cmpi eq, %scount, %sc1_i64 : i64
+    %ssingle = arith.andi %sone, %snot_tuple : i1
+    %sout:2 = scf.if %ssingle -> (memref<2xi64>, memref<?xi8>) {
+      %sblock_ptr = llvm.inttoptr %sblock : i64 to !llvm.ptr
+      %sbox_ptr = llvm.getelementptr %sblock_ptr[%sc1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %sclass_gep = llvm.getelementptr %sbox_ptr[%sc1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %sclass_id = llvm.load %sclass_gep : !llvm.ptr -> i64
+      // ⛔ KeyError.__str__ IS repr(args[0]) IN CPYTHON, and it is inherited, so
+      // the taxonomy walk decides rather than an equality test: routing a
+      // non-str argument through the generic payload path would otherwise lose
+      // the override that the str path keeps in LyKeyError_Init, and
+      // `str(KeyError(p))` printed p's __str__ where CPython prints its __repr__.
+      %sexc_class_slot = arith.constant 2 : index
+      %sexc_class = memref.load %header[%sexc_class_slot] : memref<3xi64>
+      %skey_root = arith.constant 54 : i64
+      %sis_key = func.call @LyEH_ClassIdMatches(%sexc_class, %skey_root) : (i64, i64) -> i1
+      %spicked:2 = scf.if %sis_key -> (memref<2xi64>, memref<?xi8>) {
+        %krh, %krb = func.call @__ly_repr_boxed_or_default(%sbox_ptr, %sclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %krh, %krb : memref<2xi64>, memref<?xi8>
+      } else {
+        %sh, %sb = func.call @__ly_str_boxed_or_default(%sbox_ptr, %sclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %sh, %sb : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %spicked#0, %spicked#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %th, %tb = func.call @__ly_exc_render_args_tuple(%header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %th, %tb : memref<2xi64>, memref<?xi8>
+    }
+    func.return %sout#0, %sout#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // str(x) of a boxed payload value, with CPython's fallback chain: the class's
+  // own __str__, then its __repr__, then the default <C object at 0x...>.
+  func.func private @__ly_str_boxed_or_default(%box_ptr: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "str_boxed_or_default", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b, %ok = func.call @__ly_str_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
+    cf.cond_br %ok, ^hooked, ^fallback
+
+  ^hooked:
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+
+  ^fallback:
+    %rh, %rb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %rh, %rb : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_exc_render_args_tuple(%header: memref<3xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "render_args_tuple", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c0_i64 = arith.constant 0 : i64
@@ -1789,8 +1853,7 @@ module attributes {
     %out_h, %out_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %cl_h, %cl_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%cl_h) : (memref<2xi64>) -> ()
-    func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
-    func.return %header, %out_h, %out_b : memref<3xi64>, memref<2xi64>, memref<?xi8>
+    func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
   }
 
   // Payload block entry count (0 for an absent block). Bit 62 of the count

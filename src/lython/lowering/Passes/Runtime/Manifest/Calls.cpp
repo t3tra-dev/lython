@@ -951,7 +951,35 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                           op) ||
        (instanceClassOp &&
         RuntimeBundleLowerer::exceptionAncestorContract(instanceClassOp)));
-  if (exceptionInit && !groupInit && sources.size() > 2) {
+  // ⭐ A SINGLE NON-str ARGUMENT TAKES THE SAME PATH. The manifest __init__
+  // stores its one argument in the message LANE, which is a unicode, so
+  // `ValueError(42)` was refused by the ABI ("cannot adapt builtins.int to
+  // runtime input 3 of builtins.ValueError.__init__") while `ValueError("x",
+  // 42)` -- strictly more work -- compiled. CPython accepts any object, so the
+  // int goes in the payload block like the second argument of the pair already
+  // did, and .args reads it back as an int rather than as its text.
+  //
+  // ⛔ A str argument keeps the lane. It is the overwhelmingly common spelling,
+  // the lane is one store against a block allocation plus a boxed str render,
+  // and str(e) off the lane is the string itself rather than a copy of it.
+  //
+  // ⛔ SystemExit IS HELD BACK, and this is the one place it shows. Its exit
+  // STATUS is recorded out of band (LyHost_SetExitStatus) and the top-level
+  // runner reads "the message is empty" as "use that status", so a SystemExit
+  // whose argument moved into the payload block would print its code and exit
+  // 1 where CPython exits WITH it. Refusing (the ABI's own "cannot adapt
+  // builtins.int to runtime input 3") is the honest answer until the runner
+  // learns to read the code; sys.exit(n) is the spelling that works.
+  bool singleNonStringArgument = false;
+  if (exceptionInit && !groupInit && sources.size() == 2 && sources[1] &&
+      !py::isAssignableTo(runtimeContractType(context, initContract),
+                          runtimeContractType(context, "builtins.SystemExit"),
+                          op))
+    singleNonStringArgument = !py::isAssignableTo(
+        sources[1]->objectValue.contract,
+        runtimeContractType(context, "builtins.str"), op);
+  if (exceptionInit && !groupInit &&
+      (sources.size() > 2 || singleNonStringArgument)) {
     if (mlir::failed(requireEmptyAggregate(op, op.getKwnames(), "kw names")) ||
         mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
       return mlir::failure();

@@ -1929,23 +1929,71 @@ them in.
 # compile, so that entry now has one fewer unknown rather than one fewer half.
 
 # ==========================================================================
-# [GAP x2] exceptions, from a four-program probe            FOUND 2026-08-19
+# [GAP x2] exceptions, from a four-program probe      FOUND + 1/2 FIXED 2026-08-19
 # Two of four ordinary exception programs do not compile; the other two (a
 # two-argument ValueError read through e.args, and a user class calling
 # super().__init__ with an f-string) do.
 #
-# 1. A NON-STR EXCEPTION ARGUMENT. `raise ValueError(42)` -> "cannot adapt
-#    builtins.int to runtime input 3 of builtins.ValueError.__init__". CPython
-#    stores the argument as it is and renders it in str(e)/repr(e); here the
-#    message slot is a str, so anything else has nowhere to go. `ValueError(str(42))`
-#    is the workaround, and `raise ValueError("m", 2)` works because the FIRST
-#    argument is the message and the rest ride e.args.
+# 1. FIXED 2026-08-19 (night). A NON-STR EXCEPTION ARGUMENT. `raise
+#    ValueError(42)` -> "cannot adapt builtins.int to runtime input 3 of
+#    builtins.ValueError.__init__".
+#
+#    ⭐ THE ASYMMETRY NAMED THE MECHANISM: `raise ValueError("m", 2)` -- strictly
+#    more work -- already compiled. TWO arguments go into the payload block
+#    (boxed, .args reads them back); ONE goes into the message LANE, which is a
+#    unicode, so anything else had nowhere to go. One non-str argument now takes
+#    the same block. The renderer had to learn CPython's one-argument case with
+#    it: str(e) is str(args[0]) for one and "(a, b)" for two-and-up, which is
+#    why `str(ValueError(42))` is "42" and not "(42,)".
+#
+#    ⛔ KeyError.__str__ IS repr(args[0]) and it is INHERITED, so the renderer
+#    asks the class taxonomy (LyEH_ClassIdMatches) rather than comparing one
+#    class id. The str path kept that override inside LyKeyError_Init; routing
+#    the non-str argument through the generic block would have lost it, and
+#    `str(KeyError(p))` printed p's __str__ where CPython prints its __repr__.
+#    Both halves are in the golden, with a Point whose two dunders differ.
+#
+#    ⛔ SystemExit IS HELD BACK on purpose, and the two defects that hold it are
+#    recorded below. Pinned by
+#    tests/golden/cases/exception_argument_is_not_a_string.py.
 #
 # 2. `type(e.__cause__).__name__` -> "type(x) needs a statically resolved class,
 #    and !py.union<...> is not one". __cause__ is `BaseException | None`, and the
 #    class-name read added today answers a single contract. A union could be
 #    answered per tag (the value carries one), which is the same shape as every
 #    other union read and waits on the same mechanism.
+
+# ==========================================================================
+# [BUG x2] SystemExit's code, both directions                FOUND 2026-08-19
+# Found by asking what the non-str exception argument fix above would do to
+# SystemExit, and the answer was "mis-execute", so it is excluded from it. Two
+# defects, one mechanism: the top-level runner reads "the message is empty" as
+# "use the status LyHost_SetExitStatus recorded", which is a PROXY for "this
+# came from sys.exit" and gets both edges of that proxy wrong.
+#
+# 1. `raise SystemExit(3)` -> refused ("cannot adapt builtins.int to runtime
+#    input 3"). CPython exits 3, silently. If the argument were let into the
+#    payload block the message would render as "3" and the runner would PRINT it
+#    and exit 1 -- a wrong answer where there is a refusal today, which is why
+#    the fix above excludes SystemExit rather than including it.
+#
+# 2. `raise SystemExit("")` -> exits 0, silently. CPython prints an empty line
+#    to stderr and exits 1. The empty message is indistinguishable from
+#    `SystemExit()` (which IS exit 0) under the proxy, and this one needs no new
+#    feature to be wrong -- it is wrong today.
+#
+# ⭐ THE FIX IS ONE CHANGE OF SIGNAL, not two repairs: give the raise path an
+# explicit "silent, use the status" flag (code is None or an int) instead of
+# inferring it from the message length, route SystemExit's argument -- str
+# included -- through the payload block so `SystemExit()` and `SystemExit("")`
+# stop being the same shape, and read the int code at raise time (in the
+# manifest, where LyLong_AsI64 is reachable) rather than in the runner's
+# hand-built LLVM. sys.exit(n) keeps working unchanged: it already sets the
+# status, and it would set the flag with it.
+#
+# ⛔ The stale rationale is written down in sys.mlir: "an int code must go
+# through sys.exit (the exception object has no code slot)". The payload block
+# IS that slot, and it has existed since multi-argument exceptions landed.
 
 # ==========================================================================
 # [GAP] a recursive generator, in three stages       FOUND + 2/3 FIXED 2026-08-19
