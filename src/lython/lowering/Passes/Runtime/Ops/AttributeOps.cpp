@@ -1199,7 +1199,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   if (mlir::failed(offset))
     return mlir::failure();
   if (*offset + valueTypes->size() > object->physicalValues().size())
-    return op.emitError() << "class field ABI exceeds object payload";
+    // ⭐ NAMES THE CLASS, THE FIELD AND THE REASON. An instance is LANES, not a
+    // pointer, so a value typed as a BASE carries room for the base's fields
+    // only: reading a field the subclass added runs off the end of what the
+    // base-typed value was given. int and bool fields are stored in the
+    // instance itself (`classFieldStoredBoxed`) and so survive the widening,
+    // which is why the same program with an int field compiles -- and why the
+    // bare "exceeds object payload" reads as an internal limit rather than as
+    // the two-line description of the shape it is. Reached through a narrowed
+    // `isinstance` guard, through a base-typed parameter, and through the
+    // synthesized dispatch for an overridden method.
+    return op.emitError()
+           << "field '" << op.getName() << "' of class "
+           << classOp.getSymName()
+           << " is not carried by a value typed as its base: an instance is "
+              "passed as its fields, and only int and bool fields are stored "
+              "in the instance itself, so a wider reference has no lane for "
+              "this one";
 
   llvm::SmallVector<mlir::Value, 4> values;
   appendValueSlice(object->physicalValues(), *offset,

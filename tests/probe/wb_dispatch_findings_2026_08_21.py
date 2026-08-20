@@ -29,7 +29,11 @@
 #
 #     print(show(B(1.5)), show(A("x")))
 #
-# lyc: error: class field ABI exceeds object payload   (exit 1)
+# lyc: error: field 'w' of class B is not carried by a value typed as its base:
+#      an instance is passed as its fields, and only int and bool fields are
+#      stored in the instance itself, so a wider reference has no lane for this
+#      one   (exit 1; before 2026-08-21 this read "class field ABI exceeds
+#      object payload", which named neither the field nor the reason)
 # py : 1.5 0.0
 #
 # axes, measured the same day:
@@ -55,8 +59,8 @@
 # not a pointer, and a base-typed lane list has room for the base's fields
 # only. `classFieldValueOffset` computes the subclass's offset from the
 # subclass's own field list and the read runs off the end of what the base
-# carried -- which the lowering catches (AttributeOps.cpp, "class field ABI
-# exceeds object payload"), so this is a refusal and not a wrong answer.
+# carried -- which the lowering catches (AttributeOps.cpp), so this is a
+# refusal and not a wrong answer.
 #
 # What it would take: size a class's payload for the widest class in its
 # subtree, so a base-typed value can hold any subclass instance. Single
