@@ -1,8 +1,11 @@
 # pathlib's Path, lexical surface then filesystem surface.
 #
-# Every line matches CPython 3.14 byte for byte EXCEPT the three `parts`
-# reads: pathlib.py documents parts as a list[str] rather than a tuple,
-# because the component count is not static. The content is CPython's.
+# Every line matches CPython 3.14 byte for byte, `parts` included. It used to
+# be the one exception -- a list where CPython has a tuple, on the reasoning
+# that the component count is not static and a tuple has no layout without one.
+# A tuple built from a list at run time does have one (`tuple(out)` behind a
+# `-> tuple[str]` annotation, which is the arity-erased spelling), so the
+# deviation was the reasoning rather than the compiler.
 #
 # Properties are bound to locals before use on purpose: `str(p.parent)`
 # straight through segfaults, and two property reads in one print() render

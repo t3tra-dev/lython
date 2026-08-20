@@ -14,7 +14,7 @@ nope.txt
 nope
 .txt
 _golden_w3_cross_absent
-['_golden_w3_cross_absent', 'nope.txt']
+('_golden_w3_cross_absent', 'nope.txt')
 False
 False
 _golden_w3_cross_absent/nope.log

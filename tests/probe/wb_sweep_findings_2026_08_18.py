@@ -1964,6 +1964,33 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [BUG] pathlib.parts was a list                       FOUND + FIXED 2026-08-20
+# Found by re-running the differential over the whole golden corpus after the
+# day's fixes: three programs disagreed with CPython, and TWO of them were the
+# same recorded deviation.
+#
+#     print(Path("/x/y/z.txt").parts)
+#     # ['/', 'x', 'y', 'z.txt'] where CPython prints ('/', 'x', 'y', 'z.txt')
+#
+# ⭐ THE DEVIATION WAS THE REASONING, NOT THE COMPILER. pathlib.py said "the
+# segment count is not static, so a tuple has no layout" -- and a tuple built
+# from a list at RUN TIME does have one. `return tuple(out)` behind a
+# `-> tuple[str]` annotation (the arity-erased spelling) compiles, prints and
+# indexes; measured on a standalone function first, then on the port.
+#
+# ⛔ THE COMMENT OUTLIVED ITS CODE, which is the fifth instance of the shape
+# lython-stale-rationale records. It is worth naming how it was found: not by
+# reading pathlib.py, but by a corpus-wide differential that the two goldens'
+# own headers had explained away in prose. A deviation documented in a comment
+# stops being re-measured.
+#
+# Both goldens (stdlib_pathlib, w3_cross_os_try_rebind) now match CPython byte
+# for byte, and their headers say so, so a divergence in either is a defect
+# again. The corpus is down to ONE disagreement -- Counter.elements() returning
+# a materialized list where CPython returns a lazy itertools.chain, whose own
+# output is an address no golden could pin.
+
+# ==========================================================================
 # [GAP] @dataclass(order=True)                         FOUND + FIXED 2026-08-20
 # From an eight-program grid of ORDINARY programs (a word counter, a recursive
 # tree depth, a transpose, a graph walk, a tokenizer, a memoized fib, a sorted

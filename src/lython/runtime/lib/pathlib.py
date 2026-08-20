@@ -20,9 +20,6 @@ Deviations from CPython:
     currently mis-executes (reported to the Wave 3 foundation track). Pass a
     Path with `str(other)`, or use `/` and `joinpath`, both of which accept a
     str segment.
-  - `parts` is a `list[str]`, not a tuple: the segment count is not static, so
-    a tuple has no layout. It follows CPython's content -- an absolute path's
-    first element is '/'.
   - `parents` is absent (it is a lazy immutable sequence view); walk `parent`
     instead. `glob`/`rglob` accept only a pattern of the form '*', '*.ext',
     'prefix*', or a literal name -- no '**', no character classes, no
@@ -168,11 +165,10 @@ class Path:
         return Path(head)
 
     @property
-    def parts(self) -> list[str]:
-        """The path's components.
+    def parts(self) -> tuple[str]:
+        """The path's components, as CPython's tuple.
 
-        A list, not CPython's tuple: the count is not static. An absolute
-        path's first element is '/', as CPython's is.
+        An absolute path's first element is '/', as CPython's is.
         """
         out: list[str] = []
         rest = self._raw
@@ -182,7 +178,7 @@ class Path:
         for piece in pieces:
             if piece != "" and piece != ".":
                 out.append(piece)
-        return out
+        return tuple(out)
 
     def is_absolute(self) -> bool:
         """True if the path is absolute."""

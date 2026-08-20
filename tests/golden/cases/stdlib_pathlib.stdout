@@ -3,7 +3,7 @@ z.txt
 z
 .txt
 /x/y
-['/', 'x', 'y', 'z.txt']
+('/', 'x', 'y', 'z.txt')
 True
 /x/y/z.txt/w
 /x/y/other.md
@@ -12,7 +12,7 @@ True
 /x/y/z
 a/b/c
 a/b/c/d
-['a', 'b']
+('a', 'b')
 .
 .
 PosixPath('/tmp/a')
@@ -21,7 +21,7 @@ True False
 //a/b
 /a
 a/b/../c
-['/']
+('/',)
 True
 .gz
 b.tar

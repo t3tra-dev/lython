@@ -14,12 +14,11 @@
 # path, are host-independent and match CPython 3.14 byte for byte. The tree is
 # never created: the case only needs paths that cannot exist.
 #
-# One line does NOT match CPython, and it is a recorded port deviation rather
-# than anything this case is pinning: `print(parts)` renders a list where
-# CPython renders a tuple, because pathlib.py documents `parts` as list[str]
-# ("the count is not static"). Noted here because a differential run over the
-# golden corpus reads this file's stdout as a divergence and there is no other
-# way to tell a deviation from a defect. Same deviation as stdlib_pathlib.py.
+# Every line matches CPython now, `print(parts)` included -- it used to be the
+# one exception, a list where CPython has a tuple, and the note here existed so
+# a differential run over the corpus could tell that deviation from a defect.
+# The deviation is gone (pathlib.py's `parts` builds the tuple at run time), so
+# a divergence in this file is a defect again.
 import os
 from pathlib import Path
 
