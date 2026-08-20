@@ -2114,6 +2114,35 @@ them in.
 # never-entered case still unbound as CPython leaves it.
 
 # ==========================================================================
+# [BUG] sum() over floats lost its correction term     FOUND + FIXED 2026-08-21
+#     print(sum([0.1, 0.2, 0.3]))       # 0.6000000000000001; CPython says 0.6
+#     print(sum([1e100, 1.0, -1e100]))  # 0.0;                CPython says 1.0
+#
+# ⭐ CPython'S builtin_sum HAS BEEN COMPENSATED SINCE 3.12 (Neumaier): a
+# correction term rides beside the running total and is added back at the end.
+# The second line is the one that shows this is not a rounding quibble -- the
+# naive fold loses the whole 1.0.
+#
+# ⛔ WRITTEN AS THE SAME SYNTHESIZED PYTHON the rest of the fold is, so the
+# arithmetic is this compiler's own float ops rather than a second
+# implementation of them. That also means the correction is subject to every
+# rule the fold already obeys (one SSA type per accumulator, the seen-flag, the
+# empty-iterable seed).
+#
+# ⛔ AND `0.1 + 0.2 + 0.3` IS STILL 0.6000000000000001, in both. The
+# compensation belongs to sum(), not to addition; the golden prints them side
+# by side so the difference is visible rather than assumed.
+#
+# ⛔ ONE DEVIATION REMAINS AND IS NOW WRITTEN AT THE SEED: `sum(xs)` over an
+# EMPTY list[float] prints 0.0 here and 0 in CPython, whose accumulator is
+# still the int start it never added to. Matching that needs one accumulator
+# with two types -- the union construction this compiler does not build. The
+# comment at the float seed used to claim the int seed survived that case; it
+# does not, and now says so.
+#
+# Pinned by tests/golden/cases/float_sum_is_compensated.py.
+
+# ==========================================================================
 # [BUG] an unhashable class was accepted as a key      FOUND + FIXED 2026-08-21
 #     @dataclass
 #     class K:

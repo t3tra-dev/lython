@@ -3598,9 +3598,16 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         // float sum with the int zero asked the lowering to store a float
         // into an int lane -- "cannot adapt runtime bundle builtins.float
         // with physical values (memref<3xi64>) to expected ABI". Seeding the
-        // promoted zero is the same answer (sum([1.5, 2.5]) is 4.0 either
-        // way); the int seed stays wherever the promotion does not happen,
-        // including the empty iterable, whose sum CPython says is int 0.
+        // promoted zero is the same answer for every non-empty iterable
+        // (sum([1.5, 2.5]) is 4.0 either way).
+        //
+        // ⛔ AND IT IS NOT THE SAME FOR AN EMPTY ONE: `sum(xs)` over an empty
+        // list[float] prints 0.0 here and 0 in CPython, because CPython's
+        // accumulator is still the int start it never added to. Matching that
+        // needs the accumulator to be int-or-float chosen at run time, which
+        // is one SSA value with two types -- the union construction this
+        // compiler does not build. Measured 2026-08-21; the non-empty answers
+        // all agree, compensation included.
         auto zero = py::FloatConstantOp::create(builder, loc(expr),
                                                 types.floatType(),
                                                 builder.getF64FloatAttr(0.0));
@@ -3624,7 +3631,60 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::NodePtr tmpName = synth::name(tmp, expr.range);
     parser::NodePtr elementName = synth::name(element, expr.range);
     std::vector<parser::NodePtr> body;
-    if (reducer == "sum") {
+    // ⭐ A FLOAT SUM IS COMPENSATED, because CPython's has been since 3.12:
+    // builtin_sum carries a Neumaier correction term and adds it back at the
+    // end. Without it this answered `sum([0.1, 0.2, 0.3])` as
+    // 0.6000000000000001 where CPython says 0.6, and -- the case that shows it
+    // is not a rounding quibble -- `sum([1e100, 1.0, -1e100])` as 0.0 where
+    // CPython says 1.0. The naive fold loses the small term entirely.
+    //
+    // ⛔ Written as the same synthesized Python the rest of the fold is, so the
+    // arithmetic is the compiler's own float ops rather than a second
+    // implementation: t = acc + x; c += (acc - t) + x when |acc| >= |x|, else
+    // c += (x - t) + acc; acc = t; and acc + c at the end.
+    std::string compensation = "__" + reducer.str() + "comp" +
+                               std::to_string(listCompCounter);
+    std::string partial =
+        "__" + reducer.str() + "part" + std::to_string(listCompCounter);
+    bool compensated =
+        reducer == "sum" &&
+        types.widenLiteral(values[tmp].type) == types.floatType();
+    if (compensated) {
+      auto zero = py::FloatConstantOp::create(builder, loc(expr),
+                                              types.floatType(),
+                                              builder.getF64FloatAttr(0.0));
+      values[compensation] = Value{zero.getResult(), types.floatType()};
+      types.bindSymbol(compensation, types.floatType());
+    }
+    if (compensated) {
+      parser::NodePtr compName = synth::name(compensation, expr.range);
+      parser::NodePtr partialName = synth::name(partial, expr.range);
+      auto absOf = [&](parser::NodePtr value) {
+        return synth::call(synth::name("abs", expr.range),
+                           std::vector<parser::NodePtr>{std::move(value)},
+                           expr.range);
+      };
+      // <partial> = <tmp> + <element>
+      body.push_back(synth::assign(
+          partialName,
+          synth::binOp(tmpName, "Add", elementName, expr.range), expr.range));
+      auto correction = [&](parser::NodePtr large, parser::NodePtr small) {
+        return synth::binOp(
+            compName, "Add",
+            synth::binOp(synth::binOp(std::move(large), "Sub", partialName,
+                                      expr.range),
+                         "Add", std::move(small), expr.range),
+            expr.range);
+      };
+      body.push_back(synth::ifStmt(
+          synth::compare(absOf(tmpName), "GtE", absOf(elementName), expr.range),
+          {synth::assign(compName, correction(tmpName, elementName),
+                         expr.range)},
+          {synth::assign(compName, correction(elementName, tmpName),
+                         expr.range)},
+          expr.range));
+      body.push_back(synth::assign(tmpName, partialName, expr.range));
+    } else if (reducer == "sum") {
       // <tmp> = <tmp> + <element>
       parser::NodePtr addOp = parser::makeNode("Add", expr.range);
       parser::NodePtr add = parser::makeNode("BinOp", expr.range);
@@ -3666,6 +3726,12 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     if (auto found = values.find(element); found != values.end())
       priorElement = found->second;
     emitFor(*loop);
+    if (compensated)
+      emitStatement(*synth::assign(
+          synth::name(tmp, expr.range),
+          synth::binOp(synth::name(tmp, expr.range), "Add",
+                       synth::name(compensation, expr.range), expr.range),
+          expr.range));
     auto built = values.find(tmp);
     if (built == values.end() || !built->second.value) {
       diagnostics.push_back(parser::Diagnostic{
@@ -3675,6 +3741,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     }
     Value result = built->second;
     values.erase(tmp);
+    values.erase(compensation);
+    values.erase(partial);
     if (priorElement)
       values[element] = *priorElement;
     else
