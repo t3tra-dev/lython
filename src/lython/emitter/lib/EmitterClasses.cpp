@@ -1933,6 +1933,45 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                        llvm::ArrayRef<llvm::StringRef>{}, range),
                           std::move(sig));
     }
+    // ⭐ `_asdict` IS THE DICT LITERAL ITS FIELDS SPELL, and the field names and
+    // types are both known right here. CPython's namedtuple builds it from
+    // _fields and zip; there is nothing dynamic in it, so a synthesized method
+    // is the whole implementation. `p._asdict()` was "'P' inherits
+    // builtins.object._asdict, which Lython does not implement".
+    //
+    // ⛔ The value type is the JOIN of the field types, which is what makes a
+    // mixed NamedTuple's dict a dict[str, int | str] rather than a refusal --
+    // the same type the equivalent literal gets.
+    if (isNamedTuple && !userDefines("_asdict") && !order.empty()) {
+      std::vector<parser::NodePtr> keys;
+      std::vector<parser::NodePtr> valueNodes;
+      llvm::SmallVector<mlir::Type, 8> valueTypes;
+      for (const std::string &field : order) {
+        keys.push_back(synth::strConstant(field, range));
+        valueNodes.push_back(synth::selfAttribute("self", field, range));
+        auto found = fieldTypeMap.find(field);
+        valueTypes.push_back(found != fieldTypeMap.end() ? found->second
+                                                         : types.object());
+      }
+      mlir::Type valueType = types.join(valueTypes);
+      if (valueType) {
+        parser::NodePtr mapping = parser::makeNode("Dict", range);
+        parser::addField(*mapping, "keys", std::move(keys));
+        parser::addField(*mapping, "values", std::move(valueNodes));
+        parser::NodePtr returnNode =
+            synth::returnStmt(std::move(mapping), range);
+        FunctionSignature sig;
+        sig.positionalNames.push_back("self");
+        sig.positionalTypes.push_back(types.contract(contractName));
+        sig.positionalDefaults.push_back(false);
+        sig.resultType = types.dictOf(types.strType(), valueType);
+        registerSynthesized(
+            synth::functionDef("_asdict", toSynthParams({"self"}), {},
+                               {std::move(returnNode)}, nullptr,
+                               llvm::ArrayRef<llvm::StringRef>{}, range),
+            std::move(sig));
+      }
+    }
     // A SYNTHESIZED dataclass `__eq__` compares only against its own class and
     // answers False for any other -- which is what lets the comparison of two
     // distinct classes fold to a constant. A NamedTuple's does not: it is

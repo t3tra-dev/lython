@@ -2000,6 +2000,25 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
             builder, loc(expr), type, builder.getStringAttr(simple));
         return Value{constant.getResult(), type};
       }
+  // ⭐ `P._fields` IS A COMPILE-TIME TUPLE, for the same reason `C.__name__` is
+  // a compile-time string: a NamedTuple's field order is the class statement.
+  // CPython builds it at class creation and never changes it, so the fold is
+  // the whole implementation -- it was "attr.get type object has no static
+  // runtime attribute '_fields'".
+  if (*attr == "_fields")
+    if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(object.type))
+      if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+              typeObject.getInstanceType()))
+        if (namedTupleContracts.count(contract.getContractName())) {
+          std::vector<parser::NodePtr> names;
+          for (const std::string &field :
+               classFieldOrders[contract.getContractName()])
+            names.push_back(synth::strConstant(field, expr.range));
+          parser::NodePtr literal = parser::makeNode("Tuple", expr.range);
+          parser::addField(*literal, "elts", std::move(names));
+          synthesizedIteratorDefs.push_back(literal);
+          return emitExpr(literal.get());
+        }
   // Property reads inline the getter (before general attribute inference,
   // which knows nothing about accessor bindings).
   if (std::optional<MethodBinding> property =

@@ -2006,6 +2006,41 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
         return reject(std::string(ctor) +
                       "() does not support starred arguments yet");
 
+  // ⭐ `tuple(p)` / `list(p)` OVER A NamedTuple IS ITS FIELDS, in order. A
+  // NamedTuple has no __iter__ here -- it is a source class with named fields,
+  // not a runtime tuple -- and the display it spells is what CPython's
+  // iteration would produce anyway. `tuple(p)` was "static type
+  // !py.contract<"P"> does not provide manifest method '__iter__'".
+  //
+  // ⛔ Only the two SEQUENCE constructors: a set of the fields would drop
+  // duplicates and a dict of them has no keys, so neither is the same answer.
+  if ((ctor == "tuple" || ctor == "list") && args && args->size() == 1 &&
+      args->front() && (!keywords || keywords->empty()))
+    if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+            types.widenLiteral(types.inferExpr(args->front().get()))))
+      if (namedTupleContracts.count(contract.getContractName())) {
+        llvm::ArrayRef<std::string> order =
+            classFieldOrders[contract.getContractName()];
+        if (!order.empty()) {
+          std::string tmp =
+              "__ntseq" + std::to_string(++syntheticFunctionCounter);
+          Value receiver = emitExpr(args->front().get());
+          values[tmp] = receiver;
+          types.bindSymbol(tmp, receiver.type);
+          std::vector<NodePtr> members;
+          for (const std::string &field : order)
+            members.push_back(
+                synth::attribute(synth::name(tmp, range), field, range));
+          NodePtr display =
+              parser::makeNode(ctor == "tuple" ? "Tuple" : "List", range);
+          parser::addField(*display, "elts", std::move(members));
+          synthesizedIteratorDefs.push_back(display);
+          Value built = emitExpr(display.get());
+          values.erase(tmp);
+          return built;
+        }
+      }
+
   // dict(a=1, b=2): the keyword form builds the literal (values evaluate
   // left to right, CPython's order).
   if (keywords && !keywords->empty()) {

@@ -815,6 +815,8 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return *v;
   if (std::optional<Value> v = tryEmitSetattrCall(expr, calleeNode))
     return *v;
+  if (std::optional<Value> v = tryEmitNamedTupleReplace(expr, calleeNode))
+    return *v;
   if (std::optional<Value> v = tryEmitIsInstanceCall(expr, calleeNode))
     return *v;
   if (std::optional<Value> v = tryEmitIntBaseCall(expr, calleeNode))
@@ -1877,6 +1879,88 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
 // store written as a call -- so it becomes one, and the field's declared type,
 // the ownership traffic and the refusals all come from the assignment path
 // unchanged. The call's own value is None, which is what CPython returns.
+
+// ⭐ `p._replace(x=5)` IS THE CONSTRUCTION IT DESCRIBES: every field the call
+// does not name comes from p, and the class, the field order and the field
+// names are all known here. CPython's namedtuple builds it out of _make and
+// _fields; there is nothing dynamic in it, so the rewrite IS the
+// implementation. It was "'P' inherits builtins.object._replace, which Lython
+// does not implement".
+//
+// ⛔ The receiver is bound to a temporary first. `make()._replace(x=1)` would
+// otherwise call make() once per field the replacement does not name, which is
+// a side effect CPython does not have.
+std::optional<Value>
+ModuleEmitter::tryEmitNamedTupleReplace(const parser::Node &expr,
+                                        const parser::Node *calleeNode) {
+  if (!calleeNode || calleeNode->kind != "Attribute")
+    return std::nullopt;
+  std::optional<std::string_view> attr = ast::string(*calleeNode, "attr");
+  if (!attr || *attr != "_replace")
+    return std::nullopt;
+  const parser::Node *receiverNode = ast::node(*calleeNode, "value");
+  if (!receiverNode)
+    return std::nullopt;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(types.inferExpr(receiverNode)));
+  if (!contract || !namedTupleContracts.count(contract.getContractName()))
+    return std::nullopt;
+  llvm::StringRef className = contract.getContractName();
+  // A shadowed class name would build the wrong thing; the rewrite spells the
+  // class by name, so it has to be the name that still means this class.
+  std::optional<mlir::Type> bound = types.lookupClass(className);
+  if (!bound || *bound != mlir::Type(contract))
+    return std::nullopt;
+
+  parser::SourceRange range = expr.range;
+  auto refuse = [&](const std::string &message) -> std::optional<Value> {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, range.start, message});
+    return emitNone(expr);
+  };
+  const auto *args = ast::nodeList(expr, "args");
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (args && !args->empty())
+    return refuse("_replace() takes keyword arguments only");
+  llvm::ArrayRef<std::string> order = classFieldOrders[className];
+  if (order.empty())
+    return refuse("_replace() needs a NamedTuple with fields");
+  llvm::StringMap<parser::NodePtr> replacements;
+  if (keywords)
+    for (const parser::NodePtr &entry : *keywords) {
+      if (!entry)
+        continue;
+      std::optional<std::string_view> keyword = ast::string(*entry, "arg");
+      const parser::Field *value = parser::findField(*entry, "value");
+      if (!keyword || !value ||
+          !std::holds_alternative<parser::NodePtr>(value->value))
+        return refuse("_replace() takes keyword arguments only");
+      if (!llvm::is_contained(order, std::string(*keyword)))
+        return refuse("_replace() got an unexpected field name '" +
+                      std::string(*keyword) + "'");
+      replacements[*keyword] = std::get<parser::NodePtr>(value->value);
+    }
+
+  std::string tmp = "__replace" + std::to_string(++syntheticFunctionCounter);
+  Value receiver = emitExpr(receiverNode);
+  values[tmp] = receiver;
+  types.bindSymbol(tmp, receiver.type);
+  std::vector<parser::NodePtr> arguments;
+  for (const std::string &field : order) {
+    auto found = replacements.find(field);
+    arguments.push_back(found != replacements.end()
+                            ? found->second
+                            : synth::attribute(synth::name(tmp, range), field,
+                                               range));
+  }
+  parser::NodePtr construction = synth::call(
+      synth::name(className, range), std::move(arguments), range);
+  synthesizedIteratorDefs.push_back(construction);
+  Value built = emitExpr(construction.get());
+  values.erase(tmp);
+  return built;
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitSetattrCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {

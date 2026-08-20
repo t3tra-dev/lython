@@ -1964,6 +1964,39 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [GAP x4] the NamedTuple API                         FOUND + FIXED 2026-08-20
+# `_fields`, `_replace`, `_asdict` and `tuple(p)` were all missing, and all four
+# are decided by the class statement:
+#
+#     print(P._fields)      # attr.get type object has no static runtime
+#                           # attribute '_fields'
+#     print(p._replace(x=5))
+#     print(p._asdict())    # 'P' inherits builtins.object._replace/_asdict,
+#                           # which Lython does not implement
+#     print(tuple(p))       # 'P' does not provide manifest method '__iter__'
+#
+# ⭐ CPython BUILDS ALL FOUR AT CLASS CREATION out of _fields and _make, with
+# nothing dynamic in any of them -- so each is a different KIND of compile-time
+# answer here, and picking the right kind is the work:
+#   - `_asdict` is a synthesized METHOD returning the dict literal its fields
+#     spell (the same shape __hash__ and __len__ already use), with the JOIN of
+#     the field types as the dict's value type;
+#   - `_fields` FOLDS to a tuple of strings, the way C.__name__ folds to a
+#     string -- there is no type-object surface to hang an attribute on;
+#   - `_replace` and `tuple(p)`/`list(p)` are REWRITES of the call, because
+#     both need the receiver expression and _replace needs the keywords.
+#
+# ⛔ THE RECEIVER IS BOUND TO A TEMPORARY, and the golden counts calls to prove
+# it: `make()._replace(x=1)` would otherwise call make() once per field the
+# replacement does not name.
+#
+# ⛔ Only tuple() and list() over a NamedTuple: a set drops duplicate field
+# values and a dict has no keys to use, so neither is the same answer. `for v
+# in p` is still refused -- the display is a rewrite, not an __iter__.
+#
+# Pinned by tests/golden/cases/namedtuple_api.py.
+
+# ==========================================================================
 # [GAP x4 + 2 OPEN] unpacking                         FOUND + FIXED 2026-08-20
 # A fifteen-program grid (walrus, star-unpacking, f-string conversions,
 # property setters, NamedTuple, exception chaining, dict comprehensions,
@@ -2017,8 +2050,8 @@ them in.
 #    ANNOTATED tuple[int, int, int] the lowering still says "starred positional
 #    arg operand ... needs sequence evidence".
 #
-# 2. `_replace` on a NamedTuple -> "'P' inherits builtins.object._replace,
-#    which Lython does not implement". _asdict and _fields are the same entry.
+# 2. FIXED THE SAME DAY -- `_replace`, `_asdict`, `_fields` and `tuple(p)` on a
+#    NamedTuple. See the entry below.
 
 # ==========================================================================
 # [BUG + GAP x3] match guards                         FOUND + FIXED 2026-08-20
