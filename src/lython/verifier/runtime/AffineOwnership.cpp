@@ -450,6 +450,20 @@ struct AffinePathState {
   // -- the named ones are already out of `retained` and in `slotParents`.
   // Last on purpose: the positional aggregate initializers above stay valid.
   unsigned parkedUnnamed = 0;
+  // The parked-without-a-name retains this path has already charged, by call
+  // op. A retain whose holder cannot be named has no discharge this walk can
+  // see -- the container's release names the CONTAINER -- so it stays in
+  // `retained` for the whole path; charging it AGAIN each time the walk goes
+  // round a cycle that contains it is what made `retained` climb without
+  // bound.
+  //
+  // ⛔ NOT a claim that the retain runs once. It runs once per iteration and
+  // so does the container's release; this walk has no iteration count for
+  // either, and every other recurring charge it tracks is already deduped the
+  // same way -- `slotParents` by holder identity, `borrowedRetains` by op. The
+  // shape that needed it: a resource produced OUTSIDE a cycle and parked
+  // INSIDE it, which is every `for i in ...: for j in ...: out.append(i)`.
+  llvm::SmallVector<mlir::Operation *, 2> parkedOps;
 };
 
 struct BorrowedEntryResource {
@@ -506,6 +520,7 @@ bool samePathState(const AffinePathState &lhs, const AffinePathState &rhs) {
   return lhs.block == rhs.block && lhs.start == rhs.start &&
          lhs.token == rhs.token && lhs.retained == rhs.retained &&
          lhs.parkedUnnamed == rhs.parkedUnnamed &&
+         lhs.parkedOps == rhs.parkedOps &&
          lhs.borrowedRetains == rhs.borrowedRetains &&
          lhs.exceptional == rhs.exceptional &&
          lhs.slotParents == rhs.slotParents &&
@@ -543,6 +558,7 @@ std::size_t pathStateDedupKey(const AffinePathState &state) {
   llvm::hash_code code = llvm::hash_combine(
       state.block, state.start, static_cast<int>(state.token), state.retained,
       state.parkedUnnamed, state.exceptional,
+      llvm::hash_combine_range(state.parkedOps.begin(), state.parkedOps.end()),
       llvm::hash_combine_range(state.borrowedRetains.begin(),
                                state.borrowedRetains.end()),
       llvm::hash_combine_range(state.slotParents.begin(),
@@ -2558,6 +2574,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               // branch on the element.
               next.slotParents = state.slotParents;
               next.parkedUnnamed = state.parkedUnnamed;
+              next.parkedOps = state.parkedOps;
               worklist.push_back(std::move(next));
             }
             op = nullptr;
@@ -2869,14 +2886,20 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             if (!llvm::is_contained(state.slotParents, *slotParent))
               state.slotParents.push_back(*slotParent);
           }
-          else {
-            ++state.retained;
+          else if (parkedWithoutAName) {
             // Parked in a holder this walk cannot name. It stays in
             // `retained` -- it really does keep the object alive, and every
             // rule that asks that question must keep seeing it -- but it is
             // the holder's, so the owned-return rule subtracts it.
-            if (parkedWithoutAName)
+            //
+            // Charged once per PATH, not once per traversal: see `parkedOps`.
+            if (!llvm::is_contained(state.parkedOps, call.getOperation())) {
+              state.parkedOps.push_back(call.getOperation());
+              ++state.retained;
               ++state.parkedUnnamed;
+            }
+          } else {
+            ++state.retained;
           }
         }
         const OwnershipWalkCache::RaiseFacts &raise = walk.raiseFacts(call);
@@ -3091,6 +3114,10 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       // Same reasoning as slotParents: the holder is the same allocation on
       // both sides of the edge, so the charge crosses it unrenamed.
       next.parkedUnnamed = std::min(state.parkedUnnamed, nextRetained);
+      // Follows `parkedUnnamed`: the ops it names are the charges that number
+      // counts, so an edge that keeps the charge must keep its provenance or
+      // the same retain would be charged again on the far side.
+      next.parkedOps = state.parkedOps;
       next.trail = state.trail;
       worklist.push_back(std::move(next));
     }
