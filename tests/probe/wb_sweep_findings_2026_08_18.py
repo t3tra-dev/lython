@@ -1964,6 +1964,34 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [GAP] @dataclass(order=True)                         FOUND + FIXED 2026-08-20
+# From an eight-program grid of ORDINARY programs (a word counter, a recursive
+# tree depth, a transpose, a graph walk, a tokenizer, a memoized fib, a sorted
+# record list). Six agreed; one needs collections.deque, which is absent on
+# purpose; the last was `@dataclass(order=True)` -> "dataclass argument 'order'
+# is not supported", which is a refusal of `sorted(rows)` over a record type --
+# the reason to reach for a dataclass in the first place.
+#
+# ⭐ CPython'S dataclasses BUILDS THE FIELD TUPLES and lets tuple's own ordering
+# decide, so the four methods are synthesized as exactly that expression. The
+# answer then comes from the manifest tuple comparison rather than from a
+# second implementation of lexicographic order, and it agrees with
+# `sorted(key=...)` over the same fields by construction rather than by
+# agreement -- the same argument the NamedTuple __hash__ note makes.
+#
+# ⛔ CPython returns NotImplemented for a foreign operand and lets the
+# reflected method try. Here `other` is typed as this class, so a foreign
+# operand is refused at the call -- earlier, and with the class named.
+#
+# ⛔ `max(rows)` / `min(rows)` OVER A CLASS ARE STILL REFUSED, and this is the
+# fold's seeding rule rather than the ordering: the accumulator needs a value
+# of the element type before the first trip (the seen-flag is what keeps it
+# unread), and a user class has no constant to seed with. `sorted(rows)[-1]` is
+# the spelling that works, and it is in the golden so the limit is visible.
+#
+# Pinned by tests/golden/cases/dataclass_order.py.
+
+# ==========================================================================
 # [BUG] the exception chain attributes           FOUND + DIAGNOSED 2026-08-20
 # Found chasing `type(e.__cause__).__name__` from the fifteen-program grid, and
 # the type-name half was a red herring -- the READ is what fails, and it fails

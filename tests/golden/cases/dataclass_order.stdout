@@ -1,0 +1,9 @@
+[Rec(score=1, name='a'), Rec(score=1, name='z'), Rec(score=2, name='a'), Rec(score=2, name='b')]
+[Rec(score=2, name='b'), Rec(score=2, name='a'), Rec(score=1, name='z'), Rec(score=1, name='a')]
+True True False
+True True True
+True False
+[One(x=1), One(x=2), One(x=3)] True
+True
+Rec(score=2, name='b') Rec(score=1, name='a')
+hits 101

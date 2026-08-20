@@ -1096,6 +1096,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // dataclass is not (CPython sets __hash__ to None when eq is synthesized and
   // frozen is not). Only the first gets one below.
   bool isNamedTuple = false;
+  bool dataclassOrder = false;
   bool dataclassInit = true;
   bool dataclassRepr = true;
   bool dataclassEq = true;
@@ -1134,8 +1135,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
             dataclassRepr = *flag;
           else if (*keywordName == "eq")
             dataclassEq = *flag;
-          else if ((*keywordName == "frozen" || *keywordName == "order") &&
-                   !*flag)
+          else if (*keywordName == "order")
+            dataclassOrder = *flag;
+          else if (*keywordName == "frozen" && !*flag)
             ; // explicit False matches the synthesized behavior
           else
             diagnostics.push_back(parser::Diagnostic{
@@ -1967,6 +1969,54 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         sig.resultType = types.dictOf(types.strType(), valueType);
         registerSynthesized(
             synth::functionDef("_asdict", toSynthParams({"self"}), {},
+                               {std::move(returnNode)}, nullptr,
+                               llvm::ArrayRef<llvm::StringRef>{}, range),
+            std::move(sig));
+      }
+    }
+    // ⭐ `@dataclass(order=True)` COMPARES THE FIELD TUPLES, in declaration
+    // order, which is exactly what CPython's dataclasses does -- it builds
+    // `(self.f0, ...) < (other.f0, ...)` and lets tuple's own ordering decide.
+    // Written here as that same expression, so the answer comes from the
+    // manifest tuple comparison rather than from a second implementation of
+    // lexicographic order. It was "dataclass argument 'order' is not
+    // supported", which is a refusal of `sorted(rows)` on a record type.
+    //
+    // ⛔ CPython returns NotImplemented for a different class and the operand
+    // falls back to the reflected method; here the parameter is typed as this
+    // class, so a foreign operand is refused at the call instead -- earlier,
+    // and with the class named.
+    if (dataclassOrder && !order.empty()) {
+      static constexpr std::pair<const char *, const char *> kOrderings[] = {
+          {"__lt__", "Lt"},
+          {"__le__", "LtE"},
+          {"__gt__", "Gt"},
+          {"__ge__", "GtE"}};
+      for (auto [methodName, opKind] : kOrderings) {
+        if (userDefines(methodName))
+          continue;
+        auto fieldTuple = [&](llvm::StringRef receiver) {
+          std::vector<parser::NodePtr> members;
+          for (const std::string &field : order)
+            members.push_back(synth::selfAttribute(receiver, field, range));
+          parser::NodePtr literal = parser::makeNode("Tuple", range);
+          parser::addField(*literal, "elts", std::move(members));
+          return literal;
+        };
+        parser::NodePtr comparison = synth::compare(
+            fieldTuple("self"), opKind, fieldTuple("other"), range);
+        parser::NodePtr returnNode =
+            synth::returnStmt(std::move(comparison), range);
+        FunctionSignature sig;
+        sig.positionalNames.push_back("self");
+        sig.positionalTypes.push_back(types.contract(contractName));
+        sig.positionalDefaults.push_back(false);
+        sig.positionalNames.push_back("other");
+        sig.positionalTypes.push_back(types.contract(contractName));
+        sig.positionalDefaults.push_back(false);
+        sig.resultType = types.boolType();
+        registerSynthesized(
+            synth::functionDef(methodName, toSynthParams({"self", "other"}), {},
                                {std::move(returnNode)}, nullptr,
                                llvm::ArrayRef<llvm::StringRef>{}, range),
             std::move(sig));
