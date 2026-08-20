@@ -13,6 +13,14 @@ namespace lython::emitter {
 llvm::SmallVector<std::string, 4>
 lexicalCaptureNames(const parser::Node &callable);
 
+// Every name `callable` binds in its own scope: its parameters plus every
+// assignment, loop target, with-target, and nested def/class NAME in its body
+// (not the bodies of those nested scopes). This is Python's local rule, so it
+// answers "does this name shadow an enclosing one" -- unlike
+// `collectAssignedNames`, which also reports `xs.append(...)` receivers and
+// subscript containers because its question is which locals a loop must carry.
+llvm::StringSet<> functionLocalNames(const parser::Node &callable);
+
 // Locals of `callable` that some nested function declares `nonlocal`
 // (directly or through intermediate scopes that do not rebind them). These
 // must be promoted to shared cells (R6).

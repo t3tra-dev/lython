@@ -312,6 +312,12 @@ void countNameAssignments(const std::vector<parser::NodePtr> *statements,
 }
 } // namespace
 
+llvm::StringSet<> functionLocalNames(const parser::Node &callable) {
+  llvm::StringSet<> locals;
+  collectFunctionLocalNames(callable, locals);
+  return locals;
+}
+
 llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
   llvm::StringSet<> locals;
   collectFunctionLocalNames(callable, locals);

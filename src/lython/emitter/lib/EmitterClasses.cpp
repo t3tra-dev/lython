@@ -2982,6 +2982,31 @@ Value ModuleEmitter::emitInlineMethodBody(
   // class's contract name. Inside the cross-module isolation above, so an
   // imported generic keeps them too.
   bindClassTypeArguments(method.definingClass);
+  // ⭐ THE BODY'S OWN LOCALS SHADOW THE USE SITE'S NAMES. An inlined body is
+  // emitted in the caller's `values`, so a method local whose name also stands
+  // at the use site inherited that binding: with `a = "hello"` at module scope,
+  // `for a in xs:` inside a method made the loop target a carried local of the
+  // GLOBAL's type, joined to the element's, and the program was refused with
+  // "cannot adapt runtime bundle builtins.int ... to (memref<16xi64>, ...)" --
+  // an erased union nothing in the source asked for. The same method as a free
+  // function has always been correct, because a real function body never sees
+  // the caller's frame.
+  //
+  // ⛔ NOT `collectAssignedNames`, which is the loop walker's over-
+  // approximation: it reports `xs.append(...)` receivers and `x[k] = v`
+  // containers, and erasing those would unbind a module-level list a method
+  // only MUTATES -- which Python keeps global.
+  //
+  // ⛔ Names the body declares `global` are excluded: those writes go to the
+  // module cell by declaration, so the use-site binding is the right one.
+  // Cross-module methods take the wholesale `values.clear()` above instead;
+  // this is the same rule for a class defined in the module being compiled.
+  if (!methodSource) {
+    llvm::StringSet<> globalDecls = moduleGlobalDeclarations(*method.method);
+    for (const auto &local : functionLocalNames(*method.method))
+      if (!globalDecls.contains(local.getKey()))
+        values.erase(local.getKey());
+  }
   llvm::StringSet<> bound;
   auto bind = [&](llvm::StringRef name, Value value) {
     values[name] = value;
