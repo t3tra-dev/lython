@@ -1090,7 +1090,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
       // the block holds it boxed and reading an i64 back out of a box would
       // need a per-class unboxer the top-level runner has no way to call.
       if (systemExitInit && sources.size() == 2) {
-        llvm::StringRef codeContract = payload->contractName();
+        // ⛔ std::string, not StringRef: `contractName()` returns BY VALUE, so
+        // a StringRef binding dangles past this declaration statement -- ASan
+        // caught it as a stack-use-after-scope inside the very comparison
+        // below, on tests/golden/cases/system_exit_is_an_exception.py. The
+        // comparison happened to answer right anyway, which is what makes
+        // the pattern worth naming rather than just fixing.
+        std::string codeContract = payload->contractName();
         if (codeContract == "builtins.int" || codeContract == "builtins.bool") {
           std::optional<RuntimeSymbol> setCode = manifest.primitive(
               "builtins.SystemExit",
