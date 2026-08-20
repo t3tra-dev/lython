@@ -1387,6 +1387,33 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
     const parser::Node *objectNode = ast::node(target, "value");
     Value object = emitExpr(objectNode);
     if (auto attr = ast::string(target, "attr")) {
+      // ⭐ A FROZEN DATACLASS REFUSES THE STORE, which is the other half of what
+      // `frozen=True` means -- CPython raises FrozenInstanceError, and the whole
+      // reason to accept the argument is that it is the only spelling for a
+      // hashable record. Accepting the keyword and then letting the field be
+      // rewritten would make the hash of a live dict key change under it.
+      //
+      // ⛔ The class's own __init__ is exempt, because that is where CPython
+      // fills the fields (through object.__setattr__), and the synthesized one
+      // goes through this same path.
+      if (auto contract =
+              mlir::dyn_cast_if_present<py::ContractType>(object.type);
+          contract &&
+          frozenDataclassContracts.count(contract.getContractName())) {
+        bool inOwnConstructor =
+            frozenInitContract &&
+            *frozenInitContract == contract.getContractName().str();
+        if (!inOwnConstructor) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, target.range.start,
+              "cannot assign to field '" + std::string(*attr) + "' of frozen "
+              "dataclass '" +
+                  py::contracts::displayClassNameForContract(
+                      contract.getContractName()) +
+                  "' (CPython raises FrozenInstanceError)"});
+          return;
+        }
+      }
       // Property writes inline the setter; a getter without a setter is the
       // CPython AttributeError, surfaced statically.
       if (std::optional<MethodBinding> setter = lookupClassMethod(

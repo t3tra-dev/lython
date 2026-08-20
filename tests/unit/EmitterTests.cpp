@@ -461,6 +461,55 @@ TEST(EmitterTest, AnExceptionsArgsAndItsOwnFieldsStillRead) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
+TEST(EmitterTest, AnUnfrozenDataclassIsRefusedAsAKeyAndAsAnElement) {
+  for (const char *use : {"d = {K(1): 2}", "s = {K(1)}"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource(std::string("from dataclasses import dataclass\n"
+                               "@dataclass\n"
+                               "class K:\n"
+                               "    a: int\n") +
+                       use + "\n",
+                   context);
+    EXPECT_FALSE(emitted.ok()) << use;
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found ||
+              diagnostic.message.find("unhashable type") != std::string::npos;
+    EXPECT_TRUE(found) << use;
+  }
+}
+
+TEST(EmitterTest, AFrozenDataclassFieldIsNotAssignableOutsideItsConstructor) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("from dataclasses import dataclass\n"
+                 "@dataclass(frozen=True)\n"
+                 "class K:\n"
+                 "    a: int\n"
+                 "k = K(1)\n"
+                 "k.a = 5\n",
+                 context);
+  EXPECT_FALSE(emitted.ok());
+  bool found = false;
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    found = found || diagnostic.message.find("frozen dataclass") !=
+                         std::string::npos;
+  EXPECT_TRUE(found);
+}
+
+TEST(EmitterTest, AFrozenDataclassFillsItsFieldsInItsOwnConstructor) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("from dataclasses import dataclass\n"
+                 "@dataclass(frozen=True)\n"
+                 "class K:\n"
+                 "    a: int\n"
+                 "print(K(1).a, hash(K(1)) == hash(K(1)))\n",
+                 context);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());

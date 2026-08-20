@@ -558,6 +558,9 @@ private:
   std::optional<Value> tryEmitDynamicClassName(const parser::Node &expr);
   std::optional<Value> tryEmitHasattrCall(const parser::Node &expr,
                                           const parser::Node *calleeNode);
+  std::optional<std::string> unhashableClassName(mlir::Type type) const;
+  bool refuseUnhashableKey(const parser::Node &site, mlir::Type type,
+                           llvm::StringRef role);
   std::optional<Value> tryEmitNamedTupleReplace(const parser::Node &expr,
                                                 const parser::Node *calleeNode);
   std::optional<Value> tryEmitSetattrCall(const parser::Node &expr,
@@ -938,6 +941,8 @@ private:
   // Classes written as `class P(NamedTuple)`: their instances are tuples, so
   // a literal subscript folds to the field at that position (EmitterExpressions).
   llvm::StringSet<> namedTupleContracts;
+  llvm::StringSet<> frozenDataclassContracts;
+  const std::string *frozenInitContract = nullptr;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
   // Canonical (resolved) base contract names per class, in declaration order.

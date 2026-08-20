@@ -1961,6 +1961,54 @@ ModuleEmitter::tryEmitNamedTupleReplace(const parser::Node &expr,
   return built;
 }
 
+
+// The class whose instances CPython makes unhashable: one that defines __eq__
+// and inherits object's __hash__, which is every unfrozen dataclass. Answering
+// object's identity hash instead would place two instances the class calls
+// EQUAL in different buckets, and every hash container built on them would miss
+// without a word -- which is what `{K(1): 2}` did before this was asked at the
+// key as well as at `hash()`.
+//
+// ⛔ Enum members are exempt: CPython's Enum defines no __eq__ of its own, so
+// members stay hashable; the __eq__ Lython synthesizes for an enum is a
+// lowering artifact rather than the author's value equality.
+std::optional<std::string>
+ModuleEmitter::unhashableClassName(mlir::Type type) const {
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(type));
+  if (!contract || enumClasses.count(contract.getContractName()))
+    return std::nullopt;
+  if (!inheritsObjectDefaultDunder(type, "__hash__") ||
+      !lookupClassMethod(type, "__eq__"))
+    return std::nullopt;
+  return py::contracts::displayClassNameForContract(contract.getContractName());
+}
+
+// ⭐ ASKED AT THE KEY, not only at `hash()`. The two are the same question and
+// CPython raises for both -- "cannot use 'K' as a dict key (unhashable type:
+// 'K')" -- but only `hash()` was asking, so a dict literal accepted the key,
+// stored it under an identity hash, and then MISSED on an equal one:
+//
+//     @dataclass
+//     class K:
+//         a: int
+//     d = {K(1): 2}
+//     print(d[K(1)])       # KeyError: K(a=1)
+bool ModuleEmitter::refuseUnhashableKey(const parser::Node &site,
+                                        mlir::Type type,
+                                        llvm::StringRef role) {
+  std::optional<std::string> unhashable = unhashableClassName(type);
+  if (!unhashable)
+    return false;
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, site.range.start,
+      "cannot use '" + *unhashable + "' as a " + role.str() +
+          " (unhashable type: '" + *unhashable +
+          "'): it defines __eq__ without __hash__, so CPython sets __hash__ to "
+          "None for it, as it does for every unfrozen dataclass"});
+  return true;
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitSetattrCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {
@@ -3837,16 +3885,10 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
   // Enum members are exempt: CPython's Enum defines no __eq__ of its own, so
   // members stay hashable; the __eq__ Lython synthesizes for an enum is a
   // lowering artifact, not the author's value equality.
-  if (auto contract =
-          mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(argType));
-      contract && inheritsObjectDefaultDunder(argType, "__hash__") &&
-      lookupClassMethod(argType, "__eq__") &&
-      !enumClasses.count(contract.getContractName())) {
+  if (std::optional<std::string> unhashable = unhashableClassName(argType)) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        "'" +
-            py::contracts::displayClassNameForContract(
-                contract.getContractName()) +
+        "'" + *unhashable +
             "' defines __eq__ without __hash__, so its instances are "
             "unhashable (CPython sets __hash__ to None for such a class, "
             "including every unfrozen dataclass); define __hash__ consistently "

@@ -2478,9 +2478,13 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
   const auto *elts = ast::nodeList(expr, "elts");
   if (!elts || elts->empty())
     return reject("malformed set literal");
-  for (const parser::NodePtr &element : *elts)
+  for (const parser::NodePtr &element : *elts) {
     if (!element)
       return reject("malformed set literal");
+    if (refuseUnhashableKey(*element, types.inferExpr(element.get()),
+                            "set element"))
+      return emitNone(expr);
+  }
 
   mlir::Type elementType;
   if (auto expectedContract =
@@ -3031,6 +3035,9 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
     const auto *vals = ast::nodeList(expr, "values");
     for (auto [index, key] : llvm::enumerate(*keys)) {
       empty = false;
+      if (key && refuseUnhashableKey(*key, types.inferExpr(key.get()),
+                                     "dict key"))
+        return emitNone(expr);
       if (key)
         valuesToPack.push_back(emitExprExpected(key.get(), keyExpected));
       if (vals && index < vals->size()) {

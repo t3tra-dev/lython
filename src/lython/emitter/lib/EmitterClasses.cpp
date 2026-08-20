@@ -1097,6 +1097,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // frozen is not). Only the first gets one below.
   bool isNamedTuple = false;
   bool dataclassOrder = false;
+  bool dataclassFrozen = false;
   bool dataclassInit = true;
   bool dataclassRepr = true;
   bool dataclassEq = true;
@@ -1137,8 +1138,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
             dataclassEq = *flag;
           else if (*keywordName == "order")
             dataclassOrder = *flag;
-          else if (*keywordName == "frozen" && !*flag)
-            ; // explicit False matches the synthesized behavior
+          else if (*keywordName == "frozen")
+            dataclassFrozen = *flag;
           else
             diagnostics.push_back(parser::Diagnostic{
                 parser::Severity::Error, keyword->range.start,
@@ -1974,6 +1975,38 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
             std::move(sig));
       }
     }
+    // ⭐ `@dataclass(frozen=True)` IS WHAT MAKES A RECORD HASHABLE, and that is
+    // the whole reason it cannot stay refused: an unfrozen dataclass is
+    // unhashable in CPython (and now here, at the key as well as at `hash()`),
+    // so without frozen there is no spelling for a record used as a dict key.
+    // The hash is `hash((self.f0, ...))` -- tuple's own, which is what CPython's
+    // dataclass builds -- so it agrees with the synthesized __eq__ by
+    // construction rather than by agreement, the same argument the NamedTuple
+    // __hash__ above makes.
+    if (dataclassFrozen)
+      frozenDataclassContracts.insert(contractName);
+    if (dataclassFrozen && dataclassEq && !userDefines("__hash__") &&
+        !order.empty()) {
+      std::vector<parser::NodePtr> members;
+      for (const std::string &field : order)
+        members.push_back(synth::selfAttribute("self", field, range));
+      parser::NodePtr tuple = parser::makeNode("Tuple", range);
+      parser::addField(*tuple, "elts", std::move(members));
+      parser::NodePtr call = synth::call(
+          synth::name("hash", range),
+          std::vector<parser::NodePtr>{std::move(tuple)}, range);
+      parser::NodePtr returnNode = synth::returnStmt(std::move(call), range);
+      FunctionSignature sig;
+      sig.positionalNames.push_back("self");
+      sig.positionalTypes.push_back(types.contract(contractName));
+      sig.positionalDefaults.push_back(false);
+      sig.resultType = types.intType();
+      registerSynthesized(
+          synth::functionDef("__hash__", toSynthParams({"self"}), {},
+                             {std::move(returnNode)}, nullptr,
+                             llvm::ArrayRef<llvm::StringRef>{}, range),
+          std::move(sig));
+    }
     // ⭐ `@dataclass(order=True)` COMPARES THE FIELD TUPLES, in declaration
     // order, which is exactly what CPython's dataclasses does -- it builds
     // `(self.f0, ...) < (other.f0, ...)` and lets tuple's own ordering decide.
@@ -2134,6 +2167,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     if (instanceBody)
       superContexts.push_back(SuperContext{std::string(contractName),
                                            bodySig.positionalNames.front()});
+    // The frozen-field guard is off inside this class's own __init__, which is
+    // where the fields are filled -- CPython goes around its own block there
+    // with object.__setattr__. The body is emitted BOTH as a symbol (here) and
+    // inlined at each construction, so the exemption is set in both places.
+    std::string frozenOwner{contractName};
+    std::optional<llvm::SaveAndRestore<const std::string *>> frozenInit;
+    if (ast::string(*statement, "name").value_or("") == "__init__" &&
+        frozenDataclassContracts.count(frozenOwner))
+      frozenInit.emplace(frozenInitContract, &frozenOwner);
     emitCallableFunction(*statement, symbolName, bodySig, {},
                          /*isLambda=*/false);
     if (instanceBody)
@@ -2752,6 +2794,22 @@ Value ModuleEmitter::emitInlineMethodBody(
     const llvm::StringMap<Value> &keywords) {
   if (!method.method)
     return emitNone(anchor);
+  // A frozen dataclass refuses field stores everywhere EXCEPT the constructor
+  // that fills them -- CPython's own __init__ goes around the block with
+  // object.__setattr__, and the synthesized one here is inlined through this
+  // path, so the exemption is a context rather than a symbol name (there is no
+  // symbol: the body is inlined into its caller).
+  std::string frozenInitOwner;
+  std::optional<llvm::SaveAndRestore<const std::string *>> frozenInit;
+  if (ast::string(*method.method, "name").value_or("") == "__init__") {
+    if (auto receiverContract =
+            mlir::dyn_cast_if_present<py::ContractType>(receiver.type))
+      frozenInitOwner = receiverContract.getContractName().str();
+    else
+      frozenInitOwner = method.definingClass;
+    if (frozenDataclassContracts.count(frozenInitOwner))
+      frozenInit.emplace(frozenInitContract, &frozenInitOwner);
+  }
   // A method body reached from inside its own inlining (directly, or around a
   // cycle like a() -> self.b() -> self.a()) would expand without end: reject
   // at this boundary instead of recursing until the emitter's own stack

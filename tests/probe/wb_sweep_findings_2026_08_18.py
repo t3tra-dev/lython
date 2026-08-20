@@ -2114,6 +2114,43 @@ them in.
 # never-entered case still unbound as CPython leaves it.
 
 # ==========================================================================
+# [BUG] an unhashable class was accepted as a key      FOUND + FIXED 2026-08-21
+#     @dataclass
+#     class K:
+#         a: int
+#     d = {K(1): 2}
+#     print(d[K(1)])       # KeyError: K(a=1)
+#
+# ⭐ THE RULE WAS ALREADY HERE AND ONLY ONE CALLER ASKED IT. `hash(K(1))` was
+# refused with the right reason -- CPython sets __hash__ to None for a class
+# that defines __eq__ and inherits object's, which is every unfrozen dataclass
+# -- and a dict key never asked. So the key went in under an identity hash and
+# MISSED on a key the class calls equal: the exact failure the hash() refusal's
+# own comment says it exists to prevent.
+#
+# ⛔ IT IS A MIS-EXECUTION, not a missing check: the program compiled, stored,
+# and then raised KeyError on a lookup CPython answers. A hand-written __eq__
+# without __hash__ has the same hole; both are refused now, at the dict key and
+# at the set element, with CPython 3.14's own wording.
+#
+# ⛔ AND THE REFUSAL NEEDED A WAY OUT, which is why `@dataclass(frozen=True)` is
+# implemented with it: without frozen there is no spelling for a record used as
+# a dict key. Its __hash__ is `hash((self.f0, ...))` -- tuple's own, what
+# CPython's dataclass builds -- so it agrees with the synthesized __eq__ by
+# construction. Its other half is a refusal too: assigning a field outside the
+# constructor is CPython's FrozenInstanceError, and accepting the keyword
+# without that would let a live dict key's hash change under it.
+#
+# ⛔ THE CONSTRUCTOR EXEMPTION IS SET IN TWO PLACES because the synthesized
+# __init__ is emitted twice: once as a symbol at the class declaration, once
+# inlined at each construction. Setting it only at the inline site left the
+# class DECLARATION refusing its own field stores -- a program that never
+# constructs anything failed to compile.
+#
+# Pinned by tests/golden/cases/frozen_dataclass_is_a_key.py and three
+# EmitterTests.
+
+# ==========================================================================
 # [BUG + BUG] a loop-built field, and a variadic ctor  FOUND 2026-08-20
 # Found by re-measuring the OTHER deviation both path ports document -- "a
 # `*args` parameter read inside an imported module currently mis-executes" --
