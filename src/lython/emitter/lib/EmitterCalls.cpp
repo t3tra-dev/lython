@@ -2411,50 +2411,56 @@ parser::NodePtr sharedField(const parser::Node &node, llvm::StringRef field) {
 }
 } // namespace
 
-std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
-    const parser::Node &expr, const parser::Node &calleeNode,
-    const parser::Node *receiverNode, Value receiver,
-    llvm::StringRef methodName) {
+const ModuleEmitter::VirtualDispatchHelper *
+ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
+                                    llvm::StringRef methodName,
+                                    unsigned argumentCount) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!contract)
-    return std::nullopt;
+    return nullptr;
   llvm::StringRef receiverClass = contract.getContractName();
-  // Keyword arguments at the CALL site: the dispatcher forwards positionals
-  // only, so a keyword would silently move to another parameter.
-  if (const auto *keywords = ast::nodeList(expr, "keywords"))
-    if (!keywords->empty())
-      return std::nullopt;
-  if (const auto *args = ast::nodeList(expr, "args"))
-    for (const parser::NodePtr &argument : *args)
-      if (argument && (argument->kind == "Starred"))
-        return std::nullopt;
+  const parser::Node &expr = anchor;
 
   // The body the STATIC type resolves to: its signature is the one the
   // dispatcher restates, and its declaring class is how the fallback names it.
   std::optional<MethodBinding> base = lookupClassMethod(receiver.type, methodName);
   if (!base || !base->method || base->definingClass.empty())
-    return std::nullopt;
+    return nullptr;
   if (base->kind != "instance" || base->async ||
       base->bodySignature.isGeneratorFunction ||
       base->bodySignature.isAsyncGeneratorFunction)
-    return std::nullopt;
+    return nullptr;
   if (types.lookupClass(base->definingClass) == mlir::Type())
-    return std::nullopt;
+    return nullptr;
 
   const parser::Node *arguments = ast::node(*base->method, "args");
   if (!arguments)
-    return std::nullopt;
+    return nullptr;
   if (ast::node(*arguments, "vararg") || ast::node(*arguments, "kwarg"))
-    return std::nullopt;
+    return nullptr;
   if (const auto *defaults = ast::nodeList(*arguments, "defaults"))
     if (!defaults->empty())
-      return std::nullopt;
+      return nullptr;
   if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs"))
     if (!kwonly->empty())
-      return std::nullopt;
+      return nullptr;
   parser::NodePtr returns = sharedField(*base->method, "returns");
   if (!returns)
-    return std::nullopt;
+    return nullptr;
+  // ⛔ A method that hands back an ITERATOR cannot be reached through a
+  // function: the frame a generator resumes into is not carried by the
+  // returned value ("a generator returned out of a function cannot be
+  // resumed"), so a dispatched `__iter__` would compile to a loop over a
+  // generator that cannot run. `for v in b` with an overridden `__iter__`
+  // keeps the refusal, which is what tests/golden/errors/
+  // for_over_a_subclass_overridden_iter.py pins.
+  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
+          types.widenLiteral(base->signature.resultType))) {
+    llvm::StringRef name = protocol.getProtocolName();
+    if (name == "Iterator" || name == "Generator" || name == "AsyncIterator" ||
+        name == "AsyncGenerator" || name == "Iterable")
+      return nullptr;
+  }
 
   parser::SourceRange range = expr.range;
   llvm::SmallVector<std::string, 4> parameterNames;
@@ -2465,7 +2471,7 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
     if (const auto *list = ast::nodeList(*arguments, field))
       for (const parser::NodePtr &argument : *list) {
         if (!argument)
-          return std::nullopt;
+          return nullptr;
         llvm::StringRef name = ast::nameSpelling(*argument);
         if (!selfSeen) {
           selfSeen = true;
@@ -2473,12 +2479,12 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
         }
         parser::NodePtr annotation = sharedField(*argument, "annotation");
         if (!annotation)
-          return std::nullopt;
+          return nullptr;
         parameterNames.push_back(name.str());
         params.push_back(synth::Param{name.str(), std::move(annotation)});
       }
   if (!selfSeen)
-    return std::nullopt;
+    return nullptr;
 
   std::string key = (receiverClass + "." + methodName).str();
   auto memo = virtualDispatchHelpers.find(key);
@@ -2513,11 +2519,11 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
         continue;
       depth = seen.size();
       if (types.lookupClass(candidate) == mlir::Type())
-        return std::nullopt;
+        return nullptr;
       candidates.push_back({depth, candidate.str()});
     }
     if (candidates.empty())
-      return std::nullopt;
+      return nullptr;
     llvm::sort(candidates, [](const auto &lhs, const auto &rhs) {
       if (lhs.first != rhs.first)
         return lhs.first > rhs.first;
@@ -2588,18 +2594,59 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
     memo = virtualDispatchHelpers.find(key);
   }
   if (!memo->second.callable)
-    return std::nullopt;
+    return nullptr;
+  return &memo->second;
+}
 
+// The AST call site: `x.m(a, b)` with a base-typed `x`.
+std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
+    const parser::Node &expr, const parser::Node &calleeNode,
+    const parser::Node *receiverNode, Value receiver,
+    llvm::StringRef methodName) {
+  // Keyword arguments at the CALL site: the dispatcher forwards positionals
+  // only, so a keyword would silently move to another parameter.
+  if (const auto *keywords = ast::nodeList(expr, "keywords"))
+    if (!keywords->empty())
+      return std::nullopt;
+  const auto *args = ast::nodeList(expr, "args");
+  unsigned argumentCount = args ? static_cast<unsigned>(args->size()) : 0;
+  if (args)
+    for (const parser::NodePtr &argument : *args)
+      if (argument && argument->kind == "Starred")
+        return std::nullopt;
+  const VirtualDispatchHelper *helper =
+      virtualDispatcherFor(expr, receiver, methodName, argumentCount);
+  if (!helper)
+    return std::nullopt;
+  // Emitted only now: a bail above must not have evaluated the arguments, or
+  // the normal path below would evaluate them a second time.
   llvm::SmallVector<Value, 4> callArguments{receiver};
-  if (const auto *args = ast::nodeList(expr, "args"))
+  if (args)
     for (const parser::NodePtr &argument : *args)
       callArguments.push_back(emitExpr(argument.get()));
-  if (callArguments.size() != parameterNames.size() + 1)
-    return std::nullopt;
-  Value callee = emitBindingRef(expr, memo->second.symbol, memo->second.callable);
+  Value callee = emitBindingRef(expr, helper->symbol, helper->callable);
   return emitCallableDispatch(
       expr, callee,
       emitCallOperands(expr, callArguments, /*includeAstArguments=*/false));
+}
+
+// The OPERATOR sites -- `len(x)`, `str(x)`, `x == y`, `x[i]`, `for x in y` --
+// which reach a method with their operands already emitted. Same dispatcher,
+// same memo: a dunder is a method, and eleven of them were measured silently
+// wrong on a base-typed receiver before the refusal existed.
+std::optional<Value> ModuleEmitter::tryEmitVirtualDispatchWithValues(
+    const parser::Node &anchor, Value receiver, llvm::StringRef methodName,
+    llvm::ArrayRef<Value> positional) {
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      anchor, receiver, methodName, static_cast<unsigned>(positional.size()));
+  if (!helper)
+    return std::nullopt;
+  llvm::SmallVector<Value, 4> callArguments{receiver};
+  callArguments.append(positional.begin(), positional.end());
+  Value callee = emitBindingRef(anchor, helper->symbol, helper->callable);
+  return emitCallableDispatch(
+      anchor, callee,
+      emitCallOperands(anchor, callArguments, /*includeAstArguments=*/false));
 }
 
 std::optional<Value>
@@ -4402,8 +4449,28 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
       llvm::StringRef wanted = name == "print" ? "__str__" : "__repr__";
       if (subclassOverridesMethod(argumentContract.getContractName(), wanted)) {
         Value argument = emitExpr(args->front().get());
-        if (refuseUnresolvableDispatch(expr, argument, wanted))
-          return emitNone(expr);
+        if (dispatchIsUnresolvable(argument, wanted, /*receiverNode=*/nullptr,
+                                   /*throughSuper=*/false)) {
+          // The dispatcher answers the same string this path would have
+          // inlined, so it joins the existing `repr` flow below rather than
+          // printing on its own.
+          if (std::optional<Value> dispatched =
+                  tryEmitVirtualDispatchWithValues(expr, argument, wanted,
+                                                   {})) {
+            if (name == "repr")
+              return *dispatched;
+            CallOperands dispatchedOperands =
+                emitCallOperands(expr, {*dispatched},
+                                 /*includeAstArguments=*/false);
+            std::optional<Value> printBinding = emitBuiltinBinding(name);
+            if (!printBinding)
+              return emitNone(expr);
+            return emitCallableDispatch(expr, *printBinding,
+                                        dispatchedOperands, types.none());
+          }
+          if (refuseUnresolvableDispatch(expr, argument, wanted))
+            return emitNone(expr);
+        }
       }
     }
     std::optional<MethodBinding> sourceMethod;
@@ -4685,8 +4752,14 @@ ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
   if (valueType == types.none())
     return emitStrLiteralPiece(anchor, "None");
   std::optional<Value> repr;
-  if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
-    return emitNone(anchor);
+  if (dispatchIsUnresolvable(value, "__repr__", /*receiverNode=*/nullptr,
+                             /*throughSuper=*/false)) {
+    if (std::optional<Value> dispatched =
+            tryEmitVirtualDispatchWithValues(anchor, value, "__repr__", {}))
+      return *dispatched;
+    if (refuseUnresolvableDispatch(anchor, value, "__repr__"))
+      return emitNone(anchor);
+  }
   if (std::optional<Value> dispatched =
           tryEmitClassDunder(anchor, value, "__repr__")) {
     repr = *dispatched;

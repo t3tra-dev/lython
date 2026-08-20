@@ -14,8 +14,14 @@ Value ModuleEmitter::emitBinarySpecial(const parser::Node &anchor,
   // synthesized ones) inline like any other source method call -- through the
   // same gate `x.m()` goes through, since `a == b` on a base-typed `a` is the
   // same unresolvable dispatch written differently.
-  if (refuseUnresolvableDispatch(anchor, lhs, method))
-    return emitNone(anchor);
+  if (dispatchIsUnresolvable(lhs, method, /*receiverNode=*/nullptr,
+                             /*throughSuper=*/false)) {
+    if (std::optional<Value> dispatched =
+            tryEmitVirtualDispatchWithValues(anchor, lhs, method, {rhs}))
+      return *dispatched;
+    if (refuseUnresolvableDispatch(anchor, lhs, method))
+      return emitNone(anchor);
+  }
   if (std::optional<MethodBinding> binding =
           lookupClassMethod(lhs.type, method);
       binding && binding->method)

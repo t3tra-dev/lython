@@ -2642,6 +2642,19 @@ ModuleEmitter::tryEmitClassDunder(const parser::Node &anchor, Value receiver,
                                   llvm::StringRef dunder,
                                   llvm::ArrayRef<Value> positional,
                                   bool *refusedOut) {
+  // An overridden dunder on a base-typed receiver goes through the same
+  // synthesized dispatcher a named call does: `len(bag)` and `bag.__len__()`
+  // are one method, and answering only the second would leave the operator
+  // spelling refused for exactly the programs the dispatch exists for.
+  if (dispatchIsUnresolvable(receiver, dunder, /*receiverNode=*/nullptr,
+                             /*throughSuper=*/false))
+    if (std::optional<Value> dispatched =
+            tryEmitVirtualDispatchWithValues(anchor, receiver, dunder,
+                                             positional)) {
+      if (refusedOut)
+        *refusedOut = false;
+      return dispatched;
+    }
   bool refused = false;
   std::optional<MethodBinding> method =
       resolveClassDunder(anchor, receiver, dunder, refused);

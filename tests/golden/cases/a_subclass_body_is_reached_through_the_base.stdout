@@ -8,3 +8,10 @@ rect/4 a rect square/4
 ['<shape', '<rect', '<square', '<circle']
 square 4
 [circle
+2 bag True
+6 full True
+0 bag False
+5 False Money
+6 True Doubled
+money
+doubled

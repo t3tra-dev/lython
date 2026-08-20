@@ -133,10 +133,21 @@ private:
                                               const parser::Node *receiverNode,
                                               Value receiver,
                                               llvm::StringRef methodName);
+  // The same dispatch for an operator site, whose operands are already values.
+  std::optional<Value>
+  tryEmitVirtualDispatchWithValues(const parser::Node &anchor, Value receiver,
+                                   llvm::StringRef methodName,
+                                   llvm::ArrayRef<Value> positional);
   struct VirtualDispatchHelper {
     std::string symbol;
     py::CallableType callable;
   };
+  // The dispatcher for one (receiver class, method), synthesized on first use.
+  // Null when the shape is outside what the synthesis covers.
+  const VirtualDispatchHelper *virtualDispatcherFor(const parser::Node &anchor,
+                                                    Value receiver,
+                                                    llvm::StringRef methodName,
+                                                    unsigned argumentCount);
   // Keyed "<class>.<method>", so one dispatcher serves every call site and a
   // method that dispatches on itself terminates. Filled BEFORE the body is
   // emitted for that second reason.
