@@ -42,33 +42,33 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionTargetRuntimeSources(
   closureSources.reserve(callable.closureValues.size());
   for (auto [index, closureValue] : llvm::enumerate(callable.closureValues)) {
     mlir::Type expected = closureTypes[index];
-    // ⭐ A CAPTURED FUNCTION ARRIVES ERASED. The closure slot's declared type
-    // is the emitter's precise `!py.callable<...>`, while the VALUE carried in
-    // a function object is `builtins.function` -- the one physical shape every
-    // function value has, which is also why calling a callable-typed PARAMETER
-    // works. Comparing the two by assignability refused the capture, which is
-    // the wrapper-closure idiom and therefore every decorator:
+    // ⛔ AN ERASED FUNCTION IS REFUSED HERE, and letting it through was tried
+    // and REVERTED on 2026-08-20. A captured function's value carries the one
+    // physical shape every function has, `builtins.function`, while the slot's
+    // declared type is the emitter's precise callable -- so this comparison
+    // refuses the wrapper-closure idiom, and therefore every hand-written
+    // decorator:
     //
     //     def wrap(fn: Callable[[int], int]) -> Callable[[int], int]:
     //         def inner(n: int) -> int:
     //             return fn(n)
     //         return inner
     //
-    //     # function target wrap$inner closure 0 has contract
-    //     # '!py.contract<"builtins.function">', expected '!py.callable<...>'
+    // ⭐ WHAT THE RELAXATION UNCOVERED is why it cannot stay: the call through
+    // such a capture resolves to the WRONG TARGET when the captured function is
+    // itself a closure. `step1 = double(base); step2 = add_one(step1)` printed
+    // `step2(5)` as 6 -- base(5)+1 -- and the lowered body of add_one's wrapper
+    // reads `call @base(...)`, a static call to the innermost function instead
+    // of an indirect one through the object it was handed. Two top-level
+    // functions in the same position dispatch correctly (`wrap(inc)` and
+    // `wrap(dec)` answer 11 and 9), which is why the relaxation looked sound.
     //
-    // ⛔ The emitter has already checked the capture against the declared type;
-    // this is the ABI's own check, and the ABI's question is whether the values
-    // fit the slot. Only this one direction is allowed -- an erased function
-    // into a callable slot -- so nothing else loses its check.
-    bool erasedFunctionIntoCallable = false;
-    if (mlir::isa<py::CallableType>(expected))
-      if (auto actual = mlir::dyn_cast_if_present<py::ContractType>(
-              closureValue.contract))
-        erasedFunctionIntoCallable =
-            actual.getContractName() == "builtins.function";
-    if (!erasedFunctionIntoCallable &&
-        !py::isAssignableTo(closureValue.contract, expected, op.getOperation()))
+    // ⛔ AND THE MIS-EXECUTION IS NOT THIS CHECK'S: the same program with both
+    // wrappers' inner functions NAMED THE SAME compiles without the relaxation
+    // and prints 6 too. This check narrows how much of the defect is reachable;
+    // the defect is the closure evidence a captured callable carries, recorded
+    // in tests/probe/wb_sweep_findings_2026_08_18.py.
+    if (!py::isAssignableTo(closureValue.contract, expected, op.getOperation()))
       return op.emitError()
              << "function target " << targetName << " closure " << index
              << " has contract " << closureValue.contract << ", expected "

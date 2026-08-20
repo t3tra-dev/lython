@@ -1891,7 +1891,46 @@ them in.
 # fixpoint does not cover at all.
 
 # ==========================================================================
-# [BUG] a closure that captures a FUNCTION            FOUND + FIXED 2026-08-19
+# [BUG] a captured callable calls the wrong function       FOUND 2026-08-20
+# ⛔ THE FIX BELOW WAS REVERTED THE NEXT DAY. Read this entry first.
+#
+#     def double(fn): ...  # returns a wrapper that calls fn(n) * 2
+#     def add_one(fn): ... # returns a wrapper that calls fn(n) + 1
+#     def base(n): return n
+#     step1 = double(base)
+#     step2 = add_one(step1)
+#     print(step1(5), step2(5))     # 10 6   -- CPython prints 10 11
+#
+# ⭐ 6 IS base(5) + 1: the wrapper add_one built called `base`, not `step1`. The
+# lowered body of add_one's inner function says so literally -- `call @base(...)`
+# where the frontend IR has an indirect `py.call` through the closure parameter.
+# So the closure evidence a captured callable carries names the INNERMOST
+# function instead of the object that was handed over, and the indirect
+# dispatch collapses to a static call to it.
+#
+# ⛔ TWO TOP-LEVEL FUNCTIONS IN THE SAME POSITION DISPATCH CORRECTLY:
+# `wrap(inc)` and `wrap(dec)` answer 11 and 9, and `wrap(pick(flag))` picks
+# correctly too. It is specifically a captured function that is ITSELF a
+# closure. That is why the relaxation below looked sound on five programs.
+#
+# ⛔ AND IT IS NOT THE CHECK'S DEFECT: with the relaxation reverted, the same
+# program whose two wrappers name their inner function THE SAME still compiles
+# -- the check does not fire -- and still prints 6. The check narrows how much
+# of the defect is reachable; it does not cause it. Measured on the pre-session
+# binary too, so it is not new.
+#
+# ⛔ WHAT ELSE THE SAME EVIDENCE BREAKS: `rewrap(make(10))` where make returns a
+# closure over an int raises "TypeError: callable target is not available" at
+# run time -- the dispatch found no arm for the object it was given.
+#
+# ⭐ WHERE TO START: Evidence/CallableArgument.cpp builds a callable argument's
+# alternatives from `returnedCallableSummaries` -- for a call that RETURNS a
+# callable it walks the producer's captures and records a closure value TYPE per
+# capture. The types are right; what reaches the wrapper at run time is the
+# capture's VALUE where the object belongs.
+
+# ==========================================================================
+# [GAP -> REVERTED] a closure that captures a FUNCTION      2026-08-19/20
 # Found while scoping the decorator feature above, and it is the third half of
 # it: what `@deco` desugars to is exactly this program, written by hand.
 #
@@ -1920,9 +1959,12 @@ them in.
 # question the emitter had already answered, at a point where the answer had
 # been erased; only that re-ask is relaxed.
 #
-# Pinned by tests/golden/cases/closure_captures_a_function.py -- twice() calls
-# the captured function twice and compose() threads two of them, which
-# distinguishes "the right function was captured" from "a function was".
+# ⛔ REVERTED 2026-08-20 and the golden deleted with it. Every program it
+# pinned still gave the right answer -- the reason it had to go is the entry
+# above: the same relaxation admits programs that call the WRONG function
+# silently, and this check is what keeps most of them out until the closure
+# evidence is repaired. A refusal that also refuses correct programs beats a
+# wrong answer.
 #
 # ⛔ The decorator SYNTAX is still refused (half two above). This closes the
 # thing that would have made the desugar produce a program that does not
