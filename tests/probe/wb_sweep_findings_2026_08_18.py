@@ -2051,6 +2051,45 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [SWEEP] the method tables, measured                        RAN 2026-08-20
+# Every non-underscore method CPython gives str, list, dict and set was called
+# with a plausible argument and diffed -- about eighty calls. FOUR names came
+# back short, and only two of them are defects:
+#
+# 1. `set.pop()` -- absent. Not a manifest method because its RESULT is the
+#    element type, which the manifest cannot name; the same reason set
+#    ITERATION is a lowering rewrite over `items_view` rather than an
+#    `__iter__`. The emitter shape that would work is the reducer fold's:
+#    seed an accumulator of the element type, `for e in s: acc = e; found = 1;
+#    break`, raise KeyError when the flag is clear, then discard. It needs the
+#    reducer's placeholder machinery (int/str/float/bool/tuple only), which is
+#    a lambda inside tryEmitReducerCall today -- so the first question is
+#    whether that placeholder should be shared before a second caller appears.
+#
+# 2. `d.keys()` / `.values()` / `.items()` PRINTED -- the recorded dict-view
+#    gap; they work where they are consumed.
+#
+# `list.count` and `list.index` came back only because the sweep passed a str
+# to a list[int].
+#
+# ==========================================================================
+# [GAP] the loop variable does not outlive the loop           FOUND 2026-08-20
+#     s = {1, 2}
+#     for e in s:
+#         break
+#     print(e)          # unresolved name 'e' -- CPython prints 1
+#
+# ⭐ CPython leaks the loop target into the enclosing scope, and a search loop
+# is written that way ("for x in xs: if pred(x): break" then use x). It is a
+# refusal, not a wrong answer, and it is what made the set.pop() rewrite above
+# need an accumulator instead of just reading the target afterwards.
+#
+# ⛔ NOT A ONE-LINE SCOPE CHANGE: emitFor has six paths (genexpr fusion, lazy
+# iterator fusion, itertools fusion, the in-generator index loop, the plain
+# iterator protocol) and the target would have to survive all of them, with the
+# never-entered case still unbound as CPython leaves it.
+
+# ==========================================================================
 # [BUG + BUG] a loop-built field, and a variadic ctor  FOUND 2026-08-20
 # Found by re-measuring the OTHER deviation both path ports document -- "a
 # `*args` parameter read inside an imported module currently mis-executes" --
