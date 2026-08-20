@@ -6746,8 +6746,15 @@ module attributes {
   memref.global "private" constant @__ly_long_msg_float_infinity : memref<40xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 99, 111, 110, 118, 101, 114, 116, 32, 102, 108, 111, 97, 116, 32, 105, 110, 102, 105, 110, 105, 116, 121, 32, 116, 111, 32, 105, 110, 116, 101, 103, 101, 114]>
   // "zero to a negative power"
   memref.global "private" constant @__ly_long_msg_zero_negative_power : memref<24xi8> = dense<[122, 101, 114, 111, 32, 116, 111, 32, 97, 32, 110, 101, 103, 97, 116, 105, 118, 101, 32, 112, 111, 119, 101, 114]>
-  // "negative number cannot be raised to a fractional power" (CPython returns
-  // a complex here; complex is not implemented, so reject loudly instead)
+  // "negative number cannot be raised to a fractional power".
+  //
+  // ⛔ CPython returns a COMPLEX here, and complex is implemented -- what
+  // blocks it is the static result type, not the type's absence. `x ** y` over
+  // two floats is a float for every pair but this one, and a return type of
+  // `float | complex` is a union the py ABI cannot carry out of an operator.
+  // typeshed says the same thing by giving `float.__pow__` a result of `Any`.
+  // So the operator raises where the answer would leave the type: loud, and at
+  // the value that caused it.
   memref.global "private" constant @__ly_long_msg_fractional_power_negative : memref<54xi8> = dense<[110, 101, 103, 97, 116, 105, 118, 101, 32, 110, 117, 109, 98, 101, 114, 32, 99, 97, 110, 110, 111, 116, 32, 98, 101, 32, 114, 97, 105, 115, 101, 100, 32, 116, 111, 32, 97, 32, 102, 114, 97, 99, 116, 105, 111, 110, 97, 108, 32, 112, 111, 119, 101, 114]>
   memref.global "private" constant @__ly_long_zero_header : memref<2xi64> = dense<[9223372036854775807, 1]>
   memref.global "private" constant @__ly_long_zero_meta : memref<2xi64> = dense<[0, 0]>
