@@ -585,6 +585,27 @@ bool RuntimeBundleLowerer::storedSourceOutlivesStore(mlir::Operation *op,
                                                      mlir::Value source) {
   if (!source)
     return false;
+  // ⭐ A LOOP-CARRIED VALUE OUTLIVES EVERY STORE INSIDE OR AFTER THE LOOP, and
+  // the dominance walk below cannot see it: its other uses are the loop's own,
+  // which the store does not dominate, so the store read "nobody else needs
+  // this" and took the token. The loop then released the same reference again:
+  //
+  //     class B:
+  //         def __init__(self, n: int) -> None:
+  //             raw = ""
+  //             for i in range(n):
+  //                 raw = raw + "x"
+  //             self.raw: str = raw
+  //
+  //     # owned resource from @LyUnicode_FromBytes result 0 is released or
+  //     # transferred more than once on one CFG path
+  //
+  // ⛔ A BLOCK ARGUMENT IS THE SIGNAL, not the loop: the same is true of an
+  // if/else merge, whose two arms each hand over a reference the frame still
+  // owns. Both are values the store did not produce, and the store may only
+  // move a token it can see the whole life of.
+  if (mlir::isa<mlir::BlockArgument>(source))
+    return true;
   mlir::Operation *function = op->getParentOfType<mlir::func::FuncOp>();
   if (!function)
     return false;

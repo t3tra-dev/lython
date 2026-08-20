@@ -16,10 +16,9 @@ Deviations from CPython:
   - the PurePath hierarchy and the flavour mechanism are gone (above). `Path`
     is final and concrete.
   - `Path(...)` takes up to four str segments rather than `*args` of
-    str-or-PathLike: a `*args` parameter read inside an imported module
-    currently mis-executes (reported to the Wave 3 foundation track). Pass a
-    Path with `str(other)`, or use `/` and `joinpath`, both of which accept a
-    str segment.
+    str-or-PathLike; the comment on __init__ has the measurement that says
+    why. Pass a Path with `str(other)`, or use `/` and `joinpath`, both of
+    which accept a str segment.
   - `parents` is absent (it is a lazy immutable sequence view); walk `parent`
     instead. `glob`/`rglob` accept only a pattern of the form '*', '*.ext',
     'prefix*', or a literal name -- no '**', no character classes, no
@@ -99,6 +98,25 @@ class Path:
     redundant separators and single dots are dropped, '..' is kept.
     """
 
+    # ⛔ NOT `*segments`, and the reason is narrower than it used to be. A
+    # `*args` parameter read inside an imported module works now (measured:
+    # a free function and a class both fold one correctly across a module
+    # boundary). What does not work is CALLING a variadic constructor with a
+    # value that is owned on only one branch of a merge -- `with_name` below
+    # does exactly that, and the argument leaks:
+    #
+    #     class P:
+    #         def __init__(self, *segments: str) -> None: ...
+    #     def g(a: str, b: str) -> str:
+    #         t = b
+    #         if a != "":
+    #             t = a + "/" + b
+    #         return P(t).raw
+    #     # owned resource from @LyUnicode_Concat result 0 reaches function
+    #     # exit without release
+    #
+    # The same call to a non-variadic __init__ is fine, so it is the vararg
+    # pack at a constructor rather than the merge.
     def __init__(self, a: str = ".", b: str = "", c: str = "",
                  d: str = "") -> None:
         self._raw: str = _clean(posixpath.join(a, b, c, d))

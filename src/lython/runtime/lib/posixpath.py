@@ -9,13 +9,6 @@ Instead of importing os.path use os.sep etc. as os.path is a
 platform-dependent alias for this module.
 
 Deviations from CPython:
-  - `join(a, *p)` becomes `join(a, b, c, d)` with three optional components: a
-    `*args` parameter read inside an imported module currently mis-executes
-    (reported to the Wave 3 foundation track), and four components cover every
-    real call. Each component behaves exactly as CPython's loop treats it,
-    including `join('a', '')` == 'a/'; the unfilled parameters default to a NUL
-    sentinel, which no path component can contain, rather than to '', so an
-    explicit '' stays distinguishable from an omitted argument.
   - paths are `str` only. CPython's posixpath is generic over str and bytes
     through `os.fspath` and a `_get_sep` that switches on the argument's
     type; that is a runtime type test, so this module is the str
@@ -74,13 +67,6 @@ def isabs(s: str) -> bool:
     return s.startswith("/")
 
 
-# No path component can contain a NUL byte, so it stands in for "argument not
-# passed" -- `join(a, b='')` would be indistinguishable from `join(a)`, and
-# CPython's join DOES treat a trailing '' as a request for a trailing
-# separator.
-_UNSET: str = "\x00"
-
-
 def _join_one(path: str, piece: str) -> str:
     if piece.startswith("/"):
         # `piece + ""`, not `piece`: returning a borrowed parameter as owned
@@ -92,7 +78,7 @@ def _join_one(path: str, piece: str) -> str:
     return path + "/" + piece
 
 
-def join(a: str, b: str = _UNSET, c: str = _UNSET, d: str = _UNSET) -> str:
+def join(a: str, *p: str) -> str:
     """Join two or more pathname components, inserting '/' as needed.
 
     If any component is an absolute path, all previous path components
@@ -102,12 +88,8 @@ def join(a: str, b: str = _UNSET, c: str = _UNSET, d: str = _UNSET) -> str:
     # `a + ""` so the accumulator is owned on every path, including the
     # one-argument call that never reassigns it.
     path = a + ""
-    if b != _UNSET:
-        path = _join_one(path, b)
-    if c != _UNSET:
-        path = _join_one(path, c)
-    if d != _UNSET:
-        path = _join_one(path, d)
+    for piece in p:
+        path = _join_one(path, piece)
     return path
 
 

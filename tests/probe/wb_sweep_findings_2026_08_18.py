@@ -1964,6 +1964,59 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [BUG + BUG] a loop-built field, and a variadic ctor  FOUND 2026-08-20
+# Found by re-measuring the OTHER deviation both path ports document -- "a
+# `*args` parameter read inside an imported module currently mis-executes" --
+# which is no longer true: a free function and a class both fold one correctly
+# across a module boundary now. posixpath.join takes `*p` again as a result.
+# Making pathlib.Path variadic too surfaced two defects, one of them wider than
+# either port.
+#
+# 1. FIXED. A LOCAL BUILT BY A LOOP AND STORED INTO A FIELD double-releases:
+#
+#        class B:
+#            def __init__(self, n: int) -> None:
+#                raw = ""
+#                for i in range(n):
+#                    raw = raw + "x"
+#                self.raw: str = raw
+#
+#    ⭐ The field store may take the value's reference when nothing else needs
+#    it, and `storedSourceOutlivesStore` decides that by asking whether any USE
+#    of the source is DOMINATED by the store. A loop-carried value has no such
+#    use -- its other uses are the loop's own, which the store does not
+#    dominate -- so the store read "nobody else needs this" and took a token
+#    the loop then released again. A block argument is the signal: the store
+#    did not produce that value and may only move a token whose whole life it
+#    can see. The if/else merge is the same shape and is in the golden with it.
+#
+#    ⛔ SAME FAMILY AS THE EXCEPTION-ARGUMENT FIX earlier today: a slot that
+#    retains AND releases the source is right for a temporary and a double free
+#    for anything the frame still owns. Two different predicates in two files
+#    now answer that question; a third place asking it would be the argument
+#    for one shared answer.
+#
+# 2. NOT FIXED. CALLING A VARIADIC CONSTRUCTOR with a value that is owned on
+#    only one branch of a merge LEAKS the argument:
+#
+#        class P:
+#            def __init__(self, *segments: str) -> None: ...
+#        def g(a: str, b: str) -> str:
+#            t = b
+#            if a != "":
+#                t = a + "/" + b
+#            return P(t).raw
+#        # owned resource from @LyUnicode_Concat result 0 reaches function exit
+#        # without release
+#
+#    ⛔ NOT the merge and NOT varargs on their own: the same call to a
+#    NON-variadic __init__ is fine, and the same merge into a variadic FUNCTION
+#    is fine. It is the vararg pack at a CONSTRUCTOR. pathlib.Path keeps its
+#    four fixed segments because of it -- `with_name` is exactly that shape --
+#    and the reason now sits on __init__ with the reproducer instead of the
+#    stale one about imported modules.
+
+# ==========================================================================
 # [BUG] pathlib.parts was a list                       FOUND + FIXED 2026-08-20
 # Found by re-running the differential over the whole golden corpus after the
 # day's fixes: three programs disagreed with CPython, and TWO of them were the
