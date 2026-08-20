@@ -656,6 +656,33 @@
 # in three places.
 #
 # ============================================================
+# (57) FIXED: max(xs, default=...) / min(xs, default=...).
+# ============================================================
+#     print(max(xs, default=0))
+#     # max() with the 'default' keyword argument is not supported
+#
+# ⭐ FIXED 2026-08-20. The fold already emits a seen-flag and `if not seen:
+# raise ValueError(...)`, so a default is that branch's other answer -- and the
+# cheapest way to give it is not a second arm but a different SEED. The
+# accumulator starts at the default and the empty guard disappears.
+#
+# ⛔ SEEDING THE PLACEHOLDER AND ASSIGNING THE DEFAULT AFTERWARDS COMPILED AND
+# LEAKED: "owned resource from builtin.unrealized_conversion_cast result 0
+# reaches function exit without release". The fabricated seed was only ever
+# unread because the empty path RAISED; give that path a return and the
+# fabrication reaches the exit. The measurement is the argument for seeding
+# rather than branching, and it is why the empty guard is now absent rather
+# than two-armed.
+#
+# ⛔ AND THE KEYWORDS ARE NOW READ BY NAME. The old code took
+# `reducerKeywords->front()` as "the key", which was right while `key` was the
+# only keyword allowed; `min(xs, default="none", key=len)` then probed the
+# DEFAULT as if it were the key function and reported "needs a key the fold can
+# seed ... this one produces object". Both orders are in the golden.
+#
+# Pinned by tests/golden/cases/min_max_with_a_default.py.
+#
+# ============================================================
 # (56) FIXED: setattr(x, "v", value) -- AND WHAT THE WHOLE BUILTIN SURFACE
 #      STILL LACKS, MEASURED RATHER THAN GUESSED.
 # ============================================================

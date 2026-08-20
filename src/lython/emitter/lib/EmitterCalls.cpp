@@ -3076,14 +3076,38 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
   // best key, compared in place of the element. CPython's builtin_max does
   // exactly that (keyfunc applied once per item, the item kept). It was
   // refused for an argument shape the fold could take with one extra slot.
+  //
+  // ⭐ AND `default=` IS THE EMPTY GUARD'S OTHER ANSWER. The fold already emits
+  // `if not seen: raise ValueError(...)`; with a default that branch assigns
+  // instead of raising, which is all CPython's builtin_max does with it. It was
+  // refused as "max() with the 'default' keyword argument is not supported",
+  // for a shape one arm of an `if` away.
   const parser::Node *reducerKeyNode = nullptr;
-  if ((reducer == "max" || reducer == "min") && reducerKeywords &&
-      reducerKeywords->size() == 1 && reducerKeywords->front() &&
-      ast::string(*reducerKeywords->front(), "arg").value_or("") == "key")
-    reducerKeyNode = ast::node(*reducerKeywords->front(), "value");
+  parser::NodePtr reducerKeyValue;
+  parser::NodePtr reducerDefaultValue;
+  if ((reducer == "max" || reducer == "min") && reducerKeywords)
+    for (const parser::NodePtr &entry : *reducerKeywords) {
+      if (!entry)
+        continue;
+      llvm::StringRef name = ast::string(*entry, "arg").value_or("");
+      const parser::Field *field = parser::findField(*entry, "value");
+      if (!field || !std::holds_alternative<parser::NodePtr>(field->value))
+        continue;
+      const parser::NodePtr &value = std::get<parser::NodePtr>(field->value);
+      if (name == "key") {
+        reducerKeyValue = value;
+        reducerKeyNode = value.get();
+      } else if (name == "default") {
+        reducerDefaultValue = value;
+      }
+    }
+  bool reducerKeywordsUnderstood =
+      !reducerKeywords || reducerKeywords->empty() ||
+      (reducerKeywords->size() ==
+       static_cast<std::size_t>(reducerKeyNode ? 1 : 0) +
+           static_cast<std::size_t>(reducerDefaultValue ? 1 : 0));
   if (reducerArgs && reducerArgs->size() == 1 && reducerArgs->front() &&
-      (!reducerKeywords || reducerKeywords->empty() || reducerKeyNode) &&
-      (reducer == "max" || reducer == "min")) {
+      reducerKeywordsUnderstood && (reducer == "max" || reducer == "min")) {
     mlir::Type elementType = reducerElementType();
     // The accumulator needs a value of the element type before the first
     // trip; the seen-flag is what keeps it from ever being READ, so only its
@@ -3159,10 +3183,9 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         auto scope = types.pushScope();
         types.bindLocalSymbol("__lykeyprobe", elementType);
         parser::NodePtr probeArg = synth::name(std::string("__lykeyprobe"), expr.range);
-        parser::NodePtr probe = synth::call(std::get<parser::NodePtr>(
-                             parser::findField(*reducerKeywords->front(),
-                                               "value")
-                                 ->value), std::vector<parser::NodePtr>{std::move(probeArg)}, expr.range);
+        parser::NodePtr probe = synth::call(
+            reducerKeyValue, std::vector<parser::NodePtr>{std::move(probeArg)},
+            expr.range);
         keyType = types.widenLiteral(types.inferExpr(probe.get()));
       }
       keyPlaceholder = placeholderFor(keyType);
@@ -3194,6 +3217,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
             const auto *elts = ast::nodeList(*arg, "elts");
             return !elts || elts->empty();
           }();
+      if (emptyLiteral && reducerDefaultValue)
+        return emitExpr(reducerDefaultValue.get());
       if (emptyLiteral) {
         parser::NodePtr errorName = synth::name(std::string("ValueError"), expr.range);
         parser::NodePtr message = parser::makeNode("Constant", expr.range);
@@ -3223,9 +3248,21 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         "__" + reducer.str() + "seen" + std::to_string(listCompCounter);
     std::string element =
         "__" + reducer.str() + "el" + std::to_string(listCompCounter);
-    values[tmp] = Value{placeholder,
-                        placeholder.getType()};
-    types.bindSymbol(tmp, placeholder.getType());
+    // ⭐ WITH A DEFAULT THE SEED *IS* THE ANSWER FOR AN EMPTY ITERABLE, so the
+    // accumulator starts there and the empty guard disappears instead of
+    // growing a second arm. Seeding the placeholder and assigning the default
+    // afterwards compiled but leaked: the placeholder is a fabricated value the
+    // first element overwrites, and it was only ever unread because the empty
+    // path RAISED. Give it a path that returns and the fabrication reaches the
+    // exit ("owned resource ... reaches function exit without release").
+    if (reducerDefaultValue) {
+      Value seed = emitExpr(reducerDefaultValue.get());
+      values[tmp] = seed;
+      types.bindSymbol(tmp, seed.type);
+    } else {
+      values[tmp] = Value{placeholder, placeholder.getType()};
+      types.bindSymbol(tmp, placeholder.getType());
+    }
     // The seen-flag is an INT (0/1): loop-carried bool contract block
     // arguments have no boxed physical form yet.
     mlir::Type flagType = types.literal("0");
@@ -3302,10 +3339,9 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::addField(*seenSwitch, "orelse", std::move(firstBody));
     std::vector<parser::NodePtr> loopBody;
     if (reducerKeyNode) {
-      parser::NodePtr keyCall = synth::call(std::get<parser::NodePtr>(
-                           parser::findField(*reducerKeywords->front(),
-                                             "value")
-                               ->value), std::vector<parser::NodePtr>{elementName}, expr.range);
+      parser::NodePtr keyCall = synth::call(
+          reducerKeyValue, std::vector<parser::NodePtr>{elementName},
+          expr.range);
       parser::NodePtr bindKey = synth::assign(keyName, std::move(keyCall), expr.range);
       loopBody.push_back(std::move(bindKey));
     }
@@ -3317,23 +3353,29 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     parser::addField(*loop, "orelse", std::vector<parser::NodePtr>{});
     // if __seen == 0: raise ValueError("max()/min() iterable argument is
     // empty")
-    parser::NodePtr notSeen = flagCompare("Eq");
-    parser::NodePtr message = parser::makeNode("Constant", expr.range);
-    parser::addField(*message, "value",
-                     reducer.str() + "() iterable argument is empty");
-    parser::NodePtr errorCall = synth::call(nameNode("ValueError"), std::vector<parser::NodePtr>{message}, expr.range);
-    parser::NodePtr raiseNode = synth::raiseStmt(errorCall, expr.range);
-    parser::NodePtr emptyGuard = parser::makeNode("If", expr.range);
-    parser::addField(*emptyGuard, "test", notSeen);
-    parser::addField(*emptyGuard, "body",
-                     std::vector<parser::NodePtr>{raiseNode});
-    parser::addField(*emptyGuard, "orelse",
-                     std::vector<parser::NodePtr>{});
+    parser::NodePtr emptyGuard;
+    if (!reducerDefaultValue) {
+      parser::NodePtr notSeen = flagCompare("Eq");
+      parser::NodePtr message = parser::makeNode("Constant", expr.range);
+      parser::addField(*message, "value",
+                       reducer.str() + "() iterable argument is empty");
+      parser::NodePtr errorCall = synth::call(
+          nameNode("ValueError"), std::vector<parser::NodePtr>{message},
+          expr.range);
+      parser::NodePtr raiseNode = synth::raiseStmt(errorCall, expr.range);
+      emptyGuard = parser::makeNode("If", expr.range);
+      parser::addField(*emptyGuard, "test", notSeen);
+      parser::addField(*emptyGuard, "body",
+                       std::vector<parser::NodePtr>{raiseNode});
+      parser::addField(*emptyGuard, "orelse",
+                       std::vector<parser::NodePtr>{});
+    }
     std::optional<Value> priorElement;
     if (auto found = values.find(element); found != values.end())
       priorElement = found->second;
     emitFor(*loop);
-    emitStatement(*emptyGuard);
+    if (emptyGuard)
+      emitStatement(*emptyGuard);
     auto built = values.find(tmp);
     if (built == values.end() || !built->second.value) {
       diagnostics.push_back(parser::Diagnostic{

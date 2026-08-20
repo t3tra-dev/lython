@@ -1,0 +1,10 @@
+5 1
+-1 99
+7 8
+ccc a
+none none
+none
+(3, 'c')
+(0, 'z')
+still raises max() iterable argument is empty
+loop 40000
