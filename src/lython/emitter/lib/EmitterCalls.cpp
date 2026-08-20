@@ -1151,6 +1151,12 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           }
         }
         Value receiver = emitExpr(receiverNode);
+        if (dispatchIsUnresolvable(receiver, *methodName, receiverNode,
+                                   /*throughSuper=*/false)) {
+          if (std::optional<Value> dispatched = tryEmitVirtualDispatch(
+                  expr, *calleeNode, receiverNode, receiver, *methodName))
+            return *dispatched;
+        }
         if (refuseUnresolvableDispatch(*calleeNode, receiver, *methodName,
                                        receiverNode))
           return emitNone(expr);
@@ -2359,6 +2365,243 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
 // rather than guessing, because "0" is also a valid base-10 literal and the
 // CPython rule for it (prefix decides, bare leading zeros are an error) is a
 // different parse, not a parameter of this one.
+// ⭐ THE CALL THE STATIC RECEIVER TYPE CANNOT ANSWER, ANSWERED. When a
+// subclass overrides the method, the receiver's static class does not say which
+// body runs, and this project has no vtable to fall back on -- so the call was
+// refused ("'name' is overridden by a subclass of 'A', ..."), which took every
+// base-typed collection, parameter and declared binding with it.
+//
+// The dispatch is a synthesized module FUNCTION, one per (class, method):
+//
+//     def __lyvdisp$1(__ly_recv: A, p: int) -> str:
+//         if isinstance(__ly_recv, B):
+//             return __ly_recv.name(p)     # narrowed: resolves to B's body
+//         return A.name(__ly_recv, p)      # the base's body, by class
+//
+// Every piece of it already existed and is exercised by ordinary programs:
+// `isinstance` on a source class is a runtime class test, an `isinstance` guard
+// NARROWS the receiver so the call inside resolves statically, and an unbound
+// `A.name(recv)` names the base's body without asking the receiver's type. The
+// same three lines written by hand compile and print CPython's answers, which
+// is what made this a synthesis rather than a new lowering.
+//
+// ⛔ Per (class, method), not per call site: a body reached through the
+// dispatcher may dispatch on the same method again (`self.area()` where self is
+// base-typed), and a per-site expansion would not terminate. The memo entry is
+// written BEFORE the body is emitted for exactly that reason -- the same order
+// the generic specializer uses.
+//
+// ⛔ Only for a shape whose signature the dispatcher can restate: plain
+// positional parameters, all annotated, an annotated return, and a base that
+// declares the method. A generator, an async method, a property, a
+// classmethod/staticmethod, defaults, *args/**kwargs or keyword arguments at
+// the call site fall through to the refusal, which is what shipped for all of
+// them before. A dispatcher may not GUESS a signature it will then call
+// through: getting that wrong is a silent wrong body, and the refusal is not.
+namespace {
+// The shared_ptr behind a node field, so a synthesized def can reuse an
+// annotation the source already wrote instead of re-parsing its spelling.
+parser::NodePtr sharedField(const parser::Node &node, llvm::StringRef field) {
+  const parser::Field *found = parser::findField(node, field);
+  if (!found)
+    return nullptr;
+  if (const auto *child = std::get_if<parser::NodePtr>(&found->value))
+    return *child;
+  return nullptr;
+}
+} // namespace
+
+std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
+    const parser::Node &expr, const parser::Node &calleeNode,
+    const parser::Node *receiverNode, Value receiver,
+    llvm::StringRef methodName) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+  if (!contract)
+    return std::nullopt;
+  llvm::StringRef receiverClass = contract.getContractName();
+  // Keyword arguments at the CALL site: the dispatcher forwards positionals
+  // only, so a keyword would silently move to another parameter.
+  if (const auto *keywords = ast::nodeList(expr, "keywords"))
+    if (!keywords->empty())
+      return std::nullopt;
+  if (const auto *args = ast::nodeList(expr, "args"))
+    for (const parser::NodePtr &argument : *args)
+      if (argument && (argument->kind == "Starred"))
+        return std::nullopt;
+
+  // The body the STATIC type resolves to: its signature is the one the
+  // dispatcher restates, and its declaring class is how the fallback names it.
+  std::optional<MethodBinding> base = lookupClassMethod(receiver.type, methodName);
+  if (!base || !base->method || base->definingClass.empty())
+    return std::nullopt;
+  if (base->kind != "instance" || base->async ||
+      base->bodySignature.isGeneratorFunction ||
+      base->bodySignature.isAsyncGeneratorFunction)
+    return std::nullopt;
+  if (types.lookupClass(base->definingClass) == mlir::Type())
+    return std::nullopt;
+
+  const parser::Node *arguments = ast::node(*base->method, "args");
+  if (!arguments)
+    return std::nullopt;
+  if (ast::node(*arguments, "vararg") || ast::node(*arguments, "kwarg"))
+    return std::nullopt;
+  if (const auto *defaults = ast::nodeList(*arguments, "defaults"))
+    if (!defaults->empty())
+      return std::nullopt;
+  if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs"))
+    if (!kwonly->empty())
+      return std::nullopt;
+  parser::NodePtr returns = sharedField(*base->method, "returns");
+  if (!returns)
+    return std::nullopt;
+
+  parser::SourceRange range = expr.range;
+  llvm::SmallVector<std::string, 4> parameterNames;
+  llvm::SmallVector<synth::Param, 4> params;
+  params.push_back(synth::Param{"__ly_recv", synth::name(receiverClass, range)});
+  bool selfSeen = false;
+  for (llvm::StringRef field : {"posonlyargs", "args"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      for (const parser::NodePtr &argument : *list) {
+        if (!argument)
+          return std::nullopt;
+        llvm::StringRef name = ast::nameSpelling(*argument);
+        if (!selfSeen) {
+          selfSeen = true;
+          continue; // the receiver, restated as __ly_recv above
+        }
+        parser::NodePtr annotation = sharedField(*argument, "annotation");
+        if (!annotation)
+          return std::nullopt;
+        parameterNames.push_back(name.str());
+        params.push_back(synth::Param{name.str(), std::move(annotation)});
+      }
+  if (!selfSeen)
+    return std::nullopt;
+
+  std::string key = (receiverClass + "." + methodName).str();
+  auto memo = virtualDispatchHelpers.find(key);
+  if (memo == virtualDispatchHelpers.end()) {
+    // Every class that declares the method and has the receiver's class among
+    // its ancestors, most-derived first so a subclass of a subclass wins.
+    llvm::SmallVector<std::pair<unsigned, std::string>, 4> candidates;
+    for (const auto &entry : declaredClassBases) {
+      llvm::StringRef candidate = entry.getKey();
+      if (candidate == receiverClass)
+        continue;
+      auto declares = declaredClassMethods.find(candidate);
+      if (declares == declaredClassMethods.end() ||
+          !declares->second.contains(methodName))
+        continue;
+      unsigned depth = 0;
+      llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
+      llvm::StringSet<> seen;
+      bool derived = false;
+      while (!worklist.empty()) {
+        llvm::StringRef current = worklist.pop_back_val();
+        auto bases = declaredClassBases.find(current);
+        if (bases == declaredClassBases.end())
+          continue;
+        for (const std::string &base : bases->second)
+          if (seen.insert(base).second) {
+            worklist.push_back(base);
+            derived = derived || base == receiverClass;
+          }
+      }
+      if (!derived)
+        continue;
+      depth = seen.size();
+      if (types.lookupClass(candidate) == mlir::Type())
+        return std::nullopt;
+      candidates.push_back({depth, candidate.str()});
+    }
+    if (candidates.empty())
+      return std::nullopt;
+    llvm::sort(candidates, [](const auto &lhs, const auto &rhs) {
+      if (lhs.first != rhs.first)
+        return lhs.first > rhs.first;
+      return lhs.second < rhs.second;
+    });
+
+    std::string symbol = "__lyvdisp$" + std::to_string(++syntheticFunctionCounter);
+    // Memoized before the body: a body reached from here may dispatch the same
+    // method again.
+    VirtualDispatchHelper &entry = virtualDispatchHelpers[key];
+    entry.symbol = symbol;
+
+    auto forwarded = [&] {
+      std::vector<parser::NodePtr> out;
+      for (const std::string &name : parameterNames)
+        out.push_back(synth::name(name, range));
+      return out;
+    };
+    std::vector<parser::NodePtr> body;
+    for (const auto &candidate : candidates)
+      body.push_back(synth::ifStmt(
+          synth::call(synth::name("isinstance", range),
+                      {synth::name("__ly_recv", range),
+                       synth::name(candidate.second, range)},
+                      range),
+          {synth::returnStmt(synth::methodCall(synth::name("__ly_recv", range),
+                                               methodName, forwarded(), range),
+                             range)},
+          {}, range));
+    std::vector<parser::NodePtr> fallbackArguments;
+    fallbackArguments.push_back(synth::name("__ly_recv", range));
+    for (parser::NodePtr &argument : forwarded())
+      fallbackArguments.push_back(std::move(argument));
+    body.push_back(synth::returnStmt(
+        synth::call(synth::attribute(synth::name(base->definingClass, range),
+                                     methodName, range),
+                    std::move(fallbackArguments), range),
+        range));
+
+    parser::NodePtr def = synth::functionDef(symbol, params, {},
+                                             std::move(body), returns, {}, range);
+    synthesizedIteratorDefs.push_back(def);
+    FunctionSignature sig = types.functionSignature(*def);
+    {
+      // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
+      // inside an inlined method body. Emitting it under the inliner's state
+      // made its `return` branch to the INLINER's continuation block --
+      // "reference to block defined in another region", from a `self.area()`
+      // inside a base method. The loop and super contexts are cleared for the
+      // same reason: none of them belong to this body.
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      llvm::scope_exit restoreContexts([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+      });
+      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    }
+    virtualDispatchHelpers[key].callable = sig.publicCallable;
+    memo = virtualDispatchHelpers.find(key);
+  }
+  if (!memo->second.callable)
+    return std::nullopt;
+
+  llvm::SmallVector<Value, 4> callArguments{receiver};
+  if (const auto *args = ast::nodeList(expr, "args"))
+    for (const parser::NodePtr &argument : *args)
+      callArguments.push_back(emitExpr(argument.get()));
+  if (callArguments.size() != parameterNames.size() + 1)
+    return std::nullopt;
+  Value callee = emitBindingRef(expr, memo->second.symbol, memo->second.callable);
+  return emitCallableDispatch(
+      expr, callee,
+      emitCallOperands(expr, callArguments, /*includeAstArguments=*/false));
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {

@@ -1,0 +1,10 @@
+shape 0
+rect 4
+square 4
+circle 0
+square/4 shape/0 circle/0
+rect 4
+rect/4 a rect square/4
+['<shape', '<rect', '<square', '<circle']
+square 4
+[circle

@@ -119,6 +119,28 @@ private:
                                   llvm::StringRef methodName,
                                   const parser::Node *receiverNode = nullptr,
                                   bool throughSuper = false);
+  // The same question without the diagnostic, for the sites that can answer
+  // the call another way before refusing it (EmitterClasses.cpp).
+  bool dispatchIsUnresolvable(Value receiver, llvm::StringRef methodName,
+                              const parser::Node *receiverNode,
+                              bool throughSuper) const;
+  // A call the static receiver type cannot resolve, answered by a synthesized
+  // module function that tests the runtime class and calls the body that class
+  // declares (EmitterCalls.cpp). Nothing when the shape is outside what the
+  // synthesis covers, and the caller then refuses as before.
+  std::optional<Value> tryEmitVirtualDispatch(const parser::Node &expr,
+                                              const parser::Node &calleeNode,
+                                              const parser::Node *receiverNode,
+                                              Value receiver,
+                                              llvm::StringRef methodName);
+  struct VirtualDispatchHelper {
+    std::string symbol;
+    py::CallableType callable;
+  };
+  // Keyed "<class>.<method>", so one dispatcher serves every call site and a
+  // method that dispatches on itself terminates. Filled BEFORE the body is
+  // emitted for that second reason.
+  llvm::StringMap<VirtualDispatchHelper> virtualDispatchHelpers;
   // True when `type` is a SOURCE class whose linearization provides
   // `methodName` only through builtins.object — i.e. it inherits object's
   // default. The question is not "does the method resolve" (since the class's

@@ -432,6 +432,26 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
                                                llvm::StringRef methodName,
                                                const parser::Node *receiverNode,
                                                bool throughSuper) {
+  if (!dispatchIsUnresolvable(receiver, methodName, receiverNode, throughSuper))
+    return false;
+  auto contract = mlir::cast<py::ContractType>(receiver.type);
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, anchor.range.start,
+      "'" + std::string(methodName) + "' is overridden by a subclass of '" +
+          contract.getContractName().str() +
+          "', so this call cannot be resolved from the static type of the "
+          "receiver"});
+  return true;
+}
+
+// The question alone. Split out so a site that can ANSWER the call -- the
+// synthesized runtime-class dispatcher in EmitterCalls -- can ask it without
+// filing the refusal first; the refusal above is the same predicate plus the
+// diagnostic, so the two can never disagree about which calls are unresolvable.
+bool ModuleEmitter::dispatchIsUnresolvable(Value receiver,
+                                           llvm::StringRef methodName,
+                                           const parser::Node *receiverNode,
+                                           bool throughSuper) const {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!contract)
     return false;
@@ -468,8 +488,6 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
   bool redeclared =
       subclassOverridesMethod(contract.getContractName(), methodName) ||
       subclassShadowsAttribute(contract.getContractName(), methodName);
-  if (!redeclared)
-    return false;
   // ⛔ NOT gated on the name resolving ON THE RECEIVER. A subclass may be the
   // only class that declares it -- `class A: pass` / `class B(A): __repr__` --
   // and `repr(a)` on a base-typed `a` then ran object's repr and printed
@@ -477,13 +495,7 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
   // declares it is the whole evidence the dispatch is real; requiring the base
   // to declare it too made the gate blind to exactly the case where the
   // subclass introduces the method.
-  diagnostics.push_back(parser::Diagnostic{
-      parser::Severity::Error, anchor.range.start,
-      "'" + std::string(methodName) + "' is overridden by a subclass of '" +
-          contract.getContractName().str() +
-          "', so this call cannot be resolved from the static type of the "
-          "receiver"});
-  return true;
+  return redeclared;
 }
 
 bool ModuleEmitter::subclassOverridesMethod(llvm::StringRef receiverClass,

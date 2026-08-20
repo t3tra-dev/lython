@@ -1,1 +1,1 @@
-is overridden by a subclass of 'A'
+is used before 'B' is defined

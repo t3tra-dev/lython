@@ -4,6 +4,12 @@
 # hierarchy has an override is a property of the module, not of where in it
 # the question is asked, so the hierarchy is recorded before anything is
 # emitted.
+#
+# The override itself is now DISPATCHED when the subclass stands above the use
+# (tests/golden/cases/a_subclass_body_is_reached_through_the_base.py). What is
+# refused here is the ORDER: the dispatcher tests the runtime class and calls
+# the body that class declares, and `B` has no method table before its ClassDef
+# is emitted. The refusal names that, because the fix is to move the class.
 class A:
     def v(self) -> int:
         return 1
