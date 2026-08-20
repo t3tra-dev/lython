@@ -932,16 +932,19 @@ module attributes {
   py.class @range attributes {base_names = ["Sequence", "Hashable"],
                              ly.typing.base_args = [[!py.contract<"builtins.int">], []],
                              ly.typing.final,
-    method_names = ["__new__", "__new__", "__new__", "__init__", "__iter__"],
+    method_names = ["__new__", "__new__", "__new__", "__init__", "__iter__",
+                    "__eq__", "__ne__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.range">>, !py.contract<"builtins.int">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.range">>, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.range">>, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.paramspec<"P">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.range">] -> [!py.contract<"builtins.range_iterator">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.range">] -> [!py.contract<"builtins.range_iterator">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.range">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.range">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["classmethod", "classmethod", "classmethod", "instance",
-                    "instance"]
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @range_iterator attributes {
@@ -22978,6 +22981,61 @@ module attributes {
   func.func @LyRange_Len(%self: memref<5xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.range", ly.runtime.method = "__len__"} {
     %length = func.call @__ly_range_length(%self) : (memref<5xi64>) -> i64
     func.return %length : i64
+  }
+
+  // ⭐ TWO RANGES ARE EQUAL WHEN THEY PRODUCE THE SAME SEQUENCE, which is what
+  // CPython's range_richcompare answers -- `range(3) == range(0, 3)` is True
+  // and `range(0, 3, 7) == range(0, 3, 9)` is too, because a one-element range
+  // never uses its step. With no __eq__ of its own, `range(3) == range(3)` fell
+  // through to identity and printed False.
+  func.func @LyRange_EqBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.range", ly.runtime.method = "__eq__"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %start_slot = arith.constant 2 : index
+    %step_slot = arith.constant 4 : index
+    %llen = func.call @__ly_range_length(%lhs) : (memref<5xi64>) -> i64
+    %rlen = func.call @__ly_range_length(%rhs) : (memref<5xi64>) -> i64
+    %same_len = arith.cmpi eq, %llen, %rlen : i64
+    %answer = scf.if %same_len -> (i1) {
+      %empty = arith.cmpi eq, %llen, %zero : i64
+      %both_empty = scf.if %empty -> (i1) {
+        %true_v = arith.constant true
+        scf.yield %true_v : i1
+      } else {
+        %lstart = memref.load %lhs[%start_slot] : memref<5xi64>
+        %rstart = memref.load %rhs[%start_slot] : memref<5xi64>
+        %same_start = arith.cmpi eq, %lstart, %rstart : i64
+        %rest = scf.if %same_start -> (i1) {
+          %single = arith.cmpi eq, %llen, %one : i64
+          %step_ok = scf.if %single -> (i1) {
+            %true_v = arith.constant true
+            scf.yield %true_v : i1
+          } else {
+            %lstep = memref.load %lhs[%step_slot] : memref<5xi64>
+            %rstep = memref.load %rhs[%step_slot] : memref<5xi64>
+            %same_step = arith.cmpi eq, %lstep, %rstep : i64
+            scf.yield %same_step : i1
+          }
+          scf.yield %step_ok : i1
+        } else {
+          %false_v = arith.constant false
+          scf.yield %false_v : i1
+        }
+        scf.yield %rest : i1
+      }
+      scf.yield %both_empty : i1
+    } else {
+      %false_v = arith.constant false
+      scf.yield %false_v : i1
+    }
+    func.return %answer : i1
+  }
+
+  func.func @LyRange_NeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.range", ly.runtime.method = "__ne__"} {
+    %true_v = arith.constant true
+    %eq = func.call @LyRange_EqBool(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i1
+    %ne = arith.xori %eq, %true_v : i1
+    func.return %ne : i1
   }
 
   func.func @LyRange_GetItem(%self: memref<5xi64> {ly.ownership.object_header}, %index_header: memref<2xi64> {ly.ownership.object_header}, %index_meta: memref<2xi64>, %index_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.method = "__getitem__", ly.runtime.result_contract = "builtins.int"} {

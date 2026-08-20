@@ -28,3 +28,11 @@ total: int = 0
 for v in range(1, 10, 2):
     total = total + v
 print(total)
+
+# Equality is over the sequence a range denotes, not its fields: two empty
+# ranges are equal whatever their bounds, and the step of a one-element range
+# does not matter. range had no __eq__ and fell back to identity.
+print(range(3) == range(3), range(3) == range(0, 3), range(3) == range(4))
+print(range(0, 0) == range(5, 5), range(0, 1, 7) == range(0, 1, 9))
+print(range(0, 10, 2) == range(0, 9, 2), range(1, 4) != range(1, 4))
+print(range(2) != range(3), range(0, 5, 2) == range(0, 5, 3))
