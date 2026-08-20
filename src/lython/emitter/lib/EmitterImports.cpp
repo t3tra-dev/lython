@@ -1004,6 +1004,41 @@ bool ModuleEmitter::bindImportStatement(const parser::Node &statement,
 
   std::int64_t level = ast::integer(statement, "level").value_or(0);
   std::optional<std::string_view> module = ast::string(statement, "module");
+  // ⭐ `from __future__ import annotations` and its siblings are NO-OPS here,
+  // and refusing them took the whole file with them. Every future feature
+  // CPython still names is mandatory behaviour in 3.14 except `annotations`,
+  // and that one only asks that annotations be treated as strings -- which is
+  // what this compiler does with them anyway, now that a quoted annotation is
+  // parsed as the annotation it spells. Binding nothing is the whole
+  // implementation.
+  //
+  // ⛔ Named one by one rather than accepting the module: a future feature
+  // this compiler has NOT implemented must still be refused, and there is no
+  // way to tell the two apart from the module name.
+  if (level == 0 && module && *module == "__future__") {
+    static constexpr llvm::StringLiteral kInertFutures[] = {
+        llvm::StringLiteral("annotations"),
+        llvm::StringLiteral("absolute_import"),
+        llvm::StringLiteral("division"),
+        llvm::StringLiteral("generators"),
+        llvm::StringLiteral("generator_stop"),
+        llvm::StringLiteral("nested_scopes"),
+        llvm::StringLiteral("print_function"),
+        llvm::StringLiteral("unicode_literals"),
+        llvm::StringLiteral("with_statement")};
+    if (const auto *futureNames = ast::nodeList(statement, "names")) {
+      bool everyOneInert = true;
+      for (const parser::NodePtr &alias : *futureNames) {
+        std::optional<std::string_view> name =
+            alias ? ast::string(*alias, "name") : std::nullopt;
+        everyOneInert =
+            everyOneInert && name &&
+            llvm::is_contained(kInertFutures, llvm::StringRef(*name));
+      }
+      if (everyOneInert)
+        return true;
+    }
+  }
   std::optional<std::string> resolvedModule =
       resolveRelativeModule(activePackageName, level, module);
   if (!resolvedModule) {
