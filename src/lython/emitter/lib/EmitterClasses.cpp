@@ -2205,6 +2205,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   mlir::OperationState state(loc(classDef), py::ClassOp::getOperationName());
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(contractName));
+  // ⭐ THIS CLASS IS THE PROGRAM'S, and the class-id assignment has to know.
+  // A manifest `py.class` carries its contract in its SYMBOL's leaf
+  // (`py.class @Task` for `_asyncio.Task`), so the lowering finds a manifest
+  // id by trying `builtins.`/`types.`/`_asyncio.`/`asyncio.`/`contextlib.` in
+  // front of a bare name -- and `class Task` in a program then took asyncio's
+  // id 15 instead of a fresh source id. Its instances were tagged as asyncio
+  // Tasks and the program SEGFAULTED. Nothing else distinguishes the two: a
+  // manifest class op carries no contract attribute of its own.
+  state.addAttribute("ly.class.source", builder.getUnitAttr());
   state.addAttribute("base_names", stringArray(builder, bases));
   state.addAttribute("field_names", stringArray(builder, fieldNames));
   state.addAttribute("field_types", typeArray(builder, fieldTypes));

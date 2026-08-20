@@ -590,9 +590,15 @@ RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
     return std::nullopt;
 
   llvm::StringRef className = classOp.getSymName();
-  for (const std::string &candidate : classContractCandidates(className))
-    if (std::optional<std::int64_t> classId = manifest.classId(candidate))
-      return classId;
+  // ⛔ NOT for a class the program declared. The candidate list guesses a
+  // manifest namespace in front of a bare name, which is how a manifest
+  // `py.class @Task` finds `_asyncio.Task` -- and how `class Task` in a
+  // program took that id, tagging its instances as asyncio Tasks.
+  bool sourceClass = classOp->hasAttr("ly.class.source");
+  if (!sourceClass)
+    for (const std::string &candidate : classContractCandidates(className))
+      if (std::optional<std::int64_t> classId = manifest.classId(candidate))
+        return classId;
 
   if (auto attr =
           classOp->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr))
@@ -608,13 +614,16 @@ RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
       return;
     bool hasDeclaredRuntimeId = current->getAttrOfType<mlir::IntegerAttr>(
                                     kManifestClassIdAttr) != nullptr;
-    for (const std::string &candidate :
-         classContractCandidates(current.getSymName())) {
-      if (manifest.classId(candidate)) {
-        hasDeclaredRuntimeId = true;
-        break;
+    // Same question as above, asked while NUMBERING: a source class never
+    // counts as having a manifest id, or the ordinals would shift under it.
+    if (!current->hasAttr("ly.class.source"))
+      for (const std::string &candidate :
+           classContractCandidates(current.getSymName())) {
+        if (manifest.classId(candidate)) {
+          hasDeclaredRuntimeId = true;
+          break;
+        }
       }
-    }
 
     if (current.getOperation() == classOp.getOperation()) {
       result = kSourceClassIdBase + ordinal;

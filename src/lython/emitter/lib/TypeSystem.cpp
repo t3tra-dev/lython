@@ -2278,8 +2278,35 @@ mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
     return none();
   if (annotationNameIs(name, "Self"))
     return py::SelfType::get(&context);
+  // ⭐ A CLASS THE PROGRAM DECLARES WINS OVER A MANIFEST NAME. Five bare
+  // spellings are claimed by manifest contracts whether or not anything
+  // imported them -- `Task`, `Future`, `AbstractEventLoop`, `CancelledError`,
+  // `Context` -- so `class Task` followed by `def top(ts: list[Task])` typed
+  // the parameter as asyncio's Task and the call was refused with "arguments
+  // do not match Callable contract for function target top", naming neither
+  // the class nor the collision. `Task` is an ordinary name for an ordinary
+  // class, and in Python the module-level binding shadows anything a name
+  // could otherwise mean.
+  //
+  // ⛔ The PROTOCOL spellings are claimed the same way -- `Sequence`,
+  // `Iterator`, `Generator` and eleven more -- and letting a declared class
+  // win over those was tried and REVERTED: the emitter's own iteration typing
+  // asks this function for `Iterator`, so `class Iterator` in a program broke
+  // every `for` loop in it with "static type !py.protocol<"Iterator", [...]>
+  // does not provide manifest method '__next__'". A user class of that name
+  // keeps the old refusal until the compiler's internal spellings are ones a
+  // program cannot shadow.
+  //
+  // ⛔ Bare names only: `asyncio.Task` spelled with its module still means the
+  // manifest contract, `collections.abc.Sequence` still means the protocol,
+  // and so does a name inside a runtime module that declares no class of that
+  // name.
   if (auto protocolName = protocolAnnotationName(name))
     return protocol(*protocolName);
+  bool bare = !name.contains('.');
+  if (bare)
+    if (auto declared = lookupClass(name))
+      return *declared;
   if (auto contractName = contractAnnotationName(name))
     return contract(*contractName);
   if (auto knownClass = lookupClass(name))
