@@ -780,6 +780,8 @@ private:
   mlir::Type siblingExpectationFor(const parser::Node &literal,
                                    const parser::Node *element,
                                    bool forKey);
+  std::optional<Value> tryEmitUnpackedLiteral(const parser::Node &expr,
+                                              mlir::Type expected);
   Value emitContainerLiteral(const parser::Node &expr,
                              mlir::Type expected = {});
   Value emitSetLiteral(const parser::Node &expr, mlir::Type expected = {});

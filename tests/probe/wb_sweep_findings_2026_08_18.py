@@ -1964,6 +1964,63 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [GAP x4 + 2 OPEN] unpacking                         FOUND + FIXED 2026-08-20
+# A fifteen-program grid (walrus, star-unpacking, f-string conversions,
+# property setters, NamedTuple, exception chaining, dict comprehensions,
+# recursion, repr in containers...) left five failures. Four are one feature:
+#
+#     print([*xs, 4])       # unsupported expression kind 'Starred'
+#     print({*xs, 4})       # starred elements in a set literal are not
+#                           # supported yet
+#     print((*xs, 4))       # unsupported expression kind 'Starred'
+#     print({**d, "b": 2})  # dict literal pack has an odd operand count
+#
+# ⭐ THE THIRD MESSAGE NAMES THE FIX. A display is PACKED, and a pack takes a
+# count the compiler knows; a star does not have one. So the display is not a
+# pack, it is the loop it means -- an empty accumulator, `for e in xs`,
+# append/add or a key store, and `tuple(list)` for the frozen form. Every piece
+# of that already compiled.
+#
+# ⛔ AND `{**d, ...}` WAS A LOWERING ERROR, not an emitter one, which is the
+# wrong boundary by this project's own rule: the shape is decided at parse time
+# and the reader got an internal count mismatch. Implementing it removes the
+# question; if it had been refused instead, the refusal belonged in the
+# emitter.
+#
+# ⛔ THE ELEMENT TYPE HAS TO BE COMPUTED UP FRONT. The seed is an empty
+# accumulator and an empty accumulator has no element type of its own, so
+# `[*ints, "a"]` seeds list[int] and then refuses the str. The join over every
+# piece -- each starred operand's ELEMENT type, each plain element's own -- is
+# what makes the mixed case type the way the same display without a star does.
+#
+# ⛔ AND THE SEED IS AN EMPTY PACK, not a synthesized `set()`: an expectation
+# does not reach a CONSTRUCTION, so `set()` came back set[object] and the first
+# add had nowhere to put an int. The set literal's own accumulator is built the
+# same way, which is where the shape came from.
+#
+# Pinned by tests/golden/cases/unpacking_inside_a_literal.py.
+#
+# ⛔ TWO NEIGHBOURS STAY OPEN, and they are the same erasure:
+#
+# 1. `f(*args)` -> "starred call arguments require a statically sized tuple",
+#    and `a, *rest = (1, 2, 3)` -> "starred assignment target ... a statically
+#    unknown number of elements". A tuple of UNIFORM members is typed
+#    `tuple[T]` with the arity dropped (tupleOfMembers), so `(5, 2)` and a
+#    ten-tuple of ints are the same type -- while `("ab", 2)` keeps
+#    `tuple[str, int]` and `f(*("ab", 2))` works today.
+#
+#    ⭐ KEEPING THE ARITY WAS MEASURED AND REVERTED: 19 tests fail. A
+#    multi-member tuple is not accepted as a set element, a dict key, or a
+#    __getitem__ receiver, so the collapse is what makes homogeneous tuples
+#    usable in those positions at all. The repair is those three paths, not
+#    the type -- and `f(*t)` needs one more thing after it, because with an
+#    ANNOTATED tuple[int, int, int] the lowering still says "starred positional
+#    arg operand ... needs sequence evidence".
+#
+# 2. `_replace` on a NamedTuple -> "'P' inherits builtins.object._replace,
+#    which Lython does not implement". _asdict and _fields are the same entry.
+
+# ==========================================================================
 # [BUG + GAP x3] match guards                         FOUND + FIXED 2026-08-20
 # From a fresh twenty-program grid against CPython 3.14 (dataclasses with a
 # default_factory, str splitting, sorting with keys, f-string formats, slices,

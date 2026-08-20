@@ -2433,12 +2433,14 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
         parser::Diagnostic{parser::Severity::Error, expr.range.start, message});
     return emitNone(expr);
   };
+  if (std::optional<Value> unpacked = tryEmitUnpackedLiteral(expr, expected))
+    return *unpacked;
   const auto *elts = ast::nodeList(expr, "elts");
   if (!elts || elts->empty())
     return reject("malformed set literal");
   for (const parser::NodePtr &element : *elts)
-    if (!element || element->kind == "Starred")
-      return reject("starred elements in a set literal are not supported yet");
+    if (!element)
+      return reject("malformed set literal");
 
   mlir::Type elementType;
   if (auto expectedContract =
@@ -2748,8 +2750,196 @@ mlir::Type ModuleEmitter::siblingExpectationFor(const parser::Node &literal,
   return arguments.size() == 1 ? arguments.front() : mlir::Type();
 }
 
+
+// ⭐ `[*xs, 4]`, `{*xs, 4}`, `(*xs, 4)` and `{**d, "k": v}` AS THE LOOP THEY
+// MEAN. Each is a container built left to right, and every piece of that -- an
+// empty literal under an expected element type, `for e in xs`, `append`/`add`,
+// a key store, and `tuple(list)` -- already compiles. Written as one more
+// arm of the pack path instead, each would need the pack to take a runtime
+// count, which is the thing a statically sized literal is defined not to have.
+//
+// ⛔ The ELEMENT TYPE is computed here rather than left to the appends: the
+// seed is an empty literal, and an empty literal has no element type of its
+// own, so `[*ints, "a"]` would seed list[int] and then refuse the str. The
+// join over every piece is what makes the mixed case type the way the
+// equivalent literal without a star does.
+std::optional<Value>
+ModuleEmitter::tryEmitUnpackedLiteral(const parser::Node &expr,
+                                      mlir::Type expected) {
+  bool isDict = expr.kind == "Dict";
+  const auto *elts = ast::nodeList(expr, isDict ? "values" : "elts");
+  const auto *keys = isDict ? ast::nodeList(expr, "keys") : nullptr;
+  if (!elts)
+    return std::nullopt;
+  bool unpacked = false;
+  if (isDict) {
+    if (!keys || keys->size() != elts->size())
+      return std::nullopt;
+    for (const parser::NodePtr &key : *keys)
+      unpacked = unpacked || !key;
+  } else {
+    for (const parser::NodePtr &element : *elts)
+      unpacked = unpacked || (element && element->kind == "Starred");
+  }
+  if (!unpacked)
+    return std::nullopt;
+
+  parser::SourceRange range = expr.range;
+  auto refuse = [&](const std::string &message) -> std::optional<Value> {
+    diagnostics.push_back(
+        parser::Diagnostic{parser::Severity::Error, range.start, message});
+    return emitNone(expr);
+  };
+
+  llvm::SmallVector<mlir::Type, 8> elementParts;
+  llvm::SmallVector<mlir::Type, 8> valueParts;
+  auto dictArguments = [&](const parser::Node *node)
+      -> std::optional<std::pair<mlir::Type, mlir::Type>> {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(node)));
+    if (!contract || contract.getContractName() != "builtins.dict" ||
+        contract.getArguments().size() != 2)
+      return std::nullopt;
+    return std::pair{contract.getArguments()[0], contract.getArguments()[1]};
+  };
+  for (auto [index, element] : llvm::enumerate(*elts)) {
+    if (!element)
+      return refuse("malformed container literal");
+    if (isDict && !(*keys)[index]) {
+      std::optional<std::pair<mlir::Type, mlir::Type>> pair =
+          dictArguments(element.get());
+      if (!pair)
+        return refuse("`**` in a dict literal needs a dict with statically "
+                      "known key and value types");
+      elementParts.push_back(pair->first);
+      valueParts.push_back(pair->second);
+      continue;
+    }
+    if (isDict) {
+      elementParts.push_back(
+          types.widenLiteral(types.inferExpr((*keys)[index].get())));
+      valueParts.push_back(types.widenLiteral(types.inferExpr(element.get())));
+      continue;
+    }
+    if (element->kind == "Starred") {
+      mlir::Type inner =
+          types.iterationElementType(ast::node(*element, "value"));
+      if (!inner)
+        return refuse("`*` in a container literal needs an iterable with a "
+                      "statically known element type");
+      elementParts.push_back(types.widenLiteral(inner));
+      continue;
+    }
+    elementParts.push_back(types.widenLiteral(types.inferExpr(element.get())));
+  }
+  mlir::Type elementType = types.join(elementParts);
+  if (!elementType)
+    return refuse("container literal elements have no common type");
+  mlir::Type valueType;
+  if (isDict) {
+    valueType = types.join(valueParts);
+    if (!valueType)
+      return refuse("dict literal values have no common type");
+  }
+
+  // An expectation that names the same container wins over the join, the way
+  // it does for a literal without a star.
+  if (auto expectedContract =
+          mlir::dyn_cast_if_present<py::ContractType>(expected)) {
+    llvm::StringRef wanted = isDict          ? "builtins.dict"
+                             : expr.kind == "Set" ? "builtins.set"
+                                                  : "builtins.list";
+    if (expectedContract.getContractName() == wanted) {
+      if (isDict && expectedContract.getArguments().size() == 2) {
+        elementType = expectedContract.getArguments()[0];
+        valueType = expectedContract.getArguments()[1];
+      } else if (!isDict && expectedContract.getArguments().size() == 1) {
+        elementType = expectedContract.getArguments()[0];
+      }
+    }
+  }
+
+  bool isSet = expr.kind == "Set";
+  bool isTuple = expr.kind == "Tuple";
+  mlir::Type seedType = isDict ? types.contract("builtins.dict",
+                                                {elementType, valueType})
+                       : isSet ? types.contract("builtins.set", {elementType})
+                               : types.listOf(elementType);
+  // The seed is an empty pack of the computed type, the way the set literal
+  // builds its own accumulator. Written as a synthesized `set()` call instead
+  // it came back set[object] -- the expectation does not reach a construction
+  // -- and the first `add` then had nowhere to put an int.
+  auto seedPack =
+      py::PackOp::create(builder, loc(expr), seedType, mlir::ValueRange{});
+  Value seed{seedPack.getResult(), seedType};
+
+  std::string tmp = "__unpack" + std::to_string(++listCompCounter);
+  std::string cursor = "__unpackel" + std::to_string(listCompCounter);
+  std::string keyCursor = "__unpackk" + std::to_string(listCompCounter);
+  values[tmp] = seed;
+  types.bindSymbol(tmp, seed.type);
+  auto tmpName = [&] { return synth::name(tmp, range); };
+
+  for (auto [index, element] : llvm::enumerate(*elts)) {
+    if (isDict) {
+      if ((*keys)[index]) {
+        emitStatement(*synth::assign(
+            synth::subscript(tmpName(), (*keys)[index], range), element,
+            range));
+        continue;
+      }
+      parser::NodePtr target = synth::tuple(
+          {synth::name(keyCursor, range), synth::name(cursor, range)}, range);
+      std::vector<parser::NodePtr> body{synth::assign(
+          synth::subscript(tmpName(), synth::name(keyCursor, range), range),
+          synth::name(cursor, range), range)};
+      emitStatement(*synth::forStmt(
+          target, synth::methodCall(element, "items", {}, range),
+          std::move(body), {}, range));
+      continue;
+    }
+    llvm::StringRef adder = isSet ? "add" : "append";
+    if (element->kind == "Starred") {
+      std::vector<parser::NodePtr> body{synth::exprStmt(
+          synth::methodCall(tmpName(), adder,
+                            {synth::name(cursor, range)}, range),
+          range)};
+      const parser::Field *inner = parser::findField(*element, "value");
+      if (!inner || !std::holds_alternative<parser::NodePtr>(inner->value))
+        return refuse("malformed starred element");
+      emitStatement(*synth::forStmt(synth::name(cursor, range),
+                                    std::get<parser::NodePtr>(inner->value),
+                                    std::move(body), {}, range));
+      continue;
+    }
+    emitStatement(*synth::exprStmt(
+        synth::methodCall(tmpName(), adder, {element}, range), range));
+  }
+
+  auto built = values.find(tmp);
+  if (built == values.end() || !built->second.value)
+    return refuse("container literal with `*` could not be built");
+  Value result = built->second;
+  values.erase(tmp);
+  values.erase(cursor);
+  values.erase(keyCursor);
+  if (!isTuple)
+    return result;
+  // A tuple literal builds the list and freezes it; the pack path cannot take
+  // a count it does not know at compile time.
+  values[tmp] = result;
+  types.bindSymbol(tmp, result.type);
+  Value frozen =
+      emitExpr(synth::call(synth::name("tuple", range), {tmpName()}, range)
+                   .get());
+  values.erase(tmp);
+  return frozen;
+}
+
 Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
                                           mlir::Type expected) {
+  if (std::optional<Value> unpacked = tryEmitUnpackedLiteral(expr, expected))
+    return *unpacked;
   // The expectation only distributes when its container class matches the
   // literal's node kind; a mismatched expectation falls back to synthesis so
   // the caller's contract check reports it at the right place.
