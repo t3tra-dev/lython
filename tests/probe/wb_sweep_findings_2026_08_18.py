@@ -1939,6 +1939,31 @@ them in.
 #     in the slot with no record of what it can dispatch to, which is what the
 #     indirect call inside the wrapper then has to guess.
 #
+# ⭐⭐ AND THE ROOT IS ARCHITECTURAL, read out of the two files above plus the
+# lowered signatures. A CLOSURE IS STATIC EVIDENCE HERE, NOT RUNTIME STATE:
+#
+#   - `lowerFunctionBindingRef` builds the runtime function object with
+#     `LyFunction_New(targetId, 0, 0, 0, 0, 0)` -- five ZERO words where the
+#     captures would go -- and keeps the captures in the BUNDLE
+#     (`bundle.closureValues`) instead.
+#   - A callable PARAMETER is given its target and its closure lanes as
+#     compile-time evidence (CallableABI.cpp appends hidden arguments for the
+#     closure values), so a static call can pass them.
+#   - `appendClosureValues` then stores `captureBundle->objectValue` in the new
+#     closure slot and drops that evidence.
+#
+# So a function value crossing a boundary the compiler cannot see through
+# arrives with its target but WITHOUT its captures, and the wrapper's call
+# resolves to whatever the remaining evidence names -- the innermost function.
+# The five zero words in LyFunction_New are where a runtime closure would live;
+# nothing writes or reads them today.
+#
+# ⛔ WHICH MEANS THE REPAIR IS A MECHANISM, not a predicate: either the function
+# object carries its captures at run time (write the five words, have the
+# indirect dispatch read them back), or a callable that carries captures is
+# refused at every boundary that erases it. The check in FunctionTargetCalls.cpp
+# is the second answer applied to one boundary.
+#
 # ⛔ THE ONE SHAPE STILL REACHABLE is the double rebinding of a def's own name:
 #
 #     base = double(base)
