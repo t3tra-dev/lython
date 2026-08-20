@@ -1891,8 +1891,32 @@ them in.
 # fixpoint does not cover at all.
 
 # ==========================================================================
-# [BUG] a captured callable calls the wrong function       FOUND 2026-08-20
-# ⛔ THE FIX BELOW WAS REVERTED THE NEXT DAY. Read this entry first.
+# [BUG] a captured callable calls the wrong function  FOUND + FIXED 2026-08-20
+# ⭐ FIXED BY ONE CONDITION, and the diagnosis below is how it was found. The
+# wrong answer came from the INDIRECT CALL, not from the capture check that was
+# reverted for admitting it: `lowerIndirectFunctionObjectCall` devirtualized
+# whenever exactly one candidate survived, and `collectIndirectCallableTargets`
+# filters candidates by "does my closure evidence match this one's arity". A
+# runtime function value carries no closure evidence, so every wrapper is
+# filtered out and a plain function can be left standing ALONE -- and calling it
+# is a guess. The fast path now requires `callable.functionTarget` to be
+# non-empty, which is exactly "the compiler knows which function this is". An
+# unknown target goes through the id dispatch, whose default arm raises.
+#
+# So the same program now says "TypeError: callable target is not available"
+# where it printed 6, and the capture relaxation could be RE-LANDED with it --
+# the wrapper-closure idiom and the c-series programs work again, and the one
+# shape that cannot work fails loudly. Pinned by
+# tests/golden/errors/nested_wrapper_closure.py (which also prints the
+# one-level `double(base)(5)` == 10 above the raise) and
+# tests/golden/cases/closure_captures_a_function.py.
+#
+# ⛔ IT IS A RUNTIME RAISE, NOT A COMPILE-TIME REFUSAL, and that is the right
+# boundary here: the compiler cannot prove the value is a closure-carrying
+# function, only that it does not know which function it is. Refusing every
+# unknown-target call would refuse `f = inc if flag else dec; f(1)`.
+#
+# The original diagnosis follows.
 #
 #     def double(fn): ...  # returns a wrapper that calls fn(n) * 2
 #     def add_one(fn): ... # returns a wrapper that calls fn(n) + 1
@@ -2004,12 +2028,12 @@ them in.
 # question the emitter had already answered, at a point where the answer had
 # been erased; only that re-ask is relaxed.
 #
-# ⛔ REVERTED 2026-08-20 and the golden deleted with it. Every program it
-# pinned still gave the right answer -- the reason it had to go is the entry
-# above: the same relaxation admits programs that call the WRONG function
-# silently, and this check is what keeps most of them out until the closure
-# evidence is repaired. A refusal that also refuses correct programs beats a
-# wrong answer.
+# ⛔ REVERTED 2026-08-20 and RE-LANDED the same night, with the golden. The
+# revert was right at the time -- the relaxation admitted programs that called
+# the WRONG function silently -- and what made it landable was fixing the
+# indirect call instead: with the devirtualization guard in place the same
+# programs raise. The lesson is that the check was never the defect, only the
+# gate in front of it, and reverting a gate does not close a hole.
 #
 # ⛔ The decorator SYNTAX is still refused (half two above). This closes the
 # thing that would have made the desugar produce a program that does not

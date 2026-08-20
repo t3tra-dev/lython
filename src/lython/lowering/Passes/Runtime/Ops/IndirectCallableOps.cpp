@@ -186,7 +186,24 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   llvm::SmallVector<mlir::func::FuncOp, 8> targets =
       RuntimeBundleLowerer::collectIndirectCallableTargets(op, callable);
 
-  if (targets.size() == 1) {
+  // ⭐ ONE CANDIDATE IS NOT ONE ANSWER unless the callable's target is known
+  // STATICALLY. The candidate walk keeps only functions whose closure arity
+  // matches the evidence in hand, and a runtime function value carries no
+  // closure evidence -- so every wrapper is filtered out and a plain function
+  // can be left standing alone. Calling it directly is then a guess:
+  //
+  //     f = double(base)      # each returns a wrapper that calls its fn
+  //     f = add_one(f)
+  //     print(f(5))           # 6 -- base(5) + 1, where CPython prints 11
+  //
+  // The wrapper's `fn(n)` devirtualized to `call @base`, the only zero-closure
+  // candidate. With the target unknown the dispatch below is what must run: it
+  // compares the object's target id and raises on a miss, so the same program
+  // now says "callable target is not available" instead of answering.
+  //
+  // ⛔ The fast path stays for a callable whose target the evidence names --
+  // that is the ordinary static call, and it is not a guess.
+  if (targets.size() == 1 && !callable.functionTarget.empty()) {
     mlir::func::FuncOp target = targets.front();
     llvm::StringRef targetName = target.getSymName();
     RuntimeBundle selectedCallable = callable;
