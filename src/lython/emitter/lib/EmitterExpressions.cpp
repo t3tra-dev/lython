@@ -2000,6 +2000,27 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
             builder, loc(expr), type, builder.getStringAttr(simple));
         return Value{constant.getResult(), type};
       }
+  // ⛔ THE EXCEPTION CHAIN HAS NO VALUE SURFACE, and BaseException DECLARES the
+  // four attributes that would read it -- so `e.__cause__` type-checked and
+  // then failed in the lowering with "attr.get object type has no class
+  // schema", which names nothing the reader wrote. The chain itself is real:
+  // `raise X from e` records it and the traceback prints it. What is missing is
+  // a way to hand a chain node back as a VALUE -- `BaseException | None` is a
+  // union built at run time, which is a mechanism this compiler does not have,
+  // and __traceback__ has no representable type at all.
+  if (*attr == "__cause__" || *attr == "__context__" ||
+      *attr == "__traceback__" || *attr == "__suppress_context__")
+    if (!lookupClassField(object.type, *attr) &&
+        py::isAssignableTo(object.type,
+                           types.contract("builtins.BaseException"), module)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "'" + std::string(*attr) +
+              "' is declared by the standard-library contract but has no "
+              "runtime implementation: the exception chain is recorded for "
+              "the traceback and has no value representation here"});
+      return emitNone(expr);
+    }
   // ⭐ `P._fields` IS A COMPILE-TIME TUPLE, for the same reason `C.__name__` is
   // a compile-time string: a NamedTuple's field order is the class statement.
   // CPython builds it at class creation and never changes it, so the fold is

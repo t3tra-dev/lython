@@ -1964,6 +1964,43 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [BUG] the exception chain attributes           FOUND + DIAGNOSED 2026-08-20
+# Found chasing `type(e.__cause__).__name__` from the fifteen-program grid, and
+# the type-name half was a red herring -- the READ is what fails, and it fails
+# for four attributes, all in the lowering:
+#
+#     except ValueError as e:
+#         print(e.__cause__)
+#     # error: attr.get object type has no class schema
+#
+# ⭐ BaseException DECLARES ALL FIVE FIELDS (args, __cause__, __context__,
+# __suppress_context__, __traceback__) and implements one. The declaration is
+# what let the emitter accept the read; the lowering then had nothing to lower
+# it to and said so in its own words, which name nothing the reader wrote. This
+# is the wrong boundary by the project's own rule.
+#
+# ⛔ REFUSED AT THE EMITTER, not implemented, and the message says which of the
+# two reasons applies: the chain IS recorded -- `raise X from e` stores it and
+# the traceback prints it -- but handing a node back as a VALUE needs
+# `BaseException | None` built at run time, which is the union-construction
+# mechanism this compiler does not have. __traceback__ has no representable
+# type at all.
+#
+# ⛔ The wording matches the one the METHODS already get ("declared by the
+# standard-library contract but has no runtime implementation", from
+# Manifest/Calls.cpp, which is what `e.add_note("n")` says today) -- same
+# situation, and it now says so at the earlier boundary.
+#
+# ⛔ `lookupClassField` DOES NOT SEE A MANIFEST-DECLARED FIELD, which is worth
+# knowing: the first version of the guard used it to confirm the field exists
+# and never fired. It is used the other way round now -- a class that declares
+# its OWN attribute of that name keeps it.
+#
+# Pinned by EmitterTest.TheExceptionChainAttributesAreRefusedWhereTheyAreWritten
+# and EmitterTest.AnExceptionsArgsAndItsOwnFieldsStillRead. No golden: a
+# refusal is not worth an execution.
+
+# ==========================================================================
 # [GAP x4] the NamedTuple API                         FOUND + FIXED 2026-08-20
 # `_fields`, `_replace`, `_asdict` and `tuple(p)` were all missing, and all four
 # are decided by the class statement:

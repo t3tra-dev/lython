@@ -426,6 +426,41 @@ TEST(EmitterTest, AUserDefinedSetattrStillWins) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
+TEST(EmitterTest, TheExceptionChainAttributesAreRefusedWhereTheyAreWritten) {
+  for (const char *attribute :
+       {"__cause__", "__context__", "__traceback__", "__suppress_context__"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted =
+        emitSource(std::string("try:\n"
+                               "    raise ValueError('v')\n"
+                               "except ValueError as e:\n"
+                               "    print(e.") +
+                       attribute + ")\n",
+                   context);
+    EXPECT_FALSE(emitted.ok()) << attribute;
+    bool found = false;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      found = found || diagnostic.message.find("no runtime implementation") !=
+                           std::string::npos;
+    EXPECT_TRUE(found) << attribute;
+  }
+}
+
+TEST(EmitterTest, AnExceptionsArgsAndItsOwnFieldsStillRead) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("class E(Exception):\n"
+                 "    def __init__(self) -> None:\n"
+                 "        super().__init__('x')\n"
+                 "        self.code = 3\n"
+                 "try:\n"
+                 "    raise E()\n"
+                 "except E as e:\n"
+                 "    print(e.code, e.args)\n",
+                 context);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
