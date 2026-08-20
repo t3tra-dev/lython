@@ -301,7 +301,7 @@ module attributes {
     method_names = ["__new__", "__new__", "__new__", "__new__", "__new__", "__new__", "__new__",
                     "__init__", "__init__", "__init__", "__init__", "__init__", "__init__", "__init__",
                     "__add__", "__sub__", "__mul__", "__truediv__",
-                    "__neg__", "__pos__", "__eq__", "__ne__",
+                    "__neg__", "__pos__", "__eq__", "__ne__", "__hash__",
                     "__repr__", "__str__", "__abs__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.complex">>] -> [!py.self]>,
@@ -329,6 +329,7 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.float">]>
+      ,!py.protocol<"Callable", [!py.contract<"builtins.complex">] -> [!py.contract<"builtins.int">]>
     ],
     method_kinds = ["classmethod", "classmethod", "classmethod", "classmethod",
                     "classmethod", "classmethod", "classmethod",
@@ -336,7 +337,7 @@ module attributes {
                     "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @str attributes {
@@ -16632,13 +16633,15 @@ module attributes {
   // 2^61-1, computed on the IEEE-754 fields directly (value = mant * 2^exp;
   // multiplying by 2^k mod 2^61-1 is a 61-bit rotation), so hash(1.0) ==
   // hash(1) holds against LyLong_Hash's digit rotation.
-  func.func @LyFloat_Hash(%header: memref<3xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__hash__"} {
+  //
+  // ⛔ TAKEN AS RAW BITS PLUS AN IDENTITY WORD rather than as a float object,
+  // because complex hashes its two components with the SAME rule and CPython's
+  // hash(complex(2, 0)) == hash(2) depends on it being the same rule. The
+  // identity word is only read for a NaN, which CPython hashes by object.
+  func.func private @__ly_float_hash_bits(%bits: i64, %ident: i64) -> i64 {
     %c0 = arith.constant 0 : index
     %zero = arith.constant 0 : i64
-    %value_slot = arith.constant 2 : index
-    // The hash works on the IEEE-754 fields, and word 2 already holds them, so
-    // the handle form removes the round trip the payload lane forced.
-    %bits = memref.load %header[%value_slot] : memref<3xi64>
+    %true_ident = arith.constant true
     %c52 = arith.constant 52 : i64
     %c63 = arith.constant 63 : i64
     %exp_mask = arith.constant 2047 : i64
@@ -16653,8 +16656,7 @@ module attributes {
       %is_nan = arith.cmpi ne, %mant_bits, %zero : i64
       %special = scf.if %is_nan -> (i64) {
         // NaN: identity hash of the boxed object (CPython 3.10+).
-        %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
-        %p = arith.index_cast %ptr_index : index to i64
+        %p = arith.select %true_ident, %ident, %ident : i1, i64
         %c4 = arith.constant 4 : i64
         %c60 = arith.constant 60 : i64
         %lo = arith.shrui %p, %c4 : i64
@@ -16714,6 +16716,50 @@ module attributes {
       scf.yield %finite : i64
     }
     %fixed = func.call @__ly_hash_fixup(%result) : (i64) -> i64
+    func.return %fixed : i64
+  }
+
+  // float.__hash__ over the object: the bits are word 2 and the identity word
+  // is the handle's own address.
+  func.func @LyFloat_Hash(%header: memref<3xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__hash__"} {
+    %value_slot = arith.constant 2 : index
+    %bits = memref.load %header[%value_slot] : memref<3xi64>
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
+    %p = arith.index_cast %ptr_index : index to i64
+    %c4 = arith.constant 4 : i64
+    %c60 = arith.constant 60 : i64
+    %lo = arith.shrui %p, %c4 : i64
+    %hi = arith.shli %p, %c60 : i64
+    %ident = arith.ori %lo, %hi : i64
+    %hashed = func.call @__ly_float_hash_bits(%bits, %ident) : (i64, i64) -> i64
+    func.return %hashed : i64
+  }
+
+  // ⭐ complex.__hash__ IS CPython'S: hash(re) + 1000003 * hash(im), wrapping in
+  // 64 bits. With no __hash__ of its own a complex fell back to the boxed
+  // default, and `{complex(1, 2): "a"}[complex(1, 2)]` raised KeyError -- two
+  // values the class calls EQUAL landing in different buckets, which is the
+  // failure the unhashable-class refusal exists to prevent and this type walked
+  // straight into. The rule also makes hash(complex(2, 0)) == hash(2), which is
+  // CPython's numeric-hash invariant.
+  func.func @LyComplex_Hash(%header: memref<7xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.complex", ly.runtime.method = "__hash__"} {
+    %re_slot = arith.constant 2 : index
+    %im_slot = arith.constant 3 : index
+    %re_bits = memref.load %header[%re_slot] : memref<7xi64>
+    %im_bits = memref.load %header[%im_slot] : memref<7xi64>
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<7xi64> -> index
+    %p = arith.index_cast %ptr_index : index to i64
+    %c4 = arith.constant 4 : i64
+    %c60 = arith.constant 60 : i64
+    %lo = arith.shrui %p, %c4 : i64
+    %hi = arith.shli %p, %c60 : i64
+    %ident = arith.ori %lo, %hi : i64
+    %re_hash = func.call @__ly_float_hash_bits(%re_bits, %ident) : (i64, i64) -> i64
+    %im_hash = func.call @__ly_float_hash_bits(%im_bits, %ident) : (i64, i64) -> i64
+    %imag_prime = arith.constant 1000003 : i64
+    %scaled = arith.muli %im_hash, %imag_prime : i64
+    %combined = arith.addi %re_hash, %scaled : i64
+    %fixed = func.call @__ly_hash_fixup(%combined) : (i64) -> i64
     func.return %fixed : i64
   }
 
