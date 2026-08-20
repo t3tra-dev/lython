@@ -24,3 +24,10 @@ dd = {frozenset([1, 2]): "a"}
 print(dd[frozenset([2, 1])])
 e = frozenset()
 print(len(e))
+
+# frozenset had no __bool__, so a truth test on one failed at lowering.
+print(bool(fs), bool(e))
+if fs:
+    print("non-empty is true")
+if not e:
+    print("empty is false")

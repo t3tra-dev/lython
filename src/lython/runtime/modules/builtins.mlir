@@ -22606,6 +22606,14 @@ module attributes {
     func.return %length : i64
   }
 
+  func.func @LyFrozenSet_Bool(%self: memref<13xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__bool__"} {
+    %length_slot = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %length = memref.load %self[%length_slot] : memref<13xi64>
+    %non_empty = arith.cmpi ne, %length, %zero : i64
+    func.return %non_empty : i1
+  }
+
   func.func @LyFrozenSet_ContainsBox(%self: memref<13xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) -> i1 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.primitive = "contains_box"} {
     %minus_one = arith.constant -1 : i64
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index

@@ -11,3 +11,6 @@ True True True
 True
 a
 0
+True False
+non-empty is true
+empty is false
