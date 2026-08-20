@@ -51,7 +51,7 @@
 
 module attributes {
   ly.typing.manifest,
-  ly.runtime.contracts = ["types.NoneType", "builtins.object", "builtins.bool", "builtins.BaseException", "builtins.int", "builtins.str", "builtins.Exception", "builtins.RuntimeError", "builtins.TypeError", "builtins.ValueError", "builtins.ArithmeticError", "builtins.LookupError", "builtins.ZeroDivisionError", "builtins.KeyError", "builtins.IndexError", "builtins.AssertionError", "builtins.StopIteration", "builtins.StopAsyncIteration", "builtins.SystemExit", "builtins.GeneratorExit", "builtins.OSError", "builtins.FileNotFoundError", "asyncio.CancelledError", "builtins.float", "builtins.complex", "builtins.bytes", "builtins.list", "builtins.tuple", "builtins.dict", "builtins.set", "builtins.range", "builtins.range_iterator", "builtins.str_iterator", "builtins.KeyboardInterrupt", "builtins.BaseExceptionGroup", "builtins.ExceptionGroup", "builtins.FloatingPointError", "builtins.OverflowError", "builtins.BufferError", "builtins.EOFError", "builtins.ImportError", "builtins.ModuleNotFoundError", "builtins.MemoryError", "builtins.NameError", "builtins.UnboundLocalError", "builtins.AttributeError", "builtins.ReferenceError", "builtins.NotImplementedError", "builtins.RecursionError", "builtins.PythonFinalizationError", "builtins.SyntaxError", "builtins.IndentationError", "builtins.TabError", "builtins.SystemError", "builtins.UnicodeError", "builtins.UnicodeDecodeError", "builtins.UnicodeEncodeError", "builtins.UnicodeTranslateError", "builtins.Warning", "builtins.BytesWarning", "builtins.DeprecationWarning", "builtins.EncodingWarning", "builtins.FutureWarning", "builtins.ImportWarning", "builtins.PendingDeprecationWarning", "builtins.ResourceWarning", "builtins.RuntimeWarning", "builtins.SyntaxWarning", "builtins.UnicodeWarning", "builtins.UserWarning", "builtins.BlockingIOError", "builtins.ChildProcessError", "builtins.ConnectionError", "builtins.BrokenPipeError", "builtins.ConnectionAbortedError", "builtins.ConnectionRefusedError", "builtins.ConnectionResetError", "builtins.FileExistsError", "builtins.InterruptedError", "builtins.IsADirectoryError", "builtins.NotADirectoryError", "builtins.PermissionError", "builtins.ProcessLookupError", "builtins.TimeoutError"],
+  ly.runtime.contracts = ["types.NoneType", "builtins.object", "builtins.bool", "builtins.BaseException", "builtins.int", "builtins.str", "builtins.Exception", "builtins.RuntimeError", "builtins.TypeError", "builtins.ValueError", "builtins.ArithmeticError", "builtins.LookupError", "builtins.ZeroDivisionError", "builtins.KeyError", "builtins.IndexError", "builtins.AssertionError", "builtins.StopIteration", "builtins.StopAsyncIteration", "builtins.SystemExit", "builtins.GeneratorExit", "builtins.OSError", "builtins.FileNotFoundError", "asyncio.CancelledError", "builtins.float", "builtins.complex", "builtins.bytes", "builtins.list", "builtins.tuple", "builtins.dict", "builtins.set", "builtins.range", "builtins.range_iterator", "builtins.str_iterator", "builtins.bytes_iterator", "builtins.KeyboardInterrupt", "builtins.BaseExceptionGroup", "builtins.ExceptionGroup", "builtins.FloatingPointError", "builtins.OverflowError", "builtins.BufferError", "builtins.EOFError", "builtins.ImportError", "builtins.ModuleNotFoundError", "builtins.MemoryError", "builtins.NameError", "builtins.UnboundLocalError", "builtins.AttributeError", "builtins.ReferenceError", "builtins.NotImplementedError", "builtins.RecursionError", "builtins.PythonFinalizationError", "builtins.SyntaxError", "builtins.IndentationError", "builtins.TabError", "builtins.SystemError", "builtins.UnicodeError", "builtins.UnicodeDecodeError", "builtins.UnicodeEncodeError", "builtins.UnicodeTranslateError", "builtins.Warning", "builtins.BytesWarning", "builtins.DeprecationWarning", "builtins.EncodingWarning", "builtins.FutureWarning", "builtins.ImportWarning", "builtins.PendingDeprecationWarning", "builtins.ResourceWarning", "builtins.RuntimeWarning", "builtins.SyntaxWarning", "builtins.UnicodeWarning", "builtins.UserWarning", "builtins.BlockingIOError", "builtins.ChildProcessError", "builtins.ConnectionError", "builtins.BrokenPipeError", "builtins.ConnectionAbortedError", "builtins.ConnectionRefusedError", "builtins.ConnectionResetError", "builtins.FileExistsError", "builtins.InterruptedError", "builtins.IsADirectoryError", "builtins.NotADirectoryError", "builtins.PermissionError", "builtins.ProcessLookupError", "builtins.TimeoutError"],
   // Manifest Callable contracts for builtin free functions. These are the
   // single trusted source for these signatures; the emitter's seedBuiltins
   // reads them here instead of constructing the contracts in C++.
@@ -495,6 +495,17 @@ module attributes {
     method_kinds = ["instance", "instance"]
   } {}
 
+  py.class @bytes_iterator attributes {
+    base_names = ["Iterator"],
+    ly.typing.base_args = [[!py.contract<"builtins.int">]],
+    method_names = ["__iter__", "__next__"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes_iterator">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes_iterator">] -> [!py.contract<"builtins.int">]>
+    ],
+    method_kinds = ["instance", "instance"]
+  } {}
+
   py.class @bytes attributes {
     base_names = ["Sequence", "Hashable"],
     ly.typing.base_args = [[!py.contract<"builtins.int">], []],
@@ -509,7 +520,8 @@ module attributes {
                     "capitalize", "title", "lstrip", "lstrip", "rstrip",
                     "rstrip", "removeprefix", "removesuffix", "isalpha",
                     "isdigit", "isalnum", "isspace", "isascii", "islower",
-                    "isupper", "__contains__", "__contains__"],
+                    "isupper", "__contains__", "__contains__",
+                    "__lt__", "__le__", "__gt__", "__ge__", "__iter__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -566,7 +578,12 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes_iterator">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -576,7 +593,9 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "classmethod", "instance", "instance",
                     "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
   py.class @bytearray attributes {base_names = ["MutableSequence"],
                                  ly.typing.base_args = [[!py.contract<"builtins.int">]],
@@ -5145,6 +5164,72 @@ module attributes {
     %true_bit = arith.constant true
     %not_equal = arith.xori %equal, %true_bit : i1
     func.return %not_equal : i1
+  }
+
+  // bytes ordering is a lexicographic compare over unsigned bytes with the
+  // shorter operand ordering first on a shared prefix -- CPython's
+  // bytes_richcompare, whose memcmp is unsigned even though `char` is not.
+  func.func private @__ly_bytes_compare(%lhs_header: memref<6xi64>, %rhs_header: memref<6xi64>) -> i64 {
+    %lhs_bytes = func.call @__ly_bytes_payload(%lhs_header) : (memref<6xi64>) -> memref<?xi8>
+    %rhs_bytes = func.call @__ly_bytes_payload(%rhs_header) : (memref<6xi64>) -> memref<?xi8>
+    %c0 = arith.constant 0 : index
+    %step = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %minus_one = arith.constant -1 : i64
+    %plus_one = arith.constant 1 : i64
+    %lhs_dim = memref.dim %lhs_bytes, %c0 : memref<?xi8>
+    %rhs_dim = memref.dim %rhs_bytes, %c0 : memref<?xi8>
+    %lhs_len = arith.index_cast %lhs_dim : index to i64
+    %rhs_len = arith.index_cast %rhs_dim : index to i64
+    %min_dim = arith.minsi %lhs_dim, %rhs_dim : index
+    %byte_cmp = scf.for %index = %c0 to %min_dim step %step iter_args(%acc = %zero) -> (i64) {
+      %lhs_byte = memref.load %lhs_bytes[%index] : memref<?xi8>
+      %rhs_byte = memref.load %rhs_bytes[%index] : memref<?xi8>
+      %lhs_val = arith.extui %lhs_byte : i8 to i64
+      %rhs_val = arith.extui %rhs_byte : i8 to i64
+      %lt = arith.cmpi ult, %lhs_val, %rhs_val : i64
+      %gt = arith.cmpi ugt, %lhs_val, %rhs_val : i64
+      %gt_val = arith.select %gt, %plus_one, %zero : i64
+      %this = arith.select %lt, %minus_one, %gt_val : i64
+      %decided = arith.cmpi ne, %acc, %zero : i64
+      %next = arith.select %decided, %acc, %this : i64
+      scf.yield %next : i64
+    }
+    %len_lt = arith.cmpi slt, %lhs_len, %rhs_len : i64
+    %len_gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
+    %len_gt_val = arith.select %len_gt, %plus_one, %zero : i64
+    %len_cmp = arith.select %len_lt, %minus_one, %len_gt_val : i64
+    %prefix_equal = arith.cmpi eq, %byte_cmp, %zero : i64
+    %result = arith.select %prefix_equal, %len_cmp, %byte_cmp : i64
+    func.return %result : i64
+  }
+
+  func.func @LyBytes_LtBool(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__lt__"} {
+    %cmp = func.call @__ly_bytes_compare(%lhs_header, %rhs_header) : (memref<6xi64>, memref<6xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi slt, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyBytes_LeBool(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__le__"} {
+    %cmp = func.call @__ly_bytes_compare(%lhs_header, %rhs_header) : (memref<6xi64>, memref<6xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sle, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyBytes_GtBool(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__gt__"} {
+    %cmp = func.call @__ly_bytes_compare(%lhs_header, %rhs_header) : (memref<6xi64>, memref<6xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sgt, %cmp, %zero : i64
+    func.return %result : i1
+  }
+
+  func.func @LyBytes_GeBool(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__ge__"} {
+    %cmp = func.call @__ly_bytes_compare(%lhs_header, %rhs_header) : (memref<6xi64>, memref<6xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %result = arith.cmpi sge, %cmp, %zero : i64
+    func.return %result : i1
   }
 
   func.func @LyBytes_Concat(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__add__"} {
@@ -23196,6 +23281,87 @@ module attributes {
 
   ^dealloc:
     memref.dealloc %self : memref<5xi64>
+    cf.br ^done
+
+  ^done:
+    func.return
+  }
+
+  // ===== impls: bytes_iterator =====
+  // Two lanes, like str_iterator: the handle carries position/length, the
+  // source bytes object travels beside it. The payload is not a third lane --
+  // __ly_bytes_payload derives it from the header, so a `bytes` that a
+  // deallocator moved would not leave a stale view behind.
+  func.func private @LyBytesIterator_Shape() -> (memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.shape}
+
+  func.func private @__ly_bytes_iterator_alloc(%position: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 24 : i64, ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.primitive = "alloc"} {
+    %header = memref.alloc() {alignment = 16 : i64, ly.ownership.object_header, ly.ownership.owned_local_object} : memref<2xi64>
+    %state = memref.alloc() {alignment = 16 : i64} : memref<2xi64>
+    %one = arith.constant 1 : i64
+    %layout_bytes_iterator = arith.constant 24 : i64
+    %refcount_slot = arith.constant 0 : index
+    %layout_slot = arith.constant 1 : index
+    %position_slot = arith.constant 0 : index
+    %length_slot = arith.constant 1 : index
+    memref.store %one, %header[%refcount_slot] : memref<2xi64>
+    memref.store %layout_bytes_iterator, %header[%layout_slot] : memref<2xi64>
+    memref.store %position, %state[%position_slot] : memref<2xi64>
+    memref.store %length, %state[%length_slot] : memref<2xi64>
+    func.return %header, %state : memref<2xi64>, memref<2xi64>
+  }
+
+  func.func @LyBytes_Iter(%source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__iter__", ly.runtime.result_contract = "builtins.bytes_iterator"} {
+    %zero = arith.constant 0 : i64
+    %length = func.call @LyBytes_Len(%source_header) : (memref<6xi64>) -> i64
+    %iter_header, %state = func.call @__ly_bytes_iterator_alloc(%zero, %length) : (i64, i64) -> (memref<2xi64>, memref<2xi64>)
+    %source_header_sub = memref.subview %source_header[0] [2] [1] : memref<6xi64> to memref<2xi64, strided<[1]>>
+    %source_header_view = memref.cast %source_header_sub : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%source_header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %iter_header, %state, %source_header : memref<2xi64>, memref<2xi64>, memref<6xi64>
+  }
+
+  func.func @LyBytesIterator_Iter(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.method = "__iter__", ly.runtime.result_contract = "builtins.bytes_iterator"} {
+    %iter_header_view = memref.cast %iter_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%iter_header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+    func.return %iter_header, %state, %source_header : memref<2xi64>, memref<2xi64>, memref<6xi64>
+  }
+
+  func.func @LyBytesIterator_Next(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>, i1, memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_results = [0, 4], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "builtins.bytes_iterator", ly.runtime.valid_result_index = 3 : i64} {
+    %position_slot = arith.constant 0 : index
+    %length_slot = arith.constant 1 : index
+    %position = memref.load %state[%position_slot] : memref<2xi64>
+    %length = memref.load %state[%length_slot] : memref<2xi64>
+    %valid = arith.cmpi slt, %position, %length : i64
+    %one = arith.constant 1 : i64
+    %next_position_candidate = arith.addi %position, %one : i64
+    %next_position = arith.select %valid, %next_position_candidate, %position : i1, i64
+    memref.store %next_position, %state[%position_slot] : memref<2xi64>
+    %iter_header_view = memref.cast %iter_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    func.call @Ly_IncRef(%iter_header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+
+    %zero = arith.constant 0 : i64
+    %bytes = func.call @__ly_bytes_payload(%source_header) : (memref<6xi64>) -> memref<?xi8>
+    %element_value = scf.if %valid -> (i64) {
+      %at = arith.index_cast %position : i64 to index
+      %byte = memref.load %bytes[%at] : memref<?xi8>
+      %wide = arith.extui %byte : i8 to i64
+      scf.yield %wide : i64
+    } else {
+      scf.yield %zero : i64
+    }
+    %element:3 = func.call @LyLong_FromI64(%element_value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %element#0, %element#1, %element#2, %valid, %iter_header, %state, %source_header : memref<2xi64>, memref<2xi64>, memref<?xi32>, i1, memref<2xi64>, memref<2xi64>, memref<6xi64>
+  }
+
+  func.func @LyBytesIterator_DecRef(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.deallocator} {
+    %storage = memref.cast %iter_header : memref<2xi64> to memref<?xi64>
+    %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
+    cf.cond_br %became_zero, ^dealloc, ^done
+
+  ^dealloc:
+    func.call @LyBytes_DecRef(%source_header) : (memref<6xi64>) -> ()
+    memref.dealloc %state : memref<2xi64>
+    memref.dealloc %iter_header : memref<2xi64>
     cf.br ^done
 
   ^done:

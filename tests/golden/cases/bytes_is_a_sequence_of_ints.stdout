@@ -1,0 +1,12 @@
+True True True True
+True False False
+True True
+[b'a', b'ab', b'b']
+b'aa' b'b'
+[97, 98]
+104
+105
+[65, 90] 3 99
+[97, 98, 99]
+[]
+[120, 121, 122] [120, 121, 122]
