@@ -1,0 +1,8 @@
+True True True True
+False False False
+True True False False
+False True False True
+range byte must be in range(0, 256)
+range byte must be in range(0, 256)
+range byte must be in range(0, 256)
+hits 203

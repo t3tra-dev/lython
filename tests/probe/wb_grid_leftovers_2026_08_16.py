@@ -656,6 +656,28 @@
 # in three places.
 #
 # ============================================================
+# (61) FIXED: `in` OVER bytes, BOTH SPELLINGS.
+# ============================================================
+#     print(b"a" in b"abc")
+#     # builtins.bytes.__contains__ is declared by the standard-library
+#     # contract but has no runtime implementation
+#
+# ⭐ FIXED 2026-08-21. bytes inherits __contains__ from its Sequence base, so
+# the operator type-checked and then had nothing to call -- the same shape as
+# the exception-chain attributes diagnosed the day before, except that this one
+# has no missing mechanism behind it. CPython takes a bytes (subsequence) and
+# an int (byte value) through the same operator; both are implemented.
+#
+# ⛔ THE BYTES FORM IS `find(...) >= 0`, not a second scan: the empty sub is IN
+# every bytes for both, and answering it once means the two cannot drift.
+#
+# ⛔ AND AN INT OUTSIDE 0..255 RAISES rather than answering False -- `256 in
+# b"abc"` is a ValueError in CPython, so the range check is part of the
+# operation. Pinned with CPython's own message.
+#
+# Pinned by tests/golden/cases/bytes_containment.py.
+#
+# ============================================================
 # (60) FIXED: divmod OVER FLOATS.
 # ============================================================
 #     print(divmod(7.5, 2))

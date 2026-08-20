@@ -508,7 +508,7 @@ module attributes {
                     "capitalize", "title", "lstrip", "lstrip", "rstrip",
                     "rstrip", "removeprefix", "removesuffix", "isalpha",
                     "isdigit", "isalnum", "isspace", "isascii", "islower",
-                    "isupper"],
+                    "isupper", "__contains__", "__contains__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -563,7 +563,9 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -573,7 +575,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "classmethod", "instance", "instance",
                     "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
   py.class @bytearray attributes {base_names = ["MutableSequence"],
                                  ly.typing.base_args = [[!py.contract<"builtins.int">]],
@@ -5501,6 +5503,68 @@ module attributes {
     %len = arith.index_cast %dim : index to i64
     func.return %len : i64
   }
+
+  // `sub in data` and `value in data` -- both spellings CPython's
+  // bytes.__contains__ takes. Declared through the Sequence base and never
+  // implemented, so `b"a" in b"abc"` said so at the ABI ("declared by the
+  // standard-library contract but has no runtime implementation").
+  //
+  // ⛔ The bytes form is `find(...) >= 0` rather than a second scan: the empty
+  // sub is True for both, and the two answers cannot drift.
+  func.func @LyBytes_ContainsBytes(%header: memref<6xi64> {ly.ownership.object_header}, %sub_header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__contains__"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %sub_bytes = func.call @__ly_bytes_payload(%sub_header) : (memref<6xi64>) -> memref<?xi8>
+    %zero = arith.constant 0 : i64
+    %max = arith.constant 9223372036854775807 : i64
+    %false_bit = arith.constant false
+    %len = func.call @__ly_bytes_len_of(%bytes) : (memref<?xi8>) -> i64
+    %start, %end = func.call @__ly_unicode_adjust_range(%len, %zero, %max) : (i64, i64, i64) -> (i64, i64)
+    %n = func.call @__ly_bytes_len_of(%sub_bytes) : (memref<?xi8>) -> i64
+    %found = func.call @__ly_bytes_find_core(%bytes, %sub_bytes, %start, %end, %n, %false_bit) : (memref<?xi8>, memref<?xi8>, i64, i64, i64, i1) -> i64
+    %hit = arith.cmpi sge, %found, %zero : i64
+    func.return %hit : i1
+  }
+
+  // ⛔ CPython RAISES for an int outside 0..255 rather than answering False --
+  // `256 in b"abc"` is a ValueError, not a miss -- so the range check is part
+  // of the operation and not an optimisation of it.
+  func.func @LyBytes_ContainsInt(%header: memref<6xi64> {ly.ownership.object_header}, %value_header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__contains__"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %limit = arith.constant 256 : i64
+    %false_bit = arith.constant false
+    %value = func.call @LyLong_AsI64(%value_header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %too_small = arith.cmpi slt, %value, %zero : i64
+    %too_big = arith.cmpi sge, %value, %limit : i64
+    %out_of_range = arith.ori %too_small, %too_big : i1
+    scf.if %out_of_range {
+      func.call @__ly_bytes_raise_byte_range() : () -> ()
+    }
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    %hit = scf.for %i = %c0 to %dim step %c1 iter_args(%seen = %false_bit) -> (i1) {
+      %raw = memref.load %bytes[%i] : memref<?xi8>
+      %b = arith.extui %raw : i8 to i64
+      %same = arith.cmpi eq, %b, %value : i64
+      %next = arith.ori %seen, %same : i1
+      scf.yield %next : i1
+    }
+    func.return %hit : i1
+  }
+
+  func.func private @__ly_bytes_raise_byte_range() attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "raise_byte_range"} {
+    %c0 = arith.constant 0 : index
+    %message = memref.get_global @__ly_bytes_byte_range_message : memref<29xi8>
+    %message_dyn = memref.cast %message : memref<29xi8> to memref<?xi8>
+    %len = arith.constant 29 : i64
+    %class_id = arith.constant 53 : i64
+    func.call @__ly_long_raise_message(%class_id, %message_dyn, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // "byte must be in range(0, 256)"
+  memref.global "private" constant @__ly_bytes_byte_range_message : memref<29xi8> = dense<[98, 121, 116, 101, 32, 109, 117, 115, 116, 32, 98, 101, 32, 105, 110, 32, 114, 97, 110, 103, 101, 40, 48, 44, 32, 50, 53, 54, 41]>
 
   func.func @LyBytes_Find(%header: memref<6xi64> {ly.ownership.object_header}, %sub_header: memref<6xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "find", ly.runtime.result_contract = "builtins.int"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
