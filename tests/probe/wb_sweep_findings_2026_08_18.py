@@ -1964,6 +1964,49 @@ them in.
 #    other union read and waits on the same mechanism.
 
 # ==========================================================================
+# [BUG + GAP x3] match guards                         FOUND + FIXED 2026-08-20
+# From a fresh twenty-program grid against CPython 3.14 (dataclasses with a
+# default_factory, str splitting, sorting with keys, f-string formats, slices,
+# comprehensions, set algebra, match, context managers, keyword-only
+# parameters, super(), enumerate over tuple unpacking...). EIGHTEEN AGREED.
+# Two did not, and one of them was `case int() if x > 3`.
+#
+# 1. THE BUG. A guard was evaluated even when the pattern did not match:
+#
+#        match x:              # x = 2
+#            case 1 if note():
+#        # note() called once; CPython does not call it at all
+#
+#    The guard and the pattern condition were ANDed in one block, and an `and`
+#    over two already-computed values evaluates both. A BRANCH is what sequences
+#    them. The failing-guard edge and the failing-pattern edge are the same
+#    block, because both go on to the next case.
+#
+# 2. THE GAP, three arms wide. The class, sequence and mapping patterns refused
+#    a guard outright -- "(no guards)", "guards not supported here yet". Each
+#    already had the machinery: every one of them gates its body on a condition
+#    computed after the captures are bound, which is exactly where CPython
+#    evaluates the guard, so the guard is one more edge on a branch that was
+#    already there.
+#
+# ⛔ THE ORDER WITHIN THE ARM IS THE POINT, not just the presence: after the
+# captures (or `case [a, b] if a < b` cannot see a and b) and after the length
+# and key tests (or a subject of the wrong shape reaches a guard CPython never
+# runs). The golden counts the calls for each arm, which is the only way to see
+# either half.
+#
+# ⛔ createBlock MOVES THE BUILDER into the block it makes, so the guard has to
+# be emitted BEFORE the blocks that branch on it. Written the other way round
+# it put the guard's ops in the next case's check block and MLIR rejected the
+# empty one it left behind ("empty block: expect at least a terminator").
+#
+# Pinned by tests/golden/cases/a_match_guard_runs_only_when_it_matched.py.
+#
+# ⛔ THE OTHER GRID FAILURE was `from collections import defaultdict`, which is
+# absent on purpose: collections.py says deque and defaultdict are C-only in
+# CPython and not ported.
+
+# ==========================================================================
 # [BUG x3] None inside an erased object                FOUND + FIXED 2026-08-20
 # The two neighbours the erased-comparison entry below recorded turned out to be
 # one defect in two halves, plus a third that only became visible once they were

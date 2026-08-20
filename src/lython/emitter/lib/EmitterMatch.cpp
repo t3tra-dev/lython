@@ -146,7 +146,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       bool sequenceSubject =
           contract && (contract.getContractName() == "builtins.tuple" ||
                        contract.getContractName() == "builtins.list");
-      bool shapeSupported = sequenceSubject && subPatterns && !guard;
+      bool shapeSupported = sequenceSubject && subPatterns;
       constexpr unsigned kNoStar = ~0u;
       unsigned starIndex = kNoStar;
       if (shapeSupported)
@@ -173,8 +173,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "match sequence pattern requires a tuple/list subject with "
-            "capture or literal elements (one trailing *rest allowed; guards "
-            "not supported here yet)"});
+            "capture or literal elements (one trailing *rest allowed)"});
         return;
       }
       unsigned prefixCount = starIndex == kNoStar
@@ -356,6 +355,20 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
                                        mlir::ValueRange{});
         builder.setInsertionPointToStart(bodyBlock);
       }
+      // The guard runs after the length test and the element captures, which
+      // is where CPython runs it: `case [a, b] if a < b` needs both names, and
+      // a subject of the wrong length must not reach the comparison at all.
+      if (guard) {
+        mlir::Value guardCond = emitBoolValue(emitExpr(guard), *guard);
+        mlir::Block *guardBlock = builder.getInsertionBlock();
+        mlir::Block *guardBody =
+            builder.createBlock(region, continuation->getIterator());
+        builder.setInsertionPointToEnd(guardBlock);
+        mlir::cf::CondBranchOp::create(builder, loc(statement), guardCond,
+                                       guardBody, mlir::ValueRange{},
+                                       nextCheck, mlir::ValueRange{});
+        builder.setInsertionPointToStart(guardBody);
+      }
       emitStatements(body);
       if (!insertionBlockTerminated(builder))
         mlir::cf::BranchOp::create(builder, loc(statement), continuation);
@@ -378,8 +391,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
           return ast::node(*sub, "pattern") == nullptr;
         return sub->kind == "MatchValue";
       };
-      bool shapeSupported =
-          !guard && ((kwdAttrs == nullptr) == (kwdPatterns == nullptr));
+      bool shapeSupported = (kwdAttrs == nullptr) == (kwdPatterns == nullptr);
       std::size_t keywordCount = kwdAttrs ? kwdAttrs->size() : 0;
       if (shapeSupported && kwdPatterns) {
         if (kwdPatterns->size() != keywordCount)
@@ -403,7 +415,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "match class pattern requires a statically resolved class with "
-            "capture or literal sub-patterns (no guards)"});
+            "capture or literal sub-patterns"});
         return;
       }
       // (attribute name, sub-pattern) pairs: positional names resolve through
@@ -542,7 +554,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         return;
       }
 
-      bool refutableByValue = valueCondition.has_value();
+      bool refutableByValue = valueCondition.has_value() || guard;
       if (valueCondition) {
         mlir::Block *conditionBlock = builder.getInsertionBlock();
         if (!nextCheck)
@@ -555,6 +567,27 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
                                        mlir::ValueRange{}, nextCheck,
                                        mlir::ValueRange{});
         builder.setInsertionPointToStart(bodyBlock);
+      }
+      // ⭐ THE GUARD IS EMITTED HERE, after the captures are bound and after
+      // the literal sub-patterns have branched, because CPython evaluates it
+      // in exactly that position: `case Point(x=0) if log(p):` does not call
+      // log for a point whose x is 1, and `case P(x=n) if n > 3` needs n. The
+      // arm used to refuse a guard outright rather than place it.
+      if (guard) {
+        // The guard is EMITTED before the blocks are made: createBlock moves
+        // the builder into the block it makes, so making them first puts the
+        // guard's own ops in the wrong one.
+        mlir::Value guardCond = emitBoolValue(emitExpr(guard), *guard);
+        mlir::Block *guardBlock = builder.getInsertionBlock();
+        if (!nextCheck)
+          nextCheck = builder.createBlock(region, continuation->getIterator());
+        mlir::Block *guardBody =
+            builder.createBlock(region, continuation->getIterator());
+        builder.setInsertionPointToEnd(guardBlock);
+        mlir::cf::CondBranchOp::create(builder, loc(statement), guardCond,
+                                       guardBody, mlir::ValueRange{},
+                                       nextCheck, mlir::ValueRange{});
+        builder.setInsertionPointToStart(guardBody);
       }
       emitStatements(body);
       if (!insertionBlockTerminated(builder))
@@ -583,7 +616,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       bool shapeSupported = contract &&
                             contract.getContractName() == "builtins.dict" &&
                             keys && valuePatterns &&
-                            keys->size() == valuePatterns->size() && !guard &&
+                            keys->size() == valuePatterns->size() &&
                             !ast::node(*pattern, "rest");
       if (shapeSupported)
         for (const parser::NodePtr &sub : *valuePatterns) {
@@ -687,6 +720,19 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
                                        mlir::ValueRange{});
         builder.setInsertionPointToStart(bodyBlock);
       }
+      // As in the sequence arm: after the key tests and the captures, so a
+      // subject missing the key never reaches the guard.
+      if (guard) {
+        mlir::Value guardCond = emitBoolValue(emitExpr(guard), *guard);
+        mlir::Block *guardBlock = builder.getInsertionBlock();
+        mlir::Block *guardBody =
+            builder.createBlock(region, continuation->getIterator());
+        builder.setInsertionPointToEnd(guardBlock);
+        mlir::cf::CondBranchOp::create(builder, loc(statement), guardCond,
+                                       guardBody, mlir::ValueRange{},
+                                       nextCheck, mlir::ValueRange{});
+        builder.setInsertionPointToStart(guardBody);
+      }
       emitStatements(body);
       if (!insertionBlockTerminated(builder))
         mlir::cf::BranchOp::create(builder, loc(statement), continuation);
@@ -705,12 +751,30 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
     }
 
     // A guard makes even an irrefutable pattern refutable.
+    //
+    // ⭐ AND IT ONLY RUNS WHEN THE PATTERN MATCHED. The two used to be ANDed
+    // together in one block, which evaluates the guard either way -- so
+    // `case 1 if note():` called note() for a subject that is not 1, where
+    // CPython does not. A branch rather than an `and` is what sequences them;
+    // the failing-guard edge and the failing-pattern edge are the same block,
+    // because both go on to the next case.
+    mlir::Block *guardFail = nullptr;
     if (guard) {
-      mlir::Value guardCond = emitBoolValue(emitExpr(guard), *guard);
-      condition = condition ? mlir::arith::AndIOp::create(
-                                  builder, loc(statement), *condition, guardCond)
-                                  .getResult()
-                            : guardCond;
+      if (condition) {
+        guardFail = builder.createBlock(region, continuation->getIterator());
+        mlir::Block *guardBlock =
+            builder.createBlock(region, guardFail->getIterator());
+        builder.setInsertionPointToEnd(check);
+        mlir::cf::CondBranchOp::create(builder, loc(statement), *condition,
+                                       guardBlock, mlir::ValueRange{},
+                                       guardFail, mlir::ValueRange{});
+        builder.setInsertionPointToStart(guardBlock);
+      }
+      condition = emitBoolValue(emitExpr(guard), *guard);
+      // The guard's own control flow (a short-circuit `and`) may have moved on
+      // from the block it started in; the branch below has to leave from where
+      // its value actually is.
+      check = builder.getInsertionBlock();
     }
 
     if (!condition) {
@@ -725,7 +789,8 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
     mlir::Block *bodyBlock =
         builder.createBlock(region, continuation->getIterator());
     mlir::Block *nextCheck =
-        builder.createBlock(region, continuation->getIterator());
+        guardFail ? guardFail
+                  : builder.createBlock(region, continuation->getIterator());
     builder.setInsertionPointToEnd(check);
     mlir::cf::CondBranchOp::create(builder, loc(statement), *condition,
                                    bodyBlock, mlir::ValueRange{}, nextCheck,

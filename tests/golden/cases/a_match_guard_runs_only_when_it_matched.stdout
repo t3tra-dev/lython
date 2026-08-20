@@ -1,0 +1,16 @@
+one
+other 2
+literal guards 1
+class small 1
+class big 3
+zero
+class guards 2
+pair 1 2
+pair big 3 4
+not a pair
+sequence guards 2
+map small 1
+map big 5
+no k
+mapping guards 2
+int guard
