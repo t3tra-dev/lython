@@ -802,6 +802,44 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 tryEmitClassDunder(expr, receiver, "__divmod__", rest))
           return *dispatched;
       }
+      // ⭐ `divmod` OVER FLOATS IS THE PAIR ITS OPERATORS ALREADY ANSWER.
+      // CPython defines divmod(x, y) and (x // y, x % y) together -- the same
+      // quotient and the same remainder -- and the manifest's divmod is typed
+      // [int, int], so `divmod(7.5, 2)` was "!py.callable<[int, int], ...> is
+      // not callable with these arguments" for a pair this compiler can
+      // already compute.
+      //
+      // ⛔ The operands are bound to temporaries first: `divmod(f(), g())`
+      // names each of them twice below, and CPython calls each once.
+      mlir::Type otherType =
+          types.widenLiteral(types.inferExpr((*divArgs)[1].get()));
+      if (receiverType == types.floatType() || otherType == types.floatType()) {
+        unsigned serial = ++syntheticFunctionCounter;
+        std::string left = "__divmodl" + std::to_string(serial);
+        std::string right = "__divmodr" + std::to_string(serial);
+        Value leftValue = emitExpr(divArgs->front().get());
+        Value rightValue = emitExpr((*divArgs)[1].get());
+        values[left] = leftValue;
+        types.bindSymbol(left, leftValue.type);
+        values[right] = rightValue;
+        types.bindSymbol(right, rightValue.type);
+        auto operand = [&](const std::string &name) {
+          return synth::name(name, expr.range);
+        };
+        parser::NodePtr pair = parser::makeNode("Tuple", expr.range);
+        parser::addField(
+            *pair, "elts",
+            std::vector<parser::NodePtr>{
+                synth::binOp(operand(left), "FloorDiv", operand(right),
+                             expr.range),
+                synth::binOp(operand(left), "Mod", operand(right),
+                             expr.range)});
+        synthesizedIteratorDefs.push_back(pair);
+        Value built = emitExpr(pair.get());
+        values.erase(left);
+        values.erase(right);
+        return built;
+      }
     }
   }
 

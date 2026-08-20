@@ -656,6 +656,29 @@
 # in three places.
 #
 # ============================================================
+# (60) FIXED: divmod OVER FLOATS.
+# ============================================================
+#     print(divmod(7.5, 2))
+#     # static type !py.callable<[builtins.int, builtins.int], ...> is not
+#     # callable with these arguments
+#
+# ⭐ FIXED 2026-08-21, from a numeric-semantics grid. The manifest's divmod is
+# typed [int, int]; the pair it would answer for floats is one this compiler
+# already computes, because CPython defines divmod(x, y) and (x // y, x % y)
+# TOGETHER -- same quotient, same remainder. So the float call is that pair,
+# and no new arithmetic is written.
+#
+# ⛔ THE OPERANDS ARE BOUND FIRST: the rewrite names each of them twice, and
+# `divmod(f(), 2)` must call f() once. The golden counts.
+#
+# ⛔ The negatives are what the golden is for: floor division rounds toward
+# negative infinity and the remainder takes the DIVISOR's sign, so
+# divmod(-7.5, 2) is (-4.0, 0.5) and divmod(7.5, -2) is (-4.0, -0.5). A
+# truncating implementation gets both wrong.
+#
+# Pinned by tests/golden/cases/divmod_over_floats.py.
+#
+# ============================================================
 # (59) FIXED: int(s, 0) -- THE BASE READ OFF THE PREFIX.
 # ============================================================
 #     print(int("0b101", 0))
