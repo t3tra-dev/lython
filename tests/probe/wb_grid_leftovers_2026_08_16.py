@@ -656,6 +656,35 @@
 # in three places.
 #
 # ============================================================
+# (59) FIXED: int(s, 0) -- THE BASE READ OFF THE PREFIX.
+# ============================================================
+#     print(int("0b101", 0))
+#     # ValueError: int() base 0 (auto-detect) is not supported; pass a base
+#     # between 2 and 36
+#
+# ⭐ FIXED 2026-08-20. The refusal's reason -- "CPython's auto-detect is a
+# different parse, not a parameter of this one" -- was half right and that half
+# is why it is one variable rather than a second function: everything below the
+# sign strip consumes a `radix` read off the prefix, and only the ERROR MESSAGES
+# keep `base`, because CPython reports "with base 0" for a string it detected.
+#
+# ⛔ THE OTHER HALF IS REAL AND IS NOW IMPLEMENTED: a bare leading zero is an
+# ERROR under base 0. `int("012", 0)` is an ambiguity with the old octal
+# spelling and CPython refuses it, while `int("00", 0)` and `int("0_0", 0)` are
+# 0 -- so the check is "every remaining character is 0 or _", not "the value is
+# zero". Eleven edge cases were measured against CPython 3.14, including
+# `int("0b_1", 0)` (1, the underscore is legal right after a prefix) and
+# `int(" -0o17 ", 0)` (-15, sign outside, prefix inside).
+#
+# ⛔ IT USED TO RAISE AT RUN TIME for a base the emitter could see was the
+# literal 0. That is the wrong boundary by this project's own rule, and the
+# reason it was reachable at all is that the whole parse is a SYNTHESIZED PYTHON
+# FUNCTION -- the base is a parameter of it, so the check went where the parse
+# is. Implementing it removed the question instead of moving it.
+#
+# Pinned in tests/golden/cases/int_base_keyword.py.
+#
+# ============================================================
 # (58) FIXED: EIGHTEEN bytes METHODS, THE ASCII HALF OF THE TABLE.
 # ============================================================
 #     print(b"hello".upper())

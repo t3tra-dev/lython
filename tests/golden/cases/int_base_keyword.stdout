@@ -1,2 +1,9 @@
 255 3 31
 True
+5 15 31 12
+31 -16 -15 1
+0 0 0 10
+refused invalid literal for int() with base 0: '012'
+refused invalid literal for int() with base 0: '0_1'
+refused invalid literal for int() with base 0: '0x'
+refused invalid literal for int() with base 0: '0b12'

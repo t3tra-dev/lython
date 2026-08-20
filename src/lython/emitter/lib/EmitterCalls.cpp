@@ -2223,20 +2223,15 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     };
 
     std::vector<parser::NodePtr> body;
-    // ⛔ base=0 is refused rather than guessed: CPython's auto-detect is a
-    // different parse (the prefix decides, and a bare leading zero is an
-    // error), not a parameter of this one.
     body.push_back(synth::ifStmt(
-        synth::compare(name("base"), "Eq", num(0), range),
-        {synth::raiseValueError(
-            "int() base 0 (auto-detect) is not supported; pass a base "
-            "between 2 and 36",
-            range)},
-        {}, range));
-    body.push_back(synth::ifStmt(
-        synth::orChain({synth::compare(name("base"), "Lt", num(2), range),
-                        synth::compare(name("base"), "Gt", num(36), range)},
-                       range),
+        synth::boolOp(
+            "And",
+            {synth::compare(name("base"), "NotEq", num(0), range),
+             synth::orChain(
+                 {synth::compare(name("base"), "Lt", num(2), range),
+                  synth::compare(name("base"), "Gt", num(36), range)},
+                 range)},
+            range),
         {synth::raiseValueError("int() base must be >= 2 and <= 36, or 0",
                                 range)},
         {}, range));
@@ -2259,12 +2254,33 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     // `int("0x_1f", 16)`.
     body.push_back(
         synth::assign(name("pending"), synth::boolConstant(true, range), range));
-    // The prefix is accepted only when it agrees with the base, as CPython does.
+    // ⭐ base=0 IS THE SAME PARSE WITH THE RADIX READ OFF THE PREFIX, which is
+    // why it is a variable rather than a second function: everything below
+    // consumes `radix`, and only the ERROR MESSAGES keep `base`, because
+    // CPython reports "with base 0" for a string it auto-detected.
+    body.push_back(synth::assign(name("radix"), name("base"), range));
+    {
+      std::vector<parser::NodePtr> detect;
+      detect.push_back(synth::assign(name("radix"), num(10), range));
+      for (auto [prefixBase, prefix] :
+           {std::pair<std::int64_t, const char *>{16, "0x"},
+            {8, "0o"},
+            {2, "0b"}})
+        detect.push_back(synth::ifStmt(
+            synth::methodCall(name("body"), "startswith", {str(prefix)},
+                              range),
+            {synth::assign(name("radix"), num(prefixBase), range)}, {},
+            range));
+      body.push_back(synth::ifStmt(
+          synth::compare(name("base"), "Eq", num(0), range), std::move(detect),
+          {}, range));
+    }
+    // The prefix is accepted only when it agrees with the radix, as CPython does.
     for (auto [prefixBase, prefix] :
          {std::pair<std::int64_t, const char *>{16, "0x"}, {8, "0o"}, {2, "0b"}})
       body.push_back(synth::ifStmt(
           synth::boolOp("And",
-                        {synth::compare(name("base"), "Eq", num(prefixBase),
+                        {synth::compare(name("radix"), "Eq", num(prefixBase),
                                         range),
                          synth::methodCall(name("body"), "startswith",
                                            {str(prefix)}, range)},
@@ -2273,6 +2289,32 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
            synth::assign(name("pending"), synth::boolConstant(false, range),
                          range)},
           {}, range));
+    // ⛔ AND A BARE LEADING ZERO IS AN ERROR UNDER base=0, which is the half
+    // that makes auto-detect a different parse rather than a default: CPython
+    // reads `int("012", 0)` as an ambiguity between the old octal spelling and
+    // decimal and refuses it, while `int("00", 0)` and `int("0_0", 0)` are 0.
+    {
+      std::vector<parser::NodePtr> scan{synth::ifStmt(
+          synth::boolOp("And",
+                        {synth::compare(name("ch"), "NotEq", str("0"), range),
+                         synth::compare(name("ch"), "NotEq", str("_"), range)},
+                        range),
+          {invalidLiteral()}, {}, range)};
+      body.push_back(synth::ifStmt(
+          synth::boolOp(
+              "And",
+              {synth::compare(name("base"), "Eq", num(0), range),
+               synth::boolOp(
+                   "And",
+                   {synth::compare(name("radix"), "Eq", num(10), range),
+                    synth::methodCall(name("body"), "startswith", {str("0")},
+                                      range)},
+                   range)},
+              range),
+          {synth::forStmt(name("ch"), name("body"), std::move(scan), {},
+                          range)},
+          {}, range));
+    }
     body.push_back(synth::assign(
         name("alphabet"), str("0123456789abcdefghijklmnopqrstuvwxyz"), range));
     body.push_back(synth::assign(name("total"), num(0), range));
@@ -2289,12 +2331,13 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
         synth::methodCall(name("alphabet"), "find", {name("ch")}, range), range));
     loop.push_back(synth::ifStmt(
         synth::orChain({synth::compare(name("digit"), "Lt", num(0), range),
-                        synth::compare(name("digit"), "GtE", name("base"), range)},
+                        synth::compare(name("digit"), "GtE", name("radix"),
+                                       range)},
                        range),
         {invalidLiteral()}, {}, range));
     loop.push_back(synth::assign(
         name("total"),
-        synth::binOp(synth::binOp(name("total"), "Mult", name("base"), range),
+        synth::binOp(synth::binOp(name("total"), "Mult", name("radix"), range),
                      "Add", name("digit"), range),
         range));
     loop.push_back(synth::assign(
