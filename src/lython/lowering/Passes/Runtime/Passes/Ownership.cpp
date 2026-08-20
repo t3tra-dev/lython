@@ -1709,6 +1709,26 @@ bool releaseOwnedGroupByLiveness(
           // needs one name for its borrow accounting and another for the
           // second reference, and today there is only one value to name.
           //
+          // ⭐ A SMALLER PROGRAM REACHES THE SAME WALL, found 2026-08-21 from
+          // the other end (a variadic constructor leaking its argument):
+          //
+          //     def g(a: str, b: str) -> int:
+          //         t = b
+          //         if a != "":
+          //             t = a + "/" + b     # owned on one branch only
+          //         total = 0
+          //         for e in (t,):          # tuple #1, iterated
+          //             total += len(e)
+          //         x = (t,)                # tuple #2
+          //         return total + len(x)
+          //
+          // Two `sequence.literal` retains on the merge argument and NOT ONE
+          // release of its own token -- the one-tuple version has one, so the
+          // placement disappears when the second reference arrives. Same knot,
+          // six lines, one line of output, and no classes or varargs in it;
+          // tests/probe/wb_sweep_findings_2026_08_18.py has the table of clean
+          // neighbours that isolates each of its three necessary properties.
+          //
           // The seventh attempt cut exactly there -- marker for the second
           // reference, terminator left naming the original -- and it fails
           // with the SAME diagnostic as the sixth. So the conflict is not
