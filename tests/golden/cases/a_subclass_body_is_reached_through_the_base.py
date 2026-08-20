@@ -131,3 +131,26 @@ for m in monies:
     print(m + 2, m == m, repr(m))
 for m in monies:
     print(m)
+
+# A dispatched body that needs THE SAME dispatcher: `Wrap.size` calls `.size()`
+# on a base-typed value, and that call is emitted while the dispatcher for
+# Node.size is still being built. Its memo entry therefore has to be complete
+# -- symbol AND callable -- before the body is emitted; an entry carrying only
+# the symbol answered "no dispatcher yet" and the program came back refused.
+class Node:
+    def size(self) -> int:
+        return 1
+
+
+def a_node() -> Node:
+    return Node()
+
+
+class Wrap(Node):
+    def size(self) -> int:
+        return a_node().size() + 1
+
+
+nodes: list[Node] = [Node(), Wrap()]
+for n in nodes:
+    print(n.size())

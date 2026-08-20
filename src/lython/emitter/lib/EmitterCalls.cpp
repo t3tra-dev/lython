@@ -2531,10 +2531,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     });
 
     std::string symbol = "__lyvdisp$" + std::to_string(++syntheticFunctionCounter);
-    // Memoized before the body: a body reached from here may dispatch the same
-    // method again.
-    VirtualDispatchHelper &entry = virtualDispatchHelpers[key];
-    entry.symbol = symbol;
+    virtualDispatchHelpers[key].symbol = symbol;
 
     auto forwarded = [&] {
       std::vector<parser::NodePtr> out;
@@ -2567,6 +2564,14 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                                              std::move(body), returns, {}, range);
     synthesizedIteratorDefs.push_back(def);
     FunctionSignature sig = types.functionSignature(*def);
+    // ⭐ THE MEMO IS COMPLETE BEFORE THE BODY IS EMITTED, callable included.
+    // A body reached from here may dispatch the same method again -- a
+    // recursive class does it on its own field (`Pair.size` calling
+    // `self.l.size()` where `l: N` and Pair overrides N.size) -- and an entry
+    // that carried only the symbol answered "no dispatcher yet" to that call,
+    // which came back as the refusal for a program the dispatcher was already
+    // being built for.
+    virtualDispatchHelpers[key].callable = sig.publicCallable;
     {
       // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
       // inside an inlined method body. Emitting it under the inliner's state
@@ -2590,7 +2595,6 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       });
       emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
     }
-    virtualDispatchHelpers[key].callable = sig.publicCallable;
     memo = virtualDispatchHelpers.find(key);
   }
   if (!memo->second.callable)
