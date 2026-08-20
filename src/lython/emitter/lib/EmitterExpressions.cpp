@@ -2996,6 +2996,9 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
   bool container = false;
 
   llvm::SmallVector<Value, 8> valuesToPack;
+  // Parallel to `valuesToPack`: the type the EXPECTATION asked each element to
+  // be, or null where the element had none (a sibling guess is not one).
+  llvm::SmallVector<mlir::Type, 8> elementExpectations;
   bool empty = true;
   if (const auto *elts = ast::nodeList(expr, "elts")) {
     mlir::Type elementExpected;
@@ -3018,9 +3021,12 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
       mlir::Type eltExpected = index < positionalExpected.size()
                                    ? positionalExpected[index]
                                    : elementExpected;
+      bool fromExpectation = static_cast<bool>(eltExpected);
       if (!eltExpected)
         eltExpected = siblingExpectationFor(expr, elt.get(), /*forKey=*/false);
       valuesToPack.push_back(emitExprExpected(elt.get(), eltExpected));
+      elementExpectations.push_back(fromExpectation ? eltExpected
+                                                    : mlir::Type());
     }
   }
   if (const auto *keys = ast::nodeList(expr, "keys")) {
@@ -3038,31 +3044,90 @@ Value ModuleEmitter::emitContainerLiteral(const parser::Node &expr,
       if (key && refuseUnhashableKey(*key, types.inferExpr(key.get()),
                                      "dict key"))
         return emitNone(expr);
-      if (key)
+      if (key) {
         valuesToPack.push_back(emitExprExpected(key.get(), keyExpected));
+        elementExpectations.push_back(keyExpected);
+      }
       if (vals && index < vals->size()) {
         mlir::Type thisValueExpected = valueExpected;
+        bool fromExpectation = static_cast<bool>(thisValueExpected);
         if (!thisValueExpected)
           thisValueExpected =
               siblingExpectationFor(expr, (*vals)[index].get(),
                                     /*forKey=*/false);
         valuesToPack.push_back(
             emitExprExpected((*vals)[index].get(), thisValueExpected));
+        elementExpectations.push_back(fromExpectation ? thisValueExpected
+                                                      : mlir::Type());
       }
     }
   }
   // An empty literal synthesizes its top-erased element type, which the
   // stricter lowering contract match later rejects against a concrete
   // formal; adopting the expectation types the pack correctly from the
-  // start. Non-empty literals keep the synthesized type: their elements
-  // determine it, and the caller's coercion validates the expectation.
+  // start.
+  //
+  // ⭐ AND SO DOES A NON-EMPTY ONE WHOSE ELEMENTS ALL FIT. The comment that
+  // stood here said the caller's coercion validates the expectation -- but a
+  // container is INVARIANT, so there is no coercion to validate it with:
+  // `def f(xs: list[float])` reached by `f([1, 2])` was refused as "call
+  // arguments do not match the Callable contract", and `join([B(), B()])` with
+  // `xs: list[A]` the same way, while `ys: list[A] = [B(), B()]` -- the same
+  // literal under the same expectation, one line up -- has always compiled.
+  // The expectation is the type the literal is being BUILT as, which is what
+  // bidirectional inference means and what CPython's type checkers do.
+  //
+  // ⛔ Only when every element carried an expectation AND is assignable to it:
+  // a literal whose elements do not fit keeps its synthesized type, so the
+  // mismatch is still reported against the formal by the caller rather than
+  // silently retyped here.
   mlir::Type resultType =
       (empty && container) ? expected : types.inferExpr(&expr);
   llvm::SmallVector<mlir::Value, 8> operands;
   for (Value value : valuesToPack)
     operands.push_back(value.value);
   auto op = py::PackOp::create(builder, loc(expr), resultType, operands);
-  return {op.getResult(), resultType};
+  Value packed{op.getResult(), resultType};
+  // ⭐ AND A NON-EMPTY LITERAL WHOSE ELEMENTS ALL FIT TAKES THE EXPECTATION
+  // TOO. A container is INVARIANT, so `list[B]` never reaches a `list[A]`
+  // formal on its own: `def join(xs: list[A])` reached by `join([B(), B()])`
+  // was refused as "call arguments do not match the Callable contract", while
+  // `ys: list[A] = [B(), B()]` -- the same literal under the same expectation
+  // -- has always compiled, because the ASSIGNMENT coerces the built container.
+  // The call site had no such step, so the same literal was accepted in one
+  // spelling and refused in the other.
+  //
+  // ⛔ The CONTAINER is coerced, not its elements. Coercing each element wraps
+  // it in the expectation -- for `list[str | None]` that is a union wrap per
+  // element -- and the reader then finds a pre-wrapped union where the
+  // evidence expects a member's own lanes ("unnarrowed union cannot be used
+  // where a concrete object is required", eleven goldens).
+  //
+  // ⛔ Only when every element carried an expectation and is assignable to it.
+  // A literal whose elements do not fit keeps its synthesized type, so the
+  // mismatch is still reported against the formal by the caller.
+  if (container && expected && resultType != expected && !empty &&
+      elementExpectations.size() == valuesToPack.size()) {
+    bool allFit = true;
+    for (auto [value, wanted] : llvm::zip(valuesToPack, elementExpectations)) {
+      if (!wanted || !value.type) {
+        allFit = false;
+        break;
+      }
+      mlir::Type actual = types.widenLiteral(value.type);
+      mlir::Type formal = types.widenLiteral(wanted);
+      if (actual == formal)
+        continue;
+      if (!isAssignableWithStaticEvidence(actual, formal, module) &&
+          !declaredSubclassOfType(actual, formal, types)) {
+        allFit = false;
+        break;
+      }
+    }
+    if (allFit)
+      return coerceValue(packed, expected, expr);
+  }
+  return packed;
 }
 
 // A literal-typed symbol's value is fully determined by its type, so a
