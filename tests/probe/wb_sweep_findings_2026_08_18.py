@@ -1923,11 +1923,31 @@ them in.
 # closure over an int raises "TypeError: callable target is not available" at
 # run time -- the dispatch found no arm for the object it was given.
 #
-# ⭐ WHERE TO START: Evidence/CallableArgument.cpp builds a callable argument's
-# alternatives from `returnedCallableSummaries` -- for a call that RETURNS a
-# callable it walks the producer's captures and records a closure value TYPE per
-# capture. The types are right; what reaches the wrapper at run time is the
-# capture's VALUE where the object belongs.
+# ⭐ WHERE TO START, two places, both measured by reading the code rather than
+# by running it:
+#
+#   - Evidence/CallableArgument.cpp builds a callable argument's alternatives
+#     from `returnedCallableSummaries`: for a call that RETURNS a callable it
+#     walks the producer's captures and records a closure value TYPE per
+#     capture. The types are right; what reaches the wrapper is the capture's
+#     VALUE where the object belongs.
+#
+#   - Ops/PackAndBindingOps.cpp `appendClosureValues` pushes
+#     `captureBundle->objectValue` -- the contract and the physical values --
+#     and DROPS the capture bundle's own functionTarget, closureValues and
+#     callableAlternatives. A capture that is itself a function object arrives
+#     in the slot with no record of what it can dispatch to, which is what the
+#     indirect call inside the wrapper then has to guess.
+#
+# ⛔ THE ONE SHAPE STILL REACHABLE is the double rebinding of a def's own name:
+#
+#     base = double(base)
+#     base = add_one(base)
+#     print(base(5))     # 6
+#
+# One rebinding is correct (10), and the same two steps into DIFFERENT names are
+# refused by the closure check. So a repair can be checked against a single
+# program, and a regression in it is one line of output.
 
 # ==========================================================================
 # [GAP -> REVERTED] a closure that captures a FUNCTION      2026-08-19/20
