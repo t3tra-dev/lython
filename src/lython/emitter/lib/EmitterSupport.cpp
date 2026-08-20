@@ -426,8 +426,31 @@ isinstanceTargetTypes(const parser::Node *node, TypeSystem &types) {
   return std::nullopt;
 }
 
+// The subclass relation from the module PRE-PASS, for the two source classes
+// whose class ops the subtype walk may not have seen yet.
+//
+// ⛔ Not a replacement for `isAssignableTo`: it knows only what the source
+// wrote, so it answers nothing about manifest contracts, generics or
+// protocols. It is consulted where the alternative is `setAlwaysFalse`, which
+// is a WRONG answer rather than a missing one -- `isinstance(a, B)` inside a
+// function defined above `class B(A)` folded to False and ran the else branch,
+// printing 1 where CPython prints 2.
+bool declaredSubclassOfType(mlir::Type sub, mlir::Type super,
+                            TypeSystem &types) {
+  auto subContract = mlir::dyn_cast_if_present<py::ContractType>(sub);
+  auto superContract = mlir::dyn_cast_if_present<py::ContractType>(super);
+  if (!subContract || !superContract)
+    return false;
+  if (!isSourceDefinedContract(sub) || !isSourceDefinedContract(super))
+    return false;
+  return types.declaredSubclassOf(subContract.getContractName(),
+                                  superContract.getContractName());
+}
+
 bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
                       mlir::Operation *from) {
+  if (declaredSubclassOfType(sub, super, types))
+    return true;
   if (isAssignableWithStaticEvidence(sub, super, from))
     return true;
   // ⭐ Python's CLASS hierarchy, which is not this compiler's assignability.
@@ -540,8 +563,10 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
   }
 
   if (mlir::isa<py::ContractType>(analysis.sourceType) &&
-      isAssignableWithStaticEvidence(analysis.targetType, analysis.sourceType,
-                                     from)) {
+      (isAssignableWithStaticEvidence(analysis.targetType, analysis.sourceType,
+                                      from) ||
+       declaredSubclassOfType(analysis.targetType, analysis.sourceType,
+                              types))) {
     analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
     analysis.trueType = analysis.targetType;
     return analysis;

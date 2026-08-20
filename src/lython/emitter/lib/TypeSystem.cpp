@@ -1336,6 +1336,32 @@ void TypeSystem::ScopeIsolation::reset() {
   owner = nullptr;
 }
 
+void TypeSystem::bindDeclaredBases(llvm::StringRef name,
+                                   llvm::ArrayRef<std::string> bases) {
+  declaredBases[name].assign(bases.begin(), bases.end());
+}
+
+bool TypeSystem::declaredSubclassOf(llvm::StringRef sub,
+                                    llvm::StringRef super) const {
+  if (sub == super)
+    return true;
+  llvm::SmallVector<llvm::StringRef, 8> worklist{sub};
+  llvm::StringSet<> seen;
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.pop_back_val();
+    auto entry = declaredBases.find(current);
+    if (entry == declaredBases.end())
+      continue;
+    for (const std::string &base : entry->second) {
+      if (base == super)
+        return true;
+      if (seen.insert(base).second)
+        worklist.push_back(base);
+    }
+  }
+  return false;
+}
+
 TypeSystem::ScopeIsolation TypeSystem::isolateScopes() const {
   ScopeIsolation isolation(*this);
   isolation.savedScopes = std::move(scopes);

@@ -122,6 +122,11 @@ isinstanceTargetTypes(const parser::Node *node, TypeSystem &types);
 // a manifest contract is module-qualified.
 bool isSourceDefinedContract(mlir::Type type);
 
+// The subclass relation the module PRE-PASS recorded, for two source classes
+// whose class ops the subtype walk may not have created yet.
+bool declaredSubclassOfType(mlir::Type sub, mlir::Type super,
+                            TypeSystem &types);
+
 bool isAssignableWithStaticEvidence(mlir::Type actual, mlir::Type expected,
                                     mlir::Operation *from);
 // Does Python's class hierarchy say `sub` is a subclass of `super`? Wider than

@@ -254,6 +254,14 @@ public:
   std::optional<std::string> lookupCanonicalBinding(llvm::StringRef name) const;
   void bindClass(llvm::StringRef name, mlir::Type instanceType);
   std::optional<mlir::Type> lookupClass(llvm::StringRef name) const;
+  // The hierarchy AS WRITTEN, from the module pre-pass. Registered before any
+  // statement is emitted so a question asked above a class answers the same as
+  // one asked below it -- the class ops the subtype walk reads are created as
+  // each ClassDef is reached, which is why `isinstance(a, B)` in a function
+  // defined above `class B(A)` folded to False and ran the wrong branch.
+  void bindDeclaredBases(llvm::StringRef name,
+                         llvm::ArrayRef<std::string> bases);
+  bool declaredSubclassOf(llvm::StringRef sub, llvm::StringRef super) const;
   // Monomorphization of `class C[T]`: the py ABI has no runtime
   // representation for a type parameter, so a generic class is never a
   // contract of its own — every ground instantiation becomes a separate
@@ -426,6 +434,7 @@ private:
   std::string targetTriple;
   llvm::StringMap<mlir::Type> symbols;
   llvm::StringMap<mlir::Type> classes;
+  llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredBases;
   // Class static attributes, keyed "<class>.<attr>". The protocol table's
   // field channel models instance layout only, and a static attribute is not
   // a field: it needs its own inference channel so `C.attr` types as the

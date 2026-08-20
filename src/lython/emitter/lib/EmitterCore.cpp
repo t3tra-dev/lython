@@ -151,6 +151,10 @@ void ModuleEmitter::collectTopLevelBindings() {
         for (const parser::NodePtr &base : *baseNodes)
           if (base && base->kind == "Name")
             bases.push_back(std::string(ast::nameSpelling(*base)));
+      // The same hierarchy, where the SUBTYPE questions are asked from: the
+      // isinstance analysis reads class ops that do not exist yet for a class
+      // declared further down.
+      types.bindDeclaredBases(*name, bases);
       auto &methods = declaredClassMethods[*name];
       auto &attributes = declaredClassAttributes[*name];
       if (const auto *classBody = ast::nodeList(*statement, "body"))

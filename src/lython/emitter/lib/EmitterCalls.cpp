@@ -1257,6 +1257,33 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
           }
         }
 
+        // ⭐ A CLASS DECLARED FURTHER DOWN THE MODULE has no method table yet:
+        // its ClassDef has not been emitted, so `lookupClassMethod` finds
+        // nothing and the generic path reports "static type !py.contract<"B">
+        // does not provide manifest method 'v'" -- which is false, B declares
+        // it. Reached through a function body above the class, either by an
+        // `isinstance` guard that narrowed to it or by the dispatch synthesis.
+        // Named here rather than left to that wording, because the fix is to
+        // move the class, and nothing in the other message says so.
+        if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(receiver.type))) {
+          llvm::StringRef className = contract.getContractName();
+          auto declares = declaredClassMethods.find(className);
+          if (moduleClassNames.contains(className) &&
+              !classMethodBindings.count(className) &&
+              declares != declaredClassMethods.end() &&
+              declares->second.contains(*methodName)) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, expr.range.start,
+                "'" + className.str() + "." + std::string(*methodName) +
+                    "' is used before '" + className.str() +
+                    "' is defined; a method of a class declared later in the "
+                    "module cannot be resolved here, so move the class above "
+                    "this use"});
+            return emitNone(expr);
+          }
+        }
+
         // A source class inherits ALL of builtins.object's declared methods
         // through its protocol-table base, but only the defaults above have
         // something behind them. The rest are refused here, located and naming

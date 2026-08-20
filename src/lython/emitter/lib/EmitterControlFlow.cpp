@@ -47,17 +47,27 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
           if (sourceType != narrowed &&
               mlir::isa<py::ContractType>(sourceType) &&
               mlir::isa<py::ContractType>(narrowed) &&
-              py::isAssignableTo(narrowed, sourceType, module)) {
+              (py::isAssignableTo(narrowed, sourceType, module) ||
+               declaredSubclassOfType(narrowed, sourceType, types))) {
             auto refine = py::ClassRefineOp::create(
                 builder, loc(anchor), narrowed, found->second.value);
             found->second.value = refine.getResult();
           }
         }
+        // ⛔ `declaredSubclassOfType` beside the subtype walk for the same
+        // reason the isinstance analysis needs it: the walk reads class ops,
+        // and a class declared FURTHER DOWN the module has none yet, so the
+        // refine was skipped and the branch went on using the base type -- the
+        // narrowing silently did nothing inside a guard that had just proved
+        // the class.
       } else if (found->second.value.getType() != narrowed &&
                  mlir::isa<py::ContractType>(found->second.value.getType()) &&
                  mlir::isa<py::ContractType>(narrowed) &&
-                 py::isAssignableTo(narrowed, found->second.value.getType(),
-                                    module)) {
+                 (py::isAssignableTo(narrowed, found->second.value.getType(),
+                                     module) ||
+                  declaredSubclassOfType(narrowed,
+                                         found->second.value.getType(),
+                                         types))) {
         auto refine = py::ClassRefineOp::create(builder, loc(anchor),
                                                 narrowed, found->second.value);
         found->second.value = refine.getResult();
