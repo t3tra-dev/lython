@@ -504,7 +504,11 @@ module attributes {
                     "count", "count", "count", "startswith", "startswith",
                     "startswith", "endswith", "endswith", "endswith", "strip",
                     "strip", "replace", "replace", "hex", "fromhex", "join",
-                    "__mul__", "__hash__"],
+                    "__mul__", "__hash__", "upper", "lower", "swapcase",
+                    "capitalize", "title", "lstrip", "lstrip", "rstrip",
+                    "rstrip", "removeprefix", "removesuffix", "isalpha",
+                    "isdigit", "isalnum", "isspace", "isascii", "islower",
+                    "isupper"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -541,7 +545,25 @@ module attributes {
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bytes">>, !py.contract<"builtins.str">] -> [!py.contract<"builtins.bytes">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.protocol<"Iterable", [!py.contract<"builtins.bytes">]>] -> [!py.contract<"builtins.bytes">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.bytes">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -550,7 +572,8 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "classmethod", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance",
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
   py.class @bytearray attributes {base_names = ["MutableSequence"],
                                  ly.typing.base_args = [[!py.contract<"builtins.int">]],
@@ -5666,6 +5689,332 @@ module attributes {
 
     %result = func.call @__ly_bytes_slice(%bytes, %begin, %finish) : (memref<?xi8>, index, index) -> memref<6xi64>
     func.return %result : memref<6xi64>
+  }
+
+
+  // ASCII byte classes, shared by the case maps and the is* predicates below.
+  // Bytes are ASCII-only for these methods in CPython too: `b"\xc3\xa9".upper()`
+  // leaves the high bytes alone, which is what a byte-wise map does.
+  func.func private @__ly_bytes_byte_is_upper(%b: i64) -> i1 {
+    %lo = arith.constant 65 : i64
+    %hi = arith.constant 90 : i64
+    %ge = arith.cmpi sge, %b, %lo : i64
+    %le = arith.cmpi sle, %b, %hi : i64
+    %in = arith.andi %ge, %le : i1
+    func.return %in : i1
+  }
+
+  func.func private @__ly_bytes_byte_is_lower(%b: i64) -> i1 {
+    %lo = arith.constant 97 : i64
+    %hi = arith.constant 122 : i64
+    %ge = arith.cmpi sge, %b, %lo : i64
+    %le = arith.cmpi sle, %b, %hi : i64
+    %in = arith.andi %ge, %le : i1
+    func.return %in : i1
+  }
+
+  func.func private @__ly_bytes_byte_is_digit(%b: i64) -> i1 {
+    %lo = arith.constant 48 : i64
+    %hi = arith.constant 57 : i64
+    %ge = arith.cmpi sge, %b, %lo : i64
+    %le = arith.cmpi sle, %b, %hi : i64
+    %in = arith.andi %ge, %le : i1
+    func.return %in : i1
+  }
+
+  // Case map over the payload. %mode: 0 upper, 1 lower, 2 swapcase,
+  // 3 capitalize, 4 title. capitalize and title need the position, which is
+  // why one loop carries "the previous byte was a letter" rather than five
+  // separate walks.
+  func.func private @__ly_bytes_case_map(%bytes: memref<?xi8>, %mode: i64) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "case_map", ly.runtime.result_contract = "builtins.bytes"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %shift = arith.constant 32 : i64
+    %false_bit = arith.constant false
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    %len = arith.index_cast %dim : index to i64
+    %out = func.call @__ly_bytes_alloc(%len) : (i64) -> memref<6xi64>
+    %out_bytes = func.call @__ly_bytes_payload(%out) : (memref<6xi64>) -> memref<?xi8>
+    %final = scf.for %i = %c0 to %dim step %c1 iter_args(%prev_alpha = %false_bit) -> (i1) {
+      %raw = memref.load %bytes[%i] : memref<?xi8>
+      %b = arith.extui %raw : i8 to i64
+      %is_up = func.call @__ly_bytes_byte_is_upper(%b) : (i64) -> i1
+      %is_low = func.call @__ly_bytes_byte_is_lower(%b) : (i64) -> i1
+      %is_alpha = arith.ori %is_up, %is_low : i1
+      %arith_true = arith.constant true
+      %first = arith.cmpi eq, %i, %c0 : index
+      // Which direction this position wants: upper, lower, or leave alone.
+      %want_upper_mode0 = arith.cmpi eq, %mode, %zero : i64
+      %want_lower_mode1 = arith.cmpi eq, %mode, %one : i64
+      %is_swap = arith.cmpi eq, %mode, %two : i64
+      %is_cap = arith.cmpi eq, %mode, %three : i64
+      %is_title = arith.cmpi eq, %mode, %four : i64
+      %cap_upper = arith.andi %is_cap, %first : i1
+      %not_first = arith.xori %first, %arith_true : i1
+      %cap_lower = arith.andi %is_cap, %not_first : i1
+      %title_lower = arith.andi %is_title, %prev_alpha : i1
+      %prev_not_alpha = arith.xori %prev_alpha, %arith_true : i1
+      %title_upper = arith.andi %is_title, %prev_not_alpha : i1
+      %swap_upper = arith.andi %is_swap, %is_low : i1
+      %swap_lower = arith.andi %is_swap, %is_up : i1
+      %up_a = arith.ori %want_upper_mode0, %cap_upper : i1
+      %up_b = arith.ori %up_a, %title_upper : i1
+      %to_upper = arith.ori %up_b, %swap_upper : i1
+      %low_a = arith.ori %want_lower_mode1, %cap_lower : i1
+      %low_b = arith.ori %low_a, %title_lower : i1
+      %to_lower = arith.ori %low_b, %swap_lower : i1
+      %do_upper = arith.andi %to_upper, %is_low : i1
+      %do_lower = arith.andi %to_lower, %is_up : i1
+      %lowered = arith.addi %b, %shift : i64
+      %uppered = arith.subi %b, %shift : i64
+      %after_up = arith.select %do_upper, %uppered, %b : i64
+      %mapped = arith.select %do_lower, %lowered, %after_up : i64
+      %out_byte = arith.trunci %mapped : i64 to i8
+      memref.store %out_byte, %out_bytes[%i] : memref<?xi8>
+      scf.yield %is_alpha : i1
+    }
+    func.return %out : memref<6xi64>
+  }
+
+  // All-bytes predicate. %kind: 0 alpha, 1 digit, 2 alnum, 3 space, 4 ascii,
+  // 5 lower, 6 upper. CPython answers False on an empty bytes for every one of
+  // these except isascii, and islower/isupper additionally need at least one
+  // cased byte -- both are the "any cased seen" half of the fold.
+  func.func private @__ly_bytes_class_all(%bytes: memref<?xi8>, %kind: i64) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "class_all"} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %five = arith.constant 5 : i64
+    %six = arith.constant 6 : i64
+    %ascii_limit = arith.constant 128 : i64
+    %true_bit = arith.constant true
+    %false_bit = arith.constant false
+    %dim = memref.dim %bytes, %c0 : memref<?xi8>
+    %walk:2 = scf.for %i = %c0 to %dim step %c1 iter_args(%ok = %true_bit, %cased = %false_bit) -> (i1, i1) {
+      %raw = memref.load %bytes[%i] : memref<?xi8>
+      %b = arith.extui %raw : i8 to i64
+      %is_up = func.call @__ly_bytes_byte_is_upper(%b) : (i64) -> i1
+      %is_low = func.call @__ly_bytes_byte_is_lower(%b) : (i64) -> i1
+      %is_digit = func.call @__ly_bytes_byte_is_digit(%b) : (i64) -> i1
+      %is_space = func.call @__ly_bytes_byte_is_ascii_space(%b) : (i64) -> i1
+      %is_alpha = arith.ori %is_up, %is_low : i1
+      %is_alnum = arith.ori %is_alpha, %is_digit : i1
+      %is_ascii = arith.cmpi slt, %b, %ascii_limit : i64
+      %not_up = arith.xori %is_up, %true_bit : i1
+      %not_low = arith.xori %is_low, %true_bit : i1
+      %k0 = arith.cmpi eq, %kind, %zero : i64
+      %k1 = arith.cmpi eq, %kind, %one : i64
+      %k2 = arith.cmpi eq, %kind, %two : i64
+      %k3 = arith.cmpi eq, %kind, %three : i64
+      %k4 = arith.cmpi eq, %kind, %four : i64
+      %k5 = arith.cmpi eq, %kind, %five : i64
+      %sel0 = arith.select %k0, %is_alpha, %true_bit : i1
+      %sel1 = arith.select %k1, %is_digit, %sel0 : i1
+      %sel2 = arith.select %k2, %is_alnum, %sel1 : i1
+      %sel3 = arith.select %k3, %is_space, %sel2 : i1
+      %sel4 = arith.select %k4, %is_ascii, %sel3 : i1
+      %sel5 = arith.select %k5, %not_up, %sel4 : i1
+      %k6 = arith.cmpi eq, %kind, %six : i64
+      %this_ok = arith.select %k6, %not_low, %sel5 : i1
+      %next_ok = arith.andi %ok, %this_ok : i1
+      %next_cased = arith.ori %cased, %is_alpha : i1
+      scf.yield %next_ok, %next_cased : i1, i1
+    }
+    %empty = arith.cmpi eq, %dim, %c0 : index
+    %kind_ascii = arith.cmpi eq, %kind, %four : i64
+    %kind_lower = arith.cmpi eq, %kind, %five : i64
+    %kind_upper = arith.cmpi eq, %kind, %six : i64
+    %kind_cased = arith.ori %kind_lower, %kind_upper : i1
+    // isascii is the one that is True for an empty bytes.
+    %not_empty = arith.xori %empty, %true_bit : i1
+    %nonempty_or_ascii = arith.ori %not_empty, %kind_ascii : i1
+    %base = arith.andi %walk#0, %nonempty_or_ascii : i1
+    %cased_ok = arith.ori %walk#1, %kind_ascii : i1
+    %needs_cased = arith.select %kind_cased, %walk#1, %true_bit : i1
+    %answer = arith.andi %base, %needs_cased : i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_Upper(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "upper", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 0 : i64
+    %out = func.call @__ly_bytes_case_map(%bytes, %mode) : (memref<?xi8>, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_Lower(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "lower", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 1 : i64
+    %out = func.call @__ly_bytes_case_map(%bytes, %mode) : (memref<?xi8>, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_SwapCase(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "swapcase", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 2 : i64
+    %out = func.call @__ly_bytes_case_map(%bytes, %mode) : (memref<?xi8>, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_Capitalize(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "capitalize", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 3 : i64
+    %out = func.call @__ly_bytes_case_map(%bytes, %mode) : (memref<?xi8>, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_Title(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "title", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 4 : i64
+    %out = func.call @__ly_bytes_case_map(%bytes, %mode) : (memref<?xi8>, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_LStrip(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "lstrip", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 1 : i64
+    %false_bit = arith.constant false
+    %c0 = arith.constant 0 : index
+    %result = func.call @__ly_bytes_strip_core(%bytes, %mode, %false_bit, %bytes, %c0) : (memref<?xi8>, i64, i1, memref<?xi8>, index) -> memref<6xi64>
+    func.return %result : memref<6xi64>
+  }
+
+  func.func @LyBytes_LStripChars(%header: memref<6xi64> {ly.ownership.object_header}, %chars_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "lstrip", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %chars_bytes = func.call @__ly_bytes_payload(%chars_header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 1 : i64
+    %true_bit = arith.constant true
+    %c0 = arith.constant 0 : index
+    %dim = memref.dim %chars_bytes, %c0 : memref<?xi8>
+    %result = func.call @__ly_bytes_strip_core(%bytes, %mode, %true_bit, %chars_bytes, %dim) : (memref<?xi8>, i64, i1, memref<?xi8>, index) -> memref<6xi64>
+    func.return %result : memref<6xi64>
+  }
+
+  func.func @LyBytes_RStrip(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "rstrip", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 2 : i64
+    %false_bit = arith.constant false
+    %c0 = arith.constant 0 : index
+    %result = func.call @__ly_bytes_strip_core(%bytes, %mode, %false_bit, %bytes, %c0) : (memref<?xi8>, i64, i1, memref<?xi8>, index) -> memref<6xi64>
+    func.return %result : memref<6xi64>
+  }
+
+  func.func @LyBytes_RStripChars(%header: memref<6xi64> {ly.ownership.object_header}, %chars_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "rstrip", ly.runtime.result_contract = "builtins.bytes"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %chars_bytes = func.call @__ly_bytes_payload(%chars_header) : (memref<6xi64>) -> memref<?xi8>
+    %mode = arith.constant 2 : i64
+    %true_bit = arith.constant true
+    %c0 = arith.constant 0 : index
+    %dim = memref.dim %chars_bytes, %c0 : memref<?xi8>
+    %result = func.call @__ly_bytes_strip_core(%bytes, %mode, %true_bit, %chars_bytes, %dim) : (memref<?xi8>, i64, i1, memref<?xi8>, index) -> memref<6xi64>
+    func.return %result : memref<6xi64>
+  }
+
+  // removeprefix/removesuffix: the affix test is the existing startswith /
+  // endswith scan, and the answer is either a copy of the tail or a copy of
+  // the whole -- never the receiver itself, because bytes handles are values
+  // here and returning the argument would alias it.
+  func.func @LyBytes_RemovePrefix(%header: memref<6xi64> {ly.ownership.object_header}, %affix_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "removeprefix", ly.runtime.result_contract = "builtins.bytes"} {
+    %c0 = arith.constant 0 : index
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %affix = func.call @__ly_bytes_payload(%affix_header) : (memref<6xi64>) -> memref<?xi8>
+    %len = func.call @__ly_bytes_len_of(%bytes) : (memref<?xi8>) -> i64
+    %affix_len = func.call @__ly_bytes_len_of(%affix) : (memref<?xi8>) -> i64
+    %affix_index = arith.index_cast %affix_len : i64 to index
+    %fits = arith.cmpi sle, %affix_len, %len : i64
+    %scan = scf.if %fits -> (i1) {
+      %eq = func.call @__ly_bytes_match_at(%bytes, %c0, %affix, %affix_index) : (memref<?xi8>, index, memref<?xi8>, index) -> i1
+      scf.yield %eq : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    %kept = arith.subi %len, %affix_len : i64
+    %start = arith.select %scan, %affix_index, %c0 : index
+    %out_len = arith.select %scan, %kept, %len : i64
+    %out = func.call @LyBytes_FromBytes(%bytes, %start, %out_len) : (memref<?xi8>, index, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_RemoveSuffix(%header: memref<6xi64> {ly.ownership.object_header}, %affix_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "removesuffix", ly.runtime.result_contract = "builtins.bytes"} {
+    %c0 = arith.constant 0 : index
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %affix = func.call @__ly_bytes_payload(%affix_header) : (memref<6xi64>) -> memref<?xi8>
+    %len = func.call @__ly_bytes_len_of(%bytes) : (memref<?xi8>) -> i64
+    %affix_len = func.call @__ly_bytes_len_of(%affix) : (memref<?xi8>) -> i64
+    %zero_i64 = arith.constant 0 : i64
+    %tail_start = arith.subi %len, %affix_len : i64
+    %fits = arith.cmpi sge, %tail_start, %zero_i64 : i64
+    %affix_index = arith.index_cast %affix_len : i64 to index
+    %hit = scf.if %fits -> (i1) {
+      %tail_index = arith.index_cast %tail_start : i64 to index
+      %eq = func.call @__ly_bytes_match_at(%bytes, %tail_index, %affix, %affix_index) : (memref<?xi8>, index, memref<?xi8>, index) -> i1
+      scf.yield %eq : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    %out_len = arith.select %hit, %tail_start, %len : i64
+    %out = func.call @LyBytes_FromBytes(%bytes, %c0, %out_len) : (memref<?xi8>, index, i64) -> memref<6xi64>
+    func.return %out : memref<6xi64>
+  }
+
+  func.func @LyBytes_IsAlpha(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "isalpha"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 0 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_IsDigit(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "isdigit"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 1 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_IsAlnum(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "isalnum"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 2 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_IsSpace(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "isspace"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 3 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_IsAscii(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "isascii"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 4 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_IsLower(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "islower"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 5 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
+  }
+
+  func.func @LyBytes_IsUpper(%header: memref<6xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "isupper"} {
+    %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %kind = arith.constant 6 : i64
+    %answer = func.call @__ly_bytes_class_all(%bytes, %kind) : (memref<?xi8>, i64) -> i1
+    func.return %answer : i1
   }
 
   func.func @LyBytes_Strip(%header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "strip", ly.runtime.result_contract = "builtins.bytes"} {

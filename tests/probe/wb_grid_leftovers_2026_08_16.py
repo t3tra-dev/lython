@@ -656,6 +656,37 @@
 # in three places.
 #
 # ============================================================
+# (58) FIXED: EIGHTEEN bytes METHODS, THE ASCII HALF OF THE TABLE.
+# ============================================================
+#     print(b"hello".upper())
+#     # static type !py.contract<"builtins.bytes"> does not provide manifest
+#     # method 'upper'
+#
+# ⭐ FIXED 2026-08-20, found by asking `dir(b"")` which names this compiler
+# rejects: upper, lower, swapcase, capitalize, title, lstrip and rstrip (both
+# arities), removeprefix, removesuffix, and isalpha/isdigit/isalnum/isspace/
+# isascii/islower/isupper.
+#
+# ⛔ TWO LOOPS, NOT EIGHTEEN. The five case maps share one walk because
+# capitalize and title need the POSITION (title carries "the previous byte was
+# a letter"), and the seven predicates share another because islower/isupper
+# need "was there a cased byte at all" beside "did every byte pass". Written as
+# eighteen walks this would have been the same code eighteen times.
+#
+# ⛔ BYTES ARE BYTES: `b"\xc3\xa9abc".upper()` maps only a..z, which is what
+# CPython does too -- a bytes object has no encoding to case-fold against. The
+# golden has a high byte in it for exactly that reason.
+#
+# ⛔ The empty bytes is what separates the predicates: False for six and True
+# for isascii. Both are in the golden.
+#
+# ⛔ STILL MISSING: istitle, index, rindex, rfind, ljust, rjust, center, zfill,
+# expandtabs, partition, rpartition, rsplit, splitlines, maketrans, translate.
+# Not harder, only more.
+#
+# Pinned by tests/golden/cases/bytes_ascii_methods.py.
+#
+# ============================================================
 # (57) FIXED: max(xs, default=...) / min(xs, default=...).
 # ============================================================
 #     print(max(xs, default=0))

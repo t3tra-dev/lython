@@ -1,0 +1,18 @@
+b'HELLO WORLD' b'hello world' b'hELLO wORLD'
+b'Hello world' b'Hello World' b'Hello World'
+b'A1B2' b'\xc3\xa9ABC' b''
+b'xx  ' b'  xx' b'xx'
+b'bxaa' b'aabx' b'bx'
+b'body' b'body'
+b'abc' b'abc'
+b'a' b'a' b'abc'
+True False True False True True False
+True False True False True False True
+True False True False True False False
+False False True False True True False
+False True True False True False False
+False False False True True False False
+False False False False True False False
+False False False False False False False
+False False False False True True False
+loop 400
