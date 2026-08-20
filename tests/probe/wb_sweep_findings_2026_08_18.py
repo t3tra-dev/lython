@@ -2171,10 +2171,42 @@ them in.
 #      | a tuple/list LITERAL `(t,)` iterated in-frame      | clean  |
 #      | variadic ctor + loop over the vararg + merge       | LEAKS  |
 #
-#    ⭐ THE LEAD THE LAST TWO ROWS POINT AT: a construction emits `py.new` and
-#    `py.init` and hands the SAME posargs pack to both, so the vararg tuple has
-#    TWO consumers where a method or a function has one. Every other row has one
-#    consumer. That is where to look before anything in the ownership pass.
+#    ⭐ AND THAT LEAD LED SOMEWHERE BETTER: a construction packs its arguments
+#    TWICE -- once for `py.new`, once for `py.init` -- so the merged value gets
+#    two `sequence.literal` retains where a method or a function gives it one.
+#    Following that, the constructor and the vararg both drop out of the
+#    reproducer entirely:
+#
+#        def g(a: str, b: str) -> int:
+#            t = b
+#            if a != "":
+#                t = a + "/" + b        # t is owned on one branch only
+#            total = 0
+#            for e in (t,):             # tuple #1, iterated
+#                total += len(e)
+#            x = (t,)                   # tuple #2
+#            return total + len(x)
+#        # owned resource from @LyUnicode_Concat result 0 reaches function exit
+#        # without release
+#
+#    ⛔ THREE PROPERTIES, EACH NECESSARY, each checked by a clean neighbour:
+#      - the MERGE: the same two tuples over a plain temporary are clean;
+#      - TWO tuples: one iterated tuple is clean;
+#      - a TUPLE: the same two as LISTS are clean, and one tuple holding the
+#        value twice (`(t, t)`) is clean.
+#    At least one of the two must be iterated: two un-iterated tuples are clean.
+#
+#    ⭐ IN THE IR the merged block argument takes two `sequence.literal` retains
+#    and NOT ONE release of its own token -- `grep -c "DecRef(%10)"` is 0, and
+#    the one-tuple version has 1. So the end-of-life placement disappeared when
+#    the second retain arrived, which points at releaseOwnedGroupByLiveness /
+#    insertOwnedBlockArgumentReleases rather than at the pack.
+#
+#    ⛔ DO NOT START BY EDITING THAT PASS. Its own notes record that folding its
+#    predicates together does not converge, and the memory entry on fragile
+#    invariants lists four reverted attempts in the same file. The reproducer
+#    above is six lines and one line of output; use it to find the invariant
+#    first.
 #
 #    pathlib.Path keeps its four fixed segments because of this -- `with_name`
 #    is exactly that shape -- and the reason now sits on __init__ with the
