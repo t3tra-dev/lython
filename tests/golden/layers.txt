@@ -31,7 +31,6 @@
 # say the case must fail: they say the compiler must refuse the program, not
 # shape of that repair -- the case still exists, it just no longer stops early.
 # where it refuses it. rfc/test-suite-debt.md measured the difference to be a
-errors/annotation_forward_ref_complex emit
 errors/boxed_payload_too_wide_fields lower
 errors/class_attr_instance_shadow_write emit
 errors/class_attribute_numeric_representation emit

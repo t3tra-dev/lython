@@ -455,6 +455,11 @@ private:
   // and emission may both visit one node), so diagnostics accumulate in a
   // mutable, deduplicated buffer instead of being reported inline.
   mutable parser::Diagnostics annotationDiagnostics;
+  // Parsed string annotations, keyed by their text. The TREES are what is
+  // cached, not the types: the resolution walks the nodes, so they have to
+  // outlive the call, and a second occurrence of the same annotation then
+  // costs nothing.
+  mutable llvm::StringMap<parser::NodePtr> parsedAnnotations;
   GenericClassResolver genericClassResolver;
   struct GenericClassTemplate {
     llvm::SmallVector<std::string, 4> params;

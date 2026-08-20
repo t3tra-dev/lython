@@ -10,6 +10,7 @@
 #include "PlatformConstants.h"
 #include "PrimitiveTypes.h"
 #include "PyCallableShape.h"
+#include "Parser.h"
 #include "PyProtocols.h"
 
 #include "mlir/IR/BuiltinTypes.h"
@@ -2444,11 +2445,46 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
         if (everyMemberSimple)
           return py::UnionType::getNormalized(&context, resolved);
       }
+      // ⭐ ANYTHING ELSE IS PARSED. `"list[int]"`, `"tuple[int, str]"` and
+      // `"Callable[[int], int]"` are ordinary annotations that happen to be
+      // quoted -- a method returning its own class writes the second one, and
+      // an annotation under `from __future__ import annotations` is a string
+      // for every type there is. They resolved to `object`, and the program
+      // then failed as "static type builtins.object does not provide ...",
+      // which names neither the annotation nor the quoting.
+      //
+      // ⛔ The TREE is cached, not the type: the walk below reads the nodes,
+      // so they must outlive this call. And the diagnostics the walk files
+      // carry positions inside the annotation TEXT, which is a different file
+      // from the program -- they are re-pointed at the string itself, or a
+      // reader gets a line number from a source that does not exist.
+      auto cached = parsedAnnotations.find(name);
+      if (cached == parsedAnnotations.end()) {
+        parser::ParseResult parsed =
+            parser::parse(name, "<annotation>",
+                          parser::ParseOptions{parser::ParseMode::Expression,
+                                               /*typeComments=*/false});
+        parsedAnnotations[name] =
+            parsed.diagnostics.empty() ? parsed.tree : parser::NodePtr();
+        cached = parsedAnnotations.find(name);
+      }
+      if (cached->second) {
+        const parser::Node *body = ast::node(*cached->second, "body");
+        if (body && body->kind != "Constant") {
+          std::size_t before = annotationDiagnostics.size();
+          mlir::Type resolved = annotationType(body);
+          for (std::size_t index = before; index < annotationDiagnostics.size();
+               ++index)
+            annotationDiagnostics[index].location = node->range.start;
+          if (resolved && resolved != object())
+            return resolved;
+        }
+      }
       parser::Diagnostic diagnostic{
           parser::Severity::Error, node->range.start,
           "string annotation \"" + name.str() +
-              "\" is not a simple class name; only forward references to a "
-              "class name (optionally dotted) resolve statically"};
+              "\" does not resolve to a type; a quoted annotation is parsed "
+              "as the annotation it spells, so it must be one"};
       bool duplicate = false;
       for (const parser::Diagnostic &existing : annotationDiagnostics)
         if (existing.location.line == diagnostic.location.line &&
