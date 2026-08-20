@@ -382,6 +382,70 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
           "loop lost carried local '" + local.name + "'"});
       continue;
     }
+    // ⭐ THE LANE HAS ONE TYPE, AND THIS IS WHERE A SECOND ONE ARRIVES. A
+    // carried local's lane type is fixed at loop entry from the pre-loop
+    // binding, so a body that rebinds the name to an unrelated type has no
+    // lane to write: `a = "x"` then `for a in [1, 2]` (or `a = i` in the
+    // body) reached the runtime lowering as "cannot adapt runtime bundle
+    // builtins.int with physical values (...) to expected ABI (...)", which
+    // names MLIR types and no source name at all.
+    //
+    // ⛔ Why the question is NOT asked of `coerceValue`'s result: that
+    // function ends in an unconditional `py.class.upcast` to any contract
+    // target, so it reports the target type for a value that cannot hold it --
+    // int into a str lane came back typed str and the mismatch stayed
+    // invisible until the runtime lowering. It is a retyping, not a check.
+    //
+    // ⛔ Only when BOTH types are manifest contracts. A source-defined class
+    // reaches its manifest base through `base_names` spelled as the SOURCE
+    // writes them (`class Err(Exception)` declares "Exception", not
+    // "builtins.BaseException"), and neither `isAssignableTo` overload bridges
+    // that gap -- asking it refused
+    // tests/golden/cases/exception_loop_carried_rebuild.py, where seven loops
+    // rebind a `cur: BaseException` to a subclass. So a lane whose type or
+    // whose assignment is source-defined keeps falling through to the runtime
+    // lowering's message. That is a gap in this diagnostic, not a claim about
+    // those programs.
+    //
+    // ⛔ Why REFUSE and not widen the lane to the union: the zero-iteration
+    // path leaves the pre-loop value bound, so the after-loop read is
+    // genuinely either type, and the erased `object` lane that would hold
+    // both fails one layer further down anyway -- the module-global spelling
+    // of this same program reaches "to expected ABI (memref<16xi64>, ...)"
+    // through exactly that widening.
+    mlir::Type assignedType = types.widenLiteral(found->second.type);
+    bool bothManifest =
+        mlir::isa_and_nonnull<py::ContractType>(assignedType) &&
+        mlir::isa_and_nonnull<py::ContractType>(local.type) &&
+        !isSourceDefinedContract(assignedType) &&
+        !isSourceDefinedContract(local.type);
+    if (bothManifest && assignedType != local.type &&
+        !py::isAssignableTo(assignedType, local.type, module) &&
+        !py::isAssignableTo(found->second.type, local.type, module)) {
+      std::string carriedText;
+      std::string assignedText;
+      {
+        llvm::raw_string_ostream carriedStream(carriedText);
+        carriedStream << local.type;
+        llvm::raw_string_ostream assignedStream(assignedText);
+        assignedStream << found->second.type;
+      }
+      std::string message =
+          "loop-carried local '" + local.name + "' is bound to " + carriedText +
+          " before the loop and to " + assignedText +
+          " inside it; a name carried across a loop edge keeps one type, "
+          "because a loop that runs zero times leaves the earlier binding "
+          "in place; bind the loop's value to a different name";
+      bool alreadyReported =
+          llvm::any_of(diagnostics, [&](const parser::Diagnostic &existing) {
+            return existing.message == message;
+          });
+      if (!alreadyReported)
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, anchor.range.start, message});
+      operands.push_back(found->second.value);
+      continue;
+    }
     mlir::Value value = coerceValue(found->second, local.type, anchor).value;
     // Release the current-iteration header value when the body replaced it, so
     // the loop-carried ownership token stays balanced on every edge that

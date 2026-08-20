@@ -510,6 +510,67 @@ TEST(EmitterTest, AFrozenDataclassFillsItsFieldsInItsOwnConstructor) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
+// A loop-carried name has ONE lane type. Rebinding it to an unrelated one used
+// to reach the runtime lowering as "cannot adapt runtime bundle builtins.int
+// with physical values (...) to expected ABI (...)", which names MLIR types and
+// no source name; the refusal now happens at the loop and names the local.
+TEST(EmitterTest, ALoopCarriedLocalRebornWithAnotherTypeIsRefusedAtTheLoop) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("def f() -> int:\n"
+                 "    a = \"x\"\n"
+                 "    t = 0\n"
+                 "    for a in [1, 2]:\n"
+                 "        t = t + a\n"
+                 "    return t\n"
+                 "print(f())\n",
+                 context);
+  EXPECT_FALSE(emitted.ok());
+  bool found = false;
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    found = found || diagnostic.message.find("loop-carried local 'a'") !=
+                         std::string::npos;
+  EXPECT_TRUE(found);
+}
+
+// The body assignment spelling of the same lane, so the check is not read as
+// being about loop TARGETS.
+TEST(EmitterTest, ALoopBodyCannotRetypeACarriedLocal) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("def f() -> int:\n"
+                 "    a = \"x\"\n"
+                 "    for i in [1, 2]:\n"
+                 "        a = i\n"
+                 "    return 0\n"
+                 "print(f())\n",
+                 context);
+  EXPECT_FALSE(emitted.ok());
+  bool found = false;
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    found = found || diagnostic.message.find("loop-carried local 'a'") !=
+                         std::string::npos;
+  EXPECT_TRUE(found);
+}
+
+// The negative control: widening a carried lane is not a retype. `n` is bound
+// to a literal before the loop and to its widened contract inside it, and the
+// numeric tower lets an int reach a float lane.
+TEST(EmitterTest, ACarriedLaneStillTakesAWidenedValue) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("def f() -> float:\n"
+                 "    total = 0.0\n"
+                 "    n = 0\n"
+                 "    for i in [1, 2]:\n"
+                 "        n = i\n"
+                 "        total = total + i\n"
+                 "    return total + n\n"
+                 "print(f())\n",
+                 context);
+  EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
