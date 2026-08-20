@@ -820,9 +820,14 @@ them in.
 # `path`. There is no source-level diagnostic: the compil
 
 # ==========================================================================
-# [CRASH] stdlib
+# [CRASH] stdlib                                             FIXED 2026-08-21
 # itertools.accumulate with the builtin max/min as the binary function
 # explodes the ownership CFG explorer (20000-state abort)
+#
+# FIXED as part of the nested-loop entry at the end of this file: the
+# combinator's result is the element of the OUTER loop and it is parked inside
+# an inner cycle, which is the same shape. `accumulate([3, 1], max)` now prints
+# 3 and agrees.
 #
 #     --- program
 #     import itertools
@@ -2711,3 +2716,48 @@ them in.
 #    `sum(count(n-1))`) hits the neighbouring wall: "a generator returned out of
 #    a function cannot be resumed".
 
+
+
+# ==========================================================================
+# [GAP] every nested loop that appends the outer element   FIXED 2026-08-21
+#
+#     out: list[int] = []
+#     for i in range(2):
+#         for j in range(2):
+#             out.append(i)
+#
+# lyc: "ownership CFG exploration exceeded 20000 states (last: retained=1817
+# parked=0 borrowed=0 prev=0 stale=0 group=1 token=1)", pointing at the OUTER
+# `range(2)` -- i.e. at `LyRangeIterator_Next`, whose result #0 is `i`.
+# py : [0, 0, 1, 1]
+#
+# axes, all measured on the same day:
+#   out.append(5)   -> compiles. No loop resource is retained.
+#   out.append(j)   -> compiles. The innermost element is produced inside the
+#                      cycle that retains it, so one path sees one retain.
+#   out.append(i)   -> aborts. The element is produced OUTSIDE the cycle that
+#                      retains it.
+#   three deep, appending the innermost -> compiles; appending an outer one
+#                      aborts. So it is the nesting relation, not the depth.
+#   comprehension with two `for` clauses -> the same abort, because it lowers
+#                      to the same nest; `[i for i in xs for j in ys]`,
+#                      `{...}` dict comprehensions and generator expressions
+#                      all reached it.
+#   body `print(i)`  -> compiles. The value must be STORED.
+#
+# Root cause: `slotRetainParent` could not name the holder (the append retain
+# carries `ly.ownership.aggregate_retain` but no `ly.ownership.aggregate_parent`
+# when the list is a module global), so the charge fell through to
+# `state.retained` -- which is part of the visited key. Going round the inner
+# cycle produced retained=1, 2, 3, ... and the fixpoint never closed.
+#
+# Fixed by charging such a retain once per PATH (`parkedOps`), the same way
+# `slotParents` dedupes by holder and `borrowedRetains` by op. Pinned by
+# tests/golden/cases/a_nested_loop_appends_the_outer_element.py, RED on the
+# pre-fix binary and ASan-clean and leak-free after.
+#
+# ⛔ What this does NOT fix: the missing `aggregate_parent` on an append into a
+# module-global list. With the link present the retain would be charged to the
+# holder and discharged by the holder's release, which is strictly more precise
+# than charging it once and subtracting it at the return. The dedup is what
+# makes the walk converge; the link is what would make it exact.
