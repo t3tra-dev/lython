@@ -2159,12 +2159,26 @@ them in.
 #        # owned resource from @LyUnicode_Concat result 0 reaches function exit
 #        # without release
 #
-#    ⛔ NOT the merge and NOT varargs on their own: the same call to a
-#    NON-variadic __init__ is fine, and the same merge into a variadic FUNCTION
-#    is fine. It is the vararg pack at a CONSTRUCTOR. pathlib.Path keeps its
-#    four fixed segments because of it -- `with_name` is exactly that shape --
-#    and the reason now sits on __init__ with the reproducer instead of the
-#    stale one about imported modules.
+#    ⛔ NARROWED 2026-08-21 to THREE conditions that must all hold. Each row is
+#    a program that runs clean, so the difference is one property at a time:
+#
+#      | program                                            | result |
+#      | variadic ctor, loop, temporary argument (no merge) | clean  |
+#      | variadic ctor, merge, NO loop over the vararg      | clean  |
+#      | variadic METHOD, loop, merge                       | clean  |
+#      | variadic FUNCTION, loop, merge                     | clean  |
+#      | non-variadic ctor over `[t]`, loop, merge          | clean  |
+#      | a tuple/list LITERAL `(t,)` iterated in-frame      | clean  |
+#      | variadic ctor + loop over the vararg + merge       | LEAKS  |
+#
+#    ⭐ THE LEAD THE LAST TWO ROWS POINT AT: a construction emits `py.new` and
+#    `py.init` and hands the SAME posargs pack to both, so the vararg tuple has
+#    TWO consumers where a method or a function has one. Every other row has one
+#    consumer. That is where to look before anything in the ownership pass.
+#
+#    pathlib.Path keeps its four fixed segments because of this -- `with_name`
+#    is exactly that shape -- and the reason now sits on __init__ with the
+#    reproducer instead of the stale one about imported modules.
 
 # ==========================================================================
 # [BUG] pathlib.parts was a list                       FOUND + FIXED 2026-08-20
