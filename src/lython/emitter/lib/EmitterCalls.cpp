@@ -3689,6 +3689,120 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
       return py::PackOp::create(builder, loc(expr), type, members).getResult();
     };
     mlir::Value placeholder = placeholderFor(elementType);
+    // ⭐ A NON-PRIMITIVE ELEMENT IS FOLDED BY INDEX, NOT BY ACCUMULATOR.
+    // `max(rows, key=lambda r: r.score)` over a list of INSTANCES -- what
+    // every "pick the best record" line looks like -- was refused, because the
+    // accumulator needs a value of the element type before the first trip and
+    // `placeholderFor` can only fabricate one for int/str/float/bool and
+    // tuples of those. `sorted(rows, key=...)` beside it has always worked.
+    //
+    // Carrying the best ELEMENT instead was built first and does not work: the
+    // frame then owns the element twice, once from the seed read and once from
+    // the loop's reassignment ("ly.ownership.owned_local_object marks a value
+    // this frame already owns"). So nothing but INTS crosses the loop edge --
+    // the best index and the best key -- and the element is read once, after
+    // the loop:
+    //
+    //     __src = <arg>
+    //     if len(__src) == 0: raise ValueError("max() iterable argument is empty")
+    //     __bi = 0
+    //     __bk = key(__src[0])
+    //     for __i in range(1, len(__src)):
+    //         __ck = key(__src[__i])
+    //         if __ck > __bk:          # Lt for min
+    //             __bi = __i
+    //             __bk = __ck
+    //     __src[__bi]
+    //
+    // Strict `>` keeps CPython's tie rule: the FIRST maximal element wins.
+    //
+    // ⛔ With a KEY only. Without one the carried value would be the element
+    // itself again, and comparing two instances needs the class's own ordering
+    // -- a different question, and one CPython answers with TypeError when the
+    // class has none.
+    // ⛔ And an INDEXABLE argument only: a generator has no first element to
+    // read without consuming it.
+    // ⛔ An EMPTY literal is left to the branch below, which raises the
+    // ValueError directly: this path would emit `key(__src[0])` against an
+    // element type that does not exist, and `max([], key=len)` came back as
+    // "builtins.object does not provide manifest method '__len__'".
+    bool emptyLiteralArgument =
+        (reducerArgs->front()->kind == "List" ||
+         reducerArgs->front()->kind == "Tuple") &&
+        [&] {
+          const auto *elts = ast::nodeList(*reducerArgs->front(), "elts");
+          return !elts || elts->empty();
+        }();
+    if (!placeholder && !reducerDefaultValue && reducerKeyNode && elementType &&
+        elementType != types.object() && !emptyLiteralArgument) {
+      mlir::Type argType =
+          types.widenLiteral(types.inferExpr(reducerArgs->front().get()));
+      auto argContract = mlir::dyn_cast_if_present<py::ContractType>(argType);
+      llvm::StringRef argName =
+          argContract ? argContract.getContractName() : llvm::StringRef();
+      // ⛔ A LIST, not a tuple. Reading `t[0]` and then `t[i]` out of a tuple
+      // the frame owns is refused as a second retain of one entity ("a re-read
+      // of an entity the frame owns is a borrow: reuse the existing token"),
+      // which is a rule about tuple elements and not about this fold. A tuple
+      // argument keeps the seed refusal.
+      if (argName == "builtins.list") {
+        ++listCompCounter;
+        std::string counter = std::to_string(listCompCounter);
+        std::string src = "__" + reducer.str() + "src" + counter;
+        std::string bestIndex = "__" + reducer.str() + "bi" + counter;
+        std::string bestKey = "__" + reducer.str() + "bk" + counter;
+        std::string index = "__" + reducer.str() + "i" + counter;
+        std::string currentKey = "__" + reducer.str() + "ck" + counter;
+        auto nameOf = [&](const std::string &id) {
+          return synth::name(id, expr.range);
+        };
+        auto elementAt = [&](parser::NodePtr position) {
+          return synth::subscript(nameOf(src), std::move(position), expr.range);
+        };
+        auto keyOf = [&](parser::NodePtr element) {
+          return synth::call(reducerKeyValue,
+                             std::vector<parser::NodePtr>{std::move(element)},
+                             expr.range);
+        };
+        emitStatement(
+            *synth::assign(nameOf(src), reducerArgs->front(), expr.range));
+        emitStatement(*synth::ifStmt(
+            synth::compare(synth::lenCall(nameOf(src), expr.range), "Eq",
+                           synth::intConstant(0, expr.range), expr.range),
+            {synth::raiseCall("ValueError",
+                              reducer.str() + "() iterable argument is empty",
+                              expr.range)},
+            {}, expr.range));
+        emitStatement(*synth::assign(
+            nameOf(bestIndex), synth::intConstant(0, expr.range), expr.range));
+        emitStatement(*synth::assign(
+            nameOf(bestKey), keyOf(elementAt(synth::intConstant(0, expr.range))),
+            expr.range));
+        std::vector<parser::NodePtr> better{
+            synth::assign(nameOf(bestIndex), nameOf(index), expr.range),
+            synth::assign(nameOf(bestKey), nameOf(currentKey), expr.range)};
+        std::vector<parser::NodePtr> body{
+            synth::assign(nameOf(currentKey), keyOf(elementAt(nameOf(index))),
+                          expr.range),
+            synth::ifStmt(synth::compare(nameOf(currentKey),
+                                         reducer == "max" ? "Gt" : "Lt",
+                                         nameOf(bestKey), expr.range),
+                          std::move(better), {}, expr.range)};
+        parser::NodePtr span = synth::call(
+            nameOf("range"),
+            std::vector<parser::NodePtr>{
+                synth::intConstant(1, expr.range),
+                synth::lenCall(nameOf(src), expr.range)},
+            expr.range);
+        emitStatement(*synth::forStmt(nameOf(index), std::move(span),
+                                      std::move(body), {}, expr.range));
+        Value result = emitExpr(elementAt(nameOf(bestIndex)).get());
+        for (const std::string &name :
+             {src, bestIndex, bestKey, index, currentKey})
+          values.erase(name);
+        return result;
+      }
+    }
     // The key accumulator needs its own placeholder, on the same terms.
     mlir::Value keyPlaceholder;
     if (placeholder && reducerKeyNode) {
@@ -3741,7 +3855,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
         return emitNone(expr);
       }
     }
-    if (!placeholder) {
+    if (!placeholder && !reducerDefaultValue) {
       // max()/min() over an EMPTY literal always raises: emit the
       // ValueError directly (there is no element type to desugar with).
       const parser::Node *arg = reducerArgs->front().get();
@@ -3773,7 +3887,8 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
           parser::Severity::Error, expr.range.start,
           reducer.str() +
               "() needs an element type the fold can seed (int, str, float, "
-              "bool, or a tuple of those)"});
+              "bool, or a tuple of those), or an indexable argument to take "
+              "the first element from"});
       return emitNone(expr);
     }
     std::string tmp =
