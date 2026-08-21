@@ -1,6 +1,8 @@
 #include "runtime/Detail.h"
 #include "runtime/Verification.h"
 
+#include "Common/Instrumentation.h"
+
 #include "Ownership.h"
 #include "runtime/ThreadSafeModel.h"
 
@@ -10,6 +12,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -279,9 +282,58 @@ mlir::LogicalResult verifySchedulerHappensBeforeContracts(
 }
 
 mlir::LogicalResult verifyFuturePayloadStateOrdering(mlir::ModuleOp module) {
+  // ⭐ ONLY THE FUNCTIONS THAT CAN REACH A PAYLOAD ROLE, and finding them
+  // first is what makes this affordable. The check below is a no-op for a
+  // function whose timeline holds no future PAYLOAD role -- and building that
+  // timeline walks the function's body plus the bodies of everything it calls
+  // four levels deep, re-walking the same callees once per caller. Over a
+  // module with the stdlib linked in (thousands of functions) it was 3.32 s of
+  // the 3.32 s this verifier spent on
+  // tests/golden/cases/w3_cross_json_ordereddict.py -- half of that program's
+  // whole lowering time, and it is charged to EVERY program because the
+  // asyncio manifest is always linked.
+  //
+  // A timeline entry is the value of an `ly.ownership.atomic_role` attribute
+  // on an op in this module, and `appendFunctionRoleTimeline` follows at most
+  // four call edges. So a function's timeline can hold a payload role only if
+  // it reaches, in four edges or fewer, a function that carries one -- which
+  // is a BFS over the reverse call graph from the ops that do. Exact, not a
+  // heuristic: same set of functions, same diagnostics, in module order.
+  llvm::SmallPtrSet<mlir::Operation *, 8> reaching;
+  module.walk([&](mlir::Operation *op) {
+    auto role = op->getAttrOfType<mlir::StringAttr>(own::kAtomicRoleAttr);
+    if (!role || !isFuturePayloadRole(role.getValue()))
+      return;
+    if (auto owner = op->getParentOfType<mlir::func::FuncOp>())
+      reaching.insert(owner.getOperation());
+  });
+  if (reaching.empty())
+    return mlir::success();
+
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *, 2>>
+      callersOf;
+  module.walk([&](mlir::func::CallOp call) {
+    auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+    auto caller = call->getParentOfType<mlir::func::FuncOp>();
+    if (callee && caller)
+      callersOf[callee.getOperation()].push_back(caller.getOperation());
+  });
+  llvm::SmallVector<mlir::Operation *, 8> frontier(reaching.begin(),
+                                                   reaching.end());
+  for (unsigned hop = 0; hop < 4 && !frontier.empty(); ++hop) {
+    llvm::SmallVector<mlir::Operation *, 8> next;
+    for (mlir::Operation *callee : frontier)
+      for (mlir::Operation *caller : callersOf.lookup(callee))
+        if (reaching.insert(caller).second)
+          next.push_back(caller);
+    frontier = std::move(next);
+  }
+
   VerificationResult verified;
   module.walk([&](mlir::func::FuncOp function) {
     if (verified.failed())
+      return;
+    if (!reaching.contains(function.getOperation()))
       return;
     llvm::SmallVector<std::string, 32> timeline;
     llvm::SmallPtrSet<mlir::Operation *, 8> activeFunctions;
@@ -555,12 +607,22 @@ verifyPreservedLoweredSafetyContracts(mlir::ModuleOp module) {
 }
 
 mlir::LogicalResult verifyThreadSafeContracts(mlir::ModuleOp module) {
-  if (mlir::failed(walkVerifyOperations(module, verifyAtomicContract)))
-    return mlir::failure();
-  if (mlir::failed(verifySchedulerHappensBeforeContracts(module)))
-    return mlir::failure();
-  if (mlir::failed(verifyFuturePayloadStateOrdering(module)))
-    return mlir::failure();
+  {
+    py::PerfScope perf("thread-safety.atomic-contracts");
+    if (mlir::failed(walkVerifyOperations(module, verifyAtomicContract)))
+      return mlir::failure();
+  }
+  {
+    py::PerfScope perf("thread-safety.happens-before");
+    if (mlir::failed(verifySchedulerHappensBeforeContracts(module)))
+      return mlir::failure();
+  }
+  {
+    py::PerfScope perf("thread-safety.future-payload-ordering");
+    if (mlir::failed(verifyFuturePayloadStateOrdering(module)))
+      return mlir::failure();
+  }
+  py::PerfScope perf("thread-safety.preserved-contracts");
   return verifyPreservedLoweredSafetyContracts(module);
 }
 
