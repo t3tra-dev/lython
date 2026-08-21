@@ -98,7 +98,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
     -dict=fuzz/dictionaries/python.dict fuzz/corpora/fuzz_pipeline tests/golden/cases
 ```
 
-`ctest --test-dir build-fuzz` はチェックイン済みコーパス + golden cases の無変異リプレイ (regression)。テストは harness ごとに `corpus` (チェックイン済みコーパス、crash regression) と `goldens.1..4` (golden の `.py` を 4 分割) に分かれる — 1 プロセスで全部replay すると ASan 下で 13 分 (CI ではその 2.5 倍) かかり、golden が増えるほど伸びるため。`-j` で並列に走らせること。発見した crash 入力は診断化して修正後、該当 `fuzz/corpora/<harness>/` に追加する。
+`ctest --test-dir build-fuzz` はチェックイン済みコーパス + golden cases の無変異リプレイ (regression)。テストは harness ごとに `corpus` (チェックイン済みコーパス、crash regression) と `goldens.1..4` (golden の `.py` を 4 分割) に分かれる — 1 プロセスで全部 replay すると ASan 下で 13 分 (CI ではその 2.5 倍) かかり、golden が増えるほど伸びるため。`-j` で並列に走らせること。発見した crash 入力は診断化して修正後、該当 `fuzz/corpora/<harness>/` に追加する。
 
 ### デバッグ用環境変数
 
