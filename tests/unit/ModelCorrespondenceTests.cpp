@@ -190,7 +190,13 @@ TEST(ModelCorrespondenceTest, TheOwnedLocalMarkerHasOneMintSite) {
     llvm::StringRef path = entry->path();
     if (!path.ends_with(".cpp") && !path.ends_with(".h"))
       continue;
-    for (llvm::StringRef line : linesOf(readOrDie(path.str()))) {
+    // ⛔ The file's text is a NAMED local. `linesOf` returns views into its
+    // argument, and a temporary in a range-for's initializer dies before the
+    // first iteration in C++17 (P2718R0 only fixed that in C++23) -- so this
+    // walked freed memory. It read the right bytes on macOS and SEGFAULTed on
+    // the Linux CI, which is the whole difference between the two allocators.
+    std::string source = readOrDie(path.str());
+    for (llvm::StringRef line : linesOf(source)) {
       if (!line.contains("setAttr("))
         continue;
       if (!line.contains("kOwnedLocalObjectAttr") &&
