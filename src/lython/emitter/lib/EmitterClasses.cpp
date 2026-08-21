@@ -17,6 +17,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/SaveAndRestore.h"
 
+#include <iterator>
 #include <optional>
 #include <utility>
 

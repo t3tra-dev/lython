@@ -4,6 +4,9 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
+#include <cstddef>
+#include <iterator>
+
 namespace py::lowering {
 namespace {
 

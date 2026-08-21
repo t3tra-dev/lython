@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include <cstddef>
+
 namespace py::lowering {
 
 mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(

@@ -18,10 +18,13 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <utility>
 
 namespace py::lowering::arch::arm {
 namespace {

@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>

@@ -22,6 +22,8 @@
 
 #include "PyDialect.h.inc"
 
+#include <system_error>
+
 int main(int argc, char **argv) {
   llvm::InitLLVM init(argc, argv);
 

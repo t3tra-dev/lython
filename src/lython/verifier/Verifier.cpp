@@ -19,6 +19,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <optional>
+#include <string>
 
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"

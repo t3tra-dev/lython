@@ -5,6 +5,7 @@
 
 #include "../pegen.h"
 
+#include <cstddef>
 #include <deque>
 #include <string>
 #include <string_view>

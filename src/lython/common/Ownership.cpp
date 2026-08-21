@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <optional>
 
 namespace py::ownership {

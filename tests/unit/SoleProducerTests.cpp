@@ -27,6 +27,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <string>
+#include <system_error>
 
 namespace {
 

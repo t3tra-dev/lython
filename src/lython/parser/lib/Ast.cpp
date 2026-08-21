@@ -2,6 +2,7 @@
 #include "CpythonSpec.h"
 
 #include <optional>
+#include <ostream>
 #include <sstream>
 #include <type_traits>
 

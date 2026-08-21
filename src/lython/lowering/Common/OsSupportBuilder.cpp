@@ -8,6 +8,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <cmath>
+#include <utility>
+
 // Host boundary of the OS/time cluster: the calls behind modules/posix.mlir
 // and modules/time.mlir. They live here rather than in those manifests
 // because the manifests are embedded as target-INDEPENDENT bytecode while

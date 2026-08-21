@@ -14,6 +14,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstddef>
+
 namespace lython::emitter {
 
 void ModuleEmitter::emitMatch(const parser::Node &statement) {

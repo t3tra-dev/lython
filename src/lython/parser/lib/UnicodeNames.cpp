@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace lython::parser {

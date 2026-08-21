@@ -5,6 +5,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <cstddef>
 #include <string>
 
 namespace py::contracts {

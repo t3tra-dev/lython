@@ -2,6 +2,8 @@
 
 #include "Runtime/ABI/BoxLayout.h"
 
+#include <cstddef>
+
 namespace py::lowering {
 
 namespace {

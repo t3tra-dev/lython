@@ -4,6 +4,8 @@
 #include "Runtime/ABI/CollectionPayload.h"
 #include "Runtime/ABI/ContainerLayout.h"
 
+#include <cstddef>
+
 namespace py::lowering {
 namespace {
 

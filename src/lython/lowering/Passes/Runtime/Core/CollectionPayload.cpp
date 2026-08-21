@@ -5,6 +5,7 @@
 #include "llvm/Support/Process.h"
 
 #include <algorithm>
+#include <iterator>
 
 namespace py::lowering {
 namespace {

@@ -15,6 +15,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
 
+#include <cstddef>
 #include <string>
 
 namespace lython::emitter {

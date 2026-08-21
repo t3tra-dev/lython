@@ -2,6 +2,8 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSwitch.h"
 
+#include <algorithm>
+
 namespace py::lowering::ctypes {
 
 std::optional<TargetPlatformFacts> targetPlatformFacts(mlir::ModuleOp module) {

@@ -23,6 +23,7 @@
 
 #include <complex>
 #include <functional>
+#include <iterator>
 #include <optional>
 #include <string>
 

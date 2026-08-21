@@ -15,9 +15,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Path.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace py {
 namespace {

@@ -15,6 +15,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstddef>
+
 namespace lython::emitter {
 
 // The one place a proved fact becomes a narrower SSA value. `if`, the

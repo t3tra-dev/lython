@@ -37,6 +37,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
+#include <utility>
 
 using namespace mlir;
 

@@ -8,6 +8,8 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <cstddef>
+
 namespace lython::emitter {
 
 void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {

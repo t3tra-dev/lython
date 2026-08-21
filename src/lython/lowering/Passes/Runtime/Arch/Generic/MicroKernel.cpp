@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <cstddef>
 #include <optional>
 
 namespace py::lowering::arch::generic {

@@ -2,6 +2,8 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <utility>
+
 namespace py::lowering {
 
 namespace {

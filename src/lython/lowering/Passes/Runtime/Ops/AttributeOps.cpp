@@ -6,6 +6,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 
+#include <cstddef>
+
 namespace py::lowering {
 
 namespace {

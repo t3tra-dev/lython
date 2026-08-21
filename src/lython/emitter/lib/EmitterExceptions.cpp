@@ -16,6 +16,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstddef>
 #include <cstdlib>
 
 namespace lython::emitter {

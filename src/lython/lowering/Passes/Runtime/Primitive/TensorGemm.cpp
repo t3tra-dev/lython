@@ -17,6 +17,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>

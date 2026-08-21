@@ -3,13 +3,16 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
 #include <fstream>
 #include <iterator>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #ifndef LYTHON_CPYTHON_314_PARSER_ROOT
 #define LYTHON_CPYTHON_314_PARSER_ROOT ""

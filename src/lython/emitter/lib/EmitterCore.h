@@ -9,6 +9,9 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstddef>
+#include <map>
+
 namespace lython::emitter {
 
 class ModuleEmitter {

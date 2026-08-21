@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>

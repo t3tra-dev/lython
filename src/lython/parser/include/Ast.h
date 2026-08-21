@@ -1,10 +1,13 @@
 #pragma once
 
 #include <complex>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 

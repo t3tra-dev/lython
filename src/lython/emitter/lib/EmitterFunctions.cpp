@@ -14,6 +14,8 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/SaveAndRestore.h"
 
+#include <cstddef>
+
 namespace lython::emitter {
 namespace {
 

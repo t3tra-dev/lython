@@ -62,6 +62,8 @@
 
 #include "PyDialect.h.inc"
 
+#include <system_error>
+
 namespace {
 
 mlir::LogicalResult stampTargetFacts(mlir::ModuleOp module,

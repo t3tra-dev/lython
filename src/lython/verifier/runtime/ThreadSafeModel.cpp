@@ -9,6 +9,7 @@
 #include "llvm/ADT/StringSwitch.h"
 
 #include <optional>
+#include <utility>
 
 namespace py::threadsafe {
 namespace {

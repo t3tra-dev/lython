@@ -9,6 +9,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>

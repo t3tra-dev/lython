@@ -5,7 +5,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 
+#include <algorithm>
 #include <cctype>
+#include <iterator>
 
 // Loop-body generators: transform an int-pure generator body into a
 // primitive-i64 RESUME state machine (pure SSA — no in-body memory):

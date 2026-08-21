@@ -12,6 +12,7 @@
 
 #include <map>
 
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <vector>

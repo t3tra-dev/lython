@@ -31,7 +31,9 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cctype>
+#include <cstddef>
 #include <string>
+#include <system_error>
 
 namespace {
 

@@ -8,6 +8,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 
+#include <cstddef>
+
 namespace lython::emitter {
 namespace {
 

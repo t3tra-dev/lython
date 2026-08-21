@@ -3,6 +3,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include <algorithm>
+
 namespace py::lowering::ctypes {
 
 std::string targetFactsLabel(const std::optional<TargetPlatformFacts> &facts) {

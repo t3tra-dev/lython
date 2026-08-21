@@ -13,6 +13,8 @@
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <cmath>
+#include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
