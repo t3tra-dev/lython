@@ -142,7 +142,10 @@ llvm::cl::opt<llvm::CodeGenOptLevel> JitCodeGenOptOption(
     "jit-codegen-opt",
     llvm::cl::desc("Instruction selection quality for JIT execution. The "
                    "default favors first-output latency; kernels dominated by "
-                   "compute want 'aggressive' (matches AOT code quality)"),
+                   "compute want 'less' or better. Measured on examples/: "
+                   "'less' costs ~180 ms of jit-build and roughly halves "
+                   "execution, so it pays from ~360 ms of execution upward "
+                   "(tarai 1.60 s -> 1.11 s total; hello 0.18 s -> 0.35 s)"),
     llvm::cl::values(
         clEnumValN(llvm::CodeGenOptLevel::None, "none",
                    "Fastest compilation, unoptimized code (default)"),
@@ -154,6 +157,31 @@ llvm::cl::opt<llvm::CodeGenOptLevel> JitCodeGenOptOption(
                    "Full codegen optimization, like AOT")),
     llvm::cl::init(llvm::CodeGenOptLevel::None),
     llvm::cl::cat(LythonCategory));
+
+// The IR pipeline is a separate knob from instruction selection, and it used
+// to have no knob at all: the JIT ran O0 unconditionally while AOT ran O2, so
+// `-jit-codegen-opt=aggressive` could not close the gap on its own.
+llvm::cl::opt<unsigned> JitOptOption(
+    "jit-opt",
+    llvm::cl::desc("LLVM IR optimization level for JIT execution (0-3). The "
+                   "default favors first-output latency; 2 is what AOT uses "
+                   "and reaches AOT execution speed, at ~250 ms more "
+                   "jit-build than 0 -- worth it only for a program that runs "
+                   "for seconds"),
+    llvm::cl::init(0), llvm::cl::cat(LythonCategory));
+
+llvm::OptimizationLevel jitOptimizationLevel() {
+  switch (JitOptOption) {
+  case 0:
+    return llvm::OptimizationLevel::O0;
+  case 1:
+    return llvm::OptimizationLevel::O1;
+  case 2:
+    return llvm::OptimizationLevel::O2;
+  default:
+    return llvm::OptimizationLevel::O3;
+  }
+}
 
 LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
                                bool includeAttributes, bool interactiveMode,
@@ -626,8 +654,7 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       PerfScope perf("jit-build.llvm-opt");
       if (failed(finalizeLoweredLLVMModule(*llvmModule, safetyProfile,
                                            optimizationTargetMachine.get(),
-                                           llvm::OptimizationLevel::O0,
-                                           &irDump)))
+                                           jitOptimizationLevel(), &irDump)))
         return failure();
     }
 

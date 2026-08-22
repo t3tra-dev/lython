@@ -30,7 +30,7 @@ cmake --build build -j$(nproc)
 uv run pyright
 ```
 
-主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質。デフォルト none は初回出力レイテンシ優先、計算律速なら aggressive で AOT 相当)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)。
+主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質) と `-jit-opt=0..3` (JIT の LLVM IR 最適化レベル。AOT は常に O2)。どちらも既定は初回出力レイテンシ優先の最低値。実測の分岐点: `-jit-codegen-opt=less` は jit-build を約 180 ms 増やして実行を約半分にするので、実行が 360 ms を超えるプログラムから得になる (`examples/tarai.py` は合計 1.60 s → 1.11 s、`examples/hello.py` は 0.18 s → 0.35 s)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)。
 
 ### テスト
 
