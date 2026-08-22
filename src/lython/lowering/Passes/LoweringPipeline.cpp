@@ -269,6 +269,23 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "refcount-elision", module);
 
+  // ⭐ THE BODIES NOBODY CAN REACH ARE EMPTIED, NOT REMOVED. The merged
+  // manifest brings ~1500 functions into a module whose program uses a few
+  // hundred; every verifier and every conversion after this point walked all
+  // of them. Symbol DCE cannot run here -- the verifiers read manifest
+  // declarations as contract witnesses (that is why it runs after phase 13,
+  // and moving it up made `LyLong_FromI64` look like it may unwind) -- so the
+  // symbol and its attributes stay and only the body goes.
+  //
+  // ⛔ Placed AFTER refcount insertion, not before: that pass is what mints
+  // the calls to deallocators, and a deallocator is unreachable until it does.
+  // Nothing after this point introduces a call to a manifest body; the unwind
+  // insertion below calls LLVM externals the support builder declares.
+  {
+    PerfScope perf("lowering.unreachable-body-strip");
+    lowering::runtime::cleanup::stripUnreachableManifestBodies(module);
+  }
+
   if (failed(runVerifierPhase(
           "pre-cleanup-llvm-call-verifier", [&](PassManager &pm) {
             pm.addPass(createLLVMCallOwnershipVerifierPass());
