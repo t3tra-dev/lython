@@ -192,13 +192,13 @@ module attributes {
     func.return %false : i1
   }
 
+  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
+
+  // Every asyncio raise is a RuntimeError, so the class is fixed here rather
+  // than at each call site.
   func.func private @__ly_task_raise_runtime_error(%message: memref<?xi8>, %length: i64) {
     %class_id_runtime_error = arith.constant 51 : i64
-    %start = arith.constant 0 : index
-    %exception:3 = func.call @LyBaseException_New(%class_id_runtime_error) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_static_message(%class_id_runtime_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 

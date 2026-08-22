@@ -114,21 +114,9 @@ module attributes {
   //
   // The string is not released here: `LyBaseException_Init` declares
   // `transfer_args` for it, so the exception takes it.
-  func.func private @__ly_time_throw_str(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) {
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
-    func.return
-  }
+  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
 
-  func.func private @__ly_time_throw(%class_id: i64, %message: memref<?xi8>, %length: i64) {
-    %c0 = arith.constant 0 : index
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
-    func.return
-  }
+  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
 
   func.func private @__ly_time_raise_neg_sleep() {
     %c0 = arith.constant 0 : index
@@ -141,7 +129,7 @@ module attributes {
     // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_time_msg_neg_sleep : memref<33xi8>
     %buffer = memref.cast %text : memref<33xi8> to memref<?xi8>
-    func.call @__ly_time_throw(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -156,7 +144,7 @@ module attributes {
     // global this way -- this is that, not a new convention.
     %text = memref.get_global @__ly_time_msg_bad_time : memref<17xi8>
     %buffer = memref.cast %text : memref<17xi8> to memref<?xi8>
-    func.call @__ly_time_throw(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -174,7 +162,7 @@ module attributes {
     // other callers hand it a static global.
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
-    func.call @__ly_time_throw_str(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_message_object(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 

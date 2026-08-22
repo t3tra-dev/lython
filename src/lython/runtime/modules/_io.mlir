@@ -221,14 +221,7 @@ module attributes {
   memref.global "private" constant @__ly_io_msg_not_seekable : memref<33xi8> = dense<[117, 110, 100, 101, 114, 108, 121, 105, 110, 103, 32, 115, 116, 114, 101, 97, 109, 32, 105, 115, 32, 110, 111, 116, 32, 115, 101, 101, 107, 97, 98, 108, 101]>
   memref.global "private" constant @__ly_io_msg_neg_size : memref<19xi8> = dense<[110, 101, 103, 97, 116, 105, 118, 101, 32, 115, 105, 122, 101, 32, 118, 97, 108, 117, 101]>
 
-  func.func private @__ly_io_raise(%class_id: i64, %message: memref<?xi8>, %length: i64) {
-    %start = arith.constant 0 : index
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
-    func.return
-  }
+  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
 
   // Raise the OSError subclass errno maps to, with CPython's
   // "[Errno %d] %s: '%s'" message. Structurally __ly_posix_throw; kept local
@@ -284,7 +277,7 @@ module attributes {
     %length = arith.constant 29 : i64
     %static = memref.get_global @__ly_io_msg_closed : memref<29xi8>
     %message = memref.cast %static : memref<29xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -294,7 +287,7 @@ module attributes {
     %length = arith.constant 12 : i64
     %static = memref.get_global @__ly_io_msg_not_readable : memref<12xi8>
     %message = memref.cast %static : memref<12xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -303,7 +296,7 @@ module attributes {
     %length = arith.constant 12 : i64
     %static = memref.get_global @__ly_io_msg_not_writable : memref<12xi8>
     %message = memref.cast %static : memref<12xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -313,7 +306,7 @@ module attributes {
     %length = arith.constant 22 : i64
     %static = memref.get_global @__ly_io_msg_neg_seek : memref<22xi8>
     %message = memref.cast %static : memref<22xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -322,7 +315,7 @@ module attributes {
     %length = arith.constant 14 : i64
     %static = memref.get_global @__ly_io_msg_bad_whence : memref<14xi8>
     %message = memref.cast %static : memref<14xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -333,7 +326,7 @@ module attributes {
     %length = arith.constant 33 : i64
     %static = memref.get_global @__ly_io_msg_not_seekable : memref<33xi8>
     %message = memref.cast %static : memref<33xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -343,7 +336,7 @@ module attributes {
     %length = arith.constant 19 : i64
     %static = memref.get_global @__ly_io_msg_neg_size : memref<19xi8>
     %message = memref.cast %static : memref<19xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -352,7 +345,7 @@ module attributes {
     %length = arith.constant 31 : i64
     %static = memref.get_global @__ly_io_msg_nonzero_seek : memref<31xi8>
     %message = memref.cast %static : memref<31xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -1638,7 +1631,7 @@ module attributes {
     %len_invalid = arith.constant 12 : i64
     %static_invalid = memref.get_global @__ly_io_msg_invalid_mode : memref<12xi8>
     %msg_invalid = memref.cast %static_invalid : memref<12xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_invalid, %msg_invalid, %len_invalid) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_invalid, %msg_invalid, %len_invalid) : (i64, memref<?xi8>, i64) -> ()
     func.return
 
   ^binary:
@@ -1646,7 +1639,7 @@ module attributes {
     %len_binary = arith.constant 28 : i64
     %static_binary = memref.get_global @__ly_io_msg_binary_mode : memref<28xi8>
     %msg_binary = memref.cast %static_binary : memref<28xi8> to memref<?xi8>
-    func.call @__ly_io_raise(%class_binary, %msg_binary, %len_binary) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_binary, %msg_binary, %len_binary) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 

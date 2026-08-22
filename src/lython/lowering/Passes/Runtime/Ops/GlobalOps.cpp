@@ -326,7 +326,7 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
   mlir::Value unbound = mlir::arith::CmpIOp::create(
       builder, loc, mlir::arith::CmpIPredicate::eq, bound, zero);
   mlir::func::FuncOp raise =
-      module.lookupSymbol<mlir::func::FuncOp>("__ly_long_raise_message");
+      module.lookupSymbol<mlir::func::FuncOp>("__ly_raise_static_message");
   if (!raise)
     return op.emitError() << "runtime manifest raise helper is missing";
   auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},

@@ -16,6 +16,7 @@ add_library(LythonEmitter STATIC
     lib/EmitterMatch.cpp
     lib/EmitterPrimitive.cpp
     lib/EmitterStatements.cpp
+    lib/EmitterStrings.cpp
     lib/EmitterSupport.cpp
     lib/EmitterWith.cpp
     lib/PrimitiveTypes.cpp

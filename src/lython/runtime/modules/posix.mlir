@@ -181,13 +181,16 @@ module attributes {
   // Not marked with an ownership attribute: `%buffer` is scratch, not an entity --
   // no header, no refcount, one `memref.alloc` with no interior. The attributes
   // describe objects.
+  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
+
+  // Not the shared static-message raise: this one OWNS the formatted buffer,
+  // and the free has to happen between building the str and the throw, since
+  // a throw does not return.
   func.func private @__ly_posix_throw_message(%class_id: i64, %buffer: memref<?xi8>, %len: i64) {
     %c0 = arith.constant 0 : index
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_message_object(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 

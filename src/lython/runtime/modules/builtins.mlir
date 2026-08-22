@@ -4932,7 +4932,7 @@ module attributes {
     %length = arith.constant 18 : i64
     %message_static = memref.get_global @__ly_bytes_msg_index_out_of_range : memref<18xi8>
     %message = memref.cast %message_static : memref<18xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -5049,13 +5049,9 @@ module attributes {
   func.func private @__ly_slice_raise_zero_step() {
     %class_id = arith.constant 53 : i64
     %length = arith.constant 25 : i64
-    %start = arith.constant 0 : index
     %message_static = memref.get_global @__ly_slice_msg_zero_step : memref<25xi8>
     %message = memref.cast %message_static : memref<25xi8> to memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -5534,7 +5530,7 @@ module attributes {
       %length = arith.constant 58 : i64
       %static = memref.get_global @__ly_bytes_msg_bad_errors : memref<58xi8>
       %message = memref.cast %static : memref<58xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %result:2 = func.call @LyBytes_DecodeEncoding(%header, %enc_header, %enc_bytes) : (memref<6xi64>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
@@ -5648,7 +5644,7 @@ module attributes {
     %message_dyn = memref.cast %message : memref<29xi8> to memref<?xi8>
     %len = arith.constant 29 : i64
     %class_id = arith.constant 53 : i64
-    func.call @__ly_long_raise_message(%class_id, %message_dyn, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message_dyn, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -6361,7 +6357,7 @@ module attributes {
       %length = arith.constant 15 : i64
       %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
       %message = memref.cast %static : memref<15xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
 
     %count:3 = scf.while (%pos = %zero, %used = %zero, %go = %true_a) : (i64, i64, i1) -> (i64, i64, i1) {
@@ -6766,42 +6762,40 @@ module attributes {
   memref.global "private" constant @__ly_long_two_meta : memref<2xi64> = dense<[1, 1]>
   memref.global "private" constant @__ly_long_two_digits : memref<1xi32> = dense<[2]>
 
-  func.func private @__ly_long_raise_message(%class_id: i64, %message: memref<?xi8>, %length: i64) {
-    %start = arith.constant 0 : index
+  // ⭐ THE ONE STATIC-MESSAGE RAISE. `raise <class>("literal")` from a native
+  // body is this: make the exception, make the str, init, throw. It was
+  // written twice here (once as `__ly_long_raise_message`, once as
+  // `__ly_unicode_raise`) and inlined again in five argument-less helpers.
+  // Every module that raises has its own copy of this by design -- a manifest
+  // is self-contained, since it is only linked when its module is imported --
+  // but within one manifest there is no reason for two.
+  // Raise `class_id` carrying an already-built str. The other manifests reach
+  // this one: posix must free its formatted buffer between building the str
+  // and throwing, and _time raises a strftime message it computed.
+  func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) {
     %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
-  func.func private @__ly_long_raise_true_div_zero() {
-    %class_id = arith.constant 61 : i64
-    %length = arith.constant 16 : i64
-    %message_static = memref.get_global @__ly_long_msg_division_by_zero : memref<16xi8>
-    %message = memref.cast %message_static : memref<16xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64) {
+    %start = arith.constant 0 : index
+    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.call @__ly_raise_message_object(%class_id, %message_header, %message_bytes) : (i64, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
   // CPython 3.14 unified the /, //, and % zero-divisor message to
-  // "division by zero" (gh-87999), so the historic per-operator texts are
-  // not used.
-  func.func private @__ly_long_raise_floor_div_zero() {
+  // "division by zero" (gh-87999), so the historic per-operator texts are not
+  // used -- and once they were gone the three raisers were the same function
+  // under three names.
+  func.func private @__ly_long_raise_division_by_zero() {
     %class_id = arith.constant 61 : i64
     %length = arith.constant 16 : i64
     %message_static = memref.get_global @__ly_long_msg_division_by_zero : memref<16xi8>
     %message = memref.cast %message_static : memref<16xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
-    func.return
-  }
-
-  func.func private @__ly_long_raise_mod_zero() {
-    %class_id = arith.constant 61 : i64
-    %length = arith.constant 16 : i64
-    %message_static = memref.get_global @__ly_long_msg_division_by_zero : memref<16xi8>
-    %message = memref.cast %message_static : memref<16xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -6810,7 +6804,7 @@ module attributes {
     %length = arith.constant 20 : i64
     %message_static = memref.get_global @__ly_long_msg_negative_shift_count : memref<20xi8>
     %message = memref.cast %message_static : memref<20xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7528,7 +7522,7 @@ module attributes {
     %length = arith.constant 51 : i64
     %message_static = memref.get_global @__ly_long_msg_int_too_large : memref<51xi8>
     %message = memref.cast %message_static : memref<51xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7753,7 +7747,7 @@ module attributes {
     %length = arith.constant 35 : i64
     %message_static = memref.get_global @__ly_long_msg_float_nan : memref<35xi8>
     %message = memref.cast %message_static : memref<35xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7762,7 +7756,7 @@ module attributes {
     %length = arith.constant 40 : i64
     %message_static = memref.get_global @__ly_long_msg_float_infinity : memref<40xi8>
     %message = memref.cast %message_static : memref<40xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7771,7 +7765,7 @@ module attributes {
     %length = arith.constant 33 : i64
     %message_static = memref.get_global @__ly_long_msg_int_too_large_float : memref<33xi8>
     %message = memref.cast %message_static : memref<33xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7780,7 +7774,7 @@ module attributes {
     %length = arith.constant 45 : i64
     %message_static = memref.get_global @__ly_long_msg_div_result_too_large : memref<45xi8>
     %message = memref.cast %message_static : memref<45xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7789,7 +7783,7 @@ module attributes {
     %length = arith.constant 24 : i64
     %message_static = memref.get_global @__ly_long_msg_zero_negative_power : memref<24xi8>
     %message = memref.cast %message_static : memref<24xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7798,7 +7792,7 @@ module attributes {
     %length = arith.constant 54 : i64
     %message_static = memref.get_global @__ly_long_msg_fractional_power_negative : memref<54xi8>
     %message = memref.cast %message_static : memref<54xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7807,7 +7801,7 @@ module attributes {
     %length = arith.constant 91 : i64
     %message_static = memref.get_global @__ly_long_msg_pow_negative_exponent : memref<91xi8>
     %message = memref.cast %message_static : memref<91xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -7816,7 +7810,7 @@ module attributes {
     %length = arith.constant 21 : i64
     %message_static = memref.get_global @__ly_long_msg_shift_count_too_large : memref<21xi8>
     %message = memref.cast %message_static : memref<21xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -8406,7 +8400,7 @@ module attributes {
     cf.cond_br %rhs_zero, ^zero_divisor, ^check_zero_lhs
 
   ^zero_divisor:
-    func.call @__ly_long_raise_true_div_zero() : () -> ()
+    func.call @__ly_long_raise_division_by_zero() : () -> ()
     %dummy = arith.constant 0.0 : f64
     %zh = func.call @LyFloat_FromF64(%dummy) : (f64) -> memref<3xi64>
     func.return %zh : memref<3xi64>
@@ -8558,7 +8552,7 @@ module attributes {
     cf.cond_br %rhs_zero, ^zero_divisor, ^nonzero
 
   ^zero_divisor:
-    func.call @__ly_long_raise_floor_div_zero() : () -> ()
+    func.call @__ly_long_raise_division_by_zero() : () -> ()
     %zh, %zm, %zd = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %zh, %zm, %zd : memref<2xi64>, memref<2xi64>, memref<?xi32>
 
@@ -8609,7 +8603,7 @@ module attributes {
     cf.cond_br %rhs_zero, ^zero_divisor, ^nonzero
 
   ^zero_divisor:
-    func.call @__ly_long_raise_mod_zero() : () -> ()
+    func.call @__ly_long_raise_division_by_zero() : () -> ()
     %zh, %zm, %zd = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %zh, %zm, %zd : memref<2xi64>, memref<2xi64>, memref<?xi32>
 
@@ -9988,13 +9982,9 @@ module attributes {
   func.func private @__ly_unicode_raise_index_error() {
     %class_id = arith.constant 55 : i64
     %length = arith.constant 25 : i64
-    %start = arith.constant 0 : index
     %message_static = memref.get_global @__ly_unicode_msg_string_index_out_of_range : memref<25xi8>
     %message = memref.cast %message_static : memref<25xi8> to memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -10004,13 +9994,9 @@ module attributes {
   func.func private @__ly_unicode_raise_decode_error() {
     %class_id = arith.constant 122 : i64
     %length = arith.constant 22 : i64
-    %start = arith.constant 0 : index
     %message_static = memref.get_global @__ly_unicode_msg_invalid_utf8 : memref<22xi8>
     %message = memref.cast %message_static : memref<22xi8> to memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -10746,15 +10732,6 @@ module attributes {
   // "The fill character must be exactly one character long"
   memref.global "private" constant @__ly_unicode_msg_bad_fill : memref<53xi8> = dense<[84, 104, 101, 32, 102, 105, 108, 108, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 109, 117, 115, 116, 32, 98, 101, 32, 101, 120, 97, 99, 116, 108, 121, 32, 111, 110, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 108, 111, 110, 103]>
 
-  func.func private @__ly_unicode_raise(%class_id: i64, %message: memref<?xi8>, %length: i64) {
-    %start = arith.constant 0 : index
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
-    func.return
-  }
-
   // CPython ADJUST_INDICES: negative indices count from the end (clamped to
   // 0), the end clamps to the length, and the start deliberately does NOT
   // clamp downward to the length -- find("", past-the-end) must miss.
@@ -10915,7 +10892,7 @@ module attributes {
       %length = arith.constant 19 : i64
       %static = memref.get_global @__ly_unicode_msg_substring_not_found : memref<19xi8>
       %message = memref.cast %static : memref<19xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %result:3 = func.call @LyLong_FromI64(%found) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
@@ -11364,7 +11341,7 @@ module attributes {
       %length = arith.constant 53 : i64
       %static = memref.get_global @__ly_unicode_msg_bad_fill : memref<53xi8>
       %message = memref.cast %static : memref<53xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %len_index_bound = arith.index_cast %len : i64 to index
@@ -11691,7 +11668,7 @@ module attributes {
       %length = arith.constant 15 : i64
       %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
       %message = memref.cast %static : memref<15xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
 
     // Pass 1: number of separators actually used.
@@ -11769,7 +11746,7 @@ module attributes {
       %length = arith.constant 15 : i64
       %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
       %message = memref.cast %static : memref<15xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
 
     %true_rsplit1 = arith.constant true
@@ -12103,7 +12080,7 @@ module attributes {
       %length = arith.constant 15 : i64
       %static = memref.get_global @__ly_unicode_msg_empty_separator : memref<15xi8>
       %message = memref.cast %static : memref<15xi8> to memref<?xi8>
-      func.call @__ly_unicode_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %tuple = func.call @LyTuple_FromLength(%three) : (i64) -> memref<14xi64>
     %tuple_items = func.call @__ly_tuple_items(%tuple) : (memref<14xi64>) -> memref<?xi64>
@@ -13591,7 +13568,7 @@ module attributes {
 
   func.func private @__ly_fmt_raise_bytes(%message: memref<?xi8>, %length: i64) {
     %value_error = arith.constant 53 : i64
-    func.call @__ly_long_raise_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -15231,7 +15208,7 @@ module attributes {
 
   func.func private @__ly_fmtrt_raise(%message: memref<?xi8>, %length: i64) {
     %value_error = arith.constant 53 : i64
-    func.call @__ly_long_raise_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%value_error, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -15867,13 +15844,9 @@ module attributes {
   func.func private @__ly_complex_raise_zero_division() {
     %class_id = arith.constant 61 : i64
     %length = arith.constant 24 : i64
-    %start = arith.constant 0 : index
     %message_static = memref.get_global @__ly_complex_msg_zero_div : memref<24xi8>
     %message = memref.cast %message_static : memref<24xi8> to memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -16131,7 +16104,7 @@ module attributes {
     cf.cond_br %divisor_zero, ^by_zero, ^divide
 
   ^by_zero:
-    func.call @__ly_long_raise_true_div_zero() : () -> ()
+    func.call @__ly_long_raise_division_by_zero() : () -> ()
     cf.br ^divide
 
   ^divide:
@@ -16195,7 +16168,7 @@ module attributes {
     cf.cond_br %divisor_zero, ^by_zero, ^divide
 
   ^by_zero:
-    func.call @__ly_long_raise_floor_div_zero() : () -> ()
+    func.call @__ly_long_raise_division_by_zero() : () -> ()
     cf.br ^divide
 
   ^divide:
@@ -16212,7 +16185,7 @@ module attributes {
     cf.cond_br %divisor_zero, ^by_zero, ^divide
 
   ^by_zero:
-    func.call @__ly_long_raise_mod_zero() : () -> ()
+    func.call @__ly_long_raise_division_by_zero() : () -> ()
     cf.br ^divide
 
   ^divide:
@@ -16289,7 +16262,7 @@ module attributes {
     %length = arith.constant 36 : i64
     %message_static = memref.get_global @__ly_float_msg_round_overflow : memref<36xi8>
     %message = memref.cast %message_static : memref<36xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -16891,18 +16864,18 @@ module attributes {
       %msg_static = memref.get_global @__ly_hash_msg_unhashable_list : memref<23xi8>
       %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
       %len = arith.constant 23 : i64
-      func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     } else {
       scf.if %is_dict {
         %msg_static = memref.get_global @__ly_hash_msg_unhashable_dict : memref<23xi8>
         %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
         %len = arith.constant 23 : i64
-        func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+        func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
       } else {
         %msg_static = memref.get_global @__ly_hash_msg_unhashable_set : memref<22xi8>
         %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
         %len = arith.constant 22 : i64
-        func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+        func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
       }
     }
     func.return
@@ -17399,7 +17372,7 @@ module attributes {
     %msg_static = memref.get_global @__ly_cmp_msg_unorderable : memref<39xi8>
     %msg = memref.cast %msg_static : memref<39xi8> to memref<?xi8>
     %len = arith.constant 39 : i64
-    func.call @__ly_long_raise_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -17793,10 +17766,7 @@ module attributes {
   // list(xs): a fresh shallow copy of a list argument (the emitter routes
   // other iterables through the comprehension desugar instead).
   func.func @LyBuiltin_List(%self: memref<9xi64> {ly.ownership.object_header}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "list", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_list", ly.runtime.result_contract = "builtins.list"} {
-    %length_slot = arith.constant 2 : index
-    %len = memref.load %self[%length_slot] : memref<9xi64>
-    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
-    %copy = func.call @__ly_list_copy_alloc(%len, %items) : (i64, memref<?xi64>) -> memref<9xi64>
+    %copy = func.call @LyList_Copy(%self) : (memref<9xi64>) -> memref<9xi64>
     func.return %copy : memref<9xi64>
   }
 
@@ -17953,7 +17923,7 @@ module attributes {
     %b_sign = memref.load %b_meta[%c0] : memref<2xi64>
     %b_zero = arith.cmpi eq, %b_sign, %zero : i64
     scf.if %b_zero {
-      func.call @__ly_long_raise_floor_div_zero() : () -> ()
+      func.call @__ly_long_raise_division_by_zero() : () -> ()
     }
     %qr:6 = func.call @__ly_long_floor_divmod(%a_meta, %a_digits, %b_meta, %b_digits) : (memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<2xi64>, memref<?xi32>)
     %two = arith.constant 2 : i64
@@ -17986,7 +17956,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_pow_msg_negative : memref<68xi8>
       %msg = memref.cast %msg_static : memref<68xi8> to memref<?xi8>
       %len = arith.constant 68 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     }
     %mod_sign = memref.load %mod_meta[%c0] : memref<2xi64>
     %mod_zero = arith.cmpi eq, %mod_sign, %zero : i64
@@ -17994,7 +17964,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_pow_msg_zero_mod : memref<30xi8>
       %msg = memref.cast %msg_static : memref<30xi8> to memref<?xi8>
       %len = arith.constant 30 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     }
     // result = 1 % mod; acc = base % mod.
     %one_h, %one_m, %one_d = func.call @LyLong_FromI64(%zero) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
@@ -18068,7 +18038,7 @@ module attributes {
       %found = memref.cast %found_s : memref<6xi8> to memref<?xi8>
       %l6 = arith.constant 6 : i64
       %c = func.call @__ly_fmt_copy_bytes(%buf, %b, %found, %l6) : (memref<?xi8>, i64, memref<?xi8>, i64) -> i64
-      func.call @__ly_long_raise_message(%type_error, %buf, %c) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%type_error, %buf, %c) : (i64, memref<?xi8>, i64) -> ()
     }
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %cp = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
@@ -18173,7 +18143,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_chr_msg : memref<32xi8>
       %msg = memref.cast %msg_static : memref<32xi8> to memref<?xi8>
       %len = arith.constant 32 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%value_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
     }
     %width = func.call @__ly_unicode_width_for(%cp_raw) : (i64) -> i64
     %one = arith.constant 1 : i64
@@ -18611,7 +18581,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_list_msg_index_missing : memref<28xi8>
       %msg = memref.cast %msg_static : memref<28xi8> to memref<?xi8>
       %msg_len = arith.constant 28 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %h, %m, %d = func.call @LyLong_FromI64(%found) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
@@ -18632,7 +18602,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_tuple_msg_index_missing : memref<30xi8>
       %msg = memref.cast %msg_static : memref<30xi8> to memref<?xi8>
       %msg_len = arith.constant 30 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %h, %m, %d = func.call @LyLong_FromI64(%found) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
@@ -18656,7 +18626,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_list_msg_remove_missing : memref<29xi8>
       %msg = memref.cast %msg_static : memref<29xi8> to memref<?xi8>
       %msg_len = arith.constant 29 : i64
-      func.call @__ly_long_raise_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%value_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
@@ -18709,7 +18679,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_list_msg_assign_range : memref<34xi8>
       %msg = memref.cast %msg_static : memref<34xi8> to memref<?xi8>
       %msg_len = arith.constant 34 : i64
-      func.call @__ly_long_raise_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     func.return %normalized : i64
   }
@@ -18748,7 +18718,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_list_msg_assign_range : memref<34xi8>
       %msg = memref.cast %msg_static : memref<34xi8> to memref<?xi8>
       %msg_len = arith.constant 34 : i64
-      func.call @__ly_long_raise_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %normalized) : (memref<?xi64>, i64) -> ()
@@ -18825,7 +18795,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_list_msg_pop_empty : memref<19xi8>
       %msg = memref.cast %msg_static : memref<19xi8> to memref<?xi8>
       %msg_len = arith.constant 19 : i64
-      func.call @__ly_long_raise_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %is_neg = arith.cmpi slt, %raw_index, %zero : i64
     %adjusted = arith.addi %raw_index, %len : i64
@@ -18838,7 +18808,7 @@ module attributes {
       %msg_static = memref.get_global @__ly_list_msg_pop_range : memref<22xi8>
       %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
       %msg_len = arith.constant 22 : i64
-      func.call @__ly_long_raise_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%index_error, %msg, %msg_len) : (i64, memref<?xi8>, i64) -> ()
     }
     %new_len = arith.subi %len, %one : i64
     %park = arith.index_cast %new_len : i64 to index
@@ -22962,13 +22932,9 @@ module attributes {
   func.func private @__ly_range_raise_zero_step() {
     %class_id = arith.constant 53 : i64
     %length = arith.constant 30 : i64
-    %start = arith.constant 0 : index
     %message_static = memref.get_global @__ly_range_msg_zero_step : memref<30xi8>
     %message = memref.cast %message_static : memref<30xi8> to memref<?xi8>
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -23023,7 +22989,7 @@ module attributes {
     %length = arith.constant 31 : i64
     %message_static = memref.get_global @__ly_range_msg_index_out_of_range : memref<31xi8>
     %message = memref.cast %message_static : memref<31xi8> to memref<?xi8>
-    func.call @__ly_long_raise_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 

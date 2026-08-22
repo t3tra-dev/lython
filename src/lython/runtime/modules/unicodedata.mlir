@@ -67,14 +67,7 @@ module attributes {
   // "not a digit"
   memref.global "private" constant @__ly_ucd_msg_not_digit : memref<11xi8> = dense<[110, 111, 116, 32, 97, 32, 100, 105, 103, 105, 116]>
 
-  func.func private @__ly_ucd_raise(%class_id: i64, %message: memref<?xi8>, %length: i64) {
-    %start = arith.constant 0 : index
-    %exception:3 = func.call @LyBaseException_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%message, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-    %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
-    func.return
-  }
+  func.func private @__ly_raise_static_message(%class_id: i64, %message: memref<?xi8>, %length: i64)
 
   // The single code point of a one-character str; TypeError otherwise
   // (CPython's unicodedata argument contract).
@@ -90,7 +83,7 @@ module attributes {
       %length = arith.constant 36 : i64
       %static = memref.get_global @__ly_ucd_msg_not_single : memref<36xi8>
       %message = memref.cast %static : memref<36xi8> to memref<?xi8>
-      func.call @__ly_ucd_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %cp = func.call @__ly_unicode_get(%bytes, %width, %c0) : (memref<?xi8>, i64, index) -> i64
@@ -126,7 +119,7 @@ module attributes {
       %length = arith.constant 23 : i64
       %static = memref.get_global @__ly_ucd_msg_not_numeric : memref<23xi8>
       %message = memref.cast %static : memref<23xi8> to memref<?xi8>
-      func.call @__ly_ucd_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     // The raise above unwinds; the select keeps the fallthrough load in
     // bounds for the verifier.
@@ -146,7 +139,7 @@ module attributes {
       %length = arith.constant 13 : i64
       %static = memref.get_global @__ly_ucd_msg_not_decimal : memref<13xi8>
       %message = memref.cast %static : memref<13xi8> to memref<?xi8>
-      func.call @__ly_ucd_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %result:3 = func.call @LyLong_FromI64(%decimal) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
@@ -162,7 +155,7 @@ module attributes {
       %length = arith.constant 11 : i64
       %static = memref.get_global @__ly_ucd_msg_not_digit : memref<11xi8>
       %message = memref.cast %static : memref<11xi8> to memref<?xi8>
-      func.call @__ly_ucd_raise(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %result:3 = func.call @LyLong_FromI64(%digit) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
     func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
