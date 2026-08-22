@@ -6762,6 +6762,86 @@ module attributes {
   memref.global "private" constant @__ly_long_two_meta : memref<2xi64> = dense<[1, 1]>
   memref.global "private" constant @__ly_long_two_digits : memref<1xi32> = dense<[2]>
 
+  // ⭐ CPython's `_PyLong_SMALL_INTS` (Objects/longobject.c). Every int in
+  // [-_PY_NSMALLNEGINTS, _PY_NSMALLPOSINTS) -- -5 through 256 in 3.14 -- is a
+  // shared immortal object there, and `PyLong_FromLong` returns it without
+  // allocating (`IS_SMALL_INT` / `get_small_int`). This runtime cached three
+  // of them, so `i + 1` in a loop allocated and freed on every step.
+  //
+  // ⛔ ONE HEADER PER VALUE IS NOT NEEDED, because the emitter refuses `is` on
+  // int (identity of a value type is not observable in this language), so the
+  // table is a plain byte block laid out exactly like a heap int:
+  // [0,16) header, [16,32) meta, [32,36) digits, padded to 48 for alignment.
+  //
+  // ⛔ Filled at first use rather than written out as a literal: the digits are
+  // i32 and the block is bytes, so a static initializer would have to commit to
+  // an endianness, and this compiler cross-compiles. A store through the typed
+  // view is correct on either.
+  memref.global "private" @__ly_long_small_ints : memref<12576xi8> = dense<0> {alignment = 16 : i64}
+  memref.global "private" @__ly_long_small_ready : memref<1xi64> = dense<0>
+
+  func.func private @__ly_long_small_slot(%value: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) {
+    %table_static = memref.get_global @__ly_long_small_ints : memref<12576xi8>
+    %table = memref.cast %table_static : memref<12576xi8> to memref<?xi8>
+    %neg_span = arith.constant 5 : i64
+    %slot_bytes = arith.constant 48 : i64
+    %slot_index = arith.addi %value, %neg_span : i64
+    %byte_offset_i64 = arith.muli %slot_index, %slot_bytes : i64
+    %byte_offset = arith.index_cast %byte_offset_i64 : i64 to index
+    %meta_delta = arith.constant 16 : index
+    %digits_delta = arith.constant 32 : index
+    %one_digit = arith.constant 1 : index
+    %meta_offset = arith.addi %byte_offset, %meta_delta : index
+    %digits_offset = arith.addi %byte_offset, %digits_delta : index
+    %header = memref.view %table[%byte_offset][] : memref<?xi8> to memref<2xi64>
+    %meta = memref.view %table[%meta_offset][] : memref<?xi8> to memref<2xi64>
+    %digits = memref.view %table[%digits_offset][%one_digit] : memref<?xi8> to memref<?xi32>
+    func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  }
+
+  func.func private @__ly_long_small_ensure() {
+    %ready = memref.get_global @__ly_long_small_ready : memref<1xi64>
+    %flag_slot = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %flag = memref.load %ready[%flag_slot] : memref<1xi64>
+    %needs_init = arith.cmpi eq, %flag, %zero : i64
+    scf.if %needs_init {
+      %first = arith.constant 0 : index
+      %past_last = arith.constant 262 : index
+      %step = arith.constant 1 : index
+      %lowest = arith.constant -5 : i64
+      %immortal = arith.constant 9223372036854775807 : i64
+      %layout_int = arith.constant 1 : i64
+      %minus_one = arith.constant -1 : i64
+      %refcount_slot = arith.constant 0 : index
+      %layout_slot = arith.constant 1 : index
+      %sign_slot = arith.constant 0 : index
+      %digit_count_slot = arith.constant 1 : index
+      %digit0_slot = arith.constant 0 : index
+      scf.for %slot = %first to %past_last step %step {
+        %offset = arith.index_cast %slot : index to i64
+        %value = arith.addi %offset, %lowest : i64
+        %header, %meta, %digits = func.call @__ly_long_small_slot(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+        memref.store %immortal, %header[%refcount_slot] : memref<2xi64>
+        memref.store %layout_int, %header[%layout_slot] : memref<2xi64>
+        %negative = arith.cmpi slt, %value, %zero : i64
+        %is_zero = arith.cmpi eq, %value, %zero : i64
+        %signed_sign = arith.select %negative, %minus_one, %one : i1, i64
+        %sign = arith.select %is_zero, %zero, %signed_sign : i1, i64
+        %digit_count = arith.select %is_zero, %zero, %one : i1, i64
+        memref.store %sign, %meta[%sign_slot] : memref<2xi64>
+        memref.store %digit_count, %meta[%digit_count_slot] : memref<2xi64>
+        %negated = arith.subi %zero, %value : i64
+        %magnitude = arith.select %negative, %negated, %value : i1, i64
+        %digit = arith.trunci %magnitude : i64 to i32
+        memref.store %digit, %digits[%digit0_slot] : memref<?xi32>
+      }
+      memref.store %one, %ready[%flag_slot] : memref<1xi64>
+    }
+    func.return
+  }
+
   // ⭐ THE ONE STATIC-MESSAGE RAISE. `raise <class>("literal")` from a native
   // body is this: make the exception, make the str, init, throw. It was
   // written twice here (once as `__ly_long_raise_message`, once as
@@ -7065,37 +7145,18 @@ module attributes {
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
     %three = arith.constant 3 : i64
-    %is_cached_zero = arith.cmpi eq, %value, %zero : i64
-    cf.cond_br %is_cached_zero, ^cached_zero, ^check_cached_one
+    // CPython's IS_SMALL_INT: -_PY_NSMALLNEGINTS <= value < _PY_NSMALLPOSINTS.
+    %small_lowest = arith.constant -5 : i64
+    %small_past_last = arith.constant 257 : i64
+    %at_or_above_lowest = arith.cmpi sge, %value, %small_lowest : i64
+    %below_past_last = arith.cmpi slt, %value, %small_past_last : i64
+    %is_small = arith.andi %at_or_above_lowest, %below_past_last : i1
+    cf.cond_br %is_small, ^cached, ^heap
 
-  ^cached_zero:
-    %zero_header = memref.get_global @__ly_long_zero_header : memref<2xi64>
-    %zero_meta = memref.get_global @__ly_long_zero_meta : memref<2xi64>
-    %zero_digits_static = memref.get_global @__ly_long_zero_digits : memref<1xi32>
-    %zero_digits = memref.cast %zero_digits_static : memref<1xi32> to memref<?xi32>
-    func.return %zero_header, %zero_meta, %zero_digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
-
-  ^check_cached_one:
-    %is_cached_one = arith.cmpi eq, %value, %one : i64
-    cf.cond_br %is_cached_one, ^cached_one, ^check_cached_two
-
-  ^cached_one:
-    %one_header = memref.get_global @__ly_long_one_header : memref<2xi64>
-    %one_meta = memref.get_global @__ly_long_one_meta : memref<2xi64>
-    %one_digits_static = memref.get_global @__ly_long_one_digits : memref<1xi32>
-    %one_digits = memref.cast %one_digits_static : memref<1xi32> to memref<?xi32>
-    func.return %one_header, %one_meta, %one_digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
-
-  ^check_cached_two:
-    %is_cached_two = arith.cmpi eq, %value, %two : i64
-    cf.cond_br %is_cached_two, ^cached_two, ^heap
-
-  ^cached_two:
-    %two_header = memref.get_global @__ly_long_two_header : memref<2xi64>
-    %two_meta = memref.get_global @__ly_long_two_meta : memref<2xi64>
-    %two_digits_static = memref.get_global @__ly_long_two_digits : memref<1xi32>
-    %two_digits = memref.cast %two_digits_static : memref<1xi32> to memref<?xi32>
-    func.return %two_header, %two_meta, %two_digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+  ^cached:
+    func.call @__ly_long_small_ensure() : () -> ()
+    %cached_header, %cached_meta, %cached_digits = func.call @__ly_long_small_slot(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    func.return %cached_header, %cached_meta, %cached_digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
 
   ^heap:
     %is_zero = arith.cmpi eq, %value, %zero : i64
