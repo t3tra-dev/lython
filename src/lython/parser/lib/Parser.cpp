@@ -4245,11 +4245,6 @@ private:
 
 ;
 
-  std::string stringContent(const std::string &literal) {
-    StringContentRange range = stringContentRange(literal);
-    return literal.substr(range.start, range.end - range.start);
-  }
-
   void translateRanges(const NodePtr &node, SourceLocation sourceStart,
                        std::string_view source) const {
     if (!node)
@@ -4609,27 +4604,6 @@ private:
     return node;
   }
 
-  NodePtr parseInlineExpression(std::string_view source) {
-    Diagnostics nestedDiagnostics;
-    LexResult lexed =
-        lexSource(source, nestedDiagnostics, /*typeComments=*/false);
-    std::vector<Token> nestedTokens = std::move(lexed.tokens);
-    diagnostics.insert(diagnostics.end(), nestedDiagnostics.begin(),
-                       nestedDiagnostics.end());
-    if (!nestedDiagnostics.empty())
-      return makeNode("Error");
-
-    ParserImpl parser(std::move(nestedTokens), diagnostics);
-    NodePtr expression = parser.parseExpressionMode();
-    for (const Field &field : expression->fields) {
-      if (field.name != "body")
-        continue;
-      if (const auto *body = std::get_if<NodePtr>(&field.value))
-        return *body;
-    }
-    return makeNode("Error");
-  }
-
   NodePtr parseInlineAnnotatedRhs(
       std::string_view source, SourceRange outerRange,
       std::string_view stringKind,
@@ -4671,14 +4645,6 @@ private:
       }
     }
     return makeNode("Error");
-  }
-
-  void appendStringChunk(std::vector<NodePtr> &values, SourceRange range,
-                         std::string &chunk) {
-    if (chunk.empty())
-      return;
-    appendStringNode(values, makeStringConstant(range, std::move(chunk)));
-    chunk.clear();
   }
 
   std::string *mutableStringConstantValue(const NodePtr &node) {

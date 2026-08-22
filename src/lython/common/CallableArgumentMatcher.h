@@ -58,41 +58,6 @@ inline bool defaultMetadataCompatible(llvm::ArrayRef<char> required,
                                    [](char value) { return value != 0; });
 }
 
-template <typename NameT, typename DefaultT, typename OptionalT,
-          typename IsDefault>
-bool parameterMetadataCompatible(
-    unsigned requiredPositionalOnlyCount, unsigned candidatePositionalOnlyCount,
-    llvm::ArrayRef<NameT> requiredPositionalNames,
-    llvm::ArrayRef<NameT> candidatePositionalNames,
-    llvm::ArrayRef<DefaultT> requiredPositionalDefaults,
-    llvm::ArrayRef<DefaultT> candidatePositionalDefaults,
-    llvm::ArrayRef<NameT> requiredKwonlyNames,
-    llvm::ArrayRef<NameT> candidateKwonlyNames,
-    llvm::ArrayRef<DefaultT> requiredKwonlyDefaults,
-    llvm::ArrayRef<DefaultT> candidateKwonlyDefaults,
-    const OptionalT &requiredVarargName, const OptionalT &candidateVarargName,
-    const OptionalT &requiredKwargName, const OptionalT &candidateKwargName,
-    IsDefault isDefault, bool comparePositionalOnlyCount = true) {
-  if (comparePositionalOnlyCount &&
-      candidatePositionalOnlyCount > requiredPositionalOnlyCount)
-    return false;
-  if (!metadataCompatible(requiredPositionalNames, candidatePositionalNames))
-    return false;
-  if (!defaultMetadataCompatible(requiredPositionalDefaults,
-                                 candidatePositionalDefaults, isDefault))
-    return false;
-  if (!metadataCompatible(requiredKwonlyNames, candidateKwonlyNames))
-    return false;
-  if (!defaultMetadataCompatible(requiredKwonlyDefaults,
-                                 candidateKwonlyDefaults, isDefault))
-    return false;
-  if (!optionalMetadataCompatible(requiredVarargName, candidateVarargName))
-    return false;
-  if (!optionalMetadataCompatible(requiredKwargName, candidateKwargName))
-    return false;
-  return true;
-}
-
 template <typename T> struct Signature {
   llvm::ArrayRef<T> positional;
   llvm::ArrayRef<T> kwonly;
