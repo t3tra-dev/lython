@@ -1097,7 +1097,36 @@ private:
     return node;
   }
 
-  NodePtr parseParameters() {
+  // ⭐ ONE PARAMETER LIST. `def` and `lambda` share every rule that matters --
+  // `/` placement, one `*`, bare `*` needing names after it, defaults after a
+  // non-default, `**` ending the list -- and each rejection has to fire at the
+  // same point in both. What differs is the token the list ends at, whether a
+  // parameter may carry an annotation (and so a type comment), and the wording.
+  struct ParameterListFlavour {
+    std::string_view terminator;
+    // ⛔ This also gates the bare-`*` type-comment check: a lambda parameter
+    // cannot carry a type comment at all, so there is nothing to attribute.
+    bool takesAnnotations;
+    // `def f((a, b))` is CPython's tuple-parameter error and recovers past the
+    // whole parenthesized group; `lambda (a, b):` does not.
+    bool recoversBalancedParentheses;
+    std::string_view starArgMessage;
+    std::string_view starStarArgMessage;
+    std::string_view argMessage;
+    std::string_view parenthesizedMessage;
+    std::string_view keywordOnlyMessage;
+  };
+
+  NodePtr parameterArg(const ParameterListFlavour &flavour,
+                       std::string_view message,
+                       bool allowStarAnnotation = false) {
+    if (flavour.takesAnnotations)
+      return parseParameterArg(allowStarAnnotation);
+    return parseUnannotatedArg(std::string(message));
+  }
+
+  NodePtr parseParameterList(const ParameterListFlavour &flavour) {
+    const std::string terminator(flavour.terminator);
     NodePtr arguments = makeNode("arguments");
     std::vector<NodePtr> posonlyargs;
     std::vector<NodePtr> args;
@@ -1112,7 +1141,7 @@ private:
     bool seenSlash = false;
     bool bareStar = false;
 
-    while (!atText(")") && !at(TokenKind::End)) {
+    while (!atText(terminator) && !at(TokenKind::End)) {
       if (matchText("/")) {
         if (seenSlash)
           error(previous().range.start, "/ may appear only once");
@@ -1131,15 +1160,15 @@ private:
       if (matchText("**")) {
         if (bareStar && kwonlyargs.empty())
           error(previous().range.start, "named arguments must follow bare *");
-        kwarg = parseParameterArg();
+        kwarg = parameterArg(flavour, flavour.starStarArgMessage);
         if (matchText("="))
           consumeRejectedDefault(
               previous().range.start,
-              "var-keyword argument cannot have default value", ")");
-        if (matchText(",") && !atText(")")) {
+              "var-keyword argument cannot have default value", terminator);
+        if (matchText(",") && !atText(terminator)) {
           error(current().range.start,
                 "arguments cannot follow var-keyword argument");
-          skipInvalidParameterTail(")");
+          skipInvalidParameterTail(terminator);
         }
         break;
       }
@@ -1151,11 +1180,13 @@ private:
         keywordOnly = true;
         if (at(TokenKind::Name)) {
           NodePtr parsedVararg =
-              parseParameterArg(/*allowStarAnnotation=*/true);
+              parameterArg(flavour, flavour.starArgMessage,
+                           /*allowStarAnnotation=*/true);
           if (matchText("="))
             consumeRejectedDefault(
                 previous().range.start,
-                "var-positional argument cannot have default value", ")");
+                "var-positional argument cannot have default value",
+                terminator);
           if (!duplicateStar)
             vararg = std::move(parsedVararg);
           if (matchText(","))
@@ -1164,40 +1195,45 @@ private:
         }
         bareStar = true;
         if (matchText(",")) {
-          if (std::optional<TypeCommentInfo> typeComment =
-                  takeTypeCommentInfoBeforeLineOffset(
-                      previous().range.start.line,
-                      parameterListEndOffsetFromCurrent())) {
-            error(typeComment->range.start,
-                  "bare * has associated type comment");
+          if (flavour.takesAnnotations) {
+            if (std::optional<TypeCommentInfo> typeComment =
+                    takeTypeCommentInfoBeforeLineOffset(
+                        previous().range.start.line,
+                        parameterListEndOffsetFromCurrent())) {
+              error(typeComment->range.start,
+                    "bare * has associated type comment");
+            }
           }
-          if (atText(")") || atText("**"))
+          if (atText(terminator) || atText("**"))
             error(previous().range.start, "named arguments must follow bare *");
           continue;
         }
-        if (atText(")"))
+        if (atText(terminator))
           error(previous().range.start, "named arguments must follow bare *");
-        if (!atText(")"))
-          error(current().range.start, "expected keyword-only parameter");
+        if (!atText(terminator))
+          error(current().range.start,
+                std::string(flavour.keywordOnlyMessage));
         break;
       }
 
       if (atText("(")) {
         error(current().range.start,
-              "Function parameters cannot be parenthesized");
-        skipBalancedParentheses();
-        skipInvalidParameterTail(")");
+              std::string(flavour.parenthesizedMessage));
+        if (flavour.recoversBalancedParentheses)
+          skipBalancedParentheses();
+        skipInvalidParameterTail(terminator);
         break;
       }
 
-      NodePtr arg = parseParameterArg();
+      NodePtr arg = parameterArg(flavour, flavour.argMessage);
       NodePtr defaultValue;
       if (matchText("="))
-        defaultValue = parseParameterDefault(previous().range.start, ")");
+        defaultValue = parseParameterDefault(previous().range.start,
+                                             terminator);
       if (atText("/") && index + 1 < tokens.size() &&
           tokens[index + 1].rawText == "*") {
         error(tokens[index + 1].range.start, "expected comma between / and *");
-        skipInvalidParameterTail(")");
+        skipInvalidParameterTail(terminator);
         break;
       }
 
@@ -1230,6 +1266,20 @@ private:
     addField(*arguments, "defaults", std::move(defaults));
     return arguments;
   }
+
+  NodePtr parseParameters() {
+    static constexpr ParameterListFlavour kFunction{
+        ")",
+        /*takesAnnotations=*/true,
+        /*recoversBalancedParentheses=*/true,
+        "",
+        "",
+        "",
+        "Function parameters cannot be parenthesized",
+        "expected keyword-only parameter"};
+    return parseParameterList(kFunction);
+  }
+
 
   NodePtr parseParameterArg(bool allowStarAnnotation = false) {
     SourceLocation start = current().range.start;
@@ -3157,129 +3207,16 @@ private:
   }
 
   NodePtr parseLambdaParameters() {
-    NodePtr arguments = makeNode("arguments");
-    std::vector<NodePtr> posonlyargs;
-    std::vector<NodePtr> args;
-    NodePtr vararg;
-    std::vector<NodePtr> kwonlyargs;
-    std::vector<NodePtr> kwDefaults;
-    NodePtr kwarg;
-    std::vector<NodePtr> defaults;
-    bool keywordOnly = false;
-    bool seenPositionalDefault = false;
-    bool seenSlash = false;
-    bool bareStar = false;
-
-    while (!atText(":") && !at(TokenKind::End)) {
-      if (matchText("/")) {
-        if (seenSlash)
-          error(previous().range.start, "/ may appear only once");
-        if (keywordOnly)
-          error(previous().range.start, "/ must be ahead of *");
-        if (args.empty() && !keywordOnly)
-          error(previous().range.start, "at least one argument must precede /");
-        posonlyargs.insert(posonlyargs.end(), args.begin(), args.end());
-        args.clear();
-        seenSlash = true;
-        if (matchText(","))
-          continue;
-        break;
-      }
-
-      if (matchText("**")) {
-        if (bareStar && kwonlyargs.empty())
-          error(previous().range.start, "named arguments must follow bare *");
-        kwarg = parseUnannotatedArg("expected lambda ** parameter name");
-        if (matchText("="))
-          consumeRejectedDefault(
-              previous().range.start,
-              "var-keyword argument cannot have default value", ":");
-        if (matchText(",") && !atText(":")) {
-          error(current().range.start,
-                "arguments cannot follow var-keyword argument");
-          skipInvalidParameterTail(":");
-        }
-        break;
-      }
-
-      if (matchText("*")) {
-        const bool duplicateStar = static_cast<bool>(vararg) || bareStar;
-        if (duplicateStar)
-          error(previous().range.start, "* argument may appear only once");
-        keywordOnly = true;
-        if (at(TokenKind::Name)) {
-          NodePtr parsedVararg =
-              parseUnannotatedArg("expected lambda * parameter name");
-          if (matchText("="))
-            consumeRejectedDefault(
-                previous().range.start,
-                "var-positional argument cannot have default value", ":");
-          if (!duplicateStar)
-            vararg = std::move(parsedVararg);
-          if (matchText(","))
-            continue;
-          break;
-        }
-        bareStar = true;
-        if (matchText(",")) {
-          if (atText(":") || atText("**"))
-            error(previous().range.start, "named arguments must follow bare *");
-          continue;
-        }
-        if (atText(":"))
-          error(previous().range.start, "named arguments must follow bare *");
-        if (!atText(":"))
-          error(current().range.start, "expected keyword-only lambda "
-                                       "parameter");
-        break;
-      }
-
-      if (atText("(")) {
-        error(current().range.start,
-              "Lambda expression parameters cannot be parenthesized");
-        skipInvalidParameterTail(":");
-        break;
-      }
-
-      NodePtr arg = parseUnannotatedArg("expected lambda parameter name");
-      NodePtr defaultValue;
-      if (matchText("="))
-        defaultValue = parseParameterDefault(previous().range.start, ":");
-      if (atText("/") && index + 1 < tokens.size() &&
-          tokens[index + 1].rawText == "*") {
-        error(tokens[index + 1].range.start, "expected comma between / and *");
-        skipInvalidParameterTail(":");
-        break;
-      }
-
-      if (keywordOnly) {
-        kwonlyargs.push_back(std::move(arg));
-        kwDefaults.push_back(std::move(defaultValue));
-      } else {
-        if (defaultValue)
-          seenPositionalDefault = true;
-        else if (seenPositionalDefault)
-          error(arg->range.start,
-                "parameter without a default follows parameter with a "
-                "default");
-        args.push_back(std::move(arg));
-        if (defaultValue)
-          defaults.push_back(std::move(defaultValue));
-      }
-
-      if (matchText(","))
-        continue;
-      break;
-    }
-
-    addField(*arguments, "posonlyargs", std::move(posonlyargs));
-    addField(*arguments, "args", std::move(args));
-    addField(*arguments, "vararg", vararg);
-    addField(*arguments, "kwonlyargs", std::move(kwonlyargs));
-    addField(*arguments, "kw_defaults", std::move(kwDefaults));
-    addField(*arguments, "kwarg", kwarg);
-    addField(*arguments, "defaults", std::move(defaults));
-    return arguments;
+    static constexpr ParameterListFlavour kLambda{
+        ":",
+        /*takesAnnotations=*/false,
+        /*recoversBalancedParentheses=*/false,
+        "expected lambda * parameter name",
+        "expected lambda ** parameter name",
+        "expected lambda parameter name",
+        "Lambda expression parameters cannot be parenthesized",
+        "expected keyword-only lambda parameter"};
+    return parseParameterList(kLambda);
   }
 
   NodePtr parseYield() {
@@ -3416,36 +3353,32 @@ private:
     return node;
   }
 
-  NodePtr parseOr() {
-    NodePtr expr = parseAnd();
-    if (!peg.matchesLiteral("disjunction", pegToken(index), "or"))
+  // `disjunction` and `conjunction` are one grammar shape: a flat BoolOp over
+  // operands from the level below, built only once the literal actually
+  // follows -- a single operand stays the operand's own node, not a one-value
+  // BoolOp.
+  NodePtr parseBoolLevel(std::string_view rule, std::string_view literal,
+                         NodePtr (ParserImpl::*parseOperand)()) {
+    NodePtr expr = (this->*parseOperand)();
+    if (!peg.matchesLiteral(rule, pegToken(index), literal))
       return expr;
     std::vector<NodePtr> values{expr};
-    while (matchPegLiteral("disjunction", "or")) {
-      values.push_back(parseAnd());
-    }
+    while (matchPegLiteral(rule, literal))
+      values.push_back((this->*parseOperand)());
     NodePtr node =
-        makeNode(actionAstKind("disjunction", "BoolOp"),
+        makeNode(actionAstKind(rule, "BoolOp"),
                  SourceRange{extendedStart(expr), extendedEnd(values.back())});
-    addField(*node, "op", boolOperator("or"));
+    addField(*node, "op", boolOperator(literal));
     addField(*node, "values", std::move(values));
     return node;
   }
 
+  NodePtr parseOr() {
+    return parseBoolLevel("disjunction", "or", &ParserImpl::parseAnd);
+  }
+
   NodePtr parseAnd() {
-    NodePtr expr = parseInversion();
-    if (!peg.matchesLiteral("conjunction", pegToken(index), "and"))
-      return expr;
-    std::vector<NodePtr> values{expr};
-    while (matchPegLiteral("conjunction", "and")) {
-      values.push_back(parseInversion());
-    }
-    NodePtr node =
-        makeNode(actionAstKind("conjunction", "BoolOp"),
-                 SourceRange{extendedStart(expr), extendedEnd(values.back())});
-    addField(*node, "op", boolOperator("and"));
-    addField(*node, "values", std::move(values));
-    return node;
+    return parseBoolLevel("conjunction", "and", &ParserImpl::parseInversion);
   }
 
   NodePtr parseInversion() {
