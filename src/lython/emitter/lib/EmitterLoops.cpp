@@ -117,76 +117,28 @@ Value stripLocalProtocolView(Value value) {
 
 namespace {
 
-// Break statements that target this loop, not one nested inside it.
+// Jumps that target THIS loop, not one nested inside it. Both spellings are
+// the shared statement-kind walk with the loop stop switched on; the second
+// exists because the source-iterator rewrite puts the body inside a `try`'s
+// else, and either kind of jump out of one is refused there.
 bool containsLoopLevelBreak(const parser::Node *node) {
-  if (!node)
-    return false;
-  if (node->kind == "Break")
-    return true;
-  if (node->kind == "For" || node->kind == "While" ||
-      node->kind == "AsyncFor" || node->kind == "FunctionDef" ||
-      node->kind == "AsyncFunctionDef" || node->kind == "ClassDef" ||
-      node->kind == "Lambda")
-    return false;
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (containsLoopLevelBreak(child->get()))
-        return true;
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &item : *children)
-        if (containsLoopLevelBreak(item.get()))
-          return true;
-    }
-  }
-  return false;
-}
-
-// Break OR continue targeting this loop. The source-iterator rewrite puts the
-// body inside a `try`'s else, and both forms of jump out of one are
-// "break/continue through try/finally in a loop with carried locals is not
-// supported" -- or, worse, a block with no terminator. Asking here keeps that
-// out of the rewrite rather than out of the lowering.
-bool containsLoopLevelJump(const parser::Node *node) {
-  if (!node)
-    return false;
-  if (node->kind == "Break" || node->kind == "Continue")
-    return true;
-  if (node->kind == "For" || node->kind == "While" ||
-      node->kind == "AsyncFor" || node->kind == "FunctionDef" ||
-      node->kind == "AsyncFunctionDef" || node->kind == "ClassDef" ||
-      node->kind == "Lambda")
-    return false;
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (containsLoopLevelJump(child->get()))
-        return true;
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &item : *children)
-        if (containsLoopLevelJump(item.get()))
-          return true;
-    }
-  }
-  return false;
-}
-
-bool containsLoopLevelJump(const std::vector<parser::NodePtr> *body) {
-  if (!body)
-    return false;
-  for (const parser::NodePtr &item : *body)
-    if (containsLoopLevelJump(item.get()))
-      return true;
-  return false;
+  llvm::StringRef kinds[] = {"Break"};
+  return containsStatementKind(node, kinds, /*stopAtLoops=*/true);
 }
 
 bool containsLoopLevelBreak(const std::vector<parser::NodePtr> *body) {
-  if (!body)
-    return false;
-  for (const parser::NodePtr &item : *body)
-    if (containsLoopLevelBreak(item.get()))
-      return true;
-  return false;
+  llvm::StringRef kinds[] = {"Break"};
+  return containsStatementKind(body, kinds, /*stopAtLoops=*/true);
+}
+
+bool containsLoopLevelJump(const parser::Node *node) {
+  llvm::StringRef kinds[] = {"Break", "Continue"};
+  return containsStatementKind(node, kinds, /*stopAtLoops=*/true);
+}
+
+bool containsLoopLevelJump(const std::vector<parser::NodePtr> *body) {
+  llvm::StringRef kinds[] = {"Break", "Continue"};
+  return containsStatementKind(body, kinds, /*stopAtLoops=*/true);
 }
 
 bool containsNamedExpr(const parser::Node *node) {

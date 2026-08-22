@@ -8,6 +8,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <cstdint>
 #include <memory>
 
 namespace py::lowering {
@@ -65,5 +66,12 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createMatmulMicroTilingPass(TensorLoweringTarget target = {});
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createMatmulVectorizationPass(TensorLoweringTarget target = {});
+
+// m*n*k, clamped to the maximum instead of wrapping, and 0 for any
+// non-positive extent. Takes the three extents rather than a shape struct:
+// the tile shape and the static-memref record both carry them, and each had
+// its own copy of the saturation.
+std::uint64_t saturatedMatmulWork(std::int64_t m, std::int64_t n,
+                                  std::int64_t k);
 
 } // namespace py::lowering

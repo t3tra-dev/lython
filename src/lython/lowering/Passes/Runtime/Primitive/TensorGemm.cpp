@@ -197,20 +197,6 @@ staticMatmulShape(mlir::linalg::MatmulOp matmul) {
                          rhsType.getDimSize(0)};
 }
 
-std::uint64_t saturatedMatmulWork(MatmulTileShape shape) {
-  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
-  std::uint64_t work = 1;
-  for (int64_t dim : {shape.m, shape.n, shape.k}) {
-    if (dim <= 0)
-      return 0;
-    std::uint64_t value = static_cast<std::uint64_t>(dim);
-    if (work > max / value)
-      return max;
-    work *= value;
-  }
-  return work;
-}
-
 // Clamp the macro M tile to a divisor of the actual extent. A tile wider than
 // M leaves the nest with nothing but a peeled remainder, and on a strided
 // operand (the row chunks the parallel dispatch cuts) the partial-tile path
@@ -247,7 +233,7 @@ MatmulLoweringPlan classifyMatmulLowering(mlir::linalg::MatmulOp matmul) {
       shape->k <= kMatmulScalarVectorKLimit)
     return MatmulLoweringPlan::ScalarOrVector;
 
-  if (saturatedMatmulWork(*shape) >= kMatmulPackedMinWork)
+  if (saturatedMatmulWork(shape->m, shape->n, shape->k) >= kMatmulPackedMinWork)
     return MatmulLoweringPlan::TiledPackedVector;
 
   return MatmulLoweringPlan::TiledVector;
@@ -953,6 +939,21 @@ private:
 };
 
 } // namespace
+
+std::uint64_t saturatedMatmulWork(std::int64_t m, std::int64_t n,
+                                  std::int64_t k) {
+  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t work = 1;
+  for (std::int64_t dim : {m, n, k}) {
+    if (dim <= 0)
+      return 0;
+    std::uint64_t value = static_cast<std::uint64_t>(dim);
+    if (work > max / value)
+      return max;
+    work *= value;
+  }
+  return work;
+}
 
 // The divisor of `extent` nearest `target`, preferring the larger on a tie.
 // `extent` itself is always a candidate, which is how a shape whose divisors all

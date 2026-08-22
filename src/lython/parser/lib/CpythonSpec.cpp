@@ -645,30 +645,15 @@ std::vector<std::string> parseAsdlFieldNames(std::string_view fields) {
   return result;
 }
 
-std::vector<std::string> splitTopLevelAlternatives(std::string_view text) {
+// The pieces of an ASDL line separated by `separator` outside parentheses,
+// each trimmed. The alternatives of a sum ('|') and the fields of a product
+// (',') are the same split with a different character.
+std::vector<std::string> splitTopLevel(std::string_view text, char separator) {
   std::vector<std::string> result;
   std::size_t cursor = 0;
   int depth = 0;
   for (std::size_t i = 0; i <= text.size(); ++i) {
-    if (i == text.size() || (text[i] == '|' && depth == 0)) {
-      result.push_back(trim(std::string(text.substr(cursor, i - cursor))));
-      cursor = i + 1;
-      continue;
-    }
-    if (text[i] == '(')
-      ++depth;
-    else if (text[i] == ')' && depth > 0)
-      --depth;
-  }
-  return result;
-}
-
-std::vector<std::string> splitTopLevelFields(std::string_view text) {
-  std::vector<std::string> result;
-  std::size_t cursor = 0;
-  int depth = 0;
-  for (std::size_t i = 0; i <= text.size(); ++i) {
-    if (i == text.size() || (text[i] == ',' && depth == 0)) {
+    if (i == text.size() || (text[i] == separator && depth == 0)) {
       result.push_back(trim(std::string(text.substr(cursor, i - cursor))));
       cursor = i + 1;
       continue;
@@ -709,7 +694,7 @@ AstFieldSpec parseAsdlFieldSpec(std::string field) {
 
 std::vector<AstFieldSpec> parseAsdlFieldSpecs(std::string_view fields) {
   std::vector<AstFieldSpec> result;
-  for (std::string field : splitTopLevelFields(fields)) {
+  for (std::string field : splitTopLevel(fields, ',')) {
     AstFieldSpec spec = parseAsdlFieldSpec(std::move(field));
     if (!spec.name.empty() && !spec.type.empty())
       result.push_back(std::move(spec));
@@ -831,7 +816,7 @@ AstSchema collectAstSchema(const std::string &asdl,
       continue;
     }
 
-    for (const std::string &alternative : splitTopLevelAlternatives(rhs)) {
+    for (const std::string &alternative : splitTopLevel(rhs, '|')) {
       std::string name = leadingIdentifier(alternative);
       if (!startsWithUppercaseIdentifier(name))
         continue;

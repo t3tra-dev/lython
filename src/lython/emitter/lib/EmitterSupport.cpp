@@ -211,89 +211,72 @@ bool insertionBlockTerminated(const mlir::OpBuilder &builder) {
   return previous->hasTrait<mlir::OpTrait::IsTerminator>();
 }
 
+// ⭐ ONE WALK FOR EVERY "does this subtree contain such a statement" QUESTION.
+// Four of them had grown -- return, break-or-continue, continue, and the loop
+// pair in EmitterLoops -- and they disagreed about where to look: two walked
+// the node's FIELDS, two walked `body`/`orelse`/`finalbody`/`handlers` by
+// name. The named-field walk misses a `match` case, whose statements hang off
+// `cases`, so a `break` inside a match inside a try inside a loop was not seen
+// by the guard that exists to catch it and reached the lowering as "reference
+// to block defined in another region".
+//
+// So the walk is over every field, and the two axes the callers actually
+// differ on are parameters: which kinds count, and whether a nested LOOP ends
+// the search (it does for break/continue, which target that loop, and does not
+// for return).
+bool containsStatementKind(const parser::Node *node,
+                           llvm::ArrayRef<llvm::StringRef> kinds,
+                           bool stopAtLoops) {
+  if (!node)
+    return false;
+  if (llvm::is_contained(kinds, llvm::StringRef(node->kind)))
+    return true;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return false;
+  if (stopAtLoops && (node->kind == "For" || node->kind == "AsyncFor" ||
+                      node->kind == "While"))
+    return false;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (containsStatementKind(child->get(), kinds, stopAtLoops))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &item : *children)
+        if (containsStatementKind(item.get(), kinds, stopAtLoops))
+          return true;
+    }
+  }
+  return false;
+}
+
 bool containsStatementKind(const std::vector<parser::NodePtr> *statements,
-                           llvm::ArrayRef<llvm::StringRef> kinds) {
+                           llvm::ArrayRef<llvm::StringRef> kinds,
+                           bool stopAtLoops) {
   if (!statements)
     return false;
-  for (const parser::NodePtr &statement : *statements) {
-    if (!statement)
-      continue;
-    if (llvm::is_contained(kinds, llvm::StringRef(statement->kind)))
+  for (const parser::NodePtr &statement : *statements)
+    if (containsStatementKind(statement.get(), kinds, stopAtLoops))
       return true;
-    if (statement->kind == "FunctionDef" ||
-        statement->kind == "AsyncFunctionDef" || statement->kind == "ClassDef")
-      continue;
-    if (containsStatementKind(ast::nodeList(*statement, "body"), kinds) ||
-        containsStatementKind(ast::nodeList(*statement, "orelse"), kinds) ||
-        containsStatementKind(ast::nodeList(*statement, "finalbody"), kinds))
-      return true;
-    if (const auto *handlers = ast::nodeList(*statement, "handlers"))
-      for (const parser::NodePtr &handler : *handlers)
-        if (handler &&
-            containsStatementKind(ast::nodeList(*handler, "body"), kinds))
-          return true;
-  }
   return false;
 }
 
 bool containsReturnStatement(const std::vector<parser::NodePtr> *statements) {
   llvm::StringRef kinds[] = {"Return"};
-  return containsStatementKind(statements, kinds);
+  return containsStatementKind(statements, kinds, /*stopAtLoops=*/false);
 }
 
 bool containsBreakOrContinueStatement(
     const std::vector<parser::NodePtr> *statements) {
-  if (!statements)
-    return false;
-  for (const parser::NodePtr &statement : *statements) {
-    if (!statement)
-      continue;
-    if (statement->kind == "Break" || statement->kind == "Continue")
-      return true;
-    if (statement->kind == "FunctionDef" ||
-        statement->kind == "AsyncFunctionDef" ||
-        statement->kind == "ClassDef" || statement->kind == "For" ||
-        statement->kind == "AsyncFor" || statement->kind == "While")
-      continue;
-    if (containsBreakOrContinueStatement(ast::nodeList(*statement, "body")) ||
-        containsBreakOrContinueStatement(ast::nodeList(*statement, "orelse")) ||
-        containsBreakOrContinueStatement(
-            ast::nodeList(*statement, "finalbody")))
-      return true;
-    if (const auto *handlers = ast::nodeList(*statement, "handlers"))
-      for (const parser::NodePtr &handler : *handlers)
-        if (handler &&
-            containsBreakOrContinueStatement(ast::nodeList(*handler, "body")))
-          return true;
-  }
-  return false;
+  llvm::StringRef kinds[] = {"Break", "Continue"};
+  return containsStatementKind(statements, kinds, /*stopAtLoops=*/true);
 }
 
 bool containsContinueStatement(
     const std::vector<parser::NodePtr> *statements) {
-  if (!statements)
-    return false;
-  for (const parser::NodePtr &statement : *statements) {
-    if (!statement)
-      continue;
-    if (statement->kind == "Continue")
-      return true;
-    if (statement->kind == "FunctionDef" ||
-        statement->kind == "AsyncFunctionDef" ||
-        statement->kind == "ClassDef" || statement->kind == "For" ||
-        statement->kind == "AsyncFor" || statement->kind == "While")
-      continue;
-    if (containsContinueStatement(ast::nodeList(*statement, "body")) ||
-        containsContinueStatement(ast::nodeList(*statement, "orelse")) ||
-        containsContinueStatement(ast::nodeList(*statement, "finalbody")))
-      return true;
-    if (const auto *handlers = ast::nodeList(*statement, "handlers"))
-      for (const parser::NodePtr &handler : *handlers)
-        if (handler &&
-            containsContinueStatement(ast::nodeList(*handler, "body")))
-          return true;
-  }
-  return false;
+  llvm::StringRef kinds[] = {"Continue"};
+  return containsStatementKind(statements, kinds, /*stopAtLoops=*/true);
 }
 
 bool containsObjectTop(mlir::Type type, const TypeSystem &types) {

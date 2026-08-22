@@ -2187,68 +2187,59 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
   return mlir::success();
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::lowerEnter(py::EnterOp op) {
+template <typename ManagerOp>
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerContextEnter(ManagerOp op, llvm::StringRef noun,
+                                       llvm::StringRef defaultMethod) {
   mlir::FailureOr<llvm::StringRef> methodName =
       RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
-                                                "__enter__");
+                                                defaultMethod);
   if (mlir::failed(methodName))
     return mlir::failure();
   return RuntimeBundleLowerer::lowerReceiverMethodResult(
-      op, op.getManager(), op.getResult(), "enter manager", *methodName,
+      op, op.getManager(), op.getResult(), noun, *methodName,
       /*preferManifestObjectResult=*/true);
+}
+
+template <typename ManagerOp>
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerContextExit(ManagerOp op, llvm::StringRef noun,
+                                      llvm::StringRef defaultMethod) {
+  llvm::SmallVector<mlir::Value, 4> inputs{op.getManager(), op.getExcType(),
+                                           op.getExcValue(), op.getTraceback()};
+  llvm::SmallVector<const RuntimeBundle *, 4> sources;
+  if (mlir::failed(collectObjectSources(op, inputs, noun, sources)))
+    return mlir::failure();
+  mlir::FailureOr<llvm::StringRef> methodName =
+      RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
+                                                defaultMethod);
+  if (mlir::failed(methodName))
+    return mlir::failure();
+  if (mlir::failed(lowerManifestMethodResult(
+          op, op.getResult(), *sources.front(), *methodName, sources,
+          /*allowUnusedSources=*/true,
+          /*preferManifestObjectResult=*/true)))
+    return mlir::failure();
+  erase.push_back(op);
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::lowerEnter(py::EnterOp op) {
+  return lowerContextEnter(op, "enter manager", "__enter__");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerExit(py::ExitOp op) {
-  llvm::SmallVector<mlir::Value, 4> inputs{op.getManager(), op.getExcType(),
-                                           op.getExcValue(), op.getTraceback()};
-  llvm::SmallVector<const RuntimeBundle *, 4> sources;
-  if (mlir::failed(collectObjectSources(
-          op, inputs, "exit operands need runtime bundles", sources)))
-    return mlir::failure();
-  mlir::FailureOr<llvm::StringRef> methodName =
-      RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
-                                                "__exit__");
-  if (mlir::failed(methodName))
-    return mlir::failure();
-  if (mlir::failed(lowerManifestMethodResult(
-          op, op.getResult(), *sources.front(), *methodName, sources,
-          /*allowUnusedSources=*/true,
-          /*preferManifestObjectResult=*/true)))
-    return mlir::failure();
-  erase.push_back(op);
-  return mlir::success();
+  return lowerContextExit(op, "exit operands need runtime bundles",
+                          "__exit__");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAEnter(py::AEnterOp op) {
-  mlir::FailureOr<llvm::StringRef> methodName =
-      RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
-                                                "__aenter__");
-  if (mlir::failed(methodName))
-    return mlir::failure();
-  return RuntimeBundleLowerer::lowerReceiverMethodResult(
-      op, op.getManager(), op.getResult(), "aenter manager", *methodName,
-      /*preferManifestObjectResult=*/true);
+  return lowerContextEnter(op, "aenter manager", "__aenter__");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAExit(py::AExitOp op) {
-  llvm::SmallVector<mlir::Value, 4> inputs{op.getManager(), op.getExcType(),
-                                           op.getExcValue(), op.getTraceback()};
-  llvm::SmallVector<const RuntimeBundle *, 4> sources;
-  if (mlir::failed(collectObjectSources(
-          op, inputs, "aexit operands need runtime bundles", sources)))
-    return mlir::failure();
-  mlir::FailureOr<llvm::StringRef> methodName =
-      RuntimeBundleLowerer::requireMethodTarget(op, op.getTargetAttr(),
-                                                "__aexit__");
-  if (mlir::failed(methodName))
-    return mlir::failure();
-  if (mlir::failed(lowerManifestMethodResult(
-          op, op.getResult(), *sources.front(), *methodName, sources,
-          /*allowUnusedSources=*/true,
-          /*preferManifestObjectResult=*/true)))
-    return mlir::failure();
-  erase.push_back(op);
-  return mlir::success();
+  return lowerContextExit(op, "aexit operands need runtime bundles",
+                          "__aexit__");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerAIter(py::AIterOp op) {

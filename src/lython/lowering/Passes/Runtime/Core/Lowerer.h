@@ -1438,6 +1438,16 @@ private:
   mlir::LogicalResult lowerExit(py::ExitOp op);
   mlir::LogicalResult lowerAEnter(py::AEnterOp op);
   mlir::LogicalResult lowerAExit(py::AExitOp op);
+  // `__enter__`/`__aenter__` and `__exit__`/`__aexit__` lower identically:
+  // the sync and async ops differ in their type, their default method name and
+  // the noun in their diagnostic. The four entry points above stay because the
+  // dispatch is a TypeSwitch over op types.
+  template <typename ManagerOp>
+  mlir::LogicalResult lowerContextEnter(ManagerOp op, llvm::StringRef noun,
+                                        llvm::StringRef defaultMethod);
+  template <typename ManagerOp>
+  mlir::LogicalResult lowerContextExit(ManagerOp op, llvm::StringRef noun,
+                                       llvm::StringRef defaultMethod);
   mlir::LogicalResult lowerAIter(py::AIterOp op);
   mlir::LogicalResult lowerANext(py::ANextOp op);
   mlir::LogicalResult lowerAwait(py::AwaitOp op);

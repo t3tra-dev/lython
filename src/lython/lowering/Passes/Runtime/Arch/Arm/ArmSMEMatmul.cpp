@@ -220,22 +220,8 @@ matchStaticSMEMatmul(mlir::linalg::MatmulOp matmul,
                              outType, m,   n,   k,   *layout, lhsTransposed};
 }
 
-std::uint64_t saturatedMatmulWork(const StaticMatmulMemRefs &refs) {
-  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
-  std::uint64_t work = 1;
-  for (int64_t dim : {refs.m, refs.n, refs.k}) {
-    if (dim <= 0)
-      return 0;
-    std::uint64_t value = static_cast<std::uint64_t>(dim);
-    if (work > max / value)
-      return max;
-    work *= value;
-  }
-  return work;
-}
-
 bool isProfitableStaticSMEMatmul(const StaticMatmulMemRefs &refs) {
-  return saturatedMatmulWork(refs) >= kSMEMatmulMinWork;
+  return saturatedMatmulWork(refs.m, refs.n, refs.k) >= kSMEMatmulMinWork;
 }
 
 // Lanes left at `offset`, floored at zero. The floor matters for the trailing

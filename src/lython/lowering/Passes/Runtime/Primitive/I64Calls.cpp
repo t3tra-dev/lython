@@ -57,58 +57,38 @@ mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
       .getResult();
 }
 
-mlir::Value signedAddOverflow(mlir::OpBuilder &builder, mlir::Location loc,
-                              mlir::Value lhs, mlir::Value rhs,
-                              mlir::Value result) {
-  mlir::Value zero = i64Constant(builder, loc, 0);
-  mlir::Value lhsNegative =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
-                                  lhs, zero)
-          .getResult();
-  mlir::Value rhsNegative =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
-                                  rhs, zero)
-          .getResult();
-  mlir::Value resultNegative =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
-                                  result, zero)
-          .getResult();
-  mlir::Value sameSign =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::eq,
-                                  lhsNegative, rhsNegative)
-          .getResult();
-  mlir::Value signChanged =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
-                                  resultNegative, lhsNegative)
-          .getResult();
-  return logicalAnd(builder, loc, sameSign, signChanged);
-}
+// Did a signed add or subtract wrap? The two differ in one predicate: an ADD
+// overflows only when the operands share a sign, a SUBTRACT only when they do
+// not, and both then ask whether the result's sign left the left operand's.
+// Spelling that as two functions meant maintaining the same six comparisons
+// twice.
+enum class SignedArith { Add, Subtract };
 
-mlir::Value signedSubOverflow(mlir::OpBuilder &builder, mlir::Location loc,
-                              mlir::Value lhs, mlir::Value rhs,
-                              mlir::Value result) {
+mlir::Value signedOverflow(mlir::OpBuilder &builder, mlir::Location loc,
+                           mlir::Value lhs, mlir::Value rhs, mlir::Value result,
+                           SignedArith arithmetic) {
   mlir::Value zero = i64Constant(builder, loc, 0);
-  mlir::Value lhsNegative =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
-                                  lhs, zero)
-          .getResult();
-  mlir::Value rhsNegative =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
-                                  rhs, zero)
-          .getResult();
-  mlir::Value resultNegative =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::slt,
-                                  result, zero)
-          .getResult();
-  mlir::Value differentSign =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
-                                  lhsNegative, rhsNegative)
-          .getResult();
+  auto negative = [&](mlir::Value value) {
+    return mlir::arith::CmpIOp::create(builder, loc,
+                                       mlir::arith::CmpIPredicate::slt, value,
+                                       zero)
+        .getResult();
+  };
+  mlir::Value lhsNegative = negative(lhs);
+  mlir::Value rhsNegative = negative(rhs);
+  mlir::Value resultNegative = negative(result);
+  mlir::Value operandSigns = mlir::arith::CmpIOp::create(
+                                 builder, loc,
+                                 arithmetic == SignedArith::Add
+                                     ? mlir::arith::CmpIPredicate::eq
+                                     : mlir::arith::CmpIPredicate::ne,
+                                 lhsNegative, rhsNegative)
+                                 .getResult();
   mlir::Value signChanged =
       mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
                                   resultNegative, lhsNegative)
           .getResult();
-  return logicalAnd(builder, loc, differentSign, signChanged);
+  return logicalAnd(builder, loc, operandSigns, signChanged);
 }
 
 std::pair<mlir::Value, mlir::Value>
@@ -119,12 +99,12 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
   case PrimitiveI64ArithmeticKind::Add: {
     mlir::Value result =
         mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
-    return {result, signedAddOverflow(builder, loc, lhs, rhs, result)};
+    return {result, signedOverflow(builder, loc, lhs, rhs, result, SignedArith::Add)};
   }
   case PrimitiveI64ArithmeticKind::Sub: {
     mlir::Value result =
         mlir::arith::SubIOp::create(builder, loc, lhs, rhs).getResult();
-    return {result, signedSubOverflow(builder, loc, lhs, rhs, result)};
+    return {result, signedOverflow(builder, loc, lhs, rhs, result, SignedArith::Subtract)};
   }
   case PrimitiveI64ArithmeticKind::Mul: {
     auto extended =

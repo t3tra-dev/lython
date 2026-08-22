@@ -137,3 +137,34 @@
 # the program with "protocol Iterator does not provide manifest method
 # '__next__'". Fixing it means giving the compiler's internal spellings a form
 # a program cannot shadow.
+
+
+# ==========================================================================
+# [WRONG] `break` out of a match arm, with no try around it   FOUND 2026-08-22
+#
+#     def run(values: list[int]) -> str:
+#         out = ""
+#         for v in values:
+#             match v:
+#                 case 2:
+#                     break
+#                 case _:
+#                     out = out + str(v)
+#         return out
+#
+#     print(run([1, 2, 3]))
+#
+# lyc: prints an EMPTY line, exit 0.
+# py : 1
+#
+# Silent. Pre-existing: the same on the session's pre-fix binary, so it is not
+# from the statement-walk unification -- that one FIXED the neighbouring shape
+# (the same break with a `try`/`finally` around it, which used to die in the
+# lowering as "reference to block defined in another region" and now agrees;
+# tests/golden/cases/a_jump_out_of_a_match_inside_a_try.py).
+#
+# Which says where to look: the match lowering builds the arm bodies as
+# regions, and the break edge out of an arm reaches the loop's after-block
+# without carrying what the body wrote. With a `try` in between, the try's own
+# jump handling carries it -- which is why the guarded shape is the one that
+# works.

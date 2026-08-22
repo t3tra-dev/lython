@@ -49,6 +49,15 @@ bool blockHasTerminator(mlir::Block &block);
 mlir::Operation *blockTerminator(mlir::Block &block);
 void setInsertionBeforeTerminator(mlir::OpBuilder &builder, mlir::Block &block);
 bool insertionBlockTerminated(const mlir::OpBuilder &builder);
+// Statements of one of `kinds` anywhere in the subtree. A nested function,
+// lambda or class always ends the search; `stopAtLoops` also ends it at a
+// nested loop, which is what a break/continue question wants.
+bool containsStatementKind(const parser::Node *node,
+                           llvm::ArrayRef<llvm::StringRef> kinds,
+                           bool stopAtLoops);
+bool containsStatementKind(const std::vector<parser::NodePtr> *statements,
+                           llvm::ArrayRef<llvm::StringRef> kinds,
+                           bool stopAtLoops);
 bool containsReturnStatement(const std::vector<parser::NodePtr> *statements);
 bool containsBreakOrContinueStatement(
     const std::vector<parser::NodePtr> *statements);

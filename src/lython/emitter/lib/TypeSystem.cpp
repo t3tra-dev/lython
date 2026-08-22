@@ -1080,58 +1080,29 @@ bool bindManifestModuleClassExports(TypeSystem &types, llvm::StringRef module,
   return handled;
 }
 
-bool bindManifestModuleFloatConstants(TypeSystem &types,
-                                      llvm::StringRef module,
-                                      llvm::StringRef localName) {
+// The manifest constants a module exports, bound under the importing name.
+// One walk over the three channels: they differ in which export list the
+// protocol table hands back and what type the name gets, and in nothing else.
+bool bindManifestModuleConstants(TypeSystem &types, llvm::StringRef module,
+                                 llvm::StringRef localName) {
   const py::protocols::Table &table =
       py::protocols::Table::get(types.getContext());
-  bool handled = false;
-  for (const std::string &exportedName :
-       table.moduleFloatConstantExports(module)) {
-    if (!handled)
-      bindManifestModuleObject(types, module, localName);
-    handled = true;
-    std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
-    types.bindCanonicalSymbol(
-        importedManifestModuleAttribute(module, localName, exportedName),
-        canonical, types.floatType());
-  }
-  return handled;
-}
+  const std::pair<std::vector<std::string>, mlir::Type> channels[] = {
+      {table.moduleFloatConstantExports(module), types.floatType()},
+      {table.moduleIntConstantExports(module), types.intType()},
+      {table.moduleStrConstantExports(module), types.strType()}};
 
-bool bindManifestModuleIntConstants(TypeSystem &types, llvm::StringRef module,
-                                    llvm::StringRef localName) {
-  const py::protocols::Table &table =
-      py::protocols::Table::get(types.getContext());
   bool handled = false;
-  for (const std::string &exportedName :
-       table.moduleIntConstantExports(module)) {
-    if (!handled)
-      bindManifestModuleObject(types, module, localName);
-    handled = true;
-    std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
-    types.bindCanonicalSymbol(
-        importedManifestModuleAttribute(module, localName, exportedName),
-        canonical, types.intType());
-  }
-  return handled;
-}
-
-bool bindManifestModuleStrConstants(TypeSystem &types, llvm::StringRef module,
-                                    llvm::StringRef localName) {
-  const py::protocols::Table &table =
-      py::protocols::Table::get(types.getContext());
-  bool handled = false;
-  for (const std::string &exportedName :
-       table.moduleStrConstantExports(module)) {
-    if (!handled)
-      bindManifestModuleObject(types, module, localName);
-    handled = true;
-    std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
-    types.bindCanonicalSymbol(
-        importedManifestModuleAttribute(module, localName, exportedName),
-        canonical, types.strType());
-  }
+  for (const auto &[exports, type] : channels)
+    for (const std::string &exportedName : exports) {
+      if (!handled)
+        bindManifestModuleObject(types, module, localName);
+      handled = true;
+      std::string canonical = (llvm::Twine(module) + "." + exportedName).str();
+      types.bindCanonicalSymbol(
+          importedManifestModuleAttribute(module, localName, exportedName),
+          canonical, type);
+    }
   return handled;
 }
 
@@ -2104,11 +2075,7 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
     handled = true;
   if (bindManifestModuleCallableExports(*this, module, localName))
     handled = true;
-  if (bindManifestModuleFloatConstants(*this, module, localName))
-    handled = true;
-  if (bindManifestModuleIntConstants(*this, module, localName))
-    handled = true;
-  if (bindManifestModuleStrConstants(*this, module, localName))
+  if (bindManifestModuleConstants(*this, module, localName))
     handled = true;
 
   return handled;
