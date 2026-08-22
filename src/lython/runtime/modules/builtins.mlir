@@ -19301,9 +19301,10 @@ module attributes {
   // diffs (`list` set the precedent with `__ly_list_alloc`). All five forks
   // now exist and the shared original is deleted -- so this comment records
   // why the duplication was accepted, not a shared function still to unify.
+  // PyTuple_New(n) takes exactly n slots, and a tuple never grows, so the
+  // minimum this used to round up to was pure waste -- 8 KB for a pair.
   func.func private @__ly_tuple_alloc(%length: i64) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
-    %minimum_capacity = arith.constant 64 : i64
     %handle_words = arith.constant 16 : i64
     %class_id = arith.constant 11 : i64
     %zero = arith.constant 0 : i64
@@ -19314,8 +19315,7 @@ module attributes {
     %items_slot = arith.constant 4 : index
 
     %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<14xi64>
-    %needs_min_capacity = arith.cmpi slt, %length, %minimum_capacity : i64
-    %capacity = arith.select %needs_min_capacity, %minimum_capacity, %length : i1, i64
+    %capacity = arith.maxsi %length, %zero : i64
     %payload_words = arith.muli %capacity, %handle_words : i64
     %payload_words_index = arith.index_cast %payload_words : i64 to index
     // Plain memref.alloc with no alignment attribute is a bare malloc, so the
