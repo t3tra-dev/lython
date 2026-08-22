@@ -1640,10 +1640,14 @@ void enqueueRegionSuccessor(mlir::Operation *owner, mlir::RegionSuccessor succ,
   worklist.push_back(std::move(state));
 }
 
-bool enqueueRegionEntryPaths(mlir::Operation *op, AffinePathState state,
+// The owned and the borrowed walk enter regions the same way: remap the group
+// through the branch's entry operands, and keep the fallthrough alive when a
+// region never mentions the group. Only the carried state differs.
+template <typename State>
+bool enqueueRegionEntryPaths(mlir::Operation *op, State state,
                              own::AliasAnalysis &aliases,
                              OwnershipWalkCache &walk,
-                             llvm::SmallVectorImpl<AffinePathState> &worklist) {
+                             llvm::SmallVectorImpl<State> &worklist) {
   auto branch = mlir::dyn_cast<mlir::RegionBranchOpInterface>(op);
   if (!branch)
     return false;
@@ -1658,23 +1662,13 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, AffinePathState state,
   bool handled = false;
   bool hasNoUseRegionPath = false;
   for (mlir::RegionSuccessor successor : successors) {
-    if (successor.isParent()) {
-      AffinePathState next = state;
-      mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
-      next.group = remapGroupThroughValueMapping(
-          sources, successor.getSuccessorInputs(), state.group, aliases);
-      enqueueRegionSuccessor(op, successor, std::move(next), worklist);
-      handled = true;
-      continue;
-    }
-
-    mlir::Region *region = successor.getSuccessor();
-    if (!walk.regionMentionsGroup(*region, state.group)) {
+    if (!successor.isParent() &&
+        !walk.regionMentionsGroup(*successor.getSuccessor(), state.group)) {
       hasNoUseRegionPath = true;
       continue;
     }
 
-    AffinePathState next = state;
+    State next = state;
     mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
     next.group = remapGroupThroughValueMapping(
         sources, successor.getSuccessorInputs(), state.group, aliases);
@@ -1683,60 +1677,7 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, AffinePathState state,
   }
 
   if (hasNoUseRegionPath) {
-    AffinePathState next = state;
-    next.block = op->getBlock();
-    next.start = op->getNextNode();
-    worklist.push_back(std::move(next));
-    handled = true;
-  }
-
-  return handled;
-}
-
-bool enqueueBorrowedRegionEntryPaths(
-    mlir::Operation *op, BorrowedPathState state, own::AliasAnalysis &aliases,
-    OwnershipWalkCache &walk,
-    llvm::SmallVectorImpl<BorrowedPathState> &worklist) {
-  auto branch = mlir::dyn_cast<mlir::RegionBranchOpInterface>(op);
-  if (!branch)
-    return false;
-
-  llvm::SmallVector<mlir::RegionSuccessor, 4> successors;
-  llvm::SmallVector<mlir::Attribute, 8> operandConstants =
-      unknownOperandConstants(op);
-  branch.getEntrySuccessorRegions(operandConstants, successors);
-  if (successors.empty())
-    return false;
-
-  bool handled = false;
-  bool hasNoUseRegionPath = false;
-  for (mlir::RegionSuccessor successor : successors) {
-    if (successor.isParent()) {
-      BorrowedPathState next = state;
-      mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
-      next.group = remapGroupThroughValueMapping(
-          sources, successor.getSuccessorInputs(), state.group, aliases);
-      enqueueRegionSuccessor(op, successor, std::move(next), worklist);
-      handled = true;
-      continue;
-    }
-
-    mlir::Region *region = successor.getSuccessor();
-    if (!walk.regionMentionsGroup(*region, state.group)) {
-      hasNoUseRegionPath = true;
-      continue;
-    }
-
-    BorrowedPathState next = state;
-    mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
-    next.group = remapGroupThroughValueMapping(
-        sources, successor.getSuccessorInputs(), state.group, aliases);
-    enqueueRegionSuccessor(op, successor, std::move(next), worklist);
-    handled = true;
-  }
-
-  if (hasNoUseRegionPath) {
-    BorrowedPathState next = state;
+    State next = state;
     next.block = op->getBlock();
     next.start = op->getNextNode();
     worklist.push_back(std::move(next));
@@ -2168,7 +2109,7 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       }
 
       if (op->getNumRegions() != 0 &&
-          enqueueBorrowedRegionEntryPaths(op, state, aliases, walk, worklist)) {
+          enqueueRegionEntryPaths(op, state, aliases, walk, worklist)) {
         op = nullptr;
         break;
       }

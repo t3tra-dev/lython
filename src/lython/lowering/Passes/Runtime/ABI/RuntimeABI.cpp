@@ -1505,23 +1505,11 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
   return mlir::success();
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::materializeStringObject(
-    mlir::Operation *op, llvm::StringRef text, RuntimeBundle &bundle) {
-  mlir::Location loc = op->getLoc();
-  mlir::Value bytes = RuntimeBundleLowerer::materializeByteBuffer(loc, text);
-  mlir::Value start =
-      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-  mlir::Value length =
-      mlir::arith::ConstantIntOp::create(
-          builder, loc, static_cast<std::int64_t>(text.size()), 64)
-          .getResult();
-  return RuntimeBundleLowerer::initializeObjectFromRawValues(
-      op, runtimeContractType(context, "builtins.str"),
-      mlir::ValueRange{bytes, start, length}, bundle);
-}
-
-mlir::LogicalResult RuntimeBundleLowerer::materializeBytesObject(
-    mlir::Operation *op, llvm::StringRef data, RuntimeBundle &bundle) {
+// str and bytes share one physical shape (buffer, start, length), so the
+// contract name is the whole difference between materializing the two.
+mlir::LogicalResult RuntimeBundleLowerer::materializeByteBackedObject(
+    mlir::Operation *op, llvm::StringRef contractName, llvm::StringRef data,
+    RuntimeBundle &bundle) {
   mlir::Location loc = op->getLoc();
   mlir::Value bytes = RuntimeBundleLowerer::materializeByteBuffer(loc, data);
   mlir::Value start =
@@ -1531,8 +1519,18 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeBytesObject(
           builder, loc, static_cast<std::int64_t>(data.size()), 64)
           .getResult();
   return RuntimeBundleLowerer::initializeObjectFromRawValues(
-      op, runtimeContractType(context, "builtins.bytes"),
+      op, runtimeContractType(context, contractName),
       mlir::ValueRange{bytes, start, length}, bundle);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::materializeStringObject(
+    mlir::Operation *op, llvm::StringRef text, RuntimeBundle &bundle) {
+  return materializeByteBackedObject(op, "builtins.str", text, bundle);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::materializeBytesObject(
+    mlir::Operation *op, llvm::StringRef data, RuntimeBundle &bundle) {
+  return materializeByteBackedObject(op, "builtins.bytes", data, bundle);
 }
 
 bool RuntimeBundleLowerer::needsDefaultObjectRepr(
@@ -1945,38 +1943,41 @@ void RuntimeBundleLowerer::stampBoxedStrHookResult(llvm::StringRef hookName) {
                 attrBuilder.getStringAttr("builtins.str"));
 }
 
+// Demand-driven: the external declaration merged in from the manifest is what
+// asks for the definition, and an unused public hook is not eliminated.
+bool RuntimeBundleLowerer::boxedHookIsDemanded(llvm::StringRef hookName) {
+  auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName);
+  return existing && existing.isExternal();
+}
+
+// The manifest functions that implement `methodName` for their own class.
+static std::function<bool(mlir::func::FuncOp)>
+manifestMethodIs(llvm::StringRef methodName) {
+  return [methodName](mlir::func::FuncOp function) {
+    auto method = function->getAttrOfType<mlir::StringAttr>(
+        contracts::kManifestMethodAttr);
+    return method && method.getValue() == methodName;
+  };
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHookFor(
     llvm::StringRef hookName, llvm::StringRef methodName,
     mlir::TypeRange calleeResultTypes) {
-  // Demand-driven: the external declaration merged in from the manifest is
-  // what asks for the definition, and an unused public hook is not eliminated.
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName);
-      !existing || !existing.isExternal())
+  if (!boxedHookIsDemanded(hookName))
     return mlir::success();
-  return generateBoxedMethodHook(
-      hookName,
-      [methodName](mlir::func::FuncOp function) {
-        auto method = function->getAttrOfType<mlir::StringAttr>(
-            contracts::kManifestMethodAttr);
-        return method && method.getValue() == methodName;
-      },
-      calleeResultTypes, /*shareExceptionSubclasses=*/false, methodName);
+  return generateBoxedMethodHook(hookName, manifestMethodIs(methodName),
+                                 calleeResultTypes,
+                                 /*shareExceptionSubclasses=*/false,
+                                 methodName);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
     llvm::StringRef hookName, llvm::StringRef methodName,
     mlir::TypeRange calleeResultTypes) {
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName);
-      !existing || !existing.isExternal())
+  if (!boxedHookIsDemanded(hookName))
     return mlir::success();
-  return generateBoxedBinaryMethodHook(
-      hookName,
-      [methodName](mlir::func::FuncOp function) {
-        auto method = function->getAttrOfType<mlir::StringAttr>(
-            contracts::kManifestMethodAttr);
-        return method && method.getValue() == methodName;
-      },
-      calleeResultTypes, methodName);
+  return generateBoxedBinaryMethodHook(hookName, manifestMethodIs(methodName),
+                                       calleeResultTypes, methodName);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
@@ -2119,9 +2120,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
   // ⛔ The demand check is repeated here, ahead of the shared one. The
   // adapters below mint functions, so running them for a program that never
   // asked for the hook would leave dead definitions in the module.
-  if (auto existing =
-          module.lookupSymbol<mlir::func::FuncOp>("__ly_hash_boxed_by_contract");
-      !existing || !existing.isExternal())
+  if (!boxedHookIsDemanded("__ly_hash_boxed_by_contract"))
     return mlir::success();
   // The adapters first: a compiled source-class `__hash__` returns the
   // boxed-int ABI, which the uniform i64 dispatch cannot call directly.

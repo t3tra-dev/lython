@@ -1,6 +1,7 @@
 #include "ClosureAnalysis.h"
 
 #include "AstAccess.h"
+#include "EmitterSupport.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -12,20 +13,6 @@ namespace {
 bool hasContext(const parser::Node &node, llvm::StringRef expected) {
   const parser::Node *ctx = ast::node(node, "ctx");
   return ctx && ctx->kind == expected;
-}
-
-void collectTargetNames(const parser::Node *node, llvm::StringSet<> &names) {
-  if (!node)
-    return;
-  if (node->kind == "Name") {
-    names.insert(ast::nameSpelling(*node));
-    return;
-  }
-  if (node->kind == "Tuple" || node->kind == "List") {
-    if (const auto *elts = ast::nodeList(*node, "elts"))
-      for (const parser::NodePtr &elt : *elts)
-        collectTargetNames(elt.get(), names);
-  }
 }
 
 void collectParameterNames(const parser::Node *arguments,
@@ -61,16 +48,16 @@ void collectLocalNames(const parser::Node *node, llvm::StringSet<> &names) {
   if (node->kind == "Assign") {
     if (const auto *targets = ast::nodeList(*node, "targets"))
       for (const parser::NodePtr &target : *targets)
-        collectTargetNames(target.get(), names);
+        collectAssignedNameTargets(target.get(), names);
   } else if (node->kind == "AnnAssign" || node->kind == "AugAssign" ||
              node->kind == "NamedExpr") {
-    collectTargetNames(ast::node(*node, "target"), names);
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
   } else if (node->kind == "For" || node->kind == "AsyncFor") {
-    collectTargetNames(ast::node(*node, "target"), names);
+    collectAssignedNameTargets(ast::node(*node, "target"), names);
   } else if (node->kind == "With" || node->kind == "AsyncWith") {
     if (const auto *items = ast::nodeList(*node, "items"))
       for (const parser::NodePtr &item : *items)
-        collectTargetNames(ast::node(*item, "optional_vars"), names);
+        collectAssignedNameTargets(ast::node(*item, "optional_vars"), names);
   }
   for (const parser::Field &field : node->fields) {
     if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
@@ -279,17 +266,17 @@ void countNameAssignments(const parser::Node *node,
       node->kind == "AugAssign" || node->kind == "NamedExpr") {
     llvm::StringSet<> targets;
     if (const parser::Node *target = ast::node(*node, "target"))
-      collectTargetNames(target, targets);
+      collectAssignedNameTargets(target, targets);
     if (const auto *targetList = ast::nodeList(*node, "targets"))
       for (const parser::NodePtr &target : *targetList)
-        collectTargetNames(target.get(), targets);
+        collectAssignedNameTargets(target.get(), targets);
     for (const auto &entry : targets)
       ++counts[entry.getKey()];
   }
   if (node->kind == "For" || node->kind == "AsyncFor")
     if (const parser::Node *target = ast::node(*node, "target")) {
       llvm::StringSet<> targets;
-      collectTargetNames(target, targets);
+      collectAssignedNameTargets(target, targets);
       // A loop target is rebound every trip, which is more than once.
       for (const auto &entry : targets)
         counts[entry.getKey()] += 2;

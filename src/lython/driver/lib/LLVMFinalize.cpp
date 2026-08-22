@@ -1,5 +1,7 @@
 #include "DriverCodeGen.h"
 
+#include "Common/PythonSourceRange.h"
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
@@ -182,22 +184,6 @@ void rewriteExceptionPersonalityForTarget(llvm::Module &llvmModule) {
     itanium->replaceAllUsesWith(personalityFn);
 }
 
-static std::optional<FileLineColLoc> findPythonSourceLoc(Location loc) {
-  if (auto fileLoc = dyn_cast<FileLineColLoc>(loc)) {
-    if (fileLoc.getFilename().getValue().ends_with(".py"))
-      return fileLoc;
-    return std::nullopt;
-  }
-  if (auto nameLoc = dyn_cast<NameLoc>(loc))
-    return findPythonSourceLoc(nameLoc.getChildLoc());
-  if (auto fused = dyn_cast<FusedLoc>(loc)) {
-    for (Location child : fused.getLocations())
-      if (auto found = findPythonSourceLoc(child))
-        return found;
-  }
-  return std::nullopt;
-}
-
 struct PythonDebugScopeCache {
   MLIRContext *context;
   llvm::StringMap<LLVM::DIFileAttr> files;
@@ -252,7 +238,7 @@ void attachPythonDebugInfo(ModuleOp module) {
       return;
 
     std::optional<FileLineColLoc> sourceLoc =
-        findPythonSourceLoc(function.getLoc());
+        py::findPythonSourceLoc(function.getLoc());
     if (!sourceLoc)
       return;
 
@@ -282,7 +268,7 @@ void attachPythonDebugInfo(ModuleOp module) {
     function.walk([&](Operation *op) {
       if (op == function.getOperation())
         return;
-      if (!findPythonSourceLoc(op->getLoc()))
+      if (!py::findPythonSourceLoc(op->getLoc()))
         return;
       op->setLoc(scopedPythonDebugLoc(op->getLoc(), subprogram));
     });

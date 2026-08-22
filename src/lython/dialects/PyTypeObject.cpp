@@ -1,4 +1,5 @@
 #include "PyTypeObject.h"
+#include "C3Linearization.h"
 #include "PyProtocols.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
@@ -47,46 +48,13 @@ basesOf(mlir::Operation *diagnostic, ClassOp op) {
 mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 8>>
 c3Merge(llvm::SmallVector<llvm::SmallVector<llvm::StringRef, 8>, 8> sequences,
         mlir::Operation *diagnostic, llvm::StringRef className) {
-  llvm::SmallVector<llvm::StringRef, 8> result;
-  auto compact = [&]() {
-    llvm::SmallVector<llvm::SmallVector<llvm::StringRef, 8>, 8> next;
-    for (auto &sequence : sequences)
-      if (!sequence.empty())
-        next.push_back(std::move(sequence));
-    sequences = std::move(next);
-  };
-  compact();
-
-  while (!sequences.empty()) {
-    std::optional<llvm::StringRef> candidate;
-    for (const auto &sequence : sequences) {
-      llvm::StringRef head = sequence.front();
-      bool appearsInTail = false;
-      for (const auto &other : sequences) {
-        if (llvm::is_contained(
-                llvm::ArrayRef<llvm::StringRef>(other).drop_front(), head)) {
-          appearsInTail = true;
-          break;
-        }
-      }
-      if (!appearsInTail) {
-        candidate = head;
-        break;
-      }
-    }
-    if (!candidate) {
-      diagnostic->emitOpError("inconsistent C3 MRO for class '")
-          << className << "'";
-      return mlir::failure();
-    }
-
-    result.push_back(*candidate);
-    for (auto &sequence : sequences)
-      if (!sequence.empty() && sequence.front() == *candidate)
-        sequence.erase(sequence.begin());
-    compact();
+  auto merged = lython::common::c3Merge(std::move(sequences));
+  if (!merged) {
+    diagnostic->emitOpError("inconsistent C3 MRO for class '")
+        << className << "'";
+    return mlir::failure();
   }
-  return result;
+  return *merged;
 }
 
 mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 8>>

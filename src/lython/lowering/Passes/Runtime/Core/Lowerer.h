@@ -505,6 +505,10 @@ private:
   mlir::FailureOr<RuntimeValue>
   materializeClassObjectValue(mlir::Operation *op, py::ClassOp classOp,
                               mlir::Type contract, llvm::StringRef purpose);
+  mlir::LogicalResult materializeByteBackedObject(mlir::Operation *op,
+                                                  llvm::StringRef contractName,
+                                                  llvm::StringRef data,
+                                                  RuntimeBundle &bundle);
   mlir::LogicalResult materializeStringObject(mlir::Operation *op,
                                               llvm::StringRef text,
                                               RuntimeBundle &bundle);
@@ -847,6 +851,7 @@ private:
   // that `ly.runtime.method`, and let compiled source-class methods of the
   // same name join -- so the name and the callee's result shape are all that
   // varies. Five of them had those three steps written out.
+  bool boxedHookIsDemanded(llvm::StringRef hookName);
   mlir::LogicalResult generateBoxedMethodHookFor(
       llvm::StringRef hookName, llvm::StringRef methodName,
       mlir::TypeRange calleeResultTypes);

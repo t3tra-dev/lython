@@ -4617,9 +4617,9 @@ private:
             contentRange.start, contentRange.end - contentRange.start);
         SourceLocation contentStart =
             locationAt(literal.range.start, literal.text, contentRange.start);
-        std::vector<NodePtr> parts =
-            parseTStringValues(literal.range, content, contentStart,
-                               literalPrefixContains(literal.text, 'r'));
+        std::vector<NodePtr> parts = parseInterpolatedValues(
+            kTStringFlavour, literal.range, content, contentStart,
+            literalPrefixContains(literal.text, 'r'));
         appendStringNodes(values, std::move(parts));
       }
       addField(*node, "values", std::move(values));
@@ -4666,9 +4666,9 @@ private:
           contentRange.start, contentRange.end - contentRange.start);
       SourceLocation contentStart =
           locationAt(literal.range.start, literal.text, contentRange.start);
-      std::vector<NodePtr> fValues =
-          parseFStringValues(literal.range, content, contentStart,
-                             literalPrefixContains(literal.text, 'r'));
+      std::vector<NodePtr> fValues = parseInterpolatedValues(
+          kFStringFlavour, literal.range, content, contentStart,
+          literalPrefixContains(literal.text, 'r'));
       appendStringNodes(values, std::move(fValues));
     }
     flushPlain();
@@ -4940,109 +4940,56 @@ private:
     return true;
   }
 
-  std::vector<NodePtr> parseFStringValues(
-      SourceRange range, const std::string &content,
-      SourceLocation contentStart, bool rawString = false,
-      std::string_view replacementRule = "fstring_replacement_field",
-      std::string_view fullFormatSpecRule = "fstring_full_format_spec") {
-    std::vector<NodePtr> values;
-    std::string chunk;
-    std::optional<std::size_t> chunkStart;
-    auto pushChunkChar = [&](char value, std::size_t index) {
-      if (chunk.empty())
-        chunkStart = index;
-      chunk.push_back(value);
-    };
-    auto flushChunk = [&](std::size_t end) {
-      if (chunk.empty())
-        return;
-      appendStringNode(values, makeStringConstant(rangeAt(contentStart, content,
-                                                          *chunkStart, end),
-                                                  std::move(chunk)));
-      chunk.clear();
-      chunkStart.reset();
-    };
-    for (std::size_t i = 0; i < content.size(); ++i) {
-      char ch = content[i];
-      if (!rawString && ch == '\\' && i + 1 < content.size()) {
-        if (chunk.empty())
-          chunkStart = i;
-      }
-      if (appendFStringEscapedChunk(chunk, content, i, rawString))
-        continue;
-      if (ch == '{' && i + 1 < content.size() && content[i + 1] == '{') {
-        pushChunkChar('{', i);
-        ++i;
-        continue;
-      }
-      if (ch == '}' && i + 1 < content.size() && content[i + 1] == '}') {
-        pushChunkChar('}', i);
-        ++i;
-        continue;
-      }
-      if (ch == '}') {
-        error(range.start, "single '}' is not allowed in f-string");
-        break;
-      }
-      if (ch != '{') {
-        pushChunkChar(ch, i);
-        continue;
-      }
+  // ⭐ ONE INTERPOLATED-STRING SCANNER. f-strings and t-strings share the
+  // whole scan -- doubled braces, escapes, field boundaries, nested format
+  // specs -- and differ only in the node each field becomes and the grammar
+  // rule names that name it. That was two copies of the scan.
+  struct InterpolatedStringFlavour {
+    std::string_view diagnosticName;
+    std::string_view replacementRule;
+    std::string_view replacementHelper;
+    std::string_view replacementNode;
+    std::string_view fullFormatSpecRule;
+    // The rule that names replacement fields nested inside a format spec.
+    std::string_view formatSpecReplacementRule;
+    // Interpolation keeps the field's source text; FormattedValue does not.
+    bool keepsSourceText;
+  };
 
-      flushChunk(i);
-      std::size_t end = findFStringFieldEnd(content, i + 1);
-      if (end == std::string::npos) {
-        error(range.start, "unterminated f-string replacement field");
-        break;
-      }
-      SourceRange formattedRange = rangeAt(contentStart, content, i, end + 1);
-      FStringField field = parseFStringField(
-          formattedRange, content.substr(i + 1, end - i - 1), "f-string");
-      if (field.debugText)
-        appendStringNode(
-            values, makeStringConstant(rangeAt(contentStart, content, i + 1,
-                                               i + 1 + field.debugText->size()),
-                                       *field.debugText));
-      NodePtr formatted = makeNode(
-          actionHelperAstKind(replacementRule, "_PyPegen_formatted_value",
-                              "FormattedValue", "FormattedValue"),
-          formattedRange);
-      SourceLocation expressionStart =
-          locationAt(contentStart, content, i + 1 + field.expressionOffset);
-      addField(*formatted, "value",
-               field.invalid
-                   ? makeNode("Error", formattedRange)
-                   : parseInlineAnnotatedRhs(field.expression, formattedRange,
-                                             "f-string", expressionStart));
-      addField(*formatted, "conversion", field.conversion);
-      NodePtr formatSpecNode;
-      if (field.formatSpec) {
-        SourceRange formatSpecRange = rangeAt(
-            contentStart, content, i + 1 + field.formatDelimiterOffset, end);
-        SourceLocation formatStart =
-            locationAt(contentStart, content, i + 1 + field.formatOffset);
-        formatSpecNode =
-            makeNode(actionHelperAstKind(fullFormatSpecRule,
-                                         "_PyPegen_setup_full_format_spec",
-                                         "JoinedStr", "JoinedStr"),
-                     formatSpecRange);
-        addField(*formatSpecNode, "values",
-                 parseFStringValues(formatSpecRange, *field.formatSpec,
-                                    formatStart, rawString, replacementRule,
-                                    fullFormatSpecRule));
-      }
-      addField(*formatted, "format_spec", formatSpecNode);
-      values.push_back(std::move(formatted));
-      i = end;
-    }
-    flushChunk(content.size());
-    return values;
+  static constexpr InterpolatedStringFlavour kFStringFlavour{
+      "f-string",
+      "fstring_replacement_field",
+      "_PyPegen_formatted_value",
+      "FormattedValue",
+      "fstring_full_format_spec",
+      "fstring_replacement_field",
+      /*keepsSourceText=*/false};
+
+  static constexpr InterpolatedStringFlavour kTStringFlavour{
+      "t-string",
+      "tstring_replacement_field",
+      "_PyPegen_interpolation",
+      "Interpolation",
+      "tstring_full_format_spec",
+      "tstring_format_spec_replacement_field",
+      /*keepsSourceText=*/true};
+
+  // ⛔ A format spec's own fields are FormattedValue even inside a t-string
+  // (CPython builds the spec with _PyPegen_setup_full_format_spec, which takes
+  // a JoinedStr), so only the rule names carry the flavour down.
+  static InterpolatedStringFlavour
+  formatSpecFlavour(const InterpolatedStringFlavour &flavour) {
+    InterpolatedStringFlavour spec = kFStringFlavour;
+    spec.replacementRule = flavour.formatSpecReplacementRule;
+    spec.formatSpecReplacementRule = flavour.formatSpecReplacementRule;
+    spec.fullFormatSpecRule = flavour.fullFormatSpecRule;
+    return spec;
   }
 
-  std::vector<NodePtr> parseTStringValues(SourceRange range,
-                                          const std::string &content,
-                                          SourceLocation contentStart,
-                                          bool rawString = false) {
+  std::vector<NodePtr>
+  parseInterpolatedValues(const InterpolatedStringFlavour &flavour,
+                          SourceRange range, const std::string &content,
+                          SourceLocation contentStart, bool rawString) {
     std::vector<NodePtr> values;
     std::string chunk;
     std::optional<std::size_t> chunkStart;
@@ -5079,7 +5026,8 @@ private:
         continue;
       }
       if (ch == '}') {
-        error(range.start, "single '}' is not allowed in t-string");
+        error(range.start, "single '}' is not allowed in " +
+                               std::string(flavour.diagnosticName));
         break;
       }
       if (ch != '{') {
@@ -5090,34 +5038,34 @@ private:
       flushChunk(i);
       std::size_t end = findFStringFieldEnd(content, i + 1);
       if (end == std::string::npos) {
-        error(range.start, "unterminated t-string replacement field");
+        error(range.start, "unterminated " +
+                               std::string(flavour.diagnosticName) +
+                               " replacement field");
         break;
       }
-
-      SourceRange interpolationRange =
-          rangeAt(contentStart, content, i, end + 1);
-      FStringField field = parseFStringField(
-          interpolationRange, content.substr(i + 1, end - i - 1), "t-string");
+      SourceRange fieldRange = rangeAt(contentStart, content, i, end + 1);
+      FStringField field =
+          parseFStringField(fieldRange, content.substr(i + 1, end - i - 1),
+                            flavour.diagnosticName);
       if (field.debugText)
         appendStringNode(
             values, makeStringConstant(rangeAt(contentStart, content, i + 1,
                                                i + 1 + field.debugText->size()),
                                        *field.debugText));
-
-      NodePtr interpolation =
-          makeNode(actionHelperAstKind("tstring_replacement_field",
-                                       "_PyPegen_interpolation",
-                                       "Interpolation", "Interpolation"),
-                   interpolationRange);
+      NodePtr replacement = makeNode(
+          actionHelperAstKind(flavour.replacementRule, flavour.replacementHelper,
+                              flavour.replacementNode, flavour.replacementNode),
+          fieldRange);
       SourceLocation expressionStart =
           locationAt(contentStart, content, i + 1 + field.expressionOffset);
-      addField(*interpolation, "value",
-               field.invalid ? makeNode("Error", interpolationRange)
+      addField(*replacement, "value",
+               field.invalid ? makeNode("Error", fieldRange)
                              : parseInlineAnnotatedRhs(
-                                   field.expression, interpolationRange,
-                                   "t-string", expressionStart));
-      addField(*interpolation, "str", field.interpolationText);
-      addField(*interpolation, "conversion", field.conversion);
+                                   field.expression, fieldRange,
+                                   flavour.diagnosticName, expressionStart));
+      if (flavour.keepsSourceText)
+        addField(*replacement, "str", field.interpolationText);
+      addField(*replacement, "conversion", field.conversion);
       NodePtr formatSpecNode;
       if (field.formatSpec) {
         SourceRange formatSpecRange = rangeAt(
@@ -5125,54 +5073,21 @@ private:
         SourceLocation formatStart =
             locationAt(contentStart, content, i + 1 + field.formatOffset);
         formatSpecNode =
-            makeNode(actionHelperAstKind("tstring_full_format_spec",
+            makeNode(actionHelperAstKind(flavour.fullFormatSpecRule,
                                          "_PyPegen_setup_full_format_spec",
                                          "JoinedStr", "JoinedStr"),
                      formatSpecRange);
         addField(*formatSpecNode, "values",
-                 parseFStringValues(formatSpecRange, *field.formatSpec,
-                                    formatStart, rawString,
-                                    "tstring_format_spec_replacement_field",
-                                    "tstring_full_format_spec"));
+                 parseInterpolatedValues(formatSpecFlavour(flavour),
+                                         formatSpecRange, *field.formatSpec,
+                                         formatStart, rawString));
       }
-      addField(*interpolation, "format_spec", formatSpecNode);
-      values.push_back(std::move(interpolation));
+      addField(*replacement, "format_spec", formatSpecNode);
+      values.push_back(std::move(replacement));
       i = end;
     }
     flushChunk(content.size());
     return values;
-  }
-
-  NodePtr parseJoinedStringLiteral(SourceLocation start, const Token &token) {
-    NodePtr node =
-        makeNode(actionHelperAstKind("fstring", "_PyPegen_joined_str",
-                                     "JoinedStr", "JoinedStr"),
-                 SourceRange{start, token.range.end});
-    StringContentRange contentRange = stringContentRange(token.text);
-    std::string content = token.text.substr(
-        contentRange.start, contentRange.end - contentRange.start);
-    SourceLocation contentStart =
-        locationAt(token.range.start, token.text, contentRange.start);
-    addField(*node, "values",
-             parseFStringValues(node->range, content, contentStart,
-                                literalPrefixContains(token.text, 'r')));
-    return node;
-  }
-
-  NodePtr parseTemplateStringLiteral(SourceLocation start, const Token &token) {
-    NodePtr node =
-        makeNode(actionHelperAstKind("tstring", "_PyPegen_template_str",
-                                     "TemplateStr", "TemplateStr"),
-                 SourceRange{start, token.range.end});
-    StringContentRange contentRange = stringContentRange(token.text);
-    std::string content = token.text.substr(
-        contentRange.start, contentRange.end - contentRange.start);
-    SourceLocation contentStart =
-        locationAt(token.range.start, token.text, contentRange.start);
-    addField(*node, "values",
-             parseTStringValues(node->range, content, contentStart,
-                                literalPrefixContains(token.text, 'r')));
-    return node;
   }
 };
 

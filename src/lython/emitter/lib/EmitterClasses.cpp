@@ -6,6 +6,7 @@
 #include "AstAccess.h"
 #include "ClosureAnalysis.h"
 #include "Contracts.h"
+#include "C3Linearization.h"
 #include "ExceptionTaxonomy.h"
 #include "PyProtocols.h"
 #include "TypeSystemSolver.h"
@@ -179,47 +180,6 @@ manifestLinearization(llvm::StringRef contractName) {
   if (chain.back() != "builtins.object")
     chain.push_back("builtins.object");
   return chain;
-}
-
-// C3 merge over contract-name sequences. Nullopt when no linearization
-// exists (the CPython TypeError case); the caller owns the diagnostic.
-std::optional<llvm::SmallVector<std::string, 8>>
-c3MergeNames(llvm::SmallVector<llvm::SmallVector<std::string, 8>, 8> sequences) {
-  llvm::SmallVector<std::string, 8> result;
-  auto compact = [&]() {
-    llvm::SmallVector<llvm::SmallVector<std::string, 8>, 8> next;
-    for (auto &sequence : sequences)
-      if (!sequence.empty())
-        next.push_back(std::move(sequence));
-    sequences = std::move(next);
-  };
-  compact();
-  while (!sequences.empty()) {
-    std::optional<std::string> candidate;
-    for (const auto &sequence : sequences) {
-      const std::string &head = sequence.front();
-      bool appearsInTail = false;
-      for (const auto &other : sequences) {
-        if (llvm::is_contained(
-                llvm::ArrayRef<std::string>(other).drop_front(), head)) {
-          appearsInTail = true;
-          break;
-        }
-      }
-      if (!appearsInTail) {
-        candidate = head;
-        break;
-      }
-    }
-    if (!candidate)
-      return std::nullopt;
-    result.push_back(*candidate);
-    for (auto &sequence : sequences)
-      if (!sequence.empty() && sequence.front() == *candidate)
-        sequence.erase(sequence.begin());
-    compact();
-  }
-  return result;
 }
 
 // The callee expression of a decorator (a Call decorator's func, otherwise
@@ -1233,7 +1193,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     }
     sequences.emplace_back(canonicalBases.begin(), canonicalBases.end());
     std::optional<llvm::SmallVector<std::string, 8>> merged =
-        c3MergeNames(std::move(sequences));
+        lython::common::c3Merge<std::string>(std::move(sequences));
     if (!merged) {
       std::string baseList;
       for (const std::string &base : canonicalBases) {

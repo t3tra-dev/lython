@@ -1141,32 +1141,6 @@ void buildRetainPayloadSlotPtr(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyObject_RetainBoxedPayloadArraySlotRaw(memref<?xi64>, i64): shared-ABI
-// wrapper the lib manifests call to retain the index-th 16-word slot of an
-// items array (the counterpart of LyObject_ReleaseBoxedPayloadArraySlotRaw,
-// used when a container copy duplicates element boxes).
-void buildRetainBoxedPayloadArraySlotRaw(SupportBuilder &b) {
-  auto itemsType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.i64());
-  auto fn = b.beginFunction(
-      "LyObject_RetainBoxedPayloadArraySlotRaw",
-      b.builder.getFunctionType({itemsType, b.i64()}, {}));
-  mlir::Block *entry = fn.addEntryBlock();
-  b.builder.setInsertionPointToEnd(entry);
-  mlir::Value pointerIndex =
-      mlir::memref::ExtractAlignedPointerAsIndexOp::create(
-          b.builder, b.loc, entry->getArgument(0));
-  mlir::Value pointerWord = mlir::arith::IndexCastOp::create(
-      b.builder, b.loc, b.i64(), pointerIndex);
-  mlir::Value base = b.intToPtr(pointerWord);
-  mlir::Value wordOffset = mlir::arith::MulIOp::create(
-      b.builder, b.loc, entry->getArgument(1), b.iconst(16));
-  mlir::Value slot = b.gepI64(base, wordOffset);
-  mlir::func::CallOp::create(b.builder, b.loc, "retain_payload_slot_ptr",
-                             mlir::TypeRange{}, mlir::ValueRange{slot});
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
-}
-
 // LyObject_ReleaseBoxedPayloadRaw(memref<16xi64>) /
 // LyObject_ReleaseBoxedPayloadArraySlotRaw(memref<?xi64>, i64): shared-ABI
 // wrappers the lib manifests call to release a boxed slot (whole box, or the
@@ -1190,12 +1164,15 @@ void buildReleaseBoxedPayloadRaw(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-void buildReleaseBoxedPayloadArraySlotRaw(SupportBuilder &b) {
-  auto itemsType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.i64());
+// LyObject_{Retain,Release}BoxedPayloadArraySlotRaw(memref<?xi64>, i64):
+// shared-ABI wrappers the lib manifests call on the index-th 16-word slot of
+// an items array (a container copy duplicating element boxes, or dropping
+// them). The two differ only in the payload-slot helper they forward to.
+void buildBoxedPayloadArraySlotRaw(SupportBuilder &b, llvm::StringRef name,
+                                   llvm::StringRef callee) {
+  auto itemsType = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.i64());
   auto fn = b.beginFunction(
-      "LyObject_ReleaseBoxedPayloadArraySlotRaw",
-      b.builder.getFunctionType({itemsType, b.i64()}, {}));
+      name, b.builder.getFunctionType({itemsType, b.i64()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value pointerIndex =
@@ -1207,11 +1184,10 @@ void buildReleaseBoxedPayloadArraySlotRaw(SupportBuilder &b) {
   mlir::Value wordOffset = mlir::arith::MulIOp::create(
       b.builder, b.loc, entry->getArgument(1), b.iconst(16));
   mlir::Value slot = b.gepI64(base, wordOffset);
-  mlir::func::CallOp::create(b.builder, b.loc, "release_payload_slot_ptr",
-                             mlir::TypeRange{}, mlir::ValueRange{slot});
+  mlir::func::CallOp::create(b.builder, b.loc, callee, mlir::TypeRange{},
+                             mlir::ValueRange{slot});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
-
 
 void declareLLVMExternal(SupportBuilder &b, llvm::StringRef name,
                          mlir::Type result, llvm::ArrayRef<mlir::Type> inputs,
@@ -2505,9 +2481,13 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildReleasePayloadSlotPtr(support);
   buildReleaseExceptionExtras(support);
   buildReleaseBoxedPayloadRaw(support);
-  buildReleaseBoxedPayloadArraySlotRaw(support);
+  buildBoxedPayloadArraySlotRaw(
+      support, "LyObject_ReleaseBoxedPayloadArraySlotRaw",
+      "release_payload_slot_ptr");
   buildRetainPayloadSlotPtr(support);
-  buildRetainBoxedPayloadArraySlotRaw(support);
+  buildBoxedPayloadArraySlotRaw(
+      support, "LyObject_RetainBoxedPayloadArraySlotRaw",
+      "retain_payload_slot_ptr");
   buildTracebackSupport(support);
   declareEHSupport(support);
   buildCurrentExceptionClassIdUnchecked(support);
