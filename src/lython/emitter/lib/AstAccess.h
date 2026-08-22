@@ -2,11 +2,53 @@
 
 #include "Ast.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
+
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace lython::emitter::ast {
+
+// ⭐ ONE AST WALK. Every question asked of a subtree -- does it yield, does it
+// read this name, which names does it bind, where are its calls -- is a
+// depth-first pass over `fields`, and each was written out again. What differs
+// is what a node answers.
+//
+// `SkipChildren` is what makes the scope boundaries expressible: which of
+// def/class/lambda ends a walk differs by question (a yield search stops at
+// all four; a name-binding walk records the def's own name first), so the walk
+// cannot decide it and the visitor must.
+enum class Walk { Continue, SkipChildren, Stop };
+
+// Depth-first over the subtree, `node` included. True when a visit answered
+// `Stop` -- which is how a "does this subtree contain ..." question is asked.
+inline bool walk(const parser::Node *node,
+                 llvm::function_ref<Walk(const parser::Node &)> visit) {
+  if (!node)
+    return false;
+  switch (visit(*node)) {
+  case Walk::Stop:
+    return true;
+  case Walk::SkipChildren:
+    return false;
+  case Walk::Continue:
+    break;
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (walk(child->get(), visit))
+        return true;
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &nested : *children)
+        if (walk(nested.get(), visit))
+          return true;
+  }
+  return false;
+}
 
 inline const parser::FieldValue *field(const parser::Node &node,
                                        std::string_view name) {

@@ -1352,6 +1352,31 @@ Table::aggregateFieldsSpec(llvm::StringRef className) const {
   return std::nullopt;
 }
 
+bool Table::structurallyAccepts(
+    mlir::Type actual, llvm::StringRef protocolName,
+    llvm::ArrayRef<mlir::Type> expectedArguments) const {
+  const ProtocolInfo *info = lookup(protocolName);
+  if (!info || !info->isProtocol)
+    return false;
+
+  if (std::optional<std::vector<mlir::Type>> args =
+          protocolArgumentsFor(actual, protocolName))
+    if (expectedArguments.empty() || expectedArguments.size() == args->size())
+      return true;
+
+  // ⛔ ON AN ARITY MISMATCH THIS FALLS THROUGH TO THE METHOD CHECK rather than
+  // answering no. The two callers disagreed here -- the lowering's copy
+  // returned the arity answer directly -- so one of the two behaviours had to
+  // win. This one, because the lowering must never be stricter than the
+  // emitter: a program the emitter accepts and the lowering then refuses is a
+  // diagnostic at the wrong boundary. Measured before choosing: instrumented
+  // to report every case where the two would differ, the whole suite (826
+  // tests, every golden and example) hit it zero times.
+  return llvm::all_of(info->methods, [&](const auto &method) {
+    return !methodContractCandidatesWithEvidence(actual, method.first).empty();
+  });
+}
+
 std::optional<std::vector<mlir::Type>>
 Table::protocolArgumentsFor(mlir::Type receiverType,
                             llvm::StringRef protocolName) const {

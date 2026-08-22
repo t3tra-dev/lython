@@ -142,22 +142,9 @@ bool containsLoopLevelJump(const std::vector<parser::NodePtr> *body) {
 }
 
 bool containsNamedExpr(const parser::Node *node) {
-  if (!node)
-    return false;
-  if (node->kind == "NamedExpr")
-    return true;
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (containsNamedExpr(child->get()))
-        return true;
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &item : *children)
-        if (containsNamedExpr(item.get()))
-          return true;
-    }
-  }
-  return false;
+  return ast::walk(node, [](const parser::Node &current) {
+    return current.kind == "NamedExpr" ? ast::Walk::Stop : ast::Walk::Continue;
+  });
 }
 
 } // namespace

@@ -267,22 +267,12 @@ namespace {
 // OBSERVE the argument, and the parameter's own `arg` node is not a Name, so
 // the declaration does not answer yes to itself.
 bool readsName(const parser::Node *node, llvm::StringRef name) {
-  if (!node)
-    return false;
-  if (node->kind == "Name" && llvm::StringRef(ast::nameSpelling(*node)) == name)
-    return true;
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (readsName(child->get(), name))
-        return true;
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &each : *children)
-        if (readsName(each.get(), name))
-          return true;
-    }
-  }
-  return false;
+  return ast::walk(node, [&](const parser::Node &current) {
+    return current.kind == "Name" &&
+                   llvm::StringRef(ast::nameSpelling(current)) == name
+               ? ast::Walk::Stop
+               : ast::Walk::Continue;
+  });
 }
 
 // The `arg` spellings of a def, self included, in declaration order.

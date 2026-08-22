@@ -1453,22 +1453,12 @@ mlir::Type TypeSystem::coroutineOf(mlir::Type resultType) const {
 namespace {
 
 void collectNameReferences(const parser::Node *node, llvm::StringSet<> &out) {
-  if (!node)
-    return;
-  if (node->kind == "Name") {
-    if (auto id = ast::string(*node, "id"))
-      out.insert(*id);
-  }
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      collectNameReferences(child->get(), out);
-      continue;
-    }
-    if (const auto *children =
-            std::get_if<std::vector<parser::NodePtr>>(&field.value))
-      for (const parser::NodePtr &nested : *children)
-        collectNameReferences(nested.get(), out);
-  }
+  ast::walk(node, [&](const parser::Node &current) {
+    if (current.kind == "Name")
+      if (auto id = ast::string(current, "id"))
+        out.insert(*id);
+    return ast::Walk::Continue;
+  });
 }
 
 // Call sites in module-level statement position, used by the inference
@@ -1478,23 +1468,14 @@ void collectNameReferences(const parser::Node *node, llvm::StringSet<> &out) {
 // with wrong parameter bindings.
 void collectModuleCallNodes(const parser::Node *node,
                             std::vector<const parser::Node *> &out) {
-  if (!node)
-    return;
-  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-      node->kind == "Lambda" || node->kind == "ClassDef")
-    return;
-  if (node->kind == "Call")
-    out.push_back(node);
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      collectModuleCallNodes(child->get(), out);
-      continue;
-    }
-    if (const auto *children =
-            std::get_if<std::vector<parser::NodePtr>>(&field.value))
-      for (const parser::NodePtr &nested : *children)
-        collectModuleCallNodes(nested.get(), out);
-  }
+  ast::walk(node, [&](const parser::Node &current) {
+    if (current.kind == "FunctionDef" || current.kind == "AsyncFunctionDef" ||
+        current.kind == "Lambda" || current.kind == "ClassDef")
+      return ast::Walk::SkipChildren;
+    if (current.kind == "Call")
+      out.push_back(&current);
+    return ast::Walk::Continue;
+  });
 }
 
 } // namespace

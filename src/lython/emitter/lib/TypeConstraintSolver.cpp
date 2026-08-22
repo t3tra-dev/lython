@@ -42,25 +42,10 @@ std::optional<std::string> staticParameterName(mlir::Type type) {
 
 bool structuralProtocolAccepts(const TypeSystem &types,
                                py::ContractType expected, mlir::Type actual) {
-  const py::protocols::Table &table =
-      py::protocols::Table::get(types.getContext());
-  std::string protocolName =
-      manifestNameForContract(expected.getContractName());
-  const py::protocols::ProtocolInfo *info = table.lookup(protocolName);
-  if (!info || !info->isProtocol)
-    return false;
-
-  if (std::optional<std::vector<mlir::Type>> args =
-          table.protocolArgumentsFor(actual, protocolName)) {
-    llvm::ArrayRef<mlir::Type> expectedArgs = expected.getArguments();
-    if (expectedArgs.empty() || expectedArgs.size() == args->size())
-      return true;
-  }
-
-  return llvm::all_of(info->methods, [&](const auto &method) {
-    return !table.methodContractCandidatesWithEvidence(actual, method.first)
-                .empty();
-  });
+  return py::protocols::Table::get(types.getContext())
+      .structurallyAccepts(actual,
+                           manifestNameForContract(expected.getContractName()),
+                           expected.getArguments());
 }
 
 bool typeAccepts(const TypeSystem &types, mlir::Type expected,

@@ -24,10 +24,11 @@ void registerSMEDialects(mlir::DialectRegistry &registry) {
                   mlir::vector::VectorDialect>();
 }
 
-void addSMELinalgPipeline(mlir::OpPassManager &pipeline) {
-  // Keep the high-level vector/outer-product form intact until the ArmSME
-  // branch has a chance to claim it. The generic fallback is still responsible
-  // for scalarizing unsupported vector shapes later.
+// The ArmSME claim itself: convert the vector form, legalize the shapes the
+// tiles cannot take, fuse outer products, and enter streaming mode with ZA.
+// Both entry points below run exactly this, and a pass added to one of them
+// but not the other would make the two ArmSME paths disagree.
+void addSMEVectorClaim(mlir::OpPassManager &pipeline) {
   pipeline.addPass(mlir::createConvertVectorToArmSMEPass());
   pipeline.addPass(mlir::arm_sme::createVectorLegalizationPass());
   pipeline.addNestedPass<mlir::func::FuncOp>(
@@ -38,6 +39,13 @@ void addSMELinalgPipeline(mlir::OpPassManager &pipeline) {
           mlir::arm_sme::ArmZaMode::NewZA,
           /*ifRequiredByOps=*/true,
           /*ifContainsScalableVectors=*/false));
+}
+
+void addSMELinalgPipeline(mlir::OpPassManager &pipeline) {
+  // Keep the high-level vector/outer-product form intact until the ArmSME
+  // branch has a chance to claim it. The generic fallback is still responsible
+  // for scalarizing unsupported vector shapes later.
+  addSMEVectorClaim(pipeline);
   pipeline.addPass(mlir::createCanonicalizerPass());
   pipeline.addPass(mlir::createCSEPass());
 }
@@ -48,16 +56,7 @@ void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   // tile allocation expects control-flow lowering before the final
   // ArmSME-to-LLVM conversion.
   pipeline.addPass(mlir::createArithToArmSMEConversionPass());
-  pipeline.addPass(mlir::createConvertVectorToArmSMEPass());
-  pipeline.addPass(mlir::arm_sme::createVectorLegalizationPass());
-  pipeline.addNestedPass<mlir::func::FuncOp>(
-      mlir::arm_sme::createOuterProductFusionPass());
-  pipeline.addNestedPass<mlir::func::FuncOp>(
-      mlir::arm_sme::createEnableArmStreamingPass(
-          mlir::arm_sme::ArmStreamingMode::StreamingLocally,
-          mlir::arm_sme::ArmZaMode::NewZA,
-          /*ifRequiredByOps=*/true,
-          /*ifContainsScalableVectors=*/false));
+  addSMEVectorClaim(pipeline);
   pipeline.addPass(mlir::createConvertArmSMEToSCFPass());
   pipeline.addPass(mlir::createCanonicalizerPass());
   pipeline.addPass(mlir::createCSEPass());

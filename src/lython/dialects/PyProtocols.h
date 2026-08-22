@@ -259,6 +259,15 @@ public:
   std::optional<std::vector<mlir::Type>>
   protocolArgumentsFor(mlir::Type receiverType,
                        llvm::StringRef protocolName) const;
+  // ⭐ ONE STRUCTURAL-CONFORMANCE RULE. Does `actual` satisfy the protocol
+  // named `protocolName`? Either the table can produce that protocol's
+  // arguments for it and the expected arity agrees, or every method the
+  // protocol declares has a contract candidate with evidence. The emitter
+  // asks through a `$`-named ContractType and the lowering through a
+  // ProtocolType; only how they spell the name and the arguments differs,
+  // and the rule has to give both the same answer.
+  bool structurallyAccepts(mlir::Type actual, llvm::StringRef protocolName,
+                           llvm::ArrayRef<mlir::Type> expectedArguments) const;
   Variance parameterVariance(llvm::StringRef protocolName,
                              unsigned index) const;
   bool isProtocolSubtypeOf(

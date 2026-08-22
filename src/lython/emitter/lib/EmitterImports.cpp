@@ -1116,25 +1116,17 @@ namespace {
 // classes have their own. Same rule `containsYieldExpression` applies inside
 // EmitterExceptions.cpp; kept local because that one is file-static there.
 bool functionBodyContainsYield(const parser::Node &node) {
-  if (node.kind == "Yield" || node.kind == "YieldFrom")
-    return true;
-  auto ownScope = [](const parser::Node &child) {
-    return child.kind == "FunctionDef" || child.kind == "AsyncFunctionDef" ||
-           child.kind == "Lambda" || child.kind == "ClassDef";
-  };
-  for (const parser::Field &field : node.fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (*child && !ownScope(**child) && functionBodyContainsYield(**child))
-        return true;
-      continue;
-    }
-    if (const auto *children =
-            std::get_if<std::vector<parser::NodePtr>>(&field.value))
-      for (const parser::NodePtr &each : *children)
-        if (each && !ownScope(*each) && functionBodyContainsYield(*each))
-          return true;
-  }
-  return false;
+  return ast::walk(&node, [&](const parser::Node &current) {
+    if (current.kind == "Yield" || current.kind == "YieldFrom")
+      return ast::Walk::Stop;
+    // ⛔ The boundary applies to the CHILDREN only: the caller hands in the
+    // def whose body this is, and skipping it would answer no every time.
+    if (&current != &node &&
+        (current.kind == "FunctionDef" || current.kind == "AsyncFunctionDef" ||
+         current.kind == "Lambda" || current.kind == "ClassDef"))
+      return ast::Walk::SkipChildren;
+    return ast::Walk::Continue;
+  });
 }
 
 } // namespace

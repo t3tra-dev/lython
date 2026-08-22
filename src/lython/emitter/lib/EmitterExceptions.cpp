@@ -167,24 +167,14 @@ void collectStructuralReceiverNames(
 // operand's contract, so the two cannot be merged into one set here.
 void collectAugAssignTargetNames(const parser::Node *node,
                                  llvm::StringSet<> &names) {
-  if (!node)
-    return;
-  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-      node->kind == "ClassDef" || node->kind == "Lambda")
-    return;
-  if (node->kind == "AugAssign")
-    collectAssignedNameTargets(ast::node(*node, "target"), names);
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (*child)
-        collectAugAssignTargetNames(child->get(), names);
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &child : *children)
-        if (child)
-          collectAugAssignTargetNames(child.get(), names);
-    }
-  }
+  ast::walk(node, [&](const parser::Node &current) {
+    if (current.kind == "FunctionDef" || current.kind == "AsyncFunctionDef" ||
+        current.kind == "ClassDef" || current.kind == "Lambda")
+      return ast::Walk::SkipChildren;
+    if (current.kind == "AugAssign")
+      collectAssignedNameTargets(ast::node(current, "target"), names);
+    return ast::Walk::Continue;
+  });
 }
 
 void collectAugAssignTargetNames(const std::vector<parser::NodePtr> *statements,
@@ -213,25 +203,14 @@ bool isMutableContainerContract(mlir::Type type) {
 // over statement kinds never sees it. Nested callables are not descended into
 // -- their yields belong to them.
 bool containsYieldExpression(const parser::Node *node) {
-  if (!node)
-    return false;
-  if (node->kind == "Yield" || node->kind == "YieldFrom")
-    return true;
-  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-      node->kind == "Lambda" || node->kind == "ClassDef")
-    return false;
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (containsYieldExpression(child->get()))
-        return true;
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &each : *children)
-        if (containsYieldExpression(each.get()))
-          return true;
-    }
-  }
-  return false;
+  return ast::walk(node, [](const parser::Node &current) {
+    if (current.kind == "Yield" || current.kind == "YieldFrom")
+      return ast::Walk::Stop;
+    if (current.kind == "FunctionDef" || current.kind == "AsyncFunctionDef" ||
+        current.kind == "Lambda" || current.kind == "ClassDef")
+      return ast::Walk::SkipChildren;
+    return ast::Walk::Continue;
+  });
 }
 
 } // namespace

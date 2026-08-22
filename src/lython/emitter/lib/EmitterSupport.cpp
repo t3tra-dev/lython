@@ -1029,42 +1029,32 @@ void collectAssignedNameTargets(const parser::Node *node,
 // a region rebinds).
 void collectNameBindings(const parser::Node *node, llvm::StringSet<> &names,
                          bool bindsNestedDefinitions) {
-  if (!node)
-    return;
-  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-      node->kind == "ClassDef") {
-    if (bindsNestedDefinitions)
-      if (auto name = ast::string(*node, "name"))
-        names.insert(*name);
-    return;
-  }
-  if (node->kind == "Lambda")
-    return;
-  if (node->kind == "Assign") {
-    if (const auto *targets = ast::nodeList(*node, "targets"))
-      for (const parser::NodePtr &target : *targets)
-        collectAssignedNameTargets(target.get(), names);
-  } else if (node->kind == "AnnAssign" || node->kind == "AugAssign" ||
-             node->kind == "NamedExpr") {
-    collectAssignedNameTargets(ast::node(*node, "target"), names);
-  } else if (node->kind == "For" || node->kind == "AsyncFor") {
-    collectAssignedNameTargets(ast::node(*node, "target"), names);
-  } else if (node->kind == "With" || node->kind == "AsyncWith") {
-    if (const auto *items = ast::nodeList(*node, "items"))
-      for (const parser::NodePtr &item : *items)
-        collectAssignedNameTargets(ast::node(*item, "optional_vars"), names);
-  }
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (*child)
-        collectNameBindings(child->get(), names, bindsNestedDefinitions);
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &child : *children)
-        if (child)
-          collectNameBindings(child.get(), names, bindsNestedDefinitions);
+  ast::walk(node, [&](const parser::Node &current) {
+    if (current.kind == "FunctionDef" || current.kind == "AsyncFunctionDef" ||
+        current.kind == "ClassDef") {
+      if (bindsNestedDefinitions)
+        if (auto name = ast::string(current, "name"))
+          names.insert(*name);
+      return ast::Walk::SkipChildren;
     }
-  }
+    if (current.kind == "Lambda")
+      return ast::Walk::SkipChildren;
+    if (current.kind == "Assign") {
+      if (const auto *targets = ast::nodeList(current, "targets"))
+        for (const parser::NodePtr &target : *targets)
+          collectAssignedNameTargets(target.get(), names);
+    } else if (current.kind == "AnnAssign" || current.kind == "AugAssign" ||
+               current.kind == "NamedExpr") {
+      collectAssignedNameTargets(ast::node(current, "target"), names);
+    } else if (current.kind == "For" || current.kind == "AsyncFor") {
+      collectAssignedNameTargets(ast::node(current, "target"), names);
+    } else if (current.kind == "With" || current.kind == "AsyncWith") {
+      if (const auto *items = ast::nodeList(current, "items"))
+        for (const parser::NodePtr &item : *items)
+          collectAssignedNameTargets(ast::node(*item, "optional_vars"), names);
+    }
+    return ast::Walk::Continue;
+  });
 }
 
 bool derivesViaStructuralMutation(mlir::Value current, mlir::Value previous) {

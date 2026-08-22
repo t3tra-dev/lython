@@ -86,23 +86,9 @@ bool containsStaticParameter(mlir::Type type) {
 
 bool structuralProtocolArgumentAccepts(mlir::Type actual,
                                        py::ProtocolType expected) {
-  const py::protocols::Table &table =
-      py::protocols::Table::get(*expected.getContext());
-  llvm::StringRef protocolName = expected.getProtocolName();
-  const py::protocols::ProtocolInfo *info = table.lookup(protocolName);
-  if (!info || !info->isProtocol)
-    return false;
-
-  if (std::optional<std::vector<mlir::Type>> args =
-          table.protocolArgumentsFor(actual, protocolName)) {
-    llvm::ArrayRef<mlir::Type> expectedArgs = expected.getArguments();
-    return expectedArgs.empty() || expectedArgs.size() == args->size();
-  }
-
-  return llvm::all_of(info->methods, [&](const auto &method) {
-    return !table.methodContractCandidatesWithEvidence(actual, method.first)
-                .empty();
-  });
+  return py::protocols::Table::get(*expected.getContext())
+      .structurallyAccepts(actual, expected.getProtocolName(),
+                           expected.getArguments());
 }
 
 bool callableArgumentAccepts(mlir::Type actual, mlir::Type expected,
