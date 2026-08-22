@@ -572,6 +572,27 @@ void buildFreeRawI64Ptr(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
+// i64 realloc_raw_i64_ptr(i64 address, i64 bytes): CPython's list_resize hands
+// the items block to PyMem_Realloc rather than allocating a new one and
+// copying, and the mild 1.125x over-allocation it uses is only affordable
+// because of that -- realloc usually extends the block where it lies.
+// Answers the new base address.
+void buildReallocRawI64Ptr(SupportBuilder &b) {
+  b.declareExternal("realloc",
+                    b.builder.getFunctionType({b.ptr(), b.i64()}, {b.ptr()}));
+  auto fn = b.beginFunction(
+      "realloc_raw_i64_ptr",
+      b.builder.getFunctionType({b.i64(), b.i64()}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value grown =
+      b.call("realloc", b.ptr(),
+             mlir::ValueRange{b.intToPtr(entry->getArgument(0)),
+                              entry->getArgument(1)})
+          .front();
+  mlir::func::ReturnOp::create(b.builder, b.loc, b.ptrToInt(grown));
+}
+
 // i1 release_storage_raw_to_zero(ptr storage): atomically decrement the
 // refcount word at address; return whether it dropped to zero. Skips null,
 // tagged (odd), and immortal (INT64_MAX) storages.
@@ -2463,6 +2484,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildBoxedSlotPtr(support);
   buildBoxedLoadI64(support);
   buildFreeRawI64Ptr(support);
+  buildReallocRawI64Ptr(support);
   buildReleaseStorageRawToZero(support);
   buildRetainStorageRaw(support);
   buildReleaseSingleAllocation(support, "release_unicode_raw", /*twoArgs=*/true);

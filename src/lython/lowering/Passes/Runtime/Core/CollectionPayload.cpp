@@ -329,14 +329,23 @@ constexpr unsigned kPayloadValueSizeBase =
     static_cast<unsigned>(box_abi::kSizeWordBase);
 constexpr unsigned kPayloadOwnedFlagSlot =
     static_cast<unsigned>(box_abi::kOwnedFlagWord);
-constexpr std::uint64_t kMinimumCollectionCapacity = 64;
-
+// ⭐ CPython's `list_resize` (Objects/listobject.c), and it has to be exactly
+// that: this figure is what the LOWERING then believes the runtime allocated,
+// and a store below a capacity the runtime does not have writes past the
+// array. The manifest's LyList_EnsureCapacity computes the same expression for
+// the same reason.
+//
+//   over-allocate mildly and pad to a multiple of 4:
+//     new_allocated = (newsize + (newsize >> 3) + 6) & ~3
+//
+// ⛔ NOT the doubling-from-64 this used to be. A minimum of 64 with a 16-word
+// element box meant every list, however short, took 8 KB -- `[i, i + 1, i + 2]`
+// in a loop allocated and freed 8 KB per iteration, where CPython's PyList_New
+// takes the exact size (three pointers).
 std::uint64_t growCapacity(std::uint64_t current, std::uint64_t required) {
-  std::uint64_t capacity =
-      std::max<std::uint64_t>(current, kMinimumCollectionCapacity);
-  while (capacity < required)
-    capacity *= 2;
-  return capacity;
+  if (current >= required && required >= current / 2)
+    return current;
+  return (required + (required >> 3) + 6) & ~static_cast<std::uint64_t>(3);
 }
 
 mlir::Value pointerWordForPhysicalValue(mlir::OpBuilder &builder,
@@ -449,9 +458,11 @@ mlir::LogicalResult clearPayloadHandle(mlir::Operation *op,
 
 } // namespace
 
+// PyList_New(size): exactly `size` slots, no over-allocation. Growth is where
+// CPython over-allocates, not construction.
 std::uint64_t
 RuntimeBundleLowerer::collectionInitialCapacity(std::uint64_t arity) const {
-  return std::max<std::uint64_t>(arity, kMinimumCollectionCapacity);
+  return arity;
 }
 
 mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
@@ -605,8 +616,9 @@ mlir::LogicalResult RuntimeBundleLowerer::ensurePayloadCapacity(
     std::uint64_t RuntimeBundle::*capacity) {
   if (container.*capacity && index < container.*capacity)
     return mlir::success();
-  if (container.*capacity == 0 && index < kMinimumCollectionCapacity)
-    return mlir::success();
+  // ⛔ An unknown capacity used to be assumed to be at least 64. With the
+  // allocator taking the exact size (CPython's PyList_New) that assumption is
+  // false, and the store it skipped the growth for would run off the array.
 
   std::optional<RuntimeSymbol> ensure =
       manifest.primitive(contractName, "ensure_capacity");
@@ -630,10 +642,10 @@ mlir::LogicalResult RuntimeBundleLowerer::ensurePayloadCapacity(
           op, container, call.getResults(), updated)))
     return mlir::failure();
   updated.copyEvidenceFrom(container);
-  std::uint64_t oldCapacity =
-      container.*capacity ? container.*capacity : kMinimumCollectionCapacity;
+  // An unknown old capacity is taken as 0: the growth then depends only on
+  // what is required, which is the figure the runtime also computes from it.
   updated.*capacity =
-      growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
+      growCapacity(container.*capacity, static_cast<std::uint64_t>(index) + 1);
   container = std::move(updated);
   return mlir::success();
 }

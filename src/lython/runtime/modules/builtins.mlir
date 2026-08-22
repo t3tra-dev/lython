@@ -2352,6 +2352,7 @@ module attributes {
   func.func private @release_exception_extras(%header_ptr: !llvm.ptr)
   func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
   func.func private @free_raw_i64_ptr(%address: i64)
+  func.func private @realloc_raw_i64_ptr(%address: i64, %bytes: i64) -> i64
   // Rebuild a rank-1 memref over the payload a raw pointer word addresses
   // (buildGlobalViewFunction: allocated == aligned, offset 0, stride 1). The
   // manifest's only route to a descriptor -- writing the insertvalue chain and
@@ -19174,9 +19175,11 @@ module attributes {
   // observes it with no further action and a mutation has nothing to rename.
   // That is what lets ensure_capacity / extend / __setslice__ / __delslice__
   // be void and non-transferring (rfc/memory-safety-proof.md, `Interior`).
+  // CPython's PyList_New takes exactly `size` slots; the over-allocation lives
+  // in list_resize, not here. This used to take max(length, 64), which with a
+  // 16-word element box is 8 KB for every list however short.
   func.func private @__ly_list_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
-    %minimum_capacity = arith.constant 64 : i64
     %handle_words = arith.constant 16 : i64
     %class_id = arith.constant 10 : i64
     %zero = arith.constant 0 : i64
@@ -19191,8 +19194,7 @@ module attributes {
     %pad_slot = arith.constant 8 : index
 
     %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<9xi64>
-    %needs_min_capacity = arith.cmpi slt, %length, %minimum_capacity : i64
-    %capacity = arith.select %needs_min_capacity, %minimum_capacity, %length : i1, i64
+    %capacity = arith.maxsi %length, %zero : i64
     %payload_words = arith.muli %capacity, %handle_words : i64
     %payload_words_index = arith.index_cast %payload_words : i64 to index
     // Plain memref.alloc with no alignment attribute is a bare malloc, so the
@@ -19744,10 +19746,13 @@ module attributes {
   // reference for a caller to re-acquire. The three-lane spelling had to
   // declare transfer_args = [0] + owned_results = [0] because the array VALUE
   // was part of the entity's identity.
+  // CPython's list_resize growth: mild over-allocation padded to a multiple of
+  // 4. The LOWERING computes the same expression (growCapacity in
+  // Core/CollectionPayload.cpp) to decide when a store needs to grow at all, so
+  // the two must agree exactly -- a capacity the lowering believes in and the
+  // runtime did not allocate is a store past the array.
   func.func @LyList_EnsureCapacity(%self: memref<9xi64> {ly.ownership.object_header}, %required: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "ensure_capacity"} {
-    %minimum_capacity = arith.constant 64 : i64
     %handle_words = arith.constant 16 : i64
-    %two = arith.constant 2 : i64
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
     %lower = arith.constant 0 : index
@@ -19756,28 +19761,29 @@ module attributes {
     %capacity = memref.load %self[%capacity_slot] : memref<9xi64>
     %needs_grow = arith.cmpi slt, %capacity, %required : i64
     scf.if %needs_grow {
-      %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+      // list_resize: (newsize + (newsize >> 3) + 6) & ~3
+      %three = arith.constant 3 : i64
+      %six = arith.constant 6 : i64
+      %pad_mask = arith.constant -4 : i64
+      %eighth = arith.shrsi %required, %three : i64
+      %with_eighth = arith.addi %required, %eighth : i64
+      %with_slack = arith.addi %with_eighth, %six : i64
+      %new_capacity = arith.andi %with_slack, %pad_mask : i64
+      // ⭐ REALLOC, not allocate-copy-free. CPython's list_resize hands the
+      // block to PyMem_Realloc, which usually extends it where it lies; the
+      // mild 1.125x growth above is only affordable because of that. Copying
+      // instead made 20M appends take 5.0 s against 1.3 s for the doubling
+      // this replaced -- the growth constant and the mechanism are one port,
+      // not two.
+      %word_bytes = arith.constant 8 : i64
       %old_items_word = memref.load %self[%items_slot] : memref<9xi64>
-      %doubled = arith.muli %capacity, %two : i64
-      %below_min = arith.cmpi slt, %doubled, %minimum_capacity : i64
-      %base_capacity = arith.select %below_min, %minimum_capacity, %doubled : i1, i64
-      %below_required = arith.cmpi slt, %base_capacity, %required : i64
-      %new_capacity = arith.select %below_required, %required, %base_capacity : i1, i64
-      %old_words = arith.muli %capacity, %handle_words : i64
       %new_words = arith.muli %new_capacity, %handle_words : i64
-      %old_words_index = arith.index_cast %old_words : i64 to index
-      %new_words_index = arith.index_cast %new_words : i64 to index
-      %new_items = memref.alloc(%new_words_index) : memref<?xi64>
-      scf.for %i = %lower to %old_words_index step %step {
-        %word = memref.load %items[%i] : memref<?xi64>
-        memref.store %word, %new_items[%i] : memref<?xi64>
-      }
-      %new_items_index = memref.extract_aligned_pointer_as_index %new_items : memref<?xi64> -> index
-      %new_items_word = arith.index_cast %new_items_index : index to i64
-      // Publish capacity and the new base together, then free the old block.
+      %new_bytes = arith.muli %new_words, %word_bytes : i64
+      %new_items_word = func.call @realloc_raw_i64_ptr(%old_items_word, %new_bytes) : (i64, i64) -> i64
+      // Publish capacity and the new base together; realloc already released
+      // the old block if it moved.
       memref.store %new_capacity, %self[%capacity_slot] : memref<9xi64>
       memref.store %new_items_word, %self[%items_slot] : memref<9xi64>
-      func.call @free_raw_i64_ptr(%old_items_word) : (i64) -> ()
     }
     func.return
   }
