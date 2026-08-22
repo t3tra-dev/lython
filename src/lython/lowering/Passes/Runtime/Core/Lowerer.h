@@ -841,6 +841,19 @@ private:
       llvm::function_ref<bool(mlir::func::FuncOp)> selects,
       mlir::TypeRange calleeResultTypes, bool shareExceptionSubclasses,
       llvm::StringRef sourceClassMethodName = "");
+  // ⭐ ONE INSTANCE OF EITHER DISPATCH, BY METHOD NAME. Every instance below
+  // is the same three steps -- generate only when the merged manifest left an
+  // external declaration asking for it, select the manifest functions carrying
+  // that `ly.runtime.method`, and let compiled source-class methods of the
+  // same name join -- so the name and the callee's result shape are all that
+  // varies. Five of them had those three steps written out.
+  mlir::LogicalResult generateBoxedMethodHookFor(
+      llvm::StringRef hookName, llvm::StringRef methodName,
+      mlir::TypeRange calleeResultTypes);
+  mlir::LogicalResult generateBoxedBinaryMethodHookFor(
+      llvm::StringRef hookName, llvm::StringRef methodName,
+      mlir::TypeRange calleeResultTypes);
+  void stampBoxedStrHookResult(llvm::StringRef hookName);
   // repr instance of the uniform dispatch: class id -> the manifest `__repr__`
   // returning a `builtins.str`, for container __repr__ over erased elements.
   mlir::LogicalResult generateBoxedReprHook();

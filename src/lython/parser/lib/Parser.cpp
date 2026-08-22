@@ -3499,15 +3499,24 @@ private:
     return comparisonOperator(op->spelling, range);
   }
 
-  NodePtr parseBitwiseOr() {
-    NodePtr expr = parseBitwiseXor();
-    while (std::optional<std::string_view> op = peg.infixOperator(
-               CpythonInfixOperatorFamily::BitwiseOr, pegToken(index))) {
+  // ⭐ ONE LEFT-ASSOCIATIVE BINARY LEVEL. Six of them -- bitwise or/xor/and,
+  // shift, sum, term -- were spelled out with the same fold, differing in the
+  // operator family, the rule name the AST kind comes from, and which parser
+  // the two sides use. The right-hand parser is separate from the left because
+  // `sum` and `term` reject a bare `not` after the operator; the other four
+  // pass the same one twice.
+  NodePtr parseBinaryLevel(CpythonInfixOperatorFamily family,
+                           std::string_view rule,
+                           NodePtr (ParserImpl::*parseLeft)(),
+                           NodePtr (ParserImpl::*parseRight)()) {
+    NodePtr expr = (this->*parseLeft)();
+    while (std::optional<std::string_view> op =
+               peg.infixOperator(family, pegToken(index))) {
       std::string opText(*op);
       ++index;
-      NodePtr right = parseBitwiseXor();
+      NodePtr right = (this->*parseRight)();
       NodePtr node =
-          makeNode(actionAstKind("bitwise_or", "BinOp"),
+          makeNode(actionAstKind(rule, "BinOp"),
                    SourceRange{extendedStart(expr), extendedEnd(right)});
       addField(*node, "left", expr);
       addField(*node, "op", binaryOperator(opText));
@@ -3515,96 +3524,36 @@ private:
       expr = std::move(node);
     }
     return expr;
+  }
+
+  NodePtr parseBitwiseOr() {
+    return parseBinaryLevel(CpythonInfixOperatorFamily::BitwiseOr, "bitwise_or",
+                            &ParserImpl::parseBitwiseXor, &ParserImpl::parseBitwiseXor);
   }
 
   NodePtr parseBitwiseXor() {
-    NodePtr expr = parseBitwiseAnd();
-    while (std::optional<std::string_view> op = peg.infixOperator(
-               CpythonInfixOperatorFamily::BitwiseXor, pegToken(index))) {
-      std::string opText(*op);
-      ++index;
-      NodePtr right = parseBitwiseAnd();
-      NodePtr node =
-          makeNode(actionAstKind("bitwise_xor", "BinOp"),
-                   SourceRange{extendedStart(expr), extendedEnd(right)});
-      addField(*node, "left", expr);
-      addField(*node, "op", binaryOperator(opText));
-      addField(*node, "right", right);
-      expr = std::move(node);
-    }
-    return expr;
+    return parseBinaryLevel(CpythonInfixOperatorFamily::BitwiseXor, "bitwise_xor",
+                            &ParserImpl::parseBitwiseAnd, &ParserImpl::parseBitwiseAnd);
   }
 
   NodePtr parseBitwiseAnd() {
-    NodePtr expr = parseShift();
-    while (std::optional<std::string_view> op = peg.infixOperator(
-               CpythonInfixOperatorFamily::BitwiseAnd, pegToken(index))) {
-      std::string opText(*op);
-      ++index;
-      NodePtr right = parseShift();
-      NodePtr node =
-          makeNode(actionAstKind("bitwise_and", "BinOp"),
-                   SourceRange{extendedStart(expr), extendedEnd(right)});
-      addField(*node, "left", expr);
-      addField(*node, "op", binaryOperator(opText));
-      addField(*node, "right", right);
-      expr = std::move(node);
-    }
-    return expr;
+    return parseBinaryLevel(CpythonInfixOperatorFamily::BitwiseAnd, "bitwise_and",
+                            &ParserImpl::parseShift, &ParserImpl::parseShift);
   }
 
   NodePtr parseShift() {
-    NodePtr expr = parseAdditive();
-    while (std::optional<std::string_view> op = peg.infixOperator(
-               CpythonInfixOperatorFamily::Shift, pegToken(index))) {
-      std::string opText(*op);
-      ++index;
-      NodePtr right = parseAdditive();
-      NodePtr node =
-          makeNode(actionAstKind("shift_expr", "BinOp"),
-                   SourceRange{extendedStart(expr), extendedEnd(right)});
-      addField(*node, "left", expr);
-      addField(*node, "op", binaryOperator(opText));
-      addField(*node, "right", right);
-      expr = std::move(node);
-    }
-    return expr;
+    return parseBinaryLevel(CpythonInfixOperatorFamily::Shift, "shift_expr",
+                            &ParserImpl::parseAdditive, &ParserImpl::parseAdditive);
   }
 
   NodePtr parseAdditive() {
-    NodePtr expr = parseMultiplicative();
-    while (std::optional<std::string_view> op = peg.infixOperator(
-               CpythonInfixOperatorFamily::Sum, pegToken(index))) {
-      std::string opText(*op);
-      ++index;
-      NodePtr right = parseAdditiveRightHandSide();
-      NodePtr node =
-          makeNode(actionAstKind("sum", "BinOp"),
-                   SourceRange{extendedStart(expr), extendedEnd(right)});
-      addField(*node, "left", expr);
-      addField(*node, "op", binaryOperator(opText));
-      addField(*node, "right", right);
-      expr = std::move(node);
-    }
-    return expr;
+    return parseBinaryLevel(CpythonInfixOperatorFamily::Sum, "sum",
+                            &ParserImpl::parseMultiplicative, &ParserImpl::parseAdditiveRightHandSide);
   }
 
   NodePtr parseMultiplicative() {
-    NodePtr expr = parseUnary();
-    while (std::optional<std::string_view> op = peg.infixOperator(
-               CpythonInfixOperatorFamily::Term, pegToken(index))) {
-      std::string opText(*op);
-      ++index;
-      NodePtr right = parseMultiplicativeRightHandSide();
-      NodePtr node =
-          makeNode(actionAstKind("term", "BinOp"),
-                   SourceRange{extendedStart(expr), extendedEnd(right)});
-      addField(*node, "left", expr);
-      addField(*node, "op", binaryOperator(opText));
-      addField(*node, "right", right);
-      expr = std::move(node);
-    }
-    return expr;
+    return parseBinaryLevel(CpythonInfixOperatorFamily::Term, "term",
+                            &ParserImpl::parseUnary, &ParserImpl::parseMultiplicativeRightHandSide);
   }
 
   NodePtr parseAdditiveRightHandSide() {

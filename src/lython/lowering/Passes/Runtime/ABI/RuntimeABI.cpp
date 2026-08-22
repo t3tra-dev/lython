@@ -1933,77 +1933,78 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReleaseHook() {
       /*calleeResultTypes=*/{}, /*shareExceptionSubclasses=*/true);
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
-  // repr instance: class id -> the manifest `__repr__` (returns an owned str,
-  // as (header, bytes) memrefs). Each type carries its own __repr__, so no
-  // subclass sharing. Non-conforming __repr__ (bool's i1 receiver) are skipped
-  // by the memref-input predicate — that is a manifest-conformance gap for that
-  // type, not a special case here.
-  // Only generate the hook when a merged manifest __repr__ (a container's) has
-  // referenced it — otherwise it would be dead weight (and an unused public
-  // hook is not eliminated). Its presence as an external declaration signals
-  // the need.
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_repr_boxed_by_contract");
-      !existing || !existing.isExternal())
-    return mlir::success();
-  mlir::Type i64 = mlir::IntegerType::get(context, 64);
-  mlir::Type i8 = mlir::IntegerType::get(context, 8);
-  auto strHeader = mlir::MemRefType::get({2}, i64);
-  auto strBytes =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
-  if (mlir::failed(generateBoxedMethodHook(
-          "__ly_repr_boxed_by_contract",
-          [](mlir::func::FuncOp function) {
-            auto method = function->getAttrOfType<mlir::StringAttr>(
-                contracts::kManifestMethodAttr);
-            return method && method.getValue() == "__repr__";
-          },
-          {strHeader, strBytes}, /*shareExceptionSubclasses=*/false,
-          /*sourceClassMethodName=*/"__repr__")))
-    return mlir::failure();
-  // The hook forwards the manifest __repr__'s owned str result (header at 0).
-  if (auto hook = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_repr_boxed_by_contract")) {
-    mlir::OpBuilder attrBuilder(context);
-    hook->setAttr("ly.ownership.owned_results",
-                  attrBuilder.getI64ArrayAttr({0}));
-    hook->setAttr("ly.runtime.result_contract",
-                  attrBuilder.getStringAttr("builtins.str"));
-  }
-  return mlir::success();
+// Both string-shaped hooks hand back an owned `builtins.str`; the refcount
+// planner reads that off the hook, not off its callees.
+void RuntimeBundleLowerer::stampBoxedStrHookResult(llvm::StringRef hookName) {
+  auto hook = module.lookupSymbol<mlir::func::FuncOp>(hookName);
+  if (!hook)
+    return;
+  mlir::OpBuilder attrBuilder(context);
+  hook->setAttr("ly.ownership.owned_results", attrBuilder.getI64ArrayAttr({0}));
+  hook->setAttr("ly.runtime.result_contract",
+                attrBuilder.getStringAttr("builtins.str"));
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
-  // str instance of the uniform dispatch (print's conversion): class id ->
-  // the manifest `__str__` returning a `builtins.str`. Demand-driven like
-  // the repr hook.
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_str_boxed_by_contract");
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHookFor(
+    llvm::StringRef hookName, llvm::StringRef methodName,
+    mlir::TypeRange calleeResultTypes) {
+  // Demand-driven: the external declaration merged in from the manifest is
+  // what asks for the definition, and an unused public hook is not eliminated.
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName);
       !existing || !existing.isExternal())
     return mlir::success();
+  return generateBoxedMethodHook(
+      hookName,
+      [methodName](mlir::func::FuncOp function) {
+        auto method = function->getAttrOfType<mlir::StringAttr>(
+            contracts::kManifestMethodAttr);
+        return method && method.getValue() == methodName;
+      },
+      calleeResultTypes, /*shareExceptionSubclasses=*/false, methodName);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
+    llvm::StringRef hookName, llvm::StringRef methodName,
+    mlir::TypeRange calleeResultTypes) {
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName);
+      !existing || !existing.isExternal())
+    return mlir::success();
+  return generateBoxedBinaryMethodHook(
+      hookName,
+      [methodName](mlir::func::FuncOp function) {
+        auto method = function->getAttrOfType<mlir::StringAttr>(
+            contracts::kManifestMethodAttr);
+        return method && method.getValue() == methodName;
+      },
+      calleeResultTypes, methodName);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
+  // Each type carries its own `__repr__`, so no subclass sharing. A
+  // non-conforming one (bool's i1 receiver) is skipped by the memref-input
+  // predicate -- a manifest-conformance gap for that type, not a case here.
   mlir::Type i64 = mlir::IntegerType::get(context, 64);
   mlir::Type i8 = mlir::IntegerType::get(context, 8);
   auto strHeader = mlir::MemRefType::get({2}, i64);
   auto strBytes = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
-  if (mlir::failed(generateBoxedMethodHook(
-          "__ly_str_boxed_by_contract",
-          [](mlir::func::FuncOp function) {
-            auto method = function->getAttrOfType<mlir::StringAttr>(
-                contracts::kManifestMethodAttr);
-            return method && method.getValue() == "__str__";
-          },
-          {strHeader, strBytes}, /*shareExceptionSubclasses=*/false,
-          /*sourceClassMethodName=*/"__str__")))
+  if (mlir::failed(generateBoxedMethodHookFor("__ly_repr_boxed_by_contract",
+                                              "__repr__",
+                                              {strHeader, strBytes})))
     return mlir::failure();
-  if (auto hook = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_str_boxed_by_contract")) {
-    mlir::OpBuilder attrBuilder(context);
-    hook->setAttr("ly.ownership.owned_results",
-                  attrBuilder.getI64ArrayAttr({0}));
-    hook->setAttr("ly.runtime.result_contract",
-                  attrBuilder.getStringAttr("builtins.str"));
-  }
+  stampBoxedStrHookResult("__ly_repr_boxed_by_contract");
+  return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i8 = mlir::IntegerType::get(context, 8);
+  auto strHeader = mlir::MemRefType::get({2}, i64);
+  auto strBytes = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
+  if (mlir::failed(generateBoxedMethodHookFor("__ly_str_boxed_by_contract",
+                                              "__str__",
+                                              {strHeader, strBytes})))
+    return mlir::failure();
+  stampBoxedStrHookResult("__ly_str_boxed_by_contract");
   return mlir::success();
 }
 
@@ -2115,26 +2116,20 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassHashAdapters() {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
-  // hash instance: class id -> the manifest `__hash__` (returns the i64 hash
-  // word). Same demand-driven generation as the repr hook: the external
-  // declaration merged in from builtins.mlir requests the definition.
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_hash_boxed_by_contract");
+  // ⛔ The demand check is repeated here, ahead of the shared one. The
+  // adapters below mint functions, so running them for a program that never
+  // asked for the hook would leave dead definitions in the module.
+  if (auto existing =
+          module.lookupSymbol<mlir::func::FuncOp>("__ly_hash_boxed_by_contract");
       !existing || !existing.isExternal())
     return mlir::success();
-  if (mlir::failed(
-          RuntimeBundleLowerer::synthesizeSourceClassHashAdapters()))
+  // The adapters first: a compiled source-class `__hash__` returns the
+  // boxed-int ABI, which the uniform i64 dispatch cannot call directly.
+  if (mlir::failed(RuntimeBundleLowerer::synthesizeSourceClassHashAdapters()))
     return mlir::failure();
   mlir::Type i64 = mlir::IntegerType::get(context, 64);
-  return generateBoxedMethodHook(
-      "__ly_hash_boxed_by_contract",
-      [](mlir::func::FuncOp function) {
-        auto method = function->getAttrOfType<mlir::StringAttr>(
-            contracts::kManifestMethodAttr);
-        return method && method.getValue() == "__hash__";
-      },
-      {i64}, /*shareExceptionSubclasses=*/false,
-      /*sourceClassMethodName=*/"__hash__");
+  return generateBoxedMethodHookFor("__ly_hash_boxed_by_contract", "__hash__",
+                                    {i64});
 }
 
 // Binary variant of the uniform boxed-method dispatch, for same-class binary
@@ -2307,39 +2302,17 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedLtHook() {
-  // lt instance of the binary dispatch (sort/ordering over erased values).
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_lt_boxed_by_contract");
-      !existing || !existing.isExternal())
-    return mlir::success();
+  // Ordering over erased values (sort).
   mlir::Type i1 = mlir::IntegerType::get(context, 1);
-  return generateBoxedBinaryMethodHook(
-      "__ly_lt_boxed_by_contract",
-      [](mlir::func::FuncOp function) {
-        auto method = function->getAttrOfType<mlir::StringAttr>(
-            contracts::kManifestMethodAttr);
-        return method && method.getValue() == "__lt__";
-      },
-      {i1}, /*sourceClassMethodName=*/"__lt__");
+  return generateBoxedBinaryMethodHookFor("__ly_lt_boxed_by_contract",
+                                          "__lt__", {i1});
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedEqHook() {
-  // eq instance of the binary dispatch: class id -> the manifest `__eq__`
-  // taking (self shape, self shape) and returning one i1. Demand-driven like
-  // the repr/hash hooks.
-  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(
-          "__ly_eq_boxed_by_contract");
-      !existing || !existing.isExternal())
-    return mlir::success();
+  // Key equality over erased keys (dict/set probing).
   mlir::Type i1 = mlir::IntegerType::get(context, 1);
-  return generateBoxedBinaryMethodHook(
-      "__ly_eq_boxed_by_contract",
-      [](mlir::func::FuncOp function) {
-        auto method = function->getAttrOfType<mlir::StringAttr>(
-            contracts::kManifestMethodAttr);
-        return method && method.getValue() == "__eq__";
-      },
-      {i1}, /*sourceClassMethodName=*/"__eq__");
+  return generateBoxedBinaryMethodHookFor("__ly_eq_boxed_by_contract",
+                                          "__eq__", {i1});
 }
 
 } // namespace py::lowering
