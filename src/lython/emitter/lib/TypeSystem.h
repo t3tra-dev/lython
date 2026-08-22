@@ -477,4 +477,11 @@ private:
                                  mlir::ArrayRef<CallKeywordType> keywords) const;
 };
 
+// The element types a starred argument of `type` contributes, appended to
+// `out`; false when the type is not a statically sized tuple. A type-level
+// question, so it lives with the type system -- the emitter's support layer
+// had a second copy under a second name.
+bool appendStarredArgumentTypes(const TypeSystem &types, mlir::Type type,
+                                llvm::SmallVectorImpl<mlir::Type> &out);
+
 } // namespace lython::emitter

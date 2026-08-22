@@ -21,7 +21,6 @@
 namespace lython::parser {
 namespace {
 
-std::string trim(std::string text);
 
 std::string readTextFile(const std::string &path) {
   std::ifstream input(path);
@@ -492,14 +491,6 @@ collectOperatorSpellings(const std::vector<TokenSpec> &tokens) {
             });
   result.erase(std::unique(result.begin(), result.end()), result.end());
   return result;
-}
-
-std::string trim(std::string text) {
-  const std::size_t first = text.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos)
-    return std::string();
-  const std::size_t last = text.find_last_not_of(" \t\r\n");
-  return text.substr(first, last - first + 1);
 }
 
 std::string stripAsdlComments(const std::string &asdl) {

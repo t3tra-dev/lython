@@ -429,6 +429,17 @@ collectRuntimeDeallocators(mlir::ModuleOp module);
 
 bool valueRangeMatchesTypes(mlir::ValueRange values, unsigned offset,
                             llvm::ArrayRef<mlir::Type> types);
+// The integer an `arith.constant` holds, or nothing when the value is null or
+// is not one. Three files had a copy (two of them named for the width they
+// happened to read); this is the one that null-checks, which is what the other
+// two callers needed anyway.
+std::optional<std::int64_t> constantIntValue(mlir::Value value);
+
+// The physical shape of every runtime handle: one i64 lane list of any width.
+// Named once here because three files in the lowering had spelled it out
+// (twice under two capitalisations of the same name), and the two predicates
+// below are this one plus a width floor.
+bool isRankOneI64MemRef(mlir::Type type);
 bool isObjectHeaderLikeType(mlir::Type type);
 // Can a value of type `from` be spelled as the object-header interface type
 // `to` (Ly_IncRef's input, a deallocator's input)? `spellHeaderPrefix` emits

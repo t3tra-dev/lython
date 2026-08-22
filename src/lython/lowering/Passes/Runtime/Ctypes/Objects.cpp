@@ -468,7 +468,7 @@ RuntimeBundleLowerer::lowerStaticCtypesGetItem(py::GetItemOp op,
 
 bool RuntimeBundleLowerer::isErasedCtypesContract(
     llvm::StringRef contract) const {
-  return isFixedOrTargetDependentCtypesScalar(contract);
+  return isCtypesIntegralScalar(contract);
 }
 
 bool RuntimeBundleLowerer::isStaticCtypesLibraryContract(

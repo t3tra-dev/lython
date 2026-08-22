@@ -10,6 +10,24 @@
 
 namespace py::lowering {
 
+mlir::LLVM::LLVMFuncOp ensureFuncDecl(mlir::ModuleOp module,
+                                      mlir::OpBuilder &builder,
+                                      llvm::StringRef name,
+                                      mlir::LLVM::LLVMFunctionType type) {
+  if (auto existing = module.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name))
+    return existing;
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  return mlir::LLVM::LLVMFuncOp::create(builder, builder.getUnknownLoc(), name,
+                                        type);
+}
+
+mlir::Value constI64(mlir::OpBuilder &builder, mlir::Location loc,
+                     std::int64_t value) {
+  return mlir::LLVM::ConstantOp::create(builder, loc, builder.getI64Type(),
+                                        builder.getI64IntegerAttr(value));
+}
+
 bool isPrimitiveElementType(mlir::Type type) {
   return mlir::isa<mlir::FloatType, mlir::IntegerType>(type);
 }

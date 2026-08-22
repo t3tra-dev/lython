@@ -37,8 +37,6 @@ void replaceSelfInSignature(FunctionSignature &sig, mlir::Type selfType,
                             TypeSystem &types);
 bool anyTrue(llvm::ArrayRef<char> values);
 std::string methodKind(const parser::Node &function);
-bool appendStarredArgumentTypes(mlir::Type type, TypeSystem &types,
-                                llvm::SmallVectorImpl<mlir::Type> &out);
 bool isTopLevelDecl(const parser::Node &node);
 std::string importBindingName(std::string_view module,
                               std::optional<std::string_view> asname);

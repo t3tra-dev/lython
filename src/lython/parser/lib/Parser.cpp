@@ -1,5 +1,7 @@
 #include "Parser.h"
 
+#include "FStringScan.h"
+
 #include "../pegen.h"
 #include "CpythonPegAdapter.h"
 #include "GeneratedTokenStream.h"
@@ -150,6 +152,8 @@ bool isDigitForBase(char ch, int base) {
   return false;
 }
 
+// A digit's value in any base up to 16, -1 for a character that is not one.
+// The escape decoder had a `hexValue` copy of this, character for character.
 int digitValue(char ch) {
   if (ch >= '0' && ch <= '9')
     return ch - '0';
@@ -4284,45 +4288,7 @@ private:
     addField(node, name, std::move(value));
   }
 
-  static int hexValue(char ch) {
-    if (ch >= '0' && ch <= '9')
-      return ch - '0';
-    if (ch >= 'a' && ch <= 'f')
-      return 10 + ch - 'a';
-    if (ch >= 'A' && ch <= 'F')
-      return 10 + ch - 'A';
-    return -1;
-  }
-
   static bool isOctalDigit(char ch) { return ch >= '0' && ch <= '7'; }
-
-  static bool appendUtf8(std::string &out, std::uint32_t codepoint) {
-    if (codepoint <= 0x7f) {
-      out.push_back(static_cast<char>(codepoint));
-      return true;
-    }
-    if (codepoint >= 0xd800 && codepoint <= 0xdfff)
-      return false;
-    if (codepoint <= 0x7ff) {
-      out.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
-      out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-      return true;
-    }
-    if (codepoint <= 0xffff) {
-      out.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
-      out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-      out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-      return true;
-    }
-    if (codepoint <= 0x10ffff) {
-      out.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
-      out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
-      out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-      out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-      return true;
-    }
-    return false;
-  }
 
   // \xNN denotes a raw byte in bytes literals but the CODEPOINT U+00NN in
   // str literals (which lands as its UTF-8 encoding in the str payload).
@@ -4331,8 +4297,8 @@ private:
                               bool bytesLiteral) {
     if (index + 2 >= contentEnd)
       return false;
-    int high = hexValue(literal[index + 1]);
-    int low = hexValue(literal[index + 2]);
+    int high = digitValue(literal[index + 1]);
+    int low = digitValue(literal[index + 2]);
     if (high < 0 || low < 0)
       return false;
     std::uint32_t value = static_cast<std::uint32_t>((high << 4) | low);
@@ -4351,7 +4317,7 @@ private:
       return false;
     std::uint32_t codepoint = 0;
     for (int digit = 1; digit <= digits; ++digit) {
-      int value = hexValue(literal[index + static_cast<std::size_t>(digit)]);
+      int value = digitValue(literal[index + static_cast<std::size_t>(digit)]);
       if (value < 0)
         return false;
       codepoint = (codepoint << 4) | static_cast<std::uint32_t>(value);
@@ -4395,61 +4361,11 @@ private:
     out.push_back(escaped);
   }
 
-  struct StringContentRange {
-    std::size_t start = 0;
-    std::size_t end = 0;
-  };
-
-  StringContentRange stringContentRange(const std::string &literal) {
-    const std::size_t firstQuote = literal.find_first_of("'\"");
-    if (firstQuote == std::string::npos)
-      return StringContentRange{0, literal.size()};
-
-    const char quote = literal[firstQuote];
-    const bool triple = firstQuote + 2 < literal.size() &&
-                        literal[firstQuote + 1] == quote &&
-                        literal[firstQuote + 2] == quote;
-    const std::size_t contentStart = firstQuote + (triple ? 3 : 1);
-    std::size_t contentEnd = literal.size();
-    if (triple) {
-      if (contentEnd >= 3)
-        contentEnd -= 3;
-    } else if (contentEnd >= 1) {
-      contentEnd -= 1;
-    }
-
-    return StringContentRange{contentStart, contentEnd};
-  }
+;
 
   std::string stringContent(const std::string &literal) {
     StringContentRange range = stringContentRange(literal);
     return literal.substr(range.start, range.end - range.start);
-  }
-
-  SourceLocation advanceLocation(SourceLocation location, char ch) const {
-    ++location.offset;
-    if (ch == '\n') {
-      ++location.line;
-      location.column = 0;
-    } else {
-      ++location.column;
-    }
-    return location;
-  }
-
-  SourceLocation locationAt(SourceLocation start, std::string_view text,
-                            std::size_t offset) const {
-    SourceLocation location = start;
-    std::size_t limit = std::min(offset, text.size());
-    for (std::size_t i = 0; i < limit; ++i)
-      location = advanceLocation(location, text[i]);
-    return location;
-  }
-
-  SourceRange rangeAt(SourceLocation start, std::string_view text,
-                      std::size_t begin, std::size_t end) const {
-    return SourceRange{locationAt(start, text, begin),
-                       locationAt(start, text, end)};
   }
 
   void translateRanges(const NodePtr &node, SourceLocation sourceStart,
@@ -4601,7 +4517,7 @@ private:
     if (first + static_cast<std::size_t>(count) > contentEnd)
       return false;
     for (int index = 0; index < count; ++index)
-      if (hexValue(literal[first + static_cast<std::size_t>(index)]) < 0)
+      if (digitValue(literal[first + static_cast<std::size_t>(index)]) < 0)
         return false;
     return true;
   }
@@ -4613,7 +4529,7 @@ private:
     std::uint32_t codepoint = 0;
     for (int index = 0; index < digits; ++index)
       codepoint = (codepoint << 4) |
-                  static_cast<std::uint32_t>(hexValue(
+                  static_cast<std::uint32_t>(digitValue(
                       literal[first + static_cast<std::size_t>(index)]));
     std::string ignored;
     return appendUtf8(ignored, codepoint);
@@ -4914,165 +4830,6 @@ private:
       appendStringNode(values, std::move(node));
   }
 
-  std::size_t skipQuotedText(std::string_view text, std::size_t quoteIndex) {
-    char quote = text[quoteIndex];
-    bool triple = quoteIndex + 2 < text.size() &&
-                  text[quoteIndex + 1] == quote &&
-                  text[quoteIndex + 2] == quote;
-    std::size_t i = quoteIndex + (triple ? 3 : 1);
-    while (i < text.size()) {
-      char ch = text[i++];
-      if (ch == '\\') {
-        if (i < text.size())
-          ++i;
-        continue;
-      }
-      if (ch != quote)
-        continue;
-      if (!triple)
-        return i;
-      if (i + 1 < text.size() && text[i] == quote && text[i + 1] == quote)
-        return i + 2;
-    }
-    return text.size();
-  }
-
-  std::size_t skipFStringComment(std::string_view text, std::size_t index,
-                                 std::size_t limit) {
-    while (index < limit && text[index] != '\n' && text[index] != '\r')
-      ++index;
-    if (index < limit && text[index] == '\r')
-      ++index;
-    if (index < limit && text[index] == '\n')
-      ++index;
-    return index;
-  }
-
-  std::size_t findFStringFieldEnd(std::string_view text, std::size_t start) {
-    int depth = 0;
-    // After the top-level ':' the remainder is the format spec: literal
-    // text where '#' and quotes are ordinary characters ('{x:#x}',
-    // '{x:"^7}'), not comments or nested strings. Bracket depth keeps
-    // slice colons ('{a[1:2]}') from starting the spec early.
-    int groupDepth = 0;
-    bool inSpec = false;
-    for (std::size_t i = start; i < text.size();) {
-      char ch = text[i];
-      if (ch == '#' && !inSpec) {
-        i = skipFStringComment(text, i, text.size());
-        continue;
-      }
-      if ((ch == '\'' || ch == '"') && !inSpec) {
-        i = skipQuotedText(text, i);
-        continue;
-      }
-      if ((ch == '(' || ch == '[') && !inSpec) {
-        ++groupDepth;
-        ++i;
-        continue;
-      }
-      if ((ch == ')' || ch == ']') && !inSpec) {
-        --groupDepth;
-        ++i;
-        continue;
-      }
-      if (ch == ':' && depth == 0 && groupDepth == 0) {
-        inSpec = true;
-        ++i;
-        continue;
-      }
-      if (ch == '{') {
-        ++depth;
-        ++i;
-        continue;
-      }
-      if (ch == '}') {
-        if (depth == 0)
-          return i;
-        --depth;
-        ++i;
-        continue;
-      }
-      ++i;
-    }
-    return std::string_view::npos;
-  }
-
-  std::size_t findFStringFieldDelimiter(std::string_view text, char delimiter) {
-    int depth = 0;
-    for (std::size_t i = 0; i < text.size();) {
-      char ch = text[i];
-      if (ch == '#') {
-        i = skipFStringComment(text, i, text.size());
-        continue;
-      }
-      if (ch == '\'' || ch == '"') {
-        i = skipQuotedText(text, i);
-        continue;
-      }
-      if (ch == '(' || ch == '[' || ch == '{') {
-        ++depth;
-        ++i;
-        continue;
-      }
-      if (ch == ')' || ch == ']' || ch == '}') {
-        --depth;
-        ++i;
-        continue;
-      }
-      if (depth == 0 && ch == delimiter) {
-        if (delimiter == '!' && i + 1 < text.size() && text[i + 1] == '=') {
-          i += 2;
-          continue;
-        }
-        return i;
-      }
-      // A top-level ':' starts the format spec; a '!' beyond it would be
-      // spec text, never a conversion marker.
-      if (depth == 0 && ch == ':' && delimiter == '!')
-        return std::string_view::npos;
-      ++i;
-    }
-    return std::string_view::npos;
-  }
-
-  std::size_t findFStringDebugEqual(std::string_view text, std::size_t limit) {
-    int depth = 0;
-    for (std::size_t i = 0; i < limit;) {
-      char ch = text[i];
-      if (ch == '#') {
-        i = skipFStringComment(text, i, limit);
-        continue;
-      }
-      if (ch == '\'' || ch == '"') {
-        i = skipQuotedText(text, i);
-        continue;
-      }
-      if (ch == '(' || ch == '[' || ch == '{') {
-        ++depth;
-        ++i;
-        continue;
-      }
-      if (ch == ')' || ch == ']' || ch == '}') {
-        --depth;
-        ++i;
-        continue;
-      }
-      if (depth == 0 && ch == '=') {
-        char previous = i > 0 ? text[i - 1] : '\0';
-        char next = i + 1 < text.size() ? text[i + 1] : '\0';
-        if (previous == '!' || previous == '<' || previous == '>' ||
-            previous == '=' || previous == ':' || next == '=')
-          ++i;
-        else
-          return i;
-        continue;
-      }
-      ++i;
-    }
-    return std::string_view::npos;
-  }
-
   struct FStringField {
     std::string expression;
     std::string interpolationText;
@@ -5094,18 +4851,6 @@ private:
       --end;
     }
     return std::string(text.substr(0, end));
-  }
-
-  std::string trimInterpolationExpression(std::string_view text,
-                                          std::size_t &offset) {
-    const std::size_t first = text.find_first_not_of(" \t\r\n");
-    if (first == std::string_view::npos) {
-      offset = 0;
-      return std::string();
-    }
-    const std::size_t last = text.find_last_not_of(" \t\r\n");
-    offset = first;
-    return std::string(text.substr(first, last - first + 1));
   }
 
   bool startsWithLambdaKeyword(std::string_view expression) {

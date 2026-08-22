@@ -58,6 +58,17 @@ mlir::Type runtimeContractType(mlir::MLIRContext *context,
   return py::ContractType::get(context, contract);
 }
 
+mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
+                                          mlir::func::FuncOp target) {
+  auto bodyResult =
+      target->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
+  if (!bodyResult)
+    return {};
+  mlir::Type object = runtimeContractType(context, "builtins.object");
+  return py::ContractType::get(context, "types.CoroutineType",
+                               {object, object, bodyResult.getValue()});
+}
+
 bool RuntimeSymbol::hasClassIdArgument(unsigned inputIndex) const {
   return llvm::is_contained(classIdArgumentIndices, inputIndex);
 }

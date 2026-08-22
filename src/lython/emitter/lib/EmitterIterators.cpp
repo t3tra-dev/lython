@@ -673,22 +673,6 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
 // loop position.
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// def <symbol>(<params>): <body> — parameters carry no annotations; the
-// caller pins their types through TypeSystem::overrideParameterType.
-
-
-
-std::string typeKey(mlir::Type type) {
-  std::string text;
-  llvm::raw_string_ostream stream(text);
-  stream << type;
-  return text;
-}
-
-} // namespace
-
 std::optional<Value>
 ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
                                             const parser::Node *calleeNode) {
@@ -810,7 +794,7 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
   // spelling (map/filter bodies inline it syntactically).
   std::string memoKey = name.str();
   for (const Value &value : iterableValues)
-    memoKey += "|" + typeKey(types.widenLiteral(value.type));
+    memoKey += "|" + typeText(types.widenLiteral(value.type));
   if (callable.callee)
     memoKey += "|f:" + ast::qualifiedName(callable.callee.get());
   else if (callable.lambdaBody) {
@@ -2936,7 +2920,7 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     params.push_back(param);
     argValues.push_back(value);
     paramTypes.push_back(types.widenLiteral(value.type));
-    memoKey += "|" + typeKey(paramTypes.back());
+    memoKey += "|" + typeText(paramTypes.back());
     return synth::name(param, range);
   };
   auto increment = [&](NodePtr counter, std::int64_t by) {

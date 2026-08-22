@@ -32,7 +32,7 @@ namespace ts = py::threadsafe;
 inline constexpr llvm::StringLiteral kLoweredSafetyContractsAttr{
     "ly.lowered_safety_contracts"};
 
-using ts::constantIntValue;
+using py::ownership::constantIntValue;
 
 bool isConstant(mlir::Value value, int64_t expected) {
   std::optional<int64_t> actual = constantIntValue(value);

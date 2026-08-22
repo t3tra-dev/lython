@@ -5,17 +5,6 @@
 namespace py::lowering {
 namespace {
 
-mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
-                                          mlir::func::FuncOp target) {
-  auto bodyResult =
-      target->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
-  if (!bodyResult)
-    return {};
-  mlir::Type object = runtimeContractType(context, "builtins.object");
-  return py::ContractType::get(context, "types.CoroutineType",
-                               {object, object, bodyResult.getValue()});
-}
-
 } // namespace
 
 mlir::LogicalResult RuntimeBundleLowerer::collectFunctionTargetRuntimeSources(

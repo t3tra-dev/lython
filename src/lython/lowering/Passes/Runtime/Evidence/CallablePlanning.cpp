@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/Evidence/Callable.h"
+
 #include "PyCallableShape.h"
 #include "PyProtocols.h"
 
@@ -32,14 +34,6 @@ bool aggregateOperandIsUnpacked(const RuntimeBundle &aggregate,
                                 unsigned index) {
   return index < aggregate.aggregateUnpackedOperands.size() &&
          aggregate.aggregateUnpackedOperands[index] != 0;
-}
-
-bool packOperandIsUnpacked(py::PackOp pack, unsigned index) {
-  auto flags = pack->getAttrOfType<mlir::ArrayAttr>(kPackUnpackedOperandsAttr);
-  if (!flags || index >= flags.size())
-    return false;
-  auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>(flags[index]);
-  return boolAttr && boolAttr.getValue();
 }
 
 void appendStaticUnpackedPositionalTypes(
@@ -445,7 +439,7 @@ RuntimeBundleLowerer::collectStaticCallableInvocation(py::CallOp op) const {
   invocation.actualValues.reserve(posargs.getValues().size() +
                                   kwValues.getValues().size());
   for (auto [index, value] : llvm::enumerate(posargs.getValues())) {
-    if (packOperandIsUnpacked(posargs, static_cast<unsigned>(index))) {
+    if (callable_evidence::packOperandIsUnpacked(posargs, static_cast<unsigned>(index))) {
       std::size_t before = invocation.actualTypes.size();
       appendStaticUnpackedPositionalTypes(
           value.getType(), invocation.positionalTypes, invocation.actualTypes);

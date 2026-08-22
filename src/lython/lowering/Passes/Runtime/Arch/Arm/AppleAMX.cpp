@@ -103,22 +103,6 @@ constexpr std::uint32_t kKnownCpuFamilies[] = {
     0x17d5b93au, // M4 Pro / Max (Brava)
 };
 
-LLVM::LLVMFuncOp ensureFuncDecl(mlir::ModuleOp module, mlir::OpBuilder &builder,
-                                llvm::StringRef name,
-                                LLVM::LLVMFunctionType type) {
-  if (auto existing = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  return LLVM::LLVMFuncOp::create(builder, builder.getUnknownLoc(), name, type);
-}
-
-mlir::Value constI64(mlir::OpBuilder &builder, mlir::Location loc,
-                     std::int64_t value) {
-  return LLVM::ConstantOp::create(builder, loc, builder.getI64Type(),
-                                  builder.getI64IntegerAttr(value));
-}
-
 mlir::Value constI32(mlir::OpBuilder &builder, mlir::Location loc,
                      std::int32_t value) {
   return LLVM::ConstantOp::create(builder, loc, builder.getI32Type(),

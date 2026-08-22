@@ -431,12 +431,16 @@ static bool isIntegerType(mlir::Type type, unsigned width) {
   return integer && integer.getWidth() == width;
 }
 
-bool isObjectHeaderLikeType(mlir::Type type) {
+bool isRankOneI64MemRef(mlir::Type type) {
   auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
-  if (!memref || memref.getRank() != 1)
+  return memref && memref.getRank() == 1 &&
+         isIntegerType(memref.getElementType(), 64);
+}
+
+bool isObjectHeaderLikeType(mlir::Type type) {
+  if (!isRankOneI64MemRef(type))
     return false;
-  if (!isIntegerType(memref.getElementType(), 64))
-    return false;
+  auto memref = mlir::cast<mlir::MemRefType>(type);
   return memref.isDynamicDim(0) || memref.getDimSize(0) >= 2;
 }
 
@@ -1404,8 +1408,9 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
   return ownedGroups;
 }
 
-static std::optional<std::int64_t> constantIntValue(mlir::Value value) {
-  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
+std::optional<std::int64_t> constantIntValue(mlir::Value value) {
+  auto constant = value ? value.getDefiningOp<mlir::arith::ConstantOp>()
+                        : nullptr;
   if (!constant)
     return std::nullopt;
   auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());

@@ -59,13 +59,6 @@ Value boxedBool(mlir::OpBuilder &builder, mlir::Location loc, TypeSystem &types,
   return {pyBool.getResult(), types.boolType()};
 }
 
-std::string typeText(mlir::Type type) {
-  std::string text;
-  llvm::raw_string_ostream stream(text);
-  stream << type;
-  return text;
-}
-
 bool callHasNoArguments(const parser::Node &expr) {
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -221,7 +214,7 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
       operands.positional.push_back(value);
       operands.positionalUnpacked.push_back(unpacked ? 1 : 0);
       if (unpacked) {
-        if (!appendStarredArgumentTypes(value.type, types,
+        if (!appendStarredArgumentTypes(types, value.type,
                                         operands.positionalTypes)) {
           operands.valid = false;
           operands.failureReason =

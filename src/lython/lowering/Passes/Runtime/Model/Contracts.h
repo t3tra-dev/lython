@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
 #include <Contracts.h>
 
 #include "mlir/IR/BuiltinTypes.h"
@@ -58,6 +60,12 @@ bool compatibleRuntimeObjectEvidenceContract(mlir::Type resultType,
                                              mlir::Type evidenceType);
 mlir::Type runtimeContractType(mlir::MLIRContext *context,
                                llvm::StringRef contract);
+// The `types.CoroutineType` an async target's body yields, or null when the
+// target is not one. Here rather than in either caller: the ABI side (which
+// decides a call's result shape) and the call side (which decides what a
+// function target returns) had a copy each, and they are one answer.
+mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
+                                          mlir::func::FuncOp target);
 bool sameTypeSequence(llvm::ArrayRef<mlir::Type> lhs,
                       llvm::ArrayRef<mlir::Type> rhs);
 std::string describeTypeSequence(llvm::ArrayRef<mlir::Type> types);

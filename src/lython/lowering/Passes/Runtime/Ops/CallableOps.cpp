@@ -7,16 +7,6 @@
 namespace py::lowering {
 namespace {
 
-std::optional<std::int64_t> constantI64Value(mlir::Value value) {
-  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
-  if (!constant)
-    return std::nullopt;
-  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
-  if (!integer)
-    return std::nullopt;
-  return integer.getValue().getSExtValue();
-}
-
 bool primitiveI64EvidenceEqual(const RuntimeBundle &lhs,
                                const RuntimeBundle &rhs) {
   if (lhs.contractName() != "builtins.int" ||
@@ -26,9 +16,9 @@ bool primitiveI64EvidenceEqual(const RuntimeBundle &lhs,
   if (lhs.primitiveI64->value == rhs.primitiveI64->value)
     return true;
   std::optional<std::int64_t> lhsValue =
-      constantI64Value(lhs.primitiveI64->value);
+      ownership::constantIntValue(lhs.primitiveI64->value);
   std::optional<std::int64_t> rhsValue =
-      constantI64Value(rhs.primitiveI64->value);
+      ownership::constantIntValue(rhs.primitiveI64->value);
   return lhsValue && rhsValue && *lhsValue == *rhsValue;
 }
 

@@ -8,8 +8,6 @@
 
 namespace lython::emitter {
 
-namespace {
-
 std::string typeText(mlir::Type type) {
   if (!type)
     return "<unknown>";
@@ -18,6 +16,8 @@ std::string typeText(mlir::Type type) {
   stream << type;
   return stream.str();
 }
+
+namespace {
 
 } // namespace
 

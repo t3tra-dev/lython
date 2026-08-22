@@ -110,4 +110,10 @@ struct CpythonPegGrammar {
 
 CpythonPegGrammar parseCpythonPegGrammar(std::string_view grammar);
 
+// Surrounding ASCII whitespace removed. Declared with the grammar reader
+// because both readers of CPython's checked-in spec files -- this one and the
+// token/ASDL reader in CpythonSpec.cpp, which includes this header -- trim
+// every line they take, and each had its own copy.
+std::string trim(std::string text);
+
 } // namespace lython::parser

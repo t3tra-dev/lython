@@ -1,3 +1,4 @@
+#include "PyTypeObject.h"
 #include "Runtime/Ctypes/Internal.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -181,25 +182,9 @@ std::optional<mlir::Type> resolveCtypesSourceExpr(mlir::MLIRContext *context,
   return std::nullopt;
 }
 
-std::optional<mlir::Attribute> classStaticValue(py::ClassOp classOp,
-                                                llvm::StringRef name) {
-  auto names =
-      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_names");
-  auto values =
-      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_values");
-  if (!names || !values || names.size() != values.size())
-    return std::nullopt;
-  for (auto [index, attr] : llvm::enumerate(names)) {
-    auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
-    if (stringAttr && stringAttr.getValue() == name)
-      return values[index];
-  }
-  return std::nullopt;
-}
-
 std::optional<std::uint64_t> classStaticPositiveInteger(py::ClassOp classOp,
                                                         llvm::StringRef name) {
-  std::optional<mlir::Attribute> value = classStaticValue(classOp, name);
+  std::optional<mlir::Attribute> value = py::type_object::staticAttributeValue(classOp, name);
   if (!value)
     return std::nullopt;
   std::optional<std::int64_t> integer = sourceExprStaticInteger(*value);
@@ -258,7 +243,7 @@ ctypesStaticFields(mlir::ModuleOp module, py::ClassOp classOp) {
   }
 
   std::optional<mlir::Attribute> staticFields =
-      classStaticValue(classOp, "_fields_");
+      py::type_object::staticAttributeValue(classOp, "_fields_");
   if (!staticFields)
     return fields;
   auto fieldsDict =

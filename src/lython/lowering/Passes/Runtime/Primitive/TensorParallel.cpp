@@ -360,23 +360,6 @@ std::optional<int64_t> onlineProcessorsSysconfName(mlir::ModuleOp module) {
   return std::nullopt;
 }
 
-LLVM::LLVMFuncOp ensureFuncDecl(mlir::ModuleOp module, mlir::OpBuilder &builder,
-                                llvm::StringRef name,
-                                LLVM::LLVMFunctionType type) {
-  if (auto existing = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
-    return existing;
-  mlir::OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(module.getBody());
-  return LLVM::LLVMFuncOp::create(builder, builder.getUnknownLoc(), name,
-                                  type);
-}
-
-mlir::Value constI64(mlir::OpBuilder &builder, mlir::Location loc,
-                     int64_t value) {
-  return LLVM::ConstantOp::create(builder, loc, builder.getI64Type(),
-                                  builder.getI64IntegerAttr(value));
-}
-
 // struct WorkerArg { void (*fn)(i64, i64, ptr); ptr ctx; i64 begin; i64 end; }
 LLVM::LLVMStructType workerArgType(mlir::MLIRContext *context) {
   auto ptr = LLVM::LLVMPointerType::get(context);

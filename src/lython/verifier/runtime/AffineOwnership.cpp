@@ -813,20 +813,6 @@ public:
     return attr.getInt();
   }
 
-  // Does `call` release the container `identity` names? This is the DISCHARGE
-  // of every slot retain parked in that container: the holder's release runs the
-  // deallocator, and the deallocator's lemma releases each slot
-  // (rfc/memory-safety-proof.md, Aggregates -- "aggregate effects reduce to the
-  // same produce/retain/release/transfer rules over aggregate(parent, path)").
-  bool callDischargesAggregate(mlir::func::CallOp call,
-                               std::int64_t identity) {
-    buildAggregateParents();
-    auto entry = aggregateParents.find(identity);
-    if (entry == aggregateParents.end() || entry->second.empty())
-      return false;
-    return own::callConsumesGroup(contracts, call, entry->second, aliases);
-  }
-
   // `aliases.same(value, candidate)` for some candidate in a fixed candidate
   // list, with the candidates reduced to their alias roots up front: the query
   // is asked per path state and the candidate list is function-sized.
@@ -1635,9 +1621,14 @@ unknownOperandConstants(mlir::Operation *op) {
                                                mlir::Attribute());
 }
 
+// Where a region-branch successor continues, for either walk: the parent
+// continuation is the op's own next node, a region entry is that region's
+// first block. The two walks differ in what they CARRY, not in where the edge
+// goes, so the state type is the only parameter.
+template <typename State>
 void enqueueRegionSuccessor(mlir::Operation *owner, mlir::RegionSuccessor succ,
-                            AffinePathState state,
-                            llvm::SmallVectorImpl<AffinePathState> &worklist) {
+                            State state,
+                            llvm::SmallVectorImpl<State> &worklist) {
   if (succ.isParent()) {
     state.block = owner->getBlock();
     state.start = owner->getNextNode();
@@ -1702,20 +1693,6 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, AffinePathState state,
   return handled;
 }
 
-void enqueueBorrowedRegionSuccessor(
-    mlir::Operation *owner, mlir::RegionSuccessor succ, BorrowedPathState state,
-    llvm::SmallVectorImpl<BorrowedPathState> &worklist) {
-  if (succ.isParent()) {
-    state.block = owner->getBlock();
-    state.start = owner->getNextNode();
-  } else {
-    state.block =
-        succ.getSuccessor()->empty() ? nullptr : &succ.getSuccessor()->front();
-    state.start = firstOperation(succ.getSuccessor());
-  }
-  worklist.push_back(std::move(state));
-}
-
 bool enqueueBorrowedRegionEntryPaths(
     mlir::Operation *op, BorrowedPathState state, own::AliasAnalysis &aliases,
     OwnershipWalkCache &walk,
@@ -1739,7 +1716,7 @@ bool enqueueBorrowedRegionEntryPaths(
       mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
       next.group = remapGroupThroughValueMapping(
           sources, successor.getSuccessorInputs(), state.group, aliases);
-      enqueueBorrowedRegionSuccessor(op, successor, std::move(next), worklist);
+      enqueueRegionSuccessor(op, successor, std::move(next), worklist);
       handled = true;
       continue;
     }
@@ -1754,7 +1731,7 @@ bool enqueueBorrowedRegionEntryPaths(
     mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
     next.group = remapGroupThroughValueMapping(
         sources, successor.getSuccessorInputs(), state.group, aliases);
-    enqueueBorrowedRegionSuccessor(op, successor, std::move(next), worklist);
+    enqueueRegionSuccessor(op, successor, std::move(next), worklist);
     handled = true;
   }
 
@@ -1952,7 +1929,7 @@ mlir::LogicalResult handleBorrowedRegionTerminator(
 
     BorrowedPathState next = state;
     next.group = std::move(mappedGroup);
-    enqueueBorrowedRegionSuccessor(owner, successor, std::move(next), worklist);
+    enqueueRegionSuccessor(owner, successor, std::move(next), worklist);
     enqueued = true;
   }
 

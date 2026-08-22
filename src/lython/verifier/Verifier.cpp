@@ -195,16 +195,10 @@ mlir::LogicalResult verifyDescriptorKindAttr(mlir::Operation *op,
   return op->emitOpError("unsupported descriptor kind '") << kind << "'";
 }
 
-mlir::LogicalResult verifyBinarySpecialMethod(mlir::Operation *op) {
-  auto methodName = op->getAttrOfType<mlir::StringAttr>("method_name");
-  if (!methodName || methodName.getValue().empty())
-    return op->emitOpError("requires non-empty 'method_name'");
-  if (mlir::failed(requireProtocolAttr(op, "callee_contract")))
-    return mlir::failure();
-  return verifyContractResults(op);
-}
-
-mlir::LogicalResult verifyUnarySpecialMethod(mlir::Operation *op) {
+// One check for every special-method op, unary and binary alike: the arity is
+// in the op's own operand list and never reached this predicate, so the two
+// names that stood here verified the same three things.
+mlir::LogicalResult verifySpecialMethod(mlir::Operation *op) {
   auto methodName = op->getAttrOfType<mlir::StringAttr>("method_name");
   if (!methodName || methodName.getValue().empty())
     return op->emitOpError("requires non-empty 'method_name'");
@@ -554,68 +548,68 @@ mlir::LogicalResult CastToPrimOp::verify() {
 }
 
 mlir::LogicalResult NegOp::verify() {
-  return verifyUnarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult PosOp::verify() {
-  return verifyUnarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult InvertOp::verify() {
-  return verifyUnarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 
 mlir::LogicalResult AddOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult SubOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult MulOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult DivOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult FloorDivOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult ModOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult LShiftOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult RShiftOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult BitAndOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult BitOrOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult BitXorOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult PowOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult LeOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult LtOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult GtOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult GeOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult EqOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 mlir::LogicalResult NeOp::verify() {
-  return verifyBinarySpecialMethod(getOperation());
+  return verifySpecialMethod(getOperation());
 }
 
 mlir::LogicalResult ReprOp::verify() {

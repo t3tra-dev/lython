@@ -93,10 +93,4 @@ inline std::optional<PythonSourceRange> pythonSourceRange(mlir::Location loc) {
   return range;
 }
 
-inline bool sourcePointLessOrEqual(std::int32_t lhsLine, std::int32_t lhsColumn,
-                                   std::int32_t rhsLine,
-                                   std::int32_t rhsColumn) {
-  return lhsLine < rhsLine || (lhsLine == rhsLine && lhsColumn <= rhsColumn);
-}
-
 } // namespace py

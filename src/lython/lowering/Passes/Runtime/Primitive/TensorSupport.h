@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
 
@@ -44,5 +45,16 @@ std::optional<int64_t> selectDivisibleVectorLanes(mlir::Type elementType,
                                                   int64_t tripCount,
                                                   int64_t vectorBits,
                                                   int64_t minLanes);
+
+// Declaring an LLVM runtime entry point (getenv, sysconf, dlsym, the AMX
+// trampolines) and building an i64 literal for its arguments. Here because the
+// two files that emit those calls -- the parallel driver and the Apple AMX
+// path -- had a copy each, and both already include this header.
+mlir::LLVM::LLVMFuncOp ensureFuncDecl(mlir::ModuleOp module,
+                                      mlir::OpBuilder &builder,
+                                      llvm::StringRef name,
+                                      mlir::LLVM::LLVMFunctionType type);
+mlir::Value constI64(mlir::OpBuilder &builder, mlir::Location loc,
+                     std::int64_t value);
 
 } // namespace py::lowering

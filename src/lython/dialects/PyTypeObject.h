@@ -5,6 +5,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
+
 namespace py {
 
 class ClassOp;
@@ -24,6 +26,13 @@ mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,
 // Quiet subtype QUERY: false (no diagnostic) when either name is not a
 // py.class symbol. Use from subtype lattice checks; isSubclassOf is for
 // verification sites where an unknown name is an error.
+// The value the class body bound to a class-level name, or nothing when the
+// class has no such static. Here rather than in the lowering: the EMITTER
+// writes `class_static_attr_names`/`_values` and two lowering files read them
+// back, each with its own copy of the pairing rule -- one attribute layout,
+// one accessor.
+std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
+                                                    llvm::StringRef name);
 bool isKnownSubclassOf(mlir::Operation *from, llvm::StringRef derived,
                        llvm::StringRef base);
 } // namespace type_object

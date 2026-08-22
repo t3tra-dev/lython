@@ -1,3 +1,4 @@
+#include "SourceEncoding.h"
 #include "Lexer.h"
 
 #include "CpythonSpec.h"
@@ -159,28 +160,6 @@ private:
       return isAsciiNameContinue(ch);
     std::optional<std::uint32_t> codepoint = decodeUtf8CodepointAt(cursor);
     return codepoint && unicode::isXidContinue(*codepoint);
-  }
-
-  static void appendUtf8(std::string &text, std::uint32_t value) {
-    if (value <= 0x7f) {
-      text.push_back(static_cast<char>(value));
-      return;
-    }
-    if (value <= 0x7ff) {
-      text.push_back(static_cast<char>(0xc0 | (value >> 6)));
-      text.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-      return;
-    }
-    if (value <= 0xffff) {
-      text.push_back(static_cast<char>(0xe0 | (value >> 12)));
-      text.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
-      text.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-      return;
-    }
-    text.push_back(static_cast<char>(0xf0 | (value >> 18)));
-    text.push_back(static_cast<char>(0x80 | ((value >> 12) & 0x3f)));
-    text.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
-    text.push_back(static_cast<char>(0x80 | (value & 0x3f)));
   }
 
   void appendNameCodepoint(std::string &rawText) {

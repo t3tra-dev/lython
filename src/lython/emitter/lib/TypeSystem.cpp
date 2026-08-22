@@ -49,15 +49,6 @@ std::string literalSpelling(const parser::Node &constant) {
   return "object";
 }
 
-std::string typeText(mlir::Type type) {
-  if (!type)
-    return "<unknown>";
-  std::string result;
-  llvm::raw_string_ostream stream(result);
-  stream << type;
-  return stream.str();
-}
-
 CallInferenceResult unresolvedMethodCall(const TypeSystem &types,
                                          mlir::Type receiverType,
                                          llvm::StringRef methodName) {
@@ -114,9 +105,6 @@ mlir::Type inferAsyncioSleepResult(const TypeSystem &types,
   return types.contract("types.CoroutineType", {types.any(), types.any(),
                                                 types.widenLiteral(payload)});
 }
-
-bool appendStarredCallArgumentTypes(const TypeSystem &types, mlir::Type type,
-                                    llvm::SmallVectorImpl<mlir::Type> &out);
 
 void recordInferenceFailure(
     llvm::SmallVectorImpl<std::string> *failureReasons, std::string reason) {
@@ -650,21 +638,6 @@ mlir::Type tupleOfMembers(const TypeSystem &types,
   if (uniform)
     return types.tupleOf(members.front());
   return types.contract("builtins.tuple", members);
-}
-
-bool appendStarredCallArgumentTypes(const TypeSystem &types, mlir::Type type,
-                                    llvm::SmallVectorImpl<mlir::Type> &out) {
-  type = types.widenLiteral(type);
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    if (contract.getContractName() == "builtins.tuple") {
-      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
-      if (arguments.size() <= 1)
-        return false;
-      out.append(arguments.begin(), arguments.end());
-      return true;
-    }
-  }
-  return false;
 }
 
 bool bindManifestClassImport(TypeSystem &types, llvm::StringRef localName,
@@ -1277,6 +1250,22 @@ mlir::Type lazyIteratorCallType(const TypeSystem &types, llvm::StringRef name,
 }
 
 } // namespace
+
+bool appendStarredArgumentTypes(const TypeSystem &types, mlir::Type type,
+                                llvm::SmallVectorImpl<mlir::Type> &out) {
+  type = types.widenLiteral(type);
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
+    if (contract.getContractName() == "builtins.tuple") {
+      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+      if (arguments.size() <= 1)
+        return false;
+      out.append(arguments.begin(), arguments.end());
+      return true;
+    }
+  }
+  return false;
+}
+
 
 TypeSystem::TypeSystem(mlir::MLIRContext &context)
     : context(context), inferenceState(context) {}
@@ -3282,7 +3271,7 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           mlir::Type starredType = recurse(ast::node(*arg, "value"));
           if (strict && !starredType)
             return {};
-          if (!appendStarredCallArgumentTypes(*this, starredType, positional))
+          if (!appendStarredArgumentTypes(*this, starredType, positional))
             return strict ? fail("starred call arguments require a "
                                  "statically sized tuple")
                           : object();

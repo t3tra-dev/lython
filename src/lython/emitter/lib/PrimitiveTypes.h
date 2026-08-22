@@ -23,7 +23,6 @@ struct PrimitiveTypeSpec {
   llvm::SmallVector<std::int64_t, 4> shape;
 
   bool isScalar() const { return shape.empty(); }
-  bool isShaped() const { return !shape.empty(); }
 };
 
 bool isLyrtPrimitiveIntName(llvm::StringRef name);

@@ -17,14 +17,6 @@ bool startsWith(std::string_view text, std::string_view prefix) {
          text.compare(0, prefix.size(), prefix) == 0;
 }
 
-std::string trim(std::string text) {
-  const std::size_t first = text.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos)
-    return std::string();
-  const std::size_t last = text.find_last_not_of(" \t\r\n");
-  return text.substr(first, last - first + 1);
-}
-
 bool isIdentStart(char ch) {
   unsigned char typed = static_cast<unsigned char>(ch);
   return std::isalpha(typed) || ch == '_';
@@ -1010,6 +1002,14 @@ std::vector<RuleImpl> extractRules(std::string_view grammar,
 }
 
 } // namespace
+
+std::string trim(std::string text) {
+  const std::size_t first = text.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos)
+    return std::string();
+  const std::size_t last = text.find_last_not_of(" \t\r\n");
+  return text.substr(first, last - first + 1);
+}
 
 CpythonPegFirstSet::CpythonPegFirstSet(bool nullable, bool unknown,
                                        std::vector<std::string> literals,

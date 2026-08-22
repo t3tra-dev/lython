@@ -1,3 +1,4 @@
+#include "SourceEncoding.h"
 #include "UnicodeNormalize.h"
 
 #include <algorithm>
@@ -11642,28 +11643,6 @@ const std::array<Composition, 961> kCompositions{{
     {0x016D63u, 0x016D67u, 0x016D69u}, {0x016D67u, 0x016D67u, 0x016D68u},
     {0x016D69u, 0x016D67u, 0x016D6Au},
 }};
-
-void appendUtf8(std::string &text, std::uint32_t value) {
-  if (value <= 0x7fu) {
-    text.push_back(static_cast<char>(value));
-    return;
-  }
-  if (value <= 0x7ffu) {
-    text.push_back(static_cast<char>(0xc0u | (value >> 6)));
-    text.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
-    return;
-  }
-  if (value <= 0xffffu) {
-    text.push_back(static_cast<char>(0xe0u | (value >> 12)));
-    text.push_back(static_cast<char>(0x80u | ((value >> 6) & 0x3fu)));
-    text.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
-    return;
-  }
-  text.push_back(static_cast<char>(0xf0u | (value >> 18)));
-  text.push_back(static_cast<char>(0x80u | ((value >> 12) & 0x3fu)));
-  text.push_back(static_cast<char>(0x80u | ((value >> 6) & 0x3fu)));
-  text.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
-}
 
 bool decodeOne(std::string_view text, std::size_t &offset,
                std::uint32_t &value) {

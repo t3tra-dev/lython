@@ -1,3 +1,4 @@
+#include "PyTypeObject.h"
 #include "Runtime/Core/Lowerer.h"
 
 #include "ExceptionTaxonomy.h"
@@ -85,22 +86,6 @@ bool fieldReadFeedsInPlaceMutation(mlir::Value read) {
     }
   }
   return false;
-}
-
-std::optional<mlir::Attribute> classStaticValue(py::ClassOp classOp,
-                                                llvm::StringRef name) {
-  auto names =
-      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_names");
-  auto values =
-      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_values");
-  if (!names || !values || names.size() != values.size())
-    return std::nullopt;
-  for (auto [index, attr] : llvm::enumerate(names)) {
-    auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
-    if (stringAttr && stringAttr.getValue() == name)
-      return values[index];
-  }
-  return std::nullopt;
 }
 
 } // namespace
@@ -660,7 +645,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     if (py::ClassOp classOp =
             RuntimeBundleLowerer::classForContract(object->instanceContract)) {
       if (std::optional<mlir::Attribute> staticValue =
-              classStaticValue(classOp, op.getName())) {
+              py::type_object::staticAttributeValue(classOp, op.getName())) {
         auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(*staticValue);
         if (!dict)
           return op.emitError() << "static class attribute metadata for '"

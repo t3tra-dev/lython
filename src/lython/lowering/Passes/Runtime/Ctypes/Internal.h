@@ -104,8 +104,7 @@ ctypesArrayType(mlir::ModuleOp module, mlir::Type type,
                 const std::optional<TargetPlatformFacts> &facts,
                 unsigned depth = 0);
 std::string targetFactsLabel(const std::optional<TargetPlatformFacts> &facts);
-bool isFixedOrTargetDependentCtypesScalar(llvm::StringRef contract);
-bool isCtypesIntegralLike(llvm::StringRef contract);
+bool isCtypesIntegralScalar(llvm::StringRef contract);
 bool isCtypesVoidPointer(llvm::StringRef contract);
 bool isCtypesPointerContract(llvm::StringRef contract);
 // The evidence a CFuncPtr carries when it names a foreign function reached

@@ -13,21 +13,14 @@ std::string targetFactsLabel(const std::optional<TargetPlatformFacts> &facts) {
   return "target '" + facts->triple + "'";
 }
 
-bool isFixedOrTargetDependentCtypesScalar(llvm::StringRef contract) {
-  llvm::StringRef name = stripCtypesModule(contract);
-  return llvm::StringSwitch<bool>(name)
-      .Cases({"c_bool", "c_byte", "c_ubyte", "c_short", "c_ushort", "c_int",
-              "c_uint"},
-             true)
-      .Cases({"c_long", "c_ulong", "c_longlong", "c_ulonglong"}, true)
-      .Cases({"c_int8", "c_uint8", "c_int16", "c_uint16", "c_int32", "c_uint32",
-              "c_int64", "c_uint64"},
-             true)
-      .Cases({"c_ssize_t", "c_size_t", "c_void_p"}, true)
-      .Default(false);
-}
-
-bool isCtypesIntegralLike(llvm::StringRef contract) {
+// The ctypes scalars this compiler carries as an integer: the fixed-width and
+// the target-dependent ones, plus `c_void_p`, which is an address in one.
+//
+// ⛔ Two names stood here -- `isFixedOrTargetDependentCtypesScalar` for the
+// erased-contract question and `isCtypesIntegralLike` for the erased-
+// initializer one -- over byte-identical lists. They are one set, and a future
+// divergence between the two questions has to be written as one.
+bool isCtypesIntegralScalar(llvm::StringRef contract) {
   llvm::StringRef name = stripCtypesModule(contract);
   return llvm::StringSwitch<bool>(name)
       .Cases({"c_bool", "c_byte", "c_ubyte", "c_short", "c_ushort", "c_int",

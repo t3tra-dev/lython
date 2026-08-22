@@ -95,7 +95,6 @@ llvm::StringRef retainPremiseSourceName(RetainPremiseSourceKind source);
 
 AtomicOperationKind classifyAtomicOperation(mlir::Operation *op);
 AtomicOperationKind classifyAtomicOperationName(llvm::StringRef name);
-std::optional<std::int64_t> constantIntValue(mlir::Value value);
 AtomicRoleKind classifyAtomicRole(llvm::StringRef role,
                                   AtomicOperationKind operationKind);
 AtomicOrderingRank requiredOrdering(AtomicRoleKind roleKind,

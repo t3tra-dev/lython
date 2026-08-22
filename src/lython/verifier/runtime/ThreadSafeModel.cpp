@@ -16,10 +16,6 @@ namespace {
 
 namespace own = py::ownership;
 
-bool isOperationName(mlir::Operation *op, llvm::StringRef name) {
-  return op && op->getName().getStringRef() == name;
-}
-
 bool isEntryBlockArgument(mlir::Value value) {
   auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
   if (!argument)
@@ -172,17 +168,6 @@ llvm::StringRef retainPremiseSourceName(RetainPremiseSourceKind source) {
     return "locked-borrow";
   }
   return "unknown";
-}
-
-std::optional<std::int64_t> constantIntValue(mlir::Value value) {
-  auto constant = value ? value.getDefiningOp<mlir::arith::ConstantOp>()
-                        : nullptr;
-  if (!constant)
-    return std::nullopt;
-  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
-  if (!integer)
-    return std::nullopt;
-  return integer.getValue().getSExtValue();
 }
 
 AtomicOperationKind classifyAtomicOperationName(llvm::StringRef name) {
@@ -461,7 +446,7 @@ std::optional<std::int64_t> atomicSlotIndex(mlir::Operation *op) {
   }
   if (indices.size() != 1)
     return std::nullopt;
-  return constantIntValue(indices.front());
+  return py::ownership::constantIntValue(indices.front());
 }
 
 mlir::Value stripThreadSafeView(mlir::Value value) {

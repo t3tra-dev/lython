@@ -121,14 +121,6 @@ mlir::LogicalResult zeroInitializeMemRef(mlir::OpBuilder &builder,
   return mlir::success();
 }
 
-bool isRankOneI64MemRef(mlir::Type type) {
-  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
-  if (!memref || memref.getRank() != 1)
-    return false;
-  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
-  return element && element.getWidth() == 64;
-}
-
 mlir::FailureOr<mlir::Value> viewRankOneI64Prefix(mlir::Operation *op,
                                                   mlir::OpBuilder &builder,
                                                   mlir::Value source,
@@ -294,7 +286,7 @@ mlir::func::FuncOp findObjectStorageReleaseToZero(mlir::ModuleOp module) {
     return {};
   mlir::FunctionType type = releaseToZero.getFunctionType();
   if (type.getNumInputs() != 1 || type.getNumResults() != 1 ||
-      !type.getResult(0).isInteger(1) || !isRankOneI64MemRef(type.getInput(0)))
+      !type.getResult(0).isInteger(1) || !ownership::isRankOneI64MemRef(type.getInput(0)))
     return {};
   return releaseToZero;
 }
@@ -1092,7 +1084,7 @@ RuntimeBundleLowerer::objectPhysicalHeader(mlir::Operation *op,
 
   mlir::Value header = value.values.front();
   auto headerType = mlir::dyn_cast<mlir::MemRefType>(header.getType());
-  if (!headerType || !isRankOneI64MemRef(header.getType())) {
+  if (!headerType || !ownership::isRankOneI64MemRef(header.getType())) {
     // An Optional in an object position lands here with the union's i64 TAG as
     // the would-be header. Reporting that type is true and useless: it names
     // neither Optional nor narrowing, which is the whole content of the fix.

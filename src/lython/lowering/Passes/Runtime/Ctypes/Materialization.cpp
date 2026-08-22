@@ -100,7 +100,7 @@ materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
     return result;
   }
 
-  if (!isCtypesIntegralLike(evidence.ctypeName))
+  if (!isCtypesIntegralScalar(evidence.ctypeName))
     return op->emitError() << evidence.ctypeName
                            << " erased initializer is not implemented yet";
   if (sources.size() > 1)

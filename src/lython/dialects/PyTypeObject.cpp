@@ -213,4 +213,20 @@ mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,
   return llvm::is_contained(*mro, base);
 }
 
+std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
+                                                    llvm::StringRef name) {
+  auto names =
+      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_names");
+  auto values =
+      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_values");
+  if (!names || !values || names.size() != values.size())
+    return std::nullopt;
+  for (auto [index, attr] : llvm::enumerate(names)) {
+    auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
+    if (stringAttr && stringAttr.getValue() == name)
+      return values[index];
+  }
+  return std::nullopt;
+}
+
 } // namespace py::type_object

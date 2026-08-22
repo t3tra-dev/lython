@@ -15,6 +15,11 @@ struct Node;
 
 namespace lython::emitter {
 
+// A type as a diagnostic reads it, `<unknown>` for a null one. Declared at the
+// bottom of the emitter's type layer because four files had a copy -- two of
+// them without the null guard, under two names.
+std::string typeText(mlir::Type type);
+
 // Algorithm J inference core: a union-find store over py::InferVarType ids
 // with Rémy-level generalization. The MLIR type tree stays immutable — all
 // mutable unification state lives here, keyed by variable id, so the engine

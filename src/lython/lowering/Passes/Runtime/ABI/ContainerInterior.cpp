@@ -1,3 +1,5 @@
+#include "Ownership.h"
+
 #include "Runtime/Core/Lowerer.h"
 
 #include "Runtime/ABI/BoxLayout.h"
@@ -15,21 +17,11 @@ namespace {
 // kind (rfc/memory-safety-proof.md, `Provenance`) -- this only rules out
 // reading past the end of something that is not a container handle at all.
 bool isContainerHandleType(mlir::Type type) {
-  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
-  if (!memref || memref.getRank() != 1 || !memref.hasStaticShape())
+  if (!ownership::isRankOneI64MemRef(type))
     return false;
-  if (memref.getDimSize(0) < container_abi::kHandleWordCount)
-    return false;
-  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
-  return element && element.getWidth() == 64;
-}
-
-bool isRankOneI64Memref(mlir::Type type) {
-  auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
-  if (!memref || memref.getRank() != 1)
-    return false;
-  auto element = mlir::dyn_cast<mlir::IntegerType>(memref.getElementType());
-  return element && element.getWidth() == 64;
+  auto memref = mlir::cast<mlir::MemRefType>(type);
+  return memref.hasStaticShape() &&
+         memref.getDimSize(0) >= container_abi::kHandleWordCount;
 }
 
 } // namespace
@@ -168,7 +160,7 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::containerInteriorView(
              << label << " container has no physical interior lane " << lane
              << " (contract " << container.contractName() << " expands to "
              << values.size() << " physical values)";
-    if (!isRankOneI64Memref(values[lane].getType()))
+    if (!ownership::isRankOneI64MemRef(values[lane].getType()))
       return op->emitError() << label << " container interior lane " << lane
                              << " has invalid type " << values[lane].getType();
     return values[lane];

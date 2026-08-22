@@ -18,17 +18,6 @@ bool isPrimitiveOnlyCallable(py::CallableType callable) {
          llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
 }
 
-mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
-                                          mlir::func::FuncOp target) {
-  auto bodyResult =
-      target->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
-  if (!bodyResult)
-    return {};
-  mlir::Type object = runtimeContractType(context, "builtins.object");
-  return py::ContractType::get(context, "types.CoroutineType",
-                               {object, object, bodyResult.getValue()});
-}
-
 bool hasProtocolArgumentOverride(llvm::ArrayRef<mlir::Type> types) {
   return llvm::any_of(types,
                       [](mlir::Type type) { return static_cast<bool>(type); });

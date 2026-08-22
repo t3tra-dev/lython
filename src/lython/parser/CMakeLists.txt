@@ -40,6 +40,7 @@ add_library(LythonParser STATIC
     lib/Ast.cpp
     lib/CpythonPegAdapter.cpp
     lib/CpythonSpec.cpp
+    lib/FStringScan.cpp
     lib/GeneratedTokenStream.cpp
     lib/Grammar.cpp
     lib/Lexer.cpp

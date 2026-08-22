@@ -1,3 +1,4 @@
+#include "SourceEncoding.h"
 #include "UnicodeNames.h"
 
 #include <cctype>
@@ -159,34 +160,6 @@ std::optional<std::uint32_t> derivedNameCodepoint(std::string_view name) {
           generatedIdeographNameCodepoint(name, "TANGUT IDEOGRAPH-", 2))
     return codepoint;
   return std::nullopt;
-}
-
-bool appendUtf8(std::string &out, std::uint32_t codepoint) {
-  if (codepoint <= 0x7f) {
-    out.push_back(static_cast<char>(codepoint));
-    return true;
-  }
-  if (codepoint >= 0xd800 && codepoint <= 0xdfff)
-    return false;
-  if (codepoint <= 0x7ff) {
-    out.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
-    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-    return true;
-  }
-  if (codepoint <= 0xffff) {
-    out.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
-    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-    return true;
-  }
-  if (codepoint <= 0x10ffff) {
-    out.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
-    out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
-    out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-    out.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-    return true;
-  }
-  return false;
 }
 
 std::size_t dawgDecodeVarint(std::size_t index, unsigned int &result) {

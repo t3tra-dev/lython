@@ -120,21 +120,6 @@ template <typename T> struct Signature {
   }
 };
 
-template <typename T>
-bool signatureMetadataCompatible(Signature<T> required, Signature<T> candidate,
-                                 bool comparePositionalOnlyCount = true) {
-  if (!required.valid() || !candidate.valid())
-    return false;
-  return parameterMetadataCompatible(
-      required.positionalOnlyCount, candidate.positionalOnlyCount,
-      required.positionalNames, candidate.positionalNames,
-      required.positionalDefaults, candidate.positionalDefaults,
-      required.kwonlyNames, candidate.kwonlyNames, required.kwonlyDefaults,
-      candidate.kwonlyDefaults, llvm::StringRef{}, llvm::StringRef{},
-      llvm::StringRef{}, llvm::StringRef{},
-      [](char value) { return value != 0; }, comparePositionalOnlyCount);
-}
-
 template <typename T, typename Keyword> struct Invocation {
   llvm::SmallVector<T, 8> positional;
   llvm::SmallVector<Keyword, 8> keywords;
@@ -152,18 +137,6 @@ struct NoopMatchObserver {
   void onDefaultedPositional(std::size_t) { onDefaultedParameter(); }
   void onDefaultedKeywordOnly(std::size_t) { onDefaultedParameter(); }
   void onDefaultedParameter() {}
-};
-
-template <typename OnDefaulted>
-struct DefaultedOnlyMatchObserver : NoopMatchObserver {
-  OnDefaulted onDefaulted;
-
-  explicit DefaultedOnlyMatchObserver(OnDefaulted onDefaulted)
-      : onDefaulted(std::move(onDefaulted)) {}
-
-  void onDefaultedParameter() { onDefaulted(); }
-  void onDefaultedPositional(std::size_t) { onDefaulted(); }
-  void onDefaultedKeywordOnly(std::size_t) { onDefaulted(); }
 };
 
 struct InvocationSpecificityScore : NoopMatchObserver {
@@ -472,26 +445,6 @@ bool matchInvocationWithObserver(
   }
 
   return true;
-}
-
-template <typename T, typename Keyword, typename MatchExpected,
-          typename VarargShapeFn, typename KwargValue,
-          typename UnpackedKeywordValue, typename KeywordName,
-          typename KeywordValue, typename OnDefaulted>
-bool matchInvocation(Signature<T> signature, llvm::ArrayRef<T> positionalArgs,
-                     llvm::ArrayRef<Keyword> keywords,
-                     MatchExpected matchExpected, VarargShapeFn varargShape,
-                     KwargValue kwargValue,
-                     UnpackedKeywordValue unpackedKeywordValue,
-                     KeywordName keywordName, KeywordValue keywordValue,
-                     OnDefaulted onDefaulted,
-                     bool requireSatisfiedDefaults = true) {
-  DefaultedOnlyMatchObserver<OnDefaulted> observer(std::move(onDefaulted));
-  return matchInvocationWithObserver(
-      signature, positionalArgs, keywords, std::move(matchExpected),
-      std::move(varargShape), std::move(kwargValue),
-      std::move(unpackedKeywordValue), std::move(keywordName),
-      std::move(keywordValue), observer, requireSatisfiedDefaults);
 }
 
 } // namespace lython::callable

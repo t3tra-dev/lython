@@ -119,21 +119,6 @@ std::string methodKind(const parser::Node &function) {
   return "instance";
 }
 
-bool appendStarredArgumentTypes(mlir::Type type, TypeSystem &types,
-                                llvm::SmallVectorImpl<mlir::Type> &out) {
-  type = types.widenLiteral(type);
-  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type)) {
-    if (contract.getContractName() == "builtins.tuple") {
-      llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
-      if (arguments.size() <= 1)
-        return false;
-      out.append(arguments.begin(), arguments.end());
-      return true;
-    }
-  }
-  return false;
-}
-
 bool isTopLevelDecl(const parser::Node &node) {
   return node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
          node.kind == "ClassDef";
