@@ -31,6 +31,13 @@ mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,
 // writes `class_static_attr_names`/`_values` and two lowering files read them
 // back, each with its own copy of the pairing rule -- one attribute layout,
 // one accessor.
+// Value paired with `name` in an op's parallel `<...>_names` / `<...>_values`
+// array attributes, the layout the emitter uses for every static binding it
+// hands to the lowering (class statics, module statics).
+std::optional<mlir::Attribute> pairedAttributeValue(mlir::Operation *op,
+                                                    llvm::StringRef namesAttr,
+                                                    llvm::StringRef valuesAttr,
+                                                    llvm::StringRef name);
 std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
                                                     llvm::StringRef name);
 bool isKnownSubclassOf(mlir::Operation *from, llvm::StringRef derived,

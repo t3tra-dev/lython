@@ -181,12 +181,12 @@ mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,
   return llvm::is_contained(*mro, base);
 }
 
-std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
+std::optional<mlir::Attribute> pairedAttributeValue(mlir::Operation *op,
+                                                    llvm::StringRef namesAttr,
+                                                    llvm::StringRef valuesAttr,
                                                     llvm::StringRef name) {
-  auto names =
-      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_names");
-  auto values =
-      classOp->getAttrOfType<mlir::ArrayAttr>("class_static_attr_values");
+  auto names = op->getAttrOfType<mlir::ArrayAttr>(namesAttr);
+  auto values = op->getAttrOfType<mlir::ArrayAttr>(valuesAttr);
   if (!names || !values || names.size() != values.size())
     return std::nullopt;
   for (auto [index, attr] : llvm::enumerate(names)) {
@@ -195,6 +195,12 @@ std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
       return values[index];
   }
   return std::nullopt;
+}
+
+std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
+                                                    llvm::StringRef name) {
+  return pairedAttributeValue(classOp, "class_static_attr_names",
+                              "class_static_attr_values", name);
 }
 
 } // namespace py::type_object

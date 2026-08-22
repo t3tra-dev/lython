@@ -116,4 +116,11 @@ CpythonPegGrammar parseCpythonPegGrammar(std::string_view grammar);
 // every line they take, and each had its own copy.
 std::string trim(std::string text);
 
+// Index of the bracket closing the one at `open`, or npos. Nesting counts the
+// character actually at `open`, so it also matches a paren inside brackets.
+// Declared here for the same reason as `trim`: both spec readers scan CPython
+// grammar text, and each had its own copy.
+std::size_t matchingBracket(std::string_view text, std::size_t open,
+                            char close);
+
 } // namespace lython::parser

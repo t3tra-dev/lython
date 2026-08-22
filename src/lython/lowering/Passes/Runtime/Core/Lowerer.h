@@ -662,6 +662,10 @@ private:
   mlir::LogicalResult touchContainerEvidenceUse(mlir::Operation *op,
                                                 const RuntimeBundle &container,
                                                 llvm::StringRef label);
+  mlir::LogicalResult ensurePayloadCapacity(
+      mlir::Operation *op, RuntimeBundle &container, unsigned index,
+      llvm::StringRef label, llvm::StringRef contractName,
+      std::uint64_t RuntimeBundle::*capacity);
   mlir::LogicalResult ensureSequencePayloadCapacity(mlir::Operation *op,
                                                     RuntimeBundle &container,
                                                     unsigned index,

@@ -65,6 +65,8 @@ bool containsBreakOrContinueStatement(
 // different directions, and one of them scales where the other does not --
 // see the nested-loop guard in EmitterExceptions.cpp.
 bool containsContinueStatement(const std::vector<parser::NodePtr> *statements);
+void collectNameBindings(const parser::Node *node, llvm::StringSet<> &names,
+                         bool bindsNestedDefinitions);
 void collectAssignedNameTargets(const parser::Node *node,
                                 llvm::StringSet<> &names);
 void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names);

@@ -35,35 +35,41 @@ inline std::string effectiveTriple(llvm::StringRef targetTriple) {
   return llvm::Triple(llvm::sys::getDefaultTargetTriple()).normalize();
 }
 
-inline std::optional<std::string> sysPlatform(const llvm::Triple &triple) {
+// `sys.platform` and `platform.system()` name the same six operating systems
+// with different spellings (and `win32` / `Windows` is not even a case
+// difference), so the table is one row per OS: adding a target must not be
+// able to teach one of the two and not the other.
+struct OperatingSystemNames {
+  llvm::StringRef sysPlatform;
+  llvm::StringRef platformSystem;
+};
+
+inline std::optional<OperatingSystemNames>
+operatingSystemNames(const llvm::Triple &triple) {
   if (triple.isOSDarwin())
-    return std::string("darwin");
+    return OperatingSystemNames{"darwin", "Darwin"};
   if (triple.isOSLinux())
-    return std::string("linux");
+    return OperatingSystemNames{"linux", "Linux"};
   if (triple.isOSWindows())
-    return std::string("win32");
+    return OperatingSystemNames{"win32", "Windows"};
   if (triple.isOSFreeBSD())
-    return std::string("freebsd");
+    return OperatingSystemNames{"freebsd", "FreeBSD"};
   if (triple.isOSOpenBSD())
-    return std::string("openbsd");
+    return OperatingSystemNames{"openbsd", "OpenBSD"};
   if (triple.isOSNetBSD())
-    return std::string("netbsd");
+    return OperatingSystemNames{"netbsd", "NetBSD"};
+  return std::nullopt;
+}
+
+inline std::optional<std::string> sysPlatform(const llvm::Triple &triple) {
+  if (auto names = operatingSystemNames(triple))
+    return names->sysPlatform.str();
   return std::nullopt;
 }
 
 inline std::optional<std::string> platformSystem(const llvm::Triple &triple) {
-  if (triple.isOSDarwin())
-    return std::string("Darwin");
-  if (triple.isOSLinux())
-    return std::string("Linux");
-  if (triple.isOSWindows())
-    return std::string("Windows");
-  if (triple.isOSFreeBSD())
-    return std::string("FreeBSD");
-  if (triple.isOSOpenBSD())
-    return std::string("OpenBSD");
-  if (triple.isOSNetBSD())
-    return std::string("NetBSD");
+  if (auto names = operatingSystemNames(triple))
+    return names->platformSystem.str();
   return std::nullopt;
 }
 

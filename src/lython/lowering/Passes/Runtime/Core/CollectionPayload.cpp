@@ -604,58 +604,24 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
   return *concrete;
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::ensureSequencePayloadCapacity(
+// One growth step for either payload kind: the capacity the bundle tracks and
+// the contract that owns `ensure_capacity` are the whole difference. The two
+// kinds record capacity in different fields because one bundle can be both.
+mlir::LogicalResult RuntimeBundleLowerer::ensurePayloadCapacity(
     mlir::Operation *op, RuntimeBundle &container, unsigned index,
-    llvm::StringRef label) {
-  if (container.sequenceCapacity && index < container.sequenceCapacity)
+    llvm::StringRef label, llvm::StringRef contractName,
+    std::uint64_t RuntimeBundle::*capacity) {
+  if (container.*capacity && index < container.*capacity)
     return mlir::success();
-  if (container.sequenceCapacity == 0 && index < kMinimumCollectionCapacity)
+  if (container.*capacity == 0 && index < kMinimumCollectionCapacity)
     return mlir::success();
 
   std::optional<RuntimeSymbol> ensure =
-      manifest.primitive(container.contractName(), "ensure_capacity");
+      manifest.primitive(contractName, "ensure_capacity");
   if (!ensure)
     return op->emitError() << label
                            << " payload capacity is exceeded, but the runtime "
                            << "manifest has no ensure_capacity primitive";
-
-  builder.setInsertionPoint(op);
-  mlir::Value required =
-      constantI64(builder, op->getLoc(), static_cast<std::int64_t>(index) + 1);
-  llvm::SmallVector<mlir::Value, 4> operands(container.physicalValues().begin(),
-                                             container.physicalValues().end());
-  operands.push_back(required);
-  mlir::func::CallOp call =
-      RuntimeBundleLowerer::createRuntimeCall(op->getLoc(), *ensure, operands);
-  RuntimeBundle updated;
-  // A handle-fronted contract's ensure_capacity returns nothing: it wrote the
-  // new bases into the handle, so the bundle it grew is still the right one.
-  if (mlir::failed(RuntimeBundleLowerer::rebindMutatedContainer(
-          op, container, call.getResults(), updated)))
-    return mlir::failure();
-  updated.copyEvidenceFrom(container);
-  std::uint64_t oldCapacity = container.sequenceCapacity
-                                  ? container.sequenceCapacity
-                                  : kMinimumCollectionCapacity;
-  updated.sequenceCapacity =
-      growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
-  container = std::move(updated);
-  return mlir::success();
-}
-
-mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
-    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
-  if (container.mappingCapacity && index < container.mappingCapacity)
-    return mlir::success();
-  if (container.mappingCapacity == 0 && index < kMinimumCollectionCapacity)
-    return mlir::success();
-
-  std::optional<RuntimeSymbol> ensure =
-      manifest.primitive("builtins.dict", "ensure_capacity");
-  if (!ensure)
-    return op->emitError()
-           << "dict payload capacity is exceeded, but the runtime manifest "
-              "has no ensure_capacity primitive";
 
   builder.setInsertionPoint(op);
   mlir::Value required =
@@ -672,13 +638,26 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
           op, container, call.getResults(), updated)))
     return mlir::failure();
   updated.copyEvidenceFrom(container);
-  std::uint64_t oldCapacity = container.mappingCapacity
-                                  ? container.mappingCapacity
-                                  : kMinimumCollectionCapacity;
-  updated.mappingCapacity =
+  std::uint64_t oldCapacity =
+      container.*capacity ? container.*capacity : kMinimumCollectionCapacity;
+  updated.*capacity =
       growCapacity(oldCapacity, static_cast<std::uint64_t>(index) + 1);
   container = std::move(updated);
   return mlir::success();
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::ensureSequencePayloadCapacity(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index,
+    llvm::StringRef label) {
+  return ensurePayloadCapacity(op, container, index, label,
+                               container.contractName(),
+                               &RuntimeBundle::sequenceCapacity);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index) {
+  return ensurePayloadCapacity(op, container, index, "dict", "builtins.dict",
+                               &RuntimeBundle::mappingCapacity);
 }
 
 // ⛔ A USE-SET FACT IS NOT A PROXY FOR AN EXECUTION-FREQUENCY FACT, and this

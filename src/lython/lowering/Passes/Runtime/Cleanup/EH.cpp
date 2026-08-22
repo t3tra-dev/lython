@@ -341,8 +341,16 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
   return landing;
 }
 
-bool convertCallToPythonInvoke(llvm::CallInst &call,
-                               llvm::ArrayRef<PythonCallSiteRange> callSites) {
+// A call that may reach a Python handler becomes an invoke the same way in
+// both directions: split after the call, build the unwind destination, and
+// carry the call's convention, attributes and debug location across. The only
+// difference is where it unwinds -- a cleanup that re-raises, or the enclosing
+// try's catch dispatch.
+bool convertCallToPythonInvoke(
+    llvm::CallInst &call, llvm::ArrayRef<PythonCallSiteRange> callSites,
+    llvm::function_ref<llvm::BasicBlock *(llvm::BasicBlock *,
+                                          llvm::DILocation &)>
+        buildUnwindDest) {
   if (call.isInlineAsm() || call.getNumOperandBundles() != 0)
     return false;
   llvm::Function *callee = call.getCalledFunction();
@@ -363,15 +371,13 @@ bool convertCallToPythonInvoke(llvm::CallInst &call,
   llvm::BasicBlock *normalDest =
       block->splitBasicBlock(splitPoint, "py.invoke.cont");
   llvm::Instruction *oldBranch = block->getTerminator();
-  buildPythonCleanupBlock(call, normalDest, *debugLoc,
-                          matchCallSiteRange(call, callSites, *debugLoc));
-  llvm::BasicBlock *cleanupDest = normalDest->getPrevNode();
+  llvm::BasicBlock *unwindDest = buildUnwindDest(normalDest, *debugLoc);
 
   llvm::IRBuilder<> builder(oldBranch);
   llvm::SmallVector<llvm::Value *, 8> args(call.args());
   llvm::InvokeInst *invoke =
       builder.CreateInvoke(call.getFunctionType(), call.getCalledOperand(),
-                           normalDest, cleanupDest, args, call.getName());
+                           normalDest, unwindDest, args, call.getName());
   invoke->setCallingConv(call.getCallingConv());
   invoke->setAttributes(call.getAttributes());
   invoke->setDebugLoc(debugLocation);
@@ -381,6 +387,18 @@ bool convertCallToPythonInvoke(llvm::CallInst &call,
   call.eraseFromParent();
   oldBranch->eraseFromParent();
   return true;
+}
+
+bool convertCallToPythonInvoke(llvm::CallInst &call,
+                               llvm::ArrayRef<PythonCallSiteRange> callSites) {
+  return convertCallToPythonInvoke(
+      call, callSites,
+      [&](llvm::BasicBlock *normalDest, llvm::DILocation &debugLoc) {
+        buildPythonCleanupBlock(call, normalDest, debugLoc,
+                                matchCallSiteRange(call, callSites, debugLoc));
+        // buildPythonCleanupBlock inserts ahead of the continuation.
+        return normalDest->getPrevNode();
+      });
 }
 
 bool rewriteTryCatchAnchor(llvm::CallInst &call) {
@@ -412,44 +430,13 @@ bool rewriteTryCatchAnchor(llvm::CallInst &call) {
 bool convertCallToPythonTryInvoke(
     llvm::CallInst &call, const PythonTryCallMarker &marker,
     llvm::ArrayRef<PythonCallSiteRange> callSites) {
-  if (call.isInlineAsm() || call.getNumOperandBundles() != 0)
-    return false;
-  llvm::Function *callee = call.getCalledFunction();
-  if (!mayTransferToPythonTryHandler(callee))
-    return false;
-  llvm::DebugLoc debugLocation = call.getDebugLoc();
-  auto *debugLoc =
-      llvm::dyn_cast_or_null<llvm::DILocation>(debugLocation.get());
-  if (!debugLoc)
-    return false;
-
-  llvm::Function *function = call.getFunction();
-  function->setPersonalityFn(gxxPersonality(*function->getParent()));
-
-  auto splitPoint = call.getIterator();
-  ++splitPoint;
-  llvm::BasicBlock *block = call.getParent();
-  llvm::BasicBlock *normalDest =
-      block->splitBasicBlock(splitPoint, "py.invoke.cont");
-  llvm::Instruction *oldBranch = block->getTerminator();
-  llvm::BasicBlock *catchDispatch = buildPythonCatchDispatchBlock(
-      call, marker.catchBlock, *debugLoc,
-      matchCallSiteRange(call, callSites, *debugLoc));
-
-  llvm::IRBuilder<> builder(oldBranch);
-  llvm::SmallVector<llvm::Value *, 8> args(call.args());
-  llvm::InvokeInst *invoke =
-      builder.CreateInvoke(call.getFunctionType(), call.getCalledOperand(),
-                           normalDest, catchDispatch, args, call.getName());
-  invoke->setCallingConv(call.getCallingConv());
-  invoke->setAttributes(call.getAttributes());
-  invoke->setDebugLoc(debugLocation);
-
-  if (!call.getType()->isVoidTy())
-    call.replaceAllUsesWith(invoke);
-  call.eraseFromParent();
-  oldBranch->eraseFromParent();
-  return true;
+  return convertCallToPythonInvoke(
+      call, callSites,
+      [&](llvm::BasicBlock *, llvm::DILocation &debugLoc) {
+        return buildPythonCatchDispatchBlock(
+            call, marker.catchBlock, debugLoc,
+            matchCallSiteRange(call, callSites, debugLoc));
+      });
 }
 
 } // namespace

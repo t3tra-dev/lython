@@ -34,24 +34,6 @@ bool isTokenName(std::string_view name) {
   });
 }
 
-std::size_t matchingBracket(std::string_view text, std::size_t open,
-                            char close) {
-  int depth = 0;
-  char openChar = text[open];
-  for (std::size_t cursor = open; cursor < text.size(); ++cursor) {
-    if (text[cursor] == openChar) {
-      ++depth;
-      continue;
-    }
-    if (text[cursor] != close)
-      continue;
-    --depth;
-    if (depth == 0)
-      return cursor;
-  }
-  return std::string_view::npos;
-}
-
 struct RuleHeader {
   std::string name;
   std::string returnType;
@@ -1002,6 +984,25 @@ std::vector<RuleImpl> extractRules(std::string_view grammar,
 }
 
 } // namespace
+
+std::size_t matchingBracket(std::string_view text, std::size_t open,
+                            char close) {
+  int depth = 0;
+  char openChar = text[open];
+  for (std::size_t cursor = open; cursor < text.size(); ++cursor) {
+    if (text[cursor] == openChar) {
+      ++depth;
+      continue;
+    }
+    if (text[cursor] != close)
+      continue;
+    --depth;
+    if (depth == 0)
+      return cursor;
+  }
+  return std::string_view::npos;
+}
+
 
 std::string trim(std::string text) {
   const std::size_t first = text.find_first_not_of(" \t\r\n");

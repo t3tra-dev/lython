@@ -95,36 +95,7 @@ unsigned terminateOpenRegionBlocks(mlir::OpBuilder &builder, mlir::Location loc,
 // container"). Structural mutation inside a try keeps travelling the post-try
 // result lanes instead.
 void collectRebindNames(const parser::Node *node, llvm::StringSet<> &names) {
-  if (!node)
-    return;
-  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-      node->kind == "ClassDef" || node->kind == "Lambda")
-    return;
-  if (node->kind == "Assign") {
-    if (const auto *targets = ast::nodeList(*node, "targets"))
-      for (const parser::NodePtr &target : *targets)
-        collectAssignedNameTargets(target.get(), names);
-  } else if (node->kind == "AnnAssign" || node->kind == "AugAssign" ||
-             node->kind == "NamedExpr") {
-    collectAssignedNameTargets(ast::node(*node, "target"), names);
-  } else if (node->kind == "For" || node->kind == "AsyncFor") {
-    collectAssignedNameTargets(ast::node(*node, "target"), names);
-  } else if (node->kind == "With" || node->kind == "AsyncWith") {
-    if (const auto *items = ast::nodeList(*node, "items"))
-      for (const parser::NodePtr &item : *items)
-        collectAssignedNameTargets(ast::node(*item, "optional_vars"), names);
-  }
-  for (const parser::Field &field : node->fields) {
-    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
-      if (*child)
-        collectRebindNames(child->get(), names);
-    } else if (const auto *children =
-                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &child : *children)
-        if (child)
-          collectRebindNames(child.get(), names);
-    }
-  }
+  collectNameBindings(node, names, /*bindsNestedDefinitions=*/false);
 }
 
 void collectRebindNames(const std::vector<parser::NodePtr> *statements,

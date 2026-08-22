@@ -596,22 +596,6 @@ std::size_t skipSpaces(std::string_view text, std::size_t cursor) {
   return cursor;
 }
 
-std::size_t findMatchingParen(std::string_view text, std::size_t open) {
-  int depth = 0;
-  for (std::size_t cursor = open; cursor < text.size(); ++cursor) {
-    if (text[cursor] == '(') {
-      ++depth;
-      continue;
-    }
-    if (text[cursor] != ')')
-      continue;
-    --depth;
-    if (depth == 0)
-      return cursor;
-  }
-  return std::string_view::npos;
-}
-
 std::string trailingIdentifier(std::string text) {
   text = trim(std::move(text));
   if (text.empty())
@@ -728,7 +712,7 @@ collectAstFieldSchemas(const std::string &asdl,
     if (afterName < text.size() && text[afterName] == '=') {
       std::size_t rhs = skipSpaces(text, afterName + 1);
       if (rhs < text.size() && text[rhs] == '(') {
-        const std::size_t close = findMatchingParen(text, rhs);
+        const std::size_t close = matchingBracket(text, rhs, ')');
         if (close != std::string_view::npos)
           schemas[name] = parseAsdlFieldNames(
               std::string_view(text).substr(rhs + 1, close - rhs - 1));
@@ -739,7 +723,7 @@ collectAstFieldSchemas(const std::string &asdl,
 
     if (startsWithUppercaseIdentifier(name) && afterName < text.size() &&
         text[afterName] == '(') {
-      const std::size_t close = findMatchingParen(text, afterName);
+      const std::size_t close = matchingBracket(text, afterName, ')');
       if (close != std::string_view::npos) {
         schemas[name] = parseAsdlFieldNames(std::string_view(text).substr(
             afterName + 1, close - afterName - 1));
@@ -806,7 +790,7 @@ AstSchema collectAstSchema(const std::string &asdl,
     std::string rhs = trim(text.substr(rhsStart, next - rhsStart));
 
     if (!rhs.empty() && rhs.front() == '(') {
-      const std::size_t close = findMatchingParen(rhs, 0);
+      const std::size_t close = matchingBracket(rhs, 0, ')');
       if (close != std::string::npos) {
         schema.kindTypes[lhs] = lhs;
         schema.fields[lhs] =
@@ -823,7 +807,7 @@ AstSchema collectAstSchema(const std::string &asdl,
       schema.kindTypes[name] = lhs;
       std::size_t afterName = skipSpaces(alternative, name.size());
       if (afterName < alternative.size() && alternative[afterName] == '(') {
-        const std::size_t close = findMatchingParen(alternative, afterName);
+        const std::size_t close = matchingBracket(alternative, afterName, ')');
         if (close != std::string::npos)
           schema.fields[name] = parseAsdlFieldSpecs(
               std::string_view(alternative)

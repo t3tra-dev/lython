@@ -99,18 +99,9 @@ std::optional<std::int64_t> sourceExprStaticInteger(mlir::Attribute attr) {
 
 std::optional<mlir::Attribute> moduleStaticValue(mlir::ModuleOp module,
                                                  llvm::StringRef name) {
-  auto names =
-      module->getAttrOfType<mlir::ArrayAttr>("ly.module_static_attr_names");
-  auto values =
-      module->getAttrOfType<mlir::ArrayAttr>("ly.module_static_attr_values");
-  if (!names || !values || names.size() != values.size())
-    return std::nullopt;
-  for (auto [index, attr] : llvm::enumerate(names)) {
-    auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(attr);
-    if (stringAttr && stringAttr.getValue() == name)
-      return values[index];
-  }
-  return std::nullopt;
+  return py::type_object::pairedAttributeValue(
+      module, "ly.module_static_attr_names", "ly.module_static_attr_values",
+      name);
 }
 
 std::optional<mlir::Type> resolveCtypesSourceExpr(mlir::MLIRContext *context,

@@ -402,33 +402,22 @@ bool isKnownNonNegativeAndLessThan(mlir::Value value, int64_t upperBound) {
   return range && range->min >= 0 && range->max < upperBound;
 }
 
-bool foldRowMajorDiv(mlir::arith::DivUIOp div, mlir::IRRewriter &rewriter) {
-  std::optional<int64_t> stride = constantIndexValue(div.getRhs());
+// `off / stride` is the row and `off % stride` the column of the same
+// decomposition, so the fold differs only in which half it keeps.
+template <typename OpTy>
+bool foldRowMajorDelinearized(OpTy op, mlir::IRRewriter &rewriter,
+                              bool keepRow) {
+  std::optional<int64_t> stride = constantIndexValue(op.getRhs());
   if (!stride)
     return false;
 
   std::optional<std::pair<mlir::Value, mlir::Value>> indices =
-      decomposeRank2RowMajorOffset(div.getLhs(), *stride, rewriter,
-                                   div.getLoc());
+      decomposeRank2RowMajorOffset(op.getLhs(), *stride, rewriter,
+                                   op.getLoc());
   if (!indices || !isKnownNonNegativeAndLessThan(indices->second, *stride))
     return false;
 
-  rewriter.replaceOp(div, indices->first);
-  return true;
-}
-
-bool foldRowMajorRem(mlir::arith::RemUIOp rem, mlir::IRRewriter &rewriter) {
-  std::optional<int64_t> stride = constantIndexValue(rem.getRhs());
-  if (!stride)
-    return false;
-
-  std::optional<std::pair<mlir::Value, mlir::Value>> indices =
-      decomposeRank2RowMajorOffset(rem.getLhs(), *stride, rewriter,
-                                   rem.getLoc());
-  if (!indices || !isKnownNonNegativeAndLessThan(indices->second, *stride))
-    return false;
-
-  rewriter.replaceOp(rem, indices->second);
+  rewriter.replaceOp(op, keepRow ? indices->first : indices->second);
   return true;
 }
 
@@ -445,10 +434,11 @@ void foldRowMajorDelinearization(mlir::ModuleOp module,
       continue;
     rewriter.setInsertionPoint(op);
     if (auto div = mlir::dyn_cast<mlir::arith::DivUIOp>(op)) {
-      foldRowMajorDiv(div, rewriter);
+      foldRowMajorDelinearized(div, rewriter, /*keepRow=*/true);
       continue;
     }
-    foldRowMajorRem(mlir::cast<mlir::arith::RemUIOp>(op), rewriter);
+    foldRowMajorDelinearized(mlir::cast<mlir::arith::RemUIOp>(op), rewriter,
+                             /*keepRow=*/false);
   }
 }
 
