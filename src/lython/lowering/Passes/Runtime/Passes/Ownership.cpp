@@ -2047,6 +2047,29 @@ bool releaseOwnedGroupByLiveness(
           continue;
         }
         if (auto returnOp = mlir::dyn_cast<mlir::func::ReturnOp>(user)) {
+          // ⛔ A RETURN THE MINT DOES NOT DOMINATE IS NOT THIS TOKEN'S. SSA
+          // already guarantees that a use of the group's OWN values is
+          // dominated by them, so a return reached without passing the mint is
+          // returning some other name for the same object. The shape:
+          //
+          //     while i < n:
+          //         p = [i]
+          //         i = p[0] + 1
+          //     return i
+          //
+          // `p[0]` folds to `i` itself, so the element token's marker is an
+          // identity cast of the loop-carried argument and every alias query
+          // about it answers with facts about `i`. Counting `return i` as this
+          // token's transfer left the element's reference with no release at
+          // all, and the affine walk reported the symptom two blocks away:
+          // "released owned resource ... is used after release (by call to
+          // 'LyLong_LtBool')".
+          if (selfOp && !llvm::is_contained(group.values, equivalent)) {
+            if (!dominance)
+              dominance.emplace(selfOp->getParentOfType<mlir::func::FuncOp>());
+            if (!dominance->properlyDominates(selfOp, user))
+              continue;
+          }
           // An owned return transfers the token: a consuming death on that
           // path; the other paths still get their releases below.
           auto function = returnOp->getParentOfType<mlir::func::FuncOp>();

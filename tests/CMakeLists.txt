@@ -493,6 +493,11 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # An element read folded back to the loop variable it came from: the
+    # element's token is an alias of the loop-carried argument, so nothing in
+    # placement or verification can tell the two references apart by name. Only
+    # a leak check says whether the second one was released.
+    container_from_a_loop_variable_indexed
     # A message reused after an exception constructor transferred it: the
     # retain restoring the caller's reference has to be matched by exactly one
     # release, and a golden cannot see the difference between one and none.

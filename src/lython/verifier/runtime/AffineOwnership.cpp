@@ -2460,6 +2460,13 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               returnCarriesGroupInsideOwnedAggregate(
                   resource.function, ret, state.group, deallocators, aliases))
             break;
+          // ⛔ Same dominance guard as the use-after-release arms: a return the
+          // producer does not dominate is naming a value this resource's
+          // release never touched -- the loop-carried argument an element
+          // token was minted from, on the exit edge of the loop.
+          if (!releasedUseDominanceDisabled() &&
+              !walk.producerDominates(resource.producer, ret))
+            break;
           return ret.emitError()
                  << "released owned resource from " << resource.producerLabel
                  << " is used by function return";
@@ -2685,6 +2692,23 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                  << resource.resultOffset;
 
         if (state.token == AffineTokenState::Released) {
+          // ⛔ A CONSUME THE PRODUCER DOES NOT DOMINATE IS NOT THIS TOKEN'S,
+          // the same reading the use arms take. The shape it answers is the
+          // loop-carried variable an element token was minted from:
+          //
+          //     while i < n:
+          //         p = [i]
+          //         total = total + p[0]
+          //         i = i + 1
+          //
+          // the loop's own release of `i` on the EXIT edge names the block
+          // argument, which aliases the marker; read as this token's second
+          // discharge it reported "released or transferred more than once" for
+          // a program whose refcounts balance (checked with the leak gate at
+          // 200k iterations: net 0).
+          if (consumes && !releasedUseDominanceDisabled() &&
+              !walk.producerDominates(resource.producer, op))
+            consumes = false;
           if (consumes) {
             if (outstanding() == 0 && resource.condition) {
               op = op->getNextNode();
@@ -2714,10 +2738,26 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             op = op->getNextNode();
             continue;
           }
+          // ⛔ The dominance guard the non-call arm below already carries,
+          // and for the same reason: a back edge reaches blocks the producer
+          // does not dominate, and a mention there names the NEXT iteration's
+          // value, not the released one.
+          //
+          //     while i < n:
+          //         p = [i]
+          //         i = p[0] + 1
+          //
+          // `p[0]` folds to `i` itself, so the element token's marker is an
+          // identity cast of the loop-carried argument and aliases it. Its
+          // release at the bottom of the body was then read as still in force
+          // at the top, where `i < n` mentions the argument -- a refusal of a
+          // program whose refcounts balance.
           if (mentionsTracked &&
               (groupContainsOperand(op, state.group, aliases) ||
                groupContainsOperand(op, state.views, aliases)) &&
-              outstanding() == 0)
+              outstanding() == 0 &&
+              (releasedUseDominanceDisabled() ||
+               walk.producerDominates(resource.producer, op)))
             return call.emitError()
                    << "released owned resource from " << resource.producerLabel
                    << " is used after release (by call to '"
