@@ -685,6 +685,11 @@ private:
                                                     RuntimeBundle &container,
                                                     unsigned index,
                                                     llvm::StringRef label);
+  mlir::LogicalResult storePayloadSlot(
+      mlir::Operation *op, RuntimeBundle &container, unsigned index,
+      const RuntimeBundle &element, ContainerInterior interior,
+      llvm::StringRef label, llvm::StringRef capacityContract,
+      std::uint64_t RuntimeBundle::*capacity);
   mlir::LogicalResult storeSequencePayloadElement(mlir::Operation *op,
                                                   RuntimeBundle &container,
                                                   unsigned index,

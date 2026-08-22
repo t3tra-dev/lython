@@ -848,28 +848,40 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   return mlir::success();
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
+// ⭐ ONE PAYLOAD SLOT STORE. The order here is the rule: grow FIRST, take the
+// interior view AFTER. Growing may reallocate the array, and a view taken
+// before the growth names the old one -- which is why the view is re-derived
+// here and not passed in. Three callers each had this written out, and the
+// reason was written on one of them.
+mlir::LogicalResult RuntimeBundleLowerer::storePayloadSlot(
     mlir::Operation *op, RuntimeBundle &container, unsigned index,
-    const RuntimeBundle &element) {
-  if (!isSequenceCollection(container.contractName()))
-    return mlir::success();
-  if (mlir::failed(RuntimeBundleLowerer::ensureSequencePayloadCapacity(
-          op, container, index, container.contractName())))
+    const RuntimeBundle &element, ContainerInterior interior,
+    llvm::StringRef label, llvm::StringRef capacityContract,
+    std::uint64_t RuntimeBundle::*capacity) {
+  if (mlir::failed(RuntimeBundleLowerer::ensurePayloadCapacity(
+          op, container, index, label, capacityContract, capacity)))
     return mlir::failure();
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
       RuntimeBundleLowerer::objectPayloadHandleWords(op, element);
   if (mlir::failed(words))
     return mlir::failure();
-  // Derived after ensureSequencePayloadCapacity: growing may have moved the
-  // array, and a view taken before the growth would name the old one.
-  mlir::FailureOr<mlir::Value> items =
-      RuntimeBundleLowerer::containerInteriorView(
-          op, container, ContainerInterior::Primary,
-          container.contractName());
-  if (mlir::failed(items))
+  mlir::FailureOr<mlir::Value> slots =
+      RuntimeBundleLowerer::containerInteriorView(op, container, interior,
+                                                  label);
+  if (mlir::failed(slots))
     return mlir::failure();
-  return storePayloadHandle(op, builder, *items, index, *words,
-                            container.contractName());
+  return storePayloadHandle(op, builder, *slots, index, *words, label);
+}
+
+mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElement(
+    mlir::Operation *op, RuntimeBundle &container, unsigned index,
+    const RuntimeBundle &element) {
+  if (!isSequenceCollection(container.contractName()))
+    return mlir::success();
+  return storePayloadSlot(op, container, index, element,
+                          ContainerInterior::Primary, container.contractName(),
+                          container.contractName(),
+                          &RuntimeBundle::sequenceCapacity);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::storeSequencePayloadElementAt(
@@ -1076,19 +1088,9 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictKeyPayload(
     const RuntimeBundle &key) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
-  if (mlir::failed(RuntimeBundleLowerer::ensureDictPayloadCapacity(
-          op, container, index)))
-    return mlir::failure();
-  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-      RuntimeBundleLowerer::objectPayloadHandleWords(op, key);
-  if (mlir::failed(words))
-    return mlir::failure();
-  mlir::FailureOr<mlir::Value> keys =
-      RuntimeBundleLowerer::containerInteriorView(
-          op, container, ContainerInterior::Primary, "dict keys");
-  if (mlir::failed(keys))
-    return mlir::failure();
-  return storePayloadHandle(op, builder, *keys, index, *words, "dict keys");
+  return storePayloadSlot(op, container, index, key,
+                          ContainerInterior::Primary, "dict keys",
+                          "builtins.dict", &RuntimeBundle::mappingCapacity);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
@@ -1096,21 +1098,13 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
     const RuntimeBundle &value) {
   if (container.contractName() != "builtins.dict")
     return mlir::success();
-  if (mlir::failed(RuntimeBundleLowerer::ensureDictPayloadCapacity(
-          op, container, index)))
+  if (mlir::failed(storePayloadSlot(op, container, index, value,
+                                    ContainerInterior::Secondary,
+                                    "dict values", "builtins.dict",
+                                    &RuntimeBundle::mappingCapacity)))
     return mlir::failure();
-  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-      RuntimeBundleLowerer::objectPayloadHandleWords(op, value);
-  if (mlir::failed(words))
-    return mlir::failure();
-  mlir::FailureOr<mlir::Value> valuesArray =
-      RuntimeBundleLowerer::containerInteriorView(
-          op, container, ContainerInterior::Secondary, "dict values");
-  if (mlir::failed(valuesArray))
-    return mlir::failure();
-  if (mlir::failed(storePayloadHandle(op, builder, *valuesArray, index, *words,
-                                      "dict values")))
-    return mlir::failure();
+  // The present word is what makes the slot findable; it is stored last so a
+  // failed value store never leaves a slot claiming an entry it has not got.
   mlir::FailureOr<mlir::Value> present =
       RuntimeBundleLowerer::containerInteriorView(
           op, container, ContainerInterior::Present, "dict present");
