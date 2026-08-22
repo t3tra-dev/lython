@@ -170,10 +170,11 @@ mlir::LogicalResult materializeCallbackThunks(mlir::ModuleOp module) {
                                                 targetName.getValue())))
       return mlir::failure();
 
-    // The primitive-ABI clone takes (i64 raw, i1 valid) per parameter and
-    // returns struct<(i64, i1)>.
+    // The primitive-ABI clone takes one i64 per parameter -- validity is the
+    // caller's obligation, and a thunk entered from C has nothing but valid
+    // machine words -- and returns struct<(i64, i1)>.
     mlir::LLVM::LLVMFunctionType targetType = target.getFunctionType();
-    if (targetType.getNumParams() != 2 * argCodes.size())
+    if (targetType.getNumParams() != argCodes.size())
       return placeholder.emitError()
              << "callback target '" << targetName.getValue() << "' expects "
              << targetType.getNumParams() << " ABI inputs for "
@@ -207,8 +208,6 @@ mlir::LogicalResult materializeCallbackThunks(mlir::ModuleOp module) {
         mlir::LLVM::Linkage::Internal);
     mlir::Block *entry = thunk.addEntryBlock(builder);
     builder.setInsertionPointToStart(entry);
-    mlir::Value validTrue = mlir::LLVM::ConstantOp::create(
-        builder, thunk.getLoc(), i1, builder.getBoolAttr(true));
     llvm::SmallVector<mlir::Value, 8> callOperands;
     for (auto [index, codeAttr] : llvm::enumerate(argCodes)) {
       llvm::StringRef code = mlir::cast<mlir::StringAttr>(codeAttr).getValue();
@@ -227,7 +226,6 @@ mlir::LogicalResult materializeCallbackThunks(mlir::ModuleOp module) {
                                              argument);
       }
       callOperands.push_back(widened);
-      callOperands.push_back(validTrue);
     }
     auto call = mlir::LLVM::CallOp::create(builder, thunk.getLoc(), target,
                                            callOperands);

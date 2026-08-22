@@ -269,15 +269,32 @@ private:
   mlir::LogicalResult eraseCallableProtocolTemplateFunctions();
   bool isPrimitiveI64CallableClone(mlir::func::FuncOp function) const;
   bool isPrimitiveI64CallableEligible(mlir::func::FuncOp function) const;
-  // Records that the clone containing `op` just made a decision from a raw
-  // lane whose validity bit was not statically true, so every `valid` it
-  // returns from here on must be forced to false.
-  void poisonPrimitiveI64CloneSpeculation(mlir::Operation *op,
-                                          mlir::Value stillValid);
-  // Null unless the enclosing clone was poisoned somewhere; otherwise an i1
-  // that is true only if the raw lane is still trustworthy.
-  mlir::Value primitiveI64CloneSpeculationIntact(mlir::Operation *op,
-                                                 mlir::func::FuncOp clone);
+  // ⭐ A CLONE'S RAW LANES ARE VALID BY CONTRACT, NOT BY FLAG. The caller
+  // branches on validity BEFORE the call, so inside a clone every entry lane
+  // is pinned true and every branch it drives is exact. What can still go
+  // stale is a lane PRODUCED inside (an overflowing add): that validity rides
+  // the lane to the return, where it becomes the clone's answer.
+  //
+  // A comparison has nowhere to carry "my operands were not the true values",
+  // so a clone that compares a stale lane would branch on a definite `false`
+  // -- a confident wrong answer, and for `if n <= 1: return n` an endless
+  // recursion. Such a clone is marked unusable and every speculation on it is
+  // dropped; the program keeps the boxed original.
+  void refusePrimitiveI64Clone(mlir::func::FuncOp clone);
+  void parkPrimitiveI64CloneDecision(mlir::Operation *op,
+                                     mlir::Value stillValid);
+  mlir::Value primitiveI64CloneDecisionsIntact(mlir::Operation *op,
+                                               mlir::func::FuncOp clone);
+  bool isUsablePrimitiveI64Clone(mlir::func::FuncOp clone) const;
+  bool isSpeculablePrimitiveI64Clone(mlir::func::FuncOp clone);
+  // The (raw, valid) pair of a clone call, guarded so the clone is entered
+  // only with valid lanes. `argumentsValid` pinned true emits no branch.
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>>
+  emitGuardedPrimitiveI64CloneCall(py::CallOp op, mlir::func::FuncOp clone,
+                                   llvm::StringRef cloneName,
+                                   llvm::ArrayRef<const RuntimeBundle *> sources);
+  // Drops every speculation whose clone turned out not to be speculable; the
+  // call site keeps the boxed original it was already prepared to run.
   mlir::LogicalResult foldUnprovenPrimitiveI64Speculations();
   std::optional<std::string> primitiveI64CloneFor(llvm::StringRef target) const;
   mlir::LogicalResult seedPrimitiveI64CallableEntryArgumentBundles(
@@ -1630,10 +1647,10 @@ private:
   llvm::StringMap<CallableArgumentEvidenceABI> callableArgumentEvidenceABIs;
   llvm::StringMap<CallableAggregateEvidenceABI> callableAggregateEvidenceABIs;
   llvm::StringMap<std::string> primitiveI64CallableClones;
-  // Per-clone `memref<1xi64>` slot holding 1 while the clone's raw lane still
-  // tracks the true Python values, 0 once some step discarded a validity bit.
-  llvm::DenseMap<mlir::Operation *, mlir::Value>
-      primitiveI64CloneSpeculationFlags;
+  // Clones whose raw lane cannot be trusted to drive their own control flow;
+  // every speculation on one is dropped (see refusePrimitiveI64Clone).
+  llvm::DenseSet<mlir::Operation *> refusedPrimitiveI64Clones;
+  llvm::DenseMap<mlir::Operation *, mlir::Value> primitiveI64CloneDecisionFlags;
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
   llvm::SmallVector<CallableLogicalEntryArgs, 8> callableLogicalEntryArgCounts;

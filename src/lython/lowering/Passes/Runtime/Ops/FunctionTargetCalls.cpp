@@ -338,18 +338,95 @@ mlir::LogicalResult RuntimeBundleLowerer::bundlePrimitiveI64CloneCallResult(
       result);
 }
 
+// ⭐ THE BRANCH THAT MAKES THE CLONE'S CONTRACT TRUE. A clone reads its raw
+// words as the Python values themselves, so it must not be entered with a lane
+// that has gone stale. The check lives here, once per call, instead of as a bit
+// the body re-tests at every branch -- which is what it was, and what made
+// `fib(93)` recurse forever once its lane overflowed.
+//
+// A pinned-true conjunction emits no branch at all, which is the common case:
+// the arguments of a top-level call are literals or freshly unboxed.
+mlir::FailureOr<std::pair<mlir::Value, mlir::Value>>
+RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(
+    py::CallOp op, mlir::func::FuncOp clone, llvm::StringRef cloneName,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  // ⛔ The caller's insertion point is kept, not reset to `op`: an indirect
+  // dispatch lowers its candidates INSIDE per-target regions, and anchoring at
+  // `op` would build the guard outside the region whose block then has no
+  // terminator (`closure_captures_a_function` and two siblings caught it).
+  mlir::Location loc = op.getLoc();
+  mlir::Value argumentsValid;
+  for (const RuntimeBundle *source : sources) {
+    if (!source || !source->primitiveI64 || !source->primitiveI64->valid)
+      continue;
+    argumentsValid = argumentsValid
+                         ? logicalAnd(builder, loc, argumentsValid,
+                                      source->primitiveI64->valid)
+                         : source->primitiveI64->valid;
+  }
+
+  auto callResults =
+      [&](mlir::func::CallOp call) -> mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> {
+    if (call.getNumResults() != 2 || !call.getResult(0).getType().isInteger(64) ||
+        !call.getResult(1).getType().isInteger(1))
+      return op.emitError() << "primitive i64 callable clone '" << cloneName
+                            << "' must return (i64, i1)";
+    return std::make_pair(call.getResult(0), call.getResult(1));
+  };
+
+  if (!argumentsValid || isPinnedTrueFlag(argumentsValid)) {
+    mlir::FailureOr<mlir::func::CallOp> call =
+        RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(op, clone,
+                                                            cloneName, sources);
+    if (mlir::failed(call))
+      return mlir::failure();
+    return callResults(*call);
+  }
+
+  context->loadDialect<mlir::scf::SCFDialect>();
+  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type i1 = mlir::IntegerType::get(context, 1);
+  auto ifOp = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{i64, i1},
+                                      argumentsValid, /*withElseRegion=*/true);
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  mlir::FailureOr<mlir::func::CallOp> call =
+      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(op, clone, cloneName,
+                                                          sources);
+  if (mlir::failed(call))
+    return mlir::failure();
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> results =
+      callResults(*call);
+  if (mlir::failed(results))
+    return mlir::failure();
+  builder.setInsertionPointToEnd(&ifOp.getThenRegion().front());
+  mlir::scf::YieldOp::create(builder, loc,
+                             mlir::ValueRange{results->first, results->second});
+
+  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+  // No answer, and no attempt: the raw word is a placeholder the invalid bit
+  // tells every reader to ignore.
+  mlir::scf::YieldOp::create(
+      builder, loc,
+      mlir::ValueRange{constantI64(builder, loc, 0),
+                       constantBool(builder, loc, false)});
+  builder.setInsertionPointAfter(ifOp);
+  return std::make_pair(ifOp.getResult(0), ifOp.getResult(1));
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(
     py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
     llvm::ArrayRef<const RuntimeBundle *> sources) {
-  mlir::FailureOr<mlir::func::CallOp> call =
-      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(op, target,
-                                                          targetName, sources);
-  if (mlir::failed(call))
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> answer =
+      RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(op, target,
+                                                             targetName,
+                                                             sources);
+  if (mlir::failed(answer))
     return mlir::failure();
 
   RuntimeBundle result;
-  if (mlir::failed(RuntimeBundleLowerer::bundlePrimitiveI64CloneCallResult(
-          op, target, *call, result)))
+  if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+          op, op.getResult(0).getType(), answer->first, answer->second,
+          result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
@@ -389,16 +466,11 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   if (mlir::failed(objectTypes))
     return mlir::failure();
 
-  mlir::FailureOr<mlir::func::CallOp> cloneCall =
-      RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+  mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> cloneAnswer =
+      RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(
           op, clone, clone.getSymName(), sources);
-  if (mlir::failed(cloneCall))
+  if (mlir::failed(cloneAnswer))
     return mlir::failure();
-  if ((*cloneCall).getNumResults() != 2 ||
-      !(*cloneCall).getResult(0).getType().isInteger(64) ||
-      !(*cloneCall).getResult(1).getType().isInteger(1))
-    return op.emitError() << "primitive i64 callable clone '"
-                          << clone.getSymName() << "' must return (i64, i1)";
 
   context->loadDialect<mlir::scf::SCFDialect>();
   mlir::Location loc = op.getLoc();
@@ -408,7 +480,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   ifResultTypes.push_back(mlir::IntegerType::get(context, 1));
 
   auto ifOp = mlir::scf::IfOp::create(builder, loc, ifResultTypes,
-                                      (*cloneCall).getResult(1),
+                                      cloneAnswer->second,
                                       /*withElseRegion=*/true);
   // The else region RE-RUNS the original, so this shape is only sound if the
   // clone cannot report valid=false. That is a property of the clone's lowered
@@ -420,7 +492,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
   RuntimeBundle fastObject;
   if (mlir::failed(RuntimeBundleLowerer::initializeObjectFromRawValues(
-          op, resultType, mlir::ValueRange{(*cloneCall).getResult(0)},
+          op, resultType, mlir::ValueRange{cloneAnswer->first},
           fastObject)))
     return mlir::failure();
   llvm::SmallVector<mlir::Value, 10> fastYield(
@@ -429,8 +501,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
     return op.emitError() << "primitive i64 clone fast path produced "
                           << fastYield.size() << " object values, expected "
                           << objectTypes->size();
-  fastYield.push_back((*cloneCall).getResult(0));
-  fastYield.push_back((*cloneCall).getResult(1));
+  fastYield.push_back(cloneAnswer->first);
+  fastYield.push_back(cloneAnswer->second);
   mlir::scf::YieldOp::create(builder, loc, fastYield);
 
   builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
@@ -518,6 +590,12 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
                  << "primitive i64 callable clone '" << targetName
                  << "' argument " << sourceIndex
                  << " is a boxed int with no matching unbox.i64 primitive";
+        // ⛔ The unbox is anchored at `op`, not at the current insertion
+        // point, because it must stay OUTSIDE any validity guard around the
+        // call: a boxed int too large for the lane raises here, and it raised
+        // there before the guard existed. The insertion point is restored so
+        // the call itself still lands inside the guard.
+        mlir::OpBuilder::InsertionGuard unboxGuard(builder);
         builder.setInsertionPoint(op);
         mlir::func::CallOp unboxed = RuntimeBundleLowerer::createRuntimeCall(
             op.getLoc(), *unbox, source->physicalValues());
@@ -530,14 +608,21 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
                               << "' argument " << sourceIndex
                               << " has no primitive i64 evidence";
       }
-      if (inputIndex + 2 > functionType.getNumInputs() ||
-          !functionType.getInput(inputIndex).isInteger(64) ||
-          !functionType.getInput(inputIndex + 1).isInteger(1))
+      // Generator resume clones still take the pair; a plain clone takes the
+      // raw word alone, because its caller has already branched on validity.
+      const bool takesValidityBit =
+          inputIndex + 1 < functionType.getNumInputs() &&
+          functionType.getInput(inputIndex + 1).isInteger(1);
+      if (inputIndex >= functionType.getNumInputs() ||
+          !functionType.getInput(inputIndex).isInteger(64))
         return op.emitError() << "primitive i64 callable clone '" << targetName
                               << "' has malformed ABI at input " << inputIndex;
       operands.push_back(evidenceValue);
-      operands.push_back(evidenceValid);
-      inputIndex += 2;
+      ++inputIndex;
+      if (takesValidityBit) {
+        operands.push_back(evidenceValid);
+        ++inputIndex;
+      }
     }
     if (inputIndex != functionType.getNumInputs())
       return op.emitError() << "primitive i64 callable clone '" << targetName

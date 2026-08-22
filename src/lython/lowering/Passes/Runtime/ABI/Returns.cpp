@@ -255,16 +255,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           operands.push_back(constantInt(
               builder, op.getLoc(), builder.getI1Type(), 0));
         }
-        // Any step inside this clone that had to decide from a raw lane whose
-        // validity was not statically true left the raw lane untrustworthy;
-        // the honest answer is valid=false so the call site re-runs the boxed
-        // original instead of trusting this raw value.
-        if (primitiveI64CloneSpeculationFlags.count(function.getOperation())) {
+        // The lane's own validity answers for the value; the parked flag
+        // answers for the DECISIONS that got here, which a comparison's i1
+        // could not carry. Both must hold for the raw word to be the answer.
+        if (primitiveI64CloneDecisionFlags.count(function.getOperation())) {
           // Operand bundling above may have dangled the saved iterator (see
           // the re-anchor below the loop); re-anchor before emitting.
           builder.setInsertionPoint(op);
           if (mlir::Value intact =
-                  RuntimeBundleLowerer::primitiveI64CloneSpeculationIntact(
+                  RuntimeBundleLowerer::primitiveI64CloneDecisionsIntact(
                       op.getOperation(), function))
             operands.back() = mlir::arith::AndIOp::create(
                                   builder, op.getLoc(), operands.back(), intact)

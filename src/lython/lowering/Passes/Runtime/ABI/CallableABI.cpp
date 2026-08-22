@@ -408,31 +408,43 @@ bool RuntimeBundleLowerer::isCallableProtocolTemplate(
 // clone's cf blocks are already built by the time a step discovers it must
 // poison, and re-signaturing them mid-lowering dangles the saved insertion
 // iterators the surrounding walk depends on. mem2reg promotes it away.
-void RuntimeBundleLowerer::poisonPrimitiveI64CloneSpeculation(
-    mlir::Operation *op, mlir::Value stillValid) {
+void RuntimeBundleLowerer::refusePrimitiveI64Clone(mlir::func::FuncOp clone) {
+  if (clone && RuntimeBundleLowerer::isPrimitiveI64CallableClone(clone))
+    refusedPrimitiveI64Clones.insert(clone.getOperation());
+}
+
+// The clone-local `memref<1xi64>` holding 1 while every decision the body has
+// made so far came from a lane that really was the Python value, 0 once one
+// did not. A comparison is where a lane's validity would otherwise be lost --
+// an i1 has nowhere to carry it -- so the bit is parked here and AND-ed into
+// whatever the clone returns.
+//
+// ⛔ NOT a refusal, which is what a stale comparison used to force: a `while`
+// whose counter overflows is exactly this shape, and refusing it left every
+// integer loop on the boxed path. The wrong branch it may take is bounded --
+// the guard at each clone call means a stale lane never ENTERS a clone, so it
+// cannot drive unbounded recursion, and `and(valid, compared)` reads false,
+// which is the exiting direction for a loop.
+void RuntimeBundleLowerer::parkPrimitiveI64CloneDecision(mlir::Operation *op,
+                                                         mlir::Value stillValid) {
   auto clone = op->getParentOfType<mlir::func::FuncOp>();
-  if (!RuntimeBundleLowerer::isPrimitiveI64CallableClone(clone))
+  if (!clone || !RuntimeBundleLowerer::isPrimitiveI64CallableClone(clone))
     return;
 
   mlir::Location loc = op->getLoc();
-  mlir::Value &slot = primitiveI64CloneSpeculationFlags[clone.getOperation()];
+  mlir::Value &slot = primitiveI64CloneDecisionFlags[clone.getOperation()];
   if (!slot) {
     mlir::OpBuilder::InsertionGuard guard(builder);
-    mlir::Block &entry = clone.getBody().front();
-    builder.setInsertionPointToStart(&entry);
+    builder.setInsertionPointToStart(&clone.getBody().front());
     slot = mlir::memref::AllocaOp::create(
-               builder, loc,
-               mlir::MemRefType::get({1}, builder.getI64Type()))
+               builder, loc, mlir::MemRefType::get({1}, builder.getI64Type()))
                .getResult();
-    mlir::memref::StoreOp::create(
-        builder, loc,
-        mlir::arith::ConstantIntOp::create(builder, loc, 1, 64).getResult(),
-        slot,
-        mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult());
+    mlir::memref::StoreOp::create(builder, loc,
+                                  constantI64(builder, loc, 1), slot,
+                                  constantIndex(builder, loc, 0));
   }
 
-  mlir::Value zero =
-      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::Value zero = constantIndex(builder, loc, 0);
   mlir::Value current =
       mlir::memref::LoadOp::create(builder, loc, slot, zero).getResult();
   mlir::Value widened =
@@ -445,22 +457,25 @@ void RuntimeBundleLowerer::poisonPrimitiveI64CloneSpeculation(
       slot, zero);
 }
 
-mlir::Value RuntimeBundleLowerer::primitiveI64CloneSpeculationIntact(
+mlir::Value RuntimeBundleLowerer::primitiveI64CloneDecisionsIntact(
     mlir::Operation *op, mlir::func::FuncOp clone) {
-  auto found = primitiveI64CloneSpeculationFlags.find(clone.getOperation());
-  if (found == primitiveI64CloneSpeculationFlags.end() || !found->second)
+  auto found = primitiveI64CloneDecisionFlags.find(clone.getOperation());
+  if (found == primitiveI64CloneDecisionFlags.end() || !found->second)
     return {};
   mlir::Location loc = op->getLoc();
   mlir::Value current =
-      mlir::memref::LoadOp::create(
-          builder, loc, found->second,
-          mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult())
+      mlir::memref::LoadOp::create(builder, loc, found->second,
+                                   constantIndex(builder, loc, 0))
           .getResult();
-  return mlir::arith::CmpIOp::create(
-             builder, loc, mlir::arith::CmpIPredicate::ne, current,
-             mlir::arith::ConstantIntOp::create(builder, loc, 0, 64)
-                 .getResult())
+  return mlir::arith::CmpIOp::create(builder, loc,
+                                     mlir::arith::CmpIPredicate::ne, current,
+                                     constantI64(builder, loc, 0))
       .getResult();
+}
+
+bool RuntimeBundleLowerer::isUsablePrimitiveI64Clone(
+    mlir::func::FuncOp clone) const {
+  return clone && !refusedPrimitiveI64Clones.contains(clone.getOperation());
 }
 
 std::optional<std::string>
@@ -548,40 +563,63 @@ bool RuntimeBundleLowerer::isPrimitiveI64CallableEligible(
         return runtimeContractName(type) == "builtins.int";
       }))
     return false;
-  // A return value that is a block argument comes from a control-flow merge
-  // (if/loop) and is a boxed object, which the unboxed-i64 clone return ABI
-  // cannot represent. Such functions must stay on the boxed-int path.
-  bool returnsBlockArgument = false;
-  function.walk([&](mlir::func::ReturnOp returnOp) {
-    for (mlir::Value operand : returnOp.getOperands())
-      if (mlir::isa<mlir::BlockArgument>(operand))
-        returnsBlockArgument = true;
-  });
-  return !returnsBlockArgument;
+  // A return value from a control-flow MERGE (if/loop) is a boxed object,
+  // which the unboxed-i64 clone return ABI cannot represent.
+  //
+  // ⛔ The test is "not the entry block", not "is a BlockArgument". A
+  // function's parameters are the entry block's arguments, and inside a clone
+  // they ARE the raw lane -- so `return n` is exactly what the clone ABI
+  // represents best. Testing `isa<BlockArgument>` refused every function that
+  // returns a parameter, which is `fib`, and with it every recursive integer
+  // function: measured, no source function in the tree ever got a clone.
+  return true;
 }
 
 namespace {
 
-// A clone is total when no `return` of it can hand back valid=false: only then
-// may a call site speculate on it, because only then is the recovery path
-// (which re-runs the original body) unreachable. Only the plain (i64, i1) shape
-// is judged -- the wider resume ABIs of generator clones are never speculated
-// on, and guessing which of their lanes is a validity bit could mistake an
-// unrelated pinned i1 for one.
-bool isTotalPrimitiveI64Clone(mlir::func::FuncOp clone) {
-  if (!clone || clone.isDeclaration())
-    return false;
-  mlir::FunctionType type = clone.getFunctionType();
-  if (type.getNumResults() != 2 || !type.getResult(0).isInteger(64) ||
-      !type.getResult(1).isInteger(1))
-    return false;
-  bool total = true;
-  clone.walk([&](mlir::func::ReturnOp returnOp) {
-    if (returnOp.getNumOperands() != 2 ||
-        !isPinnedTrueFlag(returnOp.getOperand(1)))
-      total = false;
+// Nothing a clone does before it reports valid=false may be observable: the
+// call site answers a false by running the boxed original, so the clone's work
+// has to be a rehearsal. Pure i64 arithmetic and calls to other rehearsable
+// clones qualify; a runtime call, a store or an allocation does not.
+//
+// Only the plain (i64, i1) shape is judged -- the wider resume ABIs of
+// generator clones are never speculated on.
+bool isReplaySafeBody(mlir::func::FuncOp clone,
+                      llvm::function_ref<bool(mlir::func::FuncOp)> calleeSafe) {
+  bool safe = true;
+  clone.walk([&](mlir::Operation *op) {
+    if (op == clone.getOperation())
+      return mlir::WalkResult::advance();
+    if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+      auto callee = mlir::SymbolTable::lookupNearestSymbolFrom<mlir::func::FuncOp>(
+          clone, call.getCalleeAttr());
+      if (!callee || !calleeSafe(callee)) {
+        safe = false;
+        return mlir::WalkResult::interrupt();
+      }
+      return mlir::WalkResult::advance();
+    }
+    llvm::StringRef dialect = op->getName().getDialectNamespace();
+    if (dialect == "arith" || dialect == "cf" || dialect == "scf" ||
+        dialect == "func")
+      return mlir::WalkResult::advance();
+    // The decision flag: a slot the clone allocates, writes and reads itself,
+    // dead the moment it returns. Nothing outside can see it, which is the
+    // whole question here.
+    if (mlir::isa<mlir::memref::AllocaOp>(op))
+      return mlir::WalkResult::advance();
+    if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(op)) {
+      if (load.getMemRef().getDefiningOp<mlir::memref::AllocaOp>())
+        return mlir::WalkResult::advance();
+    }
+    if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(op)) {
+      if (store.getMemRef().getDefiningOp<mlir::memref::AllocaOp>())
+        return mlir::WalkResult::advance();
+    }
+    safe = false;
+    return mlir::WalkResult::interrupt();
   });
-  return total;
+  return safe;
 }
 
 } // namespace
@@ -601,6 +639,41 @@ bool isTotalPrimitiveI64Clone(mlir::func::FuncOp clone) {
 // Unboxing at the clone's return to force valid=1 would truncate bigints.
 // Folding here touches neither the clone set nor the clone ABI: it only stops
 // callers from betting on a clone that can decline to answer.
+// A clone may be speculated on when its raw lane drives only exact branches
+// (it was never refused), its ABI is the plain (i64, i1) pair, and its body is
+// a rehearsal -- transitively, since a clone calling a refused clone inherits
+// that clone's wrong branches. The walk is optimistic about the cycle a
+// recursive clone forms with itself, which is what lets `fib` speculate at all.
+bool RuntimeBundleLowerer::isSpeculablePrimitiveI64Clone(
+    mlir::func::FuncOp clone) {
+  if (!clone || clone.isDeclaration() ||
+      !RuntimeBundleLowerer::isPrimitiveI64CallableClone(clone))
+    return false;
+  mlir::FunctionType type = clone.getFunctionType();
+  if (type.getNumResults() != 2 || !type.getResult(0).isInteger(64) ||
+      !type.getResult(1).isInteger(1))
+    return false;
+
+  llvm::DenseSet<mlir::Operation *> assumedSafe;
+  llvm::SmallVector<mlir::func::FuncOp, 4> pending{clone};
+  assumedSafe.insert(clone.getOperation());
+  while (!pending.empty()) {
+    mlir::func::FuncOp current = pending.pop_back_val();
+    if (!RuntimeBundleLowerer::isUsablePrimitiveI64Clone(current))
+      return false;
+    if (!isReplaySafeBody(current, [&](mlir::func::FuncOp callee) {
+          if (!RuntimeBundleLowerer::isPrimitiveI64CallableClone(callee) ||
+              callee.isDeclaration())
+            return false;
+          if (assumedSafe.insert(callee.getOperation()).second)
+            pending.push_back(callee);
+          return true;
+        }))
+      return false;
+  }
+  return true;
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::foldUnprovenPrimitiveI64Speculations() {
   llvm::SmallVector<mlir::scf::IfOp, 8> speculations;
@@ -613,16 +686,20 @@ RuntimeBundleLowerer::foldUnprovenPrimitiveI64Speculations() {
     auto cloneRef = ifOp->getAttrOfType<mlir::FlatSymbolRefAttr>(
         kPrimitiveI64SpeculationAttr);
     ifOp->removeAttr(kPrimitiveI64SpeculationAttr);
-    // A marker without a resolvable clone cannot be shown total, so it folds.
+    // A marker without a resolvable clone cannot be shown safe, so it folds.
     mlir::func::FuncOp clone;
     if (cloneRef)
       clone = module.lookupSymbol<mlir::func::FuncOp>(cloneRef.getAttr());
-    if (isTotalPrimitiveI64Clone(clone))
+    if (isSpeculablePrimitiveI64Clone(clone))
       continue;
 
-    // The condition is the clone call's validity result; capture the call
-    // before the only uses of it disappear.
-    auto cloneCall = ifOp.getCondition().getDefiningOp<mlir::func::CallOp>();
+    // The condition is the clone's validity answer; capture what produced it
+    // before the only uses of it disappear. It is the call itself when the
+    // arguments were provably valid, and otherwise the `scf.if` that guards
+    // the call -- and THAT one has to go too: it still contains the call, and
+    // a clone that is not replay-safe is one whose side effects would then be
+    // observed twice. `int_clone_speculation_effects` caught exactly that.
+    mlir::Operation *cloneCall = ifOp.getCondition().getDefiningOp();
     mlir::Block *elseBlock = &ifOp.getElseRegion().front();
     auto yield = mlir::cast<mlir::scf::YieldOp>(elseBlock->getTerminator());
     llvm::SmallVector<mlir::Value, 8> results(yield.getOperands());
@@ -637,7 +714,7 @@ RuntimeBundleLowerer::foldUnprovenPrimitiveI64Speculations() {
     ifOp.getOperation()->replaceAllUsesWith(results);
     ifOp.erase();
     if (cloneCall && cloneCall->use_empty())
-      cloneCall.erase();
+      cloneCall->erase();
   }
   return mlir::success();
 }
@@ -691,8 +768,15 @@ RuntimeBundleLowerer::seedPrimitiveI64CallableEntryArgumentBundles(
     mlir::BlockArgument logicalArg = entry.getArgument(index);
     mlir::BlockArgument raw = entry.addArgument(
         mlir::IntegerType::get(context, 64), logicalArg.getLoc());
-    mlir::BlockArgument valid = entry.addArgument(
-        mlir::IntegerType::get(context, 1), logicalArg.getLoc());
+    // ⭐ VALIDITY IS THE CALLER'S OBLIGATION, NOT AN ARGUMENT. It used to ride
+    // in as an i1 the body then AND-ed into its branches, which meant a clone
+    // entered with valid=false took the wrong arm of every test -- `fib(93)`,
+    // whose i64 lane overflows, recursed until the stack guard fired. With the
+    // branch moved to the call site the lane is true here by contract, so the
+    // body's branches are exactly the original's.
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&entry);
+    mlir::Value valid = constantBool(builder, logicalArg.getLoc(), true);
 
     RuntimeBundle bundle = RuntimeBundle::objectWithOwnership(
         logicalType, mlir::ValueRange{},
@@ -925,8 +1009,16 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
         }
-        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(logicalType,
-                                                              inputTypes);
+        // ⛔ The raw word ONLY -- no validity bit. Generator resume clones
+        // keep the pair, because a resumed frame's lane really can arrive
+        // stale; a plain clone is entered under the caller's branch, so a
+        // second copy of a fact already established would just invite the
+        // body to branch on it (see seedPrimitiveI64CallableEntryArgumentBundles).
+        if (generatorArgInfo)
+          RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(logicalType,
+                                                                inputTypes);
+        else
+          inputTypes.push_back(mlir::IntegerType::get(context, 64));
       }
       if (!generatorTransferArgs.empty())
         function->setAttr(ownership::kTransferArgsAttr,

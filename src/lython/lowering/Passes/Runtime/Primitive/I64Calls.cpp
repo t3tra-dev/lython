@@ -145,14 +145,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     if (!isPinnedTrueFlag(operandsValid)) {
       // A comparison answers i1: unlike arithmetic it has nowhere to carry
       // "the raw operands were not the true values" forward. WHY NOT just
-      // and-ing the validity in (which is what the boxed lane's `scf.if`
-      // guard degenerates to here): that maps "unknown" onto a definite
-      // `false`, the clone then branches on it and any literal `return` it
-      // reaches re-asserts valid=true -- a confident wrong answer. The clone
-      // has no boxed lane to fall back to, so it instead records that its raw
-      // lane went stale and lets the call site re-run the boxed original.
-      RuntimeBundleLowerer::poisonPrimitiveI64CloneSpeculation(op,
-                                                              operandsValid);
+      // and-ing the validity in: that maps "unknown" onto a definite `false`,
+      // and the clone then BRANCHES on it. For `if n <= 1: return n` the false
+      // arm is the recursive one, so an overflowed lane recursed until the
+      // stack guard fired -- measured on fib(93), which hung.
+      //
+      // So the bit is parked in the clone's decision flag and AND-ed into
+      // whatever the clone returns: the answer becomes "I cannot say", and
+      // the call site takes the boxed original. The comparison itself still
+      // reads false, which for the loop this shape usually is means "leave",
+      // and no clone is ever ENTERED with a stale lane (the call guard), so
+      // the wrong branch cannot recurse without end.
+      RuntimeBundleLowerer::parkPrimitiveI64CloneDecision(op, operandsValid);
       fastResult = logicalAnd(builder, loc, operandsValid, compared);
     }
     RuntimeBundle result;
