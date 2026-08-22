@@ -647,6 +647,9 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       PerfScope perf("jit-build.link-runtime");
       if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
         return failure();
+      lython::driver::redirectAllocationsToObjectAllocator(
+          *llvmModule, Options.sanitizers.address || Options.sanitizers.leak ||
+                           Options.sanitizers.thread);
       if (!Options.releaseMode)
         collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
     }
@@ -1008,6 +1011,9 @@ int main(int argc, char **argv) {
 
   if (failed(py::runtime_library::linkEmbeddedNativeRuntime(llvmModule)))
     return 1;
+  lython::driver::redirectAllocationsToObjectAllocator(
+      llvmModule, Options.sanitizers.address || Options.sanitizers.leak ||
+                      Options.sanitizers.thread);
   rewriteExceptionPersonalityForTarget(llvmModule);
 
   if (failed(installAOTEntryPoint(llvmModule, llvm::errs())))

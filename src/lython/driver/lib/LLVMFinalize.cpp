@@ -10,6 +10,7 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -26,6 +27,49 @@
 using namespace mlir;
 
 namespace lython::driver {
+
+unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
+                                              bool bypass) {
+  if (bypass)
+    return 0;
+  struct Redirect {
+    const char *from;
+    const char *to;
+  };
+  static constexpr Redirect kRedirects[] = {{"malloc", "LyMem_Alloc"},
+                                            {"free", "LyMem_Free"},
+                                            {"realloc", "LyMem_Realloc"}};
+  unsigned moved = 0;
+  for (llvm::Function &function : module) {
+    // The allocator itself keeps the system allocator: it is what it is built
+    // on. Nothing else in the module may reach malloc directly, or a block
+    // taken from the pool would be handed to free.
+    if (function.getName().starts_with("LyMem_"))
+      continue;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (!call)
+          continue;
+        llvm::Function *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        for (const Redirect &redirect : kRedirects) {
+          if (callee->getName() != redirect.from)
+            continue;
+          llvm::Function *replacement = module.getFunction(redirect.to);
+          if (!replacement ||
+              replacement->getFunctionType() != callee->getFunctionType())
+            break;
+          call->setCalledFunction(replacement);
+          ++moved;
+          break;
+        }
+      }
+    }
+  }
+  return moved;
+}
 
 void dumpLLVMForPass(const py::IRDumpConfig &config, llvm::StringRef passName,
                      llvm::Module &module) {

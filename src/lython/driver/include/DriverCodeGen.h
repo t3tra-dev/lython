@@ -114,6 +114,18 @@ verifyOptimizedLLVMThreadSafe(llvm::Module &llvmModule,
 
 // --- LLVM IR finalization ---------------------------------------------------
 
+// Sends every allocation in the module through the runtime's object allocator
+// (LyMem_Alloc/Free/Realloc) instead of the system one. Answers how many call
+// sites it moved.
+//
+// ⛔ A NO-OP UNDER THE MEMORY SANITIZERS, which is CPython's PYTHONMALLOC=malloc
+// and for the same reason: a pooled block is reachable from the arena, so a
+// leaked object inside one is invisible to LeakSanitizer and the leak gate
+// would go blind. The sanitizer build measures the system allocator; the
+// shipping build uses the pool.
+unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
+                                              bool bypass);
+
 void dumpLLVMForPass(const py::IRDumpConfig &config, llvm::StringRef passName,
                      llvm::Module &module);
 
