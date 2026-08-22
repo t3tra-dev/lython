@@ -1,9 +1,12 @@
 #include "Runtime/Core/Lowerer.h"
+#include "ArithBuilders.h"
 
 #include "Runtime/ABI/ConstantData.h"
 
 namespace py::lowering {
 namespace {
+
+using lython::common::constantInt;
 
 bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
   py::CallableType callable = callableTypeOf(function);
@@ -19,13 +22,6 @@ bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
 
 bool isErasedObjectResult(mlir::Type type) {
   return runtimeContractName(type) == "builtins.object";
-}
-
-mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                            mlir::IntegerType type, std::int64_t value) {
-  return mlir::arith::ConstantOp::create(
-             builder, loc, builder.getIntegerAttr(type, value))
-      .getResult();
 }
 
 } // namespace
@@ -251,12 +247,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
               op.getLoc(), *unbox, bundle->physicalValues());
           operands.push_back(unboxCall.getResult(0));
-          operands.push_back(integerConstant(
+          operands.push_back(constantInt(
               builder, op.getLoc(), builder.getI1Type(), 1));
         } else {
-          operands.push_back(integerConstant(
+          operands.push_back(constantInt(
               builder, op.getLoc(), builder.getI64Type(), 0));
-          operands.push_back(integerConstant(
+          operands.push_back(constantInt(
               builder, op.getLoc(), builder.getI1Type(), 0));
         }
         // Any step inside this clone that had to decide from a raw lane whose
@@ -308,9 +304,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         operands.push_back(bundle.primitiveI64->valid);
       } else {
         operands.push_back(
-            integerConstant(builder, op.getLoc(), builder.getI64Type(), 0));
+            constantInt(builder, op.getLoc(), builder.getI64Type(), 0));
         operands.push_back(
-            integerConstant(builder, op.getLoc(), builder.getI1Type(), 0));
+            constantInt(builder, op.getLoc(), builder.getI1Type(), 0));
       }
       resultIndex += 2;
       return mlir::success();

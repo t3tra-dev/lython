@@ -157,17 +157,6 @@ mlir::Value cdataStorageAddressValid(const RuntimeCtypesEvidence &evidence) {
   return evidence.storageAddressValid;
 }
 
-mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
-                        std::int64_t value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-      .getResult();
-}
-
-mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
-                          std::int64_t value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
-
 std::string ctypesLibraryABI(llvm::StringRef contract) {
   return llvm::StringSwitch<std::string>(contract)
       .Case("ctypes.CDLL", "cdecl")
@@ -553,7 +542,7 @@ makeCtypesBufferEvidence(mlir::OpBuilder &builder, mlir::Location loc,
   buffer.addressValid = valid;
   buffer.byteLength =
       constantI64(builder, loc, static_cast<std::int64_t>(layout.size));
-  buffer.byteLengthValid = constantI1(builder, loc, true);
+  buffer.byteLengthValid = constantBool(builder, loc, true);
   buffer.readable = true;
   buffer.writable = writable;
   buffer.cContiguous = true;
@@ -602,7 +591,7 @@ mlir::FailureOr<RuntimeBundle> materializeCtypesAddressView(
         nativeIntegerType(builder, layout), targetPlatformFacts(module));
     evidence.scalarValue =
         widenNativeInteger(builder, op->getLoc(), nativeValue, layout);
-    evidence.scalarValid = constantI1(builder, op->getLoc(), true);
+    evidence.scalarValid = constantBool(builder, op->getLoc(), true);
   }
 
   attachCtypesBufferEvidence(builder, op->getLoc(), result, evidence, layout,
@@ -628,7 +617,7 @@ mlir::FailureOr<RuntimeBundle> materializeCtypesPythonReadResult(
         runtimeContractType(op->getContext(), "builtins.int"), {});
     result.primitiveI64 = RuntimePrimitiveI64Evidence{
         widenNativeInteger(builder, op->getLoc(), nativeValue, layout),
-        constantI1(builder, op->getLoc(), true)};
+        constantBool(builder, op->getLoc(), true)};
     return result;
   }
 

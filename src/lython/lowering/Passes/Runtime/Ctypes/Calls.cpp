@@ -45,7 +45,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
                              : static_cast<std::int64_t>(layout->align);
     builder.setInsertionPoint(op);
     mlir::Value scalar = constantI64(builder, op.getLoc(), value);
-    mlir::Value valid = constantI1(builder, op.getLoc(), true);
+    mlir::Value valid = constantBool(builder, op.getLoc(), true);
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
             op, runtimeContractType(context, "builtins.int"), scalar, valid,
@@ -97,7 +97,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
     evidence.addressValue = coerceNativeInteger(
         builder, op.getLoc(), addressInt,
         nativePointerIntegerType(builder, facts));
-    evidence.addressValid = constantI1(builder, op.getLoc(), true);
+    evidence.addressValid = constantBool(builder, op.getLoc(), true);
     evidence.storageAddressValue = evidence.addressValue;
     evidence.storageAddressValid = evidence.addressValid;
     if (std::optional<CtypesLayout> layout =
@@ -176,7 +176,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
     builder.setInsertionPoint(op);
     mlir::Value address = addressWithOffset(
         builder, op.getLoc(), source->buffer->addressValue, offset, facts);
-    mlir::Value valid = constantI1(builder, op.getLoc(), true);
+    mlir::Value valid = constantBool(builder, op.getLoc(), true);
     RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
     RuntimeCtypesEvidence evidence;
     evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
@@ -276,7 +276,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
         builder, op.getLoc(), sourceAddress, nativeType, facts);
     mlir::Value ownedAddress =
         addressOfNativeCellAlloca(builder, op.getLoc(), nativeValue, facts);
-    mlir::Value valid = constantI1(builder, op.getLoc(), true);
+    mlir::Value valid = constantBool(builder, op.getLoc(), true);
 
     RuntimeBundle result = RuntimeBundle::object(op.getResult(0).getType(), {});
     RuntimeCtypesEvidence evidence;
@@ -332,7 +332,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
       i64 = mlir::arith::TruncIOp::create(builder, op.getLoc(),
                                           builder.getI64Type(), raw)
                 .getResult();
-    mlir::Value valid = constantI1(builder, op.getLoc(), true);
+    mlir::Value valid = constantBool(builder, op.getLoc(), true);
     RuntimeBundle result;
     if (mlir::failed(makePrimitiveI64Bundle(
             op, runtimeContractType(context, "builtins.int"), i64, valid,
@@ -406,7 +406,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
     evidence.provenance = RuntimeCtypesEvidence::Provenance::Cast;
     evidence.lifetime = RuntimeCtypesEvidence::Lifetime::External;
     evidence.addressValue = *address;
-    evidence.addressValid = constantI1(builder, op.getLoc(), true);
+    evidence.addressValid = constantBool(builder, op.getLoc(), true);
     keepAliveSource(evidence, *source);
     if (isCtypesVoidPointer(*targetContract)) {
       evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
@@ -570,7 +570,7 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
                               nativePointerIntegerType(builder, facts));
       evidence.storageAddressValue = addressOfNativeCellAlloca(
           builder, op.getLoc(), pointerInteger, facts);
-      evidence.storageAddressValid = constantI1(builder, op.getLoc(), true);
+      evidence.storageAddressValid = constantBool(builder, op.getLoc(), true);
       evidence.ownsNativeStorage = true;
       result.buffer = makeCtypesBufferEvidence(
           builder, op.getLoc(), *pointerLayout, evidence.storageAddressValue,

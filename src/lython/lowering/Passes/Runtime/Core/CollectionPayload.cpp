@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include "ArithBuilders.h"
 
 #include "Runtime/ABI/BoxLayout.h"
 
@@ -10,6 +11,8 @@
 namespace py::lowering {
 namespace {
 
+using lython::common::constantI64;
+
 bool isSequenceCollection(llvm::StringRef contract) {
   return contract == "builtins.list" || contract == "builtins.tuple";
 }
@@ -20,12 +23,6 @@ bool isI64Payload(mlir::Value value) {
          mlir::isa<mlir::IntegerType>(memref.getElementType()) &&
          mlir::cast<mlir::IntegerType>(memref.getElementType()).getWidth() ==
              64;
-}
-
-mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
-                        std::int64_t value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-      .getResult();
 }
 
 // The identity of the container an aggregate slot store lands in, allocated on
@@ -115,11 +112,6 @@ mlir::Operation *insertionAnchor(mlir::OpBuilder &builder) {
 }
 
 namespace {
-
-mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
-                          unsigned value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
 
 // Can `from` reach itself without passing through `barrier`? Asks whether a use
 // can execute more than once per single production of the value it uses.

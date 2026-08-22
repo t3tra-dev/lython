@@ -1,8 +1,11 @@
 #include "Runtime/Core/Lowerer.h"
+#include "ArithBuilders.h"
 
 namespace py::lowering {
 
 namespace {
+
+using lython::common::constantBool;
 
 namespace own = py::ownership;
 
@@ -18,12 +21,6 @@ bool compatibleRankOneMemRefStorage(mlir::Type source, mlir::Type target,
   if (targetMustBeDynamic)
     return targetMemRef.getDimSize(0) == mlir::ShapedType::kDynamic;
   return sourceMemRef.getShape() == targetMemRef.getShape();
-}
-
-mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                         bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
 }
 
 bool canAppendExactValues(mlir::FunctionType functionType, unsigned inputIndex,
@@ -347,7 +344,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     RuntimeBundle widened;
     if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
             op, runtimeContractType(context, "builtins.int"), wide,
-            boolConstant(builder, op->getLoc(), true), widened)))
+            constantBool(builder, op->getLoc(), true), widened)))
       return mlir::failure();
     return RuntimeBundleLowerer::appendRuntimeSource(
         op, symbol, functionType, inputIndex, widened, operands);
@@ -422,7 +419,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendPrimitiveI64EvidenceOperand(
     operands.push_back(
         mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)
             .getResult());
-    operands.push_back(boolConstant(builder, op->getLoc(), false));
+    operands.push_back(constantBool(builder, op->getLoc(), false));
   }
   inputIndex += 2;
   return mlir::success();

@@ -3,6 +3,7 @@
 #include "EmitterSupport.h"
 #include "PrimitiveTypes.h"
 
+#include "ArithBuilders.h"
 #include "AstAccess.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -21,6 +22,14 @@
 
 namespace lython::emitter {
 namespace {
+
+using common::constantBool;
+using common::constantIndex;
+using common::constantInt;
+using common::logicalAnd;
+using common::logicalNot;
+using common::SignedArith;
+using common::signedOverflow;
 
 std::optional<double> numericLiteralValue(const parser::Node *node) {
   if (!node)
@@ -86,11 +95,6 @@ bool collectTensorLiteralAttrs(mlir::OpBuilder &builder,
   return true;
 }
 
-mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
-                          std::int64_t value) {
-  return mlir::arith::ConstantIndexOp::create(builder, loc, value).getResult();
-}
-
 mlir::Value tensorExtract(mlir::OpBuilder &builder, mlir::Location loc,
                           mlir::Value tensor,
                           llvm::ArrayRef<std::int64_t> indices) {
@@ -118,66 +122,6 @@ mlir::Value coerceFloatValue(mlir::OpBuilder &builder, mlir::Location loc,
   return value;
 }
 
-mlir::Value integerConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                            mlir::IntegerType type, std::int64_t value) {
-  return mlir::arith::ConstantOp::create(builder, loc, type,
-                                         builder.getIntegerAttr(type, value))
-      .getResult();
-}
-
-mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                         bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
-}
-
-mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
-                       mlir::Value lhs, mlir::Value rhs) {
-  return mlir::arith::AndIOp::create(builder, loc, lhs, rhs).getResult();
-}
-
-mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
-                       mlir::Value value) {
-  return mlir::arith::XOrIOp::create(builder, loc, value,
-                                     boolConstant(builder, loc, true))
-      .getResult();
-}
-
-// Did a signed add or subtract wrap? The two differ in one predicate: an ADD
-// overflows only when the operands share a sign, a SUBTRACT only when they do
-// not, and both then ask whether the result's sign left the left operand's.
-// Spelling that as two functions meant maintaining the same six comparisons
-// twice.
-enum class SignedArith { Add, Subtract };
-
-mlir::Value signedOverflow(mlir::OpBuilder &builder, mlir::Location loc,
-                           mlir::Value lhs, mlir::Value rhs, mlir::Value result,
-                           mlir::IntegerType integerType,
-                           SignedArith arithmetic) {
-  mlir::Value zero = integerConstant(builder, loc, integerType, 0);
-  auto negative = [&](mlir::Value value) {
-    return mlir::arith::CmpIOp::create(builder, loc,
-                                       mlir::arith::CmpIPredicate::slt, value,
-                                       zero)
-        .getResult();
-  };
-  mlir::Value lhsNegative = negative(lhs);
-  mlir::Value rhsNegative = negative(rhs);
-  mlir::Value resultNegative = negative(result);
-  mlir::Value operandSigns = mlir::arith::CmpIOp::create(
-                                 builder, loc,
-                                 arithmetic == SignedArith::Add
-                                     ? mlir::arith::CmpIPredicate::eq
-                                     : mlir::arith::CmpIPredicate::ne,
-                                 lhsNegative, rhsNegative)
-                                 .getResult();
-  mlir::Value signChanged =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
-                                  resultNegative, lhsNegative)
-          .getResult();
-  return logicalAnd(builder, loc, operandSigns, signChanged);
-}
-
 std::optional<mlir::Value>
 createIntegerBinary(mlir::OpBuilder &builder, mlir::Location loc,
                     const parser::Node *op, mlir::Value lhs, mlir::Value rhs,
@@ -195,7 +139,7 @@ createIntegerBinary(mlir::OpBuilder &builder, mlir::Location loc,
     auto extended =
         mlir::arith::MulSIExtendedOp::create(builder, loc, lhs, rhs);
     mlir::Value shift =
-        integerConstant(builder, loc, integerType, integerType.getWidth() - 1);
+        constantInt(builder, loc, integerType, integerType.getWidth() - 1);
     mlir::Value expectedHigh =
         mlir::arith::ShRSIOp::create(builder, loc, extended.getLow(), shift)
             .getResult();

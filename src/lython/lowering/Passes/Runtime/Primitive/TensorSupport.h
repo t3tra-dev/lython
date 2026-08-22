@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ArithBuilders.h"
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
@@ -14,13 +16,13 @@ class OpBuilder;
 
 namespace py::lowering {
 
+using lython::common::constantIndex;
+
 inline constexpr std::uint64_t kPrimitiveTensorPackedMinSourceElements =
     256ull * 256ull;
 
 bool isPrimitiveElementType(mlir::Type type);
 
-mlir::Value createIndexConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                                std::int64_t value);
 bool isBlockArgumentDefinedInside(mlir::Value value, mlir::Operation *scope);
 
 std::optional<int64_t> primitiveElementBitWidth(mlir::Type type);

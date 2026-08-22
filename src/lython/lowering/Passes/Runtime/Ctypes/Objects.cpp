@@ -116,7 +116,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesValueAttrGet(
         builder, op.getLoc(), address, nativeIntegerType(builder, *layout),
         facts);
     scalar = widenNativeInteger(builder, op.getLoc(), loaded, *layout);
-    valid = constantI1(builder, op.getLoc(), true);
+    valid = constantBool(builder, op.getLoc(), true);
   }
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
@@ -163,7 +163,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(
     mlir::func::CallOp unboxCall = RuntimeBundleLowerer::createRuntimeCall(
         op.getLoc(), *unbox, value->physicalValues());
     evidence.scalarValue = unboxCall.getResult(0);
-    evidence.scalarValid = constantI1(builder, op.getLoc(), true);
+    evidence.scalarValid = constantBool(builder, op.getLoc(), true);
   }
 
   mlir::Value storageAddress = cdataStorageAddress(evidence);
@@ -190,7 +190,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(
     scalarEvidence.ctypeName = evidence.ctypeName;
     scalarEvidence.ctype = evidence.ctype;
     scalarEvidence.scalarValue = evidence.scalarValue;
-    scalarEvidence.scalarValid = constantI1(builder, op.getLoc(), true);
+    scalarEvidence.scalarValid = constantBool(builder, op.getLoc(), true);
     scalarSource.ctypes = std::move(scalarEvidence);
     if (mlir::failed(storeCtypesValueToAddress(
             op, builder, module, storageAddress, evidence.ctype,
@@ -222,7 +222,7 @@ RuntimeBundleLowerer::lowerStaticCtypesFieldDescriptorAttrGet(
     if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
             op, runtimeContractType(context, "builtins.int"),
             constantI64(builder, op.getLoc(), value),
-            constantI1(builder, op.getLoc(), true), result)))
+            constantBool(builder, op.getLoc(), true), result)))
       return mlir::failure();
     valueBundles[op.getResult()] = std::move(result);
     erase.push_back(op);
@@ -384,7 +384,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesFieldAttrSet(
     }
     if (raw) {
       normalized.primitiveI64 =
-          RuntimePrimitiveI64Evidence{raw, constantI1(builder, op.getLoc(),
+          RuntimePrimitiveI64Evidence{raw, constantBool(builder, op.getLoc(),
                                                       true)};
     }
   }
@@ -705,7 +705,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
   evidence.argTypes = callable.ctypes->argTypes;
   evidence.resultType = callable.ctypes->resultType;
   evidence.scalarValue = addressCall.getResult(0);
-  evidence.scalarValid = constantI1(builder, op.getLoc(), true);
+  evidence.scalarValid = constantBool(builder, op.getLoc(), true);
   result.ctypes = std::move(evidence);
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);

@@ -232,10 +232,10 @@ mlir::Value createRemaining(mlir::OpBuilder &builder, mlir::Location loc,
                             int64_t upper, mlir::Value offset) {
   mlir::Value remaining =
       mlir::arith::SubIOp::create(
-          builder, loc, createIndexConstant(builder, loc, upper), offset)
+          builder, loc, constantIndex(builder, loc, upper), offset)
           .getResult();
   return mlir::arith::MaxSIOp::create(builder, loc, remaining,
-                                      createIndexConstant(builder, loc, 0))
+                                      constantIndex(builder, loc, 0))
       .getResult();
 }
 
@@ -297,7 +297,7 @@ createFirstReductionTilePredicate(mlir::OpBuilder &builder, mlir::Location loc,
     return std::nullopt;
   return mlir::arith::CmpIOp::create(
              builder, loc, mlir::arith::CmpIPredicate::eq, *reductionOffset,
-             createIndexConstant(builder, loc, 0))
+             constantIndex(builder, loc, 0))
       .getResult();
 }
 
@@ -378,9 +378,9 @@ mlir::Value createPackedLhsPanel(mlir::OpBuilder &builder, mlir::Location loc,
   mlir::Value packedView =
       createDynamicRank2MemRefCast(builder, loc, packed, packedType);
 
-  mlir::Value zero = createIndexConstant(builder, loc, 0);
-  mlir::Value mUpper = createIndexConstant(builder, loc, refs.m);
-  mlir::Value kUpper = createIndexConstant(builder, loc, refs.k);
+  mlir::Value zero = constantIndex(builder, loc, 0);
+  mlir::Value mUpper = constantIndex(builder, loc, refs.m);
+  mlir::Value kUpper = constantIndex(builder, loc, refs.k);
 
   auto rowLoop = mlir::scf::ForOp::create(builder, loc, zero, mUpper, vl);
   {
@@ -478,7 +478,7 @@ mlir::Value createStridedIndex(mlir::OpBuilder &builder, mlir::Location loc,
                                mlir::MemRefType memrefType, mlir::Value row,
                                mlir::Value col) {
   std::optional<int64_t> rowStride = staticStride(memrefType, 0);
-  mlir::Value stride = createIndexConstant(builder, loc, *rowStride);
+  mlir::Value stride = constantIndex(builder, loc, *rowStride);
   return mlir::arith::AddIOp::create(
       builder, loc, mlir::arith::MulIOp::create(builder, loc, row, stride),
       col);
@@ -581,11 +581,11 @@ void createPanelBufferInto(mlir::OpBuilder &builder, mlir::Location loc,
                            mlir::Value width) {
   auto f32 = builder.getF32Type();
   auto vec4 = mlir::VectorType::get({4}, f32);
-  mlir::Value zero = createIndexConstant(builder, loc, 0);
-  mlir::Value one = createIndexConstant(builder, loc, 1);
-  mlir::Value four = createIndexConstant(builder, loc, 4);
-  mlir::Value kValue = createIndexConstant(builder, loc, k);
-  mlir::Value nValue = createIndexConstant(builder, loc, x);
+  mlir::Value zero = constantIndex(builder, loc, 0);
+  mlir::Value one = constantIndex(builder, loc, 1);
+  mlir::Value four = constantIndex(builder, loc, 4);
+  mlir::Value kValue = constantIndex(builder, loc, k);
+  mlir::Value nValue = constantIndex(builder, loc, x);
   mlir::Value rhs = source;
   mlir::Value packed = dest;
   mlir::Value panels =
@@ -625,7 +625,7 @@ void createPanelBufferInto(mlir::OpBuilder &builder, mlir::Location loc,
       builder.setInsertionPointToStart(ifOp.thenBlock());
       mlir::Value w32 = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::eq, width,
-          createIndexConstant(builder, loc, 32));
+          constantIndex(builder, loc, 32));
       auto wIf =
           mlir::scf::IfOp::create(builder, loc, w32, /*withElseRegion=*/true);
       {
@@ -645,7 +645,7 @@ void createPanelBufferInto(mlir::OpBuilder &builder, mlir::Location loc,
         mlir::Value ahead = mlir::arith::MinSIOp::create(
             builder, loc,
             mlir::arith::AddIOp::create(builder, loc, step,
-                                        createIndexConstant(builder, loc, 16)),
+                                        constantIndex(builder, loc, 16)),
             mlir::arith::SubIOp::create(builder, loc, kValue, one));
         mlir::memref::PrefetchOp::create(builder, loc, rhs,
                                          mlir::ValueRange{ahead, colBase},
@@ -655,13 +655,13 @@ void createPanelBufferInto(mlir::OpBuilder &builder, mlir::Location loc,
         llvm::SmallVector<mlir::Value, 8> vs;
         for (int64_t jj = 0; jj < 32; jj += 4) {
           mlir::Value col = mlir::arith::AddIOp::create(
-              builder, loc, colBase, createIndexConstant(builder, loc, jj));
+              builder, loc, colBase, constantIndex(builder, loc, jj));
           vs.push_back(mlir::vector::LoadOp::create(
               builder, loc, vec4, rhs, mlir::ValueRange{step, col}));
         }
         for (int64_t jj = 0; jj < 32; jj += 4) {
           mlir::Value dst = mlir::arith::AddIOp::create(
-              builder, loc, dstRow, createIndexConstant(builder, loc, jj));
+              builder, loc, dstRow, constantIndex(builder, loc, jj));
           mlir::vector::StoreOp::create(builder, loc, vs[jj / 4], packed,
                                         mlir::ValueRange{dst});
         }
@@ -735,8 +735,8 @@ mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
                             mlir::Value rhs, int64_t k, int64_t n,
                             mlir::Value width) {
   auto f32 = builder.getF32Type();
-  mlir::Value kValue = createIndexConstant(builder, loc, k);
-  mlir::Value nValue = createIndexConstant(builder, loc, n);
+  mlir::Value kValue = constantIndex(builder, loc, k);
+  mlir::Value nValue = constantIndex(builder, loc, n);
   mlir::Value panels =
       mlir::arith::CeilDivSIOp::create(builder, loc, nValue, width);
   mlir::Value total = mlir::arith::MulIOp::create(
@@ -746,7 +746,7 @@ mlir::Value createRhsPanels(mlir::OpBuilder &builder, mlir::Location loc,
   mlir::Value packed = mlir::memref::AllocOp::create(builder, loc, packedType,
                                                      mlir::ValueRange{total});
   createPanelBufferInto(builder, loc, packed,
-                        createIndexConstant(builder, loc, 0), rhs, k, n,
+                        constantIndex(builder, loc, 0), rhs, k, n,
                         width);
   return packed;
 }
@@ -774,10 +774,10 @@ mlir::Value createPanelPack(mlir::OpBuilder &builder, mlir::Location loc,
                             mlir::VectorType vectorType, int64_t k, int64_t x,
                             mlir::Value width, int64_t vectorsPerPanel) {
   mlir::Type elementType = sourceType.getElementType();
-  mlir::Value zero = createIndexConstant(builder, loc, 0);
-  mlir::Value one = createIndexConstant(builder, loc, 1);
-  mlir::Value kValue = createIndexConstant(builder, loc, k);
-  mlir::Value xValue = createIndexConstant(builder, loc, x);
+  mlir::Value zero = constantIndex(builder, loc, 0);
+  mlir::Value one = constantIndex(builder, loc, 1);
+  mlir::Value kValue = constantIndex(builder, loc, k);
+  mlir::Value xValue = constantIndex(builder, loc, x);
 
   // ceildiv(x, width) panels, each [K][width]; the last one runs past x and is
   // zero-filled, which is what lets the kernel read every panel unmasked.
@@ -806,13 +806,13 @@ mlir::Value createPanelPack(mlir::OpBuilder &builder, mlir::Location loc,
       // zero so the outer products it feeds contribute nothing.
       llvm::SmallVector<mlir::Value, 4> vectors;
       mlir::Value vl = mlir::arith::DivSIOp::create(
-          builder, loc, width, createIndexConstant(builder, loc,
+          builder, loc, width, constantIndex(builder, loc,
                                                    vectorsPerPanel));
       for (int64_t i = 0; i < vectorsPerPanel; ++i) {
         mlir::Value offset = mlir::arith::AddIOp::create(
             builder, loc, col,
             mlir::arith::MulIOp::create(builder, loc, vl,
-                                        createIndexConstant(builder, loc, i)));
+                                        constantIndex(builder, loc, i)));
         mlir::Value remaining =
             createRemaining(builder, loc, x, offset);
         mlir::Value mask = createMask(
@@ -863,10 +863,10 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
   if (!scalarZero)
     return mlir::failure();
 
-  mlir::Value zero = createIndexConstant(rewriter, loc, 0);
-  mlir::Value mUpper = createIndexConstant(rewriter, loc, refs->m);
-  mlir::Value nUpper = createIndexConstant(rewriter, loc, refs->n);
-  mlir::Value kUpper = createIndexConstant(rewriter, loc, refs->k);
+  mlir::Value zero = constantIndex(rewriter, loc, 0);
+  mlir::Value mUpper = constantIndex(rewriter, loc, refs->m);
+  mlir::Value nUpper = constantIndex(rewriter, loc, refs->n);
+  mlir::Value kUpper = constantIndex(rewriter, loc, refs->k);
   mlir::Value vl = mlir::arm_sme::StreamingVLOp::create(
                        rewriter, loc, rewriter.getIndexType(),
                        refs->layout.streamingVLUnit)
@@ -874,11 +874,11 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
   SMETileGrid grid = kSMETileGrid;
   mlir::Value rowBlock =
       mlir::arith::MulIOp::create(
-          rewriter, loc, vl, createIndexConstant(rewriter, loc, grid.rows))
+          rewriter, loc, vl, constantIndex(rewriter, loc, grid.rows))
           .getResult();
   mlir::Value colBlock =
       mlir::arith::MulIOp::create(
-          rewriter, loc, vl, createIndexConstant(rewriter, loc, grid.cols))
+          rewriter, loc, vl, constantIndex(rewriter, loc, grid.cols))
           .getResult();
   // Panel-pack both operands when the multi-vector loads are reachable: it is
   // what makes the reduction step read contiguously (see createPanelPack).
@@ -935,15 +935,15 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
     std::optional<mlir::Value> outRow = createSubviewOffsetForDimension(
         rewriter, loc, refs->out, /*dimension=*/0);
     mlir::Value rowOffset =
-        outRow ? *outRow : createIndexConstant(rewriter, loc, 0);
+        outRow ? *outRow : constantIndex(rewriter, loc, 0);
     mlir::Value chunk = mlir::arith::DivSIOp::create(
-        rewriter, loc, rowOffset, createIndexConstant(rewriter, loc, refs->m));
+        rewriter, loc, rowOffset, constantIndex(rewriter, loc, refs->m));
     mlir::Value panelsPerChunk = mlir::arith::CeilDivSIOp::create(
-        rewriter, loc, createIndexConstant(rewriter, loc, refs->m), rowBlock);
+        rewriter, loc, constantIndex(rewriter, loc, refs->m), rowBlock);
     mlir::Value chunkStride = mlir::arith::MulIOp::create(
         rewriter, loc,
         mlir::arith::MulIOp::create(rewriter, loc, panelsPerChunk,
-                                    createIndexConstant(rewriter, loc,
+                                    constantIndex(rewriter, loc,
                                                         refs->k)),
         rowBlock);
     lhsPanelBase =
@@ -965,7 +965,7 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
                             rewriter, loc, base,
                             mlir::arith::MulIOp::create(
                                 rewriter, loc, vl,
-                                createIndexConstant(rewriter, loc, index))
+                                constantIndex(rewriter, loc, index))
                                 .getResult())
                             .getResult());
     return offsets;
@@ -989,7 +989,7 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
   if (packOperands) {
     int64_t nc = (4 << 20) / (refs->k * 4);
     nc = std::max<int64_t>(nc - nc % 32, 32);
-    colGroup = createIndexConstant(rewriter, loc, nc);
+    colGroup = constantIndex(rewriter, loc, nc);
     colGroup = mlir::arith::MaxSIOp::create(rewriter, loc, colGroup, colBlock);
   }
   auto groupLoop =
@@ -1145,7 +1145,7 @@ mlir::LogicalResult lowerStaticMatmulToSME(mlir::linalg::MatmulOp matmul,
       // 1594 / 1596 GFLOP/s and 2048^3 runs 1474 / 1474 / 1452 / 1456 at an
       // unroll of 1 / 2 / 4 / 8. Unrolling also constrained K, since a factor
       // that did not divide it needed a residue loop.
-      mlir::Value one = createIndexConstant(rewriter, loc, 1);
+      mlir::Value one = constantIndex(rewriter, loc, 1);
       auto buildKLoop = [&](mlir::OpBuilder &b, bool multiVector) {
         return mlir::scf::ForOp::create(
             b, loc, zero, kUpper, one, initialAccs,
@@ -1489,7 +1489,7 @@ public:
       mlir::Value lanes = createStreamingLaneCount(builder, loc);
       mlir::Value width = mlir::arith::MulIOp::create(
           builder, loc, lanes,
-          createIndexConstant(builder, loc, kSMETileGrid.cols));
+          constantIndex(builder, loc, kSMETileGrid.cols));
       mlir::Value packed = createRhsPanels(builder, loc, refs->rhs, refs->k,
                                            refs->n, width);
       auto lieType = mlir::MemRefType::get({refs->k, refs->n},
@@ -1552,10 +1552,10 @@ private:
     mlir::Value lanes = createStreamingLaneCount(builder, loc);
     mlir::Value panelWidth = mlir::arith::MulIOp::create(
         builder, loc, lanes,
-        createIndexConstant(builder, loc, kSMETileGrid.cols));
-    mlir::Value rowsValue = createIndexConstant(builder, loc, rows);
-    mlir::Value kValue = createIndexConstant(builder, loc, refs.k);
-    mlir::Value chunksValue = createIndexConstant(builder, loc, chunks);
+        constantIndex(builder, loc, kSMETileGrid.cols));
+    mlir::Value rowsValue = constantIndex(builder, loc, rows);
+    mlir::Value kValue = constantIndex(builder, loc, refs.k);
+    mlir::Value chunksValue = constantIndex(builder, loc, chunks);
     mlir::Value panelsPerChunk = mlir::arith::CeilDivSIOp::create(
         builder, loc, rowsValue, panelWidth);
     mlir::Value chunkStride = mlir::arith::MulIOp::create(
@@ -1569,8 +1569,8 @@ private:
     mlir::Value panels = mlir::memref::AllocOp::create(
         builder, loc, packedType, mlir::ValueRange{total});
 
-    mlir::Value zero = createIndexConstant(builder, loc, 0);
-    mlir::Value one = createIndexConstant(builder, loc, 1);
+    mlir::Value zero = constantIndex(builder, loc, 0);
+    mlir::Value one = constantIndex(builder, loc, 1);
     auto chunkLoop =
         mlir::scf::ForOp::create(builder, loc, zero, chunksValue, one);
     {

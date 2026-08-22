@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "ArithBuilders.h"
+
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -7,6 +9,13 @@
 namespace py::lowering {
 
 namespace {
+
+using lython::common::constantBool;
+using lython::common::constantI64;
+using lython::common::logicalAnd;
+using lython::common::logicalNot;
+using lython::common::SignedArith;
+using lython::common::signedOverflow;
 
 enum class PrimitiveI64ArithmeticKind { Add, Sub, Mul };
 
@@ -33,64 +42,6 @@ primitiveI64ComparePredicate(llvm::StringRef methodName) {
       .Default(std::nullopt);
 }
 
-mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                         bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
-}
-
-mlir::Value i64Constant(mlir::OpBuilder &builder, mlir::Location loc,
-                        std::int64_t value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-      .getResult();
-}
-
-mlir::Value logicalAnd(mlir::OpBuilder &builder, mlir::Location loc,
-                       mlir::Value lhs, mlir::Value rhs) {
-  return mlir::arith::AndIOp::create(builder, loc, lhs, rhs).getResult();
-}
-
-mlir::Value logicalNot(mlir::OpBuilder &builder, mlir::Location loc,
-                       mlir::Value value) {
-  return mlir::arith::XOrIOp::create(builder, loc, value,
-                                     boolConstant(builder, loc, true))
-      .getResult();
-}
-
-// Did a signed add or subtract wrap? The two differ in one predicate: an ADD
-// overflows only when the operands share a sign, a SUBTRACT only when they do
-// not, and both then ask whether the result's sign left the left operand's.
-// Spelling that as two functions meant maintaining the same six comparisons
-// twice.
-enum class SignedArith { Add, Subtract };
-
-mlir::Value signedOverflow(mlir::OpBuilder &builder, mlir::Location loc,
-                           mlir::Value lhs, mlir::Value rhs, mlir::Value result,
-                           SignedArith arithmetic) {
-  mlir::Value zero = i64Constant(builder, loc, 0);
-  auto negative = [&](mlir::Value value) {
-    return mlir::arith::CmpIOp::create(builder, loc,
-                                       mlir::arith::CmpIPredicate::slt, value,
-                                       zero)
-        .getResult();
-  };
-  mlir::Value lhsNegative = negative(lhs);
-  mlir::Value rhsNegative = negative(rhs);
-  mlir::Value resultNegative = negative(result);
-  mlir::Value operandSigns = mlir::arith::CmpIOp::create(
-                                 builder, loc,
-                                 arithmetic == SignedArith::Add
-                                     ? mlir::arith::CmpIPredicate::eq
-                                     : mlir::arith::CmpIPredicate::ne,
-                                 lhsNegative, rhsNegative)
-                                 .getResult();
-  mlir::Value signChanged =
-      mlir::arith::CmpIOp::create(builder, loc, mlir::arith::CmpIPredicate::ne,
-                                  resultNegative, lhsNegative)
-          .getResult();
-  return logicalAnd(builder, loc, operandSigns, signChanged);
-}
-
 std::pair<mlir::Value, mlir::Value>
 buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
                             PrimitiveI64ArithmeticKind kind, mlir::Value lhs,
@@ -99,17 +50,19 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
   case PrimitiveI64ArithmeticKind::Add: {
     mlir::Value result =
         mlir::arith::AddIOp::create(builder, loc, lhs, rhs).getResult();
-    return {result, signedOverflow(builder, loc, lhs, rhs, result, SignedArith::Add)};
+    return {result, signedOverflow(builder, loc, lhs, rhs, result,
+                           builder.getI64Type(), SignedArith::Add)};
   }
   case PrimitiveI64ArithmeticKind::Sub: {
     mlir::Value result =
         mlir::arith::SubIOp::create(builder, loc, lhs, rhs).getResult();
-    return {result, signedOverflow(builder, loc, lhs, rhs, result, SignedArith::Subtract)};
+    return {result, signedOverflow(builder, loc, lhs, rhs, result,
+                           builder.getI64Type(), SignedArith::Subtract)};
   }
   case PrimitiveI64ArithmeticKind::Mul: {
     auto extended =
         mlir::arith::MulSIExtendedOp::create(builder, loc, lhs, rhs);
-    mlir::Value shift = i64Constant(builder, loc, 63);
+    mlir::Value shift = constantI64(builder, loc, 63);
     mlir::Value expectedHigh =
         mlir::arith::ShRSIOp::create(builder, loc, extended.getLow(), shift)
             .getResult();

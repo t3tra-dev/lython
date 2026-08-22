@@ -12,6 +12,7 @@
 // enforced by explicit earliest-boundary rejections and the inter-phase
 // verifiers instead of a ConversionTarget.
 
+#include "ArithBuilders.h"
 #include "Ownership.h"
 #include "Runtime/Manifest/Index.h"
 #include "Runtime/Model/Bundles.h"
@@ -53,6 +54,13 @@
 #include <string>
 
 namespace py::lowering {
+
+using lython::common::constantBool;
+using lython::common::constantI64;
+using lython::common::constantIndex;
+using lython::common::constantInt;
+using lython::common::logicalAnd;
+using lython::common::logicalNot;
 
 class RuntimeBundleLowerer {
 public:
@@ -1744,12 +1752,6 @@ inline mlir::func::FuncOp
 getOrCreateSetCurrentSuppress(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   return getOrCreatePrivateFunction(module, builder, "LyEH_SetCurrentSuppress",
                                     builder.getFunctionType({}, {}));
-}
-
-inline mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
-                              bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
 }
 
 inline bool sameRuntimeValueIdentity(const RuntimeValue &lhs,

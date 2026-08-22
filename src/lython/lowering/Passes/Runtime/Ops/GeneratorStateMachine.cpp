@@ -2063,14 +2063,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   unsigned sentValueIndex =
       1 + RuntimeBundleLowerer::generatorArgumentPhysicalCount(info);
   builder.setInsertionPointToStart(entry);
-  auto slotIndex = [&](std::int64_t slot) {
-    return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
-        .getResult();
-  };
-  auto i64Const = [&](std::int64_t value) {
-    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-        .getResult();
-  };
+  auto slotIndex = [&](std::int64_t slot) { return constantIndex(builder, loc, slot); };
+  auto i64Const = [&](std::int64_t value) { return constantI64(builder, loc, value); };
 
   // EH token swap areas (single-token TLS): the generator storage words
   // [48, 64) stash the suspended body's in-flight handler token; the local
@@ -2565,10 +2559,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   mlir::Block *entry = function.addEntryBlock();
   mlir::Region &body = function.getBody();
   builder.setInsertionPointToStart(entry);
-  auto i64Const = [&](std::int64_t value) {
-    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-        .getResult();
-  };
+  auto i64Const = [&](std::int64_t value) { return constantI64(builder, loc, value); };
   // throw() may run inside the caller's exception handler: park the pending
   // token so the staging below finds the single TLS slot free.
   // The stash cell holds a chain node POINTER, so its address arrives as a
@@ -2635,10 +2626,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCatchMarker(),
                              mlir::ValueRange{i64Const(handlerId)});
   mlir::Value generator = entry->getArgument(0);
-  auto slotIndex = [&](std::int64_t slot) {
-    return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
-        .getResult();
-  };
+  auto slotIndex = [&](std::int64_t slot) { return constantIndex(builder, loc, slot); };
   mlir::Value lifecycle =
       mlir::memref::LoadOp::create(builder, loc, generator, slotIndex(2))
           .getResult();
@@ -2672,7 +2660,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
   RuntimeBundleLowerer::appendGeneratorArgumentEntryOperands(entry, info,
                                                              advanceOperands);
   advanceOperands.push_back(i64Const(0));
-  advanceOperands.push_back(constantI1(builder, loc, false));
+  advanceOperands.push_back(constantBool(builder, loc, false));
   advanceOperands.push_back(i64Const(1)); // inject
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
                              mlir::ValueRange{i64Const(resumeHandlerId)});
@@ -2766,14 +2754,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
   mlir::Region &body = function.getBody();
   mlir::Value generator = entry->getArgument(0);
   builder.setInsertionPointToStart(entry);
-  auto i64Const = [&](std::int64_t value) {
-    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-        .getResult();
-  };
-  auto slotIndex = [&](std::int64_t slot) {
-    return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
-        .getResult();
-  };
+  auto i64Const = [&](std::int64_t value) { return constantI64(builder, loc, value); };
+  auto slotIndex = [&](std::int64_t slot) { return constantIndex(builder, loc, slot); };
   // close() may run while the caller holds the pending TLS token (close
   // inside an except block, or the drop finalizer during unwinding); the
   // GeneratorExit staging below needs the single slot free, so the caller
@@ -2881,7 +2863,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
   RuntimeBundleLowerer::appendGeneratorArgumentEntryOperands(entry, info,
                                                              stepOperands);
   stepOperands.push_back(i64Const(0));
-  stepOperands.push_back(constantI1(builder, loc, false));
+  stepOperands.push_back(constantBool(builder, loc, false));
   stepOperands.push_back(i64Const(1)); // inject
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
                              mlir::ValueRange{i64Const(resumeId)});
@@ -3016,14 +2998,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
   mlir::Region &body = function.getBody();
   mlir::Value storage = entry->getArgument(0);
   builder.setInsertionPointToStart(entry);
-  auto i64Const = [&](std::int64_t value) {
-    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-        .getResult();
-  };
-  auto slotIndex = [&](std::int64_t slot) {
-    return mlir::arith::ConstantIndexOp::create(builder, loc, slot)
-        .getResult();
-  };
+  auto i64Const = [&](std::int64_t value) { return constantI64(builder, loc, value); };
+  auto slotIndex = [&](std::int64_t slot) { return constantIndex(builder, loc, slot); };
 
   mlir::Block *closeBlock = builder.createBlock(&body);
   mlir::Block *caughtBlock = builder.createBlock(&body);
@@ -3300,7 +3276,7 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
   } else {
     operands.push_back(
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult());
-    operands.push_back(constantI1(builder, loc, false));
+    operands.push_back(constantBool(builder, loc, false));
   }
   operands.push_back(
       mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult());
@@ -3311,7 +3287,7 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
   unsigned spanWidth = static_cast<unsigned>(
       RuntimeBundleLowerer::generatorLanePhysicalTypes(info.valueLane).size());
   SourceGeneratorResumeResult result;
-  result.hasValue = raiseWhenExhausted ? constantI1(builder, loc, true)
+  result.hasValue = raiseWhenExhausted ? constantBool(builder, loc, true)
                                        : call.getResult(0);
   for (unsigned lane = 0; lane < spanWidth; ++lane)
     result.lanePhysicals.push_back(call.getResult(spanBegin + lane));
@@ -3323,7 +3299,7 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
   } else {
     result.value =
         mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
-    result.valid = constantI1(builder, loc, false);
+    result.valid = constantBool(builder, loc, false);
   }
   return result;
 }

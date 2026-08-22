@@ -890,7 +890,7 @@ ModuleEmitter::tryEmitLazyIteratorValueCall(const parser::Node &expr,
     } else {
       body.push_back(synth::assign(indexRef, synth::intConstant(0, bodyRange),
                                 bodyRange));
-      body.push_back(synth::whileStmt(synth::boolConstant(true, bodyRange), std::move(loopBody),
+      body.push_back(synth::whileStmt(synth::constantBool(true, bodyRange), std::move(loopBody),
                                {}, bodyRange));
     }
 
@@ -1860,10 +1860,10 @@ ModuleEmitter::tryEmitDictViewMembership(const parser::Node &expr) {
     emitStatement(*synth::assign(synth::name(probeName, range), left, range));
     if (needsTemp)
       emitStatement(*synth::assign(synth::name(dictName, range), receiver, range));
-    parser::NodePtr falseInit = synth::boolConstant(false, range);
+    parser::NodePtr falseInit = synth::constantBool(false, range);
     emitStatement(*synth::assign(synth::name(resultName, range),
                               std::move(falseInit), range));
-    parser::NodePtr trueValue = synth::boolConstant(true, range);
+    parser::NodePtr trueValue = synth::constantBool(true, range);
     if (*viewName == "values") {
       // for __k in d: if d[__k] == __x: __r = True; break
       NodePtr hit = synth::ifStmt(
@@ -2411,7 +2411,7 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
         synth::assign(parts->target, counter, range),
         synth::assign(counter, synth::binOp(counter, "Add", stepRef, range), range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
-    NodePtr loop = synth::whileStmt(synth::boolConstant(true, range), std::move(body),
+    NodePtr loop = synth::whileStmt(synth::constantBool(true, range), std::move(body),
                              parts->orelse, range);
     return emitFused([&] { emitWhile(*loop); });
   }
@@ -2431,7 +2431,7 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     if (!times) {
       std::vector<NodePtr> body{synth::assign(parts->target, objectRef, range)};
       body.insert(body.end(), parts->body.begin(), parts->body.end());
-      NodePtr loop = synth::whileStmt(synth::boolConstant(true, range), std::move(body),
+      NodePtr loop = synth::whileStmt(synth::constantBool(true, range), std::move(body),
                                parts->orelse, range);
       return emitFused([&] { emitWhile(*loop); });
     }
@@ -2616,13 +2616,13 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
       std::string flagName = scratch("d");
       scratchNames.push_back(flagName);
       NodePtr flag = synth::name(flagName, range);
-      setup.push_back(synth::assign(flag, synth::boolConstant(true, range), range));
+      setup.push_back(synth::assign(flag, synth::constantBool(true, range), range));
       std::vector<NodePtr> dropping;
       NodePtr test;
       if (!buildLazyCall(statement, callable, {element}, dropping, test))
         return true;
       dropping.push_back(synth::ifStmt(test, {synth::continueStmt(range)}, {}, range));
-      dropping.push_back(synth::assign(flag, synth::boolConstant(false, range), range));
+      dropping.push_back(synth::assign(flag, synth::constantBool(false, range), range));
       body.push_back(synth::ifStmt(flag, std::move(dropping), {}, range));
       body.push_back(synth::assign(parts->target, element, range));
       body.insert(body.end(), parts->body.begin(), parts->body.end());
@@ -2665,7 +2665,7 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     NodePtr element = synth::name(elementName, range);
     NodePtr acc = synth::name(accName, range);
     NodePtr flag = synth::name(flagName, range);
-    setup.push_back(synth::assign(flag, synth::boolConstant(false, range), range));
+    setup.push_back(synth::assign(flag, synth::constantBool(false, range), range));
     // The accumulator is loop-carried, so it needs a pre-loop definition (a
     // branch-local first assignment is invisible to the sibling branch).
     // The int seed restricts fused accumulate to int elements; other element
@@ -2681,7 +2681,7 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     accumulateStep.push_back(synth::assign(acc, applied, range));
     std::vector<NodePtr> firstStep{
         synth::assign(acc, element, range),
-        synth::assign(flag, synth::boolConstant(true, range), range)};
+        synth::assign(flag, synth::constantBool(true, range), range)};
     std::vector<NodePtr> body{
         synth::ifStmt(flag, std::move(accumulateStep), std::move(firstStep),
                    range),
@@ -2744,13 +2744,13 @@ bool ModuleEmitter::tryEmitItertoolsFor(const parser::Node &statement,
     NodePtr element = synth::name(elementName, range);
     NodePtr prev = synth::name(prevName, range);
     NodePtr flag = synth::name(flagName, range);
-    setup.push_back(synth::assign(flag, synth::boolConstant(true, range), range));
+    setup.push_back(synth::assign(flag, synth::constantBool(true, range), range));
     // Loop-carried previous element; same int-seed restriction as the
     // fused accumulate (see the comment there).
     setup.push_back(synth::assign(prev, synth::intConstant(0, range), range));
     std::vector<NodePtr> firstStep{
         synth::assign(prev, element, range),
-        synth::assign(flag, synth::boolConstant(false, range), range),
+        synth::assign(flag, synth::constantBool(false, range), range),
         synth::continueStmt(range)};
     std::vector<NodePtr> body{synth::ifStmt(flag, std::move(firstStep), {}, range),
                               synth::assign((*elts)[0], prev, range),
@@ -2947,7 +2947,7 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     std::vector<NodePtr> loop{
         synth::yieldStmt(cursor, range),
         synth::assign(cursor, synth::binOp(cursor, "Add", stride, range), range)};
-    body.push_back(synth::whileStmt(synth::boolConstant(true, range), std::move(loop), {},
+    body.push_back(synth::whileStmt(synth::constantBool(true, range), std::move(loop), {},
                              range));
   }
 
@@ -2963,7 +2963,7 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
     NodePtr objectRef = addParam("o", object);
     if (!timesNode) {
       memoKey += "|inf";
-      body.push_back(synth::whileStmt(synth::boolConstant(true, range),
+      body.push_back(synth::whileStmt(synth::constantBool(true, range),
                                {synth::yieldStmt(objectRef, range)}, {}, range));
     } else {
       memoKey += "|times";
@@ -3089,7 +3089,7 @@ ModuleEmitter::tryEmitItertoolsValueCall(const parser::Node &expr,
           increment(index, stepValue)};
       NodePtr condition = stopRef
                               ? synth::compare(index, "Lt", stopRef, range)
-                              : synth::boolConstant(true, range);
+                              : synth::constantBool(true, range);
       body.push_back(synth::whileStmt(std::move(condition), std::move(loop), {},
                                range));
     } else if (name == "dropwhile") {

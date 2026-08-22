@@ -225,7 +225,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
         raw = mlir::arith::ExtSIOp::create(builder, op.getLoc(), i64, raw)
                   .getResult();
     }
-    mlir::Value valid = constantI1(builder, op.getLoc(), true);
+    mlir::Value valid = constantBool(builder, op.getLoc(), true);
     RuntimeBundle result;
     if (mlir::failed(makePrimitiveI64Bundle(
             op, runtimeContractType(context, "builtins.int"), raw, valid,
@@ -242,7 +242,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
   } else if (isPointerScalarLayout(*resultLayout)) {
     mlir::Value raw =
         nativePointerToInteger(builder, op.getLoc(), resultAt(0));
-    mlir::Value valid = constantI1(builder, op.getLoc(), true);
+    mlir::Value valid = constantBool(builder, op.getLoc(), true);
     RuntimeBundle result;
     if (mlir::failed(makePrimitiveI64Bundle(
             op, runtimeContractType(context, "builtins.int"), raw, valid,

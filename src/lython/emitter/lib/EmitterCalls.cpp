@@ -3,6 +3,7 @@
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
+#include "ArithBuilders.h"
 #include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
 #include "PyProtocols.h"
@@ -27,6 +28,8 @@
 namespace lython::emitter {
 namespace {
 
+using common::constantBool;
+
 // CPython's numeric tower as a total order on the four rungs that are
 // implicitly acceptable where a higher one is declared (PEP 484 §"The numeric
 // tower"). -1 is "not on the tower", which never compares.
@@ -46,12 +49,6 @@ int numericTowerRung(const TypeSystem &types, mlir::Type type) {
   return -1;
 }
 
-
-mlir::Value constantI1(mlir::OpBuilder &builder, mlir::Location loc,
-                       bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
-}
 
 Value boxedBool(mlir::OpBuilder &builder, mlir::Location loc, TypeSystem &types,
                 mlir::Value bit) {
@@ -2295,9 +2292,9 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
 
   mlir::Value bit;
   if (analysis.kind == IsInstanceAnalysis::Kind::AlwaysTrue) {
-    bit = constantI1(builder, loc(expr), true);
+    bit = constantBool(builder, loc(expr), true);
   } else if (analysis.kind == IsInstanceAnalysis::Kind::AlwaysFalse) {
-    bit = constantI1(builder, loc(expr), false);
+    bit = constantBool(builder, loc(expr), false);
   } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionTest) {
     if (!mlir::isa<py::UnionType>(input.value.getType())) {
       diagnostics.push_back(parser::Diagnostic{
@@ -2316,7 +2313,7 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
                 : test.getResult();
     }
     if (!bit)
-      bit = constantI1(builder, loc(expr), false);
+      bit = constantBool(builder, loc(expr), false);
   } else if (analysis.kind == IsInstanceAnalysis::Kind::UnionClassTest) {
     if (!mlir::isa<py::UnionType>(input.value.getType()) ||
         analysis.unionMembers.size() != 1) {
@@ -2723,10 +2720,10 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     body.push_back(synth::assign(
         name("text"), synth::methodCall(name("s"), "strip", {}, range), range));
     body.push_back(
-        synth::assign(name("negative"), synth::boolConstant(false, range), range));
+        synth::assign(name("negative"), synth::constantBool(false, range), range));
     body.push_back(synth::ifStmt(
         synth::methodCall(name("text"), "startswith", {str("-")}, range),
-        {synth::assign(name("negative"), synth::boolConstant(true, range), range),
+        {synth::assign(name("negative"), synth::constantBool(true, range), range),
          synth::assign(name("text"), slice("text", 1), range)},
         {synth::ifStmt(
             synth::methodCall(name("text"), "startswith", {str("+")}, range),
@@ -2738,7 +2735,7 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     // had just seen one -- except right after a prefix, where CPython allows
     // `int("0x_1f", 16)`.
     body.push_back(
-        synth::assign(name("pending"), synth::boolConstant(true, range), range));
+        synth::assign(name("pending"), synth::constantBool(true, range), range));
     // ⭐ base=0 IS THE SAME PARSE WITH THE RADIX READ OFF THE PREFIX, which is
     // why it is a variable rather than a second function: everything below
     // consumes `radix`, and only the ERROR MESSAGES keep `base`, because
@@ -2771,7 +2768,7 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
                                            {str(prefix)}, range)},
                         range),
           {synth::assign(name("body"), slice("body", 2), range),
-           synth::assign(name("pending"), synth::boolConstant(false, range),
+           synth::assign(name("pending"), synth::constantBool(false, range),
                          range)},
           {}, range));
     // ⛔ AND A BARE LEADING ZERO IS AN ERROR UNDER base=0, which is the half
@@ -2808,7 +2805,7 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     loop.push_back(synth::ifStmt(
         synth::compare(name("ch"), "Eq", str("_"), range),
         {synth::ifStmt(name("pending"), {invalidLiteral()}, {}, range),
-         synth::assign(name("pending"), synth::boolConstant(true, range), range),
+         synth::assign(name("pending"), synth::constantBool(true, range), range),
          synth::continueStmt(range)},
         {}, range));
     loop.push_back(synth::assign(
@@ -2828,7 +2825,7 @@ ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
     loop.push_back(synth::assign(
         name("seen"), synth::binOp(name("seen"), "Add", num(1), range), range));
     loop.push_back(
-        synth::assign(name("pending"), synth::boolConstant(false, range), range));
+        synth::assign(name("pending"), synth::constantBool(false, range), range));
     body.push_back(
         synth::forStmt(name("ch"), name("body"), std::move(loop), {}, range));
     // A trailing underscore and an empty digit run are the same refusal.

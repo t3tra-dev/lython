@@ -750,14 +750,14 @@ bool lowerInnerContiguousPackedPanelCopy(mlir::linalg::CopyOp copy,
 
   mlir::Location loc = copy.getLoc();
   rewriter.setInsertionPoint(copy);
-  mlir::Value rowBegin = createIndexConstant(rewriter, loc, 0);
+  mlir::Value rowBegin = constantIndex(rewriter, loc, 0);
   mlir::Value rowEnd =
-      createIndexConstant(rewriter, loc, targetType.getDimSize(0));
-  mlir::Value rowStep = createIndexConstant(rewriter, loc, 1);
+      constantIndex(rewriter, loc, targetType.getDimSize(0));
+  mlir::Value rowStep = constantIndex(rewriter, loc, 1);
   mlir::Value colBegin = rowBegin;
   mlir::Value colEnd =
-      createIndexConstant(rewriter, loc, targetType.getDimSize(1));
-  mlir::Value colStep = createIndexConstant(rewriter, loc, *lanes);
+      constantIndex(rewriter, loc, targetType.getDimSize(1));
+  mlir::Value colStep = constantIndex(rewriter, loc, *lanes);
 
   auto rowLoop =
       mlir::scf::ForOp::create(rewriter, loc, rowBegin, rowEnd, rowStep);

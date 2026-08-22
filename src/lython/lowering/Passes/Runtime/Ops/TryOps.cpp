@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include "ArithBuilders.h"
 
 #include "Runtime/Model/Contracts.h"
 
@@ -8,6 +9,8 @@
 
 namespace py::lowering {
 namespace {
+
+using lython::common::constantBool;
 
 // Region walks below must not touch yields/rethrows that belong to a py.try
 // NESTED inside `region`: tries lower outermost-first (handler ids must exist
@@ -52,17 +55,11 @@ void replaceExceptYields(mlir::OpBuilder &builder, mlir::Region &region,
   }
 }
 
-mlir::Value boolConstant(mlir::OpBuilder &builder, mlir::Location loc,
-                         bool value) {
-  return mlir::arith::ConstantIntOp::create(builder, loc, value ? 1 : 0, 1)
-      .getResult();
-}
-
 mlir::FailureOr<mlir::Value> pythonDefault(mlir::OpBuilder &builder,
                                            mlir::Operation *anchor,
                                            mlir::Type type) {
   if (type.isInteger(1))
-    return boolConstant(builder, anchor->getLoc(), false);
+    return constantBool(builder, anchor->getLoc(), false);
   if (auto literal = mlir::dyn_cast<py::LiteralType>(type)) {
     llvm::StringRef spelling = literal.getSpelling();
     if (spelling == "None")
@@ -132,7 +129,7 @@ mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
 exceptionalFinallyOperands(mlir::OpBuilder &builder, py::TryOp op) {
   llvm::SmallVector<mlir::Value, 4> operands;
   operands.reserve(op.getNumResults() + 1);
-  operands.push_back(boolConstant(builder, op.getLoc(), true));
+  operands.push_back(constantBool(builder, op.getLoc(), true));
   for (mlir::Value result : op.getResults()) {
     mlir::FailureOr<mlir::Value> value =
         pythonDefault(builder, op.getOperation(), result.getType());
@@ -153,7 +150,7 @@ void replaceYieldsWithFinallyEntry(mlir::OpBuilder &builder,
   for (YieldOp yield : yields) {
     builder.setInsertionPoint(yield);
     llvm::SmallVector<mlir::Value, 4> operands;
-    mlir::Value mode = boolConstant(builder, yield.getLoc(), exceptional);
+    mlir::Value mode = constantBool(builder, yield.getLoc(), exceptional);
     operands.push_back(mode);
     operands.append(yield.getOperands().begin(), yield.getOperands().end());
     mlir::cf::BranchOp::create(builder, yield.getLoc(), finallyEntry, operands);
@@ -171,7 +168,7 @@ void replaceExceptYieldsWithFinallyEntry(
     mlir::func::CallOp::create(builder, yield.getLoc(), discardCurrentException,
                                mlir::ValueRange{});
     llvm::SmallVector<mlir::Value, 4> operands;
-    mlir::Value mode = boolConstant(builder, yield.getLoc(), false);
+    mlir::Value mode = constantBool(builder, yield.getLoc(), false);
     operands.push_back(mode);
     operands.append(yield.getOperands().begin(), yield.getOperands().end());
     mlir::cf::BranchOp::create(builder, yield.getLoc(), finallyEntry, operands);
@@ -210,7 +207,7 @@ void replaceFinallyYields(mlir::OpBuilder &builder, mlir::Region &region,
       operands.push_back(mode);
       operands.append(carriedValues.begin(), carriedValues.end());
     } else {
-      operands.push_back(boolConstant(builder, yield.getLoc(), false));
+      operands.push_back(constantBool(builder, yield.getLoc(), false));
       operands.append(yield.getOperands().begin(), yield.getOperands().end());
     }
     mlir::cf::BranchOp::create(builder, yield.getLoc(), dispatch, operands);

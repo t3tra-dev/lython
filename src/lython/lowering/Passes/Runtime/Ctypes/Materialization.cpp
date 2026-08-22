@@ -31,7 +31,7 @@ materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
     builder.setInsertionPoint(op);
     mlir::Value storageAddress = addressOfZeroedNativeBytesAlloca(
         builder, op->getLoc(), array->layout.size, facts);
-    mlir::Value valid = constantI1(builder, op->getLoc(), true);
+    mlir::Value valid = constantBool(builder, op->getLoc(), true);
     evidence.addressValue = storageAddress;
     evidence.addressValid = valid;
     evidence.storageAddressValue = storageAddress;
@@ -73,7 +73,7 @@ materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
     builder.setInsertionPoint(op);
     mlir::Value storageAddress = addressOfZeroedNativeBytesAlloca(
         builder, op->getLoc(), aggregateLayout->layout.size, facts);
-    mlir::Value valid = constantI1(builder, op->getLoc(), true);
+    mlir::Value valid = constantBool(builder, op->getLoc(), true);
     evidence.addressValue = storageAddress;
     evidence.addressValid = valid;
     evidence.storageAddressValue = storageAddress;
@@ -111,7 +111,7 @@ materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
   builder.setInsertionPoint(op);
   if (sources.empty()) {
     evidence.scalarValue = constantI64(builder, op->getLoc(), 0);
-    evidence.scalarValid = constantI1(builder, op->getLoc(), true);
+    evidence.scalarValid = constantBool(builder, op->getLoc(), true);
   } else {
     const RuntimeBundle *source = sources.front();
     if (!source)
@@ -122,7 +122,7 @@ materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
     } else if (isCtypesVoidPointer(evidence.ctypeName) &&
                isNoneBundle(*source)) {
       evidence.scalarValue = constantI64(builder, op->getLoc(), 0);
-      evidence.scalarValid = constantI1(builder, op->getLoc(), true);
+      evidence.scalarValid = constantBool(builder, op->getLoc(), true);
     } else if (source->ctypes && source->ctypes->scalarValue &&
                source->ctypes->scalarValid) {
       evidence.scalarValue = source->ctypes->scalarValue;
@@ -146,7 +146,7 @@ materializeCtypesCell(mlir::Operation *op, mlir::OpBuilder &builder,
         builder, op->getLoc(), evidence.scalarValue, nativeType);
     evidence.addressValue =
         addressOfNativeCellAlloca(builder, op->getLoc(), nativeValue, facts);
-    evidence.addressValid = constantI1(builder, op->getLoc(), true);
+    evidence.addressValid = constantBool(builder, op->getLoc(), true);
     evidence.storageAddressValue = evidence.addressValue;
     evidence.storageAddressValid = evidence.addressValid;
     attachCtypesBufferEvidence(builder, op->getLoc(), result, evidence, *layout,

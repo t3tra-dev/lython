@@ -27,7 +27,7 @@ std::optional<mlir::Value> knownEvidenceEquality(mlir::Operation *op,
     return std::nullopt;
   mlir::Location loc = op->getLoc();
   if (lhs.literalText && rhs.literalText)
-    return constantI1(builder, loc, *lhs.literalText == *rhs.literalText);
+    return constantBool(builder, loc, *lhs.literalText == *rhs.literalText);
   if (lhs.contractName() == "builtins.int" &&
       rhs.contractName() == "builtins.int" && lhs.primitiveI64 &&
       rhs.primitiveI64 && lhs.primitiveI64->value && rhs.primitiveI64->value &&
@@ -41,7 +41,7 @@ std::optional<mlir::Value> knownEvidenceEquality(mlir::Operation *op,
         .getResult();
   }
   if (sameRuntimeValueIdentity(lhs.objectValue, rhs.objectValue))
-    return constantI1(builder, loc, true);
+    return constantBool(builder, loc, true);
   return std::nullopt;
 }
 
@@ -1030,7 +1030,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
             std::make_shared<RuntimeBundle>(std::move(storedValue)));
         if (!updated.mappingPresent.empty())
           updated.mappingPresent.push_back(
-              constantI1(builder, op.getLoc(), true));
+              constantBool(builder, op.getLoc(), true));
       } else {
         unsigned position =
             static_cast<unsigned>(found - updated.mappingKeys.begin());
@@ -1062,7 +1062,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
         if (position < updated.mappingPresent.size()) {
           builder.setInsertionPoint(op);
           updated.mappingPresent[position] =
-              constantI1(builder, op.getLoc(), true);
+              constantBool(builder, op.getLoc(), true);
         }
       }
       if (mlir::failed(RuntimeBundleLowerer::writeBackFieldAlias(op, updated)))
@@ -1533,7 +1533,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
               op, container, "sequence contains")))
         return mlir::failure();
       mlir::Location loc = op.getLoc();
-      mlir::Value result = constantI1(builder, loc, false);
+      mlir::Value result = constantBool(builder, loc, false);
       for (const std::shared_ptr<RuntimeBundle> &element :
            container.sequenceElementBundles) {
         std::optional<mlir::Value> equal =
@@ -1559,10 +1559,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerContains(py::ContainsOp op) {
             op, container, "dict contains")))
       return mlir::failure();
     mlir::Location loc = op.getLoc();
-    mlir::Value result = constantI1(builder, loc, false);
+    mlir::Value result = constantBool(builder, loc, false);
     if (item.literalText) {
       for (auto [index, key] : llvm::enumerate(container.mappingKeys)) {
-        mlir::Value match = constantI1(builder, loc, key == *item.literalText);
+        mlir::Value match = constantBool(builder, loc, key == *item.literalText);
         if (index < container.mappingPresent.size())
           match = mlir::arith::AndIOp::create(builder, loc, match,
                                               container.mappingPresent[index]);

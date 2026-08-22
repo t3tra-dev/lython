@@ -36,7 +36,7 @@ using parser::SourceRange;
 NodePtr name(llvm::StringRef id, SourceRange range);
 NodePtr intConstant(std::int64_t value, SourceRange range);
 NodePtr strConstant(llvm::StringRef text, SourceRange range);
-NodePtr boolConstant(bool value, SourceRange range);
+NodePtr constantBool(bool value, SourceRange range);
 NodePtr noneConstant(SourceRange range);
 NodePtr attribute(NodePtr value, llvm::StringRef attr, SourceRange range);
 NodePtr selfAttribute(llvm::StringRef receiver, llvm::StringRef attr,

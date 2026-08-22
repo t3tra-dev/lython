@@ -30,7 +30,7 @@ NodePtr strConstant(llvm::StringRef text, SourceRange range) {
   return node;
 }
 
-NodePtr boolConstant(bool value, SourceRange range) {
+NodePtr constantBool(bool value, SourceRange range) {
   NodePtr node = parser::makeNode("Constant", range);
   parser::addField(*node, "value", value);
   return node;

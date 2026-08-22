@@ -114,7 +114,7 @@ createFirstReductionTilePredicate(mlir::OpBuilder &builder, mlir::Location loc,
       builder, loc, matmul.getDpsInputOperand(0)->get(), /*dimension=*/1);
   if (!reductionOffset)
     return std::nullopt;
-  mlir::Value zero = createIndexConstant(builder, loc, 0);
+  mlir::Value zero = constantIndex(builder, loc, 0);
   return mlir::arith::CmpIOp::create(builder, loc,
                                      mlir::arith::CmpIPredicate::eq,
                                      *reductionOffset, zero)
@@ -215,7 +215,7 @@ mlir::LogicalResult accumulateStaticKRange(
   for (int64_t k = begin; k < end; ++k) {
     if (mlir::failed(accumulateKStep(builder, loc, lhs, rhs, acc, rowVectorType,
                                      rowIndices,
-                                     createIndexConstant(builder, loc, k))))
+                                     constantIndex(builder, loc, k))))
       return mlir::failure();
   }
   return mlir::success();
@@ -265,7 +265,7 @@ mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
   llvm::SmallVector<mlir::Value, 16> indexConstants;
   indexConstants.reserve(microM);
   for (int64_t index = 0; index < microM; ++index)
-    indexConstants.push_back(createIndexConstant(rewriter, loc, index));
+    indexConstants.push_back(constantIndex(rewriter, loc, index));
 
   mlir::Value lhs = matmul.getDpsInputOperand(0)->get();
   mlir::Value rhs = matmul.getDpsInputOperand(1)->get();
@@ -279,9 +279,9 @@ mlir::LogicalResult lowerMatmulMicroKernel(mlir::linalg::MatmulOp matmul,
 
   int64_t unrolledLimit = (microK / kRegisterKUnroll) * kRegisterKUnroll;
   if (unrolledLimit > 0) {
-    mlir::Value lower = createIndexConstant(rewriter, loc, 0);
-    mlir::Value upper = createIndexConstant(rewriter, loc, unrolledLimit);
-    mlir::Value step = createIndexConstant(rewriter, loc, kRegisterKUnroll);
+    mlir::Value lower = constantIndex(rewriter, loc, 0);
+    mlir::Value upper = constantIndex(rewriter, loc, unrolledLimit);
+    mlir::Value step = constantIndex(rewriter, loc, kRegisterKUnroll);
     auto kLoop = mlir::scf::ForOp::create(
         rewriter, loc, lower, upper, step, acc,
         [&](mlir::OpBuilder &builder, mlir::Location nestedLoc, mlir::Value iv,

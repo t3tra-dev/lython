@@ -27,10 +27,7 @@ mlir::Value RuntimeBundleLowerer::memrefFromBoxPointer(mlir::OpBuilder &builder,
                                                        mlir::Value pointer,
                                                        mlir::Value sizeWord,
                                                        mlir::MemRefType type) {
-  auto word = [&](std::int64_t value) {
-    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
-        .getResult();
-  };
+  auto word = [&](std::int64_t value) { return constantI64(builder, loc, value); };
   MemRef1DParts parts;
   parts.allocated = pointer;
   parts.aligned = pointer;

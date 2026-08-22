@@ -2,6 +2,7 @@
 
 #include "Runtime/Core/Lowerer.h"
 
+#include "ArithBuilders.h"
 #include "Native.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -129,10 +130,8 @@ void keepAliveBufferSource(RuntimeBufferEvidence &evidence,
                            const RuntimeBundle &source);
 mlir::Value cdataStorageAddress(const RuntimeCtypesEvidence &evidence);
 mlir::Value cdataStorageAddressValid(const RuntimeCtypesEvidence &evidence);
-mlir::Value constantI64(mlir::OpBuilder &builder, mlir::Location loc,
-                        std::int64_t value);
-mlir::Value constantIndex(mlir::OpBuilder &builder, mlir::Location loc,
-                          std::int64_t value);
+using lython::common::constantI64;
+using lython::common::constantIndex;
 std::string ctypesLibraryABI(llvm::StringRef contract);
 bool isKnownTrue(mlir::Value value);
 bool isIntegerScalarLayout(const CtypesLayout &layout);

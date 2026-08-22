@@ -32,7 +32,7 @@ mlir::Value multiplyIndexByConstant(mlir::OpBuilder &builder,
   if (factor == 1)
     return value;
   return mlir::arith::MulIOp::create(builder, loc, value,
-                                     createIndexConstant(builder, loc, factor))
+                                     constantIndex(builder, loc, factor))
       .getResult();
 }
 
@@ -172,13 +172,13 @@ void buildFullRhsPrepackLoops(mlir::Value base, mlir::Value storage,
     return;
 
   rewriter.setInsertionPointAfter(storage.getDefiningOp());
-  mlir::Value zero = createIndexConstant(rewriter, loc, 0);
-  mlir::Value one = createIndexConstant(rewriter, loc, 1);
-  mlir::Value totalKValue = createIndexConstant(rewriter, loc, totalK);
-  mlir::Value totalNValue = createIndexConstant(rewriter, loc, totalN);
-  mlir::Value panelKValue = createIndexConstant(rewriter, loc, panelK);
-  mlir::Value panelNValue = createIndexConstant(rewriter, loc, panelN);
-  mlir::Value lanesValue = createIndexConstant(rewriter, loc, *lanes);
+  mlir::Value zero = constantIndex(rewriter, loc, 0);
+  mlir::Value one = constantIndex(rewriter, loc, 1);
+  mlir::Value totalKValue = constantIndex(rewriter, loc, totalK);
+  mlir::Value totalNValue = constantIndex(rewriter, loc, totalN);
+  mlir::Value panelKValue = constantIndex(rewriter, loc, panelK);
+  mlir::Value panelNValue = constantIndex(rewriter, loc, panelN);
+  mlir::Value lanesValue = constantIndex(rewriter, loc, *lanes);
 
   auto nPanelLoop =
       mlir::scf::ForOp::create(rewriter, loc, zero, totalNValue, panelNValue);

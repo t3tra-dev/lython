@@ -805,7 +805,7 @@ bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
   parser::addField(*handler, "body",
                    std::vector<parser::NodePtr>{synth::assign(
                        synth::name(doneName, range),
-                       synth::boolConstant(true, range), range)});
+                       synth::constantBool(true, range), range)});
   parser::NodePtr tryNode = parser::makeNode("Try", range);
   parser::addField(
       *tryNode, "body",
@@ -839,7 +839,7 @@ bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
       {}, range);
   runWithScratchNames({iteratorName, doneName}, [&] {
     emitStatement(*synth::assign(synth::name(doneName, range),
-                                 synth::boolConstant(false, range), range));
+                                 synth::constantBool(false, range), range));
     emitStatement(*synth::assign(
         synth::name(iteratorName, range),
         synth::methodCall(source, "__iter__", {}, range), range));
@@ -1238,7 +1238,7 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       exitBody.push_back(parser::makeNode("Break", statement.range));
       parser::addField(*guard, "orelse", std::move(exitBody));
 
-      parser::NodePtr trueConstant = synth::boolConstant(true, statement.range);
+      parser::NodePtr trueConstant = synth::constantBool(true, statement.range);
       parser::NodePtr loop = parser::makeNode("While", statement.range);
       parser::addField(*loop, "test", trueConstant);
       parser::addField(*loop, "body", std::vector<parser::NodePtr>{guard});
