@@ -1879,11 +1879,37 @@ Value ModuleEmitter::emitGenericCall(const parser::Node &expr,
 // when the class has a subclass, because the subclass may define exactly that
 // attribute. Answering False there is the silent wrong answer this project
 // exists to avoid; refusing says which class to look at.
+// The attribute name a `"..."` literal argument spells, or nothing when the
+// argument is not one. The quotes are part of a LiteralType's spelling, so a
+// name is only there when both are.
+std::optional<llvm::StringRef>
+ModuleEmitter::literalStringArgument(const parser::Node *node) {
+  auto literal =
+      mlir::dyn_cast_if_present<py::LiteralType>(types.inferExpr(node));
+  if (!literal)
+    return std::nullopt;
+  llvm::StringRef spelling = literal.getSpelling();
+  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
+    return std::nullopt;
+  return spelling.drop_front().drop_back();
+}
+
+// ⭐ THE ONE GATE EVERY BUILTIN INTERCEPTION OPENS WITH. Folding `len(x)` or
+// `getattr(x, "v")` is only legal while the name still means the builtin, and
+// ANY binding the program makes for that spelling shadows it -- a local, a
+// parameter, a top-level `def next`. Gating on locals alone once made the
+// winner depend on the argument count. Nineteen sites spelled this out.
+bool ModuleEmitter::callsUnshadowedBuiltin(const parser::Node *calleeNode,
+                                           llvm::StringRef name) const {
+  return calleeNode && calleeNode->kind == "Name" &&
+         llvm::StringRef(ast::nameSpelling(*calleeNode)) == name &&
+         !programBindsName(name);
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "hasattr" || programBindsName("hasattr"))
+  if (!callsUnshadowedBuiltin(calleeNode, "hasattr"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -1896,17 +1922,12 @@ ModuleEmitter::tryEmitHasattrCall(const parser::Node &expr,
   if (!args || args->size() != 2 || (keywords && !keywords->empty()) ||
       !args->front() || !(*args)[1])
     return refuse("hasattr() takes exactly two arguments");
-  const parser::Node *nameNode = (*args)[1].get();
-  mlir::Type nameType = types.inferExpr(nameNode);
-  auto nameLiteral = mlir::dyn_cast_if_present<py::LiteralType>(nameType);
-  if (!nameLiteral)
+  std::optional<llvm::StringRef> name =
+      literalStringArgument((*args)[1].get());
+  if (!name)
     return refuse("hasattr() needs a literal attribute name: the answer is "
                   "decided at compile time here");
-  llvm::StringRef spelling = nameLiteral.getSpelling();
-  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
-    return refuse("hasattr() needs a literal attribute name: the answer is "
-                  "decided at compile time here");
-  llvm::StringRef attribute = spelling.drop_front().drop_back();
+  llvm::StringRef attribute = *name;
   mlir::Type subject = types.widenLiteral(types.inferExpr(args->front().get()));
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(subject);
   if (!contract)
@@ -2074,8 +2095,7 @@ bool ModuleEmitter::refuseUnhashableKey(const parser::Node &site,
 std::optional<Value>
 ModuleEmitter::tryEmitSetattrCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "setattr" || programBindsName("setattr"))
+  if (!callsUnshadowedBuiltin(calleeNode, "setattr"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -2088,16 +2108,13 @@ ModuleEmitter::tryEmitSetattrCall(const parser::Node &expr,
   if (!args || args->size() != 3 || (keywords && !keywords->empty()) ||
       !args->front() || !(*args)[1] || !(*args)[2])
     return refuse("setattr() takes exactly three arguments");
-  mlir::Type nameType = types.inferExpr((*args)[1].get());
-  auto nameLiteral = mlir::dyn_cast_if_present<py::LiteralType>(nameType);
-  llvm::StringRef spelling = nameLiteral ? nameLiteral.getSpelling()
-                                         : llvm::StringRef();
-  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
+  std::optional<llvm::StringRef> name =
+      literalStringArgument((*args)[1].get());
+  if (!name)
     return refuse("setattr() needs a literal attribute name: the store is "
                   "resolved at compile time here");
   parser::NodePtr target =
-      synth::attribute(args->front(),
-                       spelling.drop_front().drop_back().str(), expr.range);
+      synth::attribute(args->front(), name->str(), expr.range);
   synthesizedIteratorDefs.push_back(target);
   emitAssignTarget(*target, emitExpr((*args)[2].get()));
   return emitNone(expr);
@@ -2111,8 +2128,7 @@ ModuleEmitter::tryEmitSetattrCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "getattr" || programBindsName("getattr"))
+  if (!callsUnshadowedBuiltin(calleeNode, "getattr"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -2126,16 +2142,13 @@ ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
       !args->front() || !(*args)[1])
     return refuse("getattr() takes exactly two arguments here: the default "
                   "form would need a runtime attribute lookup");
-  mlir::Type nameType = types.inferExpr((*args)[1].get());
-  auto nameLiteral = mlir::dyn_cast_if_present<py::LiteralType>(nameType);
-  llvm::StringRef spelling = nameLiteral ? nameLiteral.getSpelling()
-                                         : llvm::StringRef();
-  if (spelling.size() < 2 || spelling.front() != '"' || spelling.back() != '"')
+  std::optional<llvm::StringRef> name =
+      literalStringArgument((*args)[1].get());
+  if (!name)
     return refuse("getattr() needs a literal attribute name: the lookup is "
                   "resolved at compile time here");
   parser::NodePtr attribute =
-      synth::attribute(args->front(),
-                       spelling.drop_front().drop_back().str(), expr.range);
+      synth::attribute(args->front(), name->str(), expr.range);
   synthesizedIteratorDefs.push_back(attribute);
   return emitExpr(attribute.get());
 }
@@ -2143,9 +2156,7 @@ ModuleEmitter::tryEmitGetattrCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitCallableCall(const parser::Node &expr,
                                    const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "callable" ||
-      programBindsName("callable"))
+  if (!callsUnshadowedBuiltin(calleeNode, "callable"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -2203,8 +2214,7 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
   // instantiation, and a type object built from an instance is not what CPython
   // returns. The interception happens before any class binding for the same
   // reason int() and str() are intercepted.
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "type" || programBindsName("type"))
+  if (!callsUnshadowedBuiltin(calleeNode, "type"))
     return std::nullopt;
   const auto *typeArgs = ast::nodeList(expr, "args");
   const auto *typeKeywords = ast::nodeList(expr, "keywords");
@@ -2253,9 +2263,7 @@ ModuleEmitter::tryEmitTypeCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
                                      const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "isinstance" ||
-      programBindsName("isinstance"))
+  if (!callsUnshadowedBuiltin(calleeNode, "isinstance"))
     return std::nullopt;
   const auto *keywords = ast::nodeList(expr, "keywords");
   const auto *args = ast::nodeList(expr, "args");
@@ -2647,8 +2655,7 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatchWithValues(
 std::optional<Value>
 ModuleEmitter::tryEmitIntBaseCall(const parser::Node &expr,
                                   const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "int" || programBindsName("int"))
+  if (!callsUnshadowedBuiltin(calleeNode, "int"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -2871,9 +2878,7 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
   // int(x) is __int__ dispatch / literal parsing (CPython semantics), not
   // construction — intercept before the class-instantiation paths claim
   // builtins.int. Zero-argument int() stays on the instantiation path.
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "int" ||
-      programBindsName("int"))
+  if (!callsUnshadowedBuiltin(calleeNode, "int"))
     return std::nullopt;
   const auto *intArgs = ast::nodeList(expr, "args");
   const auto *intKeywords = ast::nodeList(expr, "keywords");
@@ -2918,9 +2923,7 @@ ModuleEmitter::tryEmitIntCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitBoolCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "bool" ||
-      programBindsName("bool"))
+  if (!callsUnshadowedBuiltin(calleeNode, "bool"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -2964,9 +2967,7 @@ ModuleEmitter::tryEmitBoolCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
                                 const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "ascii" ||
-      programBindsName("ascii"))
+  if (!callsUnshadowedBuiltin(calleeNode, "ascii"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -2990,9 +2991,7 @@ ModuleEmitter::tryEmitAsciiCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitIssubclassCall(const parser::Node &expr,
                                      const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "issubclass" ||
-      programBindsName("issubclass"))
+  if (!callsUnshadowedBuiltin(calleeNode, "issubclass"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -3067,9 +3066,7 @@ ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
                                 const parser::Node *calleeNode) {
   // float(x) is __float__ dispatch (CPython semantics), not construction —
   // intercept before the class-instantiation paths claim builtins.float.
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "float" ||
-      programBindsName("float"))
+  if (!callsUnshadowedBuiltin(calleeNode, "float"))
     return std::nullopt;
   const auto *floatArgs = ast::nodeList(expr, "args");
   const auto *floatKeywords = ast::nodeList(expr, "keywords");
@@ -3132,8 +3129,7 @@ ModuleEmitter::tryEmitFloatCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitPowCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "pow" || programBindsName("pow"))
+  if (!callsUnshadowedBuiltin(calleeNode, "pow"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -3156,9 +3152,7 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
   // str(x) is __str__ dispatch (CPython semantics), not construction —
   // intercept before the class-instantiation paths claim builtins.str.
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "str" ||
-      programBindsName("str"))
+  if (!callsUnshadowedBuiltin(calleeNode, "str"))
     return std::nullopt;
   const auto *strArgs = ast::nodeList(expr, "args");
   const auto *strKeywords = ast::nodeList(expr, "keywords");
@@ -3285,9 +3279,7 @@ ModuleEmitter::tryEmitListCall(const parser::Node &expr,
   // list(<genexpr>) is the list comprehension over the same element/generator
   // chain — route to the comprehension emitter before the class-instantiation
   // paths claim builtins.list.
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "list" ||
-      programBindsName("list"))
+  if (!callsUnshadowedBuiltin(calleeNode, "list"))
     return std::nullopt;
   const auto *listArgs = ast::nodeList(expr, "args");
   const auto *listKeywords = ast::nodeList(expr, "keywords");
@@ -3306,9 +3298,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // resolver stays single-argument. Zero-argument print desugars to one
   // empty-string write (builtin_print_impl with objects_length == 0 emits
   // only the end="\n" terminator).
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "print" ||
-      programBindsName("print"))
+  if (!callsUnshadowedBuiltin(calleeNode, "print"))
     return std::nullopt;
   const auto *printArgs = ast::nodeList(expr, "args");
   const auto *printKeywords = ast::nodeList(expr, "keywords");
@@ -4250,8 +4240,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "len" || programBindsName("len"))
+  if (!callsUnshadowedBuiltin(calleeNode, "len"))
     return std::nullopt;
   static constexpr llvm::StringRef kParameters[] = {"obj"};
   std::optional<llvm::SmallVector<const parser::Node *, 4>> bound =
@@ -4297,13 +4286,7 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "next")
-    return std::nullopt;
-  // Any binding the program makes for this spelling shadows the builtin --
-  // a local, or a top-level `def next`. Gating on locals alone made the
-  // winner depend on the argument count.
-  if (programBindsName("next"))
+  if (!callsUnshadowedBuiltin(calleeNode, "next"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -4394,12 +4377,7 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
                                const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "hash")
-    return std::nullopt;
-  // Any binding the program makes for this spelling shadows the builtin --
-  // a local, or a top-level `def hash`.
-  if (programBindsName("hash"))
+  if (!callsUnshadowedBuiltin(calleeNode, "hash"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");
@@ -4475,8 +4453,7 @@ ModuleEmitter::tryEmitHashCall(const parser::Node &expr,
 std::optional<Value>
 ModuleEmitter::tryEmitRoundCall(const parser::Node &expr,
                                 const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "round" || programBindsName("round"))
+  if (!callsUnshadowedBuiltin(calleeNode, "round"))
     return std::nullopt;
   static constexpr llvm::StringRef kParameters[] = {"number", "ndigits"};
   std::optional<llvm::SmallVector<const parser::Node *, 4>> bound =
@@ -5766,9 +5743,7 @@ Value ModuleEmitter::emitPercentFormat(const parser::Node &expr) {
 std::optional<Value>
 ModuleEmitter::tryEmitFormatCall(const parser::Node &expr,
                                  const parser::Node *calleeNode) {
-  if (!calleeNode || calleeNode->kind != "Name" ||
-      ast::nameSpelling(*calleeNode) != "format" ||
-      programBindsName("format"))
+  if (!callsUnshadowedBuiltin(calleeNode, "format"))
     return std::nullopt;
   const auto *args = ast::nodeList(expr, "args");
   const auto *keywords = ast::nodeList(expr, "keywords");

@@ -608,147 +608,138 @@ std::optional<ViewAccess> buildViewAccess(mlir::Value view,
   return std::nullopt;
 }
 
-bool rewriteViewLoad(mlir::memref::LoadOp load, mlir::IRRewriter &rewriter) {
-  rewriter.setInsertionPoint(load);
-  std::optional<ViewAccess> view = buildViewAccess(
-      load.getMemRef(), load.getIndices(), mlir::AffineMap(), rewriter);
+// ⭐ ONE VIEW-ACCESS REWRITE FRAME. Every one of these is: resolve the chain
+// of subviews and casts under the accessed memref, then rebuild the op against
+// the source it found. Only the rebuild differs. The frame is worth naming
+// because of the second `setInsertionPoint`: resolving the chain may itself
+// emit index arithmetic, which leaves the insertion point past the op.
+template <typename OpTy, typename Rebuild>
+bool rewriteViewAccess(OpTy op, mlir::Value memref, mlir::ValueRange indices,
+                       mlir::AffineMap permutationMap,
+                       mlir::IRRewriter &rewriter, Rebuild rebuild) {
+  rewriter.setInsertionPoint(op);
+  std::optional<ViewAccess> view =
+      buildViewAccess(memref, indices, permutationMap, rewriter);
   if (!view)
     return false;
 
-  rewriter.setInsertionPoint(load);
-  mlir::Value replacement = mlir::memref::LoadOp::create(
-      rewriter, load.getLoc(), view->source, view->sourceIndices);
-  rewriter.replaceOp(load, replacement);
+  rewriter.setInsertionPoint(op);
+  rebuild(*view);
   return true;
 }
 
+bool rewriteViewLoad(mlir::memref::LoadOp load, mlir::IRRewriter &rewriter) {
+  return rewriteViewAccess(
+      load, load.getMemRef(), load.getIndices(), mlir::AffineMap(), rewriter,
+      [&](const ViewAccess &view) {
+        rewriter.replaceOp(load,
+                           mlir::memref::LoadOp::create(rewriter, load.getLoc(),
+                                                        view.source,
+                                                        view.sourceIndices));
+      });
+}
+
+// The affine forms lower to the memref op, so an identity map is the only
+// shape whose indices survive the swap unchanged.
 bool rewriteViewLoad(mlir::affine::AffineLoadOp load,
                      mlir::IRRewriter &rewriter) {
   if (!load.getMap().isIdentity())
     return false;
-
-  rewriter.setInsertionPoint(load);
-  std::optional<ViewAccess> view = buildViewAccess(
-      load.getMemref(), load.getIndices(), mlir::AffineMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(load);
-  mlir::Value replacement = mlir::memref::LoadOp::create(
-      rewriter, load.getLoc(), view->source, view->sourceIndices);
-  rewriter.replaceOp(load, replacement);
-  return true;
+  return rewriteViewAccess(
+      load, load.getMemref(), load.getIndices(), mlir::AffineMap(), rewriter,
+      [&](const ViewAccess &view) {
+        rewriter.replaceOp(load,
+                           mlir::memref::LoadOp::create(rewriter, load.getLoc(),
+                                                        view.source,
+                                                        view.sourceIndices));
+      });
 }
 
 bool rewriteViewStore(mlir::memref::StoreOp store, mlir::IRRewriter &rewriter) {
-  rewriter.setInsertionPoint(store);
-  std::optional<ViewAccess> view = buildViewAccess(
-      store.getMemRef(), store.getIndices(), mlir::AffineMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(store);
-  mlir::memref::StoreOp::create(rewriter, store.getLoc(),
-                                store.getValueToStore(), view->source,
-                                view->sourceIndices);
-  rewriter.eraseOp(store);
-  return true;
+  return rewriteViewAccess(
+      store, store.getMemRef(), store.getIndices(), mlir::AffineMap(), rewriter,
+      [&](const ViewAccess &view) {
+        mlir::memref::StoreOp::create(rewriter, store.getLoc(),
+                                      store.getValueToStore(), view.source,
+                                      view.sourceIndices);
+        rewriter.eraseOp(store);
+      });
 }
 
 bool rewriteViewStore(mlir::affine::AffineStoreOp store,
                       mlir::IRRewriter &rewriter) {
   if (!store.getMap().isIdentity())
     return false;
-
-  rewriter.setInsertionPoint(store);
-  std::optional<ViewAccess> view = buildViewAccess(
-      store.getMemref(), store.getIndices(), mlir::AffineMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(store);
-  mlir::memref::StoreOp::create(rewriter, store.getLoc(), store.getValue(),
-                                view->source, view->sourceIndices);
-  rewriter.eraseOp(store);
-  return true;
+  return rewriteViewAccess(
+      store, store.getMemref(), store.getIndices(), mlir::AffineMap(), rewriter,
+      [&](const ViewAccess &view) {
+        mlir::memref::StoreOp::create(rewriter, store.getLoc(),
+                                      store.getValue(), view.source,
+                                      view.sourceIndices);
+        rewriter.eraseOp(store);
+      });
 }
 
 bool rewriteViewTransferRead(mlir::vector::TransferReadOp read,
                              mlir::IRRewriter &rewriter) {
-  rewriter.setInsertionPoint(read);
-  std::optional<ViewAccess> view = buildViewAccess(
-      read.getBase(), read.getIndices(), read.getPermutationMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(read);
-  mlir::AffineMapAttr permutationMapAttr =
-      view->permutationMap ? mlir::AffineMapAttr::get(view->permutationMap)
-                           : read.getPermutationMapAttr();
-  mlir::Value replacement =
-      mlir::vector::TransferReadOp::create(
-          rewriter, read.getLoc(), read.getVectorType(), view->source,
-          view->sourceIndices, permutationMapAttr, read.getPadding(),
-          read.getMask(), read.getInBoundsAttr())
-          .getVector();
-  rewriter.replaceOp(read, replacement);
-  return true;
+  return rewriteViewAccess(
+      read, read.getBase(), read.getIndices(), read.getPermutationMap(),
+      rewriter, [&](const ViewAccess &view) {
+        mlir::AffineMapAttr permutationMapAttr =
+            view.permutationMap ? mlir::AffineMapAttr::get(view.permutationMap)
+                                : read.getPermutationMapAttr();
+        rewriter.replaceOp(
+            read, mlir::vector::TransferReadOp::create(
+                      rewriter, read.getLoc(), read.getVectorType(),
+                      view.source, view.sourceIndices, permutationMapAttr,
+                      read.getPadding(), read.getMask(), read.getInBoundsAttr())
+                      .getVector());
+      });
 }
 
 bool rewriteViewTransferWrite(mlir::vector::TransferWriteOp write,
                               mlir::IRRewriter &rewriter) {
-  rewriter.setInsertionPoint(write);
-  std::optional<ViewAccess> view = buildViewAccess(
-      write.getBase(), write.getIndices(), write.getPermutationMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(write);
-  mlir::AffineMapAttr permutationMapAttr =
-      view->permutationMap ? mlir::AffineMapAttr::get(view->permutationMap)
-                           : write.getPermutationMapAttr();
-  mlir::Operation *replacement =
-      mlir::vector::TransferWriteOp::create(
-          rewriter, write.getLoc(), write->getResultTypes(), write.getVector(),
-          view->source, view->sourceIndices, permutationMapAttr,
-          write.getMask(), write.getInBoundsAttr())
-          .getOperation();
-  rewriter.replaceOp(write, replacement->getResults());
-  return true;
+  return rewriteViewAccess(
+      write, write.getBase(), write.getIndices(), write.getPermutationMap(),
+      rewriter, [&](const ViewAccess &view) {
+        mlir::AffineMapAttr permutationMapAttr =
+            view.permutationMap ? mlir::AffineMapAttr::get(view.permutationMap)
+                                : write.getPermutationMapAttr();
+        rewriter.replaceOp(write, mlir::vector::TransferWriteOp::create(
+                                      rewriter, write.getLoc(),
+                                      write->getResultTypes(),
+                                      write.getVector(), view.source,
+                                      view.sourceIndices, permutationMapAttr,
+                                      write.getMask(), write.getInBoundsAttr())
+                                      .getOperation()
+                                      ->getResults());
+      });
 }
 
 bool rewriteViewVectorLoad(mlir::vector::LoadOp load,
                            mlir::IRRewriter &rewriter) {
-  rewriter.setInsertionPoint(load);
-  std::optional<ViewAccess> view = buildViewAccess(
-      load.getBase(), load.getIndices(), mlir::AffineMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(load);
-  mlir::Value replacement =
-      mlir::vector::LoadOp::create(rewriter, load.getLoc(),
-                                   load.getResult().getType(), view->source,
-                                   view->sourceIndices, load.getNontemporal())
-          .getResult();
-  rewriter.replaceOp(load, replacement);
-  return true;
+  return rewriteViewAccess(
+      load, load.getBase(), load.getIndices(), mlir::AffineMap(), rewriter,
+      [&](const ViewAccess &view) {
+        rewriter.replaceOp(
+            load, mlir::vector::LoadOp::create(
+                      rewriter, load.getLoc(), load.getResult().getType(),
+                      view.source, view.sourceIndices, load.getNontemporal())
+                      .getResult());
+      });
 }
 
 bool rewriteViewVectorStore(mlir::vector::StoreOp store,
                             mlir::IRRewriter &rewriter) {
-  rewriter.setInsertionPoint(store);
-  std::optional<ViewAccess> view = buildViewAccess(
-      store.getBase(), store.getIndices(), mlir::AffineMap(), rewriter);
-  if (!view)
-    return false;
-
-  rewriter.setInsertionPoint(store);
-  mlir::vector::StoreOp::create(rewriter, store.getLoc(),
-                                store.getValueToStore(), view->source,
-                                view->sourceIndices, store.getNontemporal());
-  rewriter.eraseOp(store);
-  return true;
+  return rewriteViewAccess(
+      store, store.getBase(), store.getIndices(), mlir::AffineMap(), rewriter,
+      [&](const ViewAccess &view) {
+        mlir::vector::StoreOp::create(rewriter, store.getLoc(),
+                                      store.getValueToStore(), view.source,
+                                      view.sourceIndices,
+                                      store.getNontemporal());
+        rewriter.eraseOp(store);
+      });
 }
 
 class ViewAccessLoweringPass

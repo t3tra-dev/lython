@@ -524,21 +524,26 @@ RuntimeBundleLowerer::bindStaticCtypesLibraryNew(py::NewOp op,
   return mlir::success();
 }
 
-mlir::LogicalResult RuntimeBundleLowerer::lowerErasedCtypesInit(
+// Both ctypes initializers are one frame: refuse unless the instance carries
+// evidence of the expected kind and is its own first source, materialize from
+// the remaining sources, and leave `None` behind. Only the materialization
+// differs, and the two materializers do not share a signature.
+mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesInit(
     py::InitOp op, const RuntimeBundle &instance,
-    llvm::ArrayRef<const RuntimeBundle *> sources) {
-  if (!instance.ctypes ||
-      instance.ctypes->kind != RuntimeCtypesEvidence::Kind::Cell)
+    llvm::ArrayRef<const RuntimeBundle *> sources,
+    RuntimeCtypesEvidence::Kind kind, llvm::StringRef mismatchMessage,
+    llvm::function_ref<mlir::FailureOr<RuntimeBundle>(
+        mlir::Type, llvm::StringRef, llvm::ArrayRef<const RuntimeBundle *>)>
+        materialize) {
+  if (!instance.ctypes || instance.ctypes->kind != kind)
     return mlir::failure();
   if (sources.empty() || sources.front() != &instance)
-    return op.emitError() << "ctypes initializer source evidence mismatch";
+    return op.emitError() << mismatchMessage;
 
-  mlir::FailureOr<RuntimeBundle> updated = materializeCtypesCell(
-      op, builder, module,
-      instance.ctypes->ctype ? instance.ctypes->ctype
-                             : op.getInstance().getType(),
-      instance.ctypes->ctypeName,
-      llvm::ArrayRef<const RuntimeBundle *>(sources).drop_front());
+  mlir::FailureOr<RuntimeBundle> updated =
+      materialize(instance.ctypes->ctype ? instance.ctypes->ctype
+                                         : op.getInstance().getType(),
+                  instance.ctypes->ctypeName, sources.drop_front());
   if (mlir::failed(updated))
     return mlir::failure();
   valueBundles[op.getInstance()] = std::move(*updated);
@@ -550,30 +555,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerErasedCtypesInit(
   return mlir::success();
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::lowerErasedCtypesInit(
+    py::InitOp op, const RuntimeBundle &instance,
+    llvm::ArrayRef<const RuntimeBundle *> sources) {
+  return lowerCtypesInit(
+      op, instance, sources, RuntimeCtypesEvidence::Kind::Cell,
+      "ctypes initializer source evidence mismatch",
+      [&](mlir::Type ctype, llvm::StringRef ctypeName,
+          llvm::ArrayRef<const RuntimeBundle *> rest) {
+        return materializeCtypesCell(op, builder, module, ctype, ctypeName,
+                                     rest);
+      });
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesLibraryInit(
     py::InitOp op, const RuntimeBundle &instance,
     llvm::ArrayRef<const RuntimeBundle *> sources) {
-  if (!instance.ctypes ||
-      instance.ctypes->kind != RuntimeCtypesEvidence::Kind::Library)
-    return mlir::failure();
-  if (sources.empty() || sources.front() != &instance)
-    return op.emitError() << "ctypes library initializer source evidence "
-                          << "mismatch";
-
-  mlir::FailureOr<RuntimeBundle> updated = materializeCtypesLibrary(
-      op, module,
-      instance.ctypes->ctype ? instance.ctypes->ctype
-                             : op.getInstance().getType(),
-      instance.ctypes->ctypeName, sources.drop_front());
-  if (mlir::failed(updated))
-    return mlir::failure();
-  valueBundles[op.getInstance()] = std::move(*updated);
-  if (mlir::failed(assignObjectBundle(
-          op, op.getResult(), runtimeContractType(context, "types.NoneType"),
-          mlir::ValueRange{})))
-    return mlir::failure();
-  erase.push_back(op);
-  return mlir::success();
+  return lowerCtypesInit(
+      op, instance, sources, RuntimeCtypesEvidence::Kind::Library,
+      "ctypes library initializer source evidence mismatch",
+      [&](mlir::Type ctype, llvm::StringRef ctypeName,
+          llvm::ArrayRef<const RuntimeBundle *> rest) {
+        return materializeCtypesLibrary(op, module, ctype, ctypeName, rest);
+      });
 }
 
 // `HANDLER(f)` where HANDLER came from ctypes.CFUNCTYPE: wrap the compiled

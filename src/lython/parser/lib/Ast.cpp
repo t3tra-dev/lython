@@ -14,7 +14,12 @@ void dumpByteEscape(std::ostream &os, std::uint8_t byte) {
   os << "\\x" << hex[(byte >> 4) & 0xf] << hex[byte & 0xf];
 }
 
-void dumpEscaped(std::ostream &os, std::string_view value) {
+// str and bytes escape the same five characters and differ in two things: the
+// prefix, and what counts as unprintable. A str's high bytes are UTF-8
+// continuation bytes and must pass through; a bytes literal's are escaped.
+void dumpQuoted(std::ostream &os, std::string_view value, bool bytesLiteral) {
+  if (bytesLiteral)
+    os << 'b';
   os << '"';
   for (unsigned char byte : value) {
     const char ch = static_cast<char>(byte);
@@ -35,8 +40,8 @@ void dumpEscaped(std::ostream &os, std::string_view value) {
       os << "\\t";
       break;
     default:
-      if (byte < 0x20 || byte == 0x7f)
-        dumpByteEscape(os, static_cast<std::uint8_t>(byte));
+      if (byte < 0x20 || (bytesLiteral ? byte >= 0x7f : byte == 0x7f))
+        dumpByteEscape(os, byte);
       else
         os << ch;
       break;
@@ -45,36 +50,15 @@ void dumpEscaped(std::ostream &os, std::string_view value) {
   os << '"';
 }
 
+void dumpEscaped(std::ostream &os, std::string_view value) {
+  dumpQuoted(os, value, /*bytesLiteral=*/false);
+}
+
 void dumpBytes(std::ostream &os, const std::vector<std::uint8_t> &value) {
-  os << "b\"";
-  for (std::uint8_t byte : value) {
-    const char ch = static_cast<char>(byte);
-    switch (ch) {
-    case '\\':
-      os << "\\\\";
-      break;
-    case '"':
-      os << "\\\"";
-      break;
-    case '\n':
-      os << "\\n";
-      break;
-    case '\r':
-      os << "\\r";
-      break;
-    case '\t':
-      os << "\\t";
-      break;
-    default:
-      if (byte < 0x20 || byte >= 0x7f) {
-        dumpByteEscape(os, byte);
-      } else {
-        os << ch;
-      }
-      break;
-    }
-  }
-  os << '"';
+  dumpQuoted(os,
+             std::string_view(reinterpret_cast<const char *>(value.data()),
+                              value.size()),
+             /*bytesLiteral=*/true);
 }
 
 void dumpComplex(std::ostream &os, const std::complex<double> &value) {

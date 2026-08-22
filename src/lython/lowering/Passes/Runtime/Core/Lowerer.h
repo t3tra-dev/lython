@@ -421,6 +421,13 @@ private:
                                           llvm::StringRef contract);
   mlir::LogicalResult bindStaticCtypesLibraryNew(py::NewOp op,
                                                  llvm::StringRef contract);
+  mlir::LogicalResult lowerCtypesInit(
+      py::InitOp op, const RuntimeBundle &instance,
+      llvm::ArrayRef<const RuntimeBundle *> sources,
+      RuntimeCtypesEvidence::Kind kind, llvm::StringRef mismatchMessage,
+      llvm::function_ref<mlir::FailureOr<RuntimeBundle>(
+          mlir::Type, llvm::StringRef, llvm::ArrayRef<const RuntimeBundle *>)>
+          materialize);
   mlir::LogicalResult
   lowerErasedCtypesInit(py::InitOp op, const RuntimeBundle &instance,
                         llvm::ArrayRef<const RuntimeBundle *> sources);

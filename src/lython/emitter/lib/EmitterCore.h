@@ -374,6 +374,13 @@ private:
   // a top-level `def` is absent from `values` and the fast paths are selected
   // by arity.
   bool programBindsName(llvm::StringRef name) const;
+  // A call to the builtin `name` that the program has not rebound: the gate
+  // every builtin interception opens with.
+  bool callsUnshadowedBuiltin(const parser::Node *calleeNode,
+                              llvm::StringRef name) const;
+  // The attribute name a `"..."` literal argument spells, when it is one.
+  std::optional<llvm::StringRef>
+  literalStringArgument(const parser::Node *node);
   // Collects moduleFunctionNames / moduleClassNames / shadowedBuiltinSymbols.
   void collectTopLevelBindings();
   // The symbol a main-module top-level `def` of this spelling is emitted
