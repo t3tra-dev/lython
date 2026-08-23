@@ -19224,7 +19224,14 @@ module attributes {
   // Passes/Runtime/ABI/ContainerLayout.h.
   func.func private @__ly_dict_alloc(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
-    %minimum_capacity = arith.constant 64 : i64
+    // PyDict_MINSIZE.
+    //
+    // ⛔ NOT the 64 this was. An entry is a 16-word box in BOTH the keys and
+    // the values array, so a minimum of 64 made every dict 8 KB + 8 KB + 512 B
+    // = 16.9 KB before its first key -- `{}` in a loop allocated and freed that
+    // per iteration, where CPython's new dict shares `empty_keys_struct` and
+    // takes nothing at all until the first insert.
+    %minimum_capacity = arith.constant 8 : i64
     %handle_words = arith.constant 16 : i64
     %class_id = arith.constant 12 : i64
     %zero = arith.constant 0 : i64
@@ -19953,7 +19960,10 @@ module attributes {
   // five-lane spelling had to declare transfer_args = [0] + owned_results = [0]
   // because the array VALUES were the entity's identity.
   func.func @LyDict_EnsureCapacity(%self: memref<8xi64> {ly.ownership.object_header}, %required: i64) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "ensure_capacity"} {
-    %minimum_capacity = arith.constant 64 : i64
+    // PyDict_MINSIZE, the same floor `__ly_dict_alloc` starts from; the growth
+    // above it doubles, so the floor only costs a dict that outgrows it three
+    // extra copies (8, 16, 32) and saves 14.8 KB on every one that does not.
+    %minimum_capacity = arith.constant 8 : i64
     %handle_words = arith.constant 16 : i64
     %two = arith.constant 2 : i64
     %zero = arith.constant 0 : i64
@@ -21851,7 +21861,10 @@ module attributes {
   func.func private @__ly_set_raw_init(%self: memref<?xi64>, %class_id: i64, %length: i64) {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %minimum_capacity = arith.constant 64 : i64
+    // PySet_MINSIZE, matching the table's own floor below. It was 64 while the
+    // table's was 8, which put 8 KB of 16-word element boxes behind a set that
+    // had reserved eight slots.
+    %minimum_capacity = arith.constant 8 : i64
     %handle_words = arith.constant 16 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
@@ -21895,7 +21908,8 @@ module attributes {
   // which every holder already names, so there is nothing to hand back and no
   // reference for a caller to re-acquire.
   func.func private @__ly_set_raw_ensure_capacity(%self: memref<?xi64>, %required: i64) {
-    %minimum_capacity = arith.constant 64 : i64
+    // PySet_MINSIZE, the floor `__ly_set_raw_init` starts from.
+    %minimum_capacity = arith.constant 8 : i64
     %handle_words = arith.constant 16 : i64
     %two = arith.constant 2 : i64
     %capacity_slot = arith.constant 3 : index

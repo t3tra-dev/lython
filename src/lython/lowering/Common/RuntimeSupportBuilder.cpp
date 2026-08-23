@@ -561,8 +561,39 @@ void buildBoxedLoadI64(SupportBuilder &b) {
 // system allocator in bulk -- and drops two things it does not need:
 //
 // ⛔ NO ARENA RELEASE. CPython returns an empty arena to the system; this does
-// not, so peak RSS is a high-water mark. That is a real difference and the
-// reason it is written down rather than left to be discovered.
+// not, so peak RSS is a high-water mark.
+//
+// It was built and measured before being left out. The shape that returns
+// memory is obmalloc's pool -- an aligned span carved into blocks of ONE size
+// class, holding its own free list and a live count, released the moment its
+// last block dies -- because a free list spanning every pool can return none of
+// them. Ported here (16 KB pools, `aligned_alloc`, the free head's null doing
+// double duty as the "off the class list" flag, the cold paths outlined so
+// `LyMem_Alloc` still inlines) it cost 10-30% on the container benchmarks
+// (b_class 37.0 -> 48.0 ms, b_tuple2 49.6 -> 61.0, b_smalllist 52.1 -> 62.0,
+// 2M-list 112.8 -> 125.9) for the live count alone: three memory ops on a path
+// that is five, and this allocator is fast enough that three is a third of it.
+//
+// ⭐ AND IT RETURNED ALMOST NOTHING, which is the actual reason. Measured on a
+// program that builds 20,000 two-key dicts, drops them, and keeps running:
+// resident memory afterwards was 66.5 MB without pools and 67.0 MB with them.
+// The bytes are not in pooled blocks. A container's payload is an array of
+// 16-word element boxes, so a dict at PyDict_MINSIZE is 8 x 16 x 8 = 1 KB per
+// array -- past the 512-byte class ceiling and already going straight to the
+// system allocator, which is 94% of that program's heap. Only a two-phase
+// workload whose objects all fit the classes showed anything, and that was 10%
+// of peak.
+//
+// So the ordering is: shrink the element box first (`box_abi::kWordsPerBox` is
+// 16 for a maximum of 3 lanes across every contract), which puts container
+// payloads back under the ceiling, and then the pool layer has something to
+// give back. Doing it in the other order buys a 10-30% regression for 0.5 MB.
+//
+// One thing the port found that outlives it: `redirectAllocationsToObjectAllocator`
+// skips functions named `LyMem_*`, so an allocator helper spelled any other way
+// has its `free(pool)` rewritten into `LyMem_Free(pool)` -- which reads the
+// pool's own header as a block prefix and pushes the pool onto its own free
+// chain. It reaches a program as a hang, not as a crash.
 //
 // ⛔ NO `address_in_range`. CPython derives the pool (and so the size class)
 // from the address by masking, which lets it keep zero per-object overhead but
