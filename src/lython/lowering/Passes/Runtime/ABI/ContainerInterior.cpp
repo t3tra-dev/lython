@@ -90,6 +90,62 @@ RuntimeBundleLowerer::loadContainerLength(mlir::Operation *op,
       .getResult();
 }
 
+// Stamp a dict's index table stale when the length being written is SMALLER
+// than the one already there.
+//
+// ⭐ The one thing the manifest cannot work out for itself. `__ly_dict_table_sync`
+// compares the table's stamp against the length and rebuilds when they differ,
+// which catches every dict this pass GROWS -- a literal, an append -- and costs
+// only the new tail. A delete is invisible to it: the dense array shifts down,
+// so every index the table holds past the hole is wrong, and a delete that
+// follows an insert puts the length back exactly where it started. The
+// comparison then sees a table that matches and a table that lies.
+//
+// Why NOT announce every write instead: this pass writes a dict's arrays from
+// six places and the manifest from six more, and the announcement would have to
+// be remembered at each. The length is the one word all twelve go through.
+mlir::LogicalResult RuntimeBundleLowerer::invalidateMappingTableOnShrink(
+    mlir::Operation *op, const RuntimeBundle &container, mlir::Value length) {
+  if (container.contractName() != "builtins.dict")
+    return mlir::success();
+  if (!RuntimeBundleLowerer::containerIsHandleFronted(container))
+    return mlir::success();
+  llvm::ArrayRef<mlir::Value> values = container.physicalValues();
+  if (values.empty())
+    return mlir::success();
+  mlir::Location loc = op->getLoc();
+  mlir::Type i64 = builder.getI64Type();
+  mlir::Value handle = values.front();
+  mlir::Value lengthWord = mlir::arith::ConstantIndexOp::create(
+                               builder, loc, container_abi::kLengthWord)
+                               .getResult();
+  mlir::Value previous =
+      mlir::memref::LoadOp::create(builder, loc, handle, lengthWord)
+          .getResult();
+  mlir::Value tableWord = mlir::arith::ConstantIndexOp::create(
+                              builder, loc, container_abi::kTableWord)
+                              .getResult();
+  mlir::Value tableAddress =
+      mlir::memref::LoadOp::create(builder, loc, handle, tableWord).getResult();
+  mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
+  mlir::Value stamp = RuntimeBundleLowerer::memrefFromBoxWords(
+      builder, loc, tableAddress, one,
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i64));
+  mlir::Value zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0)
+                         .getResult();
+  mlir::Value current =
+      mlir::memref::LoadOp::create(builder, loc, stamp, zero).getResult();
+  // Branch-free: the stale marker is -1, which `__ly_dict_table_sync` reads as
+  // "below every dense index" and answers with a full rebuild.
+  mlir::Value shrinking = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::slt, length, previous);
+  mlir::Value stale = mlir::arith::ConstantIntOp::create(builder, loc, -1, 64);
+  mlir::Value next = mlir::arith::SelectOp::create(builder, loc, shrinking,
+                                                   stale, current);
+  mlir::memref::StoreOp::create(builder, loc, next, stamp, zero);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::storeContainerLength(
     mlir::Operation *op, const RuntimeBundle &container, mlir::Value length,
     llvm::StringRef label) {
@@ -97,6 +153,9 @@ mlir::LogicalResult RuntimeBundleLowerer::storeContainerLength(
       RuntimeBundleLowerer::containerMetaSlot(
           op, container, container_abi::kMetaLengthSlot, label);
   if (mlir::failed(slot))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::invalidateMappingTableOnShrink(
+          op, container, length)))
     return mlir::failure();
   mlir::memref::StoreOp::create(builder, op->getLoc(), length, slot->first,
                                 slot->second);
@@ -120,6 +179,9 @@ mlir::LogicalResult RuntimeBundleLowerer::adjustContainerLength(
       delta >= 0
           ? mlir::arith::AddIOp::create(builder, loc, current, one).getResult()
           : mlir::arith::SubIOp::create(builder, loc, current, one).getResult();
+  if (mlir::failed(RuntimeBundleLowerer::invalidateMappingTableOnShrink(
+          op, container, next)))
+    return mlir::failure();
   mlir::memref::StoreOp::create(builder, loc, next, slot->first, slot->second);
   return mlir::success();
 }

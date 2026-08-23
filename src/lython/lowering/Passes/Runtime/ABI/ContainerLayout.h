@@ -32,7 +32,10 @@ inline constexpr std::int64_t kPrimaryArrayWord = 4;
 inline constexpr std::int64_t kSecondaryArrayWord = 5;
 // Per-slot occupancy flags; unused by a sequence.
 inline constexpr std::int64_t kPresentArrayWord = 6;
-inline constexpr std::int64_t kReservedWord = 7;
+// Base of the mapping's index table (word 0 of that block is the length the
+// table was built for; the rest is 2*capacity slots of (state, hash)). Unused
+// by a sequence, which is why it was the reserved word.
+inline constexpr std::int64_t kTableWord = 7;
 // The narrowest container handle, and therefore the minimum width at which a
 // rank-1 i64 memref can be one: `isContainerHandleType` uses it as a lower
 // bound, not as an equality, because a converted container may be WIDER than

@@ -681,6 +681,8 @@ private:
   mlir::FailureOr<mlir::Value> loadContainerLength(
       mlir::Operation *op, const RuntimeBundle &container,
       llvm::StringRef label);
+  mlir::LogicalResult invalidateMappingTableOnShrink(
+      mlir::Operation *op, const RuntimeBundle &container, mlir::Value length);
   mlir::LogicalResult storeContainerLength(mlir::Operation *op,
                                           const RuntimeBundle &container,
                                           mlir::Value length,
