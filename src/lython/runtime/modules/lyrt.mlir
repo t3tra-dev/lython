@@ -81,7 +81,7 @@ module attributes {
   // ===== impls: lyrt_counter =====
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
-  func.func private @LyLong_FromI64(%value: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]}
 
   func.func @LyCounter_New(%limit: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 19 : i64, ly.runtime.contract = "lyrt.Counter", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
@@ -116,7 +116,7 @@ module attributes {
     func.return %counter : memref<4xi64>
   }
 
-  func.func @LyCounter_Next(%counter: memref<4xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>, i1, memref<4xi64>) attributes {ly.ownership.owned_results = [0, 4], ly.runtime.contract = "lyrt.Counter", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "lyrt.Counter", ly.runtime.next_evidence = "receiver", ly.runtime.valid_result_index = 3 : i64} {
+  func.func @LyCounter_Next(%counter: memref<4xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<4xi64>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "lyrt.Counter", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "lyrt.Counter", ly.runtime.next_evidence = "receiver", ly.runtime.valid_result_index = 1 : i64} {
     %current_slot = arith.constant 2 : index
     %limit_slot = arith.constant 3 : index
     %current = memref.load %counter[%current_slot] : memref<4xi64>
@@ -128,12 +128,12 @@ module attributes {
     %next_current = arith.select %valid, %next_current_candidate, %current : i1, i64
     %value = arith.select %valid, %current, %zero : i1, i64
     memref.store %next_current, %counter[%current_slot] : memref<4xi64>
-    %result:3 = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %result = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
 
     %c0 = arith.constant 0 : index
     %header = memref.subview %counter[%c0] [2] [1] : memref<4xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%header) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %result#0, %result#1, %result#2, %valid, %counter : memref<2xi64>, memref<2xi64>, memref<?xi32>, i1, memref<4xi64>
+    func.return %result, %valid, %counter : memref<2xi64>, i1, memref<4xi64>
   }
 
   func.func @LyCounter_DecRef(%counter: memref<4xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "lyrt.Counter", ly.runtime.deallocator} {
@@ -172,7 +172,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyReadyIntAwaitable_Await(%awaitable: memref<3xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<10xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "lyrt.ReadyIntAwaitable", ly.runtime.method = "__await__", ly.runtime.result_contract = "_asyncio.FutureIter", ly.runtime.result_evidence_slots = ["asyncio.future.result"], ly.runtime.result_evidence_contracts = ["builtins.int"]} {
+  func.func @LyReadyIntAwaitable_Await(%awaitable: memref<3xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<10xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "lyrt.ReadyIntAwaitable", ly.runtime.method = "__await__", ly.runtime.result_contract = "_asyncio.FutureIter", ly.runtime.result_evidence_slots = ["asyncio.future.result"], ly.runtime.result_evidence_contracts = ["builtins.int"]} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
     %layout_future_iter = arith.constant 16 : i64
@@ -188,8 +188,8 @@ module attributes {
     memref.store %zero, %iterator[%consumed_slot] : memref<3xi64>
 
     %value = memref.load %awaitable[%value_slot] : memref<3xi64>
-    %result:3 = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %iterator, %future, %result#0, %result#1, %result#2 : memref<3xi64>, memref<10xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %iterator, %future, %result : memref<3xi64>, memref<10xi64>, memref<2xi64>
   }
 
   func.func @LyReadyIntAwaitable_DecRef(%awaitable: memref<3xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "lyrt.ReadyIntAwaitable", ly.runtime.deallocator} {
@@ -242,7 +242,7 @@ module attributes {
     func.return %counter : memref<4xi64>
   }
 
-  func.func @LyAsyncCounter_ANext(%counter: memref<4xi64> {ly.ownership.object_header}) -> (memref<10xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.contract = "lyrt.AsyncCounter", ly.runtime.method = "__anext__", ly.runtime.result_contract = "_asyncio.Future", ly.runtime.result_evidence_slots = ["asyncio.future.result"], ly.runtime.result_evidence_contracts = ["builtins.int"]} {
+  func.func @LyAsyncCounter_ANext(%counter: memref<4xi64> {ly.ownership.object_header}) -> (memref<10xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0, 1], ly.runtime.contract = "lyrt.AsyncCounter", ly.runtime.method = "__anext__", ly.runtime.result_contract = "_asyncio.Future", ly.runtime.result_evidence_slots = ["asyncio.future.result"], ly.runtime.result_evidence_contracts = ["builtins.int"]} {
     %current_slot = arith.constant 2 : index
     %limit_slot = arith.constant 3 : index
     %current = memref.load %counter[%current_slot] : memref<4xi64>
@@ -256,7 +256,7 @@ module attributes {
     %future = func.call @LyFuture_New() : () -> memref<10xi64>
     %zero = arith.constant 0 : i64
     %value = arith.select %valid, %current, %zero : i1, i64
-    %result:3 = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
+    %result = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
     cf.cond_br %valid, ^done, ^exhausted
 
   ^exhausted:
@@ -266,7 +266,7 @@ module attributes {
     cf.br ^done
 
   ^done:
-    func.return %future, %result#0, %result#1, %result#2 : memref<10xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>
+    func.return %future, %result : memref<10xi64>, memref<2xi64>
   }
 
   func.func @LyAsyncCounter_DecRef(%counter: memref<4xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "lyrt.AsyncCounter", ly.runtime.deallocator} {

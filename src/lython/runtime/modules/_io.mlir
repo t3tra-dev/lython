@@ -167,7 +167,7 @@ module attributes {
   func.func private @LyHost_OSErrorClassId(i32) -> i64
   func.func private @LyHost_OSErrorMessagePath(i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
   func.func private @LyHost_Stat(memref<?xi8>, i64, memref<?xi64>) -> i32
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_CodepointLength(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i64 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "__len__"}
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
@@ -365,7 +365,7 @@ module attributes {
 
   // write() returns the codepoint count (textio.c write semantics); the
   // byte length drives the underlying raw write.
-  func.func @LyTextIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %str_header: memref<2xi64> {ly.ownership.object_header}, %str_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTextIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %str_header: memref<2xi64> {ly.ownership.object_header}, %str_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     %kind_slot = arith.constant 3 : index
     %writable_slot = arith.constant 5 : index
@@ -393,8 +393,8 @@ module attributes {
     }
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     %codepoints = func.call @LyUnicode_CodepointLength(%str_header, %str_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %result:3 = func.call @LyLong_FromI64(%codepoints) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%codepoints) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   // read() decodes the whole rest of the stream (clinic read(size=-1) with
@@ -641,7 +641,7 @@ module attributes {
     func.return %false : i1
   }
 
-  func.func @LyTextIO_Fileno(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "fileno", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTextIO_Fileno(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "fileno", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     %kind_slot = arith.constant 3 : index
     %zero = arith.constant 0 : i64
@@ -656,8 +656,8 @@ module attributes {
       %fd64 = arith.extsi %fd32 : i32 to i64
       scf.yield %fd64 : i64
     }
-    %result:3 = func.call @LyLong_FromI64(%fd) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%fd) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyTextIO_Readable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "readable", ly.runtime.result_contract = "builtins.bool"} {
@@ -680,7 +680,7 @@ module attributes {
   // accepts cookies (or offset 0 for cur-/end-relative whence). This
   // wrapper keeps no incremental decoder state, so the cookie degenerates
   // to the byte offset; raw-fd streams (stdout/stderr) are not seekable.
-  func.func @LyTextIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %cookie: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTextIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %cookie: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     %kind_slot = arith.constant 3 : index
     %zero = arith.constant 0 : i64
@@ -720,11 +720,11 @@ module attributes {
       }
     }
     %where = func.call @LyHost_FTell(%handle) : (i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%where) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%where) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
-  func.func @LyTextIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTextIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     %kind_slot = arith.constant 3 : index
     %zero = arith.constant 0 : i64
@@ -736,8 +736,8 @@ module attributes {
     }
     %handle = memref.load %self[%handle_slot] : memref<8xi64>
     %where = func.call @LyHost_FTell(%handle) : (i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%where) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%where) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyTextIO_Seekable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "seekable", ly.runtime.result_contract = "builtins.bool"} {
@@ -923,7 +923,7 @@ module attributes {
   }
 
   // write() returns the codepoint count (stringio.c counts characters).
-  func.func @LyStringIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %str_header: memref<2xi64> {ly.ownership.object_header}, %str_bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.ownership.owned_result_contracts = ["builtins.int"], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyStringIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %str_header: memref<2xi64> {ly.ownership.object_header}, %str_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.ownership.owned_result_contracts = ["builtins.int"], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
     %c0 = arith.constant 0 : index
     // The membuf stores UTF-8; encode the adaptive-width payload first.
     %enc_header = func.call @LyUnicode_Encode(%str_header, %str_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
@@ -933,8 +933,8 @@ module attributes {
     func.call @__ly_membuf_write(%self, %enc_bytes, %length) : (memref<8xi64>, memref<?xi8>, i64) -> ()
     func.call @LyBytes_DecRef(%enc_header) : (memref<6xi64>) -> ()
     %codepoints = func.call @LyUnicode_CodepointLength(%str_header, %str_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
-    %result:3 = func.call @LyLong_FromI64(%codepoints) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%codepoints) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyStringIO_GetValue(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.owned_result_contracts = ["builtins.str"], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "getvalue", ly.runtime.result_contract = "builtins.str"} {
@@ -1014,10 +1014,10 @@ module attributes {
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyStringIO_Truncate(%self: memref<8xi64> {ly.ownership.object_header}, %size: i64 {ly.runtime.default_i64 = -9223372036854775808 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "truncate", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyStringIO_Truncate(%self: memref<8xi64> {ly.ownership.object_header}, %size: i64 {ly.runtime.default_i64 = -9223372036854775808 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "truncate", ly.runtime.result_contract = "builtins.int"} {
     %effective = func.call @__ly_membuf_truncate(%self, %size) : (memref<8xi64>, i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%effective) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%effective) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyStringIO_Seekable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.StringIO", ly.runtime.method = "seekable", ly.runtime.result_contract = "builtins.bool"} {
@@ -1043,7 +1043,7 @@ module attributes {
   // stringio.c seek: absolute seeks take any non-negative position, but
   // cur-/end-relative seeks only accept offset 0 (the text stream has no
   // byte arithmetic on positions).
-  func.func @LyStringIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %pos: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyStringIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %pos: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
     %len_slot = arith.constant 3 : index
     %pos_slot = arith.constant 5 : index
     %zero = arith.constant 0 : i64
@@ -1084,16 +1084,16 @@ module attributes {
       scf.yield %inner : i64
     }
     memref.store %new_pos, %self[%pos_slot] : memref<8xi64>
-    %result:3 = func.call @LyLong_FromI64(%new_pos) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%new_pos) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
-  func.func @LyStringIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyStringIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
     %pos_slot = arith.constant 5 : index
     func.call @__ly_membuf_check_open(%self) : (memref<8xi64>) -> ()
     %pos = memref.load %self[%pos_slot] : memref<8xi64>
-    %result:3 = func.call @LyLong_FromI64(%pos) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%pos) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyStringIO_DecRef(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_io.StringIO", ly.runtime.deallocator} {
@@ -1122,14 +1122,14 @@ module attributes {
   }
 
   // write() returns the byte count (bytesio.c).
-  func.func @LyBytesIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %bytes_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.ownership.owned_result_contracts = ["builtins.int"], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytesIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %bytes_header: memref<6xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.ownership.owned_result_contracts = ["builtins.int"], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
     %bytes_payload = func.call @__ly_bytes_payload(%bytes_header) : (memref<6xi64>) -> memref<?xi8>
     %c0 = arith.constant 0 : index
     %dim = memref.dim %bytes_payload, %c0 : memref<?xi8>
     %length = arith.index_cast %dim : index to i64
     func.call @__ly_membuf_write(%self, %bytes_payload, %length) : (memref<8xi64>, memref<?xi8>, i64) -> ()
-    %result:3 = func.call @LyLong_FromI64(%length) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%length) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyBytesIO_GetValue(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "getvalue", ly.runtime.result_contract = "builtins.bytes"} {
@@ -1174,10 +1174,10 @@ module attributes {
     func.return %header : memref<6xi64>
   }
 
-  func.func @LyBytesIO_Truncate(%self: memref<8xi64> {ly.ownership.object_header}, %size: i64 {ly.runtime.default_i64 = -9223372036854775808 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "truncate", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytesIO_Truncate(%self: memref<8xi64> {ly.ownership.object_header}, %size: i64 {ly.runtime.default_i64 = -9223372036854775808 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "truncate", ly.runtime.result_contract = "builtins.int"} {
     %effective = func.call @__ly_membuf_truncate(%self, %size) : (memref<8xi64>, i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%effective) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%effective) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyBytesIO_Seekable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "seekable", ly.runtime.result_contract = "builtins.bool"} {
@@ -1202,7 +1202,7 @@ module attributes {
 
   // bytesio.c seek: cur-/end-relative seeks take arbitrary offsets; the
   // resulting position just must not be negative.
-  func.func @LyBytesIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %pos: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytesIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %pos: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
     %len_slot = arith.constant 3 : index
     %pos_slot = arith.constant 5 : index
     %zero = arith.constant 0 : i64
@@ -1230,16 +1230,16 @@ module attributes {
       func.call @__ly_io_raise_neg_seek() : () -> ()
     }
     memref.store %candidate, %self[%pos_slot] : memref<8xi64>
-    %result:3 = func.call @LyLong_FromI64(%candidate) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%candidate) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
-  func.func @LyBytesIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyBytesIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
     %pos_slot = arith.constant 5 : index
     func.call @__ly_membuf_check_open(%self) : (memref<8xi64>) -> ()
     %pos = memref.load %self[%pos_slot] : memref<8xi64>
-    %result:3 = func.call @LyLong_FromI64(%pos) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%pos) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyBytesIO_DecRef(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_io.BytesIO", ly.runtime.deallocator} {
@@ -1392,7 +1392,7 @@ module attributes {
   }
 
   // write() returns the byte count reported by the raw write.
-  func.func @LyFileIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %bytes_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyFileIO_Write(%self: memref<8xi64> {ly.ownership.object_header}, %bytes_header: memref<6xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "write", ly.runtime.result_contract = "builtins.int"} {
     %bytes_payload = func.call @__ly_bytes_payload(%bytes_header) : (memref<6xi64>) -> memref<?xi8>
     %handle_slot = arith.constant 2 : index
     %writable_slot = arith.constant 5 : index
@@ -1408,11 +1408,11 @@ module attributes {
     %dim = memref.dim %bytes_payload, %c0 : memref<?xi8>
     %length = arith.index_cast %dim : index to i64
     %written = func.call @LyHost_FWrite(%handle, %bytes_payload, %length) : (i64, memref<?xi8>, i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%written) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%written) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
-  func.func @LyFileIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %pos: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyFileIO_Seek(%self: memref<8xi64> {ly.ownership.object_header}, %pos: i64, %whence: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "seek", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -1432,17 +1432,17 @@ module attributes {
     %whence32 = arith.trunci %whence : i64 to i32
     %status = func.call @LyHost_FSeek(%handle, %pos, %whence32) : (i64, i64, i32) -> i32
     %where = func.call @LyHost_FTell(%handle) : (i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%where) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%where) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
-  func.func @LyFileIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyFileIO_Tell(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "tell", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     func.call @__ly_textio_check_open(%self) : (memref<8xi64>) -> ()
     %handle = memref.load %self[%handle_slot] : memref<8xi64>
     %where = func.call @LyHost_FTell(%handle) : (i64) -> i64
-    %result:3 = func.call @LyLong_FromI64(%where) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%where) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyFileIO_Close(%self: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_io.FileIO", ly.runtime.method = "close", ly.runtime.result_contract = "types.NoneType"} {
@@ -1464,14 +1464,14 @@ module attributes {
     func.return
   }
 
-  func.func @LyFileIO_Fileno(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "fileno", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyFileIO_Fileno(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "fileno", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     func.call @__ly_textio_check_open(%self) : (memref<8xi64>) -> ()
     %handle = memref.load %self[%handle_slot] : memref<8xi64>
     %fd32 = func.call @LyHost_Fileno(%handle) : (i64) -> i32
     %fd = arith.extsi %fd32 : i32 to i64
-    %result:3 = func.call @LyLong_FromI64(%fd) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%fd) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyFileIO_Readable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.FileIO", ly.runtime.method = "readable", ly.runtime.result_contract = "builtins.bool"} {
@@ -1492,7 +1492,7 @@ module attributes {
 
   // truncate(size=None): flush, then ftruncate through the fd; the default
   // (INT64_MIN sentinel) truncates at the current position like fileio.c.
-  func.func @LyFileIO_Truncate(%self: memref<8xi64> {ly.ownership.object_header}, %size: i64 {ly.runtime.default_i64 = -9223372036854775808 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "truncate", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyFileIO_Truncate(%self: memref<8xi64> {ly.ownership.object_header}, %size: i64 {ly.runtime.default_i64 = -9223372036854775808 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "truncate", ly.runtime.result_contract = "builtins.int"} {
     %handle_slot = arith.constant 2 : index
     %writable_slot = arith.constant 5 : index
     %zero = arith.constant 0 : i64
@@ -1512,8 +1512,8 @@ module attributes {
       func.call @__ly_io_raise_neg_size() : () -> ()
     }
     %status = func.call @LyHost_FTruncate(%handle, %effective) : (i64, i64) -> i32
-    %result:3 = func.call @LyLong_FromI64(%effective) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%effective) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   func.func @LyFileIO_Seekable(%self: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_io.FileIO", ly.runtime.method = "seekable", ly.runtime.result_contract = "builtins.bool"} {

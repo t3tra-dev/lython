@@ -99,7 +99,7 @@ module attributes {
   func.func private @LyCoroutine_ResumeBegin(%storage: memref<5xi64> {ly.ownership.object_header}) -> i1
   func.func private @LyCoroutine_ResumeComplete(%storage: memref<5xi64> {ly.ownership.object_header})
   func.func private @LyCoroutine_DecRef(%storage: memref<5xi64> {ly.ownership.object_header})
-  func.func private @LyLong_FromI64(%value: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_New(%class_id: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
@@ -694,14 +694,14 @@ module attributes {
     func.return %cancelled : i1
   }
 
-  func.func @LyTask_Cancelling(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancelling", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTask_Cancelling(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancelling", ly.runtime.result_contract = "builtins.int"} {
     %cancel_requests_slot = arith.constant 3 : index
     %requests = memref.load %task[%cancel_requests_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.cancel.requests.load"} : memref<12xi64>
-    %header, %meta, %digits = func.call @LyLong_FromI64(%requests) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %header = func.call @LyLong_FromI64(%requests) : (i64) -> memref<2xi64>
+    func.return %header : memref<2xi64>
   }
 
-  func.func @LyTask_Uncancel(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "uncancel", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTask_Uncancel(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "uncancel", ly.runtime.result_contract = "builtins.int"} {
     %cancel_requests_slot = arith.constant 3 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -715,8 +715,8 @@ module attributes {
     %had_request = arith.cmpi sgt, %previous, %zero : i64
     %decremented = arith.subi %previous, %one : i64
     %remaining = arith.select %had_request, %decremented, %previous : i1, i64
-    %header, %meta, %digits = func.call @LyLong_FromI64(%remaining) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %header, %meta, %digits : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %header = func.call @LyLong_FromI64(%remaining) : (i64) -> memref<2xi64>
+    func.return %header : memref<2xi64>
   }
 
   func.func @LyTask_GetCoro(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "get_coro", ly.runtime.result_contract = "types.CoroutineType", ly.runtime.result_evidence = "receiver"} {

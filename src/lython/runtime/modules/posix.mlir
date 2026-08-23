@@ -122,7 +122,7 @@ module attributes {
   ly.typing.int_constant_values = [0 : i64, 4 : i64, 2 : i64, 1 : i64]
 } {
   // --- shared runtime entry points -----------------------------------------
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_Encode(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "encode", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_DecRef(%header: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
@@ -321,49 +321,49 @@ module attributes {
   }
 
   // --- process identity ----------------------------------------------------
-  func.func @LyPosix_GetPid() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getpid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getpid", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_GetPid() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getpid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getpid", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyHost_GetPid() : () -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyPosix_GetPPid() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getppid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getppid", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_GetPPid() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getppid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getppid", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyHost_GetPPid() : () -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyPosix_GetUid() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getuid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getuid", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_GetUid() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getuid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getuid", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyHost_GetUid() : () -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyPosix_GetEUid() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.geteuid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_geteuid", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_GetEUid() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.geteuid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_geteuid", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyHost_GetEUid() : () -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyPosix_GetGid() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getgid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getgid", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_GetGid() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getgid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getgid", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyHost_GetGid() : () -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyPosix_GetEGid() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getegid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getegid", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_GetEGid() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.getegid", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_getegid", ly.runtime.result_contract = "builtins.int"} {
     %value = func.call @LyHost_GetEGid() : () -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   // --- errno surface -------------------------------------------------------
 
-  func.func @LyPosix_Strerror(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.strerror", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_strerror", ly.runtime.result_contract = "builtins.str"} {
+  func.func @LyPosix_Strerror(%header: memref<2xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix.strerror", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_strerror", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
     %cap_index = arith.constant 256 : index
     %cap = arith.constant 256 : i64
-    %code64 = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %code64 = func.call @LyLong_AsI64(%header) : (memref<2xi64>) -> i64
     %code = arith.trunci %code64 : i64 to i32
     %buffer = memref.alloc(%cap_index) : memref<?xi8>
     %len = func.call @LyHost_Strerror(%code, %buffer, %cap) : (i32, memref<?xi8>, i64) -> i64
@@ -372,11 +372,11 @@ module attributes {
     memref.dealloc %buffer : memref<?xi8>
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
-  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
+  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
 
-  func.func @LyPosix_RaiseErrno(%code_header: memref<2xi64> {ly.ownership.object_header}, %code_meta: memref<2xi64>, %code_digits: memref<?xi32>, %path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix._raise_errno", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_raise_errno", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyPosix_RaiseErrno(%code_header: memref<2xi64> {ly.ownership.object_header}, %path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>) attributes {ly.runtime.builtin = "posix._raise_errno", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "posix_raise_errno", ly.runtime.result_contract = "types.NoneType"} {
     %c0 = arith.constant 0 : index
-    %code64 = func.call @LyLong_AsI64(%code_header, %code_meta, %code_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %code64 = func.call @LyLong_AsI64(%code_header) : (memref<2xi64>) -> i64
     %code = arith.trunci %code64 : i64 to i32
     %enc_header = func.call @LyUnicode_Encode(%path_header, %path_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
     %enc_bytes = func.call @__ly_bytes_payload(%enc_header) : (memref<6xi64>) -> memref<?xi8>
@@ -597,7 +597,7 @@ module attributes {
   // One os.stat_result field, or `-errno`. Never raises: os.path's predicates
   // read st_mode and treat any negative answer as "no such thing", which is
   // CPython's own os.path.exists shape (it swallows OSError).
-  func.func @LyPosix_StatField(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>, %follow: i64, %index: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix._stat_field", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_stat_field", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyPosix_StatField(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>, %follow: i64, %index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "posix._stat_field", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "posix_stat_field", ly.runtime.result_contract = "builtins.int"} {
     %c0 = arith.constant 0 : index
     %c10 = arith.constant 10 : index
     %zero = arith.constant 0 : i64
@@ -628,8 +628,8 @@ module attributes {
       scf.yield %value : i64
     }
     memref.dealloc %fields : memref<?xi64>
-    %h, %m, %d = func.call @LyLong_FromI64(%answer) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%answer) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   // --- directory listing ---------------------------------------------------

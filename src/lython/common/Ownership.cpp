@@ -839,8 +839,22 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
   std::string contract = contracts::runtimeContractName(type);
   if (const RuntimeDeallocator *deallocator =
           findDeallocatorForValueGroup(values, 0, deallocators, contract)) {
-    if (deallocator->inputTypes.size() == values.size() ||
-        deallocator->shapeTypes.size() == values.size()) {
+    // The physical span is the entity's lanes, optionally followed by the raw
+    // (i64, i1) evidence pair a speculable `builtins.int` result trails.
+    //
+    // ⛔ Why NOT compare the lane count alone, which is what stood here: it
+    // resolved a speculable int result only because the int's shape was THREE
+    // lanes and one lane plus the pair is also three. The equality was a width
+    // coincidence, and narrowing the int handle to its header alone took it
+    // away -- every `print(f())` whose `f` returns int through a try/except
+    // stopped being an owned group at all, and the affine verifier said so.
+    auto spansValues = [&](std::size_t lanes) {
+      return lanes == values.size() ||
+             skipPrimitiveReturnEvidence(values, static_cast<unsigned>(lanes),
+                                         type) == values.size();
+    };
+    if (spansValues(deallocator->inputTypes.size()) ||
+        spansValues(deallocator->shapeTypes.size())) {
       ResourceGroup group;
       group.offset = baseOffset;
       group.deallocator = deallocator;

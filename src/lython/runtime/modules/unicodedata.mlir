@@ -47,7 +47,7 @@ module attributes {
   func.func private @__ly_ucd_numeric_value(%idx: i64) -> f64
   func.func private @__ly_ucd_category_char(%cat: i64, %j: i64) -> i64
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
@@ -129,7 +129,7 @@ module attributes {
     func.return %out_header : memref<3xi64>
   }
 
-  func.func @LyUnicodeData_Decimal(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "unicodedata.decimal", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "ucd_decimal", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicodeData_Decimal(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "unicodedata.decimal", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "ucd_decimal", ly.runtime.result_contract = "builtins.int"} {
     %minus_one = arith.constant -1 : i64
     %cp = func.call @__ly_ucd_single_cp(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
@@ -141,11 +141,11 @@ module attributes {
       %message = memref.cast %static : memref<13xi8> to memref<?xi8>
       func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
-    %result:3 = func.call @LyLong_FromI64(%decimal) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%decimal) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
-  func.func @LyUnicodeData_Digit(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "unicodedata.digit", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "ucd_digit", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicodeData_Digit(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "unicodedata.digit", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "ucd_digit", ly.runtime.result_contract = "builtins.int"} {
     %minus_one = arith.constant -1 : i64
     %cp = func.call @__ly_ucd_single_cp(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %upper, %lower, %fold, %title, %decimal, %digit, %flags = func.call @__ly_ucd_ctype(%cp) : (i64) -> (i64, i64, i64, i64, i64, i64, i64)
@@ -157,8 +157,8 @@ module attributes {
       %message = memref.cast %static : memref<11xi8> to memref<?xi8>
       func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
-    %result:3 = func.call @LyLong_FromI64(%digit) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %result#0, %result#1, %result#2 : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %result = func.call @LyLong_FromI64(%digit) : (i64) -> memref<2xi64>
+    func.return %result : memref<2xi64>
   }
 
   // ---- full case mapping helpers ----

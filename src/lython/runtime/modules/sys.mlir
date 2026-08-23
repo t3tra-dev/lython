@@ -71,7 +71,7 @@ module attributes {
     "short"
   ]
 } {
-  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
+  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
   func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
   func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
@@ -100,7 +100,7 @@ module attributes {
   }
   func.func private @LySystemExit_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 64 : i64, ly.runtime.contract = "builtins.SystemExit", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
-  func.func private @__ly_systemexit_set_code(memref<3xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code"}
+  func.func private @__ly_systemexit_set_code(memref<3xi64>, memref<2xi64>) attributes {ly.runtime.contract = "builtins.SystemExit", ly.runtime.primitive = "set_code"}
 
   // sys.argv builds a fresh list[str] from the process argument vector that
   // LyHost_InitArgs recorded before the program body ran. Each element is an
@@ -179,10 +179,10 @@ module attributes {
   // SystemExit with an empty message; LyRunPythonMain reads the slot back as the
   // process exit status. The status used to travel in a process global, which is
   // why two SystemExits in flight could not each carry their own.
-  func.func @LySys_Exit(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) attributes {ly.runtime.builtin = "sys.exit", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "sys_exit", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LySys_Exit(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.runtime.builtin = "sys.exit", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "sys_exit", ly.runtime.result_contract = "types.NoneType"} {
     %class_id = arith.constant 64 : i64
     %exception:3 = func.call @LySystemExit_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    func.call @__ly_systemexit_set_code(%exception#0, %header, %meta, %digits) : (memref<3xi64>, memref<2xi64>, memref<2xi64>, memref<?xi32>) -> ()
+    func.call @__ly_systemexit_set_code(%exception#0, %header) : (memref<3xi64>, memref<2xi64>) -> ()
     func.call @LyEH_ThrowException(%exception#0, %exception#1, %exception#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }

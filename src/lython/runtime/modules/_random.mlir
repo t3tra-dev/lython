@@ -72,8 +72,8 @@ module attributes {
   ]
 } {
   // --- shared runtime entry points -----------------------------------------
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
-  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
@@ -354,13 +354,13 @@ module attributes {
 
   // --- public surface ------------------------------------------------------
 
-  func.func @LyRandom_Seed(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) attributes {ly.runtime.builtin = "_random.seed", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_seed", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyRandom_Seed(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.runtime.builtin = "_random.seed", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_seed", ly.runtime.result_contract = "types.NoneType"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
     %mask = arith.constant 4294967295 : i64
     %thirtytwo = arith.constant 32 : i64
-    %value = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %value = func.call @LyLong_AsI64(%header) : (memref<2xi64>) -> i64
     // CPython seeds from abs(a): the sign carries no entropy.
     %negative = arith.cmpi slt, %value, %zero : i64
     %negated = arith.subi %zero, %value : i64
@@ -425,10 +425,10 @@ module attributes {
     func.return %value : i64
   }
 
-  func.func @LyRandom_GetRandBits(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.getrandbits", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_getrandbits", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyRandom_GetRandBits(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.getrandbits", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_getrandbits", ly.runtime.result_contract = "builtins.int"} {
     %zero = arith.constant 0 : i64
     %sixtythree = arith.constant 63 : i64
-    %k = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %k = func.call @LyLong_AsI64(%header) : (memref<2xi64>) -> i64
     %too_small = arith.cmpi slt, %k, %zero : i64
     %too_big = arith.cmpi sgt, %k, %sixtythree : i64
     %invalid = arith.ori %too_small, %too_big : i1
@@ -436,8 +436,8 @@ module attributes {
       func.call @__ly_random_raise_bits() : () -> ()
     }
     %value = func.call @__ly_random_bits(%k) : (i64) -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   // CPython's _randbelow_with_getrandbits, which is Python in Lib/random.py.
@@ -487,21 +487,21 @@ module attributes {
     func.return %value : i64
   }
 
-  func.func @LyRandom_RandBelow(%header: memref<2xi64> {ly.ownership.object_header}, %meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.randbelow", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_randbelow", ly.runtime.result_contract = "builtins.int"} {
-    %n = func.call @LyLong_AsI64(%header, %meta, %digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+  func.func @LyRandom_RandBelow(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.randbelow", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_randbelow", ly.runtime.result_contract = "builtins.int"} {
+    %n = func.call @LyLong_AsI64(%header) : (memref<2xi64>) -> i64
     %value = func.call @__ly_random_below(%n) : (i64) -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   // CPython 3.14's Random.randint: `a + self._randbelow(b - a + 1)`, drawn
   // WITHOUT going through randrange. It is native for the same reason
   // randbelow is: the Python spelling in an imported module consumed a second
   // draw, so the answer was silently the wrong one.
-  func.func @LyRandom_RandInt(%a_header: memref<2xi64> {ly.ownership.object_header}, %a_meta: memref<2xi64>, %a_digits: memref<?xi32>, %b_header: memref<2xi64> {ly.ownership.object_header}, %b_meta: memref<2xi64>, %b_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.randint", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_randint", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyRandom_RandInt(%a_header: memref<2xi64> {ly.ownership.object_header}, %b_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_random.randint", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "random_randint", ly.runtime.result_contract = "builtins.int"} {
     %one = arith.constant 1 : i64
-    %a = func.call @LyLong_AsI64(%a_header, %a_meta, %a_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
-    %b = func.call @LyLong_AsI64(%b_header, %b_meta, %b_digits) : (memref<2xi64>, memref<2xi64>, memref<?xi32>) -> i64
+    %a = func.call @LyLong_AsI64(%a_header) : (memref<2xi64>) -> i64
+    %b = func.call @LyLong_AsI64(%b_header) : (memref<2xi64>) -> i64
     %span = arith.subi %b, %a : i64
     %width = arith.addi %span, %one : i64
     %empty = arith.cmpi slt, %b, %a : i64
@@ -510,8 +510,8 @@ module attributes {
     }
     %drawn = func.call @__ly_random_below(%width) : (i64) -> i64
     %value = arith.addi %a, %drawn : i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   // The cached second Box-Muller deviate. NaN means "nothing cached", which is

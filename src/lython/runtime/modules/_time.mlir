@@ -80,7 +80,7 @@ module attributes {
   ]
 } {
   // --- shared runtime entry points -----------------------------------------
-  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
@@ -168,25 +168,25 @@ module attributes {
 
   // --- clocks --------------------------------------------------------------
 
-  func.func @LyTime_TimeNs() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.time_ns", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_time_ns", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTime_TimeNs() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.time_ns", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_time_ns", ly.runtime.result_contract = "builtins.int"} {
     %realtime = arith.constant 0 : i64
     %value = func.call @LyHost_ClockNs(%realtime) : (i64) -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyTime_MonotonicNs() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.monotonic_ns", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_monotonic_ns", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTime_MonotonicNs() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.monotonic_ns", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_monotonic_ns", ly.runtime.result_contract = "builtins.int"} {
     %monotonic = arith.constant 1 : i64
     %value = func.call @LyHost_ClockNs(%monotonic) : (i64) -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
-  func.func @LyTime_PerfCounterNs() -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.perf_counter_ns", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_perf_counter_ns", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTime_PerfCounterNs() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.perf_counter_ns", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_perf_counter_ns", ly.runtime.result_contract = "builtins.int"} {
     %monotonic = arith.constant 1 : i64
     %value = func.call @LyHost_ClockNs(%monotonic) : (i64) -> i64
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   func.func @LyTime_Time() -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.time", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "time_time", ly.runtime.result_contract = "builtins.float"} {
@@ -245,7 +245,7 @@ module attributes {
   // tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst
   // (raw libc values -- tm_mon 0-based, tm_year since 1900) and index 9 is
   // tm_gmtoff. `utc` picks gmtime_r over localtime_r.
-  func.func @LyTime_Field(%seconds: i64, %utc: i64, %index: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.field", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_field", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTime_Field(%seconds: i64, %utc: i64, %index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.field", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_field", ly.runtime.result_contract = "builtins.int"} {
     %c10 = arith.constant 10 : index
     %zero32 = arith.constant 0 : i32
     %zero = arith.constant 0 : i64
@@ -261,13 +261,13 @@ module attributes {
     %slot = arith.index_cast %clamped : i64 to index
     %value = memref.load %fields[%slot] : memref<?xi64>
     memref.dealloc %fields : memref<?xi64>
-    %h, %m, %d = func.call @LyLong_FromI64(%value) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   // The inverse: local-time epoch seconds from the nine raw fields. isdst
   // passes through, so -1 asks the platform to guess as CPython's mktime does.
-  func.func @LyTime_Mktime(%sec: i64, %min: i64, %hour: i64, %mday: i64, %mon: i64, %year: i64, %wday: i64, %yday: i64, %isdst: i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.mktime", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_mktime", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTime_Mktime(%sec: i64, %min: i64, %hour: i64, %mday: i64, %mon: i64, %year: i64, %wday: i64, %yday: i64, %isdst: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.mktime", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "time_mktime", ly.runtime.result_contract = "builtins.int"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -295,8 +295,8 @@ module attributes {
     scf.if %failed {
       func.call @__ly_time_raise_bad_time() : () -> ()
     }
-    %h, %m, %d = func.call @LyLong_FromI64(%seconds) : (i64) -> (memref<2xi64>, memref<2xi64>, memref<?xi32>)
-    func.return %h, %m, %d : memref<2xi64>, memref<2xi64>, memref<?xi32>
+    %h = func.call @LyLong_FromI64(%seconds) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 
   func.func @LyTime_Strftime(%fmt_header: memref<2xi64> {ly.ownership.object_header}, %fmt_bytes: memref<?xi8>, %sec: i64, %min: i64, %hour: i64, %mday: i64, %mon: i64, %year: i64, %wday: i64, %yday: i64, %isdst: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_time.strftime", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "time_strftime", ly.runtime.result_contract = "builtins.str"} {
