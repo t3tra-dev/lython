@@ -1701,6 +1701,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIter(py::IterOp op) {
       // changes during iteration, while list iteration legally re-checks the
       // live length each step.
       bool guardsMutation = runtimeDictIterable || runtimeSetIterable;
+      // ⭐ A set's dense array is not in its table's order until it is asked
+      // for: `__ly_set_raw_place` appends, because keeping the array sorted
+      // under insertion is what made `set.add` linear. The walk below reads
+      // the array straight, so the order has to be restored before it starts.
+      // Once per iterator, not once per step -- CPython walks its table once
+      // per iteration too.
+      if (runtimeSetIterable) {
+        std::optional<RuntimeSymbol> reorder =
+            manifest.primitive(iterable->contractName(), "reorder");
+        if (!reorder)
+          return op.emitError()
+                 << "set iteration needs a `reorder` primitive on "
+                 << iterable->contractName();
+        builder.setInsertionPoint(op);
+        llvm::SmallVector<mlir::Value, 2> operands(
+            iterable->physicalValues().begin(),
+            iterable->physicalValues().end());
+        RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *reorder,
+                                                operands);
+      }
       mlir::Value cell;
       {
         mlir::OpBuilder::InsertionGuard guard(builder);

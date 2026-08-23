@@ -21194,6 +21194,10 @@ module attributes {
 
   func.func @LySet_Repr(%self: memref<11xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.set", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
+    // The printed order is the TABLE's, and an append leaves the dense array
+    // out of that order until this runs.
+    %raw_order = memref.cast %self : memref<11xi64> to memref<?xi64>
+    func.call @__ly_set_raw_reorder(%raw_order) : (memref<?xi64>) -> ()
     %c1_i64 = arith.constant 1 : i64
     %c5_i64 = arith.constant 5 : i64
     %zero = arith.constant 0 : i64
@@ -21221,6 +21225,10 @@ module attributes {
 
   func.func @LyFrozenSet_Repr(%self: memref<13xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
     %c0 = arith.constant 0 : index
+    // The printed order is the TABLE's, and an append leaves the dense array
+    // out of that order until this runs.
+    %raw_order = memref.cast %self : memref<13xi64> to memref<?xi64>
+    func.call @__ly_set_raw_reorder(%raw_order) : (memref<?xi64>) -> ()
     %c1_i64 = arith.constant 1 : i64
     %c11_i64 = arith.constant 11 : i64
     %zero = arith.constant 0 : i64
@@ -21933,50 +21941,25 @@ module attributes {
     %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
     %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
     %mask = memref.load %self[%mask_slot] : memref<?xi64>
-    // The rank is the dense index of the first live slot after %slot; every
-    // live slot after it is displaced by one.
-    %tail_first = arith.addi %slot, %one : i64
-    %tail_start = arith.index_cast %tail_first : i64 to index
-    %slots = arith.addi %mask, %one : i64
-    %slots_index = arith.index_cast %slots : i64 to index
-    %scanned = scf.for %s = %tail_start to %slots_index step %c1
-        iter_args(%r = %minus_one) -> (i64) {
-      %ss = arith.index_cast %s : index to i64
-      %state_off = arith.muli %ss, %two : i64
-      %state_index = arith.index_cast %state_off : i64 to index
-      %state = memref.load %table[%state_index] : memref<?xi64>
-      %live = arith.cmpi sge, %state, %two : i64
-      %next = scf.if %live -> (i64) {
-        %dense = arith.subi %state, %two : i64
-        %first = arith.cmpi eq, %r, %minus_one : i64
-        %rank = arith.select %first, %dense, %r : i1, i64
-        %bumped = arith.addi %state, %one : i64
-        memref.store %bumped, %table[%state_index] : memref<?xi64>
-        scf.yield %rank : i64
-      } else {
-        scf.yield %r : i64
-      }
-      scf.yield %next : i64
-    }
-    %none_after = arith.cmpi eq, %scanned, %minus_one : i64
-    %rank = arith.select %none_after, %used, %scanned : i1, i64
-    // Shift the dense tail up one entry, highest first.
+    // ⭐ APPEND, and let the ORDER be recovered later.
+    //
+    // What stood here kept the dense array in TABLE-SLOT order, so that
+    // iteration and repr could walk it straight and come out in the order
+    // CPython's set_next hands entries back. Holding a sorted array under
+    // insertion costs a scan of the table to find the rank (and to bump every
+    // live index after it) and a memmove of the dense tail: O(n) per add, so
+    // building a set was quadratic -- 32,000 elements took 673 ms against
+    // CPython 3.14's 17.6 ms.
+    //
+    // The entry now goes at the end and word 8 records that the dense order no
+    // longer matches the table's. `__ly_set_raw_reorder` restores it, once, in
+    // front of the two things that can observe it: repr, and the creation of an
+    // iterator. That is the same walk CPython does per iteration anyway, moved
+    // off the insert.
+    %order_slot = arith.constant 8 : index
+    %rank = arith.addi %used, %zero : i64
     %rank_index = arith.index_cast %rank : i64 to index
-    %used_index = arith.index_cast %used : i64 to index
-    %shift_count = arith.subi %used_index, %rank_index : index
-    scf.for %n = %c0 to %shift_count step %c1 {
-      %back = arith.subi %shift_count, %n : index
-      %src_entry = arith.addi %rank_index, %back : index
-      %src_prev = arith.subi %src_entry, %c1 : index
-      %src_base = arith.muli %src_prev, %c16 : index
-      %dst_base = arith.muli %src_entry, %c16 : index
-      scf.for %w = %c0 to %c16 step %c1 {
-        %src = arith.addi %src_base, %w : index
-        %dst = arith.addi %dst_base, %w : index
-        %word = memref.load %items[%src] : memref<?xi64>
-        memref.store %word, %items[%dst] : memref<?xi64>
-      }
-    }
+    memref.store %one, %self[%order_slot] : memref<?xi64>
     %src_base_i64 = arith.muli %src_slot, %c16_i64 : i64
     %src_base = arith.index_cast %src_base_i64 : i64 to index
     %dst_base = arith.muli %rank_index, %c16 : index
@@ -22013,6 +21996,93 @@ module attributes {
       }
     }
     func.return %entity : i64
+  }
+
+  // Rewrite the dense array in TABLE-SLOT order and renumber the states, once,
+  // when the order flag says an append left it out of order. This is the walk
+  // CPython's set_next does per iteration; doing it here rather than per insert
+  // is what makes `set.add` O(1).
+  //
+  // Why a scratch array rather than an in-place permutation: the permutation is
+  // a set of cycles over 16-word blocks, and following them in place needs a
+  // block of scratch anyway plus a visited bitmap. One pass through a scratch
+  // copy is the same asymptotics and no bookkeeping.
+  func.func private @__ly_set_raw_reorder(%self: memref<?xi64>) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
+    %c16_i64 = arith.constant 16 : i64
+    %capacity_slot = arith.constant 3 : index
+    %mask_slot = arith.constant 6 : index
+    %order_slot = arith.constant 8 : index
+    %flag = memref.load %self[%order_slot] : memref<?xi64>
+    %stale = arith.cmpi ne, %flag, %zero : i64
+    scf.if %stale {
+      %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
+      %table = func.call @__ly_set_raw_table(%self) : (memref<?xi64>) -> memref<?xi64>
+      %mask = memref.load %self[%mask_slot] : memref<?xi64>
+      %capacity = memref.load %self[%capacity_slot] : memref<?xi64>
+      %words = arith.muli %capacity, %c16_i64 : i64
+      %words_index = arith.index_cast %words : i64 to index
+      %scratch = memref.alloc(%words_index) : memref<?xi64>
+      %slots = arith.addi %mask, %one : i64
+      %slots_index = arith.index_cast %slots : i64 to index
+      %placed = scf.for %s = %c0 to %slots_index step %c1 iter_args(%n = %zero) -> (i64) {
+        %ss = arith.index_cast %s : index to i64
+        %state_off = arith.muli %ss, %two : i64
+        %state_index = arith.index_cast %state_off : i64 to index
+        %state = memref.load %table[%state_index] : memref<?xi64>
+        %live = arith.cmpi sge, %state, %two : i64
+        %next = scf.if %live -> (i64) {
+          %dense = arith.subi %state, %two : i64
+          %src_base_i64 = arith.muli %dense, %c16_i64 : i64
+          %src_base = arith.index_cast %src_base_i64 : i64 to index
+          %dst_base_i64 = arith.muli %n, %c16_i64 : i64
+          %dst_base = arith.index_cast %dst_base_i64 : i64 to index
+          scf.for %w = %c0 to %c16 step %c1 {
+            %src = arith.addi %src_base, %w : index
+            %dst = arith.addi %dst_base, %w : index
+            %word = memref.load %items[%src] : memref<?xi64>
+            memref.store %word, %scratch[%dst] : memref<?xi64>
+          }
+          %new_state = arith.addi %n, %two : i64
+          memref.store %new_state, %table[%state_index] : memref<?xi64>
+          %bumped = arith.addi %n, %one : i64
+          scf.yield %bumped : i64
+        } else {
+          scf.yield %n : i64
+        }
+        scf.yield %next : i64
+      }
+      %used_words_i64 = arith.muli %placed, %c16_i64 : i64
+      %used_words = arith.index_cast %used_words_i64 : i64 to index
+      scf.for %w = %c0 to %used_words step %c1 {
+        %word = memref.load %scratch[%w] : memref<?xi64>
+        memref.store %word, %items[%w] : memref<?xi64>
+      }
+      %scratch_index = memref.extract_aligned_pointer_as_index %scratch : memref<?xi64> -> index
+      %scratch_word = arith.index_cast %scratch_index : index to i64
+      func.call @free_raw_i64_ptr(%scratch_word) : (i64) -> ()
+      memref.store %zero, %self[%order_slot] : memref<?xi64>
+    }
+    func.return
+  }
+
+  // The reorder as a contract primitive, so the lowering can ask for it where
+  // it builds a set iterator (it walks the dense array itself from there).
+  func.func @LySet_Reorder(%self: memref<11xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.set", ly.runtime.primitive = "reorder"} {
+    %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
+    func.call @__ly_set_raw_reorder(%raw) : (memref<?xi64>) -> ()
+    func.return
+  }
+
+  func.func @LyFrozenSet_Reorder(%self: memref<13xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.primitive = "reorder"} {
+    %raw = memref.cast %self : memref<13xi64> to memref<?xi64>
+    func.call @__ly_set_raw_reorder(%raw) : (memref<?xi64>) -> ()
+    func.return
   }
 
   // set_discard_entry's write half: the slot becomes a dummy (so the probe
@@ -22447,7 +22517,10 @@ module attributes {
   // holding the receiver's, so releasing it frees what the receiver dropped.
   func.func private @__ly_set_raw_swap_bodies(%lhs: memref<?xi64>, %rhs: memref<?xi64>) {
     %c2 = arith.constant 2 : index
-    %c8 = arith.constant 8 : index
+    // Through word 8, which is the dense array's order flag: it belongs to the
+    // payload it describes, so a body swap that left it behind would tell one
+    // handle the other's array is in order.
+    %c8 = arith.constant 9 : index
     %c1 = arith.constant 1 : index
     scf.for %w = %c2 to %c8 step %c1 {
       %l = memref.load %lhs[%w] : memref<?xi64>
@@ -22703,6 +22776,12 @@ module attributes {
   // byte-identical; going through a bulk fill of the dense array instead would
   // give the copy no table at all.
   func.func private @__ly_set_copy_alloc(%src: memref<?xi64>) -> memref<11xi64> attributes {ly.ownership.owned_results = [0]} {
+    // The merge below can take the source's table and dense array VERBATIM,
+    // which copies whatever order the source is in; every other path rebuilds
+    // the order through `place` and gets it back at the next repr. So the
+    // source is put in order first, and the copy inherits one that is already
+    // right.
+    func.call @__ly_set_raw_reorder(%src) : (memref<?xi64>) -> ()
     %zero = arith.constant 0 : i64
     %self = func.call @__ly_set_alloc(%zero) : (i64) -> memref<11xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
