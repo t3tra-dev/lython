@@ -674,8 +674,22 @@ void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
       if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(user))
         for (mlir::Value result : cast.getResults())
           if (mlir::isa<mlir::MemRefType>(result.getType()) &&
-              known.insert(result).second)
+              known.insert(result).second) {
             views.push_back(result);
+            // ⭐ AND THE WALK IS TRANSITIVE, because a block reached through the
+            // handle can hold the address of another one. A source class
+            // instance is exactly that: the handle's body word names the block
+            // its fields live in, and a box-fronted field's payload is named by
+            // a word of THAT block. Seeding only from the handle collected the
+            // body and stopped, so the payload view pinned nothing and the
+            // release planner put `__ly_dealloc_C` between the last body load
+            // and the retain that the read owes -- the field's str was freed
+            // and then Ly_IncRef'd.
+            for (mlir::Operation *nested : result.getUsers())
+              if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(nested))
+                if (load.getMemRef() == result)
+                  worklist.push_back(load.getResult());
+          }
     }
   }
 }

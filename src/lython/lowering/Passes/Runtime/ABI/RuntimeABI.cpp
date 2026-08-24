@@ -1291,17 +1291,54 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
                            << objectShape->valueTypes.front();
 
   mlir::Location loc = op->getLoc();
-  llvm::SmallVector<std::int64_t, 1> shape(headerType.getShape().begin(),
-                                           headerType.getShape().end());
-  mlir::MemRefType allocType = mlir::MemRefType::get(
-      shape, headerType.getElementType(), mlir::MemRefLayoutAttrInterface{},
-      headerType.getMemorySpace());
-  mlir::Value allocated =
-      mlir::memref::AllocOp::create(builder, loc, allocType).getResult();
-  mlir::Value header = allocated;
-  if (allocated.getType() != headerType)
-    header = mlir::memref::CastOp::create(builder, loc, headerType, allocated)
-                 .getResult();
+  // ⭐ ONE ALLOCATION: the handle's words, then the body every field's storage
+  // lives in. `__ly_unicode_alloc` shapes a str the same way (header view,
+  // width word, code units) and `LyUnicode_DecRef` frees it through the header
+  // view, which is what lets the synthesized deallocator do the same here.
+  //
+  // Why NOT a second allocation for the body: it would be one malloc per
+  // instance on top of the header's, where this is none -- and the boxes it
+  // holds used to be a malloc EACH.
+  std::int64_t headerWords = headerType.getDimSize(0);
+  unsigned bodyWords = RuntimeBundleLowerer::classInstanceBodyWords(classOp);
+  mlir::Value blockBytes = mlir::arith::ConstantIndexOp::create(
+      builder, loc, (headerWords + static_cast<std::int64_t>(bodyWords)) * 8)
+      .getResult();
+  mlir::Value block =
+      mlir::memref::AllocOp::create(
+          builder, loc,
+          mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                builder.getI8Type()),
+          mlir::ValueRange{blockBytes})
+          .getResult();
+  mlir::Value headerOffset =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  auto headerView = mlir::memref::ViewOp::create(
+      builder, loc, headerType, block, headerOffset, mlir::ValueRange{});
+  // The view IS the allocation as far as ownership is concerned -- the block
+  // has no other owner and the deallocator frees it through this view -- which
+  // `__ly_unicode_alloc` says the same way for the same reason. The frame's
+  // OWN marker is minted where every other one is (OwnedLocalMarker.h); what
+  // the view has to say here is only that these words are an object header.
+  headerView->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());
+  mlir::Value header = headerView.getResult();
+  mlir::Value body;
+  if (bodyWords) {
+    mlir::Value bodyOffset =
+        mlir::arith::ConstantIndexOp::create(builder, loc, headerWords * 8)
+            .getResult();
+    mlir::Value bodyExtent =
+        mlir::arith::ConstantIndexOp::create(builder, loc, bodyWords)
+            .getResult();
+    body = mlir::memref::ViewOp::create(
+               builder, loc,
+               mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                     builder.getI64Type()),
+               block, bodyOffset, mlir::ValueRange{bodyExtent})
+               .getResult();
+    if (mlir::failed(zeroInitializeMemRef(builder, loc, body)))
+      return mlir::failure();
+  }
 
   std::optional<std::int64_t> classId =
       RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
@@ -1311,9 +1348,26 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
   initializeObjectHeader(builder, loc, header, /*refcount=*/1,
                          /*classId=*/*classId);
 
+  // The body address is a WORD of the header, so every reader reaches the
+  // fields the way a container reaches its items -- a load off the handle,
+  // which is the chain `collectBoxWordDerivedViews` follows to pin the entity.
+  mlir::Value bodyWord = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64)
+                             .getResult();
+  if (body) {
+    mlir::Value bodyIndex =
+        mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, body)
+            .getResult();
+    bodyWord = mlir::arith::IndexCastOp::create(builder, loc,
+                                                builder.getI64Type(), bodyIndex)
+                   .getResult();
+  }
+  mlir::Value bodySlot = mlir::arith::ConstantIndexOp::create(
+                             builder, loc, box_abi::kInstanceBodyWord)
+                             .getResult();
+  mlir::memref::StoreOp::create(builder, loc, bodyWord, header, bodySlot);
+
   llvm::SmallVector<mlir::Type, 8> fieldContractTypes =
       RuntimeBundleLowerer::classFieldContractTypes(classOp);
-  mlir::Value zeroI64 = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
   llvm::SmallVector<mlir::Value, 8> values{header};
   for (auto [fieldIndex, fieldType] : llvm::enumerate(fieldContractTypes)) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> storage =
@@ -1321,23 +1375,12 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
             op, fieldType, static_cast<unsigned>(fieldIndex), purpose);
     if (mlir::failed(storage))
       return mlir::failure();
-    // A header-word field's storage IS a word of the allocation above, which
-    // memref.alloc does not zero: initialize it here and take no lane.
-    if (storage->empty()) {
-      mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
-          builder, loc,
-          kPrimitiveFieldSlotBase + static_cast<unsigned>(fieldIndex));
-      mlir::memref::StoreOp::create(builder, loc, zeroI64, header, slotIndex);
+    // Body-word and box-fronted fields take no lane; the body was zeroed above,
+    // which is both the int field's 0 and the box's "owns nothing".
+    if (storage->empty())
       continue;
-    }
-    // Box-fronted fields store a single box16 slot; materialize the dead
-    // placeholder in the STORAGE shape, not the contract's array shape.
-    mlir::Type storageType =
-        RuntimeBundleLowerer::classFieldStoredBoxed(fieldType)
-            ? runtimeContractType(context, "builtins.object")
-            : fieldType;
     mlir::FailureOr<RuntimeValue> fieldValue =
-        RuntimeBundleLowerer::materializeDeadObjectValue(op, storageType,
+        RuntimeBundleLowerer::materializeDeadObjectValue(op, fieldType,
                                                          purpose);
     if (mlir::failed(fieldValue))
       return mlir::failure();
@@ -1471,7 +1514,70 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     mlir::cf::CondBranchOp::create(builder, loc, releaseHeader.getResult(0),
                                    deallocBlock, doneBlock);
 
+    // Every box-fronted field is a slot of the body, so the release is the
+    // container's: hand the block and the slot to the shared helper, which
+    // dispatches the box's class id to the manifest deallocator.
+    //
+    // ⛔ GUARDED ON A NULL BODY. A dead placeholder instance (a union member's
+    // zeroed lane) has a header and no block, so the address is 0 and the walk
+    // would read slot 0 of address 0. The guard is one compare on a path that
+    // already decided the object is dying.
+    unsigned boxedFields =
+        RuntimeBundleLowerer::classBoxedFieldCount(plan.classOp);
+    mlir::Block *fieldsBlock =
+        boxedFields ? plan.function.addBlock() : nullptr;
+    mlir::Block *finishBlock =
+        boxedFields ? plan.function.addBlock() : deallocBlock;
     builder.setInsertionPointToStart(deallocBlock);
+    if (boxedFields) {
+      auto releaseSlot = module.lookupSymbol<mlir::func::FuncOp>(
+          "LyObject_ReleaseBoxedPayloadArraySlotRaw");
+      if (!releaseSlot)
+        return module.emitError() << "source class deallocators require "
+                                     "LyObject_ReleaseBoxedPayloadArraySlotRaw";
+      mlir::Value bodySlot = mlir::arith::ConstantIndexOp::create(
+                                 builder, loc, box_abi::kInstanceBodyWord)
+                                 .getResult();
+      mlir::Value address = mlir::memref::LoadOp::create(
+                                builder, loc, entry->getArgument(0), bodySlot)
+                                .getResult();
+      mlir::Value zeroWord =
+          mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+      mlir::Value present = mlir::arith::CmpIOp::create(
+                                builder, loc, mlir::arith::CmpIPredicate::ne,
+                                address, zeroWord)
+                                .getResult();
+      mlir::cf::CondBranchOp::create(builder, loc, present, fieldsBlock,
+                                     finishBlock);
+
+      builder.setInsertionPointToStart(fieldsBlock);
+      mlir::Value size = mlir::arith::ConstantIntOp::create(
+                             builder, loc,
+                             static_cast<std::int64_t>(
+                                 RuntimeBundleLowerer::classInstanceBodyWords(
+                                     plan.classOp)),
+                             64)
+                             .getResult();
+      mlir::Value body = RuntimeBundleLowerer::memrefFromBoxWords(
+          builder, loc, address, size,
+          mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                builder.getI64Type()));
+      mlir::Type storageType = releaseSlot.getFunctionType().getInput(0);
+      if (body.getType() != storageType)
+        body = mlir::memref::CastOp::create(builder, loc, storageType, body)
+                   .getResult();
+      for (unsigned ordinal = 0; ordinal < boxedFields; ++ordinal) {
+        mlir::Value slot = mlir::arith::ConstantIntOp::create(
+                               builder, loc, static_cast<std::int64_t>(ordinal),
+                               64)
+                               .getResult();
+        mlir::func::CallOp::create(builder, loc, releaseSlot,
+                                   mlir::ValueRange{body, slot});
+      }
+      mlir::cf::BranchOp::create(builder, loc, finishBlock);
+      builder.setInsertionPointToStart(finishBlock);
+    }
+
     for (auto [index, fieldType] : llvm::enumerate(plan.fieldTypes)) {
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> fieldValueTypes =
           RuntimeBundleLowerer::classFieldStorageValueTypes(
@@ -1479,18 +1585,13 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
               "source class field deallocator ABI");
       if (mlir::failed(fieldValueTypes))
         return mlir::failure();
+      if (fieldValueTypes->empty())
+        continue;
       llvm::SmallVector<mlir::Value, 4> fieldValues =
           entryArgumentSlice(*entry, plan.fieldOffsets[index],
                              static_cast<unsigned>(fieldValueTypes->size()));
-      // Box-fronted fields release through the boxed route (the release hook
-      // dispatches the box's class id to the manifest deallocator); the box
-      // itself is the authoritative view of a possibly-reallocated container.
-      mlir::Type releaseType =
-          RuntimeBundleLowerer::classFieldStoredBoxed(fieldType)
-              ? runtimeContractType(context, "builtins.object")
-              : fieldType;
       if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-              plan.function, releaseType, fieldValues, "class.field",
+              plan.function, fieldType, fieldValues, "class.field",
               deallocators, /*depth=*/0)))
         return mlir::failure();
     }

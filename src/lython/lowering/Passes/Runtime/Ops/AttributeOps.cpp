@@ -13,11 +13,6 @@ namespace py::lowering {
 
 namespace {
 
-constexpr unsigned kPrimitiveFieldSlotBase =
-    static_cast<unsigned>(box_abi::kPointerWordBase);
-constexpr unsigned kPrimitiveFieldSlotLimit =
-    static_cast<unsigned>(box_abi::kWordsPerBox);
-
 void appendValueSlice(mlir::ValueRange values, unsigned begin, unsigned count,
                       llvm::SmallVectorImpl<mlir::Value> &out) {
   for (unsigned index = 0; index < count; ++index)
@@ -34,20 +29,16 @@ bool isMethodDescriptorKind(py::AttrGetOp op) {
 }
 
 // int and bool are the contracts whose whole value fits in one i64, so their
-// field storage IS an instance-header word — a heap slot every frame holding
-// the instance reaches through the same pointer. Words [0, 4) are the header's
-// own (refcount, class id, value count), so field i takes word 4 + i and a
-// class with more than kPrimitiveFieldSlotLimit - kPrimitiveFieldSlotBase of
-// them falls back to the contract's own lanes.
-std::optional<unsigned> primitiveFieldSlot(mlir::Type fieldType,
-                                           unsigned fieldIndex) {
+// field storage IS a body word — a heap slot every frame holding the instance
+// reaches through the same pointer.
+//
+// ⛔ There is no longer a CAP on how many of them a class may have. The word
+// used to be an instance-HEADER word at 4 + i, so a class ran out at
+// kWordsPerBox - 4 of them and the rest fell back to the contract's own lanes,
+// which is a different storage with a different store and a different read.
+bool isPrimitiveFieldContract(mlir::Type fieldType) {
   std::string contract = runtimeContractName(fieldType);
-  if (contract != "builtins.int" && contract != "builtins.bool")
-    return std::nullopt;
-  unsigned slot = kPrimitiveFieldSlotBase + fieldIndex;
-  if (slot >= kPrimitiveFieldSlotLimit)
-    return std::nullopt;
-  return slot;
+  return contract == "builtins.int" || contract == "builtins.bool";
 }
 
 bool isBoolFieldType(mlir::Type fieldType) {
@@ -144,13 +135,110 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // be an allocation whose only content is the absence of a value.
   if (contractName == "types.NoneType")
     return false;
-  // int/bool are the two contracts whose value is stored IN the instance
-  // header (primitiveFieldSlot), which is already a stable heap slot; their
-  // contract lanes are a placeholder the store never reads. Boxing them would
-  // add a second storage for the same field and force the load to choose.
+  // int/bool are the two contracts whose value is a single body WORD, which is
+  // already a stable heap slot; their contract lanes are a placeholder the
+  // store never reads. Boxing them would add a second storage for the same
+  // field and force the load to choose.
   if (contractName == "builtins.int" || contractName == "builtins.bool")
     return false;
   return true;
+}
+
+unsigned RuntimeBundleLowerer::classBoxedFieldCount(py::ClassOp classOp) const {
+  unsigned count = 0;
+  for (mlir::Type fieldType :
+       RuntimeBundleLowerer::classFieldContractTypes(classOp))
+    if (RuntimeBundleLowerer::classFieldStoredBoxed(fieldType))
+      ++count;
+  return count;
+}
+
+std::optional<unsigned>
+RuntimeBundleLowerer::classBoxedFieldOrdinal(py::ClassOp classOp,
+                                             unsigned fieldIndex) const {
+  llvm::SmallVector<mlir::Type, 8> fieldTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  unsigned ordinal = 0;
+  for (unsigned index = 0; index < fieldTypes.size(); ++index) {
+    if (!RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]))
+      continue;
+    if (index == fieldIndex)
+      return ordinal;
+    ++ordinal;
+  }
+  return std::nullopt;
+}
+
+// The word an int/bool field writes: past every box, then by field index. The
+// index is the FIELD's and not the primitive fields' own running count, so a
+// field's word does not move when a sibling changes type.
+std::optional<unsigned>
+RuntimeBundleLowerer::classFieldBodyWord(py::ClassOp classOp,
+                                         unsigned fieldIndex) const {
+  llvm::SmallVector<mlir::Type, 8> fieldTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  if (fieldIndex >= fieldTypes.size())
+    return std::nullopt;
+  if (!isPrimitiveFieldContract(fieldTypes[fieldIndex]))
+    return std::nullopt;
+  return RuntimeBundleLowerer::classBoxedFieldCount(classOp) *
+             static_cast<unsigned>(box_abi::kWordsPerBox) +
+         fieldIndex;
+}
+
+unsigned
+RuntimeBundleLowerer::classInstanceBodyWords(py::ClassOp classOp) const {
+  llvm::SmallVector<mlir::Type, 8> fieldTypes =
+      RuntimeBundleLowerer::classFieldContractTypes(classOp);
+  return RuntimeBundleLowerer::classBoxedFieldCount(classOp) *
+             static_cast<unsigned>(box_abi::kWordsPerBox) +
+         static_cast<unsigned>(fieldTypes.size());
+}
+
+mlir::FailureOr<std::pair<mlir::Value, unsigned>>
+RuntimeBundleLowerer::classBoxedFieldSlot(mlir::Operation *op,
+                                          const RuntimeBundle &object,
+                                          py::ClassOp classOp,
+                                          unsigned fieldIndex,
+                                          llvm::StringRef purpose) {
+  std::optional<unsigned> ordinal =
+      RuntimeBundleLowerer::classBoxedFieldOrdinal(classOp, fieldIndex);
+  if (!ordinal)
+    return op->emitError() << purpose << " field " << fieldIndex << " of "
+                           << classOp.getSymName() << " is not box-fronted";
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<mlir::Value> body =
+      RuntimeBundleLowerer::classInstanceBody(op, object, classOp);
+  if (mlir::failed(body))
+    return mlir::failure();
+  return std::make_pair(*body, *ordinal *
+                                   static_cast<unsigned>(
+                                       box_abi::kWordsPerBox));
+}
+
+mlir::FailureOr<mlir::Value>
+RuntimeBundleLowerer::classInstanceBody(mlir::Operation *op,
+                                        const RuntimeBundle &object,
+                                        py::ClassOp classOp) {
+  unsigned bodyWords = RuntimeBundleLowerer::classInstanceBodyWords(classOp);
+  if (bodyWords == 0)
+    return op->emitError() << classOp.getSymName()
+                           << " has no instance body to reach";
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  mlir::Location loc = op->getLoc();
+  mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+                         builder, loc, box_abi::kInstanceBodyWord)
+                         .getResult();
+  mlir::Value address =
+      mlir::memref::LoadOp::create(builder, loc, *header, slot).getResult();
+  mlir::Value size = constantI64(builder, loc, bodyWords);
+  return RuntimeBundleLowerer::memrefFromBoxWords(
+      builder, loc, address, size,
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                            builder.getI64Type()));
 }
 
 // Swaps the payload held by an existing box16 slot without re-rooting the
@@ -161,12 +249,13 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
 // through it. Returns the stored payload bundle (owned by the box).
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
-                                                    mlir::Value box,
+                                                    mlir::Value body,
+                                                    unsigned boxWord,
                                                     const RuntimeBundle &value,
                                                     llvm::StringRef slotName) {
-  if (!mlir::isa<mlir::MemRefType>(box.getType()))
-    return op->emitError() << slotName << " box-fronted slot is not a box16 "
-                           << "lane, got " << box.getType();
+  if (!mlir::isa<mlir::MemRefType>(body.getType()))
+    return op->emitError() << slotName << " instance body is not a memref, got "
+                           << body.getType();
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
   mlir::FailureOr<RuntimeBundle> payload =
@@ -203,16 +292,19 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
     return mlir::failure();
 
   auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
-      "LyObject_ReleaseBoxedPayloadRaw");
+      "LyObject_ReleaseBoxedPayloadArraySlotRaw");
   if (!releaseBoxed)
-    return op->emitError()
-           << "runtime support has no LyObject_ReleaseBoxedPayloadRaw";
-  mlir::Value releaseOperand = box;
-  mlir::Type expectedBox = releaseBoxed.getFunctionType().getInput(0);
-  if (releaseOperand.getType() != expectedBox)
-    releaseOperand =
-        mlir::memref::CastOp::create(builder, loc, expectedBox, releaseOperand)
+    return op->emitError() << "runtime support has no "
+                              "LyObject_ReleaseBoxedPayloadArraySlotRaw";
+  mlir::Value releaseStorage = body;
+  mlir::Type expectedStorage = releaseBoxed.getFunctionType().getInput(0);
+  if (releaseStorage.getType() != expectedStorage)
+    releaseStorage =
+        mlir::memref::CastOp::create(builder, loc, expectedStorage,
+                                     releaseStorage)
             .getResult();
+  mlir::Value releaseSlot = constantI64(
+      builder, loc, boxWord / static_cast<unsigned>(box_abi::kWordsPerBox));
   // ⭐ ALWAYS release what the box held. A store is a replace: retain the new
   // reference (above), give up the old one.
   //
@@ -244,11 +336,11 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
   // releases a null payload -- a no-op inside `LyObject_ReleaseBoxedPayloadRaw`,
   // which is why an unconditional release is safe on a fresh instance.
   mlir::func::CallOp::create(builder, loc, releaseBoxed,
-                             mlir::ValueRange{releaseOperand});
+                             mlir::ValueRange{releaseStorage, releaseSlot});
   for (auto [wordIndex, word] : llvm::enumerate(*words)) {
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, loc, static_cast<std::int64_t>(wordIndex));
-    mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+        builder, loc, static_cast<std::int64_t>(boxWord + wordIndex));
+    mlir::memref::StoreOp::create(builder, loc, word, body, slot);
   }
   RuntimeBundle stored = *payload;
   stored.setObjectLogicalOwnership(/*ownsObject=*/true);
@@ -259,10 +351,16 @@ mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
     mlir::Operation *op, const RuntimeBundle &object,
     const RuntimeBundle &value, mlir::Type fieldType, unsigned fieldIndex,
     llvm::StringRef fieldName) {
-  std::optional<unsigned> slot = primitiveFieldSlot(fieldType, fieldIndex);
+  py::ClassOp classOp = RuntimeBundleLowerer::classForContract(
+      object.objectValue.contract);
+  if (!classOp)
+    return op->emitError() << "field '" << fieldName
+                           << "' has no class schema to place its body word";
+  std::optional<unsigned> slot =
+      RuntimeBundleLowerer::classFieldBodyWord(classOp, fieldIndex);
   if (!slot)
     return op->emitError() << "field '" << fieldName << "' of " << fieldType
-                           << " has no instance header word";
+                           << " has no instance body word";
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
   mlir::Value word;
@@ -304,13 +402,13 @@ mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
     word = unboxCall.getResult(0);
   }
 
-  mlir::FailureOr<mlir::Value> header =
-      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
-  if (mlir::failed(header))
+  mlir::FailureOr<mlir::Value> body =
+      RuntimeBundleLowerer::classInstanceBody(op, object, classOp);
+  if (mlir::failed(body))
     return mlir::failure();
   mlir::Value slotIndex =
       mlir::arith::ConstantIndexOp::create(builder, loc, *slot).getResult();
-  mlir::memref::StoreOp::create(builder, loc, word, *header, slotIndex);
+  mlir::memref::StoreOp::create(builder, loc, word, *body, slotIndex);
   return mlir::success();
 }
 
@@ -322,11 +420,11 @@ mlir::LogicalResult RuntimeBundleLowerer::storePrimitiveFieldSlot(
 // box's old payload here would hand the deallocator storage the mutation
 // primitive already freed.
 mlir::LogicalResult RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
-    mlir::Operation *op, mlir::Value box, const RuntimeBundle &payload,
-    llvm::StringRef slotName) {
-  if (!mlir::isa<mlir::MemRefType>(box.getType()))
-    return op->emitError() << slotName << " box-fronted slot is not a box16 "
-                           << "lane, got " << box.getType();
+    mlir::Operation *op, mlir::Value body, unsigned boxWord,
+    const RuntimeBundle &payload, llvm::StringRef slotName) {
+  if (!mlir::isa<mlir::MemRefType>(body.getType()))
+    return op->emitError() << slotName << " instance body is not a memref, got "
+                           << body.getType();
   const RuntimeBundle *concrete =
       RuntimeBundleLowerer::concreteObjectForOwnership(payload);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
@@ -347,8 +445,8 @@ mlir::LogicalResult RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
     if (index == static_cast<unsigned>(box_abi::kOwnedFlagWord))
       continue;
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, loc, static_cast<std::int64_t>(index));
-    mlir::memref::StoreOp::create(builder, loc, (*words)[index], box, slot);
+        builder, loc, static_cast<std::int64_t>(boxWord + index));
+    mlir::memref::StoreOp::create(builder, loc, (*words)[index], body, slot);
   }
   return mlir::success();
 }
@@ -357,23 +455,19 @@ mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>>
 RuntimeBundleLowerer::classFieldStorageValueTypes(
     mlir::Operation *op, mlir::Type fieldContract, unsigned fieldIndex,
     llvm::StringRef purpose) const {
-  // A header-word field occupies NO lane: the word IS the storage. It used to
-  // carry the contract's full expansion as a placeholder nothing ever read --
-  // three memrefs allocated and released per int field per instance -- which
-  // also made a class of four int fields expand to thirteen handles and so too
-  // wide to sit in another class's box.
-  if (primitiveFieldSlot(fieldContract, fieldIndex))
+  // ⭐ NEITHER STORAGE TAKES A LANE: both are words of the instance body, and a
+  // body word is reached through the handle rather than carried beside it. That
+  // is what makes a class expand to ONE handle however many fields it has --
+  // the box-fronted field used to take a lane holding its box's descriptor, so
+  // a class with three of them expanded to four and could not be stored in a
+  // container at all.
+  //
+  // ⛔ A UNION FIELD STILL TAKES ITS LANES. Its storage is a tag plus the live
+  // member's lanes, and the members do not share a width, so there is no single
+  // box to front it with. A class with one is still as wide as its union.
+  if (isPrimitiveFieldContract(fieldContract) ||
+      classFieldStoredBoxed(fieldContract))
     return llvm::SmallVector<mlir::Type, 8>{};
-  if (classFieldStoredBoxed(fieldContract)) {
-    const RuntimeValueShape *objectShape =
-        manifest.valueShape("builtins.object");
-    if (!objectShape)
-      return op->emitError()
-             << "runtime manifest has no builtins.object ABI shape for "
-             << purpose;
-    return llvm::SmallVector<mlir::Type, 8>(objectShape->valueTypes.begin(),
-                                            objectShape->valueTypes.end());
-  }
   return RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldContract, purpose);
 }
 
@@ -426,10 +520,14 @@ RuntimeBundleLowerer::writeBackFieldAlias(mlir::Operation *op,
   // path, and why re-rooting a field alias inside a branch used to produce a
   // value that did not dominate the later read.
   if (RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex])) {
-    if (*offset >= ownerBundle.objectValue.values.size())
-      return op->emitError() << "field alias update exceeds owner payload";
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+        RuntimeBundleLowerer::classBoxedFieldSlot(op, ownerBundle, classOp,
+                                                  *fieldIndex,
+                                                  "field alias writeback");
+    if (mlir::failed(slot))
+      return mlir::failure();
     if (mlir::failed(RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
-            op, ownerBundle.objectValue.values[*offset], updatedField,
+            op, slot->first, slot->second, updatedField,
             updatedField.fieldAliasName)))
       return mlir::failure();
     RuntimeBundle boxedOwnerView = ownerBundle;
@@ -877,16 +975,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       return mlir::success();
     }
     if (std::optional<unsigned> primitiveSlot =
-            primitiveFieldSlot(fieldType, *fieldIndex)) {
+            RuntimeBundleLowerer::classFieldBodyWord(classOp, *fieldIndex)) {
       builder.setInsertionPoint(op);
-      mlir::FailureOr<mlir::Value> header =
-          RuntimeBundleLowerer::objectPhysicalHeader(op, object->objectValue);
-      if (mlir::failed(header))
+      mlir::FailureOr<mlir::Value> body =
+          RuntimeBundleLowerer::classInstanceBody(op, *object, classOp);
+      if (mlir::failed(body))
         return mlir::failure();
       mlir::Value slotIndex = mlir::arith::ConstantIndexOp::create(
           builder, op.getLoc(), *primitiveSlot);
       mlir::Value raw =
-          mlir::memref::LoadOp::create(builder, op.getLoc(), *header, slotIndex)
+          mlir::memref::LoadOp::create(builder, op.getLoc(), *body, slotIndex)
               .getResult();
       // bool's physical lane IS the i1, so the word is narrowed back into one
       // rather than carried as primitive-i64 evidence (which only int has).
@@ -1002,8 +1100,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     return mlir::success();
   }
 
+  // The base is a VALUE and not a constant because the union path selects it:
+  // two members may keep the same field at different ordinals, and reading
+  // through the inactive member's handle is not a wrong answer but a wild load.
   auto rebuildBoxedFieldLanes =
-      [&](llvm::ArrayRef<mlir::Type> laneTypes, mlir::Value box)
+      [&](llvm::ArrayRef<mlir::Type> laneTypes, mlir::Value body,
+          mlir::Value boxWord)
       -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
     builder.setInsertionPoint(op);
     llvm::SmallVector<mlir::Value, 4> rebuilt;
@@ -1013,17 +1115,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         return op.emitError()
                << "box-fronted field '" << op.getName()
                << "' expects memref physical values, got " << type;
-      mlir::Value ptrIndex = mlir::arith::ConstantIndexOp::create(
-          builder, op.getLoc(),
-          box_abi::kPointerWordBase + static_cast<std::int64_t>(index));
-      mlir::Value sizeIndex = mlir::arith::ConstantIndexOp::create(
-          builder, op.getLoc(),
-          box_abi::kSizeWordBase + static_cast<std::int64_t>(index));
+      mlir::Value ptrIndex = mlir::arith::AddIOp::create(
+          builder, op.getLoc(), boxWord,
+          mlir::arith::ConstantIndexOp::create(
+              builder, op.getLoc(),
+              box_abi::kPointerWordBase + static_cast<std::int64_t>(index)));
+      mlir::Value sizeIndex = mlir::arith::AddIOp::create(
+          builder, op.getLoc(), boxWord,
+          mlir::arith::ConstantIndexOp::create(
+              builder, op.getLoc(),
+              box_abi::kSizeWordBase + static_cast<std::int64_t>(index)));
       mlir::Value ptrWord =
-          mlir::memref::LoadOp::create(builder, op.getLoc(), box, ptrIndex)
+          mlir::memref::LoadOp::create(builder, op.getLoc(), body, ptrIndex)
               .getResult();
       mlir::Value sizeWord =
-          mlir::memref::LoadOp::create(builder, op.getLoc(), box, sizeIndex)
+          mlir::memref::LoadOp::create(builder, op.getLoc(), body, sizeIndex)
               .getResult();
       rebuilt.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
           builder, op.getLoc(), ptrWord, sizeWord, memrefType));
@@ -1031,14 +1137,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     return rebuilt;
   };
   auto rebuildBoxedFieldValues =
-      [&](mlir::Type fieldContract, mlir::Value box)
+      [&](mlir::Type fieldContract, mlir::Value body, mlir::Value boxWord)
       -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> arrayTypes =
         RuntimeBundleLowerer::runtimeValueTypesFor(op, fieldContract,
                                                    "class field ABI");
     if (mlir::failed(arrayTypes))
       return mlir::failure();
-    return rebuildBoxedFieldLanes(*arrayTypes, box);
+    return rebuildBoxedFieldLanes(*arrayTypes, body, boxWord);
+  };
+  // The body of an instance whose HANDLE is the only thing available (the
+  // union path selects one out of the members' handles).
+  auto instanceBodyOfHandle = [&](mlir::Value handle,
+                                  unsigned bodyWords) -> mlir::Value {
+    builder.setInsertionPoint(op);
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, op.getLoc(), box_abi::kInstanceBodyWord);
+    mlir::Value address =
+        mlir::memref::LoadOp::create(builder, op.getLoc(), handle, slot)
+            .getResult();
+    mlir::Value size = constantI64(builder, op.getLoc(), bodyWords);
+    return RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, op.getLoc(), address, size,
+        mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                              builder.getI64Type()));
   };
 
   if (auto unionType = mlir::dyn_cast<py::UnionType>(op.getObject().getType())) {
@@ -1048,6 +1170,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     mlir::Type commonFieldType;
     llvm::SmallVector<mlir::Type, 8> commonValueTypes;
     llvm::SmallVector<mlir::Value, 4> selectedValues;
+    // The box-fronted case selects a HANDLE and a WORD instead of lanes: the
+    // storage is behind the instance, so the read is one load through whichever
+    // member is live rather than a choice between values already in hand.
+    mlir::Value selectedHandle;
+    mlir::Value selectedBoxWord;
+    unsigned widestBody = 0;
     mlir::Value inputTag = object->physicalValues().front();
 
     builder.setInsertionPoint(op);
@@ -1072,7 +1200,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                << "class field metadata is malformed for "
                << memberClass.getSymName();
       mlir::Type memberFieldType = memberFieldTypes[*memberFieldIndex];
-      if (primitiveFieldSlot(memberFieldType, *memberFieldIndex))
+      if (isPrimitiveFieldContract(memberFieldType))
         return op.emitError()
                << "primitive union field attribute access is not supported";
 
@@ -1109,6 +1237,44 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       if (offset + commonValueTypes.size() > object->physicalValues().size())
         return op.emitError() << "union field ABI exceeds object payload";
 
+      mlir::Value tag = mlir::arith::ConstantIntOp::create(
+          builder, op.getLoc(), static_cast<std::int64_t>(memberIndex), 64);
+      mlir::Value active = mlir::arith::CmpIOp::create(
+          builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, inputTag, tag);
+
+      if (RuntimeBundleLowerer::classFieldStoredBoxed(memberFieldType)) {
+        std::optional<unsigned> ordinal =
+            RuntimeBundleLowerer::classBoxedFieldOrdinal(memberClass,
+                                                         *memberFieldIndex);
+        if (!ordinal)
+          return op.emitError() << "union member " << memberClass.getSymName()
+                                << " has no box slot for field '"
+                                << op.getName() << "'";
+        if (*memberOffset >= object->physicalValues().size())
+          return op.emitError() << "union field ABI exceeds object payload";
+        widestBody = std::max(
+            widestBody,
+            RuntimeBundleLowerer::classInstanceBodyWords(memberClass));
+        mlir::Value handle = object->physicalValues()[*memberOffset];
+        mlir::Value word = mlir::arith::ConstantIndexOp::create(
+            builder, op.getLoc(),
+            static_cast<std::int64_t>(*ordinal) * box_abi::kWordsPerBox);
+        if (!selectedHandle) {
+          selectedHandle = handle;
+          selectedBoxWord = word;
+          continue;
+        }
+        selectedHandle = mlir::arith::SelectOp::create(
+                             builder, op.getLoc(), active, handle,
+                             selectedHandle)
+                             .getResult();
+        selectedBoxWord = mlir::arith::SelectOp::create(
+                              builder, op.getLoc(), active, word,
+                              selectedBoxWord)
+                              .getResult();
+        continue;
+      }
+
       llvm::SmallVector<mlir::Value, 4> memberValues;
       appendValueSlice(object->physicalValues(), offset,
                        static_cast<unsigned>(commonValueTypes.size()),
@@ -1118,10 +1284,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         continue;
       }
 
-      mlir::Value tag = mlir::arith::ConstantIntOp::create(
-          builder, op.getLoc(), static_cast<std::int64_t>(memberIndex), 64);
-      mlir::Value active = mlir::arith::CmpIOp::create(
-          builder, op.getLoc(), mlir::arith::CmpIPredicate::eq, inputTag, tag);
       for (auto [index, memberValue] : llvm::enumerate(memberValues))
         selectedValues[index] =
             mlir::arith::SelectOp::create(builder, op.getLoc(), active,
@@ -1131,10 +1293,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
 
     if (commonFieldType &&
         RuntimeBundleLowerer::classFieldStoredBoxed(commonFieldType)) {
-      if (selectedValues.empty())
+      if (!selectedHandle)
         return op.emitError() << "box-fronted union field has no box slot";
+      mlir::Value body = instanceBodyOfHandle(selectedHandle, widestBody);
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
-          rebuildBoxedFieldValues(commonFieldType, selectedValues.front());
+          rebuildBoxedFieldValues(commonFieldType, body, selectedBoxWord);
       if (mlir::failed(rebuilt))
         return mlir::failure();
       selectedValues = std::move(*rebuilt);
@@ -1226,9 +1389,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   }
   mlir::Type loadedContract = cached ? cached->objectValue.contract : fieldType;
   if (boxedField) {
-    if (values.empty())
-      return op.emitError() << "box-fronted field has no box slot";
-    mlir::Value box = values.front();
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+        RuntimeBundleLowerer::classBoxedFieldSlot(op, *object, classOp,
+                                                  *fieldIndex,
+                                                  "class field ABI");
+    if (mlir::failed(slot))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    mlir::Value boxWord = mlir::arith::ConstantIndexOp::create(
+        builder, op.getLoc(), static_cast<std::int64_t>(slot->second))
+        .getResult();
     llvm::SmallVector<mlir::Type, 8> laneTypes;
     if (cached) {
       for (mlir::Value lane : cached->physicalValues())
@@ -1242,7 +1412,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       laneTypes = std::move(*contractTypes);
     }
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
-        rebuildBoxedFieldLanes(laneTypes, box);
+        rebuildBoxedFieldLanes(laneTypes, slot->first, boxWord);
     if (mlir::failed(rebuilt))
       return mlir::failure();
     values = std::move(*rebuilt);
@@ -1463,7 +1633,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     return RuntimeBundleLowerer::lowerExceptionFieldAttrSet(
         op, *object, *value, classOp, *fieldIndex);
 
-  if (primitiveFieldSlot(fieldTypes[*fieldIndex], *fieldIndex)) {
+  if (isPrimitiveFieldContract(fieldTypes[*fieldIndex])) {
     if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
             op, *object, *value, fieldTypes[*fieldIndex], *fieldIndex,
             op.getName())))
@@ -1482,14 +1652,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   // while one-lane `io.StringIO` lost one, so the discriminator was never the
   // width, only whether the destination was a heap slot.
   if (RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[*fieldIndex])) {
-    mlir::FailureOr<unsigned> offset =
-        RuntimeBundleLowerer::classFieldValueOffset(op, classOp, *fieldIndex,
-                                                    "class field ABI");
-    if (mlir::failed(offset))
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+        RuntimeBundleLowerer::classBoxedFieldSlot(op, *object, classOp,
+                                                  *fieldIndex,
+                                                  "class field ABI");
+    if (mlir::failed(slot))
       return mlir::failure();
-    if (*offset >= object->physicalValues().size())
-      return op.emitError() << "class field ABI exceeds object payload";
-    mlir::Value box = object->physicalValues()[*offset];
     std::string slotName = (llvm::Twine("class.") + op.getName()).str();
     bool releaseOwnedSource = false;
     if (const RuntimeBundle *source =
@@ -1501,8 +1669,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
           !RuntimeBundleLowerer::storedSourceOutlivesStore(op, op.getValue());
     }
     mlir::FailureOr<RuntimeBundle> stored =
-        RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(op, box, *value,
-                                                            slotName);
+        RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(
+            op, slot->first, slot->second, *value, slotName);
     if (mlir::failed(stored))
       return mlir::failure();
     if (releaseOwnedSource &&
@@ -1694,13 +1862,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrGet(
   // Copy: binding the result below writes valueBundles.
   RuntimeBundle object = objectRef;
   mlir::Type content = op.getResult().getType();
-  mlir::FailureOr<unsigned> offset = RuntimeBundleLowerer::classFieldValueOffset(
-      op, classOp, fieldIndex, "nonlocal cell ABI");
-  if (mlir::failed(offset))
+  mlir::FailureOr<std::pair<mlir::Value, unsigned>> cell =
+      RuntimeBundleLowerer::classBoxedFieldSlot(op, object, classOp, fieldIndex,
+                                                "nonlocal cell ABI");
+  if (mlir::failed(cell))
     return mlir::failure();
-  if (*offset >= object.physicalValues().size())
-    return op.emitError() << "nonlocal cell ABI exceeds object payload";
-  mlir::Value box = object.physicalValues()[*offset];
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
       RuntimeBundleLowerer::slotStorageShapesFor(op, content,
                                                  "nonlocal cell load");
@@ -1719,14 +1885,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrGet(
   for (auto [position, shape] : llvm::enumerate(*shapes)) {
     mlir::Value ptrIndex = mlir::arith::ConstantIndexOp::create(
         builder, loc,
-        box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
+        static_cast<std::int64_t>(cell->second) + box_abi::kPointerWordBase +
+            static_cast<std::int64_t>(position));
     mlir::Value sizeIndex = mlir::arith::ConstantIndexOp::create(
         builder, loc,
-        box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
+        static_cast<std::int64_t>(cell->second) + box_abi::kSizeWordBase +
+            static_cast<std::int64_t>(position));
     mlir::Value ptrWord =
-        mlir::memref::LoadOp::create(builder, loc, box, ptrIndex).getResult();
+        mlir::memref::LoadOp::create(builder, loc, cell->first, ptrIndex)
+            .getResult();
     mlir::Value sizeWord =
-        mlir::memref::LoadOp::create(builder, loc, box, sizeIndex).getResult();
+        mlir::memref::LoadOp::create(builder, loc, cell->first, sizeIndex)
+            .getResult();
     elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
         builder, loc, ptrWord, sizeWord, mlir::cast<mlir::MemRefType>(shape)));
   }
@@ -1754,15 +1924,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrSet(
     const RuntimeBundle &valueRef, py::ClassOp classOp, unsigned fieldIndex) {
   RuntimeBundle object = objectRef;
   RuntimeBundle value = valueRef;
-  mlir::FailureOr<unsigned> offset = RuntimeBundleLowerer::classFieldValueOffset(
-      op, classOp, fieldIndex, "nonlocal cell ABI");
-  if (mlir::failed(offset))
+  mlir::FailureOr<std::pair<mlir::Value, unsigned>> cell =
+      RuntimeBundleLowerer::classBoxedFieldSlot(op, object, classOp, fieldIndex,
+                                                "nonlocal cell ABI");
+  if (mlir::failed(cell))
     return mlir::failure();
-  if (*offset >= object.physicalValues().size())
-    return op.emitError() << "nonlocal cell ABI exceeds object payload";
-  mlir::Value box = object.physicalValues()[*offset];
   if (mlir::failed(RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(
-          op, box, value, "nonlocal.cell")))
+          op, cell->first, cell->second, value, "nonlocal.cell")))
     return mlir::failure();
   erase.push_back(op);
   return mlir::success();

@@ -627,6 +627,35 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
               op, fieldTypes[index], index, "class field ABI");
       if (mlir::failed(storageTypes))
         return mlir::failure();
+      bool boxedField =
+          RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]);
+      // Every box-fronted field fills the box the instance materialization
+      // already zeroed in the body instead of boxing into a fresh slot: the
+      // box is at a fixed word of a block whose address the instance holds, so
+      // every later store writes through it and every other frame reads
+      // through it, and it is never re-rooted after construction.
+      //
+      // Ordered BEFORE the empty-storage branch because both storages are now
+      // empty -- a box-fronted field takes no lane either -- and the branch
+      // that used to distinguish them was "has no lanes".
+      if (boxedField) {
+        std::string slotName = (llvm::Twine("class.") + fieldName).str();
+        mlir::FailureOr<std::pair<mlir::Value, unsigned>> slot =
+            RuntimeBundleLowerer::classBoxedFieldSlot(op, *instance, classOp,
+                                                      index,
+                                                      "class field ABI");
+        if (mlir::failed(slot))
+          return mlir::failure();
+        builder.setInsertionPoint(op);
+        mlir::FailureOr<RuntimeBundle> stored =
+            RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(
+                op, slot->first, slot->second, *fieldValue, slotName);
+        if (mlir::failed(stored))
+          return mlir::failure();
+        updatedFieldBundles[index] =
+            std::make_shared<RuntimeBundle>(std::move(*stored));
+        continue;
+      }
       if (storageTypes->empty()) {
         if (mlir::failed(RuntimeBundleLowerer::storePrimitiveFieldSlot(
                 op, *instance, *fieldValue, fieldTypes[index], index,
@@ -634,32 +663,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
           return mlir::failure();
         updatedFieldBundles[index] =
             std::make_shared<RuntimeBundle>(*fieldValue);
-        continue;
-      }
-      bool boxedField =
-          RuntimeBundleLowerer::classFieldStoredBoxed(fieldTypes[index]);
-      // Every box-fronted field fills the box16 the instance materialization
-      // already allocated instead of boxing into a fresh slot: the box pointer
-      // is the instance-lifetime stable handle that every later store writes
-      // through and every other frame reads through, so it must never be
-      // re-rooted after construction.
-      if (boxedField) {
-        std::string slotName = (llvm::Twine("class.") + fieldName).str();
-        mlir::FailureOr<unsigned> offset =
-            RuntimeBundleLowerer::classFieldValueOffset(op, classOp, index,
-                                                        "class field ABI");
-        if (mlir::failed(offset))
-          return mlir::failure();
-        if (*offset >= values.size())
-          return op.emitError() << "class field ABI exceeds object payload";
-        builder.setInsertionPoint(op);
-        mlir::FailureOr<RuntimeBundle> stored =
-            RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(
-                op, values[*offset], *fieldValue, slotName);
-        if (mlir::failed(stored))
-          return mlir::failure();
-        updatedFieldBundles[index] =
-            std::make_shared<RuntimeBundle>(std::move(*stored));
         continue;
       }
       // Residual: a field with no single object contract to put behind a

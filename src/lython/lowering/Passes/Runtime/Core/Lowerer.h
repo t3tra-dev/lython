@@ -147,6 +147,40 @@ private:
   // header word, a zero-lane contract has nothing to hold, and a union is not
   // one object.
   bool classFieldStoredBoxed(mlir::Type fieldContract) const;
+  // ⭐ EVERY FIELD LIVES IN THE INSTANCE BODY, which is one block reached
+  // through the header's body word:
+  //
+  //   [0, boxedCount * kWordsPerBox)          one box per box-fronted field
+  //   [boxedCount * kWordsPerBox, + N)        one word per field, written by
+  //                                           the int and bool fields
+  //
+  // The boxes come FIRST so a field's box is the j-th slot of an items array,
+  // which is what LyObject_{Retain,Release}BoxedPayloadArraySlotRaw already
+  // addresses -- the body needs no per-field descriptor and no arithmetic on
+  // the handle, and the walk that pins an interior view (collectBoxWordDerived
+  // Views) follows the load of the body word the way it follows a container's
+  // items word.
+  //
+  // Why NOT the instance's SSA lanes, which is where these were: a class then
+  // expands to one handle per field plus its own, and a value wider than the
+  // box's lanes cannot be stored in a container at all. The lanes also made the
+  // field count a function of the BOX width, which is the thing being narrowed.
+  unsigned classBoxedFieldCount(py::ClassOp classOp) const;
+  std::optional<unsigned> classBoxedFieldOrdinal(py::ClassOp classOp,
+                                                 unsigned fieldIndex) const;
+  std::optional<unsigned> classFieldBodyWord(py::ClassOp classOp,
+                                             unsigned fieldIndex) const;
+  unsigned classInstanceBodyWords(py::ClassOp classOp) const;
+  // The body view, rebuilt at every use from the header's body word. Callers
+  // set their own insertion point first.
+  mlir::FailureOr<mlir::Value> classInstanceBody(mlir::Operation *op,
+                                                 const RuntimeBundle &object,
+                                                 py::ClassOp classOp);
+  // (body view, the word its box starts at) for one box-fronted field.
+  mlir::FailureOr<std::pair<mlir::Value, unsigned>>
+  classBoxedFieldSlot(mlir::Operation *op, const RuntimeBundle &object,
+                      py::ClassOp classOp, unsigned fieldIndex,
+                      llvm::StringRef purpose);
   // The storage a field occupies in the instance's expansion, by POSITION: a
   // header-word field (int/bool) takes none, a box-fronted field one box16, and
   // the residual shapes their contract's own lanes.
@@ -164,11 +198,12 @@ private:
                                               unsigned fieldIndex,
                                               llvm::StringRef fieldName);
   mlir::FailureOr<RuntimeBundle>
-  storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value box,
-                                const RuntimeBundle &value,
+  storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value body,
+                                unsigned boxWord, const RuntimeBundle &value,
                                 llvm::StringRef slotName);
   mlir::LogicalResult updateBoxedFieldPayloadWords(mlir::Operation *op,
-                                                   mlir::Value box,
+                                                   mlir::Value body,
+                                                   unsigned boxWord,
                                                    const RuntimeBundle &payload,
                                                    llvm::StringRef slotName);
   // R6 nonlocal cells: emitter-synthesized one-field classes whose field

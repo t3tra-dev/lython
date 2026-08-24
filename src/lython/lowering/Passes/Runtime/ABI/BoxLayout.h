@@ -47,6 +47,8 @@ namespace py::lowering::box_abi {
 // (refcount, class id, entity pointer, lane count), [4, 7) the pointer word of
 // each physical memref, [7, 10) the matching size words, word 10 the owned flag
 // the deallocators consult and word 11 the cached hash the dict and set keep.
+// A source class INSTANCE is a block with these words in front of it, and it
+// reads word 3 as the address of its body rather than as a lane count.
 //
 // ⛔ IT WAS SIXTEEN, WITH ROOM FOR FIVE LANES, AND NO CONTRACT HAS MORE THAN
 // THREE. Counted across every `ly.runtime.shape` in the manifests: 71 contracts
@@ -56,28 +58,28 @@ namespace py::lowering::box_abi {
 // `objectPayloadHandleWords` rejects a wider value with a diagnostic, so
 // narrowing cannot silently truncate.
 //
-// ⛔ AND THE LANE COUNT IS THE INLINE-FIELD BUDGET, WHICH THIS SPENDS. A class
-// stored in a container is boxed by expanding it, and `objectPayloadHandleWords`
-// refuses a value wider than the lanes: at five, a class with four `float`
-// fields fit (header + four = five handles); at three it does not, and neither
-// does one with three. Measured on the diagnostic itself -- the same program
-// reads "carries at most 5" on the previous binary and "at most 3" on this one.
-// This is a REFUSAL and not a truncation, which is the only reason the trade is
-// available at all; the fix for it is the split below, not a wider box, because
-// the lanes are being spent on a class instance rather than on any contract.
+// ⛔ THE LANE COUNT IS NO LONGER A CLASS'S FIELD BUDGET. It was: a class
+// expanded to one handle per field plus its own, so narrowing the lanes from
+// five to three took `class P: x, y, z: float` out of every container. Fields
+// now live in the instance BODY (Lowerer.h, classInstanceBody) and a class is
+// one handle however many it has -- what still reaches
+// `objectPayloadHandleWords` too wide is a UNION, whose members do not share a
+// width and so cannot share a box.
 //
-// ⛔ AND TWELVE IS NOT THE FLOOR. A box is typed `builtins.object`, which is
-// also a CLASS INSTANCE's handle: `Point.__init__` takes `memref<12xi64>`, and
-// words [4, 12) are where an instance keeps its int and bool fields inline
-// (AttributeOps.cpp, `primitiveFieldSlot`) -- twelve slots before, eight now,
-// the rest falling back to the contract's lanes. The floor is FIVE, because the
-// non-first lanes of every multi-lane contract are interior to the first one's
-// allocation (`__ly_unicode_alloc` puts the bytes at +24 of the header's block,
-// the way `__ly_long_parts` recovers an int's meta and digits at +16 and +32),
-// so a box needs only the entity pointer and the lanes come back by contract.
-// Getting there means splitting the box's contract from the instance's, because
-// at five words an instance would have no inline field slots at all.
+// ⛔ AND TWELVE IS NOT THE FLOOR. The floor is FIVE, because the non-first lanes
+// of every multi-lane contract are interior to the first one's allocation
+// (`__ly_unicode_alloc` puts the bytes at +24 of the header's block, the way
+// `__ly_long_parts` recovers an int's meta and digits at +16 and +32), so a box
+// needs only the entity pointer and the lanes come back by contract. Getting
+// there is one-laning what is left: 71 contracts (the exception family) expand
+// to three, `builtins.str` and two `_asyncio` contracts to two.
 inline constexpr std::int64_t kWordsPerBox = 12;
+// Word 3 of a SOURCE CLASS INSTANCE's header holds the address of its body, the
+// block every field's storage lives in (Lowerer.h, classInstanceBody). A
+// container's box uses the same word for its lane count; the two never describe
+// the same block, because an instance stored in a container is described by a
+// box that POINTS at it.
+inline constexpr std::int64_t kInstanceBodyWord = 3;
 inline constexpr std::int64_t kPointerWordBase = 4;
 inline constexpr std::int64_t kSizeWordBase = 7;
 inline constexpr std::int64_t kPointerWordCount =

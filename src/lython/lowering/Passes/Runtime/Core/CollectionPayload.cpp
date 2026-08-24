@@ -513,6 +513,11 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   // out of the boxed-method dispatch, turning a `__repr__` that plainly
   // exists into a runtime abort. Reject at the box, the earliest point where
   // the width is known.
+  //
+  // A UNION is what reaches this now. A class instance is one handle however
+  // many fields it has -- they live in its body -- unless one of them is a
+  // union, whose storage is a tag plus every member's lanes because the members
+  // do not share a width and so cannot share a box.
   if (concrete->physicalValues().size() > kPayloadValuePointerWords)
     return op->emitError()
            << "a " << concrete->contract << " value expands to "
@@ -520,7 +525,8 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
            << " physical handles, but a payload box carries at most "
            << kPayloadValuePointerWords
            << "; it cannot be stored in a container slot or boxed field yet "
-              "(reduce the class to fewer or narrower fields)";
+              "(a union keeps every member's lanes, and a field holding one "
+              "keeps them in its class)";
 
   mlir::FailureOr<mlir::Value> header =
       RuntimeBundleLowerer::objectPhysicalHeader(op, concrete->objectValue);

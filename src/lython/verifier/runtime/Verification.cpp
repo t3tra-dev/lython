@@ -291,12 +291,25 @@ verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
     if (!token->hasAttr(own::kOwnedLocalObjectAttr) ||
         token->getNumOperands() == 0)
       return;
-    // Back through the identity casts to what defines the marked value.
+    // Back through the identity casts to what defines the marked value. A
+    // `memref.view` is one of them: a view of a fresh block IS that block's
+    // only owner, which is how `__ly_unicode_alloc` shapes a str and how a
+    // class instance's header sits in front of its body -- both are freed
+    // through the view, so the frame that made the block holds the object.
     mlir::Value root = token->getOperand(0);
-    while (auto cast = root.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
-      if (cast->getNumOperands() == 0)
-        break;
-      root = cast->getOperand(0);
+    for (bool moved = true; moved;) {
+      moved = false;
+      if (auto cast = root.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast->getNumOperands() != 0) {
+          root = cast->getOperand(0);
+          moved = true;
+          continue;
+        }
+      }
+      if (auto view = root.getDefiningOp<mlir::memref::ViewOp>()) {
+        root = view.getSource();
+        moved = true;
+      }
     }
     mlir::Operation *def = root.getDefiningOp();
     // `alloc` + `init`: the frame made the storage, so it owns the object.
