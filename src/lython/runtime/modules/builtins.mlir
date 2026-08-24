@@ -11022,53 +11022,269 @@ module attributes {
   // First (or, %reverse, last) index in [start, end-n] where the needle
   // matches; -1 when the window is empty or nothing matches. Indices are
   // pre-adjusted code-point positions.
-  func.func private @__ly_unicode_find_core(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64, %reverse: i1) -> i64 {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
+  // ⭐ CPython's STRINGLIB_BLOOM (Objects/stringlib/fastsearch.h): a 64-bit set
+  // keyed by the low six bits of the code point. It only ever answers "this
+  // character is CERTAINLY NOT in the needle", and that one-sided answer is
+  // what licenses skipping the whole needle length instead of one position.
+  func.func private @__ly_unicode_bloom_add(%mask: i64, %cp: i64) -> i64 {
+    %sixty_three = arith.constant 63 : i64
+    %one = arith.constant 1 : i64
+    %bit = arith.andi %cp, %sixty_three : i64
+    %set = arith.shli %one, %bit : i64
+    %next = arith.ori %mask, %set : i64
+    func.return %next : i64
+  }
+
+  func.func private @__ly_unicode_bloom_has(%mask: i64, %cp: i64) -> i1 {
+    %sixty_three = arith.constant 63 : i64
+    %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
+    %bit = arith.andi %cp, %sixty_three : i64
+    %set = arith.shli %one, %bit : i64
+    %hit = arith.andi %mask, %set : i64
+    %present = arith.cmpi ne, %hit, %zero : i64
+    func.return %present : i1
+  }
+
+  // `default_find`: check the needle's LAST character first, and on a miss ask
+  // the bloom set about the character just past the window. Absent means no
+  // alignment overlapping it can match, so the position advances by the whole
+  // needle; present means it advances by the gap to the previous occurrence of
+  // the last character.
+  //
+  // ⛔ Where CPython reads one past the window unconditionally -- its buffers
+  // carry a NUL sentinel -- this checks the bound first. Ours do not, and the
+  // conservative answer when there is no next character (advance by one) is
+  // the one CPython would give for a needle that contains NUL anyway.
+  //
+  // ⛔ AND THE TWO-WAY ALGORITHM IS DELIBERATELY NOT HERE. CPython keeps this
+  // same filtered scan for everything below `n < 2500 || (m < 100 && n < 30000)
+  // || m < 6` and only then switches to Crochemore-Perrin, whose critical
+  // factorization and memory table are what bound the periodic worst case.
+  // Measured against CPython 3.14.5 inside the regime where IT switches -- a
+  // 50,000-character haystack with a 21-character needle that never matches,
+  // 300 times: 13.8 ms here against 10.4 there; and on the periodic shape
+  // two-way exists to bound (`"aaaaaaaaab" * 5000` searched for
+  // `"a" * 19 + "b"`) 11.4 ms here against 12.9 there. A filtered scan is
+  // within a third of it on the first and ahead on the second, which is not
+  // what four hundred lines of factorization buys back.
+  func.func private @__ly_unicode_find_fwd(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64) -> i64 {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
-    %limit = arith.subi %end, %n : i64
-    %viable = arith.cmpi sle, %start, %limit : i64
-    %found = scf.if %viable -> (i64) {
-      %n_index = arith.index_cast %n : i64 to index
-      %span = arith.subi %limit, %start : i64
-      %positions_i64 = arith.addi %span, %one : i64
-      %positions = arith.index_cast %positions_i64 : i64 to index
-      // ⭐ STOPS AT THE FIRST MATCH. This was an `scf.for` over every position
-      // from `start` to `limit`, keeping the first hit with a select: a find
-      // that matched at position 35 of an 880-character string still ran 837
-      // `__ly_unicode_match_at` calls. `find`, `rfind`, `index`, `in`, `count`,
-      // `replace`, `split` and `partition` all come through here, and `split`
-      // restarts the scan at each separator, so it was quadratic in the number
-      // of pieces on top of that.
-      //
-      // ⛔ Still the naive O(n*m) scan CPython left behind: its stringlib is
-      // two-way with a Bloom filter over the needle's last character, which
-      // skips rather than steps. That is the next thing here, and it is a
-      // constant factor on top of a complexity this restores.
-      %walk:2 = scf.while (%k = %zero, %acc = %minus_one) : (i64, i64) -> (i64, i64) {
-        %more = arith.cmpi slt, %k, %positions_i64 : i64
-        %not_yet = arith.cmpi eq, %acc, %minus_one : i64
-        %go = arith.andi %more, %not_yet : i1
-        scf.condition(%go) %k, %acc : i64, i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %false = arith.constant false
+    %mlast = arith.subi %n, %one : i64
+    %mlast_index = arith.index_cast %mlast : i64 to index
+    %last = func.call @__ly_unicode_get(%t_bytes, %t_width, %mlast_index) : (memref<?xi8>, i64, index) -> i64
+    %pre:2 = scf.for %k = %c0 to %mlast_index step %c1 iter_args(%mask = %zero, %gap = %mlast) -> (i64, i64) {
+      %cp = func.call @__ly_unicode_get(%t_bytes, %t_width, %k) : (memref<?xi8>, i64, index) -> i64
+      %next_mask = func.call @__ly_unicode_bloom_add(%mask, %cp) : (i64, i64) -> i64
+      %same = arith.cmpi eq, %cp, %last : i64
+      %k64 = arith.index_cast %k : index to i64
+      %behind = arith.subi %mlast, %k64 : i64
+      %candidate = arith.subi %behind, %one : i64
+      %next_gap = arith.select %same, %candidate, %gap : i64
+      scf.yield %next_mask, %next_gap : i64, i64
+    }
+    %mask = func.call @__ly_unicode_bloom_add(%pre#0, %last) : (i64, i64) -> i64
+    %gap_step = arith.addi %pre#1, %one : i64
+    %long_step = arith.addi %n, %one : i64
+    %n_index = arith.index_cast %n : i64 to index
+    %w = arith.subi %end, %n : i64
+    %walk:2 = scf.while (%i = %start, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
+      %in_range = arith.cmpi sle, %i, %w : i64
+      %not_yet = arith.cmpi eq, %ans, %minus_one : i64
+      %go = arith.andi %in_range, %not_yet : i1
+      scf.condition(%go) %i, %ans : i64, i64
+    } do {
+    ^bb0(%i: i64, %ans: i64):
+      %at = arith.addi %i, %mlast : i64
+      %at_index = arith.index_cast %at : i64 to index
+      %cp = func.call @__ly_unicode_get(%s_bytes, %s_width, %at_index) : (memref<?xi8>, i64, index) -> i64
+      %is_last = arith.cmpi eq, %cp, %last : i64
+      %nextpos = arith.addi %at, %one : i64
+      %has_next = arith.cmpi slt, %nextpos, %end : i64
+      %skippable = scf.if %has_next -> (i1) {
+        %next_index = arith.index_cast %nextpos : i64 to index
+        %ncp = func.call @__ly_unicode_get(%s_bytes, %s_width, %next_index) : (memref<?xi8>, i64, index) -> i64
+        %present = func.call @__ly_unicode_bloom_has(%mask, %ncp) : (i64, i64) -> i1
+        %absent = arith.xori %present, %true : i1
+        scf.yield %absent : i1
+      } else {
+        scf.yield %false : i1
+      }
+      %step:2 = scf.if %is_last -> (i64, i64) {
+        %i_index = arith.index_cast %i : i64 to index
+        %hit = func.call @__ly_unicode_match_at(%s_bytes, %s_width, %i_index, %t_bytes, %t_width, %c0, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+        %after:2 = scf.if %hit -> (i64, i64) {
+          scf.yield %i, %i : i64, i64
+        } else {
+          %chosen = arith.select %skippable, %long_step, %gap_step : i64
+          %ni = arith.addi %i, %chosen : i64
+          scf.yield %ni, %ans : i64, i64
+        }
+        scf.yield %after#0, %after#1 : i64, i64
+      } else {
+        %chosen = arith.select %skippable, %long_step, %one : i64
+        %ni = arith.addi %i, %chosen : i64
+        scf.yield %ni, %ans : i64, i64
+      }
+      scf.yield %step#0, %step#1 : i64, i64
+    }
+    func.return %walk#1 : i64
+  }
+
+  // `default_rfind`: the same thing from the other end, keyed on the needle's
+  // FIRST character and asking the bloom set about the character just before
+  // the window.
+  func.func private @__ly_unicode_find_rev(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %false = arith.constant false
+    %mlast = arith.subi %n, %one : i64
+    %n_index = arith.index_cast %n : i64 to index
+    %first = func.call @__ly_unicode_get(%t_bytes, %t_width, %c0) : (memref<?xi8>, i64, index) -> i64
+    %mask0 = func.call @__ly_unicode_bloom_add(%zero, %first) : (i64, i64) -> i64
+    // CPython walks the needle from the back and keeps assigning, so the skip
+    // it ends with is the one for the SMALLEST index whose character equals the
+    // first. Walking forward and keeping the first assignment is the same
+    // answer; `skip` still holding `mlast` is what says none was made, because
+    // every assignment is at most mlast - 1.
+    %pre:2 = scf.for %k = %c1 to %n_index step %c1 iter_args(%mask = %mask0, %skip = %mlast) -> (i64, i64) {
+      %cp = func.call @__ly_unicode_get(%t_bytes, %t_width, %k) : (memref<?xi8>, i64, index) -> i64
+      %next_mask = func.call @__ly_unicode_bloom_add(%mask, %cp) : (i64, i64) -> i64
+      %same = arith.cmpi eq, %cp, %first : i64
+      %unset = arith.cmpi eq, %skip, %mlast : i64
+      %take = arith.andi %same, %unset : i1
+      %k64 = arith.index_cast %k : index to i64
+      %candidate = arith.subi %k64, %one : i64
+      %next_skip = arith.select %take, %candidate, %skip : i64
+      scf.yield %next_mask, %next_skip : i64, i64
+    }
+    %skip_step = arith.addi %pre#1, %one : i64
+    %long_step = arith.addi %n, %one : i64
+    %w = arith.subi %end, %n : i64
+    %walk:2 = scf.while (%i = %w, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
+      %in_range = arith.cmpi sge, %i, %start : i64
+      %not_yet = arith.cmpi eq, %ans, %minus_one : i64
+      %go = arith.andi %in_range, %not_yet : i1
+      scf.condition(%go) %i, %ans : i64, i64
+    } do {
+    ^bb0(%i: i64, %ans: i64):
+      %i_index = arith.index_cast %i : i64 to index
+      %cp = func.call @__ly_unicode_get(%s_bytes, %s_width, %i_index) : (memref<?xi8>, i64, index) -> i64
+      %is_first = arith.cmpi eq, %cp, %first : i64
+      %prevpos = arith.subi %i, %one : i64
+      %has_prev = arith.cmpi sge, %prevpos, %start : i64
+      %skippable = scf.if %has_prev -> (i1) {
+        %prev_index = arith.index_cast %prevpos : i64 to index
+        %pcp = func.call @__ly_unicode_get(%s_bytes, %s_width, %prev_index) : (memref<?xi8>, i64, index) -> i64
+        %present = func.call @__ly_unicode_bloom_has(%pre#0, %pcp) : (i64, i64) -> i1
+        %absent = arith.xori %present, %true : i1
+        scf.yield %absent : i1
+      } else {
+        scf.yield %false : i1
+      }
+      %step:2 = scf.if %is_first -> (i64, i64) {
+        %hit = func.call @__ly_unicode_match_at(%s_bytes, %s_width, %i_index, %t_bytes, %t_width, %c0, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
+        %after:2 = scf.if %hit -> (i64, i64) {
+          scf.yield %i, %i : i64, i64
+        } else {
+          %chosen = arith.select %skippable, %long_step, %skip_step : i64
+          %ni = arith.subi %i, %chosen : i64
+          scf.yield %ni, %ans : i64, i64
+        }
+        scf.yield %after#0, %after#1 : i64, i64
+      } else {
+        %chosen = arith.select %skippable, %long_step, %one : i64
+        %ni = arith.subi %i, %chosen : i64
+        scf.yield %ni, %ans : i64, i64
+      }
+      scf.yield %step#0, %step#1 : i64, i64
+    }
+    func.return %walk#1 : i64
+  }
+
+  func.func private @__ly_unicode_find_core(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64, %reverse: i1) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %c0 = arith.constant 0 : index
+    // ⭐ A ONE-CHARACTER NEEDLE IS TESTED FIRST AND SCANS PLAINLY, which is
+    // what CPython's FASTSEARCH does before anything else. The bloom filter
+    // costs a second read per position -- the character past the window -- and
+    // for a single character the candidate read IS the whole comparison, so
+    // the filter doubles the work rather than saving it.
+    //
+    // ⛔ Written out here rather than called, and tested before the window
+    // check rather than inside it, because what pays for this is `split`: it
+    // restarts the search at every separator, so splitting a 100-piece line is
+    // 200 finds that each scan one or two positions and the PER-CALL cost is
+    // the whole cost. Measured on `"a,b,...".split(",")` x 100,000: the plain
+    // scan with no filter at all is 118 ms, this shape is 131, and folding the
+    // case into the bloom loop as a branch instead of dispatching is 140. So
+    // the filter still costs `split` 10% for the 2.5x it gives `find`, and
+    // what would pay that back is `split` itself -- it walks the string TWICE,
+    // once to count the pieces and once to cut them, and a single pass would
+    // halve the searching rather than shave it.
+    %single = arith.cmpi eq, %n, %one : i64
+    %answer = scf.if %single -> (i64) {
+      %target = func.call @__ly_unicode_get(%t_bytes, %t_width, %c0) : (memref<?xi8>, i64, index) -> i64
+      %last_pos = arith.subi %end, %one : i64
+      %from = arith.select %reverse, %last_pos, %start : i64
+      %walk:2 = scf.while (%i = %from, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
+        %above = arith.cmpi sge, %i, %start : i64
+        %below = arith.cmpi slt, %i, %end : i64
+        %in_range = arith.andi %above, %below : i1
+        %not_yet = arith.cmpi eq, %ans, %minus_one : i64
+        %go = arith.andi %in_range, %not_yet : i1
+        scf.condition(%go) %i, %ans : i64, i64
       } do {
-      ^bb0(%k: i64, %acc: i64):
-        %fwd = arith.addi %start, %k : i64
-        %rev = arith.subi %limit, %k : i64
-        %pos = arith.select %reverse, %rev, %fwd : i64
-        %pos_index = arith.index_cast %pos : i64 to index
-        %ti = arith.constant 0 : index
-        %eq = func.call @__ly_unicode_match_at(%s_bytes, %s_width, %pos_index, %t_bytes, %t_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
-        %next = arith.select %eq, %pos, %acc : i64
-        %nk = arith.addi %k, %one : i64
-        scf.yield %nk, %next : i64, i64
+      ^bb0(%i: i64, %ans: i64):
+        %i_index = arith.index_cast %i : i64 to index
+        %cp = func.call @__ly_unicode_get(%s_bytes, %s_width, %i_index) : (memref<?xi8>, i64, index) -> i64
+        %hit = arith.cmpi eq, %cp, %target : i64
+        %next_ans = arith.select %hit, %i, %ans : i64
+        %back = arith.subi %i, %one : i64
+        %fwd = arith.addi %i, %one : i64
+        %ni = arith.select %reverse, %back, %fwd : i64
+        scf.yield %ni, %next_ans : i64, i64
       }
       scf.yield %walk#1 : i64
     } else {
-      scf.yield %minus_one : i64
+      %limit = arith.subi %end, %n : i64
+      %viable = arith.cmpi sle, %start, %limit : i64
+      %found = scf.if %viable -> (i64) {
+        // An empty needle matches at the near end of the window, which for the
+        // reverse direction is the far one.
+        %empty = arith.cmpi eq, %n, %zero : i64
+        %either = scf.if %empty -> (i64) {
+          %pos = arith.select %reverse, %limit, %start : i64
+          scf.yield %pos : i64
+        } else {
+          %directed = scf.if %reverse -> (i64) {
+            %r = func.call @__ly_unicode_find_rev(%s_bytes, %s_width, %t_bytes, %t_width, %start, %end, %n) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64) -> i64
+            scf.yield %r : i64
+          } else {
+            %f = func.call @__ly_unicode_find_fwd(%s_bytes, %s_width, %t_bytes, %t_width, %start, %end, %n) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64) -> i64
+            scf.yield %f : i64
+          }
+          scf.yield %directed : i64
+        }
+        scf.yield %either : i64
+      } else {
+        scf.yield %minus_one : i64
+      }
+      scf.yield %found : i64
     }
-    func.return %found : i64
+    func.return %answer : i64
   }
 
   func.func @LyUnicode_StartsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %prefix_header: memref<2xi64> {ly.ownership.object_header}, %prefix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "startswith"} {
