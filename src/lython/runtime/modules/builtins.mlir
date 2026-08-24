@@ -10649,27 +10649,44 @@ module attributes {
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %take = arith.index_cast %adj#1 : i64 to index
 
-    // Pass 1: canonical width of the selected code points.
-    %max_width = scf.for %k = %c0 to %take step %c1 iter_args(%acc = %one) -> (i64) {
-      %k64 = arith.index_cast %k : index to i64
-      %offset = arith.muli %k64, %step : i64
-      %ordinal = arith.addi %adj#0, %offset : i64
-      %ordinal_index = arith.index_cast %ordinal : i64 to index
-      %cp = func.call @__ly_unicode_get(%bytes, %width, %ordinal_index) : (memref<?xi8>, i64, index) -> i64
-      %cp_width = func.call @__ly_unicode_width_for(%cp) : (i64) -> i64
-      %wider = arith.cmpi sgt, %cp_width, %acc : i64
-      %next = arith.select %wider, %cp_width, %acc : i1, i64
-      scf.yield %next : i64
+    // Pass 1: canonical width of the selected code points. A width-1 source
+    // has none above 255, so the pass has nothing to find and is skipped --
+    // and it was the more expensive of the two, calling
+    // `__ly_unicode_width_for` per character on top of the read.
+    %narrow = arith.cmpi eq, %width, %one : i64
+    %max_width = scf.if %narrow -> (i64) {
+      scf.yield %one : i64
+    } else {
+      %scan = scf.for %k = %c0 to %take step %c1 iter_args(%acc = %one) -> (i64) {
+        %k64 = arith.index_cast %k : index to i64
+        %offset = arith.muli %k64, %step : i64
+        %ordinal = arith.addi %adj#0, %offset : i64
+        %ordinal_index = arith.index_cast %ordinal : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %ordinal_index) : (memref<?xi8>, i64, index) -> i64
+        %cp_width = func.call @__ly_unicode_width_for(%cp) : (i64) -> i64
+        %wider = arith.cmpi sgt, %cp_width, %acc : i64
+        %next = arith.select %wider, %cp_width, %acc : i1, i64
+        scf.yield %next : i64
+      }
+      scf.yield %scan : i64
     }
 
     %out_header, %out_bytes = func.call @__ly_unicode_alloc(%adj#1, %max_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
-    scf.for %k = %c0 to %take step %c1 {
-      %k64 = arith.index_cast %k : index to i64
-      %offset = arith.muli %k64, %step : i64
-      %ordinal = arith.addi %adj#0, %offset : i64
-      %ordinal_index = arith.index_cast %ordinal : i64 to index
-      %cp = func.call @__ly_unicode_get(%bytes, %width, %ordinal_index) : (memref<?xi8>, i64, index) -> i64
-      func.call @__ly_unicode_put(%out_bytes, %max_width, %k, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+    // A step of one is a contiguous run, which is the copy the byte path is
+    // for; anything else has to walk the ordinals.
+    %step_one = arith.cmpi eq, %step, %one : i64
+    scf.if %step_one {
+      %from = arith.index_cast %adj#0 : i64 to index
+      func.call @__ly_unicode_copy_run(%out_bytes, %max_width, %c0, %bytes, %width, %from, %take) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+    } else {
+      scf.for %k = %c0 to %take step %c1 {
+        %k64 = arith.index_cast %k : index to i64
+        %offset = arith.muli %k64, %step : i64
+        %ordinal = arith.addi %adj#0, %offset : i64
+        %ordinal_index = arith.index_cast %ordinal : i64 to index
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %ordinal_index) : (memref<?xi8>, i64, index) -> i64
+        func.call @__ly_unicode_put(%out_bytes, %max_width, %k, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
     }
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
@@ -10881,6 +10898,53 @@ module attributes {
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
+  // ⭐ A SAME-WIDTH COPY IS BYTES, NOT CODEPOINTS. `__ly_unicode_get` and
+  // `__ly_unicode_put` each dispatch on the width and reassemble the value a
+  // byte at a time, so copying one string into another cost two calls and a
+  // branch per character where CPython, when the two kinds agree, calls
+  // memcpy. This loop is the shape LLVM's loop-idiom recognition turns into
+  // one, and the widths agree in every case that matters: an ASCII string
+  // concatenated with an ASCII string, sliced, joined or repeated.
+  //
+  // Why NOT call memcpy directly: the manifest would have to declare it and
+  // hand it raw addresses, and the pipeline rejects a descriptor built inline
+  // (Passes/Runtime/Passes/Lowering.cpp). A byte loop over the two memrefs
+  // says the same thing in the vocabulary this layer has.
+  func.func private @__ly_unicode_copy_bytes(%dst: memref<?xi8>, %dst_off: index, %src: memref<?xi8>, %src_off: index, %count: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %b = %c0 to %count step %c1 {
+      %s = arith.addi %src_off, %b : index
+      %d = arith.addi %dst_off, %b : index
+      %v = memref.load %src[%s] : memref<?xi8>
+      memref.store %v, %dst[%d] : memref<?xi8>
+    }
+    func.return
+  }
+
+  // Copy %len codepoints from %src[%src_at] to %dst[%dst_at], taking the byte
+  // path when the two widths agree and the widening one when they do not.
+  func.func private @__ly_unicode_copy_run(%dst: memref<?xi8>, %dst_width: i64, %dst_at: index, %src: memref<?xi8>, %src_width: i64, %src_at: index, %len: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %same = arith.cmpi eq, %dst_width, %src_width : i64
+    scf.if %same {
+      %w = arith.index_cast %src_width : i64 to index
+      %bytes = arith.muli %len, %w : index
+      %d = arith.muli %dst_at, %w : index
+      %s = arith.muli %src_at, %w : index
+      func.call @__ly_unicode_copy_bytes(%dst, %d, %src, %s, %bytes) : (memref<?xi8>, index, memref<?xi8>, index, index) -> ()
+    } else {
+      scf.for %index = %c0 to %len step %c1 {
+        %si = arith.addi %src_at, %index : index
+        %di = arith.addi %dst_at, %index : index
+        %cp = func.call @__ly_unicode_get(%src, %src_width, %si) : (memref<?xi8>, i64, index) -> i64
+        func.call @__ly_unicode_put(%dst, %dst_width, %di, %cp) : (memref<?xi8>, i64, index, i64) -> ()
+      }
+    }
+    func.return
+  }
+
   func.func @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
@@ -10895,15 +10959,8 @@ module attributes {
     %header, %bytes = func.call @__ly_unicode_alloc(%total_len, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     %lhs_upper = arith.index_cast %lhs_len : i64 to index
     %rhs_upper = arith.index_cast %rhs_len : i64 to index
-    scf.for %index = %c0 to %lhs_upper step %c1 {
-      %cp = func.call @__ly_unicode_get(%lhs_bytes, %lhs_width, %index) : (memref<?xi8>, i64, index) -> i64
-      func.call @__ly_unicode_put(%bytes, %width, %index, %cp) : (memref<?xi8>, i64, index, i64) -> ()
-    }
-    scf.for %index = %c0 to %rhs_upper step %c1 {
-      %cp = func.call @__ly_unicode_get(%rhs_bytes, %rhs_width, %index) : (memref<?xi8>, i64, index) -> i64
-      %dest = arith.addi %lhs_upper, %index : index
-      func.call @__ly_unicode_put(%bytes, %width, %dest, %cp) : (memref<?xi8>, i64, index, i64) -> ()
-    }
+    func.call @__ly_unicode_copy_run(%bytes, %width, %c0, %lhs_bytes, %lhs_width, %c0, %lhs_upper) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+    func.call @__ly_unicode_copy_run(%bytes, %width, %lhs_upper, %rhs_bytes, %rhs_width, %c0, %rhs_upper) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -10978,20 +11035,36 @@ module attributes {
       %span = arith.subi %limit, %start : i64
       %positions_i64 = arith.addi %span, %one : i64
       %positions = arith.index_cast %positions_i64 : i64 to index
-      %scan = scf.for %k = %c0 to %positions step %c1 iter_args(%acc = %minus_one) -> (i64) {
-        %k_i64 = arith.index_cast %k : index to i64
-        %fwd = arith.addi %start, %k_i64 : i64
-        %rev = arith.subi %limit, %k_i64 : i64
+      // ⭐ STOPS AT THE FIRST MATCH. This was an `scf.for` over every position
+      // from `start` to `limit`, keeping the first hit with a select: a find
+      // that matched at position 35 of an 880-character string still ran 837
+      // `__ly_unicode_match_at` calls. `find`, `rfind`, `index`, `in`, `count`,
+      // `replace`, `split` and `partition` all come through here, and `split`
+      // restarts the scan at each separator, so it was quadratic in the number
+      // of pieces on top of that.
+      //
+      // ⛔ Still the naive O(n*m) scan CPython left behind: its stringlib is
+      // two-way with a Bloom filter over the needle's last character, which
+      // skips rather than steps. That is the next thing here, and it is a
+      // constant factor on top of a complexity this restores.
+      %walk:2 = scf.while (%k = %zero, %acc = %minus_one) : (i64, i64) -> (i64, i64) {
+        %more = arith.cmpi slt, %k, %positions_i64 : i64
+        %not_yet = arith.cmpi eq, %acc, %minus_one : i64
+        %go = arith.andi %more, %not_yet : i1
+        scf.condition(%go) %k, %acc : i64, i64
+      } do {
+      ^bb0(%k: i64, %acc: i64):
+        %fwd = arith.addi %start, %k : i64
+        %rev = arith.subi %limit, %k : i64
         %pos = arith.select %reverse, %rev, %fwd : i64
         %pos_index = arith.index_cast %pos : i64 to index
         %ti = arith.constant 0 : index
         %eq = func.call @__ly_unicode_match_at(%s_bytes, %s_width, %pos_index, %t_bytes, %t_width, %ti, %n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> i1
-        %not_yet = arith.cmpi eq, %acc, %minus_one : i64
-        %take = arith.andi %eq, %not_yet : i1
-        %next = arith.select %take, %pos, %acc : i64
-        scf.yield %next : i64
+        %next = arith.select %eq, %pos, %acc : i64
+        %nk = arith.addi %k, %one : i64
+        scf.yield %nk, %next : i64, i64
       }
-      scf.yield %scan : i64
+      scf.yield %walk#1 : i64
     } else {
       scf.yield %minus_one : i64
     }
@@ -11164,24 +11237,33 @@ module attributes {
   }
 
   func.func private @__ly_unicode_slice(%header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
+    %one_i64 = arith.constant 1 : i64
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
-    %maxcp = scf.for %i = %start to %end step %c1 iter_args(%acc = %zero) -> (i64) {
-      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
-      %bigger = arith.cmpi ugt, %cp, %acc : i64
-      %next = arith.select %bigger, %cp, %acc : i64
-      scf.yield %next : i64
+    // A width-1 source cannot yield a wider slice, so the scan that picks the
+    // narrowest output width has nothing to find. CPython skips
+    // _PyUnicode_FindMaxChar on a latin-1 source for the same reason, and
+    // `__ly_unicode_width_for(0)` is 1, so the scan's answer is already right
+    // when it is not run.
+    %narrow = arith.cmpi eq, %width, %one_i64 : i64
+    %maxcp = scf.if %narrow -> (i64) {
+      scf.yield %zero : i64
+    } else {
+      %scan = scf.for %i = %start to %end step %c1 iter_args(%acc = %zero) -> (i64) {
+        %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
+        %bigger = arith.cmpi ugt, %cp, %acc : i64
+        %next = arith.select %bigger, %cp, %acc : i64
+        scf.yield %next : i64
+      }
+      scf.yield %scan : i64
     }
     %span = arith.subi %end, %start : index
     %count = arith.index_cast %span : index to i64
     %out_width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
     %out_header, %out_bytes = func.call @__ly_unicode_alloc(%count, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
-    scf.for %i = %start to %end step %c1 {
-      %cp = func.call @__ly_unicode_get(%bytes, %width, %i) : (memref<?xi8>, i64, index) -> i64
-      %dst = arith.subi %i, %start : index
-      func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
-    }
+    func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %c0, %bytes, %width, %start, %span) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
