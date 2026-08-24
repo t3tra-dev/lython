@@ -10220,11 +10220,23 @@ module attributes {
 
   // PEP 393-style adaptive-width representation. One entity, one allocation:
   //   [0,16)               header [refcount, class id = 4]
-  //   [16,24)              character width word: 1 (latin-1) / 2 (UCS-2) / 4 (UCS-4)
+  //   [16,24)              shape word: (data byte count << 3) | width, where
+  //                        width is 1 (latin-1) / 2 (UCS-2) / 4 (UCS-4)
   //   [24, 24+len*width)   little-endian code units
-  // The width word lives OUTSIDE the two-word header (rather than in spare
+  // The shape word lives OUTSIDE the two-word header (rather than in spare
   // bits of header[1]) because header[1] is the class id that boxed payload
   // handles, repr dispatch and the release hook compare by equality.
+  //
+  // ⭐ THE BYTE COUNT IS RECORDED, AND IT USED TO LIVE ONLY IN THE DESCRIPTOR.
+  // `__ly_unicode_count` read it with `memref.dim` off the bytes lane, so the
+  // length existed only in the SECOND of the contract's two physical values --
+  // which means a box had to cache that lane to be able to read the string
+  // back. Three bits are enough for the width, and nothing else was using the
+  // other sixty-one.
+  //
+  // Why NOT a fourth word: it is 8 bytes on every string in the program, and
+  // the box saves 16 per BOXED string, so a program whose strings mostly sit in
+  // variables would pay for one that puts them in containers.
   // Canonical-form invariant: every constructor picks the smallest width that
   // fits the widest code point, so equal strings always have identical width
   // and identical code-unit bytes (equality can stay bytewise).
@@ -10245,9 +10257,12 @@ module attributes {
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %width_slot = arith.constant 0 : index
+    %shape_shift = arith.constant 3 : i64
+    %shape_bytes = arith.shli %data_bytes, %shape_shift : i64
+    %shape = arith.ori %shape_bytes, %width : i64
     memref.store %one, %header[%refcount_slot] : memref<2xi64>
     memref.store %layout_str, %header[%layout_slot] : memref<2xi64>
-    memref.store %width, %width_view[%width_slot] : memref<1xi64>
+    memref.store %shape, %width_view[%width_slot] : memref<1xi64>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -10257,18 +10272,40 @@ module attributes {
   func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64 {
     %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
     %ptr = arith.index_cast %ptr_index : index to i64
-    %sixteen = arith.constant 16 : i64
-    %addr = arith.addi %ptr, %sixteen : i64
-    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
-    %width = llvm.load %llptr : !llvm.ptr -> i64
+    %width = func.call @__ly_unicode_raw_width(%ptr) : (i64) -> i64
     func.return %width : i64
   }
 
+  // The shape word of a str block, by the block's address.
+  func.func private @__ly_unicode_shape_word(%hdr_ptr: i64) -> i64 {
+    %sixteen = arith.constant 16 : i64
+    %addr = arith.addi %hdr_ptr, %sixteen : i64
+    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
+    %shape = llvm.load %llptr : !llvm.ptr -> i64
+    func.return %shape : i64
+  }
+
+  // Byte length of a str's code-unit buffer, recovered from the block rather
+  // than from a descriptor -- which is what lets a box hold only the block.
+  func.func private @__ly_unicode_raw_bytes(%hdr_ptr: i64) -> i64 {
+    %shape = func.call @__ly_unicode_shape_word(%hdr_ptr) : (i64) -> i64
+    %shift = arith.constant 3 : i64
+    %bytes = arith.shrui %shape, %shift : i64
+    func.return %bytes : i64
+  }
+
+  // ⛔ THE BLOCK AND NOT THE DESCRIPTOR. The bytes lane is still taken as an
+  // argument because every caller has it, but the length comes from the shape
+  // word: a str read back out of a box has no descriptor to ask, and having the
+  // two answers come from different places is how they would drift.
   func.func private @__ly_unicode_count(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64 {
-    %c0 = arith.constant 0 : index
-    %dim = memref.dim %bytes, %c0 : memref<?xi8>
-    %data_bytes = arith.index_cast %dim : index to i64
-    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+    %ptr = arith.index_cast %ptr_index : index to i64
+    %shape = func.call @__ly_unicode_shape_word(%ptr) : (i64) -> i64
+    %mask = arith.constant 7 : i64
+    %width = arith.andi %shape, %mask : i64
+    %shift = arith.constant 3 : i64
+    %data_bytes = arith.shrui %shape, %shift : i64
     %count = arith.divsi %data_bytes, %width : i64
     func.return %count : i64
   }
@@ -12726,10 +12763,9 @@ module attributes {
 
   // Character width of a boxed str element (the width word at header+16).
   func.func private @__ly_unicode_raw_width(%hdr_ptr: i64) -> i64 {
-    %sixteen = arith.constant 16 : i64
-    %addr = arith.addi %hdr_ptr, %sixteen : i64
-    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
-    %width = llvm.load %llptr : !llvm.ptr -> i64
+    %shape = func.call @__ly_unicode_shape_word(%hdr_ptr) : (i64) -> i64
+    %mask = arith.constant 7 : i64
+    %width = arith.andi %shape, %mask : i64
     func.return %width : i64
   }
 

@@ -1817,7 +1817,14 @@ void buildUtf8MessageCStr(SupportBuilder &b) {
     b.builder.setInsertionPointToStart(&widthIf.getThenRegion().front());
     mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{one});
     b.builder.setInsertionPointToStart(&widthIf.getElseRegion().front());
-    mlir::Value stored = b.loadI64(b.gepI8(header, b.iconst(16)));
+    // The shape word packs the byte count above the width's three bits
+    // (`__ly_unicode_alloc`); reading it whole compared a length against 2 and
+    // 4, fell through to latin-1, and printed a UCS-2 message as its first
+    // code unit and a NUL.
+    mlir::Value shape = b.loadI64(b.gepI8(header, b.iconst(16)));
+    mlir::Value stored = mlir::arith::AndIOp::create(b.builder, b.loc, shape,
+                                                     b.iconst(7))
+                             .getResult();
     mlir::Value two = b.iconst(2);
     mlir::Value four = b.iconst(4);
     mlir::Value isTwo = b.cmpi(mlir::arith::CmpIPredicate::eq, stored, two);
