@@ -17804,46 +17804,290 @@ module attributes {
   // Stable in-place insertion sort over boxed slots, ordered by
   // __ly_box_less (adjacent swaps only while strictly less, so equal
   // elements keep their relative order).
-  func.func private @__ly_sort_slots(%items: memref<?xi64>, %len: i64) {
+  // CPython's merge_compute_minrun (listobject.c): the low bits of n rolled
+  // into the answer, so n/minrun is just under a power of two and the merge
+  // passes stay balanced. 32..64 for anything worth merging.
+  func.func private @__ly_sort_minrun(%n0: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c64 = arith.constant 64 : i64
+    %walk:2 = scf.while (%n = %n0, %r = %zero) : (i64, i64) -> (i64, i64) {
+      %big = arith.cmpi sge, %n, %c64 : i64
+      scf.condition(%big) %n, %r : i64, i64
+    } do {
+    ^bb0(%n: i64, %r: i64):
+      %bit = arith.andi %n, %one : i64
+      %nr = arith.ori %r, %bit : i64
+      %nn = arith.shrui %n, %one : i64
+      scf.yield %nn, %nr : i64, i64
+    }
+    %minrun = arith.addi %walk#0, %walk#1 : i64
+    func.return %minrun : i64
+  }
+
+  // One 16-word element from %src[%s] to %dst[%d]. Raw words: a slot move is
+  // not a reference change, so nothing here retains or releases.
+  func.func private @__ly_move_slot(%dst: memref<?xi64>, %d: i64, %src: memref<?xi64>, %s: i64) {
+    %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
+    %c16 = arith.constant 16 : index
     %c16_i64 = arith.constant 16 : i64
-    %c8 = arith.constant 8 : i64
-    %len_index = arith.index_cast %len : i64 to index
+    %db = arith.muli %d, %c16_i64 : i64
+    %sb = arith.muli %s, %c16_i64 : i64
+    %dbi = arith.index_cast %db : i64 to index
+    %sbi = arith.index_cast %sb : i64 to index
+    scf.for %w = %c0 to %c16 step %c1 {
+      %di = arith.addi %dbi, %w : index
+      %si = arith.addi %sbi, %w : index
+      %v = memref.load %src[%si] : memref<?xi64>
+      memref.store %v, %dst[%di] : memref<?xi64>
+    }
+    func.return
+  }
+
+  func.func private @__ly_slot_less(%items_ptr: !llvm.ptr, %a: i64, %b: i64) -> i1 {
+    %c16 = arith.constant 16 : i64
+    %ao = arith.muli %a, %c16 : i64
+    %bo = arith.muli %b, %c16 : i64
+    %ap = llvm.getelementptr %items_ptr[%ao] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %bp = llvm.getelementptr %items_ptr[%bo] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %less = func.call @__ly_box_less(%ap, %bp) : (!llvm.ptr, !llvm.ptr) -> i1
+    func.return %less : i1
+  }
+
+  func.func private @__ly_reverse_slots(%items: memref<?xi64>, %lo: i64, %hi: i64) {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %n = arith.subi %hi, %lo : i64
+    %half = arith.divui %n, %two : i64
+    %half_index = arith.index_cast %half : i64 to index
+    %last = arith.subi %hi, %one : i64
+    scf.for %k = %c0 to %half_index step %c1 {
+      %kk = arith.index_cast %k : index to i64
+      %a = arith.addi %lo, %kk : i64
+      %b = arith.subi %last, %kk : i64
+      %ai = arith.index_cast %a : i64 to index
+      %bi = arith.index_cast %b : i64 to index
+      func.call @__ly_swap_slots(%items, %ai, %bi) : (memref<?xi64>, index, index) -> ()
+    }
+    func.return
+  }
+
+  // Sort [lo, hi) in place: take the natural run at %lo -- reversing it when it
+  // is strictly descending, which is what keeps a reversed input linear -- and
+  // insertion-sort the remainder of the block into it. This is count_run plus
+  // binary_sort, and the block is at most minrun long so the quadratic tail is
+  // bounded by 64.
+  func.func private @__ly_sort_block(%items: memref<?xi64>, %items_ptr: !llvm.ptr, %lo: i64, %hi: i64) {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %false = arith.constant false
+    %c1i = arith.constant 1 : index
+    %n = arith.subi %hi, %lo : i64
+    %enough = arith.cmpi sge, %n, %two : i64
+    scf.if %enough {
+      %second = arith.addi %lo, %one : i64
+      %desc = func.call @__ly_slot_less(%items_ptr, %second, %lo) : (!llvm.ptr, i64, i64) -> i1
+      %start2 = arith.addi %lo, %two : i64
+      %end = scf.while (%k = %start2) : (i64) -> i64 {
+        %inb = arith.cmpi slt, %k, %hi : i64
+        %cont = scf.if %inb -> (i1) {
+          %prev = arith.subi %k, %one : i64
+          %lt = func.call @__ly_slot_less(%items_ptr, %k, %prev) : (!llvm.ptr, i64, i64) -> i1
+          %same = arith.cmpi eq, %lt, %desc : i1
+          scf.yield %same : i1
+        } else {
+          scf.yield %false : i1
+        }
+        scf.condition(%cont) %k : i64
+      } do {
+      ^bb0(%k: i64):
+        %nk = arith.addi %k, %one : i64
+        scf.yield %nk : i64
+      }
+      scf.if %desc {
+        func.call @__ly_reverse_slots(%items, %lo, %end) : (memref<?xi64>, i64, i64) -> ()
+      }
+      %end_index = arith.index_cast %end : i64 to index
+      %hi_index = arith.index_cast %hi : i64 to index
+      scf.for %p = %end_index to %hi_index step %c1i {
+        %pp = arith.index_cast %p : index to i64
+        %fin = scf.while (%j = %pp) : (i64) -> i64 {
+          %above = arith.cmpi sgt, %j, %lo : i64
+          %swap = scf.if %above -> (i1) {
+            %prev = arith.subi %j, %one : i64
+            %lt = func.call @__ly_slot_less(%items_ptr, %j, %prev) : (!llvm.ptr, i64, i64) -> i1
+            scf.yield %lt : i1
+          } else {
+            scf.yield %false : i1
+          }
+          scf.condition(%swap) %j : i64
+        } do {
+        ^bb0(%j: i64):
+          %prev = arith.subi %j, %one : i64
+          %ji = arith.index_cast %j : i64 to index
+          %pi = arith.index_cast %prev : i64 to index
+          func.call @__ly_swap_slots(%items, %ji, %pi) : (memref<?xi64>, index, index) -> ()
+          scf.yield %prev : i64
+        }
+      }
+    }
+    func.return
+  }
+
+  // Merge the adjacent sorted ranges [lo, mid) and [mid, hi).
+  //
+  // ⭐ THE COMPARISONS COME FIRST AND THE MOVES SECOND, and that split is the
+  // whole reason this is safe. `__ly_box_less` can raise -- it reaches
+  // `__ly_cmp_raise_unorderable` and a user `__lt__` -- and a merge that
+  // interleaved comparing with moving would be caught half way, with the array
+  // holding some elements twice and others not at all: the list's destructor
+  // would then release one box twice and leak another. Phase A only reads, so
+  // an unwind out of it leaves the array exactly as it was, and Phase B calls
+  // nothing that can raise.
+  //
+  // ⛔ What still escapes on that path is the scratch, which the caller
+  // allocated. CPython avoids even that by emptying the list for the duration
+  // of the sort and cleaning up in its error path; writing that here needs a
+  // landing pad the manifest has no spelling for.
+  func.func private @__ly_merge_slots(%items: memref<?xi64>, %items_ptr: !llvm.ptr, %scratch: memref<?xi64>, %decisions: memref<?xi8>, %lo: i64, %mid: i64, %hi: i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero8 = arith.constant 0 : i8
+    %one8 = arith.constant 1 : i8
+    %prev = arith.subi %mid, %one : i64
+    // Already in order end to end: CPython's same shortcut, and it is what
+    // makes a sorted input cost one comparison per block per pass.
+    %out_of_order = func.call @__ly_slot_less(%items_ptr, %mid, %prev) : (!llvm.ptr, i64, i64) -> i1
+    scf.if %out_of_order {
+      %walk:3 = scf.while (%i = %lo, %j = %mid, %k = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+        %li = arith.cmpi slt, %i, %mid : i64
+        %rj = arith.cmpi slt, %j, %hi : i64
+        %both = arith.andi %li, %rj : i1
+        scf.condition(%both) %i, %j, %k : i64, i64, i64
+      } do {
+      ^bb0(%i: i64, %j: i64, %k: i64):
+        // STRICTLY less, so an equal pair takes the left element: that is what
+        // makes the sort stable, and stability is observable.
+        %take_right = func.call @__ly_slot_less(%items_ptr, %j, %i) : (!llvm.ptr, i64, i64) -> i1
+        %kk = arith.index_cast %k : i64 to index
+        %mark = arith.select %take_right, %one8, %zero8 : i8
+        memref.store %mark, %decisions[%kk] : memref<?xi8>
+        %i_next = arith.addi %i, %one : i64
+        %j_next = arith.addi %j, %one : i64
+        %ni = arith.select %take_right, %i, %i_next : i64
+        %nj = arith.select %take_right, %j_next, %j : i64
+        %nk = arith.addi %k, %one : i64
+        scf.yield %ni, %nj, %nk : i64, i64, i64
+      }
+      %n1 = arith.subi %mid, %lo : i64
+      %n1_index = arith.index_cast %n1 : i64 to index
+      scf.for %t = %c0 to %n1_index step %c1 {
+        %tt = arith.index_cast %t : index to i64
+        %src = arith.addi %lo, %tt : i64
+        func.call @__ly_move_slot(%scratch, %tt, %items, %src) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+      }
+      %ndec_index = arith.index_cast %walk#2 : i64 to index
+      %after:3 = scf.for %d = %c0 to %ndec_index step %c1 iter_args(%i2 = %zero, %j2 = %mid, %k2 = %lo) -> (i64, i64, i64) {
+        %mark = memref.load %decisions[%d] : memref<?xi8>
+        %right = arith.cmpi ne, %mark, %zero8 : i8
+        %next:3 = scf.if %right -> (i64, i64, i64) {
+          func.call @__ly_move_slot(%items, %k2, %items, %j2) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+          %nj = arith.addi %j2, %one : i64
+          %nk = arith.addi %k2, %one : i64
+          scf.yield %i2, %nj, %nk : i64, i64, i64
+        } else {
+          func.call @__ly_move_slot(%items, %k2, %scratch, %i2) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+          %ni = arith.addi %i2, %one : i64
+          %nk = arith.addi %k2, %one : i64
+          scf.yield %ni, %j2, %nk : i64, i64, i64
+        }
+        scf.yield %next#0, %next#1, %next#2 : i64, i64, i64
+      }
+      // Whatever is left of the LEFT half. The right half's remainder is
+      // already where it belongs -- the cursors meet at the same index.
+      %i2_index = arith.index_cast %after#0 : i64 to index
+      scf.for %t = %i2_index to %n1_index step %c1 {
+        %tt = arith.index_cast %t : index to i64
+        %delta = arith.subi %tt, %after#0 : i64
+        %dst = arith.addi %after#2, %delta : i64
+        func.call @__ly_move_slot(%items, %dst, %scratch, %tt) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
+      }
+    }
+    func.return
+  }
+
+  // ⭐ A STABLE MERGE SORT, where this was an insertion sort: `xs.sort()` on
+  // 20,000 elements took 19.0 s against CPython 3.14's 43.5 ms, and doubling
+  // the length quadrupled the time (4,000 -> 26 ms, 8,000 -> 101, 16,000 ->
+  // 401). CPython's listsort is Timsort, and this is its shape without the
+  // merge stack or galloping: minrun-sized blocks made sorted by natural run
+  // plus insertion, then balanced bottom-up merge passes.
+  //
+  // Why the output needs nothing more than stability to agree with CPython: a
+  // stable sort of a total order has exactly one answer, so Timsort and this
+  // produce the same list. What Timsort's stack and galloping buy is speed on
+  // shapes this does not exploit -- long pre-sorted runs that are not block
+  // aligned, and merges where one side is far longer than the other.
+  func.func private @__ly_sort_slots(%items: memref<?xi64>, %len: i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %c16_i64 = arith.constant 16 : i64
+    %c0 = arith.constant 0 : index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
     %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
-    %start = arith.constant 1 : index
-    %c0_index = arith.constant 0 : index
-    %valid_start = arith.cmpi sgt, %len_index, %c0_index : index
-    scf.if %valid_start {
-      scf.for %i = %start to %len_index step %c1 {
-        %i_i64 = arith.index_cast %i : index to i64
-        %zero = arith.constant 0 : i64
-        %one = arith.constant 1 : i64
-        %final_j = scf.while (%j = %i_i64) : (i64) -> i64 {
-          %positive = arith.cmpi sgt, %j, %zero : i64
-          %should_swap = scf.if %positive -> (i1) {
-            %j_off = arith.muli %j, %c16_i64 : i64
-            %prev = arith.subi %j, %one : i64
-            %prev_off = arith.muli %prev, %c16_i64 : i64
-            %j_box = llvm.getelementptr %items_ptr[%j_off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-            %prev_box = llvm.getelementptr %items_ptr[%prev_off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-            %less = func.call @__ly_box_less(%j_box, %prev_box) : (!llvm.ptr, !llvm.ptr) -> i1
-            scf.yield %less : i1
-          } else {
-            %false = arith.constant false
-            scf.yield %false : i1
-          }
-          scf.condition(%should_swap) %j : i64
+    %sortable = arith.cmpi sge, %len, %two : i64
+    scf.if %sortable {
+      %minrun = func.call @__ly_sort_minrun(%len) : (i64) -> i64
+      %len_index = arith.index_cast %len : i64 to index
+      %minrun_index = arith.index_cast %minrun : i64 to index
+      scf.for %lo = %c0 to %len_index step %minrun_index {
+        %lo_i64 = arith.index_cast %lo : index to i64
+        %want = arith.addi %lo_i64, %minrun : i64
+        %past = arith.cmpi sgt, %want, %len : i64
+        %hi = arith.select %past, %len, %want : i64
+        func.call @__ly_sort_block(%items, %items_ptr, %lo_i64, %hi) : (memref<?xi64>, !llvm.ptr, i64, i64) -> ()
+      }
+      %needs_merge = arith.cmpi slt, %minrun, %len : i64
+      scf.if %needs_merge {
+        %scratch_words = arith.muli %len, %c16_i64 : i64
+        %scratch_index = arith.index_cast %scratch_words : i64 to index
+        %scratch = memref.alloc(%scratch_index) : memref<?xi64>
+        %decisions = memref.alloc(%len_index) : memref<?xi8>
+        %final = scf.while (%width = %minrun) : (i64) -> i64 {
+          %more = arith.cmpi slt, %width, %len : i64
+          scf.condition(%more) %width : i64
         } do {
-        ^bb0(%j: i64):
-          %one_inner = arith.constant 1 : i64
-          %prev = arith.subi %j, %one_inner : i64
-          %j_index = arith.index_cast %j : i64 to index
-          %prev_index = arith.index_cast %prev : i64 to index
-          func.call @__ly_swap_slots(%items, %j_index, %prev_index) : (memref<?xi64>, index, index) -> ()
-          scf.yield %prev : i64
+        ^bb0(%width: i64):
+          %step_i64 = arith.muli %width, %two : i64
+          %step_index = arith.index_cast %step_i64 : i64 to index
+          scf.for %lo = %c0 to %len_index step %step_index {
+            %lo_i64 = arith.index_cast %lo : index to i64
+            %mid_want = arith.addi %lo_i64, %width : i64
+            %mid_past = arith.cmpi sgt, %mid_want, %len : i64
+            %mid = arith.select %mid_past, %len, %mid_want : i64
+            %hi_want = arith.addi %lo_i64, %step_i64 : i64
+            %hi_past = arith.cmpi sgt, %hi_want, %len : i64
+            %hi = arith.select %hi_past, %len, %hi_want : i64
+            %has_right = arith.cmpi slt, %mid, %hi : i64
+            scf.if %has_right {
+              func.call @__ly_merge_slots(%items, %items_ptr, %scratch, %decisions, %lo_i64, %mid, %hi) : (memref<?xi64>, !llvm.ptr, memref<?xi64>, memref<?xi8>, i64, i64, i64) -> ()
+            }
+          }
+          scf.yield %step_i64 : i64
         }
+        %scratch_addr_index = memref.extract_aligned_pointer_as_index %scratch : memref<?xi64> -> index
+        %scratch_addr = arith.index_cast %scratch_addr_index : index to i64
+        %decisions_addr_index = memref.extract_aligned_pointer_as_index %decisions : memref<?xi8> -> index
+        %decisions_addr = arith.index_cast %decisions_addr_index : index to i64
+        func.call @free_raw_i64_ptr(%decisions_addr) : (i64) -> ()
+        func.call @free_raw_i64_ptr(%scratch_addr) : (i64) -> ()
       }
     }
     func.return
