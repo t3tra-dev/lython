@@ -1587,6 +1587,31 @@ module attributes {
     func.return
   }
 
+  // Records the message lane in the object (extended word 6). A cache, not a
+  // reference: the lane's owner releases it, and this word is only how a reader
+  // that holds the OBJECT alone finds the same string.
+  func.func private @__ly_exc_set_message(%header: memref<3xi64>, %message_header: memref<2xi64>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "set_message"} {
+    %slot = arith.constant 6 : i64
+    %ptr_index = memref.extract_aligned_pointer_as_index %message_header : memref<2xi64> -> index
+    %ptr = arith.index_cast %ptr_index : index to i64
+    func.call @__ly_exc_ext_set(%header, %slot, %ptr) : (memref<3xi64>, i64, i64) -> ()
+    func.return
+  }
+
+  // The message lanes of an exception, from the object alone.
+  func.func private @__ly_exc_message_parts(%header: memref<3xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "message_parts", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 6 : i64
+    %two = arith.constant 2 : i64
+    %prefix = arith.constant 24 : i64
+    %msg_ptr = func.call @__ly_exc_ext_get(%header, %slot) : (memref<3xi64>, i64) -> i64
+    %words = func.call @__ly_global_view_i64(%msg_ptr, %two) : (i64, i64) -> memref<?xi64>
+    %msg_header = memref.cast %words : memref<?xi64> to memref<2xi64>
+    %bytes_ptr = arith.addi %msg_ptr, %prefix : i64
+    %byte_len = func.call @__ly_unicode_raw_bytes(%msg_ptr) : (i64) -> i64
+    %msg_bytes = func.call @__ly_global_view_i8(%bytes_ptr, %byte_len) : (i64, i64) -> memref<?xi8>
+    func.return %msg_header, %msg_bytes : memref<2xi64>, memref<?xi8>
+  }
+
   // Allocate a payload block for %count boxed entries: word 0 = count, then
   // count x 16 zeroed box words. Returned as a raw pointer word (the block is
   // reached only through the extended exception words).
@@ -1833,6 +1858,7 @@ module attributes {
   // the empty construction-time message, and returns the receiver triple.
   func.func @LyBaseException_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "init_payload_message"} {
     %msg_h, %msg_b = func.call @__ly_exc_render_args(%header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @__ly_exc_set_message(%header, %msg_h) : (memref<3xi64>, memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
     func.return %header, %msg_h, %msg_b : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
@@ -2456,6 +2482,7 @@ module attributes {
   func.func private @LyCancelledError_Shape() -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "asyncio.CancelledError", ly.runtime.shape}
 
   func.func @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"} {
+    func.call @__ly_exc_set_message(%header, %message_header) : (memref<3xi64>, memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%old_message_header) : (memref<2xi64>) -> ()
     func.return %header, %message_header, %message_bytes : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
@@ -2619,19 +2646,29 @@ module attributes {
     %zero_index = arith.constant 0 : index
     %zero_len = arith.constant 0 : i64
 
-    %block_bytes = arith.constant 48 : index
+    // ⭐ WORD 6 IS THE MESSAGE, and it is what lets a box hold an exception. The
+    // message is a physical LANE of the contract and the object never named it,
+    // so a box had to cache all three lanes to hand the exception back. The
+    // word is a cache of the lane, kept in sync at the three places that
+    // produce one (New, Init, InitPayloadMessage) and released by the lane's
+    // own owner -- LyBaseException_DecRef -- so it adds no reference.
+    %message_slot = arith.constant 6 : index
+    %block_bytes = arith.constant 56 : index
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %header = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
-    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<6xi64>
+    %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<7xi64>
     %empty_bytes = memref.alloca(%zero_index) : memref<?xi8>
     %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%empty_bytes, %zero_index, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %message_ptr_index = memref.extract_aligned_pointer_as_index %message_header : memref<2xi64> -> index
+    %message_ptr = arith.index_cast %message_ptr_index : index to i64
 
     memref.store %one, %header[%refcount_slot] : memref<3xi64>
     memref.store %layout_exception, %header[%layout_slot] : memref<3xi64>
     memref.store %class_id, %header[%class_slot] : memref<3xi64>
-    memref.store %zero, %extended[%payload_slot] : memref<6xi64>
-    memref.store %zero, %extended[%fields_slot] : memref<6xi64>
-    memref.store %zero, %extended[%code_slot] : memref<6xi64>
+    memref.store %zero, %extended[%payload_slot] : memref<7xi64>
+    memref.store %zero, %extended[%fields_slot] : memref<7xi64>
+    memref.store %zero, %extended[%code_slot] : memref<7xi64>
+    memref.store %message_ptr, %extended[%message_slot] : memref<7xi64>
 
     func.return %header, %message_header, %message_bytes : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
@@ -4744,10 +4781,16 @@ module attributes {
 
   // CPython's str-based print output.
 
+  // ⛔ THE MESSAGE COMES FROM THE OBJECT AND NOT FROM THE LANES IT WAS HANDED.
+  // The two are the same string, and reading the recorded one here is what
+  // keeps the record honest: every `str(e)` in the suite compares it against
+  // the lane a producer passed, so a producer that forgot to record fails
+  // loudly instead of waiting for a box to read the stale word.
   func.func @LyBaseException_Str(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__str__", ly.runtime.result_contract = "builtins.str"} {
-    %view = memref.cast %message_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+    %recorded_header, %recorded_bytes = func.call @__ly_exc_message_parts(%header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
+    %view = memref.cast %recorded_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %message_header, %message_bytes : memref<2xi64>, memref<?xi8>
+    func.return %recorded_header, %recorded_bytes : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyBaseException_Repr(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
