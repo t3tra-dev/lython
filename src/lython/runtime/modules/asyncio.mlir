@@ -121,6 +121,9 @@ module attributes {
 
   func.func private @LyTaskIter_Shape() -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.shape}
 
+  func.func private @__ly_entity_word_set(%ptr: i64, %slot: i64, %value: i64)
+  func.func private @__ly_entity_word_get(%ptr: i64, %slot: i64) -> i64
+  func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
   func.func private @__ly_asyncio_retain_storage(%storage: memref<?xi64>) {
     %slot = arith.constant 0 : index
     %zero = arith.constant 0 : i64
@@ -535,10 +538,22 @@ module attributes {
     %layout_slot = arith.constant 1 : index
     %consumed_slot = arith.constant 2 : index
 
-    %iterator = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<3xi64>
+    // Word 3 records the future: the contract is two physical values and the
+    // iterator named neither the second nor a way back to it, so a payload box
+    // had to cache both lanes.
+    %zero_index = arith.constant 0 : index
+    %block_bytes = arith.constant 32 : index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %iterator = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
     memref.store %one, %iterator[%refcount_slot] : memref<3xi64>
     memref.store %layout_future_iter, %iterator[%layout_slot] : memref<3xi64>
     memref.store %zero, %iterator[%consumed_slot] : memref<3xi64>
+    %future_word_slot = arith.constant 3 : i64
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %future_ptr_index = memref.extract_aligned_pointer_as_index %future : memref<10xi64> -> index
+    %future_ptr = arith.index_cast %future_ptr_index : index to i64
+    func.call @__ly_entity_word_set(%iter_ptr, %future_word_slot, %future_ptr) : (i64, i64, i64) -> ()
 
     %future_storage = memref.cast %future : memref<10xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%future_storage) : (memref<?xi64>) -> ()
@@ -560,12 +575,27 @@ module attributes {
     func.return
   }
 
+  // The non-first lane of the contract, from the iterator's address.
+  func.func private @__ly_future_iter_lane_words(%iter_ptr: i64) -> (i64, i64) attributes {ly.runtime.contract = "_asyncio.FutureIter", ly.runtime.primitive = "lane_words"} {
+    %future_slot = arith.constant 3 : i64
+    %ten = arith.constant 10 : i64
+    %future_ptr = func.call @__ly_entity_word_get(%iter_ptr, %future_slot) : (i64, i64) -> i64
+    func.return %future_ptr, %ten : i64, i64
+  }
+
+  // ⛔ RETURNS THE RECOVERED LANE. It is the same future by construction, and
+  // reading it back here is what makes the record load-bearing.
   func.func @LyFutureIter_Iter(%iterator: memref<3xi64> {ly.ownership.object_header}, %future: memref<10xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<10xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.FutureIter", ly.runtime.method = "__iter__", ly.runtime.result_contract = "_asyncio.FutureIter"} {
     %iterator_storage = memref.cast %iterator : memref<3xi64> to memref<?xi64>
     %future_storage = memref.cast %future : memref<10xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%iterator_storage) : (memref<?xi64>) -> ()
     func.call @__ly_asyncio_retain_storage(%future_storage) : (memref<?xi64>) -> ()
-    func.return %iterator, %future : memref<3xi64>, memref<10xi64>
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %future_ptr, %future_size = func.call @__ly_future_iter_lane_words(%iter_ptr) : (i64) -> (i64, i64)
+    %future_words = func.call @__ly_global_view_i64(%future_ptr, %future_size) : (i64, i64) -> memref<?xi64>
+    %future_view = memref.cast %future_words : memref<?xi64> to memref<10xi64>
+    func.return %iterator, %future_view : memref<3xi64>, memref<10xi64>
   }
 
   func.func @LyFuture_DecRef(%future: memref<10xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_asyncio.Future", ly.runtime.deallocator} {
@@ -614,7 +644,17 @@ module attributes {
     %source_target_slot = arith.constant 3 : index
     %coroutine_target_id = memref.load %coroutine[%source_target_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.coroutine.target.load"} : memref<5xi64>
 
-    %task = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<12xi64>
+    // Word 12 records the coroutine, the contract's second physical value.
+    %zero_index = arith.constant 0 : index
+    %block_bytes = arith.constant 104 : index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %task = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<12xi64>
+    %coroutine_word_slot = arith.constant 12 : i64
+    %task_ptr_index = memref.extract_aligned_pointer_as_index %task : memref<12xi64> -> index
+    %task_ptr = arith.index_cast %task_ptr_index : index to i64
+    %coroutine_ptr_index = memref.extract_aligned_pointer_as_index %coroutine : memref<5xi64> -> index
+    %coroutine_ptr = arith.index_cast %coroutine_ptr_index : index to i64
+    func.call @__ly_entity_word_set(%task_ptr, %coroutine_word_slot, %coroutine_ptr) : (i64, i64, i64) -> ()
     memref.store %one, %task[%refcount_slot] : memref<12xi64>
     memref.store %layout, %task[%layout_slot] : memref<12xi64>
     // Task states: 0 = pending, 1 = running, 2 = finished, 3 = cancelled.
@@ -801,10 +841,25 @@ module attributes {
     %layout_slot = arith.constant 1 : index
     %consumed_slot = arith.constant 2 : index
 
-    %iterator = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<3xi64>
+    // Words 3 and 4 record the task and the coroutine, for the same reason
+    // LyFutureIter_New records its future.
+    %zero_index = arith.constant 0 : index
+    %block_bytes = arith.constant 40 : index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %iterator = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
     memref.store %one, %iterator[%refcount_slot] : memref<3xi64>
     memref.store %layout_task_iter, %iterator[%layout_slot] : memref<3xi64>
     memref.store %zero, %iterator[%consumed_slot] : memref<3xi64>
+    %task_word_slot = arith.constant 3 : i64
+    %coroutine_word_slot = arith.constant 4 : i64
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %task_ptr_index = memref.extract_aligned_pointer_as_index %task : memref<12xi64> -> index
+    %task_ptr = arith.index_cast %task_ptr_index : index to i64
+    %coroutine_ptr_index = memref.extract_aligned_pointer_as_index %coroutine : memref<5xi64> -> index
+    %coroutine_ptr = arith.index_cast %coroutine_ptr_index : index to i64
+    func.call @__ly_entity_word_set(%iter_ptr, %task_word_slot, %task_ptr) : (i64, i64, i64) -> ()
+    func.call @__ly_entity_word_set(%iter_ptr, %coroutine_word_slot, %coroutine_ptr) : (i64, i64, i64) -> ()
 
     %task_storage = memref.cast %task : memref<12xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%task_storage) : (memref<?xi64>) -> ()
@@ -832,12 +887,36 @@ module attributes {
     func.return
   }
 
+  func.func private @__ly_task_iter_lane_words(%iter_ptr: i64) -> (i64, i64, i64, i64) attributes {ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.primitive = "lane_words"} {
+    %task_slot = arith.constant 3 : i64
+    %coroutine_slot = arith.constant 4 : i64
+    %twelve = arith.constant 12 : i64
+    %five = arith.constant 5 : i64
+    %task_ptr = func.call @__ly_entity_word_get(%iter_ptr, %task_slot) : (i64, i64) -> i64
+    %coroutine_ptr = func.call @__ly_entity_word_get(%iter_ptr, %coroutine_slot) : (i64, i64) -> i64
+    func.return %task_ptr, %twelve, %coroutine_ptr, %five : i64, i64, i64, i64
+  }
+
+  func.func private @__ly_task_lane_words(%task_ptr: i64) -> (i64, i64) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "lane_words"} {
+    %coroutine_slot = arith.constant 12 : i64
+    %five = arith.constant 5 : i64
+    %coroutine_ptr = func.call @__ly_entity_word_get(%task_ptr, %coroutine_slot) : (i64, i64) -> i64
+    func.return %coroutine_ptr, %five : i64, i64
+  }
+
   func.func @LyTaskIter_Iter(%iterator: memref<3xi64> {ly.ownership.object_header}, %task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.method = "__iter__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
     %iterator_storage = memref.cast %iterator : memref<3xi64> to memref<?xi64>
     %task_storage = memref.cast %task : memref<12xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%iterator_storage) : (memref<?xi64>) -> ()
     func.call @__ly_asyncio_retain_storage(%task_storage) : (memref<?xi64>) -> ()
-    func.return %iterator, %task, %coroutine : memref<3xi64>, memref<12xi64>, memref<5xi64>
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %task_ptr, %task_size, %coroutine_ptr, %coroutine_size = func.call @__ly_task_iter_lane_words(%iter_ptr) : (i64) -> (i64, i64, i64, i64)
+    %task_words = func.call @__ly_global_view_i64(%task_ptr, %task_size) : (i64, i64) -> memref<?xi64>
+    %task_view = memref.cast %task_words : memref<?xi64> to memref<12xi64>
+    %coroutine_words = func.call @__ly_global_view_i64(%coroutine_ptr, %coroutine_size) : (i64, i64) -> memref<?xi64>
+    %coroutine_view = memref.cast %coroutine_words : memref<?xi64> to memref<5xi64>
+    func.return %iterator, %task_view, %coroutine_view : memref<3xi64>, memref<12xi64>, memref<5xi64>
   }
 
   func.func @LyTask_DecRef(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.deallocator} {

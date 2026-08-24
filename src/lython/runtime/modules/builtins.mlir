@@ -1587,6 +1587,30 @@ module attributes {
     func.return
   }
 
+  // ⭐ A WORD PAST AN ENTITY'S DECLARED HANDLE. Several contracts are more than
+  // one physical value, and a payload box can only hand back what the FIRST
+  // one names -- so each of them records its other lanes in words its handle
+  // does not span. `__ly_unicode_alloc` does it with the shape word,
+  // `LyBaseException_New` with extended word 6, and these are the same access
+  // for the contracts that need no accessor of their own.
+  //
+  // Why NOT widen the handle instead: the handle's width IS the contract's
+  // identity (HandleWidthRegistry.h), and widening one to hold a word no
+  // signature mentions moves it into somebody else's tie.
+  func.func private @__ly_entity_word_set(%ptr: i64, %slot: i64, %value: i64) {
+    %base = llvm.inttoptr %ptr : i64 to !llvm.ptr
+    %slot_ptr = llvm.getelementptr %base[%slot] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %value, %slot_ptr : i64, !llvm.ptr
+    func.return
+  }
+
+  func.func private @__ly_entity_word_get(%ptr: i64, %slot: i64) -> i64 {
+    %base = llvm.inttoptr %ptr : i64 to !llvm.ptr
+    %slot_ptr = llvm.getelementptr %base[%slot] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %value = llvm.load %slot_ptr : !llvm.ptr -> i64
+    func.return %value : i64
+  }
+
   // Records the message lane in the object (extended word 6). A cache, not a
   // reference: the lane's owner releases it, and this word is only how a reader
   // that holds the OBJECT alone finds the same string.
@@ -1596,6 +1620,14 @@ module attributes {
     %ptr = arith.index_cast %ptr_index : index to i64
     func.call @__ly_exc_ext_set(%header, %slot, %ptr) : (memref<3xi64>, i64, i64) -> ()
     func.return
+  }
+
+  func.func private @__ly_exc_lane_words(%obj_ptr: i64) -> (i64, i64, i64, i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "lane_words"} {
+    %message_slot = arith.constant 6 : i64
+    %two = arith.constant 2 : i64
+    %msg_ptr = func.call @__ly_entity_word_get(%obj_ptr, %message_slot) : (i64, i64) -> i64
+    %bytes_ptr, %byte_len = func.call @__ly_unicode_lane_words(%msg_ptr) : (i64) -> (i64, i64)
+    func.return %msg_ptr, %two, %bytes_ptr, %byte_len : i64, i64, i64, i64
   }
 
   // The message lanes of an exception, from the object alone.
@@ -10326,6 +10358,18 @@ module attributes {
     %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
     %shape = llvm.load %llptr : !llvm.ptr -> i64
     func.return %shape : i64
+  }
+
+  // ⭐ THE NON-FIRST LANES OF A CONTRACT, FROM THE FIRST ONE'S ADDRESS. A
+  // payload box names one entity; every contract that is more than one physical
+  // value answers here with (pointer, size) per remaining lane, so the box does
+  // not have to carry them. One of these per multi-lane contract is what the
+  // box's own width rests on.
+  func.func private @__ly_unicode_lane_words(%hdr_ptr: i64) -> (i64, i64) attributes {ly.runtime.contract = "builtins.str", ly.runtime.primitive = "lane_words"} {
+    %prefix = arith.constant 24 : i64
+    %bytes_ptr = arith.addi %hdr_ptr, %prefix : i64
+    %byte_len = func.call @__ly_unicode_raw_bytes(%hdr_ptr) : (i64) -> i64
+    func.return %bytes_ptr, %byte_len : i64, i64
   }
 
   // Byte length of a str's code-unit buffer, recovered from the block rather
@@ -24514,19 +24558,32 @@ module attributes {
   // deallocator moved would not leave a stale view behind.
   func.func private @LyBytesIterator_Shape() -> (memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.shape}
 
+  // One block: [0,2) the handle, [2,4) the (position, length) state lane,
+  // [4] the source bytes object. The state used to be its own allocation and
+  // the source only a lane, so neither was reachable from the handle -- which
+  // is what a box holds.
   func.func private @__ly_bytes_iterator_alloc(%position: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 24 : i64, ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.primitive = "alloc"} {
-    %header = memref.alloc() {alignment = 16 : i64, ly.ownership.object_header, ly.ownership.owned_local_object} : memref<2xi64>
-    %state = memref.alloc() {alignment = 16 : i64} : memref<2xi64>
+    %zero_index = arith.constant 0 : index
+    %state_offset = arith.constant 16 : index
+    %block_bytes = arith.constant 40 : index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %header = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<2xi64>
+    %state = memref.view %block[%state_offset][] : memref<?xi8> to memref<2xi64>
     %one = arith.constant 1 : i64
+    %zero = arith.constant 0 : i64
     %layout_bytes_iterator = arith.constant 24 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %position_slot = arith.constant 0 : index
     %length_slot = arith.constant 1 : index
+    %source_slot = arith.constant 4 : i64
     memref.store %one, %header[%refcount_slot] : memref<2xi64>
     memref.store %layout_bytes_iterator, %header[%layout_slot] : memref<2xi64>
     memref.store %position, %state[%position_slot] : memref<2xi64>
     memref.store %length, %state[%length_slot] : memref<2xi64>
+    %header_ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+    %header_ptr = arith.index_cast %header_ptr_index : index to i64
+    func.call @__ly_entity_word_set(%header_ptr, %source_slot, %zero) : (i64, i64, i64) -> ()
     func.return %header, %state : memref<2xi64>, memref<2xi64>
   }
 
@@ -24534,28 +24591,63 @@ module attributes {
     %zero = arith.constant 0 : i64
     %length = func.call @LyBytes_Len(%source_header) : (memref<6xi64>) -> i64
     %iter_header, %state = func.call @__ly_bytes_iterator_alloc(%zero, %length) : (i64, i64) -> (memref<2xi64>, memref<2xi64>)
+    %source_slot = arith.constant 4 : i64
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iter_header : memref<2xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %source_ptr_index = memref.extract_aligned_pointer_as_index %source_header : memref<6xi64> -> index
+    %source_ptr = arith.index_cast %source_ptr_index : index to i64
+    func.call @__ly_entity_word_set(%iter_ptr, %source_slot, %source_ptr) : (i64, i64, i64) -> ()
     %source_header_sub = memref.subview %source_header[0] [2] [1] : memref<6xi64> to memref<2xi64, strided<[1]>>
     %source_header_view = memref.cast %source_header_sub : memref<2xi64, strided<[1]>> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%source_header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
     func.return %iter_header, %state, %source_header : memref<2xi64>, memref<2xi64>, memref<6xi64>
   }
 
+  func.func private @__ly_bytes_iterator_lane_words(%iter_ptr: i64) -> (i64, i64, i64, i64) attributes {ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.primitive = "lane_words"} {
+    %state_offset = arith.constant 16 : i64
+    %two = arith.constant 2 : i64
+    %six = arith.constant 6 : i64
+    %source_slot = arith.constant 4 : i64
+    %state_ptr = arith.addi %iter_ptr, %state_offset : i64
+    %source_ptr = func.call @__ly_entity_word_get(%iter_ptr, %source_slot) : (i64, i64) -> i64
+    func.return %state_ptr, %two, %source_ptr, %six : i64, i64, i64, i64
+  }
+
+  // ⛔ RETURNS THE RECOVERED LANES AND NOT THE ONES IT WAS HANDED. They are the
+  // same two by construction, and reading the recovered pair here is what keeps
+  // the record honest -- every `for b in some_bytes` compares them.
   func.func @LyBytesIterator_Iter(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.method = "__iter__", ly.runtime.result_contract = "builtins.bytes_iterator"} {
     %iter_header_view = memref.cast %iter_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%iter_header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
-    func.return %iter_header, %state, %source_header : memref<2xi64>, memref<2xi64>, memref<6xi64>
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iter_header : memref<2xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %state_ptr, %state_size, %source_ptr, %source_size = func.call @__ly_bytes_iterator_lane_words(%iter_ptr) : (i64) -> (i64, i64, i64, i64)
+    %state_words = func.call @__ly_global_view_i64(%state_ptr, %state_size) : (i64, i64) -> memref<?xi64>
+    %state_view = memref.cast %state_words : memref<?xi64> to memref<2xi64>
+    %source_words = func.call @__ly_global_view_i64(%source_ptr, %source_size) : (i64, i64) -> memref<?xi64>
+    %source_view = memref.cast %source_words : memref<?xi64> to memref<6xi64>
+    func.return %iter_header, %state_view, %source_view : memref<2xi64>, memref<2xi64>, memref<6xi64>
   }
 
   func.func @LyBytesIterator_Next(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "builtins.bytes_iterator", ly.runtime.valid_result_index = 1 : i64} {
+    // ⛔ THE STATE COMES FROM THE RECORD AND NOT FROM THE LANE. They are the
+    // same two words by construction, and stepping the recovered one is what
+    // makes the record load-bearing: every `for b in some_bytes` walks it, so a
+    // block that stopped describing its own lanes stops iterating.
     %position_slot = arith.constant 0 : index
     %length_slot = arith.constant 1 : index
-    %position = memref.load %state[%position_slot] : memref<2xi64>
-    %length = memref.load %state[%length_slot] : memref<2xi64>
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iter_header : memref<2xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %state_ptr, %state_size, %recorded_source_ptr, %recorded_source_size = func.call @__ly_bytes_iterator_lane_words(%iter_ptr) : (i64) -> (i64, i64, i64, i64)
+    %state_words = func.call @__ly_global_view_i64(%state_ptr, %state_size) : (i64, i64) -> memref<?xi64>
+    %live_state = memref.cast %state_words : memref<?xi64> to memref<2xi64>
+    %position = memref.load %live_state[%position_slot] : memref<2xi64>
+    %length = memref.load %live_state[%length_slot] : memref<2xi64>
     %valid = arith.cmpi slt, %position, %length : i64
     %one = arith.constant 1 : i64
     %next_position_candidate = arith.addi %position, %one : i64
     %next_position = arith.select %valid, %next_position_candidate, %position : i1, i64
-    memref.store %next_position, %state[%position_slot] : memref<2xi64>
+    memref.store %next_position, %live_state[%position_slot] : memref<2xi64>
     %iter_header_view = memref.cast %iter_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%iter_header_view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
 
@@ -24580,7 +24672,8 @@ module attributes {
 
   ^dealloc:
     func.call @LyBytes_DecRef(%source_header) : (memref<6xi64>) -> ()
-    memref.dealloc %state : memref<2xi64>
+    // The state is interior to the handle's block now; the handle view carries
+    // the whole allocation, the way a str's header view does.
     memref.dealloc %iter_header : memref<2xi64>
     cf.br ^done
 
