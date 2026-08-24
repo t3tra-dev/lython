@@ -294,15 +294,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListPop(
     return mlir::memref::LoadOp::create(builder, loc, itemsArray, index)
         .getResult();
   };
-  llvm::SmallVector<mlir::Value, 4> resultValues;
-  for (auto [position, shape] : llvm::enumerate(*shapes))
-    resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-        builder, loc,
-        loadParkedWord(box_abi::kPointerWordBase +
-                       static_cast<std::int64_t>(position)),
-        loadParkedWord(box_abi::kSizeWordBase +
-                       static_cast<std::int64_t>(position)),
-        mlir::cast<mlir::MemRefType>(shape)));
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> parkedLanes =
+      RuntimeBundleLowerer::lanesFromBoxEntity(
+          builder, loc, loadParkedWord(box_abi::kEntityWord), *shapes,
+          runtimeContractName(elementContract), op);
+  if (mlir::failed(parkedLanes))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 4> resultValues(parkedLanes->begin(),
+                                                 parkedLanes->end());
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,
                                                    resultValues);
@@ -677,32 +676,24 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         return mlir::memref::LoadOp::create(builder, loc, defaultBox, index)
             .getResult();
       };
-      llvm::SmallVector<mlir::Value, 4> resultValues;
-      for (auto [position, shape] : llvm::enumerate(*shapes)) {
-        mlir::Value pointerWord =
-            loadSlotWord(box_abi::kPointerWordBase +
-                         static_cast<std::int64_t>(position));
-        mlir::Value sizeWord = loadSlotWord(
-            box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
-        if (hasDefault) {
-          mlir::Value defaultPointer =
-              loadDefaultWord(box_abi::kPointerWordBase +
-                              static_cast<std::int64_t>(position));
-          mlir::Value defaultSize =
-              loadDefaultWord(box_abi::kSizeWordBase +
-                              static_cast<std::int64_t>(position));
-          pointerWord = mlir::arith::SelectOp::create(builder, loc, ok,
-                                                      pointerWord,
-                                                      defaultPointer)
-                            .getResult();
-          sizeWord = mlir::arith::SelectOp::create(builder, loc, ok, sizeWord,
-                                                   defaultSize)
+      // The default is a box too, so the miss is chosen ONCE -- on the entity
+      // word -- and the lanes are then rebuilt from whichever box won. Selecting
+      // per lane was equivalent while the box carried them; it is not now, when
+      // rebuilding dereferences the entity and only one of the two is live.
+      mlir::Value entityWord = loadSlotWord(box_abi::kEntityWord);
+      if (hasDefault)
+        entityWord = mlir::arith::SelectOp::create(
+                         builder, loc, ok, entityWord,
+                         loadDefaultWord(box_abi::kEntityWord))
                          .getResult();
-        }
-        resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-            builder, loc, pointerWord, sizeWord,
-            mlir::cast<mlir::MemRefType>(shape)));
-      }
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> slotLanes =
+          RuntimeBundleLowerer::lanesFromBoxEntity(
+              builder, loc, entityWord, *shapes,
+              runtimeContractName(valueContract), op);
+      if (mlir::failed(slotLanes))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 4> resultValues(slotLanes->begin(),
+                                                     slotLanes->end());
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
           RuntimeBundleLowerer::unboxSlotElementValues(op, valueContract,
                                                        resultValues);

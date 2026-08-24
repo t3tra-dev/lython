@@ -1105,36 +1105,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   // through the inactive member's handle is not a wrong answer but a wild load.
   auto rebuildBoxedFieldLanes =
       [&](llvm::ArrayRef<mlir::Type> laneTypes, mlir::Value body,
-          mlir::Value boxWord)
+          mlir::Value boxWord, llvm::StringRef contract)
       -> mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> {
     builder.setInsertionPoint(op);
-    llvm::SmallVector<mlir::Value, 4> rebuilt;
-    for (auto [index, type] : llvm::enumerate(laneTypes)) {
-      auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type);
-      if (!memrefType)
-        return op.emitError()
-               << "box-fronted field '" << op.getName()
-               << "' expects memref physical values, got " << type;
-      mlir::Value ptrIndex = mlir::arith::AddIOp::create(
-          builder, op.getLoc(), boxWord,
-          mlir::arith::ConstantIndexOp::create(
-              builder, op.getLoc(),
-              box_abi::kPointerWordBase + static_cast<std::int64_t>(index)));
-      mlir::Value sizeIndex = mlir::arith::AddIOp::create(
-          builder, op.getLoc(), boxWord,
-          mlir::arith::ConstantIndexOp::create(
-              builder, op.getLoc(),
-              box_abi::kSizeWordBase + static_cast<std::int64_t>(index)));
-      mlir::Value ptrWord =
-          mlir::memref::LoadOp::create(builder, op.getLoc(), body, ptrIndex)
-              .getResult();
-      mlir::Value sizeWord =
-          mlir::memref::LoadOp::create(builder, op.getLoc(), body, sizeIndex)
-              .getResult();
-      rebuilt.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-          builder, op.getLoc(), ptrWord, sizeWord, memrefType));
-    }
-    return rebuilt;
+    mlir::Value entityIndex = mlir::arith::AddIOp::create(
+        builder, op.getLoc(), boxWord,
+        mlir::arith::ConstantIndexOp::create(builder, op.getLoc(),
+                                             box_abi::kEntityWord));
+    mlir::Value entityWord =
+        mlir::memref::LoadOp::create(builder, op.getLoc(), body, entityIndex)
+            .getResult();
+    return RuntimeBundleLowerer::lanesFromBoxEntity(
+        builder, op.getLoc(), entityWord, laneTypes, contract, op);
   };
   auto rebuildBoxedFieldValues =
       [&](mlir::Type fieldContract, mlir::Value body, mlir::Value boxWord)
@@ -1144,7 +1126,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                                                    "class field ABI");
     if (mlir::failed(arrayTypes))
       return mlir::failure();
-    return rebuildBoxedFieldLanes(*arrayTypes, body, boxWord);
+    return rebuildBoxedFieldLanes(*arrayTypes, body, boxWord,
+                                  runtimeContractName(fieldContract));
   };
   // The body of an instance whose HANDLE is the only thing available (the
   // union path selects one out of the members' handles).
@@ -1412,7 +1395,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       laneTypes = std::move(*contractTypes);
     }
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
-        rebuildBoxedFieldLanes(laneTypes, slot->first, boxWord);
+        rebuildBoxedFieldLanes(laneTypes, slot->first, boxWord,
+                               runtimeContractName(loadedContract));
     if (mlir::failed(rebuilt))
       return mlir::failure();
     values = std::move(*rebuilt);
@@ -1881,25 +1865,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrGet(
   }
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
-  llvm::SmallVector<mlir::Value, 4> elementValues;
-  for (auto [position, shape] : llvm::enumerate(*shapes)) {
-    mlir::Value ptrIndex = mlir::arith::ConstantIndexOp::create(
-        builder, loc,
-        static_cast<std::int64_t>(cell->second) + box_abi::kPointerWordBase +
-            static_cast<std::int64_t>(position));
-    mlir::Value sizeIndex = mlir::arith::ConstantIndexOp::create(
-        builder, loc,
-        static_cast<std::int64_t>(cell->second) + box_abi::kSizeWordBase +
-            static_cast<std::int64_t>(position));
-    mlir::Value ptrWord =
-        mlir::memref::LoadOp::create(builder, loc, cell->first, ptrIndex)
-            .getResult();
-    mlir::Value sizeWord =
-        mlir::memref::LoadOp::create(builder, loc, cell->first, sizeIndex)
-            .getResult();
-    elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-        builder, loc, ptrWord, sizeWord, mlir::cast<mlir::MemRefType>(shape)));
-  }
+  mlir::Value entityIndex = mlir::arith::ConstantIndexOp::create(
+      builder, loc,
+      static_cast<std::int64_t>(cell->second) + box_abi::kEntityWord);
+  mlir::Value entityWord =
+      mlir::memref::LoadOp::create(builder, loc, cell->first, entityIndex)
+          .getResult();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+      RuntimeBundleLowerer::lanesFromBoxEntity(
+          builder, loc, entityWord, *shapes, runtimeContractName(content), op);
+  if (mlir::failed(lanes))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 4> elementValues(lanes->begin(),
+                                                  lanes->end());
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, content, elementValues);
   if (mlir::failed(canonical))
@@ -2065,15 +2043,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
                loc, *boxWord, mlir::ValueRange{*block, slot, wordIndex})
         .getResult(0);
   };
-  llvm::SmallVector<mlir::Value, 4> elementValues;
-  for (auto [position, shape] : llvm::enumerate(*shapes)) {
-    mlir::Value ptrWord =
-        loadWord(box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
-    mlir::Value sizeWord =
-        loadWord(box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
-    elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-        builder, loc, ptrWord, sizeWord, mlir::cast<mlir::MemRefType>(shape)));
-  }
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+      RuntimeBundleLowerer::lanesFromBoxEntity(
+          builder, loc, loadWord(box_abi::kEntityWord), *shapes,
+          runtimeContractName(fieldType), op);
+  if (mlir::failed(lanes))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 4> elementValues(lanes->begin(),
+                                                  lanes->end());
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, fieldType, elementValues);
   if (mlir::failed(canonical))

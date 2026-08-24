@@ -80,6 +80,10 @@ inline constexpr std::int64_t kWordsPerBox = 12;
 // the same block, because an instance stored in a container is described by a
 // box that POINTS at it.
 inline constexpr std::int64_t kInstanceBodyWord = 3;
+// Word 2 is the ENTITY: the address of the object's first physical value, and
+// the only lane a box keeps. Everything else a contract expands to is reached
+// from it through that contract's `lane_words` primitive.
+inline constexpr std::int64_t kEntityWord = 2;
 inline constexpr std::int64_t kPointerWordBase = 4;
 inline constexpr std::int64_t kSizeWordBase = 7;
 inline constexpr std::int64_t kPointerWordCount =

@@ -1442,8 +1442,8 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
 }
 
 // void retain_payload_slot_ptr(ptr slot): retain an owned boxed container
-// slot by bumping the refcount of the boxed entity's object header (pointer
-// word kPointerWordBase). Class dispatch is unnecessary — every heap header
+// slot by bumping the refcount of the boxed entity's object header (the
+// entity word). Class dispatch is unnecessary — every heap header
 // keeps its refcount in word 0 — so unlike the release path there is no
 // per-program by-contract hook. Tagged (bit-0) headers own no memory and
 // immortal headers are never written (they may live in read-only sections),
@@ -1474,8 +1474,7 @@ void buildRetainPayloadSlotPtr(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(checkHeader);
   auto headerWord = mlir::func::CallOp::create(
       b.builder, b.loc, "boxed_load_i64", b.i64(),
-      mlir::ValueRange{slot,
-                       b.iconst(py::lowering::box_abi::kPointerWordBase)});
+      mlir::ValueRange{slot, b.iconst(py::lowering::box_abi::kEntityWord)});
   mlir::Value header = headerWord.getResult(0);
   mlir::Value isNull =
       b.cmpi(mlir::arith::CmpIPredicate::eq, header, zero);

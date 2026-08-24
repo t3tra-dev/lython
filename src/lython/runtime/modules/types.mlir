@@ -84,6 +84,8 @@ module attributes {
   // ===========================================================
 
   // ===== impls: generator =====
+  func.func private @__ly_entity_word_set(%ptr: i64, %slot: i64, %value: i64)
+  func.func private @__ly_entity_word_get(%ptr: i64, %slot: i64) -> i64
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
 
@@ -314,15 +316,33 @@ module attributes {
     %consumed_slot = arith.constant 2 : index
     %zero = arith.constant 0 : i64
 
-    %iterator = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<3xi64>
+    // Word 3 records the coroutine, the contract's second physical value: a
+    // payload box holds the iterator and nothing else names the coroutine.
+    %zero_index = arith.constant 0 : index
+    %block_bytes = arith.constant 32 : index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %iterator = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
     memref.store %one, %iterator[%refcount_slot] : memref<3xi64>
     memref.store %layout_await_iter, %iterator[%layout_slot] : memref<3xi64>
     memref.store %zero, %iterator[%consumed_slot] : memref<3xi64>
+    %coroutine_slot = arith.constant 3 : i64
+    %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
+    %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
+    %coroutine_ptr_index = memref.extract_aligned_pointer_as_index %storage : memref<5xi64> -> index
+    %coroutine_ptr = arith.index_cast %coroutine_ptr_index : index to i64
+    func.call @__ly_entity_word_set(%iter_ptr, %coroutine_slot, %coroutine_ptr) : (i64, i64, i64) -> ()
 
     %c0 = arith.constant 0 : index
     %header = memref.subview %storage[%c0] [2] [1] : memref<5xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%header) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
     func.return %iterator, %storage : memref<3xi64>, memref<5xi64>
+  }
+
+  func.func private @__ly_coroutine_await_iter_lane_words(%iter_ptr: i64) -> (i64, i64) attributes {ly.runtime.contract = "types.CoroutineAwaitIterator", ly.runtime.primitive = "lane_words"} {
+    %coroutine_slot = arith.constant 3 : i64
+    %five = arith.constant 5 : i64
+    %coroutine_ptr = func.call @__ly_entity_word_get(%iter_ptr, %coroutine_slot) : (i64, i64) -> i64
+    func.return %coroutine_ptr, %five : i64, i64
   }
 
   func.func @LyCoroutineAwaitIterator_Iter(%iterator: memref<3xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "types.CoroutineAwaitIterator", ly.runtime.method = "__iter__", ly.runtime.result_contract = "types.CoroutineAwaitIterator"} {

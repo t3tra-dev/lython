@@ -2009,8 +2009,6 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   if (mlir::failed(itemsOr))
     return mlir::failure();
   mlir::Value items = *itemsOr;
-  using box_abi::kPointerWordBase;
-  using box_abi::kSizeWordBase;
   mlir::Value wordsPerSlot =
       mlir::arith::ConstantIntOp::create(builder, loc, box_abi::kWordsPerBox,
                                          64);
@@ -2050,24 +2048,38 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
         .getResult();
   };
 
-  llvm::SmallVector<mlir::Value, 4> elementValues;
-  for (auto [index, deadValue] : llvm::enumerate(dead->values)) {
-    mlir::Value realPointer =
-        loadBoxWord(kPointerWordBase + static_cast<std::int64_t>(index));
-    mlir::Value realSize =
-        loadBoxWord(kSizeWordBase + static_cast<std::int64_t>(index));
-    mlir::Value pointer =
-        mlir::arith::SelectOp::create(builder, loc, valid, realPointer,
-                                      pointerWord(deadValue))
-            .getResult();
-    mlir::Value size = mlir::arith::SelectOp::create(builder, loc, valid,
-                                                     realSize,
-                                                     sizeWord(deadValue))
-                           .getResult();
-    elementValues.push_back(memrefFromBoxWords(
-        builder, loc, pointer, size,
-        mlir::cast<mlir::MemRefType>((*elementShapes)[index])));
+  // ⛔ BRANCHED AND NOT SELECTED. The lanes used to be a word-wise select
+  // between the box's and the placeholder's, which reads the box either way and
+  // is fine when the words are all the box carries. They are not any more: past
+  // the entity they come from a call that DEREFERENCES it, and an exhausted
+  // iterator's slot has nothing there. The placeholder cannot answer that call
+  // either -- its lanes are separate zeroed allocations, not one entity -- so
+  // the two sides have to be different code.
+  llvm::SmallVector<mlir::Type, 4> laneTypes(elementShapes->begin(),
+                                             elementShapes->end());
+  auto pick = mlir::scf::IfOp::create(builder, loc, laneTypes, valid,
+                                      /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&pick.getThenRegion().front());
+    mlir::Value entityWord = loadBoxWord(box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+        RuntimeBundleLowerer::lanesFromBoxEntity(
+            builder, loc, entityWord, laneTypes,
+            runtimeContractName(elementContract), op);
+    if (mlir::failed(lanes))
+      return mlir::failure();
+    mlir::scf::YieldOp::create(builder, loc, *lanes);
+    builder.setInsertionPointToStart(&pick.getElseRegion().front());
+    llvm::SmallVector<mlir::Value, 4> deadLanes;
+    for (auto [index, deadValue] : llvm::enumerate(dead->values))
+      deadLanes.push_back(memrefFromBoxWords(
+          builder, loc, pointerWord(deadValue), sizeWord(deadValue),
+          mlir::cast<mlir::MemRefType>((*elementShapes)[index])));
+    mlir::scf::YieldOp::create(builder, loc, deadLanes);
   }
+  llvm::SmallVector<mlir::Value, 4> elementValues(pick.getResults().begin(),
+                                                  pick.getResults().end());
 
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,

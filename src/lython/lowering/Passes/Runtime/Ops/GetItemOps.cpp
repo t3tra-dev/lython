@@ -1463,17 +1463,15 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
     mlir::Value base =
         mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
             .getResult();
-    for (auto [position, shape] : llvm::enumerate(*shapes)) {
-      mlir::Value pointerWord = loadContainerBoxWord(
-          builder, loc, *itemsView, base,
-          box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
-      mlir::Value sizeWord = loadContainerBoxWord(
-          builder, loc, *itemsView, base,
-          box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
-      elementValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-          builder, loc, pointerWord, sizeWord,
-          mlir::cast<mlir::MemRefType>(shape)));
-    }
+    mlir::Value entityWord = loadContainerBoxWord(builder, loc, *itemsView, base,
+                                                  box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+        RuntimeBundleLowerer::lanesFromBoxEntity(
+            builder, loc, entityWord, *shapes,
+            runtimeContractName(elementContract), op);
+    if (mlir::failed(lanes))
+      return mlir::failure();
+    elementValues.append(lanes->begin(), lanes->end());
   }
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,
@@ -1619,17 +1617,15 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
     mlir::Value base =
         mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
             .getResult();
-    for (auto [position, shape] : llvm::enumerate(*shapes)) {
-      mlir::Value pointerWord = loadContainerBoxWord(
-          builder, loc, *valuesView, base,
-          box_abi::kPointerWordBase + static_cast<std::int64_t>(position));
-      mlir::Value sizeWord = loadContainerBoxWord(
-          builder, loc, *valuesView, base,
-          box_abi::kSizeWordBase + static_cast<std::int64_t>(position));
-      resultValues.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-          builder, loc, pointerWord, sizeWord,
-          mlir::cast<mlir::MemRefType>(shape)));
-    }
+    mlir::Value entityWord = loadContainerBoxWord(builder, loc, *valuesView, base,
+                                                  box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+        RuntimeBundleLowerer::lanesFromBoxEntity(
+            builder, loc, entityWord, *shapes,
+            runtimeContractName(valueContract), op);
+    if (mlir::failed(lanes))
+      return mlir::failure();
+    resultValues.append(lanes->begin(), lanes->end());
   }
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
       RuntimeBundleLowerer::unboxSlotElementValues(op, valueContract,

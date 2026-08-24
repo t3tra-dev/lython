@@ -1579,18 +1579,30 @@ void buildPrintGroupMembers(SupportBuilder &b) {
         mlir::arith::AddIOp::create(b.builder, b.loc, boxWords, b.iconst(1));
     mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);
     mlir::Value ehWord = b.loadI64(
-        b.gepI64(boxPtr, b.iconst(py::lowering::box_abi::kPointerWordBase)));
+        b.gepI64(boxPtr, b.iconst(py::lowering::box_abi::kEntityWord)));
     // ⛔ Widened here and not carried in as a pointer: a member slot is a box
     // word, so this is the boundary the box layout imposes rather than a
     // pointer being thrown away and rebuilt (BoxLayout.cpp records why a box
     // cannot hold one).
     mlir::Value ehPtr = b.intToPtr(ehWord);
-    mlir::Value mhWord = b.loadI64(b.gepI64(
-        boxPtr, b.iconst(py::lowering::box_abi::kPointerWordBase + 1)));
-    mlir::Value mbWord = b.loadI64(b.gepI64(
-        boxPtr, b.iconst(py::lowering::box_abi::kPointerWordBase + 2)));
-    mlir::Value mbLen = b.loadI64(b.gepI64(
-        boxPtr, b.iconst(py::lowering::box_abi::kSizeWordBase + 2)));
+    // The message lanes come from the exception rather than from the box: the
+    // box holds the entity and `__ly_exc_lane_words` reads the rest out of it,
+    // which is the same answer with one copy instead of two.
+    //
+    // Declared rather than duplicated: this module is lowered on its own and
+    // linked to the manifest afterwards, and the alternative is a second copy
+    // of the exception's word layout in a file that already carries a copy of
+    // the str shape word.
+    b.declareExternal("__ly_exc_lane_words",
+                      b.builder.getFunctionType(
+                          {b.i64()}, {b.i64(), b.i64(), b.i64(), b.i64()}));
+    mlir::ValueRange messageLanes =
+        b.call("__ly_exc_lane_words",
+               mlir::TypeRange{b.i64(), b.i64(), b.i64(), b.i64()},
+               mlir::ValueRange{ehWord});
+    mlir::Value mhWord = messageLanes[0];
+    mlir::Value mbWord = messageLanes[2];
+    mlir::Value mbLen = messageLanes[3];
     mlir::Value classId =
         b.loadI64(b.gepI64(ehPtr, b.iconst(2)));
 

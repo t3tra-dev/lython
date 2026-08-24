@@ -904,6 +904,13 @@ private:
                                         mlir::Value pointerWord,
                                         mlir::Value sizeWord,
                                         mlir::MemRefType type);
+  // A boxed value's physical lanes, from the box's entity word alone: lane 0 is
+  // the entity, the rest come from the contract's `lane_words` primitive.
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+  lanesFromBoxEntity(mlir::OpBuilder &builder, mlir::Location loc,
+                     mlir::Value entityWord, llvm::ArrayRef<mlir::Type> laneTypes,
+                     llvm::StringRef contract, mlir::Operation *reporter);
+  std::optional<RuntimeSymbol> laneWordsPrimitiveFor(llvm::StringRef contract);
   // Per-program release hook: dispatches a boxed slot's class id to the
   // matching manifest deallocator (the single release implementation).
   mlir::LogicalResult generateBoxedReleaseHook();

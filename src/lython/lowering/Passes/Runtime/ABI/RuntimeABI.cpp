@@ -1756,6 +1756,10 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
   struct HookEntry {
     std::int64_t classId;
     mlir::func::FuncOp callee;
+    // The contract the BOX holds, which is not always the callee's: the
+    // exception taxonomy dispatches 71 class ids to one BaseException callee,
+    // and a source class's method carries no manifest contract at all.
+    std::string contract;
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::SmallDenseSet<std::int64_t, 16> seenIds;
@@ -1822,7 +1826,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     }
     if (!seenIds.insert(*classId).second)
       return;
-    entries.push_back(HookEntry{*classId, function});
+    entries.push_back(
+        HookEntry{*classId, function, contractAttr.getValue().str()});
   });
 
   // Compiled source-class methods share the physical-value slot convention
@@ -1842,7 +1847,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
           RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
       if (!classId || !seenIds.insert(*classId).second)
         return;
-      entries.push_back(HookEntry{*classId, function});
+      entries.push_back(
+          HookEntry{*classId, function, classOp.getSymName().str()});
     });
   }
 
@@ -1873,7 +1879,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
                 runtimeContractType(context, contractAttr.getValue()),
                 "builtins.BaseException"))
           return;
-        entries.push_back(HookEntry{classIdAttr.getInt(), baseCallee});
+        entries.push_back(HookEntry{classIdAttr.getInt(), baseCallee,
+                                    contractAttr.getValue().str()});
       });
       // Source exception classes: same shared callee, compiler-assigned ids.
       module.walk([&](py::ClassOp classOp) {
@@ -1884,7 +1891,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
         if (!classId || !seenIds.insert(*classId).second)
           return;
         if (dispatchable(*classId))
-          entries.push_back(HookEntry{*classId, baseCallee});
+          entries.push_back(HookEntry{*classId, baseCallee,
+                                      classOp.getSymName().str()});
       });
     }
   }
@@ -1945,18 +1953,16 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(handle);
-      llvm::SmallVector<mlir::Value, 6> operands;
       mlir::func::FuncOp callee = hookEntry.callee;
       mlir::FunctionType type = callee.getFunctionType();
-      for (auto [index, input] : llvm::enumerate(type.getInputs())) {
-        auto memref = mlir::cast<mlir::MemRefType>(input);
-        mlir::Value pointerWord = loadWord(
-            builder, box_abi::kPointerWordBase + static_cast<std::int64_t>(index));
-        mlir::Value sizeWord = loadWord(
-            builder, box_abi::kSizeWordBase + static_cast<std::int64_t>(index));
-        operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-            builder, loc, pointerWord, sizeWord, memref));
-      }
+      mlir::Value entityWord = loadWord(builder, box_abi::kEntityWord);
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+          RuntimeBundleLowerer::lanesFromBoxEntity(
+              builder, loc, entityWord, type.getInputs(), hookEntry.contract,
+              callee);
+      if (mlir::failed(lanes))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 6> operands(lanes->begin(), lanes->end());
       mlir::func::CallOp call =
           mlir::func::CallOp::create(builder, loc, callee, operands);
       llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
@@ -2250,6 +2256,10 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
   struct HookEntry {
     std::int64_t classId;
     mlir::func::FuncOp callee;
+    // The contract the BOX holds, which is not always the callee's: the
+    // exception taxonomy dispatches 71 class ids to one BaseException callee,
+    // and a source class's method carries no manifest contract at all.
+    std::string contract;
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::SmallDenseSet<std::int64_t, 16> seenIds;
@@ -2289,7 +2299,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     }
     if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
       return;
-    entries.push_back(HookEntry{*classId, function});
+    entries.push_back(
+        HookEntry{*classId, function, contractAttr.getValue().str()});
   });
   if (!sourceClassMethodName.empty()) {
     module.walk([&](py::ClassOp classOp) {
@@ -2305,7 +2316,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
           RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
       if (!classId || !seenIds.insert(*classId).second)
         return;
-      entries.push_back(HookEntry{*classId, function});
+      entries.push_back(
+          HookEntry{*classId, function, classOp.getSymName().str()});
     });
   }
 
@@ -2371,17 +2383,15 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
       mlir::func::FuncOp callee = hookEntry.callee;
       mlir::FunctionType type = callee.getFunctionType();
       unsigned half = type.getNumInputs() / 2;
-      for (auto [index, input] : llvm::enumerate(type.getInputs())) {
-        auto memref = mlir::cast<mlir::MemRefType>(input);
-        mlir::Value slot = index < half ? lhsSlot : rhsSlot;
-        std::int64_t position =
-            static_cast<std::int64_t>(index < half ? index : index - half);
-        mlir::Value pointerWord =
-            loadWord(builder, slot, box_abi::kPointerWordBase + position);
-        mlir::Value sizeWord =
-            loadWord(builder, slot, box_abi::kSizeWordBase + position);
-        operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-            builder, loc, pointerWord, sizeWord, memref));
+      for (mlir::Value slot : {lhsSlot, rhsSlot}) {
+        mlir::Value entityWord = loadWord(builder, slot, box_abi::kEntityWord);
+        mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+            RuntimeBundleLowerer::lanesFromBoxEntity(
+                builder, loc, entityWord, type.getInputs().take_front(half),
+                hookEntry.contract, callee);
+        if (mlir::failed(lanes))
+          return mlir::failure();
+        operands.append(lanes->begin(), lanes->end());
       }
       mlir::func::CallOp call =
           mlir::func::CallOp::create(builder, loc, callee, operands);
