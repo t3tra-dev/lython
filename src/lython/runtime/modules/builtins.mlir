@@ -1593,7 +1593,7 @@ module attributes {
   func.func private @__ly_exc_payload_alloc(%count: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_alloc"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
     %boxes = arith.muli %count, %c16 : i64
@@ -1616,7 +1616,7 @@ module attributes {
   // header's layout word (5 = the shared BaseException dispatch class), the
   // precise class id stays in the exception header itself.
   func.func private @__ly_exc_payload_store(%block_word: i64, %slot: i64, %eh: memref<3xi64>, %mh: memref<2xi64>, %mb: memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store"} {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
     %three = arith.constant 3 : i64
@@ -1644,30 +1644,50 @@ module attributes {
     llvm.store %eh_word, %w2 : i64, !llvm.ptr
     %w3 = llvm.getelementptr %box_ptr[3] : (!llvm.ptr) -> !llvm.ptr, i64
     llvm.store %three, %w3 : i64, !llvm.ptr
-    %w4 = llvm.getelementptr %box_ptr[4] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %eh_word, %w4 : i64, !llvm.ptr
-    %w5 = llvm.getelementptr %box_ptr[5] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %mh_word, %w5 : i64, !llvm.ptr
-    %w6 = llvm.getelementptr %box_ptr[6] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %mb_word, %w6 : i64, !llvm.ptr
-    %w7 = llvm.getelementptr %box_ptr[7] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %zero, %w7 : i64, !llvm.ptr
-    %w8 = llvm.getelementptr %box_ptr[8] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %zero, %w8 : i64, !llvm.ptr
-    %w9 = llvm.getelementptr %box_ptr[9] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %three, %w9 : i64, !llvm.ptr
-    %w10 = llvm.getelementptr %box_ptr[10] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %two, %w10 : i64, !llvm.ptr
-    %w11 = llvm.getelementptr %box_ptr[11] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %mb_len, %w11 : i64, !llvm.ptr
-    %w12 = llvm.getelementptr %box_ptr[12] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %zero, %w12 : i64, !llvm.ptr
-    %w13 = llvm.getelementptr %box_ptr[13] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %zero, %w13 : i64, !llvm.ptr
-    %w14 = llvm.getelementptr %box_ptr[14] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %one, %w14 : i64, !llvm.ptr
-    %w15 = llvm.getelementptr %box_ptr[15] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %zero, %w15 : i64, !llvm.ptr
+    // Clear every lane, then write the three this contract uses. The box is
+    // carved out of the payload block, so its words are numbered from the box
+    // pointer and the helpers take a base of zero.
+    %zero_base = arith.constant 0 : i64
+    %lane_count = func.call @__ly_box_lane_count() : () -> i64
+    %c0_idx = arith.constant 0 : index
+    %c1_idx = arith.constant 1 : index
+    %lane_count_idx = arith.index_cast %lane_count : i64 to index
+    scf.for %lane = %c0_idx to %lane_count_idx step %c1_idx {
+      %lane_i64 = arith.index_cast %lane : index to i64
+      %pw = func.call @__ly_box_pointer_word(%zero_base, %lane_i64) : (i64, i64) -> i64
+      %zw = func.call @__ly_box_size_word(%zero_base, %lane_i64) : (i64, i64) -> i64
+      %pg = llvm.getelementptr %box_ptr[%pw] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %zg = llvm.getelementptr %box_ptr[%zw] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      llvm.store %zero, %pg : i64, !llvm.ptr
+      llvm.store %zero, %zg : i64, !llvm.ptr
+    }
+    %lane0 = arith.constant 0 : i64
+    %lane1 = arith.constant 1 : i64
+    %lane2 = arith.constant 2 : i64
+    %p0 = func.call @__ly_box_pointer_word(%zero_base, %lane0) : (i64, i64) -> i64
+    %p1 = func.call @__ly_box_pointer_word(%zero_base, %lane1) : (i64, i64) -> i64
+    %p2 = func.call @__ly_box_pointer_word(%zero_base, %lane2) : (i64, i64) -> i64
+    %z0 = func.call @__ly_box_size_word(%zero_base, %lane0) : (i64, i64) -> i64
+    %z1 = func.call @__ly_box_size_word(%zero_base, %lane1) : (i64, i64) -> i64
+    %z2 = func.call @__ly_box_size_word(%zero_base, %lane2) : (i64, i64) -> i64
+    %ow = func.call @__ly_box_owned_word(%zero_base) : (i64) -> i64
+    %hw = func.call @__ly_box_hash_word(%zero_base) : (i64) -> i64
+    %g_p0 = llvm.getelementptr %box_ptr[%p0] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %eh_word, %g_p0 : i64, !llvm.ptr
+    %g_p1 = llvm.getelementptr %box_ptr[%p1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %mh_word, %g_p1 : i64, !llvm.ptr
+    %g_p2 = llvm.getelementptr %box_ptr[%p2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %mb_word, %g_p2 : i64, !llvm.ptr
+    %g_z0 = llvm.getelementptr %box_ptr[%z0] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %three, %g_z0 : i64, !llvm.ptr
+    %g_z1 = llvm.getelementptr %box_ptr[%z1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %two, %g_z1 : i64, !llvm.ptr
+    %g_z2 = llvm.getelementptr %box_ptr[%z2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %mb_len, %g_z2 : i64, !llvm.ptr
+    %g_ow = llvm.getelementptr %box_ptr[%ow] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %one, %g_ow : i64, !llvm.ptr
+    %g_hw = llvm.getelementptr %box_ptr[%hw] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    llvm.store %zero, %g_hw : i64, !llvm.ptr
     func.call @__ly_handle_retain_raw(%eh_word) : (i64) -> ()
     func.return
   }
@@ -1675,19 +1695,27 @@ module attributes {
   // Borrowed views of payload box %slot: the sub-exception triple, rebuilt
   // from the box's pointer/size words.
   func.func private @__ly_exc_payload_view(%block_word: i64, %slot: i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_view"} {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
     %boxes_base = arith.muli %slot, %c16 : i64
     %box_base = arith.addi %boxes_base, %one : i64
     %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %w4 = llvm.getelementptr %box_ptr[4] : (!llvm.ptr) -> !llvm.ptr, i64
+    %zero_base = arith.constant 0 : i64
+    %lane0 = arith.constant 0 : i64
+    %lane1 = arith.constant 1 : i64
+    %lane2 = arith.constant 2 : i64
+    %p0 = func.call @__ly_box_pointer_word(%zero_base, %lane0) : (i64, i64) -> i64
+    %p1 = func.call @__ly_box_pointer_word(%zero_base, %lane1) : (i64, i64) -> i64
+    %p2 = func.call @__ly_box_pointer_word(%zero_base, %lane2) : (i64, i64) -> i64
+    %z2 = func.call @__ly_box_size_word(%zero_base, %lane2) : (i64, i64) -> i64
+    %w4 = llvm.getelementptr %box_ptr[%p0] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %eh_word = llvm.load %w4 : !llvm.ptr -> i64
-    %w5 = llvm.getelementptr %box_ptr[5] : (!llvm.ptr) -> !llvm.ptr, i64
+    %w5 = llvm.getelementptr %box_ptr[%p1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %mh_word = llvm.load %w5 : !llvm.ptr -> i64
-    %w6 = llvm.getelementptr %box_ptr[6] : (!llvm.ptr) -> !llvm.ptr, i64
+    %w6 = llvm.getelementptr %box_ptr[%p2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %mb_word = llvm.load %w6 : !llvm.ptr -> i64
-    %w11 = llvm.getelementptr %box_ptr[11] : (!llvm.ptr) -> !llvm.ptr, i64
+    %w11 = llvm.getelementptr %box_ptr[%z2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %mb_len = llvm.load %w11 : !llvm.ptr -> i64
     %three = arith.constant 3 : i64
     %two = arith.constant 2 : i64
@@ -1702,8 +1730,13 @@ module attributes {
   // Store one pre-built 16-word box (objectPayloadHandleWords layout) into
   // payload box %slot -- the multi-value exception args path boxes arbitrary
   // contracts in the lowering and hands the words across.
+  // ⛔ THE ONE PLACE THE WIDTH IS STILL SPELLED OUT, and the only one where that
+  // is safe: it takes the box's words as separate arguments, so the width is
+  // its ARITY -- and an arity that disagrees with `objectPayloadHandleWords` is
+  // a verifier error at build time, not a wrong word at run time. Its two
+  // callers pass the words positionally for the same reason.
   func.func private @__ly_exc_payload_store_words(%block_word: i64, %slot: i64, %w0: i64, %w1: i64, %w2: i64, %w3: i64, %w4: i64, %w5: i64, %w6: i64, %w7: i64, %w8: i64, %w9: i64, %w10: i64, %w11: i64, %w12: i64, %w13: i64, %w14: i64, %w15: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store_words"} {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
     %boxes_base = arith.muli %slot, %c16 : i64
@@ -1904,7 +1937,7 @@ module attributes {
         scf.yield %rh, %rb : memref<2xi64>, memref<?xi8>
       }
       %box_words = arith.muli %i_i64, %c2_i64 : i64
-      %sixteen = arith.constant 16 : i64
+      %sixteen = func.call @__ly_box_word_count() : () -> i64
       %box_off = arith.muli %i_i64, %sixteen : i64
       %box_base = arith.addi %box_off, %c1_i64 : i64
       %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
@@ -1992,7 +2025,7 @@ module attributes {
   // pairs with payload_store_words: the lowering rebuilds a payload's memref
   // group from the box's pointer/size words (BoxLayout.h offsets).
   func.func private @__ly_exc_payload_box_word(%block_word: i64, %slot: i64, %word: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.interior_word, ly.runtime.primitive = "payload_box_word"} {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
     %boxes_base = arith.muli %slot, %c16 : i64
@@ -2007,7 +2040,7 @@ module attributes {
   // itself as its value (the box words ARE the canonical object handle), so
   // that read needs the box address rather than the payload words.
   func.func private @__ly_exc_payload_box_ptr(%block_word: i64, %slot: i64) -> i64 attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.interior_word, ly.runtime.primitive = "payload_box_ptr"} {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
     %boxes_base = arith.muli %slot, %c16 : i64
@@ -2020,7 +2053,7 @@ module attributes {
   // Release whatever the %slot-th box owns (a no-op while its owned flag is
   // zero), so a field rebind drops the previous payload exactly once.
   func.func private @__ly_exc_payload_release_slot(%block_word: i64, %slot: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_release_slot"} {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
     %boxes_base = arith.muli %slot, %c16 : i64
@@ -3063,7 +3096,7 @@ module attributes {
           } else {
             scf.yield %arh, %arb : memref<2xi64>, memref<?xi8>
           }
-          %asixteen = arith.constant 16 : i64
+          %asixteen = func.call @__ly_box_word_count() : () -> i64
           %abox_off = arith.muli %ai_i64, %asixteen : i64
           %abox_base = arith.addi %abox_off, %ac1 : i64
           %abox_ptr = llvm.getelementptr %ablock_ptr[%abox_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
@@ -3146,7 +3179,8 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %class_slot = arith.constant 2 : index
     %payload_slot = arith.constant 3 : i64
     %group_root = arith.constant 101 : i64
@@ -3165,7 +3199,7 @@ module attributes {
       %count_index = arith.index_cast %payload_count : i64 to index
       scf.for %i = %c0 to %count_index step %c1 {
         %i64v = arith.index_cast %i : index to i64
-        %sixteen = arith.constant 16 : i64
+        %sixteen = func.call @__ly_box_word_count() : () -> i64
         %one_off = arith.constant 1 : i64
         %box_words = arith.muli %i64v, %sixteen : i64
         %box_base = arith.addi %box_words, %one_off : i64
@@ -3387,7 +3421,8 @@ module attributes {
   func.func @LyBaseExceptionGroup_Exceptions(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<14xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.BaseExceptionGroup", ly.runtime.primitive = "exceptions", ly.runtime.result_contract = "builtins.tuple", ly.runtime.element_contract = "builtins.BaseException"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %one = arith.constant 1 : i64
     %payload_slot = arith.constant 3 : i64
     %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
@@ -3398,7 +3433,7 @@ module attributes {
     %count_index = arith.index_cast %count : i64 to index
     scf.for %i = %c0 to %count_index step %c1 {
       %i64v = arith.index_cast %i : index to i64
-      %c16_i64 = arith.constant 16 : i64
+      %c16_i64 = func.call @__ly_box_word_count() : () -> i64
       %one_off = arith.constant 1 : i64
       %box_words = arith.muli %i64v, %c16_i64 : i64
       %box_base = arith.addi %box_words, %one_off : i64
@@ -6300,11 +6335,11 @@ module attributes {
   // sibling of __ly_unicode_store_item.
   func.func private @__ly_bytes_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.transfer_args = [2]} {
     %c0 = arith.constant 0 : index
-    %handle_words = arith.constant 16 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %bytes_class = arith.constant 70 : i64
-    %base_i64 = arith.muli %slot, %handle_words : i64
+    %lane0 = arith.constant 0 : i64
+    %base_i64 = func.call @__ly_box_slot_base(%slot) : (i64) -> i64
     %base = arith.index_cast %base_i64 : i64 to index
     %hdr_ptr_index = memref.extract_aligned_pointer_as_index %eh : memref<6xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_ptr_index : index to i64
@@ -6312,11 +6347,9 @@ module attributes {
     %w1 = arith.constant 1 : index
     %w2 = arith.constant 2 : index
     %w3 = arith.constant 3 : index
-    %w4 = arith.constant 4 : index
-    %w9 = arith.constant 9 : index
-    %w14 = arith.constant 14 : index
     %one_idx = arith.constant 1 : index
-    %sixteen_idx = arith.constant 16 : index
+    %words = func.call @__ly_box_word_count() : () -> i64
+    %sixteen_idx = arith.index_cast %words : i64 to index
     scf.for %w = %c0 to %sixteen_idx step %one_idx {
       %slot_index = arith.addi %base, %w : index
       memref.store %zero, %items[%slot_index] : memref<?xi64>
@@ -6325,9 +6358,12 @@ module attributes {
     %s1 = arith.addi %base, %w1 : index
     %s2 = arith.addi %base, %w2 : index
     %s3 = arith.addi %base, %w3 : index
-    %s4 = arith.addi %base, %w4 : index
-    %s9 = arith.addi %base, %w9 : index
-    %s14 = arith.addi %base, %w14 : index
+    %p0 = func.call @__ly_box_pointer_word(%base_i64, %lane0) : (i64, i64) -> i64
+    %z0 = func.call @__ly_box_size_word(%base_i64, %lane0) : (i64, i64) -> i64
+    %ow = func.call @__ly_box_owned_word(%base_i64) : (i64) -> i64
+    %s4 = arith.index_cast %p0 : i64 to index
+    %s9 = arith.index_cast %z0 : i64 to index
+    %s14 = arith.index_cast %ow : i64 to index
     memref.store %one, %items[%s0] : memref<?xi64>
     memref.store %bytes_class, %items[%s1] : memref<?xi64>
     memref.store %hdr_ptr, %items[%s2] : memref<?xi64>
@@ -12668,7 +12704,8 @@ module attributes {
   // every reader sees it, instead of leaving a stale copy in each box.
   func.func private @__ly_bytes_item_words(%items: memref<?xi64>, %slot: index) -> (i64, i64, i64) {
     %c2 = arith.constant 2 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %c2_i64 = arith.constant 2 : i64
     %c3_i64 = arith.constant 3 : i64
     %base = arith.muli %slot, %c16 : index
@@ -17854,7 +17891,7 @@ module attributes {
   func.func @LyTuple_Hash(%self: memref<14xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__hash__"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<14xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<14xi64>) -> memref<?xi64>
@@ -17899,7 +17936,7 @@ module attributes {
   func.func private @__ly_sequence_equal_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i1 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %false = arith.constant false
     %true = arith.constant true
     %same_len = arith.cmpi eq, %lhs_len, %rhs_len : i64
@@ -18080,7 +18117,7 @@ module attributes {
   func.func private @__ly_sequence_compare_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i64 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
@@ -18170,7 +18207,8 @@ module attributes {
   func.func private @__ly_swap_slots(%items: memref<?xi64>, %a: index, %b: index) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %a_base = arith.muli %a, %c16 : index
     %b_base = arith.muli %b, %c16 : index
     scf.for %w = %c0 to %c16 step %c1 {
@@ -18214,7 +18252,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %db = arith.muli %d, %c16_i64 : i64
     %sb = arith.muli %s, %c16_i64 : i64
     %dbi = arith.index_cast %db : i64 to index
@@ -18229,7 +18267,7 @@ module attributes {
   }
 
   func.func private @__ly_slot_less(%items_ptr: !llvm.ptr, %a: i64, %b: i64) -> i1 {
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %ao = arith.muli %a, %c16 : i64
     %bo = arith.muli %b, %c16 : i64
     %ap = llvm.getelementptr %items_ptr[%ao] : (!llvm.ptr, i64) -> !llvm.ptr, i64
@@ -18420,7 +18458,7 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %c0 = arith.constant 0 : index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
@@ -18568,7 +18606,8 @@ module attributes {
   func.func private @__ly_seq_fill_copy(%dst_items: memref<?xi64>, %src_len: i64, %src_items: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %c2_slot = arith.constant 2 : index
     %len_index = arith.index_cast %src_len : i64 to index
     scf.for %i = %c0 to %len_index step %c1 {
@@ -18678,72 +18717,59 @@ module attributes {
   }
 
   // Store an owned int (h, m, d) into a tuple slot as its canonical handle.
+  // ⛔ ONE LANE. This wrote three -- header, meta and digits -- which is what
+  // `builtins.int` expanded to before its handle narrowed to the header alone.
+  // The extra pointers were dead words no reader looked at once
+  // `__ly_boxed_long_view` started going through the entity, but word 3 said
+  // THREE and that is the count a box describes itself by.
   func.func private @__ly_tuple_store_long(%items: memref<?xi64>, %slot: index, %h: memref<2xi64>) {
-    %m, %d = func.call @__ly_long_parts(%h) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
-    %c16 = arith.constant 16 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %int_class = arith.constant 1 : i64
-    %three = arith.constant 3 : i64
     %two = arith.constant 2 : i64
+    %int_class = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
-    %base = arith.muli %slot, %c16 : index
-    %h_idx = memref.extract_aligned_pointer_as_index %h : memref<2xi64> -> index
-    %m_idx = memref.extract_aligned_pointer_as_index %m : memref<2xi64> -> index
-    %d_idx = memref.extract_aligned_pointer_as_index %d : memref<?xi32> -> index
-    %h_ptr = arith.index_cast %h_idx : index to i64
-    %m_ptr = arith.index_cast %m_idx : index to i64
-    %d_ptr = arith.index_cast %d_idx : index to i64
-    %d_dim = memref.dim %d, %c0 : memref<?xi32>
-    %d_len = arith.index_cast %d_dim : index to i64
-    // words: [refcount=1, class, entity, count, ptrs..., sizes..., owned, hash]
-    %w0 = arith.addi %base, %c0 : index
-    memref.store %one, %items[%w0] : memref<?xi64>
     %c1 = arith.constant 1 : index
-    %w1 = arith.addi %base, %c1 : index
-    memref.store %int_class, %items[%w1] : memref<?xi64>
+    %lane0 = arith.constant 0 : i64
+    %base = func.call @__ly_box_slot_base_index(%slot) : (index) -> index
+    %base_i64 = arith.index_cast %base : index to i64
+    %h_idx = memref.extract_aligned_pointer_as_index %h : memref<2xi64> -> index
+    %h_ptr = arith.index_cast %h_idx : index to i64
+
+    %lanes = func.call @__ly_box_lane_count() : () -> i64
+    %lanes_index = arith.index_cast %lanes : i64 to index
+    scf.for %lane = %c0 to %lanes_index step %c1 {
+      %lane_i64 = arith.index_cast %lane : index to i64
+      %pw = func.call @__ly_box_pointer_word(%base_i64, %lane_i64) : (i64, i64) -> i64
+      %zw = func.call @__ly_box_size_word(%base_i64, %lane_i64) : (i64, i64) -> i64
+      %pi = arith.index_cast %pw : i64 to index
+      %zi = arith.index_cast %zw : i64 to index
+      memref.store %zero, %items[%pi] : memref<?xi64>
+      memref.store %zero, %items[%zi] : memref<?xi64>
+    }
+
     %c2 = arith.constant 2 : index
-    %w2 = arith.addi %base, %c2 : index
-    memref.store %h_ptr, %items[%w2] : memref<?xi64>
     %c3 = arith.constant 3 : index
-    %w3 = arith.addi %base, %c3 : index
-    memref.store %three, %items[%w3] : memref<?xi64>
-    %c4 = arith.constant 4 : index
-    %w4 = arith.addi %base, %c4 : index
-    memref.store %h_ptr, %items[%w4] : memref<?xi64>
-    %c5 = arith.constant 5 : index
-    %w5 = arith.addi %base, %c5 : index
-    memref.store %m_ptr, %items[%w5] : memref<?xi64>
-    %c6 = arith.constant 6 : index
-    %w6 = arith.addi %base, %c6 : index
-    memref.store %d_ptr, %items[%w6] : memref<?xi64>
-    %c7 = arith.constant 7 : index
-    %w7 = arith.addi %base, %c7 : index
-    memref.store %zero, %items[%w7] : memref<?xi64>
-    %c8 = arith.constant 8 : index
-    %w8 = arith.addi %base, %c8 : index
-    memref.store %zero, %items[%w8] : memref<?xi64>
-    %c9 = arith.constant 9 : index
-    %w9 = arith.addi %base, %c9 : index
-    memref.store %two, %items[%w9] : memref<?xi64>
-    %c10 = arith.constant 10 : index
-    %w10 = arith.addi %base, %c10 : index
-    memref.store %two, %items[%w10] : memref<?xi64>
-    %c11 = arith.constant 11 : index
-    %w11 = arith.addi %base, %c11 : index
-    memref.store %d_len, %items[%w11] : memref<?xi64>
-    %c12 = arith.constant 12 : index
-    %w12 = arith.addi %base, %c12 : index
-    memref.store %zero, %items[%w12] : memref<?xi64>
-    %c13 = arith.constant 13 : index
-    %w13 = arith.addi %base, %c13 : index
-    memref.store %zero, %items[%w13] : memref<?xi64>
-    %c14 = arith.constant 14 : index
-    %w14 = arith.addi %base, %c14 : index
-    memref.store %one, %items[%w14] : memref<?xi64>
-    %c15 = arith.constant 15 : index
-    %w15 = arith.addi %base, %c15 : index
-    memref.store %zero, %items[%w15] : memref<?xi64>
+    %h0 = arith.addi %base, %c0 : index
+    %h1 = arith.addi %base, %c1 : index
+    %h2 = arith.addi %base, %c2 : index
+    %h3 = arith.addi %base, %c3 : index
+    memref.store %one, %items[%h0] : memref<?xi64>
+    memref.store %int_class, %items[%h1] : memref<?xi64>
+    memref.store %h_ptr, %items[%h2] : memref<?xi64>
+    memref.store %one, %items[%h3] : memref<?xi64>
+
+    %p0 = func.call @__ly_box_pointer_word(%base_i64, %lane0) : (i64, i64) -> i64
+    %z0 = func.call @__ly_box_size_word(%base_i64, %lane0) : (i64, i64) -> i64
+    %ow = func.call @__ly_box_owned_word(%base_i64) : (i64) -> i64
+    %hw = func.call @__ly_box_hash_word(%base_i64) : (i64) -> i64
+    %p0i = arith.index_cast %p0 : i64 to index
+    %z0i = arith.index_cast %z0 : i64 to index
+    %owi = arith.index_cast %ow : i64 to index
+    %hwi = arith.index_cast %hw : i64 to index
+    memref.store %h_ptr, %items[%p0i] : memref<?xi64>
+    memref.store %two, %items[%z0i] : memref<?xi64>
+    memref.store %one, %items[%owi] : memref<?xi64>
+    memref.store %zero, %items[%hwi] : memref<?xi64>
     func.return
   }
 
@@ -19116,7 +19142,8 @@ module attributes {
   func.func private @__ly_seq_fill_concat(%dst_items: memref<?xi64>, %llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %c2_slot = arith.constant 2 : index
     %llen_index = arith.index_cast %llen : i64 to index
     %rlen_index = arith.index_cast %rlen : i64 to index
@@ -19176,7 +19203,8 @@ module attributes {
   func.func private @__ly_seq_fill_repeat(%dst_items: memref<?xi64>, %len: i64, %li: memref<?xi64>, %n: i64) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %c2_slot = arith.constant 2 : index
     %len_index = arith.index_cast %len : i64 to index
     %n_index = arith.index_cast %n : i64 to index
@@ -19238,7 +19266,7 @@ module attributes {
     %minus_one = arith.constant -1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %len_index = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
@@ -19273,7 +19301,8 @@ module attributes {
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
@@ -19302,7 +19331,8 @@ module attributes {
   func.func @LyList_ExtendM(%self: memref<9xi64> {ly.ownership.object_header}, %other: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "extend"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %olen = memref.load %other[%length_slot] : memref<9xi64>
@@ -19367,7 +19397,7 @@ module attributes {
   func.func private @__ly_sequence_count_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %len_index = arith.index_cast %len : i64 to index
@@ -19464,7 +19494,8 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %found = func.call @__ly_list_find_box(%self, %elem_box) : (memref<9xi64>, memref<16xi64>) -> i64
     %missing = arith.cmpi eq, %found, %minus_one : i64
@@ -19548,7 +19579,8 @@ module attributes {
   func.func @LyList_SetItemBox(%self: memref<9xi64> {ly.ownership.object_header}, %raw_index: i64, %value_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "setitem_box"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %zero_i = arith.constant 0 : i64
@@ -19584,7 +19616,8 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %normalized = func.call @__ly_list_normalize_assign_index(%len, %raw_index) : (i64, i64) -> i64
@@ -19632,7 +19665,8 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %index_error = arith.constant 55 : i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
@@ -19708,7 +19742,8 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
@@ -19785,21 +19820,26 @@ module attributes {
   func.func @LyObject_FromSlot(%items: memref<?xi64>, %slot: i64, %valid: i1) -> memref<16xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "from_slot", ly.runtime.result_contract = "builtins.object"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %words : i64 to index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %box = memref.alloc() {alignment = 16 : i64, ly.ownership.object_header, ly.ownership.owned_local_object} : memref<16xi64>
     scf.if %valid {
       %slot_index = arith.index_cast %slot : i64 to index
-      %base = arith.muli %slot_index, %c16 : index
+      %base = func.call @__ly_box_slot_base_index(%slot_index) : (index) -> index
       scf.for %w = %c0 to %c16 step %c1 {
         %src = arith.addi %base, %w : index
         %word = memref.load %items[%src] : memref<?xi64>
         memref.store %word, %box[%w] : memref<16xi64>
       }
       %refcount_slot = arith.constant 0 : index
-      %owned_slot = arith.constant 14 : index
-      %hash_slot = arith.constant 15 : index
+      // The box this returns is a FRESH one, so its words are numbered from
+      // zero: the helpers take a base of zero rather than a slot base.
+      %owned_word = func.call @__ly_box_owned_word(%zero) : (i64) -> i64
+      %hash_word = func.call @__ly_box_hash_word(%zero) : (i64) -> i64
+      %owned_slot = arith.index_cast %owned_word : i64 to index
+      %hash_slot = arith.index_cast %hash_word : i64 to index
       memref.store %one, %box[%refcount_slot] : memref<16xi64>
       memref.store %zero, %box[%hash_slot] : memref<16xi64>
       %entity_slot = arith.constant 2 : index
@@ -19859,7 +19899,7 @@ module attributes {
     // per iteration, where CPython's new dict shares `empty_keys_struct` and
     // takes nothing at all until the first insert.
     %minimum_capacity = arith.constant 8 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 12 : i64
     %zero = arith.constant 0 : i64
     %lower = arith.constant 0 : index
@@ -19928,7 +19968,7 @@ module attributes {
   func.func private @__ly_dict_keys(%self: memref<8xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.interior_word, ly.runtime.primitive = "keys_view"} {
     %capacity_slot = arith.constant 3 : index
     %keys_slot = arith.constant 4 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
     %words = arith.muli %capacity, %handle_words : i64
     %base = memref.load %self[%keys_slot] : memref<8xi64>
@@ -19939,7 +19979,7 @@ module attributes {
   func.func private @__ly_dict_values(%self: memref<8xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.interior_word, ly.runtime.primitive = "values_view"} {
     %capacity_slot = arith.constant 3 : index
     %values_slot = arith.constant 5 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
     %words = arith.muli %capacity, %handle_words : i64
     %base = memref.load %self[%values_slot] : memref<8xi64>
@@ -19985,7 +20025,7 @@ module attributes {
   // 16-word element box is 8 KB for every list however short.
   func.func private @__ly_list_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 10 : i64
     %zero = arith.constant 0 : i64
     %refcount_slot = arith.constant 0 : index
@@ -20030,7 +20070,7 @@ module attributes {
   func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"} {
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %capacity = memref.load %self[%capacity_slot] : memref<9xi64>
     %words = arith.muli %capacity, %handle_words : i64
     %base = memref.load %self[%items_slot] : memref<9xi64>
@@ -20110,7 +20150,7 @@ module attributes {
   // minimum this used to round up to was pure waste -- 8 KB for a pair.
   func.func private @__ly_tuple_alloc(%length: i64) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 11 : i64
     %zero = arith.constant 0 : i64
     %refcount_slot = arith.constant 0 : index
@@ -20165,7 +20205,7 @@ module attributes {
   func.func private @__ly_tuple_items(%self: memref<14xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.interior_word, ly.runtime.primitive = "items_view"} {
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %capacity = memref.load %self[%capacity_slot] : memref<14xi64>
     %words = arith.muli %capacity, %handle_words : i64
     %base = memref.load %self[%items_slot] : memref<14xi64>
@@ -20294,8 +20334,9 @@ module attributes {
     %two = arith.constant 2 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c15 = arith.constant 15 : i64
-    %c16 = arith.constant 16 : i64
+    %zero_base_h = arith.constant 0 : i64
+    %c15 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
     %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
@@ -20445,8 +20486,9 @@ module attributes {
   func.func private @__ly_seq_fill_slice(%dst_items: memref<?xi64>, %count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    %handle_words = arith.constant 16 : i64
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %count_index = arith.index_cast %count : i64 to index
     scf.for %k = %c0 to %count_index step %c1 {
       %k64 = arith.index_cast %k : index to i64
@@ -20550,7 +20592,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
@@ -20675,7 +20717,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
@@ -20765,7 +20807,7 @@ module attributes {
   // the two must agree exactly -- a capacity the lowering believes in and the
   // runtime did not allocate is a store past the array.
   func.func @LyList_EnsureCapacity(%self: memref<9xi64> {ly.ownership.object_header}, %required: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.primitive = "ensure_capacity"} {
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
     %lower = arith.constant 0 : index
@@ -20812,7 +20854,7 @@ module attributes {
     // above it doubles, so the floor only costs a dict that outgrows it three
     // extra copies (8, 16, 32) and saves 14.8 KB on every one that does not.
     %minimum_capacity = arith.constant 8 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %two = arith.constant 2 : i64
     %zero = arith.constant 0 : i64
     %capacity_slot = arith.constant 3 : index
@@ -21016,7 +21058,8 @@ module attributes {
     %minus_one = arith.constant -1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %keys = func.call @__ly_dict_keys(%self) : (memref<8xi64>) -> memref<?xi64>
     %values = func.call @__ly_dict_values(%self) : (memref<8xi64>) -> memref<?xi64>
@@ -21074,11 +21117,13 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c15 = arith.constant 15 : index
+    %zero_base_h = arith.constant 0 : i64
+    %c15_i64_h = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
+    %c15 = arith.index_cast %c15_i64_h : i64 to index
 
     %len = memref.load %self[%length_slot] : memref<8xi64>
     %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<16xi64> -> index
@@ -21149,7 +21194,8 @@ module attributes {
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %keys = func.call @__ly_dict_keys(%self) : (memref<8xi64>) -> memref<?xi64>
     %values = func.call @__ly_dict_values(%self) : (memref<8xi64>) -> memref<?xi64>
@@ -21179,7 +21225,8 @@ module attributes {
   func.func @LyDict_Copy(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.dict", ly.runtime.method = "copy", ly.runtime.result_contract = "builtins.dict"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %c2_slot = arith.constant 2 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -21236,9 +21283,11 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    %c15_i64 = arith.constant 15 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
+    %zero_base_h = arith.constant 0 : i64
+    %c15_i64 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %c2_slot = arith.constant 2 : index
     %src_idx = memref.extract_aligned_pointer_as_index %src_keys : memref<?xi64> -> index
     %src_i64 = arith.index_cast %src_idx : index to i64
@@ -21344,7 +21393,7 @@ module attributes {
   func.func @LyDict_EqBool(%self: memref<8xi64> {ly.ownership.object_header}, %other: memref<8xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.dict", ly.runtime.method = "__eq__"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %minus_one = arith.constant -1 : i64
     %zero = arith.constant 0 : i64
     %true = arith.constant true
@@ -21430,7 +21479,8 @@ module attributes {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %keys = func.call @__ly_dict_keys(%self) : (memref<8xi64>) -> memref<?xi64>
     %values = func.call @__ly_dict_values(%self) : (memref<8xi64>) -> memref<?xi64>
@@ -21537,7 +21587,7 @@ module attributes {
     %c0_i64 = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
@@ -21592,7 +21642,7 @@ module attributes {
     %c0_i64 = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<14xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<14xi64>) -> memref<?xi64>
@@ -21692,7 +21742,7 @@ module attributes {
     %c0_i64 = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %capacity_slot = arith.constant 3 : index
     %keys_slot = arith.constant 4 : index
     %values_slot = arith.constant 5 : index
@@ -21784,7 +21834,7 @@ module attributes {
     %c0_i64 = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %len_idx = arith.index_cast %len : i64 to index
     %loop:2 = scf.for %i = %c0 to %len_idx step %c1 iter_args(%rh = %open_h, %rb = %open_b) -> (memref<2xi64>, memref<?xi8>) {
       %i_i64 = arith.index_cast %i : index to i64
@@ -22097,7 +22147,7 @@ module attributes {
   func.func private @__ly_set_raw_items(%self: memref<?xi64>) -> memref<?xi64> attributes {ly.runtime.interior_word} {
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %capacity = memref.load %self[%capacity_slot] : memref<?xi64>
     %words = arith.muli %capacity, %handle_words : i64
     %base = memref.load %self[%items_slot] : memref<?xi64>
@@ -22179,7 +22229,7 @@ module attributes {
     %two = arith.constant 2 : i64
     %five = arith.constant 5 : i64
     %nine = arith.constant 9 : i64
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %shift = arith.constant 5 : i64
     %true = arith.constant true
     %false = arith.constant false
@@ -22262,7 +22312,7 @@ module attributes {
     %two = arith.constant 2 : i64
     %five = arith.constant 5 : i64
     %nine = arith.constant 9 : i64
-    %c16 = arith.constant 16 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %shift = arith.constant 5 : i64
     %true = arith.constant true
     %false = arith.constant false
@@ -22413,8 +22463,9 @@ module attributes {
     %two = arith.constant 2 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %entity_slot = arith.constant 2 : index
     %length_slot = arith.constant 2 : index
     %capacity_slot = arith.constant 3 : index
@@ -22553,9 +22604,12 @@ module attributes {
     %five = arith.constant 5 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c15 = arith.constant 15 : index
-    %c16 = arith.constant 16 : index
-    %c16_i64 = arith.constant 16 : i64
+    %zero_base_h = arith.constant 0 : i64
+    %c15_i64_h = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
+    %c15 = arith.index_cast %c15_i64_h : i64 to index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %big = arith.constant 50000 : i64
     %four = arith.constant 4 : i64
     %entity_slot = arith.constant 2 : index
@@ -22641,7 +22695,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16 = arith.constant 16 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %capacity_slot = arith.constant 3 : index
     %mask_slot = arith.constant 6 : index
     %order_slot = arith.constant 8 : index
@@ -22722,7 +22776,8 @@ module attributes {
     %minus_one = arith.constant -1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %mask_slot = arith.constant 6 : index
     %mask = memref.load %self[%mask_slot] : memref<?xi64>
@@ -22785,7 +22840,7 @@ module attributes {
     // table's was 8, which put 8 KB of 16-word element boxes behind a set that
     // had reserved eight slots.
     %minimum_capacity = arith.constant 8 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %length_slot = arith.constant 2 : index
@@ -22830,7 +22885,7 @@ module attributes {
   func.func private @__ly_set_raw_ensure_capacity(%self: memref<?xi64>, %required: i64) {
     // PySet_MINSIZE, the floor `__ly_set_raw_init` starts from.
     %minimum_capacity = arith.constant 8 : i64
-    %handle_words = arith.constant 16 : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
     %two = arith.constant 2 : i64
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
@@ -22877,8 +22932,9 @@ module attributes {
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c15 = arith.constant 15 : i64
-    %c16 = arith.constant 16 : i64
+    %zero_base_h = arith.constant 0 : i64
+    %c15 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
     %len_index = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
@@ -22933,7 +22989,8 @@ module attributes {
   // The cached hash of a raw box, refilled lazily (word 15, 0 = not yet known).
   func.func private @__ly_set_entry_hash(%entry: !llvm.ptr) -> i64 {
     %zero = arith.constant 0 : i64
-    %c15_i64 = arith.constant 15 : i64
+    %zero_base_h = arith.constant 0 : i64
+    %c15_i64 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
     %hash_gep = llvm.getelementptr %entry[%c15_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %cached = llvm.load %hash_gep : !llvm.ptr -> i64
     %unknown = arith.cmpi eq, %cached, %zero : i64
@@ -22952,7 +23009,7 @@ module attributes {
   // items base through the handle, so there is nothing to hand back.
   func.func private @__ly_set_raw_insert_slot(%self: memref<?xi64>, %src_items: memref<?xi64>, %src_slot: index) {
     %minus_one = arith.constant -1 : i64
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %src_idx = memref.extract_aligned_pointer_as_index %src_items : memref<?xi64> -> index
     %src_i64 = arith.index_cast %src_idx : index to i64
     %src_ptr = llvm.inttoptr %src_i64 : i64 to !llvm.ptr
@@ -22995,8 +23052,9 @@ module attributes {
     %five = arith.constant 5 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %true = arith.constant true
     %entity_slot = arith.constant 2 : index
     %length_slot = arith.constant 2 : index
@@ -23164,7 +23222,7 @@ module attributes {
   func.func private @__ly_set_raw_select(%self: memref<?xi64>, %a: memref<?xi64>, %b: memref<?xi64>, %want_present: i1) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %minus_one = arith.constant -1 : i64
     %length_slot = arith.constant 2 : index
     %alen = memref.load %a[%length_slot] : memref<?xi64>
@@ -23200,7 +23258,7 @@ module attributes {
   func.func private @__ly_set_raw_drop_matching(%self: memref<?xi64>, %other: memref<?xi64>, %drop_present: i1) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %minus_one = arith.constant -1 : i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<?xi64>
@@ -23234,7 +23292,7 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %true = arith.constant true
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %olen = memref.load %other[%length_slot] : memref<?xi64>
     %oi = func.call @__ly_set_raw_items(%other) : (memref<?xi64>) -> memref<?xi64>
@@ -23260,7 +23318,7 @@ module attributes {
   func.func private @__ly_set_subset_lens(%alen: i64, %ai: memref<?xi64>, %blen: i64, %bi: memref<?xi64>) -> i1 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %minus_one = arith.constant -1 : i64
     %true = arith.constant true
     %false = arith.constant false
@@ -23289,7 +23347,7 @@ module attributes {
   func.func private @__ly_set_disjoint_lens(%alen: i64, %ai: memref<?xi64>, %blen: i64, %bi: memref<?xi64>) -> i1 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %minus_one = arith.constant -1 : i64
     %true = arith.constant true
     %false = arith.constant false
@@ -23320,7 +23378,8 @@ module attributes {
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
+    %c16_words = func.call @__ly_box_word_count() : () -> i64
+    %c16 = arith.index_cast %c16_words : i64 to index
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<?xi64>
     %items = func.call @__ly_set_raw_items(%self) : (memref<?xi64>) -> memref<?xi64>
@@ -23448,7 +23507,9 @@ module attributes {
   func.func @LySet_AddBox(%self: memref<11xi64> {ly.ownership.object_header}, %elem_box: memref<16xi64>) attributes {ly.runtime.contract = "builtins.set", ly.runtime.primitive = "add_box"} {
     %zero = arith.constant 0 : i64
     %minus_one = arith.constant -1 : i64
-    %c15 = arith.constant 15 : index
+    %zero_base_h = arith.constant 0 : i64
+    %c15_i64_h = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
+    %c15 = arith.index_cast %c15_i64_h : i64 to index
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<16xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
@@ -23861,7 +23922,7 @@ module attributes {
   func.func @LyFrozenSet_Hash(%self: memref<13xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.method = "__hash__"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16_i64 = arith.constant 16 : i64
+    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %c16_shift = arith.constant 16 : i64
     %magic1 = arith.constant 89869747 : i64
     %magic2 = arith.constant 3644798167 : i64

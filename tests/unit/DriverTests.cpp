@@ -974,6 +974,70 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
     EXPECT_EQ(constantIn("__ly_box_hash_word"),
               py::lowering::box_abi::kWordsPerBox - 1)
         << "the cached hash is the box's last word";
+
+    // ⭐ AND NO FUNCTION MAY STRIDE BY A LITERAL AGAIN. The helpers are only
+    // worth having if nothing goes around them, and a stride that does is
+    // invisible to every other check: it is arithmetic on a correctly typed
+    // memref. This splits the manifest into functions, collects the names each
+    // one binds to the box width, and fails if any of them reaches a multiply
+    // -- which is what a slot stride is.
+    //
+    // ⛔ The name has to be resolved per FUNCTION. `%c16` is bound in dozens of
+    // them, and a check that looked for the literal on the multiply's own line
+    // found nothing at all: the literal is on the binding, one line up. That
+    // version passed with a stride put back by hand, which is the only reason
+    // this one is written out.
+    //
+    // `LyBytes_FromHex` is the one exemption and it is not a box: it multiplies
+    // an accumulator by sixteen per hex digit.
+    {
+      const std::string width =
+          std::to_string(py::lowering::box_abi::kWordsPerBox);
+      const std::string bindIndex = " = arith.constant " + width + " : index";
+      const std::string bindI64 = " = arith.constant " + width + " : i64";
+      std::size_t at = 0;
+      while (at < text.size()) {
+        std::size_t start = text.find("  func.func ", at);
+        if (start == std::string::npos)
+          break;
+        std::size_t stop = text.find("\n  }\n", start);
+        if (stop == std::string::npos)
+          stop = text.size();
+        const std::string body = text.substr(start, stop - start);
+        at = stop + 1;
+        std::size_t sym = body.find('@');
+        std::size_t open = body.find('(', sym);
+        const std::string name =
+            (sym == std::string::npos || open == std::string::npos)
+                ? std::string("<unnamed>")
+                : body.substr(sym + 1, open - sym - 1);
+        if (name.rfind("__ly_box_", 0) == 0 || name == "LyBytes_FromHex")
+          continue;
+        for (const std::string &bind : {bindIndex, bindI64}) {
+          std::size_t declared = 0;
+          while ((declared = body.find(bind, declared)) != std::string::npos) {
+            std::size_t nameStart = body.rfind('%', declared);
+            const std::string bound =
+                body.substr(nameStart, declared - nameStart);
+            declared += bind.size();
+            if (bound.empty())
+              continue;
+            std::size_t use = 0;
+            while ((use = body.find("arith.muli ", use)) != std::string::npos) {
+              std::size_t eol = body.find('\n', use);
+              const std::string line = body.substr(use, eol - use);
+              use = eol == std::string::npos ? body.size() : eol;
+              if (line.find(bound + " ") != std::string::npos ||
+                  line.find(bound + ",") != std::string::npos)
+                ADD_FAILURE()
+                    << name << " multiplies by " << bound
+                    << ", a literal box width; strides go through "
+                       "__ly_box_slot_base";
+            }
+          }
+        }
+      }
+    }
   }
 }
 
