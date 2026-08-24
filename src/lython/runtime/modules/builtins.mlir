@@ -12080,14 +12080,21 @@ module attributes {
   // [2] entity root, [3] value count, [4,9) physical pointers, [9,14)
   // physical sizes, [14] owned flag. The reference transfers to the
   // container; the deallocator releases it through the boxed-release hook.
+  // ⭐ WIDTH-INDEPENDENT. Every word this writes is named by a box-layout
+  // helper, and the lanes this contract does not use are cleared by walking
+  // `__ly_box_lane_count` rather than by listing them. A slot is reused --
+  // `LyList_SetItemBox` overwrites one that may have held a wider entity -- so
+  // the clearing is not redundant with the allocator's zeroing.
   func.func private @__ly_unicode_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]} {
     %c0 = arith.constant 0 : index
-    %handle_words = arith.constant 16 : i64
+    %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
     %str_class = arith.constant 4 : i64
-    %base_i64 = arith.muli %slot, %handle_words : i64
+    %lane0 = arith.constant 0 : i64
+    %lane1 = arith.constant 1 : i64
+    %base_i64 = func.call @__ly_box_slot_base(%slot) : (i64) -> i64
     %base = arith.index_cast %base_i64 : i64 to index
     %hdr_ptr_index = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_ptr_index : index to i64
@@ -12095,54 +12102,50 @@ module attributes {
     %bytes_ptr = arith.index_cast %bytes_ptr_index : index to i64
     %dim = memref.dim %eb, %c0 : memref<?xi8>
     %byte_len = arith.index_cast %dim : index to i64
-    %w0 = arith.constant 0 : index
-    %w1 = arith.constant 1 : index
-    %w2 = arith.constant 2 : index
-    %w3 = arith.constant 3 : index
-    %w4 = arith.constant 4 : index
-    %w5 = arith.constant 5 : index
-    %w6 = arith.constant 6 : index
-    %w7 = arith.constant 7 : index
-    %w8 = arith.constant 8 : index
-    %w9 = arith.constant 9 : index
-    %w10 = arith.constant 10 : index
-    %w11 = arith.constant 11 : index
-    %w12 = arith.constant 12 : index
-    %w13 = arith.constant 13 : index
-    %w14 = arith.constant 14 : index
-    %w15 = arith.constant 15 : index
-    %s0 = arith.addi %base, %w0 : index
-    %s1 = arith.addi %base, %w1 : index
-    %s2 = arith.addi %base, %w2 : index
-    %s3 = arith.addi %base, %w3 : index
-    %s4 = arith.addi %base, %w4 : index
-    %s5 = arith.addi %base, %w5 : index
-    %s6 = arith.addi %base, %w6 : index
-    %s7 = arith.addi %base, %w7 : index
-    %s8 = arith.addi %base, %w8 : index
-    %s9 = arith.addi %base, %w9 : index
-    %s10 = arith.addi %base, %w10 : index
-    %s11 = arith.addi %base, %w11 : index
-    %s12 = arith.addi %base, %w12 : index
-    %s13 = arith.addi %base, %w13 : index
-    %s14 = arith.addi %base, %w14 : index
-    %s15 = arith.addi %base, %w15 : index
-    memref.store %one, %items[%s0] : memref<?xi64>
-    memref.store %str_class, %items[%s1] : memref<?xi64>
-    memref.store %hdr_ptr, %items[%s2] : memref<?xi64>
-    memref.store %two, %items[%s3] : memref<?xi64>
-    memref.store %hdr_ptr, %items[%s4] : memref<?xi64>
-    memref.store %bytes_ptr, %items[%s5] : memref<?xi64>
-    memref.store %zero, %items[%s6] : memref<?xi64>
-    memref.store %zero, %items[%s7] : memref<?xi64>
-    memref.store %zero, %items[%s8] : memref<?xi64>
-    memref.store %two, %items[%s9] : memref<?xi64>
-    memref.store %byte_len, %items[%s10] : memref<?xi64>
-    memref.store %zero, %items[%s11] : memref<?xi64>
-    memref.store %zero, %items[%s12] : memref<?xi64>
-    memref.store %zero, %items[%s13] : memref<?xi64>
-    memref.store %one, %items[%s14] : memref<?xi64>
-    memref.store %zero, %items[%s15] : memref<?xi64>
+
+    %lanes = func.call @__ly_box_lane_count() : () -> i64
+    %lanes_index = arith.index_cast %lanes : i64 to index
+    scf.for %lane = %c0 to %lanes_index step %c1 {
+      %lane_i64 = arith.index_cast %lane : index to i64
+      %pw = func.call @__ly_box_pointer_word(%base_i64, %lane_i64) : (i64, i64) -> i64
+      %zw = func.call @__ly_box_size_word(%base_i64, %lane_i64) : (i64, i64) -> i64
+      %pi = arith.index_cast %pw : i64 to index
+      %zi = arith.index_cast %zw : i64 to index
+      memref.store %zero, %items[%pi] : memref<?xi64>
+      memref.store %zero, %items[%zi] : memref<?xi64>
+    }
+
+    // Header words 0..3 do not move with the width: refcount, class, entity,
+    // and the number of lanes that follow.
+    %h0 = arith.addi %base, %c0 : index
+    %h1 = arith.addi %base, %c1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %h2 = arith.addi %base, %c2 : index
+    %h3 = arith.addi %base, %c3 : index
+    memref.store %one, %items[%h0] : memref<?xi64>
+    memref.store %str_class, %items[%h1] : memref<?xi64>
+    memref.store %hdr_ptr, %items[%h2] : memref<?xi64>
+    memref.store %two, %items[%h3] : memref<?xi64>
+
+    %p0 = func.call @__ly_box_pointer_word(%base_i64, %lane0) : (i64, i64) -> i64
+    %p1 = func.call @__ly_box_pointer_word(%base_i64, %lane1) : (i64, i64) -> i64
+    %z0 = func.call @__ly_box_size_word(%base_i64, %lane0) : (i64, i64) -> i64
+    %z1 = func.call @__ly_box_size_word(%base_i64, %lane1) : (i64, i64) -> i64
+    %ow = func.call @__ly_box_owned_word(%base_i64) : (i64) -> i64
+    %hw = func.call @__ly_box_hash_word(%base_i64) : (i64) -> i64
+    %p0i = arith.index_cast %p0 : i64 to index
+    %p1i = arith.index_cast %p1 : i64 to index
+    %z0i = arith.index_cast %z0 : i64 to index
+    %z1i = arith.index_cast %z1 : i64 to index
+    %owi = arith.index_cast %ow : i64 to index
+    %hwi = arith.index_cast %hw : i64 to index
+    memref.store %hdr_ptr, %items[%p0i] : memref<?xi64>
+    memref.store %bytes_ptr, %items[%p1i] : memref<?xi64>
+    memref.store %two, %items[%z0i] : memref<?xi64>
+    memref.store %byte_len, %items[%z1i] : memref<?xi64>
+    memref.store %one, %items[%owi] : memref<?xi64>
+    memref.store %zero, %items[%hwi] : memref<?xi64>
     func.return
   }
 
@@ -12682,13 +12685,15 @@ module attributes {
   // (header ptr, code-unit ptr, byte length) words of element %slot.
   func.func private @__ly_unicode_item_words(%items: memref<?xi64>, %slot: index) -> (i64, i64, i64) {
     %c2 = arith.constant 2 : index
-    %c5 = arith.constant 5 : index
-    %c10 = arith.constant 10 : index
-    %c16 = arith.constant 16 : index
-    %base = arith.muli %slot, %c16 : index
+    %one_i64 = arith.constant 1 : i64
+    %base = func.call @__ly_box_slot_base_index(%slot) : (index) -> index
+    %base_i64 = arith.index_cast %base : index to i64
     %hdr_slot = arith.addi %base, %c2 : index
-    %ptr_slot = arith.addi %base, %c5 : index
-    %len_slot = arith.addi %base, %c10 : index
+    // The bytes are lane 1: its pointer word and its size word.
+    %ptr_word = func.call @__ly_box_pointer_word(%base_i64, %one_i64) : (i64, i64) -> i64
+    %len_word = func.call @__ly_box_size_word(%base_i64, %one_i64) : (i64, i64) -> i64
+    %ptr_slot = arith.index_cast %ptr_word : i64 to index
+    %len_slot = arith.index_cast %len_word : i64 to index
     %hdr = memref.load %items[%hdr_slot] : memref<?xi64>
     %ptr = memref.load %items[%ptr_slot] : memref<?xi64>
     %blen = memref.load %items[%len_slot] : memref<?xi64>
@@ -17390,6 +17395,77 @@ module attributes {
   // the class id: singletons inline, manifest/user `__hash__` through the
   // generated hook, identity hash for classes without `__hash__` (R6), and a
   // TypeError for the builtin mutable containers.
+  // ===== the payload box's layout, stated once =====
+  //
+  // ⭐ EVERY BOX ACCESS COMES THROUGH THESE. The width and the word offsets
+  // used to be literals in each function that touched a box -- 86 `slot * 16`
+  // strides and some ninety word indices -- mixed in with unrelated 16s (hex
+  // conversion, siphash, `__ly_long_parts`'s +16 byte offset). Narrowing the
+  // box then meant classifying all of them by hand, and the type system checks
+  // none of it: a store to the wrong word of a right-sized box verifies
+  // cleanly and corrupts a refcount at run time. That is not hypothetical --
+  // it is what a first attempt did, and `__ly_unicode_item_words` reading the
+  // second lane's size at word 10 was one of the sites it missed.
+  //
+  // ⛔ These have to be INLINE or they are a regression: the JIT's default is
+  // `-jit-opt=0`, where LLVM inlines nothing except what is marked, and a call
+  // per box word would land in `__ly_slot_less` and the container copies.
+  // `markBoxLayoutHelpersAlwaysInline` (driver/lib/LLVMFinalize.cpp) sets the
+  // attribute, and LLVM's AlwaysInliner runs at every optimisation level.
+  //
+  // The layout itself is ABI/BoxLayout.h, and `ManifestBoxLayoutTest` checks
+  // that these five agree with it.
+  func.func private @__ly_box_word_count() -> i64 {
+    %words = arith.constant 16 : i64
+    func.return %words : i64
+  }
+
+  func.func private @__ly_box_slot_base(%slot: i64) -> i64 {
+    %words = func.call @__ly_box_word_count() : () -> i64
+    %base = arith.muli %slot, %words : i64
+    func.return %base : i64
+  }
+
+  func.func private @__ly_box_slot_base_index(%slot: index) -> index {
+    %slot_i64 = arith.index_cast %slot : index to i64
+    %base = func.call @__ly_box_slot_base(%slot_i64) : (i64) -> i64
+    %base_index = arith.index_cast %base : i64 to index
+    func.return %base_index : index
+  }
+
+  // Lane `i`'s pointer word, and the matching size word.
+  func.func private @__ly_box_lane_count() -> i64 {
+    %lanes = arith.constant 5 : i64
+    func.return %lanes : i64
+  }
+
+  func.func private @__ly_box_pointer_word(%base: i64, %lane: i64) -> i64 {
+    %pointer_base = arith.constant 4 : i64
+    %off = arith.addi %pointer_base, %lane : i64
+    %word = arith.addi %base, %off : i64
+    func.return %word : i64
+  }
+
+  func.func private @__ly_box_size_word(%base: i64, %lane: i64) -> i64 {
+    %size_base = arith.constant 9 : i64
+    %off = arith.addi %size_base, %lane : i64
+    %word = arith.addi %base, %off : i64
+    func.return %word : i64
+  }
+
+  // The flag the deallocators consult, and the hash the dict and set cache.
+  func.func private @__ly_box_owned_word(%base: i64) -> i64 {
+    %owned = arith.constant 14 : i64
+    %word = arith.addi %base, %owned : i64
+    func.return %word : i64
+  }
+
+  func.func private @__ly_box_hash_word(%base: i64) -> i64 {
+    %hash = arith.constant 15 : i64
+    %word = arith.addi %base, %hash : i64
+    func.return %word : i64
+  }
+
   func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64 {
     %zero = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64

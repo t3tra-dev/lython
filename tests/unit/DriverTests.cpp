@@ -1,3 +1,8 @@
+#include <fstream>
+#include <sstream>
+#include <cstdlib>
+#include <cstring>
+
 #include "Driver.h"
 #include "DriverCodeGen.h"
 
@@ -915,16 +920,61 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
         << read.word << " of a chain node, and the struct now puts it at word "
         << fieldWord(read.section, read.field);
 
-  // The payload box, whose layout the manifest strides through directly
-  // (`%c16`, and slots counted from the pointer and size bases).
-  EXPECT_EQ(py::lowering::box_abi::kWordsPerBox, 16)
-      << "__ly_exc_payload_store multiplies the slot index by 16";
-  EXPECT_EQ(py::lowering::box_abi::kPointerWordBase, 4)
-      << "the manifest's box helpers index pointer words from 4";
-  EXPECT_EQ(py::lowering::box_abi::kSizeWordBase, 9)
-      << "the manifest's box helpers index size words from 9";
-  EXPECT_EQ(py::lowering::box_abi::kOwnedFlagWord, 14)
-      << "the manifest's box helpers write the owned flag at word 14";
+  // ⭐ THE PAYLOAD BOX IS READ OUT OF THE MANIFEST, not restated here. What
+  // stood in this place compared the C++ constants against literals -- which
+  // says nothing about the manifest, and the manifest is the half that indexes
+  // box words. `builtins.mlir` now states the layout once, in the
+  // `__ly_box_*_word` helpers, and this reads their constants back.
+  //
+  // Why it matters that this is mechanical: narrowing the box is a type change
+  // the verifier checks and an ARITHMETIC change it does not, so a store to the
+  // wrong word of a right-sized box compiles and corrupts a refcount at run
+  // time. A first attempt at the narrowing missed several sites; this test is
+  // what would have named them.
+  {
+    std::ifstream manifest(LYTHON_SOURCE_DIR
+                           "/src/lython/runtime/modules/builtins.mlir");
+    ASSERT_TRUE(manifest.good()) << "cannot read builtins.mlir";
+    std::stringstream buffer;
+    buffer << manifest.rdbuf();
+    const std::string text = buffer.str();
+
+    auto constantIn = [&](const char *helper) -> std::int64_t {
+      const std::string needle =
+          std::string("func.func private @") + helper + "(";
+      std::size_t at = text.find(needle);
+      EXPECT_NE(at, std::string::npos)
+          << helper << " is the manifest's only spelling of that offset and it "
+          << "is gone";
+      if (at == std::string::npos)
+        return -1;
+      std::size_t constant = text.find("arith.constant ", at);
+      if (constant == std::string::npos)
+        return -1;
+      return std::strtoll(text.c_str() + constant + std::strlen("arith.constant "),
+                          nullptr, 10);
+    };
+
+    EXPECT_EQ(constantIn("__ly_box_word_count"),
+              py::lowering::box_abi::kWordsPerBox)
+        << "the manifest strides slots by a different box width than "
+           "ABI/BoxLayout.h";
+    EXPECT_EQ(constantIn("__ly_box_lane_count"),
+              py::lowering::box_abi::kPointerWordCount)
+        << "the manifest clears a different number of lanes than the box has";
+    EXPECT_EQ(constantIn("__ly_box_pointer_word"),
+              py::lowering::box_abi::kPointerWordBase)
+        << "the manifest indexes pointer words from elsewhere";
+    EXPECT_EQ(constantIn("__ly_box_size_word"),
+              py::lowering::box_abi::kSizeWordBase)
+        << "the manifest indexes size words from elsewhere";
+    EXPECT_EQ(constantIn("__ly_box_owned_word"),
+              py::lowering::box_abi::kOwnedFlagWord)
+        << "the manifest writes the owned flag elsewhere";
+    EXPECT_EQ(constantIn("__ly_box_hash_word"),
+              py::lowering::box_abi::kWordsPerBox - 1)
+        << "the cached hash is the box's last word";
+  }
 }
 
 TEST(DriverTest, RepeatedCompileIsStable) {

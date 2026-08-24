@@ -28,8 +28,21 @@ using namespace mlir;
 
 namespace lython::driver {
 
+// The box-layout helpers are the manifest's only spelling of the payload box's
+// width and word offsets, so they are called from every function that touches a
+// box -- including `__ly_slot_less` and the container copies. At the JIT's
+// default `-jit-opt=0` LLVM inlines nothing it is not told to, so without this
+// the aggregation that made the layout checkable would put a call on every box
+// word. AlwaysInliner runs at every optimisation level.
+void markBoxLayoutHelpersAlwaysInline(llvm::Module &module) {
+  for (llvm::Function &function : module)
+    if (function.getName().starts_with("__ly_box_") && !function.isDeclaration())
+      function.addFnAttr(llvm::Attribute::AlwaysInline);
+}
+
 unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
                                               bool bypass) {
+  markBoxLayoutHelpersAlwaysInline(module);
   if (bypass)
     return 0;
   struct Redirect {
