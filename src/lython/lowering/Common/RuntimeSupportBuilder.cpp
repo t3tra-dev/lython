@@ -1511,10 +1511,10 @@ void buildRetainPayloadSlotPtr(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyObject_ReleaseBoxedPayloadRaw(memref<16xi64>) /
+// LyObject_ReleaseBoxedPayloadRaw(box) /
 // LyObject_ReleaseBoxedPayloadArraySlotRaw(memref<?xi64>, i64): shared-ABI
 // wrappers the lib manifests call to release a boxed slot (whole box, or the
-// index-th 16-word slot of an items array).
+// index-th slot of an items array).
 void buildReleaseBoxedPayloadRaw(SupportBuilder &b) {
   auto boxType = mlir::MemRefType::get(
       {py::lowering::box_abi::kWordsPerBox}, b.i64());
@@ -1535,9 +1535,9 @@ void buildReleaseBoxedPayloadRaw(SupportBuilder &b) {
 }
 
 // LyObject_{Retain,Release}BoxedPayloadArraySlotRaw(memref<?xi64>, i64):
-// shared-ABI wrappers the lib manifests call on the index-th 16-word slot of
-// an items array (a container copy duplicating element boxes, or dropping
-// them). The two differ only in the payload-slot helper they forward to.
+// shared-ABI wrappers the lib manifests call on the index-th slot of an items
+// array (a container copy duplicating element boxes, or dropping them). The
+// two differ only in the payload-slot helper they forward to.
 void buildBoxedPayloadArraySlotRaw(SupportBuilder &b, llvm::StringRef name,
                                    llvm::StringRef callee) {
   auto itemsType = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, b.i64());
@@ -1552,7 +1552,8 @@ void buildBoxedPayloadArraySlotRaw(SupportBuilder &b, llvm::StringRef name,
       b.builder, b.loc, b.i64(), pointerIndex);
   mlir::Value base = b.intToPtr(pointerWord);
   mlir::Value wordOffset = mlir::arith::MulIOp::create(
-      b.builder, b.loc, entry->getArgument(1), b.iconst(16));
+      b.builder, b.loc, entry->getArgument(1),
+      b.iconst(py::lowering::box_abi::kWordsPerBox));
   mlir::Value slot = b.gepI64(base, wordOffset);
   mlir::func::CallOp::create(b.builder, b.loc, callee, mlir::TypeRange{},
                              mlir::ValueRange{slot});
@@ -1935,7 +1936,8 @@ void buildReleaseExceptionExtras(SupportBuilder &b) {
         mlir::Value position = mlir::arith::IndexCastOp::create(
             b.builder, b.loc, b.i64(), loop.getInductionVar());
         mlir::Value boxWords = mlir::arith::MulIOp::create(
-            b.builder, b.loc, position, b.iconst(16));
+            b.builder, b.loc, position,
+            b.iconst(py::lowering::box_abi::kWordsPerBox));
         mlir::Value boxBase = mlir::arith::AddIOp::create(
             b.builder, b.loc, boxWords, b.iconst(1));
         mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);

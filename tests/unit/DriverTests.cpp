@@ -1038,6 +1038,73 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
         }
       }
     }
+
+    // ⭐ AND NO FUNCTION MAY COPY A BOX A LITERAL NUMBER OF WORDS AT A TIME.
+    // The multiply check above only knows the CURRENT width, so a copy loop
+    // left at the previous one is invisible to it -- which is exactly what
+    // happened: `LyList_SetSlice` strode by `__ly_box_word_count()` and then
+    // copied `%c16` words per slot, so every box after the first landed four
+    // words short and the next element's refcount word took the tail. It reads
+    // correctly, it type-checks, and the program it breaks is not the one that
+    // ran the copy: `b[::2] = ...` printed an `<object object>` where an int
+    // had been, and `("a", "b", "c")` aborted in `Ly_DecRef` about a third of
+    // the time, depending on what the pool handed out.
+    //
+    // ⛔ The bound is what this looks at and not the loop body, because the
+    // body is correct in every one of these: load a word, store a word. The
+    // literal is the whole defect, and it is on the binding line.
+    //
+    // `__ly_set_raw_swap_bodies` is the one exemption and it is not a box: it
+    // swaps words 2..8 of two SET HANDLES, whose width is the set's.
+    {
+      std::size_t at = 0;
+      while (at < text.size()) {
+        std::size_t start = text.find("  func.func ", at);
+        if (start == std::string::npos)
+          break;
+        std::size_t stop = text.find("\n  }\n", start);
+        if (stop == std::string::npos)
+          stop = text.size();
+        const std::string body = text.substr(start, stop - start);
+        at = stop + 1;
+        std::size_t sym = body.find('@');
+        std::size_t open = body.find('(', sym);
+        const std::string name =
+            (sym == std::string::npos || open == std::string::npos)
+                ? std::string("<unnamed>")
+                : body.substr(sym + 1, open - sym - 1);
+        if (name.rfind("__ly_box_", 0) == 0 ||
+            name == "__ly_set_raw_swap_bodies")
+          continue;
+        if (body.find("memref.store") == std::string::npos ||
+            body.find("memref<?xi64>") == std::string::npos)
+          continue;
+        for (int words = 4; words <= 64; ++words) {
+          const std::string bind =
+              " = arith.constant " + std::to_string(words) + " : index";
+          std::size_t declared = 0;
+          while ((declared = body.find(bind, declared)) != std::string::npos) {
+            std::size_t nameStart = body.rfind('%', declared);
+            const std::string bound =
+                body.substr(nameStart, declared - nameStart);
+            declared += bind.size();
+            if (bound.empty())
+              continue;
+            std::size_t use = 0;
+            while ((use = body.find("scf.for ", use)) != std::string::npos) {
+              std::size_t eol = body.find('\n', use);
+              const std::string line = body.substr(use, eol - use);
+              use = eol == std::string::npos ? body.size() : eol;
+              if (line.find(" to " + bound + " step") != std::string::npos)
+                ADD_FAILURE()
+                    << name << " walks " << bound
+                    << " words per box; the count comes from "
+                       "__ly_box_word_count";
+            }
+          }
+        }
+      }
+    }
   }
 }
 

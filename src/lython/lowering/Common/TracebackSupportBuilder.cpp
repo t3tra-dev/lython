@@ -1,5 +1,6 @@
 #include "Common/SupportBuilder.h"
 #include "ExceptionTaxonomy.h"
+#include "Runtime/ABI/BoxLayout.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -1571,20 +1572,25 @@ void buildPrintGroupMembers(SupportBuilder &b) {
         b.builder, b.loc, b.i64(), loop.getInductionVar());
     mlir::Value ordinal =
         mlir::arith::AddIOp::create(b.builder, b.loc, position, b.iconst(1));
-    mlir::Value boxWords = mlir::arith::MulIOp::create(b.builder, b.loc,
-                                                       position, b.iconst(16));
+    mlir::Value boxWords = mlir::arith::MulIOp::create(
+        b.builder, b.loc, position,
+        b.iconst(py::lowering::box_abi::kWordsPerBox));
     mlir::Value boxBase =
         mlir::arith::AddIOp::create(b.builder, b.loc, boxWords, b.iconst(1));
     mlir::Value boxPtr = b.gepI64(blockPtr, boxBase);
-    mlir::Value ehWord = b.loadI64(b.gepI64(boxPtr, b.iconst(4)));
+    mlir::Value ehWord = b.loadI64(
+        b.gepI64(boxPtr, b.iconst(py::lowering::box_abi::kPointerWordBase)));
     // ⛔ Widened here and not carried in as a pointer: a member slot is a box
     // word, so this is the boundary the box layout imposes rather than a
     // pointer being thrown away and rebuilt (BoxLayout.cpp records why a box
     // cannot hold one).
     mlir::Value ehPtr = b.intToPtr(ehWord);
-    mlir::Value mhWord = b.loadI64(b.gepI64(boxPtr, b.iconst(5)));
-    mlir::Value mbWord = b.loadI64(b.gepI64(boxPtr, b.iconst(6)));
-    mlir::Value mbLen = b.loadI64(b.gepI64(boxPtr, b.iconst(11)));
+    mlir::Value mhWord = b.loadI64(b.gepI64(
+        boxPtr, b.iconst(py::lowering::box_abi::kPointerWordBase + 1)));
+    mlir::Value mbWord = b.loadI64(b.gepI64(
+        boxPtr, b.iconst(py::lowering::box_abi::kPointerWordBase + 2)));
+    mlir::Value mbLen = b.loadI64(b.gepI64(
+        boxPtr, b.iconst(py::lowering::box_abi::kSizeWordBase + 2)));
     mlir::Value classId =
         b.loadI64(b.gepI64(ehPtr, b.iconst(2)));
 

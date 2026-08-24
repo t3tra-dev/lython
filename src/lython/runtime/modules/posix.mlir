@@ -128,6 +128,7 @@ module attributes {
   func.func private @LyBytes_DecRef(%header: memref<6xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.deallocator}
   func.func private @__ly_bytes_payload(%self: memref<6xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
   func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @__ly_unicode_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]}
   func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
@@ -264,59 +265,6 @@ module attributes {
     %len = func.call @LyHost_OSErrorMessagePath(%err, %empty, %zero, %buffer, %cap) : (i32, memref<?xi8>, i64, memref<?xi8>, i64) -> i64
     memref.dealloc %empty : memref<?xi8>
     func.call @__ly_posix_throw_message(%class_id, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
-    func.return
-  }
-
-  // Writes one owned str into a list payload slot. The 16-word slot layout is
-  // CollectionPayload.cpp's: [0] refcount, [1] class id, [2] header pointer,
-  // [3] value count, [4..8] value pointers, [9..13] value sizes, [14] owned.
-  func.func private @__ly_posix_store_str(%items: memref<?xi64>, %index: index, %str_header: memref<2xi64>, %str_bytes: memref<?xi8>) {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c2 = arith.constant 2 : index
-    %c3 = arith.constant 3 : index
-    %c4 = arith.constant 4 : index
-    %c5 = arith.constant 5 : index
-    %c9 = arith.constant 9 : index
-    %c10 = arith.constant 10 : index
-    %c14 = arith.constant 14 : index
-    %c16 = arith.constant 16 : index
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
-    %two = arith.constant 2 : i64
-    %class_slot = arith.constant 1 : index
-
-    %base = arith.muli %index, %c16 : index
-    scf.for %w = %c0 to %c16 step %c1 {
-      %slot = arith.addi %base, %w : index
-      memref.store %zero, %items[%slot] : memref<?xi64>
-    }
-    %class = memref.load %str_header[%class_slot] : memref<2xi64>
-    %header_ptr_index = memref.extract_aligned_pointer_as_index %str_header : memref<2xi64> -> index
-    %header_ptr = arith.index_cast %header_ptr_index : index to i64
-    %bytes_ptr_index = memref.extract_aligned_pointer_as_index %str_bytes : memref<?xi8> -> index
-    %bytes_ptr = arith.index_cast %bytes_ptr_index : index to i64
-    %bytes_dim = memref.dim %str_bytes, %c0 : memref<?xi8>
-    %bytes_len = arith.index_cast %bytes_dim : index to i64
-
-    %slot0 = arith.addi %base, %c0 : index
-    memref.store %one, %items[%slot0] : memref<?xi64>
-    %slot1 = arith.addi %base, %c1 : index
-    memref.store %class, %items[%slot1] : memref<?xi64>
-    %slot2 = arith.addi %base, %c2 : index
-    memref.store %header_ptr, %items[%slot2] : memref<?xi64>
-    %slot3 = arith.addi %base, %c3 : index
-    memref.store %two, %items[%slot3] : memref<?xi64>
-    %slot4 = arith.addi %base, %c4 : index
-    memref.store %header_ptr, %items[%slot4] : memref<?xi64>
-    %slot5 = arith.addi %base, %c5 : index
-    memref.store %bytes_ptr, %items[%slot5] : memref<?xi64>
-    %slot9 = arith.addi %base, %c9 : index
-    memref.store %two, %items[%slot9] : memref<?xi64>
-    %slot10 = arith.addi %base, %c10 : index
-    memref.store %bytes_len, %items[%slot10] : memref<?xi64>
-    %slot14 = arith.addi %base, %c14 : index
-    memref.store %one, %items[%slot14] : memref<?xi64>
     func.return
   }
 
@@ -705,8 +653,7 @@ module attributes {
           } else {
             %clamped = arith.minsi %len, %cap : i64
             %str_header, %str_bytes = func.call @LyUnicode_FromBytes(%name, %c0, %clamped) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
-            %slot_index = arith.index_cast %slot : i64 to index
-            func.call @__ly_posix_store_str(%items, %slot_index, %str_header, %str_bytes) : (memref<?xi64>, index, memref<2xi64>, memref<?xi8>) -> ()
+            func.call @__ly_unicode_store_item(%items, %slot, %str_header, %str_bytes) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
             %bumped = arith.addi %slot, %one : i64
             scf.yield %bumped : i64
           }
@@ -878,7 +825,7 @@ module attributes {
       func.call @LyHost_EnvironCopy(%i_i64, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
       %str_header, %str_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       memref.dealloc %buffer : memref<?xi8>
-      func.call @__ly_posix_store_str(%items, %i, %str_header, %str_bytes) : (memref<?xi64>, index, memref<2xi64>, memref<?xi8>) -> ()
+      func.call @__ly_unicode_store_item(%items, %i_i64, %str_header, %str_bytes) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
     }
     func.return %self : memref<9xi64>
   }

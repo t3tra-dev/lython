@@ -73,6 +73,7 @@ module attributes {
 } {
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
   func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @__ly_unicode_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]}
   func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyHost_ArgvCount() -> i64
@@ -104,18 +105,16 @@ module attributes {
 
   // sys.argv builds a fresh list[str] from the process argument vector that
   // LyHost_InitArgs recorded before the program body ran. Each element is an
-  // owned str stored as the standard 16-word collection payload handle
-  // (CollectionPayload.cpp layout: [0] refcount, [1] class id, [2] header
-  // pointer, [3] value count, [4..8] value pointers, [9..13] value sizes,
-  // [14] owned flag).
+  // owned str stored as the standard collection payload box.
+  //
+  // Why NOT the box written out word by word, which is what this was: the word
+  // offsets are the box's, not this module's, and a module that spells them
+  // out does not move when the box narrows -- writing an element at the old
+  // stride into a narrower array corrupts the NEXT element's refcount, which
+  // is not a crash here but wherever that element is next released.
   func.func @LySys_GetArgv() -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
-    %two = arith.constant 2 : i64
-    %header_class_slot = arith.constant 1 : index
 
     %count = func.call @LyHost_ArgvCount() : () -> i64
     %self = func.call @LyList_FromLength(%count) : (i64) -> memref<9xi64>
@@ -130,47 +129,7 @@ module attributes {
       %str_header, %str_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       memref.dealloc %buffer : memref<?xi8>
 
-      %base = arith.muli %i, %c16 : index
-      scf.for %w = %c0 to %c16 step %c1 {
-        %slot = arith.addi %base, %w : index
-        memref.store %zero, %items[%slot] : memref<?xi64>
-      }
-      %class = memref.load %str_header[%header_class_slot] : memref<2xi64>
-      %header_ptr_index = memref.extract_aligned_pointer_as_index %str_header : memref<2xi64> -> index
-      %header_ptr = arith.index_cast %header_ptr_index : index to i64
-      %bytes_ptr_index = memref.extract_aligned_pointer_as_index %str_bytes : memref<?xi8> -> index
-      %bytes_ptr = arith.index_cast %bytes_ptr_index : index to i64
-
-      %slot0 = arith.addi %base, %c0 : index
-      memref.store %one, %items[%slot0] : memref<?xi64>
-      %slot1 = arith.addi %base, %c1 : index
-      memref.store %class, %items[%slot1] : memref<?xi64>
-      %c2 = arith.constant 2 : index
-      %slot2 = arith.addi %base, %c2 : index
-      memref.store %header_ptr, %items[%slot2] : memref<?xi64>
-      %c3 = arith.constant 3 : index
-      %slot3 = arith.addi %base, %c3 : index
-      memref.store %two, %items[%slot3] : memref<?xi64>
-      %c4 = arith.constant 4 : index
-      %slot4 = arith.addi %base, %c4 : index
-      memref.store %header_ptr, %items[%slot4] : memref<?xi64>
-      %c5 = arith.constant 5 : index
-      %slot5 = arith.addi %base, %c5 : index
-      memref.store %bytes_ptr, %items[%slot5] : memref<?xi64>
-      %c9 = arith.constant 9 : index
-      %slot9 = arith.addi %base, %c9 : index
-      memref.store %two, %items[%slot9] : memref<?xi64>
-      %c10 = arith.constant 10 : index
-      %slot10 = arith.addi %base, %c10 : index
-      // The size word must be the code-unit buffer's own length: the
-      // adaptive-width payload is narrower than the UTF-8 input whenever the
-      // argument is non-ASCII.
-      %str_dim = memref.dim %str_bytes, %c0 : memref<?xi8>
-      %str_len = arith.index_cast %str_dim : index to i64
-      memref.store %str_len, %items[%slot10] : memref<?xi64>
-      %c14 = arith.constant 14 : index
-      %slot14 = arith.addi %base, %c14 : index
-      memref.store %one, %items[%slot14] : memref<?xi64>
+      func.call @__ly_unicode_store_item(%items, %i_i64, %str_header, %str_bytes) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
     }
     func.return %self : memref<9xi64>
   }
