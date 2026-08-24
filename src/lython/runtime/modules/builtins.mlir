@@ -11230,10 +11230,19 @@ module attributes {
     // the whole cost. Measured on `"a,b,...".split(",")` x 100,000: the plain
     // scan with no filter at all is 118 ms, this shape is 131, and folding the
     // case into the bloom loop as a branch instead of dispatching is 140. So
-    // the filter still costs `split` 10% for the 2.5x it gives `find`, and
-    // what would pay that back is `split` itself -- it walks the string TWICE,
-    // once to count the pieces and once to cut them, and a single pass would
-    // halve the searching rather than shave it.
+    // the filter costs `split` 10% for the 2.5x it gives `find`.
+    //
+    // ⛔ AND MAKING `split` SINGLE-PASS DOES NOT PAY THAT BACK -- measured, not
+    // reasoned. It walks the string twice, once to count the pieces so the
+    // list can be allocated at its final length and once to cut them, so the
+    // obvious move is to append to a growing list and search once. Built that
+    // way it is 180.3 ms against the two-pass 128.1, and 152.7 even with the
+    // list pre-grown so no reallocation happens at all. Removing an ENTIRE
+    // search pass loses to the per-piece list bookkeeping it costs -- a
+    // capacity load, a length store and an items view per piece -- because
+    // each of those searches scans one or two positions while each piece
+    // allocates a string. `split`'s remaining 2x against CPython is in
+    // `__ly_unicode_slice` and the allocation under it, not in the searching.
     %single = arith.cmpi eq, %n, %one : i64
     %answer = scf.if %single -> (i64) {
       %target = func.call @__ly_unicode_get(%t_bytes, %t_width, %c0) : (memref<?xi8>, i64, index) -> i64
