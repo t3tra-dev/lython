@@ -2301,6 +2301,28 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
   // worked while `[p for p in zip(a, b)]` was "builtins.object does not
   // provide __iter__". Only the first: a later iterable may reference an
   // earlier target, so it cannot be hoisted out of the loop that binds it.
+  // ⛔ A COMPREHENSION HAS ITS OWN SCOPE, so its target is a NEW binding and
+  // not the enclosing one of the same name. The desugaring below emits a `for`
+  // statement, and `for i in ...:` legitimately rebinds the function's `i`:
+  // the loop carries the target as a block argument seeded with whatever `i`
+  // is bound to on entry and releases the incoming one each trip. Applied to a
+  // comprehension that spells its target like an enclosing local, the first
+  // trip released the ENCLOSING variable's value -- `i = i + 1` followed by
+  // `[7 for i in range(3)]` and a later use of `i` was refused by the affine
+  // verifier, and what it was refusing was a real use-after-release.
+  //
+  // The targets are therefore erased from the value map before the `for` is
+  // emitted (`priorTargets` puts them back). What that would otherwise break
+  // is the FIRST iterable, which Python evaluates in the ENCLOSING scope:
+  // `[7 for i in range(i)]` reads the outer `i`. So a shadowing target forces
+  // the same hoist the lazy-iterator case uses, and the iterable is evaluated
+  // -- under the enclosing bindings -- before they go.
+  bool targetShadowsBinding = false;
+  for (const CompGenerator &entry : chain)
+    for (llvm::StringRef name : entry.targetNames)
+      if (values.find(name) != values.end())
+        targetShadowsBinding = true;
+
   std::string hoistedSource;
   std::optional<Value> hoistedPrior;
   auto restoreHoisted = llvm::make_scope_exit([&] {
@@ -2312,10 +2334,11 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
       values.erase(hoistedSource);
   });
   if (!chain.empty() && chain.front().iter &&
-      chain.front().iter->kind == "Call" &&
-      !types.inferMethodCallWithEvidence(
-          types.widenLiteral(types.inferExpr(chain.front().iter.get())),
-          "__iter__", {})) {
+      (targetShadowsBinding ||
+       (chain.front().iter->kind == "Call" &&
+        !types.inferMethodCallWithEvidence(
+            types.widenLiteral(types.inferExpr(chain.front().iter.get())),
+            "__iter__", {})))) {
     std::string name = "__lycompsrc" + std::to_string(++listCompCounter);
     parser::NodePtr target = synth::name(name, expr.range);
     parser::NodePtr assign = synth::assign(target, chain.front().iter, expr.range);
@@ -2446,6 +2469,10 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
       if (auto found = values.find(name); found != values.end())
         prior = found->second;
       priorTargets.push_back({name, prior});
+      // The comprehension's own scope: the `for` below must not find the
+      // enclosing binding and carry it into the loop as the target's previous
+      // value. See the note above the hoist.
+      values.erase(name);
     }
   emitFor(*statement);
 

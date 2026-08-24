@@ -2909,7 +2909,15 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           static const bool traceHold =
               std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
           if (traceHold)
+            // The RESOURCE's own head value, not just the walk's current
+            // group: the insertion pass prints the group it tracks, and the
+            // walk remaps its group as it goes, so without this the two lines
+            // the instrument exists to pair up cannot be matched to each other.
             llvm::errs() << "[verify] holds " << resource.producerLabel
+                         << " res0 "
+                         << (resource.values.empty()
+                                 ? static_cast<const void *>(nullptr)
+                                 : resource.values.front().getAsOpaquePointer())
                          << " at " << call.getCallee() << " op "
                          << static_cast<const void *>(call.getOperation())
                          << " group0 "
