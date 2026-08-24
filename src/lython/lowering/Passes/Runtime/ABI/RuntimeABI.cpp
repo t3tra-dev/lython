@@ -1362,7 +1362,7 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
                    .getResult();
   }
   mlir::Value bodySlot = mlir::arith::ConstantIndexOp::create(
-                             builder, loc, box_abi::kInstanceBodyWord)
+                             builder, loc, box_abi::kEntityWord)
                              .getResult();
   mlir::memref::StoreOp::create(builder, loc, bodyWord, header, bodySlot);
 
@@ -1387,15 +1387,9 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
     values.append(fieldValue->values.begin(), fieldValue->values.end());
   }
 
-  if (headerType.hasStaticShape() && headerType.getDimSize(0) >= 3) {
-    mlir::Value valueCountSlot =
-        mlir::arith::ConstantIndexOp::create(builder, loc, 2);
-    mlir::Value valueCount = mlir::arith::ConstantIntOp::create(
-        builder, loc, static_cast<std::int64_t>(values.size()), 64);
-    mlir::memref::StoreOp::create(builder, loc, valueCount, header,
-                                  valueCountSlot);
-  }
-
+  // ⛔ NO VALUE COUNT. Word 2 held one and now holds the body address, which is
+  // this object's entity; the count was write-only even before -- a contract
+  // says how many physical values it has, and nothing read the word back.
   return RuntimeValue::object(contract, values);
 }
 
@@ -1536,7 +1530,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
         return module.emitError() << "source class deallocators require "
                                      "LyObject_ReleaseBoxedPayloadArraySlotRaw";
       mlir::Value bodySlot = mlir::arith::ConstantIndexOp::create(
-                                 builder, loc, box_abi::kInstanceBodyWord)
+                                 builder, loc, box_abi::kEntityWord)
                                  .getResult();
       mlir::Value address = mlir::memref::LoadOp::create(
                                 builder, loc, entry->getArgument(0), bodySlot)

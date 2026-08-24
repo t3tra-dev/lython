@@ -959,19 +959,16 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
               py::lowering::box_abi::kWordsPerBox)
         << "the manifest strides slots by a different box width than "
            "ABI/BoxLayout.h";
-    EXPECT_EQ(constantIn("__ly_box_lane_count"),
-              py::lowering::box_abi::kPointerWordCount)
-        << "the manifest clears a different number of lanes than the box has";
-    EXPECT_EQ(constantIn("__ly_box_pointer_word"),
-              py::lowering::box_abi::kPointerWordBase)
-        << "the manifest indexes pointer words from elsewhere";
-    EXPECT_EQ(constantIn("__ly_box_size_word"),
-              py::lowering::box_abi::kSizeWordBase)
-        << "the manifest indexes size words from elsewhere";
+    EXPECT_EQ(constantIn("__ly_box_entity_word"),
+              py::lowering::box_abi::kEntityWord)
+        << "the manifest reads the one address a box holds from elsewhere";
     EXPECT_EQ(constantIn("__ly_box_owned_word"),
               py::lowering::box_abi::kOwnedFlagWord)
         << "the manifest writes the owned flag elsewhere";
     EXPECT_EQ(constantIn("__ly_box_hash_word"),
+              py::lowering::box_abi::kHashWord)
+        << "the manifest caches the hash in a different word";
+    EXPECT_EQ(py::lowering::box_abi::kHashWord,
               py::lowering::box_abi::kWordsPerBox - 1)
         << "the cached hash is the box's last word";
 
@@ -988,8 +985,11 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
     // version passed with a stride put back by hand, which is the only reason
     // this one is written out.
     //
-    // `LyBytes_FromHex` is the one exemption and it is not a box: it multiplies
-    // an accumulator by sixteen per hex digit.
+    // Two exemptions, and neither is a box. `LyBytes_FromHex` multiplies an
+    // accumulator by sixteen per hex digit, and `%probe_scale` is the 5 in
+    // CPython's `i*5 + 1 + perturb` open-addressing walk -- which the box width
+    // happens to equal, so the exemption is the NAME rather than the functions,
+    // and a stride that spelled itself any other way still fails.
     {
       const std::string width =
           std::to_string(py::lowering::box_abi::kWordsPerBox);
@@ -1020,7 +1020,7 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
             const std::string bound =
                 body.substr(nameStart, declared - nameStart);
             declared += bind.size();
-            if (bound.empty())
+            if (bound.empty() || bound == "%probe_scale")
               continue;
             std::size_t use = 0;
             while ((use = body.find("arith.muli ", use)) != std::string::npos) {

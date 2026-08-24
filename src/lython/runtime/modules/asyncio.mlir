@@ -117,9 +117,9 @@ module attributes {
 
   func.func private @LyFutureIter_Shape() -> (memref<3xi64>, memref<10xi64>) attributes {ly.runtime.contract = "_asyncio.FutureIter", ly.runtime.shape}
 
-  func.func private @LyTask_Shape() -> (memref<12xi64>, memref<5xi64>) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.shape}
+  func.func private @LyTask_Shape() -> (memref<5xi64>, memref<5xi64>) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.shape}
 
-  func.func private @LyTaskIter_Shape() -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.shape}
+  func.func private @LyTaskIter_Shape() -> (memref<3xi64>, memref<5xi64>, memref<5xi64>) attributes {ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.shape}
 
   func.func private @__ly_entity_word_set(%ptr: i64, %slot: i64, %value: i64)
   func.func private @__ly_entity_word_get(%ptr: i64, %slot: i64) -> i64
@@ -625,7 +625,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyTask_New(%coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<12xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 15 : i64, ly.runtime.contract = "_asyncio.Task", ly.runtime.initializer = "__new__"} {
+  func.func @LyTask_New(%coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<5xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 15 : i64, ly.runtime.contract = "_asyncio.Task", ly.runtime.initializer = "__new__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %layout = arith.constant 15 : i64
@@ -648,63 +648,63 @@ module attributes {
     %zero_index = arith.constant 0 : index
     %block_bytes = arith.constant 104 : index
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
-    %task = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<12xi64>
+    %task = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<5xi64>
     %coroutine_word_slot = arith.constant 12 : i64
-    %task_ptr_index = memref.extract_aligned_pointer_as_index %task : memref<12xi64> -> index
+    %task_ptr_index = memref.extract_aligned_pointer_as_index %task : memref<5xi64> -> index
     %task_ptr = arith.index_cast %task_ptr_index : index to i64
     %coroutine_ptr_index = memref.extract_aligned_pointer_as_index %coroutine : memref<5xi64> -> index
     %coroutine_ptr = arith.index_cast %coroutine_ptr_index : index to i64
     func.call @__ly_entity_word_set(%task_ptr, %coroutine_word_slot, %coroutine_ptr) : (i64, i64, i64) -> ()
-    memref.store %one, %task[%refcount_slot] : memref<12xi64>
-    memref.store %layout, %task[%layout_slot] : memref<12xi64>
+    memref.store %one, %task[%refcount_slot] : memref<5xi64>
+    memref.store %layout, %task[%layout_slot] : memref<5xi64>
     // Task states: 0 = pending, 1 = running, 2 = finished, 3 = cancelled.
-    memref.store %zero, %task[%state_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.task.state.publish"} : memref<12xi64>
-    memref.store %zero, %task[%cancel_requests_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.task.cancel.requests.publish"} : memref<12xi64>
-    memref.store %zero, %task[%ready_callbacks_slot] : memref<12xi64>
-    memref.store %zero, %task[%loop_id_slot] : memref<12xi64>
-    memref.store %zero, %task[%waiter_count_slot] : memref<12xi64>
-    memref.store %zero, %task[%result_token_slot] : memref<12xi64>
-    memref.store %zero, %task[%exception_token_slot] : memref<12xi64>
-    memref.store %zero, %task[%flags_slot] : memref<12xi64>
-    memref.store %coroutine_target_id, %task[%coroutine_target_slot] : memref<12xi64>
-    memref.store %zero, %task[%step_epoch_slot] : memref<12xi64>
+    memref.store %zero, %task[%state_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.task.state.publish"} : memref<5xi64>
+    memref.store %zero, %task[%cancel_requests_slot] {ly.atomic.ordering = "release", ly.atomic.role = "asyncio.task.cancel.requests.publish"} : memref<5xi64>
+    memref.store %zero, %task[%ready_callbacks_slot] : memref<5xi64>
+    memref.store %zero, %task[%loop_id_slot] : memref<5xi64>
+    memref.store %zero, %task[%waiter_count_slot] : memref<5xi64>
+    memref.store %zero, %task[%result_token_slot] : memref<5xi64>
+    memref.store %zero, %task[%exception_token_slot] : memref<5xi64>
+    memref.store %zero, %task[%flags_slot] : memref<5xi64>
+    memref.store %coroutine_target_id, %task[%coroutine_target_slot] : memref<5xi64>
+    memref.store %zero, %task[%step_epoch_slot] : memref<5xi64>
 
     %coroutine_storage = memref.cast %coroutine : memref<5xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%coroutine_storage) : (memref<?xi64>) -> ()
-    func.return %task, %coroutine : memref<12xi64>, memref<5xi64>
+    func.return %task, %coroutine : memref<5xi64>, memref<5xi64>
   }
 
-  func.func @LyTask_Init(%task: memref<12xi64> {ly.ownership.object_header}, %owned_coroutine: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "__init__", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyTask_Init(%task: memref<5xi64> {ly.ownership.object_header}, %owned_coroutine: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "__init__", ly.runtime.result_contract = "types.NoneType"} {
     func.return
   }
 
-  func.func @LyTask_Done(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "done", ly.runtime.result_contract = "builtins.bool"} {
+  func.func @LyTask_Done(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "done", ly.runtime.result_contract = "builtins.bool"} {
     %state_slot = arith.constant 2 : index
     %finished = arith.constant 2 : i64
     %cancelled_state = arith.constant 3 : i64
-    %state = memref.load %task[%state_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.state.load"} : memref<12xi64>
+    %state = memref.load %task[%state_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.state.load"} : memref<5xi64>
     %is_finished = arith.cmpi eq, %state, %finished : i64
     %is_cancelled = arith.cmpi eq, %state, %cancelled_state : i64
     %done = arith.ori %is_finished, %is_cancelled : i1
     func.return %done : i1
   }
 
-  func.func @LyTask_Cancelled(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancelled", ly.runtime.result_contract = "builtins.bool"} {
+  func.func @LyTask_Cancelled(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancelled", ly.runtime.result_contract = "builtins.bool"} {
     %state_slot = arith.constant 2 : index
     %cancelled_state = arith.constant 3 : i64
-    %state = memref.load %task[%state_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.state.load"} : memref<12xi64>
+    %state = memref.load %task[%state_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.state.load"} : memref<5xi64>
     %cancelled = arith.cmpi eq, %state, %cancelled_state : i64
     func.return %cancelled : i1
   }
 
-  func.func @LyTask_RequestCancel(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "cancel.request"} {
+  func.func @LyTask_RequestCancel(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "cancel.request"} {
     %state_slot = arith.constant 2 : index
     %cancel_requests_slot = arith.constant 3 : index
     %pending = arith.constant 0 : i64
     %running = arith.constant 1 : i64
     %cancelled_state = arith.constant 3 : i64
     %one = arith.constant 1 : i64
-    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<12xi64> {
+    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %is_pending = arith.cmpi eq, %current, %pending : i64
       %is_running = arith.cmpi eq, %current, %running : i64
@@ -718,7 +718,7 @@ module attributes {
     cf.cond_br %did_cancel, ^record, ^done
 
   ^record:
-    memref.generic_atomic_rmw %task[%cancel_requests_slot] : memref<12xi64> {
+    memref.generic_atomic_rmw %task[%cancel_requests_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %next = arith.addi %current, %one : i64
       memref.atomic_yield %next : i64
@@ -729,23 +729,23 @@ module attributes {
     func.return %did_cancel : i1
   }
 
-  func.func @LyTask_Cancel(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancel", ly.runtime.result_contract = "builtins.bool"} {
-    %cancelled = func.call @LyTask_RequestCancel(%task, %coroutine) : (memref<12xi64>, memref<5xi64>) -> i1
+  func.func @LyTask_Cancel(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancel", ly.runtime.result_contract = "builtins.bool"} {
+    %cancelled = func.call @LyTask_RequestCancel(%task, %coroutine) : (memref<5xi64>, memref<5xi64>) -> i1
     func.return %cancelled : i1
   }
 
-  func.func @LyTask_Cancelling(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancelling", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTask_Cancelling(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "cancelling", ly.runtime.result_contract = "builtins.int"} {
     %cancel_requests_slot = arith.constant 3 : index
-    %requests = memref.load %task[%cancel_requests_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.cancel.requests.load"} : memref<12xi64>
+    %requests = memref.load %task[%cancel_requests_slot] {ly.atomic.ordering = "acquire", ly.atomic.role = "asyncio.task.cancel.requests.load"} : memref<5xi64>
     %header = func.call @LyLong_FromI64(%requests) : (i64) -> memref<2xi64>
     func.return %header : memref<2xi64>
   }
 
-  func.func @LyTask_Uncancel(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "uncancel", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyTask_Uncancel(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "uncancel", ly.runtime.result_contract = "builtins.int"} {
     %cancel_requests_slot = arith.constant 3 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %previous = memref.generic_atomic_rmw %task[%cancel_requests_slot] : memref<12xi64> {
+    %previous = memref.generic_atomic_rmw %task[%cancel_requests_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %has_request = arith.cmpi sgt, %current, %zero : i64
       %decremented = arith.subi %current, %one : i64
@@ -759,27 +759,27 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
-  func.func @LyTask_GetCoro(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "get_coro", ly.runtime.result_contract = "types.CoroutineType", ly.runtime.result_evidence = "receiver"} {
+  func.func @LyTask_GetCoro(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "get_coro", ly.runtime.result_contract = "types.CoroutineType", ly.runtime.result_evidence = "receiver"} {
     %coroutine_storage = memref.cast %coroutine : memref<5xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%coroutine_storage) : (memref<?xi64>) -> ()
     func.return %coroutine : memref<5xi64>
   }
 
-  func.func @LyTask_SetResult(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}, %result: memref<?xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "set_result", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyTask_SetResult(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}, %result: memref<?xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "set_result", ly.runtime.result_contract = "types.NoneType"} {
     func.call @__ly_task_raise_set_result_unsupported() : () -> ()
     func.return
   }
 
-  func.func @LyTask_SetException(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}, %exception: memref<?xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "set_exception", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyTask_SetException(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}, %exception: memref<?xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "set_exception", ly.runtime.result_contract = "types.NoneType"} {
     func.call @__ly_task_raise_set_exception_unsupported() : () -> ()
     func.return
   }
 
-  func.func @LyTask_ResumeBegin(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "resume.begin"} {
+  func.func @LyTask_ResumeBegin(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "resume.begin"} {
     %state_slot = arith.constant 2 : index
     %pending = arith.constant 0 : i64
     %running = arith.constant 1 : i64
-    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<12xi64> {
+    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %is_pending = arith.cmpi eq, %current, %pending : i64
       %next = arith.select %is_pending, %running, %current : i1, i64
@@ -797,13 +797,13 @@ module attributes {
     func.return %was_pending : i1
   }
 
-  func.func @LyTask_ResumeComplete(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "resume.complete"} {
+  func.func @LyTask_ResumeComplete(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "resume.complete"} {
     %state_slot = arith.constant 2 : index
     %running = arith.constant 1 : i64
     %finished = arith.constant 2 : i64
 
     func.call @LyCoroutine_ResumeComplete(%coroutine) : (memref<5xi64>) -> ()
-    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<12xi64> {
+    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %is_running = arith.cmpi eq, %current, %running : i64
       %next = arith.select %is_running, %finished, %current : i1, i64
@@ -814,12 +814,12 @@ module attributes {
     func.return
   }
 
-  func.func @LyTask_MarkFinished(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "finish.request"} {
+  func.func @LyTask_MarkFinished(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.primitive = "finish.request"} {
     %state_slot = arith.constant 2 : index
     %pending = arith.constant 0 : i64
     %running = arith.constant 1 : i64
     %finished = arith.constant 2 : i64
-    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<12xi64> {
+    %previous = memref.generic_atomic_rmw %task[%state_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %is_pending = arith.cmpi eq, %current, %pending : i64
       %is_running = arith.cmpi eq, %current, %running : i64
@@ -833,7 +833,7 @@ module attributes {
     func.return %finished_now : i1
   }
 
-  func.func private @LyTaskIter_New(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @LyTaskIter_New(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
     %layout_task_iter = arith.constant 17 : i64
@@ -854,32 +854,32 @@ module attributes {
     %coroutine_word_slot = arith.constant 4 : i64
     %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
     %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
-    %task_ptr_index = memref.extract_aligned_pointer_as_index %task : memref<12xi64> -> index
+    %task_ptr_index = memref.extract_aligned_pointer_as_index %task : memref<5xi64> -> index
     %task_ptr = arith.index_cast %task_ptr_index : index to i64
     %coroutine_ptr_index = memref.extract_aligned_pointer_as_index %coroutine : memref<5xi64> -> index
     %coroutine_ptr = arith.index_cast %coroutine_ptr_index : index to i64
     func.call @__ly_entity_word_set(%iter_ptr, %task_word_slot, %task_ptr) : (i64, i64, i64) -> ()
     func.call @__ly_entity_word_set(%iter_ptr, %coroutine_word_slot, %coroutine_ptr) : (i64, i64, i64) -> ()
 
-    %task_storage = memref.cast %task : memref<12xi64> to memref<?xi64>
+    %task_storage = memref.cast %task : memref<5xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%task_storage) : (memref<?xi64>) -> ()
-    func.return %iterator, %task, %coroutine : memref<3xi64>, memref<12xi64>, memref<5xi64>
+    func.return %iterator, %task, %coroutine : memref<3xi64>, memref<5xi64>, memref<5xi64>
   }
 
-  func.func @LyTask_Await(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "__await__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
-    %iterator, %kept_task, %kept_coroutine = func.call @LyTaskIter_New(%task, %coroutine) : (memref<12xi64>, memref<5xi64>) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>)
-    func.return %iterator, %kept_task, %kept_coroutine : memref<3xi64>, memref<12xi64>, memref<5xi64>
+  func.func @LyTask_Await(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "__await__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
+    %iterator, %kept_task, %kept_coroutine = func.call @LyTaskIter_New(%task, %coroutine) : (memref<5xi64>, memref<5xi64>) -> (memref<3xi64>, memref<5xi64>, memref<5xi64>)
+    func.return %iterator, %kept_task, %kept_coroutine : memref<3xi64>, memref<5xi64>, memref<5xi64>
   }
 
-  func.func @LyTask_Iter(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "__iter__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
-    %iterator, %kept_task, %kept_coroutine = func.call @LyTaskIter_New(%task, %coroutine) : (memref<12xi64>, memref<5xi64>) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>)
-    func.return %iterator, %kept_task, %kept_coroutine : memref<3xi64>, memref<12xi64>, memref<5xi64>
+  func.func @LyTask_Iter(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "__iter__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
+    %iterator, %kept_task, %kept_coroutine = func.call @LyTaskIter_New(%task, %coroutine) : (memref<5xi64>, memref<5xi64>) -> (memref<3xi64>, memref<5xi64>, memref<5xi64>)
+    func.return %iterator, %kept_task, %kept_coroutine : memref<3xi64>, memref<5xi64>, memref<5xi64>
   }
 
-  func.func @LyTask_AddDoneCallback(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}, %callback: memref<?xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "add_done_callback", ly.runtime.result_contract = "types.NoneType"} {
+  func.func @LyTask_AddDoneCallback(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}, %callback: memref<?xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_asyncio.Task", ly.runtime.method = "add_done_callback", ly.runtime.result_contract = "types.NoneType"} {
     %ready_callbacks_slot = arith.constant 4 : index
     %one = arith.constant 1 : i64
-    memref.generic_atomic_rmw %task[%ready_callbacks_slot] : memref<12xi64> {
+    memref.generic_atomic_rmw %task[%ready_callbacks_slot] : memref<5xi64> {
     ^bb0(%current : i64):
       %next = arith.addi %current, %one : i64
       memref.atomic_yield %next : i64
@@ -904,42 +904,42 @@ module attributes {
     func.return %coroutine_ptr, %five : i64, i64
   }
 
-  func.func @LyTaskIter_Iter(%iterator: memref<3xi64> {ly.ownership.object_header}, %task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<12xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.method = "__iter__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
+  func.func @LyTaskIter_Iter(%iterator: memref<3xi64> {ly.ownership.object_header}, %task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) -> (memref<3xi64>, memref<5xi64>, memref<5xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.method = "__iter__", ly.runtime.result_contract = "_asyncio.TaskIter"} {
     %iterator_storage = memref.cast %iterator : memref<3xi64> to memref<?xi64>
-    %task_storage = memref.cast %task : memref<12xi64> to memref<?xi64>
+    %task_storage = memref.cast %task : memref<5xi64> to memref<?xi64>
     func.call @__ly_asyncio_retain_storage(%iterator_storage) : (memref<?xi64>) -> ()
     func.call @__ly_asyncio_retain_storage(%task_storage) : (memref<?xi64>) -> ()
     %iter_ptr_index = memref.extract_aligned_pointer_as_index %iterator : memref<3xi64> -> index
     %iter_ptr = arith.index_cast %iter_ptr_index : index to i64
     %task_ptr, %task_size, %coroutine_ptr, %coroutine_size = func.call @__ly_task_iter_lane_words(%iter_ptr) : (i64) -> (i64, i64, i64, i64)
     %task_words = func.call @__ly_global_view_i64(%task_ptr, %task_size) : (i64, i64) -> memref<?xi64>
-    %task_view = memref.cast %task_words : memref<?xi64> to memref<12xi64>
+    %task_view = memref.cast %task_words : memref<?xi64> to memref<5xi64>
     %coroutine_words = func.call @__ly_global_view_i64(%coroutine_ptr, %coroutine_size) : (i64, i64) -> memref<?xi64>
     %coroutine_view = memref.cast %coroutine_words : memref<?xi64> to memref<5xi64>
-    func.return %iterator, %task_view, %coroutine_view : memref<3xi64>, memref<12xi64>, memref<5xi64>
+    func.return %iterator, %task_view, %coroutine_view : memref<3xi64>, memref<5xi64>, memref<5xi64>
   }
 
-  func.func @LyTask_DecRef(%task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.deallocator} {
-    %task_storage = memref.cast %task : memref<12xi64> to memref<?xi64>
+  func.func @LyTask_DecRef(%task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_asyncio.Task", ly.runtime.deallocator} {
+    %task_storage = memref.cast %task : memref<5xi64> to memref<?xi64>
     %became_zero = func.call @__ly_asyncio_release_storage_to_zero(%task_storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
     func.call @LyCoroutine_DecRef(%coroutine) : (memref<5xi64>) -> ()
-    memref.dealloc %task : memref<12xi64>
+    memref.dealloc %task : memref<5xi64>
     cf.br ^done
 
   ^done:
     func.return
   }
 
-  func.func @LyTaskIter_DecRef(%iterator: memref<3xi64> {ly.ownership.object_header}, %task: memref<12xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.deallocator} {
+  func.func @LyTaskIter_DecRef(%iterator: memref<3xi64> {ly.ownership.object_header}, %task: memref<5xi64> {ly.ownership.object_header}, %coroutine: memref<5xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_asyncio.TaskIter", ly.runtime.deallocator} {
     %iterator_storage = memref.cast %iterator : memref<3xi64> to memref<?xi64>
     %became_zero = func.call @__ly_asyncio_release_storage_to_zero(%iterator_storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    func.call @LyTask_DecRef(%task, %coroutine) : (memref<12xi64>, memref<5xi64>) -> ()
+    func.call @LyTask_DecRef(%task, %coroutine) : (memref<5xi64>, memref<5xi64>) -> ()
     memref.dealloc %iterator : memref<3xi64>
     cf.br ^done
 

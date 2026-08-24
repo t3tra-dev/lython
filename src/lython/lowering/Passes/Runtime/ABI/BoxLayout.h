@@ -43,53 +43,41 @@
 
 namespace py::lowering::box_abi {
 
-// ⭐ TWELVE, AND THE MEASUREMENT THAT SET IT. Words [0, 4) are the header
-// (refcount, class id, entity pointer, lane count), [4, 7) the pointer word of
-// each physical memref, [7, 10) the matching size words, word 10 the owned flag
-// the deallocators consult and word 11 the cached hash the dict and set keep.
-// A source class INSTANCE is a block with these words in front of it, and it
-// reads word 3 as the address of its body rather than as a lane count.
+// ⭐ FIVE, WHICH IS THE FLOOR. Word 0 is the refcount, word 1 the class id,
+// word 2 the entity, word 3 the owned flag the deallocators consult and word 4
+// the cached hash the dict and set keep. Nothing else is left: a value's other
+// physical lanes come from the entity's own block, which is what every contract
+// that has any answers with `lane_words`.
 //
-// ⛔ IT WAS SIXTEEN, WITH ROOM FOR FIVE LANES, AND NO CONTRACT HAS MORE THAN
-// THREE. Counted across every `ly.runtime.shape` in the manifests: 71 contracts
-// expand to three physical values (the exception family), 3 to two, 18 to one.
-// The two spare lanes were four words on every boxed element -- 32 bytes per
-// list slot, per dict key AND value, per tuple element, per set member -- and
-// `objectPayloadHandleWords` rejects a wider value with a diagnostic, so
-// narrowing cannot silently truncate.
+// ⛔ IT WAS SIXTEEN, AND SEVEN OF THOSE WORDS WERE A SECOND COPY. Words [4, 10)
+// cached a pointer and a size for each of five lanes -- 32 bytes per list slot,
+// per dict key AND value, per tuple element, per set member, describing storage
+// the entity's own block already describes. Every contract that is more than
+// one physical value now answers `lane_words` from its first lane's address:
+// `__ly_unicode_alloc` puts a str's code units at +24 of the header's block and
+// records their length in the shape word, the exception taxonomy records its
+// message in extended word 6, and the iterators record what they walk. Reading
+// the block instead of a copy is also the defect this removes rather than
+// re-finds: a cached lane goes stale when the payload reallocates.
 //
-// ⛔ THE LANE COUNT IS NO LONGER A CLASS'S FIELD BUDGET. It was: a class
-// expanded to one handle per field plus its own, so narrowing the lanes from
-// five to three took `class P: x, y, z: float` out of every container. Fields
-// now live in the instance BODY (Lowerer.h, classInstanceBody) and a class is
-// one handle however many it has -- what still reaches
-// `objectPayloadHandleWords` too wide is a UNION, whose members do not share a
-// width and so cannot share a box.
-//
-// ⛔ AND TWELVE IS NOT THE FLOOR. The floor is FIVE, because the non-first lanes
-// of every multi-lane contract are interior to the first one's allocation
-// (`__ly_unicode_alloc` puts the bytes at +24 of the header's block, the way
-// `__ly_long_parts` recovers an int's meta and digits at +16 and +32), so a box
-// needs only the entity pointer and the lanes come back by contract. Getting
-// there is one-laning what is left: 71 contracts (the exception family) expand
-// to three, `builtins.str` and two `_asyncio` contracts to two.
-inline constexpr std::int64_t kWordsPerBox = 12;
-// Word 3 of a SOURCE CLASS INSTANCE's header holds the address of its body, the
-// block every field's storage lives in (Lowerer.h, classInstanceBody). A
-// container's box uses the same word for its lane count; the two never describe
-// the same block, because an instance stored in a container is described by a
-// box that POINTS at it.
-inline constexpr std::int64_t kInstanceBodyWord = 3;
+// ⛔ AND THE LANE COUNT WAS A CLASS'S FIELD BUDGET, which is why narrowing used
+// to cost capability. A class expanded to one handle per field plus its own, so
+// three lanes took `class P: x, y, z: float` out of every container. Fields
+// live in the instance BODY now and a class is one lane however many it has;
+// what `objectPayloadHandleWords` still refuses is a UNION, whose members do
+// not share an entity, so no single address names them.
+inline constexpr std::int64_t kWordsPerBox = 5;
 // Word 2 is the ENTITY: the address of the object's first physical value, and
-// the only lane a box keeps. Everything else a contract expands to is reached
+// the only one a box keeps. Everything else a contract expands to is reached
 // from it through that contract's `lane_words` primitive.
+//
+// A SOURCE CLASS INSTANCE's own header is a block of these words and reads word
+// 2 as the address of its body -- the block its fields live in (Lowerer.h,
+// classInstanceBody). That is the same reading: an instance's entity IS its
+// body, and a box holding the instance points at the header rather than at it.
 inline constexpr std::int64_t kEntityWord = 2;
-inline constexpr std::int64_t kPointerWordBase = 4;
-inline constexpr std::int64_t kSizeWordBase = 7;
-inline constexpr std::int64_t kPointerWordCount =
-    kSizeWordBase - kPointerWordBase;
-inline constexpr std::int64_t kOwnedFlagWord =
-    kSizeWordBase + kPointerWordCount;
+inline constexpr std::int64_t kOwnedFlagWord = 3;
+inline constexpr std::int64_t kHashWord = 4;
 
 inline mlir::MemRefType boxWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());

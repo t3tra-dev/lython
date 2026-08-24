@@ -230,7 +230,7 @@ RuntimeBundleLowerer::classInstanceBody(mlir::Operation *op,
     return mlir::failure();
   mlir::Location loc = op->getLoc();
   mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-                         builder, loc, box_abi::kInstanceBodyWord)
+                         builder, loc, box_abi::kEntityWord)
                          .getResult();
   mlir::Value address =
       mlir::memref::LoadOp::create(builder, loc, *header, slot).getResult();
@@ -1135,7 +1135,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                                   unsigned bodyWords) -> mlir::Value {
     builder.setInsertionPoint(op);
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, op.getLoc(), box_abi::kInstanceBodyWord);
+        builder, op.getLoc(), box_abi::kEntityWord);
     mlir::Value address =
         mlir::memref::LoadOp::create(builder, op.getLoc(), handle, slot)
             .getResult();
@@ -2019,9 +2019,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
                             << fieldType
                             << " has no boxable value group yet";
   }
-  if (shapes->size() > static_cast<std::size_t>(box_abi::kPointerWordCount))
-    return op.emitError() << "exception field '" << op.getName()
-                          << "' needs more box slots than the payload box has";
+  if (shapes->size() > 1 &&
+      !RuntimeBundleLowerer::laneWordsPrimitiveFor(
+          runtimeContractName(fieldType)))
+    return op.emitError()
+           << "exception field '" << op.getName() << "' of " << fieldType
+           << " expands to " << shapes->size()
+           << " physical values and nothing can rebuild them from one address";
   std::optional<RuntimeSymbol> boxWord =
       manifest.primitive("builtins.BaseException", "payload_box_word");
   if (!boxWord)

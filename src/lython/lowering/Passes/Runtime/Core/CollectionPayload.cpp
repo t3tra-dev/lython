@@ -321,12 +321,6 @@ namespace {
 
 constexpr unsigned kPayloadHandleWords =
     static_cast<unsigned>(box_abi::kWordsPerBox);
-constexpr unsigned kPayloadValuePointerWords =
-    static_cast<unsigned>(box_abi::kPointerWordCount);
-constexpr unsigned kPayloadValuePointerBase =
-    static_cast<unsigned>(box_abi::kPointerWordBase);
-constexpr unsigned kPayloadValueSizeBase =
-    static_cast<unsigned>(box_abi::kSizeWordBase);
 constexpr unsigned kPayloadOwnedFlagSlot =
     static_cast<unsigned>(box_abi::kOwnedFlagWord);
 // ⭐ CPython's `list_resize` (Objects/listobject.c), and it has to be exactly
@@ -348,42 +342,6 @@ std::uint64_t growCapacity(std::uint64_t current, std::uint64_t required) {
   return (required + (required >> 3) + 6) & ~static_cast<std::uint64_t>(3);
 }
 
-mlir::Value pointerWordForPhysicalValue(mlir::OpBuilder &builder,
-                                        mlir::Location loc, mlir::Value value,
-                                        mlir::Value zero) {
-  auto memref = mlir::dyn_cast<mlir::MemRefType>(value.getType());
-  if (!memref || memref.getRank() != 1)
-    return zero;
-  mlir::Value pointerIndex =
-      mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, value);
-  return mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
-                                          pointerIndex)
-      .getResult();
-}
-
-mlir::Value sizeWordForPhysicalValue(mlir::OpBuilder &builder,
-                                     mlir::Location loc, mlir::Value value,
-                                     mlir::Value zero) {
-  auto memref = mlir::dyn_cast<mlir::MemRefType>(value.getType());
-  if (!memref || memref.getRank() != 1)
-    return zero;
-  if (memref.hasStaticShape())
-    return constantI64(builder, loc, memref.getDimSize(0));
-  // Why NOT memref.dim: it has a constant-index fast path but was measured not
-  // to take it from here -- the emitted LLVM spilled the descriptor's whole
-  // size array to an `llvm.alloca` and reloaded one word from it. Beside a
-  // query inside a loop that is a fresh dynamic stack allocation per iteration
-  // (the frame-growth defect the payload boxes had, one order of magnitude
-  // smaller). Why this op instead: its `sizes` result lowers to a static
-  // `extractvalue`, with no index operand whose constness has to survive.
-  mlir::Value dim =
-      mlir::memref::ExtractStridedMetadataOp::create(builder, loc, value)
-          .getSizes()
-          .front();
-  return mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
-                                          dim)
-      .getResult();
-}
 
 mlir::LogicalResult storePayloadWord(mlir::Operation *op,
                                      mlir::OpBuilder &builder,
@@ -507,24 +465,24 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
     return op->emitError()
            << "collection payload element " << concrete->contract
            << " has no physical object handle; materialize it before storing";
-  // A box carries at most kPointerWordCount payload handles. Storing a wider
-  // value used to keep only the leading ones, so the element read back from
-  // the slot silently lost its tail -- and the same width knocked the class
-  // out of the boxed-method dispatch, turning a `__repr__` that plainly
-  // exists into a runtime abort. Reject at the box, the earliest point where
-  // the width is known.
+  // ⭐ A BOX HOLDS ONE ADDRESS, so a value wider than one physical lane can be
+  // stored only if its contract can rebuild the rest from that address. Storing
+  // a wider one used to keep the leading lanes and lose the tail, silently, and
+  // the same width knocked the class out of boxed-method dispatch, turning a
+  // `__repr__` that plainly exists into a runtime abort. Reject at the box, the
+  // earliest point where the width is known.
   //
-  // A UNION is what reaches this now. A class instance is one handle however
-  // many fields it has -- they live in its body -- unless one of them is a
-  // union, whose storage is a tag plus every member's lanes because the members
-  // do not share a width and so cannot share a box.
-  if (concrete->physicalValues().size() > kPayloadValuePointerWords)
+  // A UNION is what reaches this now. A class instance is one lane however many
+  // fields it has -- they live in its body -- unless one of them is a union,
+  // whose storage is a tag plus every member's lanes: the members do not share
+  // an entity, so no single address names them.
+  if (concrete->physicalValues().size() > 1 &&
+      !RuntimeBundleLowerer::laneWordsPrimitiveFor(concrete->contractName()))
     return op->emitError()
            << "a " << concrete->contract << " value expands to "
            << concrete->physicalValues().size()
-           << " physical handles, but a payload box carries at most "
-           << kPayloadValuePointerWords
-           << "; it cannot be stored in a container slot or boxed field yet "
+           << " physical values and nothing can rebuild them from one address; "
+              "it cannot be stored in a container slot or boxed field yet "
               "(a union keeps every member's lanes, and a field holding one "
               "keeps them in its class)";
 
@@ -544,20 +502,15 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
                                        pointerIndex)
           .getResult();
   mlir::Value refcount = constantI64(builder, loc, 1);
-  mlir::Value valueCount = constantI64(
-      builder, loc, static_cast<std::int64_t>(concrete->physicalValues().size()));
   mlir::Value owned = constantI64(builder, loc, ownsPayload ? 1 : 0);
+  // ⛔ THE LANES ARE NOT COPIED IN. They used to be, a pointer and a size word
+  // each, and every reader now rebuilds them from word 2 instead
+  // (`lanesFromBoxEntity`) -- so writing them would be maintaining a second
+  // copy that nothing consults and that a reallocation can falsify.
   llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
   words[0] = refcount;
   words[1] = payloadClass;
-  words[2] = payloadPointer;
-  words[3] = valueCount;
-  for (auto [index, physical] : llvm::enumerate(concrete->physicalValues())) {
-    words[kPayloadValuePointerBase + index] =
-        pointerWordForPhysicalValue(builder, loc, physical, zero);
-    words[kPayloadValueSizeBase + index] =
-        sizeWordForPhysicalValue(builder, loc, physical, zero);
-  }
+  words[box_abi::kEntityWord] = payloadPointer;
   words[kPayloadOwnedFlagSlot] = owned;
   return words;
 }
