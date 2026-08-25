@@ -11409,25 +11409,64 @@ module attributes {
       %target = func.call @__ly_unicode_get(%t_bytes, %t_width, %c0) : (memref<?xi8>, i64, index) -> i64
       %last_pos = arith.subi %end, %one : i64
       %from = arith.select %reverse, %last_pos, %start : i64
-      %walk:2 = scf.while (%i = %from, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
-        %above = arith.cmpi sge, %i, %start : i64
-        %below = arith.cmpi slt, %i, %end : i64
-        %in_range = arith.andi %above, %below : i1
-        %not_yet = arith.cmpi eq, %ans, %minus_one : i64
-        %go = arith.andi %in_range, %not_yet : i1
-        scf.condition(%go) %i, %ans : i64, i64
-      } do {
-      ^bb0(%i: i64, %ans: i64):
-        %i_index = arith.index_cast %i : i64 to index
-        %cp = func.call @__ly_unicode_get(%s_bytes, %s_width, %i_index) : (memref<?xi8>, i64, index) -> i64
-        %hit = arith.cmpi eq, %cp, %target : i64
-        %next_ans = arith.select %hit, %i, %ans : i64
-        %back = arith.subi %i, %one : i64
-        %fwd = arith.addi %i, %one : i64
-        %ni = arith.select %reverse, %back, %fwd : i64
-        scf.yield %ni, %next_ans : i64, i64
+      // ⭐ A LATIN-1 HAYSTACK IS SCANNED AS BYTES, which is what CPython reaches
+      // memchr for. `__ly_unicode_get` is a call and a width branch per
+      // position, and the width does not change inside the loop; taking it out
+      // leaves a byte compare LLVM can vectorize. Every ASCII string is here,
+      // and so is every caller that searches one -- find, split, partition,
+      // replace, count, index.
+      %byte_wide = arith.cmpi eq, %s_width, %one : i64
+      %found = scf.if %byte_wide -> (i64) {
+        %byte_max = arith.constant 255 : i64
+        %unrepresentable = arith.cmpi ugt, %target, %byte_max : i64
+        %scanned = scf.if %unrepresentable -> (i64) {
+          // A code point past latin-1 cannot occur in a latin-1 string.
+          scf.yield %minus_one : i64
+        } else {
+          %target_byte = arith.trunci %target : i64 to i8
+          %bytes_walk:2 = scf.while (%i = %from, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
+            %above = arith.cmpi sge, %i, %start : i64
+            %below = arith.cmpi slt, %i, %end : i64
+            %in_range = arith.andi %above, %below : i1
+            %not_yet = arith.cmpi eq, %ans, %minus_one : i64
+            %go = arith.andi %in_range, %not_yet : i1
+            scf.condition(%go) %i, %ans : i64, i64
+          } do {
+          ^bb0(%i: i64, %ans: i64):
+            %i_index = arith.index_cast %i : i64 to index
+            %b = memref.load %s_bytes[%i_index] : memref<?xi8>
+            %hit = arith.cmpi eq, %b, %target_byte : i8
+            %next_ans = arith.select %hit, %i, %ans : i64
+            %back = arith.subi %i, %one : i64
+            %fwd = arith.addi %i, %one : i64
+            %ni = arith.select %reverse, %back, %fwd : i64
+            scf.yield %ni, %next_ans : i64, i64
+          }
+          scf.yield %bytes_walk#1 : i64
+        }
+        scf.yield %scanned : i64
+      } else {
+        %walk:2 = scf.while (%i = %from, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
+          %above = arith.cmpi sge, %i, %start : i64
+          %below = arith.cmpi slt, %i, %end : i64
+          %in_range = arith.andi %above, %below : i1
+          %not_yet = arith.cmpi eq, %ans, %minus_one : i64
+          %go = arith.andi %in_range, %not_yet : i1
+          scf.condition(%go) %i, %ans : i64, i64
+        } do {
+        ^bb0(%i: i64, %ans: i64):
+          %i_index = arith.index_cast %i : i64 to index
+          %cp = func.call @__ly_unicode_get(%s_bytes, %s_width, %i_index) : (memref<?xi8>, i64, index) -> i64
+          %hit = arith.cmpi eq, %cp, %target : i64
+          %next_ans = arith.select %hit, %i, %ans : i64
+          %back = arith.subi %i, %one : i64
+          %fwd = arith.addi %i, %one : i64
+          %ni = arith.select %reverse, %back, %fwd : i64
+          scf.yield %ni, %next_ans : i64, i64
+        }
+        scf.yield %walk#1 : i64
       }
-      scf.yield %walk#1 : i64
+      scf.yield %found : i64
     } else {
       %limit = arith.subi %end, %n : i64
       %viable = arith.cmpi sle, %start, %limit : i64
@@ -11860,7 +11899,170 @@ module attributes {
   // str.replace via the unified walk (i <= len when old is empty, so the
   // trailing insertion happens; a match consumes old and suppresses the
   // char emit). Pass 1 measures (count, widest); pass 2 writes.
+  // ⭐ THE COMMON SHAPE IS FIND-AND-COPY-RUNS, which is what CPython's
+  // `unicode_replace` does: FASTSEARCH to the next occurrence, memcpy the span
+  // in between. The general path below walks EVERY position, tries a full
+  // substring compare at each, and moves the answer one code point at a time
+  // through `__ly_unicode_get`/`__ly_unicode_put` -- 880 characters replaced
+  // 200,000 times took 0.65 s against CPython's 0.09 s.
+  //
+  // ⛔ LATIN-1 INPUT ONLY, and the reason is the canonical form rather than the
+  // copying. The output's width has to be the smallest that fits it, or two
+  // equal strings can have different bytes and equality stops being bytewise
+  // -- and for a wider input the answer depends on whether the widest character
+  // survived the replacement, which is a scan of the retained runs. A width-1
+  // input cannot narrow, so the answer is `max(1, the replacement's width)`
+  // with nothing to scan. Width 1 is every ASCII and every latin-1 string.
+  //
+  // ⛔ AND AN EMPTY NEEDLE IS NOT THIS SHAPE. `"ab".replace("", "-")` inserts
+  // between characters and at both ends; there is nothing to find and no run to
+  // copy, so it stays on the general path.
   func.func @LyUnicode_Replace(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %old_header: memref<2xi64> {ly.ownership.object_header}, %old_bytes: memref<?xi8>, %new_header: memref<2xi64> {ly.ownership.object_header}, %new_bytes: memref<?xi8>, %limit: i64 {ly.runtime.default_i64 = -1 : i64}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "replace", ly.runtime.result_contract = "builtins.str"} {
+    %one_width = arith.constant 1 : i64
+    %zero_len = arith.constant 0 : i64
+    %in_width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %needle_n = func.call @__ly_unicode_count(%old_header, %old_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %is_latin1 = arith.cmpi eq, %in_width, %one_width : i64
+    %has_needle = arith.cmpi sgt, %needle_n, %zero_len : i64
+    %fast = arith.andi %is_latin1, %has_needle : i1
+    %picked:2 = scf.if %fast -> (memref<2xi64>, memref<?xi8>) {
+      %r:2 = func.call @__ly_unicode_replace_runs(%header, %bytes, %old_header, %old_bytes, %new_header, %new_bytes, %limit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %r:2 = func.call @__ly_unicode_replace_scan(%header, %bytes, %old_header, %old_bytes, %new_header, %new_bytes, %limit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %picked#0, %picked#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // Occurrence-driven replace: count with `__ly_unicode_find_core`, allocate
+  // once, then copy the spans between matches with `__ly_unicode_copy_run`.
+  func.func private @__ly_unicode_replace_runs(%header: memref<2xi64>, %bytes: memref<?xi8>, %old_header: memref<2xi64>, %old_bytes: memref<?xi8>, %new_header: memref<2xi64>, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %false_bit = arith.constant false
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %old_width = func.call @__ly_unicode_width(%old_header) : (memref<2xi64>) -> i64
+    %new_width = func.call @__ly_unicode_width(%new_header) : (memref<2xi64>) -> i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %old_n = func.call @__ly_unicode_count(%old_header, %old_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %new_n = func.call @__ly_unicode_count(%new_header, %new_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %new_n_index = arith.index_cast %new_n : i64 to index
+
+    // ⭐ A SAME-LENGTH REPLACEMENT NEEDS NO COUNTING PASS, which is CPython's
+    // `replace_1char_inplace` generalised: the answer is the receiver with some
+    // spans overwritten, so the length is known, the whole string is copied
+    // once, and the walk poke the replacements in. `"o" -> "0"` over 880
+    // characters is the shape this is for, and it halves the searching.
+    %same_len = arith.cmpi eq, %old_n, %new_n : i64
+    %first = func.call @__ly_unicode_find_core(%bytes, %width, %old_bytes, %old_width, %zero, %len, %old_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+    %matched_any = arith.cmpi sge, %first, %zero : i64
+    %budgeted = arith.cmpi ne, %limit, %zero : i64
+    %will_replace = arith.andi %matched_any, %budgeted : i1
+    %overwrite = arith.andi %will_replace, %same_len : i1
+    %stitched:2 = scf.if %overwrite -> (memref<2xi64>, memref<?xi8>) {
+      %out_width = arith.maxsi %width, %new_width : i64
+      %out_header, %out_bytes = func.call @__ly_unicode_alloc(%len, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %len_index = arith.index_cast %len : i64 to index
+      func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %c0, %bytes, %width, %c0, %len_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+      // The search reads the INPUT, never the half-rewritten output: a
+      // replacement can spell the needle again (`"ab".replace("ab", "ba")`)
+      // and searching what has been written would find it.
+      %poke:2 = scf.while (%i = %first, %rem = %limit) : (i64, i64) -> (i64, i64) {
+        %found = arith.cmpi sge, %i, %zero : i64
+        %budget = arith.cmpi ne, %rem, %zero : i64
+        %go = arith.andi %found, %budget : i1
+        scf.condition(%go) %i, %rem : i64, i64
+      } do {
+      ^bb0(%i: i64, %rem: i64):
+        %at = arith.index_cast %i : i64 to index
+        func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %at, %new_bytes, %new_width, %c0, %new_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+        %after = arith.addi %i, %old_n : i64
+        %next = func.call @__ly_unicode_find_core(%bytes, %width, %old_bytes, %old_width, %after, %len, %old_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+        %spent = arith.subi %rem, %one : i64
+        scf.yield %next, %spent : i64, i64
+      }
+      scf.yield %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+    } else {
+      %r:2 = func.call @__ly_unicode_replace_spans(%header, %bytes, %old_header, %old_bytes, %new_header, %new_bytes, %limit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %stitched#0, %stitched#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // Different-length replacement: count the occurrences, allocate once, then
+  // copy the spans between them.
+  func.func private @__ly_unicode_replace_spans(%header: memref<2xi64>, %bytes: memref<?xi8>, %old_header: memref<2xi64>, %old_bytes: memref<?xi8>, %new_header: memref<2xi64>, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %false_bit = arith.constant false
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %old_width = func.call @__ly_unicode_width(%old_header) : (memref<2xi64>) -> i64
+    %new_width = func.call @__ly_unicode_width(%new_header) : (memref<2xi64>) -> i64
+    %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %old_n = func.call @__ly_unicode_count(%old_header, %old_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %new_n = func.call @__ly_unicode_count(%new_header, %new_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %new_n_index = arith.index_cast %new_n : i64 to index
+
+    %tally:3 = scf.while (%i = %zero, %rem = %limit, %n = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+      %budget = arith.cmpi ne, %rem, %zero : i64
+      %tail = arith.addi %i, %old_n : i64
+      %room = arith.cmpi sle, %tail, %len : i64
+      %go = arith.andi %budget, %room : i1
+      scf.condition(%go) %i, %rem, %n : i64, i64, i64
+    } do {
+    ^bb0(%i: i64, %rem: i64, %n: i64):
+      %hit = func.call @__ly_unicode_find_core(%bytes, %width, %old_bytes, %old_width, %i, %len, %old_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+      %found = arith.cmpi sge, %hit, %zero : i64
+      %after = arith.addi %hit, %old_n : i64
+      // A miss ends the walk by stepping past what the guard admits.
+      %stop = arith.addi %len, %one : i64
+      %next_i = arith.select %found, %after, %stop : i64
+      %bumped = arith.addi %n, %one : i64
+      %next_n = arith.select %found, %bumped, %n : i64
+      %spent = arith.subi %rem, %one : i64
+      %next_rem = arith.select %found, %spent, %rem : i64
+      scf.yield %next_i, %next_rem, %next_n : i64, i64, i64
+    }
+    %none = arith.cmpi eq, %tally#2, %zero : i64
+    %result:2 = scf.if %none -> (memref<2xi64>, memref<?xi8>) {
+      // Nothing matched, so the answer IS the receiver -- the same object with
+      // one more reference, which is `unicode_result_unchanged`.
+      %kept:2 = func.call @__ly_unicode_retain_self(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %kept#0, %kept#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %delta = arith.subi %new_n, %old_n : i64
+      %grown = arith.muli %tally#2, %delta : i64
+      %total = arith.addi %len, %grown : i64
+      %out_width = arith.maxsi %width, %new_width : i64
+      %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %count_index = arith.index_cast %tally#2 : i64 to index
+      %walk:2 = scf.for %k = %c0 to %count_index step %c1 iter_args(%i = %zero, %pos = %c0) -> (i64, index) {
+        %hit = func.call @__ly_unicode_find_core(%bytes, %width, %old_bytes, %old_width, %i, %len, %old_n, %false_bit) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64, i1) -> i64
+        %run = arith.subi %hit, %i : i64
+        %run_index = arith.index_cast %run : i64 to index
+        %from_index = arith.index_cast %i : i64 to index
+        func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %pos, %bytes, %width, %from_index, %run_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+        %after_run = arith.addi %pos, %run_index : index
+        func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %after_run, %new_bytes, %new_width, %c0, %new_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+        %next_pos = arith.addi %after_run, %new_n_index : index
+        %next_i = arith.addi %hit, %old_n : i64
+        scf.yield %next_i, %next_pos : i64, index
+      }
+      %tail_len = arith.subi %len, %walk#0 : i64
+      %tail_index = arith.index_cast %tail_len : i64 to index
+      %tail_from = arith.index_cast %walk#0 : i64 to index
+      func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %walk#1, %bytes, %width, %tail_from, %tail_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+      scf.yield %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_unicode_replace_scan(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %old_header: memref<2xi64> {ly.ownership.object_header}, %old_bytes: memref<?xi8>, %new_header: memref<2xi64> {ly.ownership.object_header}, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64

@@ -34,10 +34,27 @@ namespace lython::driver {
 // default `-jit-opt=0` LLVM inlines nothing it is not told to, so without this
 // the aggregation that made the layout checkable would put a call on every box
 // word. AlwaysInliner runs at every optimisation level.
+//
+// ⭐ AND THE STR COPY HELPERS, for a different reason: they are called PER RUN,
+// and a run is short. `str.replace` moves the spans between matches through
+// `__ly_unicode_copy_run`, which decides on the width and then calls
+// `__ly_unicode_copy_bytes` -- two calls and a branch to move fourteen bytes,
+// where CPython emits a memcpy the compiler can see through. Inlining both puts
+// the width test where the caller's width is a loop invariant, so it is decided
+// once rather than per run.
+//
+// ⛔ NOT A GENERAL "inline the hot manifest functions". Every function marked
+// here is copied into every caller at every optimisation level; these two are
+// ten lines each and are called from loops whose trip count is the run length.
 void markBoxLayoutHelpersAlwaysInline(llvm::Module &module) {
-  for (llvm::Function &function : module)
-    if (function.getName().starts_with("__ly_box_") && !function.isDeclaration())
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration())
+      continue;
+    llvm::StringRef name = function.getName();
+    if (name.starts_with("__ly_box_") || name == "__ly_unicode_copy_run" ||
+        name == "__ly_unicode_copy_bytes")
       function.addFnAttr(llvm::Attribute::AlwaysInline);
+  }
 }
 
 unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
