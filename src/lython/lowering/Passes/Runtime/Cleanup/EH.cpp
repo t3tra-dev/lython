@@ -315,15 +315,132 @@ void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
   builder.CreateResume(landingPad);
 }
 
-llvm::LandingPadInst *createCatchAllLandingPad(llvm::IRBuilder<> &builder,
-                                               llvm::StringRef name) {
+// The Python classes a try's `except` arms test for, read back off the dispatch
+// chain the lowering already built: a run of blocks each holding one
+// `LyEH_CurrentExceptionMatches(<constant class id>)` and branching on it, ending
+// in the re-raise that runs when no arm matched.
+//
+// ⛔ Returns nothing unless the whole chain reads that way. The clause list this
+// feeds is what the personality uses to decide the frame is NOT entered -- a
+// list missing one class is an exception flying past a handler that would have
+// caught it. A pad with no list is a catch-all, which is what every pad used to
+// be: slower, never wrong.
+// The markers this pass erases before it returns. They are in the blocks the
+// walk below reads, and they are not there afterwards.
+bool isErasedTryMarker(const llvm::Instruction &instruction) {
+  const auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+  if (!call || !call->getCalledFunction())
+    return false;
+  llvm::StringRef name = call->getCalledFunction()->getName();
+  return name == "LyEH_TryCatchMarker" || name == "LyEH_TryCallSiteMarker" ||
+         name == "LyEH_TryCatchAnchor";
+}
+
+// The only instructions a block may hold and still count as "does nothing for
+// an exception it does not name".
+bool holdsOnly(llvm::BasicBlock &block,
+               llvm::ArrayRef<const llvm::Instruction *> allowed) {
+  for (llvm::Instruction &instruction : block) {
+    if (instruction.isDebugOrPseudoInst() || isErasedTryMarker(instruction))
+      continue;
+    if (!llvm::is_contained(allowed, &instruction))
+      return false;
+  }
+  return true;
+}
+
+std::optional<llvm::SmallVector<std::int64_t, 4>>
+handledClassIds(llvm::BasicBlock *dispatch) {
+  llvm::SmallVector<std::int64_t, 4> ids;
+  llvm::SmallPtrSet<llvm::BasicBlock *, 8> seen;
+  llvm::BasicBlock *block = dispatch;
+  while (block && seen.insert(block).second) {
+    auto *branch = llvm::dyn_cast<llvm::BranchInst>(block->getTerminator());
+    // The pad lands on a forwarding block; following it is following control
+    // flow, not assuming anything about what runs.
+    if (branch && branch->isUnconditional() && holdsOnly(*block, {branch})) {
+      block = branch->getSuccessor(0);
+      continue;
+    }
+    if (branch && branch->isConditional()) {
+      auto *test = llvm::dyn_cast<llvm::CallInst>(branch->getCondition());
+      if (!test || !isRuntimeMarkerCall(*test, "LyEH_CurrentExceptionMatches") ||
+          test->getParent() != block)
+        return std::nullopt;
+      // ⛔ And NOTHING ELSE in the block. A generator's resume step marks itself
+      // dead here before testing the arms, and that store has to happen for
+      // every exception, not only the ones the arms name -- a frame with work
+      // in front of its dispatch is a frame that must be entered.
+      if (!holdsOnly(*block, {test, branch}))
+        return std::nullopt;
+      auto *classId = llvm::dyn_cast<llvm::ConstantInt>(test->getArgOperand(0));
+      if (!classId)
+        return std::nullopt;
+      ids.push_back(classId->getSExtValue());
+      block = branch->getSuccessor(1);
+      continue;
+    }
+    // The end of the chain: nothing matched, so the exception carries straight
+    // on. Re-raising FIRST is what proves the frame does nothing for an
+    // exception outside the list -- a `finally` puts its body here instead, and
+    // that frame really is entered for everything, so it stays a catch-all.
+    llvm::Instruction *tail = nullptr;
+    for (llvm::Instruction &instruction : *block)
+      if (!instruction.isDebugOrPseudoInst() && !isErasedTryMarker(instruction)) {
+        tail = &instruction;
+        break;
+      }
+    auto *rethrow = llvm::dyn_cast_or_null<llvm::CallBase>(tail);
+    if (rethrow && rethrow->getCalledFunction() &&
+        rethrow->getCalledFunction()->getName() == "LyEH_RethrowCurrent")
+      return ids.empty() ? std::nullopt : std::optional(ids);
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// One global per class id, holding the id in its first word. The type table
+// entries in the LSDA point at these, and the personality loads the word.
+llvm::Constant *exceptionTypeGlobal(llvm::Module &module, std::int64_t classId) {
+  std::string name = ("__ly_exc_type_" + llvm::Twine(classId)).str();
+  if (llvm::GlobalVariable *existing = module.getNamedGlobal(name))
+    return existing;
+  llvm::Type *word = llvm::Type::getInt64Ty(module.getContext());
+  auto *global = new llvm::GlobalVariable(
+      module, word, /*isConstant=*/true, llvm::GlobalValue::InternalLinkage,
+      llvm::ConstantInt::get(word, classId), name);
+  global->setAlignment(llvm::Align(8));
+  return global;
+}
+
+// The pad for a try's catch dispatch. Naming the classes lets the personality
+// answer during the SEARCH phase, which is what keeps a frame that does not
+// handle this exception from being entered at all.
+//
+// ⛔ Such a pad is ALSO a cleanup, and that is not optional. A Python frame puts
+// itself in the traceback by being entered; a frame skipped for not handling the
+// exception would vanish from what the program prints, which is a wrong answer
+// rather than a slow one. The cleanup entry brings it back in the second phase,
+// where the selector tells the two apart.
+llvm::LandingPadInst *createCatchLandingPad(llvm::IRBuilder<> &builder,
+                                            llvm::StringRef name,
+                                            llvm::BasicBlock *dispatch) {
   llvm::LLVMContext &context = builder.getContext();
   llvm::StructType *landingPadType = llvm::StructType::get(
       llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
+  std::optional<llvm::SmallVector<std::int64_t, 4>> ids =
+      handledClassIds(dispatch);
   llvm::LandingPadInst *landingPad =
-      builder.CreateLandingPad(landingPadType, 1, name);
-  landingPad->addClause(
-      llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(context)));
+      builder.CreateLandingPad(landingPadType, ids ? ids->size() : 1, name);
+  if (!ids) {
+    landingPad->addClause(
+        llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(context)));
+    return landingPad;
+  }
+  llvm::Module &module = *builder.GetInsertBlock()->getModule();
+  for (std::int64_t classId : *ids)
+    landingPad->addClause(exceptionTypeGlobal(module, classId));
+  landingPad->setCleanup(true);
   return landingPad;
 }
 
@@ -338,14 +455,36 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
       llvm::BasicBlock::Create(context, "py.try.catch", function, catchDest);
   llvm::IRBuilder<> builder(landing);
   llvm::LandingPadInst *landingPad =
-      createCatchAllLandingPad(builder, "py.catch.lpad");
+      createCatchLandingPad(builder, "py.catch.lpad", catchDest);
   llvm::Value *exceptionObject =
       builder.CreateExtractValue(landingPad, {0}, "py.catch.exception");
-  builder.CreateCall(beginPythonCatch(*module), {exceptionObject});
   // Same rule as the cleanup pads: raise primitives already recorded their
   // raise-site frame during MLIR lowering.
-  if (!isPythonRuntimeRaiseCall(call.getCalledFunction()) &&
-      !isGeneratorInternalEdge(call))
+  bool recordsFrame = !isPythonRuntimeRaiseCall(call.getCalledFunction()) &&
+                      !isGeneratorInternalEdge(call);
+
+  if (landingPad->isCleanup()) {
+    llvm::BasicBlock *passing = llvm::BasicBlock::Create(
+        context, "py.try.passing", function, catchDest);
+    llvm::BasicBlock *handling = llvm::BasicBlock::Create(
+        context, "py.try.handling", function, catchDest);
+    llvm::Value *selector =
+        builder.CreateExtractValue(landingPad, {1}, "py.catch.selector");
+    builder.CreateCondBr(
+        builder.CreateICmpEQ(selector,
+                             llvm::ConstantInt::get(selector->getType(), 0)),
+        passing, handling);
+
+    builder.SetInsertPoint(passing);
+    if (recordsFrame)
+      emitTracebackPush(builder, *module, site, debugLoc);
+    builder.CreateResume(landingPad);
+
+    builder.SetInsertPoint(handling);
+  }
+
+  builder.CreateCall(beginPythonCatch(*module), {exceptionObject});
+  if (recordsFrame)
     emitTracebackPush(builder, *module, site, debugLoc);
   builder.CreateBr(catchDest);
   return landing;

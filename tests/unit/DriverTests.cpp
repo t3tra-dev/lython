@@ -1121,11 +1121,10 @@ TEST(DriverTest, RepeatedCompileIsStable) {
 
 } // namespace
 
-// Every landing pad is a pure cleanup or a catch-ALL, and the personality that
-// reads them counts on it: `LyEH_Personality` decides "this frame catches" from
-// the presence of an action record alone and never looks at a type table, so a
-// clause naming a type would be silently treated as if it named everything.
-TEST(DriverTest, EveryLandingPadIsCleanupOrCatchAll) {
+// Every landing pad is a pure cleanup, a catch-ALL, or a list of Python class
+// ids -- and `LyEH_Personality` reads it as exactly that. A clause naming
+// anything else would be dereferenced as if its first word were a class id.
+TEST(DriverTest, EveryLandingPadClauseIsAPythonClassOrCatchAll) {
   CompileResult result = compileSource("def boom() -> int:\n"
                                        "    raise ValueError('x')\n"
                                        "\n"
@@ -1136,14 +1135,13 @@ TEST(DriverTest, EveryLandingPadIsCleanupOrCatchAll) {
                                        "        return 1\n"
                                        "    except KeyError:\n"
                                        "        return 2\n"
-                                       "    finally:\n"
-                                       "        print('done')\n"
                                        "\n"
                                        "print(run())\n");
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   ASSERT_TRUE(result.verified.llvmModule);
 
   unsigned pads = 0;
+  llvm::SmallVector<std::string, 4> named;
   for (llvm::Function &function : *result.verified.llvmModule)
     for (llvm::BasicBlock &block : function) {
       auto *pad = block.getLandingPadInst();
@@ -1158,13 +1156,104 @@ TEST(DriverTest, EveryLandingPadIsCleanupOrCatchAll) {
             << "a filter clause (an exception specification) in "
             << function.getName().str()
             << ": LyEH_Personality has no path for one";
-        EXPECT_TRUE(pad->getClause(index)->isNullValue())
-            << "a typed catch clause in " << function.getName().str()
-            << ": LyEH_Personality reads no type table, so this would catch "
-               "everything";
+        llvm::Constant *clause = pad->getClause(index);
+        if (clause->isNullValue())
+          continue;
+        auto *global = llvm::dyn_cast<llvm::GlobalVariable>(clause);
+        ASSERT_NE(global, nullptr) << "a clause that is not a global";
+        EXPECT_TRUE(global->getName().starts_with("__ly_exc_type_"))
+            << global->getName().str()
+            << " is not a Python class id record, and the personality would "
+               "read its first word as one";
+        named.push_back(global->getName().str());
       }
     }
   EXPECT_GT(pads, 0u) << "the program above must produce landing pads at all";
+  EXPECT_FALSE(named.empty())
+      << "two named except arms and no finally must reach the type table";
+}
+
+// ⛔ The clause list is what lets the personality decide a frame is NOT entered,
+// so every shape whose handled set is not exactly the list must stay a
+// catch-all. `except*` matches an ExceptionGroup CONTAINING the named class
+// rather than the class; a `finally` runs its body for every exception, so that
+// frame really is entered by all of them.
+TEST(DriverTest, ShapesThatHandleMoreThanTheyNameStayCatchAll) {
+  for (llvm::StringRef program :
+       {"try:\n    raise ValueError('x')\nexcept* ValueError as e:\n"
+        "    print(e)\n",
+        "def run() -> int:\n    try:\n        raise ValueError('x')\n"
+        "    except ValueError:\n        return 1\n    finally:\n"
+        "        print('d')\n\nprint(run())\n"}) {
+    CompileResult result = compileSource(program);
+    ASSERT_TRUE(result.succeeded) << result.diagnostics;
+    for (llvm::Function &function : *result.verified.llvmModule)
+      for (llvm::BasicBlock &block : function) {
+        auto *pad = block.getLandingPadInst();
+        if (!pad)
+          continue;
+        for (unsigned index = 0; index < pad->getNumClauses(); ++index)
+          EXPECT_TRUE(pad->getClause(index)->isNullValue())
+              << "a typed clause under:\n" << program.str();
+      }
+  }
+}
+
+// A bare `except` DOES get a clause, and it is BaseException -- which is not an
+// exception to the rule above but the reason there is no exception to make:
+// `LyEH_ClassIdMatches` answers true for everything against it, so naming it is
+// the same decision a catch-all makes, reached one call earlier.
+TEST(DriverTest, ABareExceptNamesBaseException) {
+  CompileResult result = compileSource("def boom() -> int:\n"
+                                       "    raise ValueError('x')\n"
+                                       "\n"
+                                       "try:\n"
+                                       "    boom()\n"
+                                       "except:\n"
+                                       "    print('any')\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  unsigned typedClauses = 0;
+  for (llvm::Function &function : *result.verified.llvmModule)
+    for (llvm::BasicBlock &block : function) {
+      auto *pad = block.getLandingPadInst();
+      if (!pad)
+        continue;
+      for (unsigned index = 0; index < pad->getNumClauses(); ++index) {
+        llvm::Constant *clause = pad->getClause(index);
+        if (clause->isNullValue())
+          continue;
+        ++typedClauses;
+        EXPECT_EQ(clause->getName(), "__ly_exc_type_5")
+            << "a bare except that names anything narrower than BaseException "
+               "drops the exceptions it does not name";
+      }
+    }
+  EXPECT_GT(typedClauses, 0u);
+}
+
+// A tuple of classes is one arm, and every class in it has to reach the table:
+// the one left out is an exception the personality walks past.
+TEST(DriverTest, EveryClassOfATupleArmReachesTheTypeTable) {
+  CompileResult result = compileSource("def boom() -> int:\n"
+                                       "    raise KeyError('x')\n"
+                                       "\n"
+                                       "try:\n"
+                                       "    boom()\n"
+                                       "except (ValueError, KeyError):\n"
+                                       "    print('caught')\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  unsigned typedClauses = 0;
+  for (llvm::Function &function : *result.verified.llvmModule)
+    for (llvm::BasicBlock &block : function) {
+      auto *pad = block.getLandingPadInst();
+      if (!pad)
+        continue;
+      for (unsigned index = 0; index < pad->getNumClauses(); ++index)
+        if (!pad->getClause(index)->isNullValue())
+          ++typedClauses;
+    }
+  EXPECT_EQ(typedClauses, 2u)
+      << "both arms of the tuple must be clauses, or neither";
 }
 
 // The personality is chosen from the target, in one place, and both sides ask
