@@ -100,6 +100,13 @@ bool installPythonExceptionCleanupFrames(
     llvm::ArrayRef<PythonCallSiteRange> callSites);
 void installArmStreamingCompatibleMemoryRoutines(llvm::Module &module);
 
+// The foreign symbols ctypes declared: the only declarations in a compiled
+// program that are neither ours nor the C library's.
+void collectCtypesForeignSymbols(mlir::ModuleOp module,
+                                 llvm::SmallVectorImpl<std::string> &symbols);
+void markCLibraryDeclarationsNonUnwinding(
+    llvm::Module &module, llvm::ArrayRef<std::string> foreignSymbols);
+
 namespace optimizer::pipeline {
 void finalLLVMCleanup(mlir::ModuleOp module);
 } // namespace optimizer::pipeline

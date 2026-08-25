@@ -31,6 +31,8 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     collectLLVMSafetyContracts(module, safetyProfile);
   llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
   py::collectPythonCallSiteRanges(module, pythonCallSites);
+  llvm::SmallVector<std::string, 4> ctypesSymbols;
+  py::collectCtypesForeignSymbols(module, ctypesSymbols);
   attachPythonDebugInfo(module);
 
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
@@ -40,6 +42,7 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     return failure();
   }
   dumpLLVMForPass(irDump, "pre-eh-llvm", *llvmModule);
+  py::markCLibraryDeclarationsNonUnwinding(*llvmModule, ctypesSymbols);
   py::installPythonExceptionCleanupFrames(
       *llvmModule, codeGenTripleForTarget(py::TensorLoweringTarget{}, options),
       pythonCallSites);

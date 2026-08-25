@@ -2,10 +2,13 @@
 #include "Common/RuntimeSupport.h"
 #include "Common/UnwindABI.h"
 
+#include "Native.h"
+
 #include "Ownership.h"
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
@@ -593,6 +596,57 @@ bool convertCallToPythonTryInvoke(
 }
 
 } // namespace
+
+// ⭐ A C FUNCTION DOES NOT UNWIND, AND SAYING SO IS WHAT SHRINKS THE LSDA.
+// Without it LLVM has to assume `puts` might throw, so anything calling it
+// might throw, so every call to that is an invoke with a landing pad and a
+// call-site entry. Half the landing pads in a program were this:
+// `__gcc_except_tab` 1468 bytes -> 732.
+//
+// The libc declarations LLVM already recognises get this from
+// `InferFunctionAttrs`; the ones it does not are the ones whose prototype here
+// differs from the header's (`void puts(ptr)`, `i32 getentropy(ptr, i64)`),
+// which is most of the OS cluster.
+//
+// ⛔ IT IS NOT A SPEEDUP, AND HERE IS WHERE THE TIME ACTUALLY IS. The
+// personality reads the call-site table linearly, so a raise costs the entries
+// BEFORE it: 0/10/40/80 statements in front of a `try` measure 1598/1698/2052/
+// 2442 ns per raise -- 10.6 ns per preceding call site, dead straight. The
+// calls this removes are the ones that cannot raise, and those were never the
+// ones in front of a `try` in a loop: the 40 `str(i) + 'a'` in that measurement
+// call `LyUnicode_FromBytes`, which really can raise, so the prefix is
+// unchanged and so is the time (2045 ns -> 2061). Shortening the table is not
+// the lever; not scanning it twice per frame would be.
+//
+// ⛔ NOT the `Ly*` declarations, which is the whole point of them, and not the
+// ctypes symbols, which may be anything a program dlopens -- including C++ that
+// really does unwind. `_Unwind_RaiseException` is the loudest counterexample of
+// all: marking it would delete the raise's own unwind edge.
+void markCLibraryDeclarationsNonUnwinding(
+    llvm::Module &module, llvm::ArrayRef<std::string> foreignSymbols) {
+  llvm::StringSet<> foreign;
+  for (const std::string &symbol : foreignSymbols)
+    foreign.insert(symbol);
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration() || function.isIntrinsic())
+      continue;
+    llvm::StringRef name = function.getName();
+    if (name.starts_with("Ly") || name.starts_with("__ly") ||
+        name.starts_with("_Unwind") || name.starts_with("__gxx_personality") ||
+        foreign.contains(name))
+      continue;
+    function.setDoesNotThrow();
+  }
+}
+
+void collectCtypesForeignSymbols(mlir::ModuleOp module,
+                                 llvm::SmallVectorImpl<std::string> &symbols) {
+  module.walk([&](mlir::func::FuncOp function) {
+    if (auto symbol = function->getAttrOfType<mlir::StringAttr>(
+            py::native::kNativeSymbolAttr))
+      symbols.push_back(symbol.getValue().str());
+  });
+}
 
 void collectPythonCallSiteRanges(
     mlir::ModuleOp module,
