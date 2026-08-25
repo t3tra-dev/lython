@@ -268,7 +268,96 @@ module attributes {
   // (0 = upper, 1 = lower with the Final_Sigma rule, 2 = casefold). Pass 1
   // measures the mapped length and the widest mapped code point so the
   // output re-canonicalizes to the smallest fitting width.
+  // Is every byte of a latin-1 buffer below 0x80? The ASCII case mapping is a
+  // conditional +/-32 and nothing else, so this is the whole test that lets the
+  // UCD tables stay unread.
+  func.func private @__ly_unicode_all_ascii(%bytes: memref<?xi8>, %n: index) -> i1 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true_bit = arith.constant true
+    %high_bit = arith.constant -128 : i8
+    %zero_i8 = arith.constant 0 : i8
+    %clean = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %true_bit) -> (i1) {
+      %b = memref.load %bytes[%i] : memref<?xi8>
+      %masked = arith.andi %b, %high_bit : i8
+      %plain = arith.cmpi eq, %masked, %zero_i8 : i8
+      %next = arith.andi %acc, %plain : i1
+      scf.yield %next : i1
+    }
+    func.return %clean : i1
+  }
+
+  // ⭐ CPython's `ascii_upper_or_lower`. ASCII case mapping is one-to-one, never
+  // widens, and needs no table: 'a'..'z' and 'A'..'Z' differ by one bit and
+  // everything else is itself. `casefold` is `lower` here -- the two differ only
+  // where the UCD says so, and it says so nowhere below 0x80.
+  func.func private @__ly_unicode_ascii_case(%bytes: memref<?xi8>, %n: index, %to_upper: i1) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %one = arith.constant 1 : i64
+    %n_i64 = arith.index_cast %n : index to i64
+    %out_header, %out_bytes = func.call @__ly_unicode_alloc(%n_i64, %one) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %lower_a = arith.constant 97 : i8
+    %lower_z = arith.constant 122 : i8
+    %upper_a = arith.constant 65 : i8
+    %upper_z = arith.constant 90 : i8
+    %case_bit = arith.constant 32 : i8
+    scf.for %i = %c0 to %n step %c1 {
+      %b = memref.load %bytes[%i] : memref<?xi8>
+      %ge_lower = arith.cmpi uge, %b, %lower_a : i8
+      %le_lower = arith.cmpi ule, %b, %lower_z : i8
+      %is_lower = arith.andi %ge_lower, %le_lower : i1
+      %ge_upper = arith.cmpi uge, %b, %upper_a : i8
+      %le_upper = arith.cmpi ule, %b, %upper_z : i8
+      %is_upper = arith.andi %ge_upper, %le_upper : i1
+      %raised = arith.subi %b, %case_bit : i8
+      %dropped = arith.addi %b, %case_bit : i8
+      %as_upper = arith.select %is_lower, %raised, %b : i8
+      %as_lower = arith.select %is_upper, %dropped, %b : i8
+      %mapped = arith.select %to_upper, %as_upper, %as_lower : i8
+      memref.store %mapped, %out_bytes[%i] : memref<?xi8>
+    }
+    func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
   func.func private @__ly_unicode_case_transform(%header: memref<2xi64>, %bytes: memref<?xi8>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %sigma = arith.constant 931 : i64
+    %small_sigma = arith.constant 963 : i64
+    %final_sigma = arith.constant 962 : i64
+    %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
+    %count = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %is_lower_mode = arith.cmpi eq, %which, %one : i64
+
+    // ⛔ THE TEST IS ASCII AND NOT LATIN-1, because the upper half of latin-1
+    // does not case-map inside itself: U+00FF maps to U+0178, which is UCS-2,
+    // so the result would widen and the +/-32 rule would be wrong twice over.
+    %byte_wide = arith.cmpi eq, %width, %one : i64
+    %ascii_only = scf.if %byte_wide -> (i1) {
+      %plain = func.call @__ly_unicode_all_ascii(%bytes, %count_index) : (memref<?xi8>, index) -> i1
+      scf.yield %plain : i1
+    } else {
+      %false_bit = arith.constant false
+      scf.yield %false_bit : i1
+    }
+    %fast:2 = scf.if %ascii_only -> (memref<2xi64>, memref<?xi8>) {
+      %upper_mode = arith.cmpi eq, %which, %zero : i64
+      %r:2 = func.call @__ly_unicode_ascii_case(%bytes, %count_index, %upper_mode) : (memref<?xi8>, index, i1) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %r:2 = func.call @__ly_unicode_case_transform_ucd(%header, %bytes, %which) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %fast#0, %fast#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // The general path: two walks over the UCD case tables, one to size the
+  // result and pick its width and one to write it.
+  func.func private @__ly_unicode_case_transform_ucd(%header: memref<2xi64>, %bytes: memref<?xi8>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
