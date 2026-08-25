@@ -2906,176 +2906,94 @@ void buildEHReadField(SupportBuilder &b) {
       mlir::ValueRange{done->getArgument(0), done->getArgument(1)});
 }
 
-// ⭐ THE TYPE TABLE HOLDS PYTHON CLASS IDS, NOT C++ RTTI. A landing pad's
-// clauses name the exception classes its `except` arms test for, as globals
-// whose first word is the class id, so the SEARCH phase can answer "does this
-// frame handle this exception" -- which is the question that decides whether
-// the frame is entered at all.
+mlir::FunctionType personalityFunctionType(SupportBuilder &b) {
+  return b.builder.getFunctionType(
+      {b.i32(), b.i32(), b.i64(), b.ptr(), b.ptr()}, {b.i32()});
+}
+
+// Where a return address lands in a function's LSDA: the landing pad's address
+// (0 when the range has none), the action the call site names, and the two
+// table bases an action walk needs.
 //
-// It used to be unanswerable. Every pad was a catch-ALL, so an `except KeyError`
-// stopped a ValueError, ran its dispatch chain, found no arm, and re-raised --
-// a second full two-phase unwind per handler that did not match. Measured with
-// one such frame in between: 2.67 us to reach the real handler, 5.95 us with
-// the frame that does not handle it. That difference is a whole raise.
+// ⭐ SHARED, NOT COPIED. The personality answers this for the Itanium unwinder
+// and the fast walk answers it for itself, and the two must reach the same
+// landing pad or a raise means one thing in one phase and another in the next.
+// They agree by CALLING THIS.
 //
-// `__gxx_personality_v0` could not have been given this: a Python class match is
-// `LyEH_ClassIdMatches` walking an MRO, not a `std::type_info::can_catch`, so
-// the predicate has to be ours even though the table format is not.
-//
-// ⭐ AND THE LOOKUP IS REMEMBERED IN THE CARRIER. The call-site table is read
-// linearly, so a raise pays for the entries in front of it -- 10.6 ns each,
-// per frame, per phase, measured dead straight from 0 to 80 statements before a
-// `try`. The answer depends on nothing but the return address, so it is kept in
-// a direct-mapped table inside the exception carrier: the cleanup phase reads
-// back what the search phase found, and a carrier handed back by a catch keeps
-// the table for the next raise.
-//
-// ⛔ In the CARRIER rather than a global, and this is the whole reason it can be
-// a plain load: a carrier belongs to one in-flight exception, so no second
-// thread can be writing the slot this one is reading. A global would need to be
-// thread-local, which on Darwin is a call per access.
-//
-// ⛔ It refuses rather than guesses. An LSDA whose landing pads are relative to
-// something other than the function start, whose call sites are in an encoding
-// LLVM has never emitted for a DWARF target, or whose type table is not
-// indirect-pcrel-sdata4, aborts -- and so does a negative type index, which is a
-// C++ exception specification and cannot appear here. A personality that
-// returns the wrong landing pad resumes the program at an address of its own
-// invention, which is the one failure this compiler will not risk.
-void buildPythonPersonality(SupportBuilder &b) {
-  EHDataRegisters regs = ehDataRegisters(b.triple);
+// `memo` is a slot in the carrier's table, or null when the carrier is not ours
+// -- the call-site table is read linearly, so what was found for a return
+// address is worth keeping, and the answer depends on nothing else.
+void buildEHLookupSite(SupportBuilder &b) {
   auto fn = b.beginFunction(
-      kPythonPersonalityName,
-      b.builder.getFunctionType({b.i32(), b.i32(), b.i64(), b.ptr(), b.ptr()},
-                                {b.i32()}));
+      "ly_eh_lookup_site",
+      b.builder.getFunctionType({b.i64(), b.ptr(), b.i64(), b.ptr(), b.ptr()},
+                                {b.i1()}),
+      /*isPrivate=*/true);
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
-  mlir::Block *lookUp = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
-  mlir::Block *readLSDA = b.builder.createBlock(&body);
-  mlir::Block *haveLSDA = b.builder.createBlock(&body);
   mlir::Block *readTypeTableBase =
       b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
   mlir::Block *typeTableKnown =
       b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
   mlir::Block *stepOverTypeTableBase =
       b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
-  // (call-site encoding byte, type table base)
   mlir::Block *readHeader =
       b.builder.createBlock(&body, {}, {b.ptr(), b.ptr()}, {b.loc, b.loc});
   mlir::Block *scan = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
   mlir::Block *readSite = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
-  // (landing pad ADDRESS or 0, action, action table start, type table base)
   mlir::Block *remember = b.builder.createBlock(
       &body, {}, {b.i64(), b.i64(), b.ptr(), b.ptr()},
       {b.loc, b.loc, b.loc, b.loc});
-  mlir::Block *decide = b.builder.createBlock(
+  mlir::Block *writeMemo = b.builder.createBlock(&body);
+  mlir::Block *report = b.builder.createBlock(
       &body, {}, {b.i64(), b.i64(), b.ptr(), b.ptr()},
       {b.loc, b.loc, b.loc, b.loc});
-  mlir::Block *havePad = b.builder.createBlock(
-      &body, {}, {b.i64(), b.i64(), b.ptr(), b.ptr()},
-      {b.loc, b.loc, b.loc, b.loc});
-  mlir::Block *searchPhase = b.builder.createBlock(
-      &body, {}, {b.i64(), b.ptr(), b.ptr()}, {b.loc, b.loc, b.loc});
-  mlir::Block *readClauses = b.builder.createBlock(
-      &body, {}, {b.i64(), b.ptr(), b.ptr()}, {b.loc, b.loc, b.loc});
-  mlir::Block *walkActions = b.builder.createBlock(
-      &body, {}, {b.ptr(), b.i64(), b.ptr()}, {b.loc, b.loc, b.loc});
-  mlir::Block *notCleanupEntry = b.builder.createBlock(
-      &body, {}, {b.i64(), b.ptr(), b.i64(), b.ptr()},
-      {b.loc, b.loc, b.loc, b.loc});
-  mlir::Block *typedClause = b.builder.createBlock(
-      &body, {}, {b.i64(), b.ptr(), b.i64(), b.ptr()},
-      {b.loc, b.loc, b.loc, b.loc});
-  mlir::Block *decodeType = b.builder.createBlock(
-      &body, {}, {b.ptr(), b.i64(), b.ptr(), b.ptr()},
-      {b.loc, b.loc, b.loc, b.loc});
-  mlir::Block *nextAction = b.builder.createBlock(
-      &body, {}, {b.ptr(), b.i64(), b.ptr()}, {b.loc, b.loc, b.loc});
-  mlir::Block *handlerHere = b.builder.createBlock(&body);
-  mlir::Block *cleanupPhase = b.builder.createBlock(
-      &body, {}, {b.i64(), b.i64(), b.ptr()}, {b.loc, b.loc, b.loc});
-  mlir::Block *notTheHandler = b.builder.createBlock(
-      &body, {}, {b.i64(), b.i64(), b.ptr()}, {b.loc, b.loc, b.loc});
-  mlir::Block *seekCleanupEntry =
-      b.builder.createBlock(&body, {}, {b.i64(), b.ptr()}, {b.loc, b.loc});
-  mlir::Block *seekNext =
-      b.builder.createBlock(&body, {}, {b.i64(), b.ptr()}, {b.loc, b.loc});
-  mlir::Block *install =
-      b.builder.createBlock(&body, {}, {b.i64(), b.i64()}, {b.loc, b.loc});
-  mlir::Block *keepWalking = b.builder.createBlock(&body);
+  mlir::Block *nothing = b.builder.createBlock(&body);
   mlir::Block *refuse = b.builder.createBlock(&body);
 
-  // _URC_CONTINUE_UNWIND / _URC_HANDLER_FOUND
-  b.builder.setInsertionPointToEnd(keepWalking);
+  b.builder.setInsertionPointToEnd(nothing);
   mlir::func::ReturnOp::create(b.builder, b.loc,
-                               mlir::ValueRange{b.iconst32(8)});
-  b.builder.setInsertionPointToEnd(handlerHere);
-  mlir::func::ReturnOp::create(b.builder, b.loc,
-                               mlir::ValueRange{b.iconst32(6)});
+                               mlir::ValueRange{b.iconst1(false)});
   b.builder.setInsertionPointToEnd(refuse);
-  b.emitTrap(b.i32());
+  b.emitTrap(b.i1());
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value actions = mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
-                                                   entry->getArgument(1));
-  mlir::Value carrierClass = entry->getArgument(2);
-  mlir::Value carrier = entry->getArgument(3);
-  mlir::Value context = entry->getArgument(4);
-  // The unwinder reports the RETURN address; the call that may transfer to a
-  // pad here is the byte before it, and that byte is what the memo is keyed on.
-  mlir::Value site = mlir::arith::SubIOp::create(
-      b.builder, b.loc,
-      b.call("_Unwind_GetIP", b.i64(), mlir::ValueRange{context}).front(),
-      b.iconst(1));
-  mlir::Value ours = b.cmpi(mlir::arith::CmpIPredicate::eq, carrierClass,
-                            b.iconst(static_cast<std::int64_t>(
-                                kLythonExceptionClass)));
-  mlir::Value slot = b.gepI8(
-      carrier,
-      mlir::arith::AddIOp::create(
-          b.builder, b.loc, b.iconst(eh_carrier::kMemoOffset),
-          mlir::arith::MulIOp::create(
-              b.builder, b.loc,
-              mlir::arith::AndIOp::create(
-                  b.builder, b.loc,
-                  mlir::arith::ShRUIOp::create(b.builder, b.loc, site,
-                                               b.iconst(2)),
-                  b.iconst(eh_carrier::kMemoEntries - 1)),
-              b.iconst(eh_carrier::kMemoEntryBytes))));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, ours, lookUp,
-                                 mlir::ValueRange{slot}, readLSDA,
+  mlir::Value site = entry->getArgument(0);
+  mlir::Value lsda = entry->getArgument(1);
+  mlir::Value regionStart = entry->getArgument(2);
+  mlir::Value memo = entry->getArgument(3);
+  mlir::Value out = entry->getArgument(4);
+  mlir::Block *checkMemo = b.builder.createBlock(&body);
+  mlir::Block *scanFresh = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value hasMemo = b.ptrNe(memo, b.nullPtr());
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, b.ptrEq(lsda, b.nullPtr()),
+                                 nothing, mlir::ValueRange{}, checkMemo,
                                  mlir::ValueRange{});
-
-  b.builder.setInsertionPointToEnd(lookUp);
-  mlir::Value memo = lookUp->getArgument(0);
-  mlir::Value remembered = b.loadI64(memo);
-  auto memoField = [&](std::int64_t index) {
-    return b.gepI8(memo, b.iconst(index * 8));
-  };
+  b.builder.setInsertionPointToEnd(checkMemo);
+  mlir::Block *readMemo = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(checkMemo);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, hasMemo, readMemo,
+                                 mlir::ValueRange{}, scanFresh,
+                                 mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(readMemo);
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, remembered, site), decide,
-      mlir::ValueRange{b.loadI64(memoField(1)), b.loadI64(memoField(2)),
-                       b.loadPtrVal(memoField(3)), b.loadPtrVal(memoField(4))},
-      readLSDA, mlir::ValueRange{});
+      b.cmpi(mlir::arith::CmpIPredicate::eq, b.loadI64(memo), site), report,
+      mlir::ValueRange{b.loadI64(b.gepI8(memo, b.iconst(8))),
+                       b.loadI64(b.gepI8(memo, b.iconst(16))),
+                       b.loadPtrVal(b.gepI8(memo, b.iconst(24))),
+                       b.loadPtrVal(b.gepI8(memo, b.iconst(32)))},
+      scanFresh, mlir::ValueRange{});
 
-  b.builder.setInsertionPointToEnd(readLSDA);
-  mlir::Value lsda = b.call("_Unwind_GetLanguageSpecificData", b.ptr(),
-                            mlir::ValueRange{context})
-                         .front();
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, b.ptrEq(lsda, b.nullPtr()),
-                                 keepWalking, mlir::ValueRange{}, haveLSDA,
-                                 mlir::ValueRange{});
-
-  b.builder.setInsertionPointToEnd(haveLSDA);
+  b.builder.setInsertionPointToEnd(scanFresh);
   // DW_EH_PE_omit: landing pads are relative to the function start, the only
   // form LLVM emits for a DWARF target.
-  mlir::Value lpOmitted = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                 b.loadI8(lsda), b.iconst8(-1));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, lpOmitted,
-                                 readTypeTableBase,
-                                 mlir::ValueRange{b.gepI8(lsda, b.iconst(1))},
-                                 refuse, mlir::ValueRange{});
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, b.loadI8(lsda), b.iconst8(-1)),
+      readTypeTableBase, mlir::ValueRange{b.gepI8(lsda, b.iconst(1))}, refuse,
+      mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(readTypeTableBase);
   mlir::Value typeEncodingAt = readTypeTableBase->getArgument(0);
@@ -3122,9 +3040,6 @@ void buildPythonPersonality(SupportBuilder &b) {
                               b.iconst32(0x01)});
   // The action table starts where the call-site table ends.
   mlir::Value tableEnd = b.gepI8(tableLength[1], tableLength[0]);
-  mlir::Value regionStart =
-      b.call("_Unwind_GetRegionStart", b.i64(), mlir::ValueRange{context})
-          .front();
   mlir::Value offset =
       mlir::arith::SubIOp::create(b.builder, b.loc, site, regionStart);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, knownEncoding, scan,
@@ -3169,87 +3084,102 @@ void buildPythonPersonality(SupportBuilder &b) {
       scan, mlir::ValueRange{siteAction[1]});
 
   b.builder.setInsertionPointToEnd(remember);
-  mlir::Block *writeMemo = b.builder.createBlock(&body);
-  b.builder.setInsertionPointToEnd(remember);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, ours, writeMemo,
-                                 mlir::ValueRange{}, decide,
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, hasMemo, writeMemo,
+                                 mlir::ValueRange{}, report,
                                  remember->getArguments());
   b.builder.setInsertionPointToEnd(writeMemo);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, remember->getArgument(0),
-                              b.gepI8(slot, b.iconst(8)), /*alignment=*/8);
+                              b.gepI8(memo, b.iconst(8)), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, remember->getArgument(1),
-                              b.gepI8(slot, b.iconst(16)), /*alignment=*/8);
+                              b.gepI8(memo, b.iconst(16)), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, remember->getArgument(2),
-                              b.gepI8(slot, b.iconst(24)), /*alignment=*/8);
+                              b.gepI8(memo, b.iconst(24)), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(b.builder, b.loc, remember->getArgument(3),
-                              b.gepI8(slot, b.iconst(32)), /*alignment=*/8);
+                              b.gepI8(memo, b.iconst(32)), /*alignment=*/8);
   // The key LAST: a slot is only readable once everything it names is there.
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, site, slot, /*alignment=*/8);
-  mlir::cf::BranchOp::create(b.builder, b.loc, decide,
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, site, memo, /*alignment=*/8);
+  mlir::cf::BranchOp::create(b.builder, b.loc, report,
                              remember->getArguments());
 
-  b.builder.setInsertionPointToEnd(decide);
-  mlir::Value searching = b.cmpi(
-      mlir::arith::CmpIPredicate::ne,
-      mlir::arith::AndIOp::create(b.builder, b.loc, actions, b.iconst(1)),
-      b.iconst(0));
+  b.builder.setInsertionPointToEnd(report);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, report->getArgument(0), out,
+                              /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, report->getArgument(1),
+                              b.gepI8(out, b.iconst(8)), /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, report->getArgument(2),
+                              b.gepI8(out, b.iconst(16)), /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, report->getArgument(3),
+                              b.gepI8(out, b.iconst(24)), /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst1(true)});
+}
+
+// Whether a call site's action chain names a class the raised exception is.
+// `wantCleanup` asks the other question the same chain answers: whether the pad
+// also cleans up, which is what makes a frame the exception is only passing
+// through run anyway.
+//
+// ⛔ A ZERO INDEX IS THE CLEANUP ENTRY, NOT A CATCH-ALL. `catch (...)` is a
+// POSITIVE index whose type table entry is null; index zero is what LLVM
+// appends for a pad that also cleans up. Reading it as a catch-all would stop
+// every exception at the first frame with a `finally`.
+void buildEHActionWalk(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "ly_eh_action_walk",
+      b.builder.getFunctionType({b.ptr(), b.i64(), b.ptr(), b.i64(), b.i1()},
+                                {b.i1()}),
+      /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *walk = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  mlir::Block *notCleanupEntry =
+      b.builder.createBlock(&body, {}, {b.i64(), b.ptr()}, {b.loc, b.loc});
+  mlir::Block *typedClause =
+      b.builder.createBlock(&body, {}, {b.i64(), b.ptr()}, {b.loc, b.loc});
+  mlir::Block *decodeType =
+      b.builder.createBlock(&body, {}, {b.ptr(), b.ptr()}, {b.loc, b.loc});
+  mlir::Block *nextAction = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  mlir::Block *yes = b.builder.createBlock(&body);
+  mlir::Block *no = b.builder.createBlock(&body);
+  mlir::Block *refuse = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(yes);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst1(true)});
+  b.builder.setInsertionPointToEnd(no);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst1(false)});
+  b.builder.setInsertionPointToEnd(refuse);
+  b.emitTrap(b.i1());
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value actionStart = entry->getArgument(0);
+  mlir::Value action = entry->getArgument(1);
+  mlir::Value typeTableBase = entry->getArgument(2);
+  mlir::Value raised = entry->getArgument(3);
+  mlir::Value wantCleanup = entry->getArgument(4);
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, decide->getArgument(0),
-             b.iconst(0)),
-      keepWalking, mlir::ValueRange{}, havePad, decide->getArguments());
+      b.cmpi(mlir::arith::CmpIPredicate::eq, action, b.iconst(0)), no,
+      mlir::ValueRange{}, walk,
+      mlir::ValueRange{b.gepI8(actionStart,
+                               mlir::arith::SubIOp::create(
+                                   b.builder, b.loc, action, b.iconst(1)))});
 
-  b.builder.setInsertionPointToEnd(havePad);
-  mlir::cf::CondBranchOp::create(
-      b.builder, b.loc, searching, searchPhase,
-      mlir::ValueRange{havePad->getArgument(1), havePad->getArgument(2),
-                       havePad->getArgument(3)},
-      cleanupPhase,
-      mlir::ValueRange{havePad->getArgument(0), havePad->getArgument(1),
-                       havePad->getArgument(2)});
-
-  b.builder.setInsertionPointToEnd(searchPhase);
-  // A carrier from another language passes through: nothing put its payload in
-  // `g_current_parts`, so a handler that took it would be handed an exception
-  // object nobody built.
-  mlir::Value handles = mlir::arith::AndIOp::create(
-      b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::ne, searchPhase->getArgument(0),
-             b.iconst(0)),
-      ours);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, handles, readClauses,
-                                 searchPhase->getArguments(), keepWalking,
-                                 mlir::ValueRange{});
-
-  b.builder.setInsertionPointToEnd(readClauses);
-  mlir::Value raised =
-      b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front();
-  mlir::cf::BranchOp::create(
-      b.builder, b.loc, walkActions,
-      mlir::ValueRange{
-          b.gepI8(readClauses->getArgument(1),
-                  mlir::arith::SubIOp::create(
-                      b.builder, b.loc, readClauses->getArgument(0),
-                      b.iconst(1))),
-          raised, readClauses->getArgument(2)});
-
-  b.builder.setInsertionPointToEnd(walkActions);
-  auto typeIndex =
-      b.call("ly_eh_read_field", {b.i64(), b.ptr()},
-             mlir::ValueRange{walkActions->getArgument(0), b.iconst32(0x09)});
-  // ⛔ A ZERO INDEX IS THE CLEANUP ENTRY, NOT A CATCH-ALL. `catch (...)` is a
-  // POSITIVE index whose type table entry is null; index zero is what LLVM
-  // appends for a pad that also cleans up. Reading it as a catch-all would stop
-  // every exception at the first frame with a `finally`.
+  b.builder.setInsertionPointToEnd(walk);
+  auto typeIndex = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                          mlir::ValueRange{walk->getArgument(0),
+                                           b.iconst32(0x09)});
+  mlir::Block *cleanupEntry = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  b.builder.setInsertionPointToEnd(walk);
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
       b.cmpi(mlir::arith::CmpIPredicate::eq, typeIndex[0], b.iconst(0)),
-      nextAction,
-      mlir::ValueRange{typeIndex[1], walkActions->getArgument(1),
-                       walkActions->getArgument(2)},
-      notCleanupEntry,
-      mlir::ValueRange{typeIndex[0], typeIndex[1], walkActions->getArgument(1),
-                       walkActions->getArgument(2)});
+      cleanupEntry, mlir::ValueRange{typeIndex[1]}, notCleanupEntry,
+      mlir::ValueRange{typeIndex[0], typeIndex[1]});
+  b.builder.setInsertionPointToEnd(cleanupEntry);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, wantCleanup, yes,
+                                 mlir::ValueRange{}, nextAction,
+                                 mlir::ValueRange{cleanupEntry->getArgument(0)});
 
   b.builder.setInsertionPointToEnd(notCleanupEntry);
   // A negative index is a C++ exception specification. Nothing here emits one.
@@ -3257,21 +3187,28 @@ void buildPythonPersonality(SupportBuilder &b) {
       b.builder, b.loc,
       b.cmpi(mlir::arith::CmpIPredicate::sgt, notCleanupEntry->getArgument(0),
              b.iconst(0)),
-      b.ptrNe(notCleanupEntry->getArgument(3), b.nullPtr()));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, usable, typedClause,
-                                 notCleanupEntry->getArguments(), refuse,
+      b.ptrNe(typeTableBase, b.nullPtr()));
+  mlir::Block *catchEntry = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(notCleanupEntry);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, usable, catchEntry,
+                                 mlir::ValueRange{}, refuse,
                                  mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(catchEntry);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, wantCleanup, nextAction,
+      mlir::ValueRange{notCleanupEntry->getArgument(1)}, typedClause,
+      notCleanupEntry->getArguments());
 
   b.builder.setInsertionPointToEnd(typedClause);
   // The type table grows BACKWARDS from its base, four bytes per entry, and
   // each entry is the displacement to a slot holding the address.
-  mlir::Value entryAt =
-      b.gepI8(typedClause->getArgument(3),
-              mlir::arith::SubIOp::create(
-                  b.builder, b.loc, b.iconst(0),
-                  mlir::arith::MulIOp::create(b.builder, b.loc,
-                                              typedClause->getArgument(0),
-                                              b.iconst(4))));
+  mlir::Value entryAt = b.gepI8(
+      typeTableBase,
+      mlir::arith::SubIOp::create(
+          b.builder, b.loc, b.iconst(0),
+          mlir::arith::MulIOp::create(b.builder, b.loc,
+                                      typedClause->getArgument(0),
+                                      b.iconst(4))));
   mlir::Value displacement = mlir::LLVM::SExtOp::create(
       b.builder, b.loc, b.i64(),
       mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i32(), entryAt,
@@ -3284,37 +3221,141 @@ void buildPythonPersonality(SupportBuilder &b) {
   // pointer built out of the entry's own address.
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, displacement, b.iconst(0)),
-      handlerHere, mlir::ValueRange{}, decodeType,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, displacement, b.iconst(0)), yes,
+      mlir::ValueRange{}, decodeType,
       mlir::ValueRange{b.gepI8(entryAt, displacement),
-                       typedClause->getArgument(2),
-                       typedClause->getArgument(1),
-                       typedClause->getArgument(3)});
+                       typedClause->getArgument(1)});
 
   b.builder.setInsertionPointToEnd(decodeType);
   mlir::Value classId = b.loadI64(b.loadPtrVal(decodeType->getArgument(0)));
-  mlir::Value matched =
-      b.call("LyEH_ClassIdMatches", b.i1(),
-             mlir::ValueRange{decodeType->getArgument(1), classId})
-          .front();
   mlir::cf::CondBranchOp::create(
-      b.builder, b.loc, matched, handlerHere, mlir::ValueRange{}, nextAction,
-      mlir::ValueRange{decodeType->getArgument(2),
-                       decodeType->getArgument(1),
-                       decodeType->getArgument(3)});
+      b.builder, b.loc,
+      b.call("LyEH_ClassIdMatches", b.i1(), mlir::ValueRange{raised, classId})
+          .front(),
+      yes, mlir::ValueRange{}, nextAction,
+      mlir::ValueRange{decodeType->getArgument(1)});
 
   b.builder.setInsertionPointToEnd(nextAction);
   // The chain link is relative to its own position.
-  auto link =
-      b.call("ly_eh_read_field", {b.i64(), b.ptr()},
-             mlir::ValueRange{nextAction->getArgument(0), b.iconst32(0x09)});
+  auto link = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                     mlir::ValueRange{nextAction->getArgument(0),
+                                      b.iconst32(0x09)});
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, link[0], b.iconst(0)), keepWalking,
-      mlir::ValueRange{}, walkActions,
-      mlir::ValueRange{b.gepI8(nextAction->getArgument(0), link[0]),
-                       nextAction->getArgument(1),
-                       nextAction->getArgument(2)});
+      b.cmpi(mlir::arith::CmpIPredicate::eq, link[0], b.iconst(0)), no,
+      mlir::ValueRange{}, walk,
+      mlir::ValueRange{b.gepI8(nextAction->getArgument(0), link[0])});
+}
+
+// ⭐ THE TYPE TABLE HOLDS PYTHON CLASS IDS, NOT C++ RTTI. A landing pad's
+// clauses name the exception classes its `except` arms test for, as globals
+// whose first word is the class id, so the SEARCH phase can answer "does this
+// frame handle this exception" -- which is the question that decides whether
+// the frame is entered at all.
+//
+// It used to be unanswerable. Every pad was a catch-ALL, so an `except KeyError`
+// stopped a ValueError, ran its dispatch chain, found no arm, and re-raised --
+// a second full two-phase unwind per handler that did not match. Measured with
+// one such frame in between: 2.67 us to reach the real handler, 5.95 us with
+// the frame that does not handle it. That difference is a whole raise.
+//
+// `__gxx_personality_v0` could not have been given this: a Python class match is
+// `LyEH_ClassIdMatches` walking an MRO, not a `std::type_info::can_catch`, so
+// the predicate has to be ours even though the table format is not.
+//
+// The reading of the tables is `ly_eh_lookup_site` and `ly_eh_action_walk`,
+// which the fast walk calls too -- the two paths reach the same landing pad
+// because they ask the same code, not because they were written to agree.
+void buildPythonPersonality(SupportBuilder &b) {
+  EHDataRegisters regs = ehDataRegisters(b.triple);
+  auto fn = b.beginFunction(
+      kPythonPersonalityName, personalityFunctionType(b));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *havePad = b.builder.createBlock(&body);
+  mlir::Block *searchPhase = b.builder.createBlock(&body);
+  mlir::Block *cleanupPhase = b.builder.createBlock(&body);
+  mlir::Block *notTheHandler = b.builder.createBlock(&body);
+  mlir::Block *install = b.builder.createBlock(&body, {}, {b.i64()}, {b.loc});
+  mlir::Block *keepWalking = b.builder.createBlock(&body);
+
+  // _URC_CONTINUE_UNWIND
+  b.builder.setInsertionPointToEnd(keepWalking);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(8)});
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value actions = mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
+                                                   entry->getArgument(1));
+  mlir::Value carrierClass = entry->getArgument(2);
+  mlir::Value carrier = entry->getArgument(3);
+  mlir::Value context = entry->getArgument(4);
+  // The unwinder reports the RETURN address; the call that may transfer to a
+  // pad here is the byte before it, and that byte is what the memo is keyed on.
+  mlir::Value site = mlir::arith::SubIOp::create(
+      b.builder, b.loc,
+      b.call("_Unwind_GetIP", b.i64(), mlir::ValueRange{context}).front(),
+      b.iconst(1));
+  mlir::Value ours = b.cmpi(mlir::arith::CmpIPredicate::eq, carrierClass,
+                            b.iconst(static_cast<std::int64_t>(
+                                kLythonExceptionClass)));
+  mlir::Value memo = mlir::arith::SelectOp::create(
+      b.builder, b.loc, ours,
+      b.call("ly_eh_memo_slot", b.ptr(), mlir::ValueRange{carrier, site})
+          .front(),
+      b.nullPtr());
+  mlir::Value found = mlir::LLVM::AllocaOp::create(
+      b.builder, b.loc, b.ptr(), b.i8(), b.iconst32(32), /*alignment=*/8);
+  mlir::Value known =
+      b.call("ly_eh_lookup_site", b.i1(),
+             mlir::ValueRange{
+                 site,
+                 b.call("_Unwind_GetLanguageSpecificData", b.ptr(),
+                        mlir::ValueRange{context})
+                     .front(),
+                 b.call("_Unwind_GetRegionStart", b.i64(),
+                        mlir::ValueRange{context})
+                     .front(),
+                 memo, found})
+          .front();
+  mlir::Value padAddress = b.loadI64(found);
+  mlir::Value action = b.loadI64(b.gepI8(found, b.iconst(8)));
+  mlir::Value actionStart = b.loadPtrVal(b.gepI8(found, b.iconst(16)));
+  mlir::Value typeTableBase = b.loadPtrVal(b.gepI8(found, b.iconst(24)));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      mlir::arith::AndIOp::create(
+          b.builder, b.loc, known,
+          b.cmpi(mlir::arith::CmpIPredicate::ne, padAddress, b.iconst(0))),
+      havePad, mlir::ValueRange{}, keepWalking, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(havePad);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::ne,
+             mlir::arith::AndIOp::create(b.builder, b.loc, actions,
+                                         b.iconst(1)),
+             b.iconst(0)),
+      searchPhase, mlir::ValueRange{}, cleanupPhase, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(searchPhase);
+  // A carrier from another language passes through: nothing put its payload in
+  // `g_current_parts`, so a handler that took it would be handed an exception
+  // object nobody built.
+  //
+  // _URC_HANDLER_FOUND / _URC_CONTINUE_UNWIND
+  mlir::Value handles = mlir::arith::AndIOp::create(
+      b.builder, b.loc, ours,
+      b.call("ly_eh_action_walk", b.i1(),
+             mlir::ValueRange{
+                 actionStart, action, typeTableBase,
+                 b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front(),
+                 b.iconst1(false)})
+          .front());
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{mlir::arith::SelectOp::create(
+          b.builder, b.loc, handles, b.iconst32(6), b.iconst32(8))});
 
   b.builder.setInsertionPointToEnd(cleanupPhase);
   // _UA_HANDLER_FRAME is what the search phase promised: this is the frame that
@@ -3324,51 +3365,27 @@ void buildPythonPersonality(SupportBuilder &b) {
              mlir::arith::AndIOp::create(b.builder, b.loc, actions,
                                          b.iconst(4)),
              b.iconst(0));
-  mlir::Value pureCleanup = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                   cleanupPhase->getArgument(1), b.iconst(0));
   mlir::cf::CondBranchOp::create(
-      b.builder, b.loc, b.orBit(pureCleanup, isHandlerFrame), install,
-      mlir::ValueRange{cleanupPhase->getArgument(0),
-                       mlir::arith::SelectOp::create(b.builder, b.loc,
-                                                     isHandlerFrame,
-                                                     b.iconst(1), b.iconst(0))},
-      notTheHandler, cleanupPhase->getArguments());
+      b.builder, b.loc,
+      b.orBit(b.cmpi(mlir::arith::CmpIPredicate::eq, action, b.iconst(0)),
+              isHandlerFrame),
+      install,
+      mlir::ValueRange{mlir::arith::SelectOp::create(
+          b.builder, b.loc, isHandlerFrame, b.iconst(1), b.iconst(0))},
+      notTheHandler, mlir::ValueRange{});
 
   // The frame this exception is only passing through. Its pad still runs if it
   // asked to clean up -- that is where a Python frame records itself in the
   // traceback, so skipping it would drop the frame from what the program
   // prints, which is a wrong answer rather than a slow one.
   b.builder.setInsertionPointToEnd(notTheHandler);
-  mlir::cf::BranchOp::create(
-      b.builder, b.loc, seekCleanupEntry,
-      mlir::ValueRange{notTheHandler->getArgument(0),
-                       b.gepI8(notTheHandler->getArgument(2),
-                               mlir::arith::SubIOp::create(
-                                   b.builder, b.loc,
-                                   notTheHandler->getArgument(1),
-                                   b.iconst(1)))});
-
-  b.builder.setInsertionPointToEnd(seekCleanupEntry);
-  auto cleanupIndex =
-      b.call("ly_eh_read_field", {b.i64(), b.ptr()},
-             mlir::ValueRange{seekCleanupEntry->getArgument(1),
-                              b.iconst32(0x09)});
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, cleanupIndex[0], b.iconst(0)),
-      install,
-      mlir::ValueRange{seekCleanupEntry->getArgument(0), b.iconst(0)}, seekNext,
-      mlir::ValueRange{seekCleanupEntry->getArgument(0), cleanupIndex[1]});
-  b.builder.setInsertionPointToEnd(seekNext);
-  auto cleanupLink =
-      b.call("ly_eh_read_field", {b.i64(), b.ptr()},
-             mlir::ValueRange{seekNext->getArgument(1), b.iconst32(0x09)});
-  mlir::cf::CondBranchOp::create(
-      b.builder, b.loc,
-      b.cmpi(mlir::arith::CmpIPredicate::eq, cleanupLink[0], b.iconst(0)),
-      keepWalking, mlir::ValueRange{}, seekCleanupEntry,
-      mlir::ValueRange{seekNext->getArgument(0),
-                       b.gepI8(seekNext->getArgument(1), cleanupLink[0])});
+      b.call("ly_eh_action_walk", b.i1(),
+             mlir::ValueRange{actionStart, action, typeTableBase, b.iconst(0),
+                              b.iconst1(true)})
+          .front(),
+      install, mlir::ValueRange{b.iconst(0)}, keepWalking, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(install);
   b.call("_Unwind_SetGR", {},
@@ -3378,12 +3395,37 @@ void buildPythonPersonality(SupportBuilder &b) {
   // what a pad that both catches and cleans up branches on.
   b.call("_Unwind_SetGR", {},
          mlir::ValueRange{context, b.iconst32(regs.selector),
-                          install->getArgument(1)});
-  b.call("_Unwind_SetIP", {},
-         mlir::ValueRange{context, install->getArgument(0)});
+                          install->getArgument(0)});
+  b.call("_Unwind_SetIP", {}, mlir::ValueRange{context, padAddress});
   // _URC_INSTALL_CONTEXT
   mlir::func::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(7)});
+}
+
+// Which slot of the carrier's memo table a return address falls in. Direct
+// mapped, so a collision costs a rescan and nothing else.
+void buildEHMemoSlot(SupportBuilder &b) {
+  auto fn = b.beginFunction("ly_eh_memo_slot",
+                            b.builder.getFunctionType({b.ptr(), b.i64()},
+                                                      {b.ptr()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{b.gepI8(
+          entry->getArgument(0),
+          mlir::arith::AddIOp::create(
+              b.builder, b.loc, b.iconst(eh_carrier::kMemoOffset),
+              mlir::arith::MulIOp::create(
+                  b.builder, b.loc,
+                  mlir::arith::AndIOp::create(
+                      b.builder, b.loc,
+                      mlir::arith::ShRUIOp::create(b.builder, b.loc,
+                                                   entry->getArgument(1),
+                                                   b.iconst(2)),
+                      b.iconst(eh_carrier::kMemoEntries - 1)),
+                  b.iconst(eh_carrier::kMemoEntryBytes))))});
 }
 
 } // namespace
@@ -3667,6 +3709,10 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   declareEHSupport(support);
   if (usePythonPersonality(support.triple)) {
     buildEHReadField(support);
+    buildEHMemoSlot(support);
+    buildEHLookupSite(support);
+    buildEHActionWalk(support);
+
     buildPythonPersonality(support);
   }
   buildCurrentExceptionClassIdUnchecked(support);
