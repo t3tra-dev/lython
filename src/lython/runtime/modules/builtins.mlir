@@ -20283,21 +20283,43 @@ module attributes {
 
     %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
     %capacity = func.call @__ly_dict_round_capacity(%length) : (i64) -> i64
-    %capacity_index = arith.index_cast %capacity : i64 to index
+    // ⭐ ONE BLOCK FOR ALL FOUR ARRAYS. Keys, values, the present flags and the
+    // index table are all sized from the capacity and all live and die
+    // together, and they used to be four allocations -- five with the handle,
+    // where CPython's dict is two. Building `{j: j for j in range(20)}` a
+    // hundred thousand times spent more of its time in the allocator than in
+    // the hashing.
+    //
+    // The handle still holds four addresses, so every reader and every growth
+    // is unchanged; what changed is where they come from. Keys sit at offset
+    // zero, which is what lets `free_raw_i64_ptr(keys)` release the block.
+    //
+    //   [0, capacity*W)                  keys
+    //   [capacity*W, 2*capacity*W)       values
+    //   [2*capacity*W, +capacity)        present flags
+    //   [.., +4*capacity + 1)            index table, word 0 = built-for length
+    %four = arith.constant 4 : i64
+    %eight = arith.constant 8 : i64
+    %two = arith.constant 2 : i64
     %payload_words = arith.muli %capacity, %handle_words : i64
-    %payload_words_index = arith.index_cast %payload_words : i64 to index
+    %pair_words = arith.muli %payload_words, %two : i64
+    %through_present = arith.addi %pair_words, %capacity : i64
+    %table_words = arith.muli %capacity, %four : i64
+    %table_alloc_i64 = arith.addi %table_words, %one : i64
+    %block_words = arith.addi %through_present, %table_alloc_i64 : i64
+    %block_words_index = arith.index_cast %block_words : i64 to index
     // Plain memref.alloc with no alignment attribute is a bare malloc, so the
     // aligned pointer IS the allocated pointer and free_raw_i64_ptr can
     // release it later (same convention as __ly_exc_payload_alloc).
-    %keys = memref.alloc(%payload_words_index) : memref<?xi64>
-    %values = memref.alloc(%payload_words_index) : memref<?xi64>
-    %present = memref.alloc(%capacity_index) : memref<?xi64>
-    %keys_index = memref.extract_aligned_pointer_as_index %keys : memref<?xi64> -> index
-    %keys_word = arith.index_cast %keys_index : index to i64
-    %values_index = memref.extract_aligned_pointer_as_index %values : memref<?xi64> -> index
-    %values_word = arith.index_cast %values_index : index to i64
-    %present_index = memref.extract_aligned_pointer_as_index %present : memref<?xi64> -> index
-    %present_word = arith.index_cast %present_index : index to i64
+    %block = memref.alloc(%block_words_index) : memref<?xi64>
+    %block_index = memref.extract_aligned_pointer_as_index %block : memref<?xi64> -> index
+    %keys_word = arith.index_cast %block_index : index to i64
+    %values_off = arith.muli %payload_words, %eight : i64
+    %values_word = arith.addi %keys_word, %values_off : i64
+    %present_off = arith.muli %pair_words, %eight : i64
+    %present_word = arith.addi %keys_word, %present_off : i64
+    %table_off = arith.muli %through_present, %eight : i64
+    %table_word = arith.addi %keys_word, %table_off : i64
 
     memref.store %one, %self[%refcount_slot] : memref<8xi64>
     memref.store %class_id, %self[%layout_slot] : memref<8xi64>
@@ -20306,23 +20328,14 @@ module attributes {
     memref.store %keys_word, %self[%keys_slot] : memref<8xi64>
     memref.store %values_word, %self[%values_slot] : memref<8xi64>
     memref.store %present_word, %self[%present_slot] : memref<8xi64>
-    // The index table: 4*capacity + 1 words, word 0 being the length it was
-    // built for. Zero is the right stamp for a fresh handle whose entries the
-    // caller has not written yet -- a nonzero %length means an evidence-written
-    // dict, and the mismatch is what makes the first probe build the table.
-    %four = arith.constant 4 : i64
-    %table_words = arith.muli %capacity, %four : i64
-    %table_alloc_i64 = arith.addi %table_words, %one : i64
-    %table_alloc = arith.index_cast %table_alloc_i64 : i64 to index
-    %table_block = memref.alloc(%table_alloc) : memref<?xi64>
-    scf.for %t = %lower to %table_alloc step %step {
-      memref.store %zero, %table_block[%t] : memref<?xi64>
-    }
-    %table_index = memref.extract_aligned_pointer_as_index %table_block : memref<?xi64> -> index
-    %table_word = arith.index_cast %table_index : index to i64
     memref.store %table_word, %self[%reserved_slot] : memref<8xi64>
-    scf.for %i = %lower to %capacity_index step %step {
-      memref.store %zero, %present[%i] : memref<?xi64>
+    // Zero the flags and the table in one walk. Zero is the right table stamp
+    // for a fresh handle whose entries the caller has not written yet -- a
+    // nonzero %length means an evidence-written dict, and the mismatch is what
+    // makes the first probe build the table.
+    %pair_words_index = arith.index_cast %pair_words : i64 to index
+    scf.for %w = %pair_words_index to %block_words_index step %step {
+      memref.store %zero, %block[%w] : memref<?xi64>
     }
     func.return %self : memref<8xi64>
   }
@@ -21203,9 +21216,16 @@ module attributes {
       %old_keys_word = memref.load %self[%keys_slot] : memref<8xi64>
       %old_values_word = memref.load %self[%values_slot] : memref<8xi64>
       %old_present_word = memref.load %self[%present_slot] : memref<8xi64>
+      // ⭐ CPython's GROWTH_RATE, which is `used * 3` rather than a doubling of
+      // the CAPACITY. Doubling the capacity grows a dict being built one power
+      // of two at a time -- 8, 16, 32 for twenty entries -- and each step
+      // copies every entry and rebuilds the table. Sizing from what is being
+      // ASKED FOR reaches the same 32 in one step.
+      %three = arith.constant 3 : i64
+      %tripled = arith.muli %required, %three : i64
       %doubled = arith.muli %capacity, %two : i64
-      %below_required = arith.cmpi slt, %doubled, %required : i64
-      %wanted = arith.select %below_required, %required, %doubled : i1, i64
+      %below_required = arith.cmpi slt, %tripled, %doubled : i64
+      %wanted = arith.select %below_required, %doubled, %tripled : i1, i64
       %new_capacity = func.call @__ly_dict_round_capacity(%wanted) : (i64) -> i64
       %old_words = arith.muli %capacity, %handle_words : i64
       %new_words = arith.muli %new_capacity, %handle_words : i64
@@ -21213,11 +21233,31 @@ module attributes {
       %new_words_index = arith.index_cast %new_words : i64 to index
       %old_capacity_index = arith.index_cast %capacity : i64 to index
       %new_capacity_index = arith.index_cast %new_capacity : i64 to index
-      %new_keys = memref.alloc(%new_words_index) : memref<?xi64>
-      %new_values = memref.alloc(%new_words_index) : memref<?xi64>
-      %new_present = memref.alloc(%new_capacity_index) : memref<?xi64>
-      scf.for %i = %lower to %new_capacity_index step %step {
-        memref.store %zero, %new_present[%i] : memref<?xi64>
+      // One block, laid out as `__ly_dict_alloc` lays it out.
+      %four_g = arith.constant 4 : i64
+      %eight_g = arith.constant 8 : i64
+      %one_g = arith.constant 1 : i64
+      %new_pair_words = arith.muli %new_words, %two : i64
+      %new_through_present = arith.addi %new_pair_words, %new_capacity : i64
+      %new_table_words_g = arith.muli %new_capacity, %four_g : i64
+      %new_table_alloc_g = arith.addi %new_table_words_g, %one_g : i64
+      %new_block_words = arith.addi %new_through_present, %new_table_alloc_g : i64
+      %new_block_words_index = arith.index_cast %new_block_words : i64 to index
+      %new_block = memref.alloc(%new_block_words_index) : memref<?xi64>
+      %new_block_index = memref.extract_aligned_pointer_as_index %new_block : memref<?xi64> -> index
+      %new_base = arith.index_cast %new_block_index : index to i64
+      %new_values_off = arith.muli %new_words, %eight_g : i64
+      %new_values_base = arith.addi %new_base, %new_values_off : i64
+      %new_present_off = arith.muli %new_pair_words, %eight_g : i64
+      %new_present_base = arith.addi %new_base, %new_present_off : i64
+      %new_table_off = arith.muli %new_through_present, %eight_g : i64
+      %new_table_base = arith.addi %new_base, %new_table_off : i64
+      %new_keys = func.call @__ly_global_view_i64(%new_base, %new_words) : (i64, i64) -> memref<?xi64>
+      %new_values = func.call @__ly_global_view_i64(%new_values_base, %new_words) : (i64, i64) -> memref<?xi64>
+      %new_present = func.call @__ly_global_view_i64(%new_present_base, %new_capacity) : (i64, i64) -> memref<?xi64>
+      %new_tail_index = arith.index_cast %new_pair_words : i64 to index
+      scf.for %w = %new_tail_index to %new_block_words_index step %step {
+        memref.store %zero, %new_block[%w] : memref<?xi64>
       }
       scf.for %i = %lower to %old_words_index step %step {
         %key_word = memref.load %keys[%i] : memref<?xi64>
@@ -21229,12 +21269,6 @@ module attributes {
         %present_word = memref.load %present[%i] : memref<?xi64>
         memref.store %present_word, %new_present[%i] : memref<?xi64>
       }
-      %new_keys_index = memref.extract_aligned_pointer_as_index %new_keys : memref<?xi64> -> index
-      %new_keys_word = arith.index_cast %new_keys_index : index to i64
-      %new_values_index = memref.extract_aligned_pointer_as_index %new_values : memref<?xi64> -> index
-      %new_values_word = arith.index_cast %new_values_index : index to i64
-      %new_present_index = memref.extract_aligned_pointer_as_index %new_present : memref<?xi64> -> index
-      %new_present_word = arith.index_cast %new_present_index : index to i64
       // Publish capacity and the new bases together, then free the old
       // blocks: after these stores no view derived from the handle can reach
       // the old blocks, and before them no reader could reach the new ones.
@@ -21243,22 +21277,13 @@ module attributes {
       %table_slot = arith.constant 7 : index
       %four = arith.constant 4 : i64
       %one_i64 = arith.constant 1 : i64
-      %old_table_word = memref.load %self[%table_slot] : memref<8xi64>
-      %new_table_words = arith.muli %new_capacity, %four : i64
-      %new_table_alloc_i64 = arith.addi %new_table_words, %one_i64 : i64
-      %new_table_alloc = arith.index_cast %new_table_alloc_i64 : i64 to index
-      %new_table = memref.alloc(%new_table_alloc) : memref<?xi64>
-      %new_table_index = memref.extract_aligned_pointer_as_index %new_table : memref<?xi64> -> index
-      %new_table_word = arith.index_cast %new_table_index : index to i64
       memref.store %new_capacity, %self[%capacity_slot] : memref<8xi64>
-      memref.store %new_keys_word, %self[%keys_slot] : memref<8xi64>
-      memref.store %new_values_word, %self[%values_slot] : memref<8xi64>
-      memref.store %new_present_word, %self[%present_slot] : memref<8xi64>
-      memref.store %new_table_word, %self[%table_slot] : memref<8xi64>
+      memref.store %new_base, %self[%keys_slot] : memref<8xi64>
+      memref.store %new_values_base, %self[%values_slot] : memref<8xi64>
+      memref.store %new_present_base, %self[%present_slot] : memref<8xi64>
+      memref.store %new_table_base, %self[%table_slot] : memref<8xi64>
       func.call @__ly_dict_table_rebuild(%self) : (memref<8xi64>) -> ()
-      func.call @free_raw_i64_ptr(%old_table_word) : (i64) -> ()
-      func.call @free_raw_i64_ptr(%old_present_word) : (i64) -> ()
-      func.call @free_raw_i64_ptr(%old_values_word) : (i64) -> ()
+      // Keys sit at offset zero of the block, so this frees all four arrays.
       func.call @free_raw_i64_ptr(%old_keys_word) : (i64) -> ()
     }
     func.return
@@ -22354,14 +22379,8 @@ module attributes {
         func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%values, %logical_index) : (memref<?xi64>, i64) -> ()
       }
     }
-    %table_slot = arith.constant 7 : index
-    %table_word = memref.load %self[%table_slot] : memref<8xi64>
-    %present_word = memref.load %self[%present_slot] : memref<8xi64>
-    %values_word = memref.load %self[%values_slot] : memref<8xi64>
+    // Keys sit at offset zero of the one block the four arrays share.
     %keys_word = memref.load %self[%keys_slot] : memref<8xi64>
-    func.call @free_raw_i64_ptr(%table_word) : (i64) -> ()
-    func.call @free_raw_i64_ptr(%present_word) : (i64) -> ()
-    func.call @free_raw_i64_ptr(%values_word) : (i64) -> ()
     func.call @free_raw_i64_ptr(%keys_word) : (i64) -> ()
     memref.dealloc %self : memref<8xi64>
     cf.br ^done
