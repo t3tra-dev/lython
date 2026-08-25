@@ -1410,6 +1410,26 @@ void buildPrintBytes(SupportBuilder &b) {
 // void release_payload_slot_ptr(ptr slot): release an owned boxed container
 // slot through the per-program `__ly_release_boxed_by_contract` hook (the
 // manifest deallocators, generated in the user module and resolved at link).
+//
+// ⭐ THE HOOK IS FOR DYING, AND MOST RELEASES ARE NOT. Every heap header keeps
+// its refcount in word 0 -- which is why `retain_payload_slot_ptr` beside this
+// needs no class dispatch at all -- so a release that leaves the count above
+// zero is the same load and store for every contract, and only the one that
+// takes it to zero needs to know what the object is. This used to dispatch
+// unconditionally: a call, a jump table over eighty-odd class ids, and the
+// deallocator's prologue, for a decrement.
+//
+// Slicing a hundred-element `list[int]` was the shape that showed it -- the
+// slice's elements are all still held by the source, so all forty-eight
+// releases ended in a decrement and none of them freed anything.
+//
+// ⛔ THE PEEK IS A PLAIN LOAD, not part of the atomic step. Reading one and
+// then dispatching is correct whatever the count does in between -- the
+// deallocator re-reads it atomically and asserts it is positive -- and reading
+// two or more and decrementing cannot be wrong in a runtime whose object model
+// is single-threaded (see the object allocator's note). What it must not do is
+// decrement twice, which is why the slow path decrements nowhere but inside
+// the deallocator.
 void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "release_payload_slot_ptr", b.builder.getFunctionType({b.ptr()}, {}),
@@ -1417,6 +1437,9 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *owned = b.builder.createBlock(&body);
+  mlir::Block *checkCount = b.builder.createBlock(&body);
+  mlir::Block *decrement = b.builder.createBlock(&body);
+  mlir::Block *dying = b.builder.createBlock(&body);
   mlir::Block *done = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value slot = entry->getArgument(0);
@@ -1429,7 +1452,51 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   mlir::cf::CondBranchOp::create(b.builder, b.loc, notOwned, done,
                                  mlir::ValueRange{}, owned,
                                  mlir::ValueRange{});
+
   b.builder.setInsertionPointToEnd(owned);
+  auto entityWord = mlir::func::CallOp::create(
+      b.builder, b.loc, "boxed_load_i64", b.i64(),
+      mlir::ValueRange{slot, b.iconst(py::lowering::box_abi::kEntityWord)});
+  mlir::Value entity = entityWord.getResult(0);
+  mlir::Value isNull = b.cmpi(mlir::arith::CmpIPredicate::eq, entity, zero);
+  mlir::Value tagBit =
+      mlir::arith::AndIOp::create(b.builder, b.loc, entity, b.iconst(1));
+  mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::ne, tagBit, zero);
+  mlir::Value skip = b.orBit(isNull, isTagged);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, skip, done,
+                                 mlir::ValueRange{}, checkCount,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(checkCount);
+  mlir::Value entityPtr = b.intToPtr(entity);
+  mlir::Value observed =
+      mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i64(), entityPtr)
+          .getResult();
+  mlir::Value immortal = b.iconst(std::numeric_limits<std::int64_t>::max());
+  mlir::Value isImmortal =
+      b.cmpi(mlir::arith::CmpIPredicate::eq, observed, immortal);
+  mlir::Value shared = b.cmpi(mlir::arith::CmpIPredicate::sgt, observed,
+                              b.iconst(1));
+  // Immortal storage is never written; shared storage only loses a count.
+  mlir::Value settled = b.orBit(isImmortal, shared);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, settled, decrement,
+                                 mlir::ValueRange{}, dying,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(decrement);
+  mlir::Block *reallyDrop = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(decrement);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, isImmortal, done,
+                                 mlir::ValueRange{}, reallyDrop,
+                                 mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(reallyDrop);
+  mlir::LLVM::AtomicRMWOp::create(b.builder, b.loc,
+                                  mlir::LLVM::AtomicBinOp::sub, entityPtr,
+                                  b.iconst(1),
+                                  mlir::LLVM::AtomicOrdering::acq_rel);
+  mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(dying);
   auto classWord = mlir::func::CallOp::create(
       b.builder, b.loc, "boxed_load_i64", b.i64(),
       mlir::ValueRange{slot, b.iconst(1)});
