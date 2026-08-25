@@ -13050,11 +13050,7 @@ module attributes {
       %needs_sep = arith.xori %is_first, %true_k : i1
       %after_sep = scf.if %needs_sep -> (index) {
         %sep_n_index = arith.index_cast %sep_n : i64 to index
-        scf.for %j = %c0 to %sep_n_index step %c1 {
-          %cp = func.call @__ly_unicode_get(%sep_bytes, %sep_width, %j) : (memref<?xi8>, i64, index) -> i64
-          %dst = arith.addi %pos, %j : index
-          func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
-        }
+        func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %pos, %sep_bytes, %sep_width, %c0, %sep_n_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
         %advanced = arith.addi %pos, %sep_n_index : index
         scf.yield %advanced : index
       } else {
@@ -13064,11 +13060,14 @@ module attributes {
       %w = func.call @__ly_unicode_raw_width(%hdr) : (i64) -> i64
       %count = arith.divsi %blen, %w : i64
       %count_index = arith.index_cast %count : i64 to index
-      scf.for %j = %c0 to %count_index step %c1 {
-        %cp = func.call @__ly_unicode_get_raw(%ptr, %w, %j) : (i64, i64, index) -> i64
-        %dst = arith.addi %after_sep, %j : index
-        func.call @__ly_unicode_put(%out_bytes, %out_width, %dst, %cp) : (memref<?xi8>, i64, index, i64) -> ()
-      }
+      // ⭐ THE ELEMENT IS COPIED AS A RUN, and reaching it takes a descriptor
+      // first. A boxed element is addressed by the raw pointer its box holds,
+      // and `__ly_unicode_get_raw` was the only reader for that -- one call and
+      // a width branch per character. Building the view costs a few
+      // instructions per ELEMENT and hands the copy to the same byte path every
+      // other str copy takes.
+      %elem_bytes = func.call @__ly_global_view_i8(%ptr, %blen) : (i64, i64) -> memref<?xi8>
+      func.call @__ly_unicode_copy_run(%out_bytes, %out_width, %after_sep, %elem_bytes, %w, %c0, %count_index) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
       %next_pos = arith.addi %after_sep, %count_index : index
       scf.yield %next_pos : index
     }
