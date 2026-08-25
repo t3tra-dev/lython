@@ -433,6 +433,10 @@ mlir::Value buildMemRef1D(SupportBuilder &b, mlir::Type memrefType,
 
 // Three memref values into an ExceptionParts region (the process slot, or a
 // chain node's payload -- `nodeMember(node, kNodePayload)` is one).
+// Emits the raise of a Lython `_Unwind_Exception` at the current insertion
+// point (RuntimeSupportBuilder.cpp). Inline at every raise on purpose.
+void emitRaiseCarrier(SupportBuilder &b);
+
 void storeExceptionTriple(SupportBuilder &b, mlir::Value parts,
                           mlir::ValueRange triple);
 

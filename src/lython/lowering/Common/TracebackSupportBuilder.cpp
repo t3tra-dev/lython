@@ -2732,8 +2732,8 @@ void buildStarPop(SupportBuilder &b) {
 }
 
 // The shared "throw the pending token" tail for the star rethrow paths
-// (a func-level function: its callers are func-level; __cxa_throw never
-// returns, the trailing return only satisfies the verifier).
+// (a func-level function: its callers are func-level; the raise never returns,
+// the trailing return only satisfies the verifier).
 void buildStarThrowPending(SupportBuilder &b) {
   auto fn = b.beginFunction("star_throw_pending",
                             b.builder.getFunctionType({}, {}),
@@ -2741,13 +2741,7 @@ void buildStarThrowPending(SupportBuilder &b) {
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
   b.call("end_native_catch_if_active", mlir::TypeRange{}, {});
-  auto carrier = mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{b.ptr()}, "__cxa_allocate_exception",
-      mlir::ValueRange{b.iconst(1)});
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "__cxa_throw",
-      mlir::ValueRange{carrier.getResult(),
-                       b.addrOf("_ZTI17LyPythonException"), b.nullPtr()});
+  emitRaiseCarrier(b);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 

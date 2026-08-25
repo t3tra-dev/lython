@@ -59,20 +59,14 @@ bool named(llvm::StringRef path, llvm::StringRef suffix) {
 
 // `Common/MemRef1D.h` assembles the rank-1 memref descriptor, and is the only
 // thing that may.
-//
-// `RuntimeSupportBuilder.cpp` is allowed to build an aggregate because it also
-// emits a C++ `__class_type_info` for the EH personality, which is a different
-// struct entirely. It may NOT grow a descriptor: that is the drift this catches,
-// since a descriptor built in a pass is exactly how the last one appeared.
 TEST(SoleProducerTest, TheRank1DescriptorIsAssembledInOnePlace) {
   llvm::SmallVector<std::string, 4> unexpected;
   for (const std::string &path : filesContaining("InsertValueOp::create"))
-    if (!named(path, "Common/MemRef1D.h") &&
-        !named(path, "Common/RuntimeSupportBuilder.cpp"))
+    if (!named(path, "Common/MemRef1D.h"))
       unexpected.push_back(path);
 
   EXPECT_TRUE(unexpected.empty())
-      << "an LLVM aggregate is assembled outside the two files that may: "
+      << "an LLVM aggregate is assembled outside the one file that may: "
       << llvm::join(unexpected, ", ")
       << ". If it is a rank-1 memref descriptor, call buildMemRef1D from "
          "Common/MemRef1D.h -- one assembler is what keeps the box path and "
@@ -80,11 +74,10 @@ TEST(SoleProducerTest, TheRank1DescriptorIsAssembledInOnePlace) {
          "other struct, add it here and say what it is.";
 }
 
-// The allow-list above is only meaningful while both entries are load-bearing.
+// The allow-list above is only meaningful while every entry is load-bearing.
 // A stale exemption is the same species of rot as a stale comment.
 TEST(SoleProducerTest, TheDescriptorAssemblerExemptionsAreStillUsed) {
-  for (llvm::StringRef exemption :
-       {"Common/MemRef1D.h", "Common/RuntimeSupportBuilder.cpp"}) {
+  for (llvm::StringRef exemption : {"Common/MemRef1D.h"}) {
     bool used = false;
     for (const std::string &path : filesContaining("InsertValueOp::create"))
       used = used || named(path, exemption);

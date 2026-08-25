@@ -1642,10 +1642,19 @@ void declareLLVMExternal(SupportBuilder &b, llvm::StringRef name,
 
 void declareEHSupport(SupportBuilder &b) {
   declareLLVMExternal(b, "LyRt_InstallStackGuard", {}, {});
-  declareLLVMExternal(b, "__cxa_allocate_exception", b.ptr(), {b.i64()});
-  declareLLVMExternal(b, "__cxa_throw", {}, {b.ptr(), b.ptr(), b.ptr()});
-  declareLLVMExternal(b, "__cxa_begin_catch", b.ptr(), {b.ptr()});
-  declareLLVMExternal(b, "__cxa_end_catch", {}, {});
+  // ⭐ THE UNWINDER, NOT THE C++ RUNTIME. A Python exception carries nothing in
+  // the C++ carrier -- the object, its message and its chain live in
+  // `g_current_parts`, and every landing pad this compiler emits is a
+  // catch-ALL, so the RTTI `__cxa_throw` matches on was never read. What the
+  // C++ layer was buying was `__cxa_allocate_exception`'s malloc, an exception
+  // header nobody fills in, and the uncaught-exception bookkeeping.
+  // `_Unwind_RaiseException` is the part that does the work.
+  //
+  // Measured on this machine, a two-frame throw and catch: 2.03 us through
+  // `__cxa_throw`, 1.28 us raising a foreign exception with a carrier that is
+  // already allocated -- and Lython was at 3.2 us.
+  declareLLVMExternal(b, "_Unwind_RaiseException", b.i32(), {b.ptr()});
+  declareLLVMExternal(b, "_Unwind_DeleteException", {}, {b.ptr()});
   declareLLVMExternal(b, "__gxx_personality_v0", b.i32(), {},
                       /*isVarArg=*/true);
 
@@ -1660,6 +1669,20 @@ void declareEHSupport(SupportBuilder &b) {
   };
   boolGlobal("g_current_exception");
   boolGlobal("g_native_catch_active");
+  // The carrier the unwinder is walking, so the catch that ends the unwind can
+  // hand it back. `__cxa_begin_catch` used to hold this for us.
+  {
+    auto carrier = mlir::LLVM::GlobalOp::create(
+        b.builder, b.loc, b.ptr(), /*isConstant=*/false,
+        mlir::LLVM::Linkage::Internal, "g_current_carrier", mlir::Attribute(),
+        /*alignment=*/8);
+    carrier.setDsoLocal(true);
+    mlir::OpBuilder::InsertionGuard initGuard(b.builder);
+    mlir::Block *init = b.builder.createBlock(&carrier.getInitializerRegion());
+    b.builder.setInsertionPointToEnd(init);
+    mlir::Value zero = mlir::LLVM::ZeroOp::create(b.builder, b.loc, b.ptr());
+    mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{zero});
+  }
   // The in-flight exception. `ExceptionParts` -- so the three descriptors are
   // stored as descriptors and their pointer members round-trip as pointers.
   //
@@ -1685,49 +1708,7 @@ void declareEHSupport(SupportBuilder &b) {
   b.stringGlobal(".native_exception",
                  "error: uncaught native exception during Python execution\n");
 
-  // Itanium typeinfo for LyPythonException: vtable slot from the C++ ABI's
-  // __class_type_info, name from the mangled-string global.
-  mlir::LLVM::GlobalOp::create(
-      b.builder, b.loc, mlir::LLVM::LLVMArrayType::get(b.ptr(), 0),
-      /*isConstant=*/false, mlir::LLVM::Linkage::External,
-      "_ZTVN10__cxxabiv117__class_type_infoE", mlir::Attribute());
-  {
-    std::string mangled = "17LyPythonException";
-    mangled.push_back('\0');
-    auto nameType = mlir::LLVM::LLVMArrayType::get(b.i8(), mangled.size());
-    auto nameGlobal = mlir::LLVM::GlobalOp::create(
-        b.builder, b.loc, nameType, /*isConstant=*/true,
-        mlir::LLVM::Linkage::LinkonceODR, "_ZTS17LyPythonException",
-        b.builder.getStringAttr(mangled), /*alignment=*/1);
-    nameGlobal.setDsoLocal(true);
-    nameGlobal.setVisibility_(mlir::LLVM::Visibility::Hidden);
-  }
-  {
-    auto typeInfoType = mlir::LLVM::LLVMStructType::getLiteral(
-        b.builder.getContext(), {b.ptr(), b.ptr()});
-    auto typeInfo = mlir::LLVM::GlobalOp::create(
-        b.builder, b.loc, typeInfoType, /*isConstant=*/true,
-        mlir::LLVM::Linkage::LinkonceODR, "_ZTI17LyPythonException",
-        mlir::Attribute(), /*alignment=*/8);
-    typeInfo.setDsoLocal(true);
-    typeInfo.setVisibility_(mlir::LLVM::Visibility::Hidden);
-    mlir::OpBuilder::InsertionGuard initGuard(b.builder);
-    mlir::Block *init = b.builder.createBlock(&typeInfo.getInitializerRegion());
-    b.builder.setInsertionPointToEnd(init);
-    mlir::Value name = b.addrOf("_ZTS17LyPythonException");
-    mlir::Value vtable = b.addrOf("_ZTVN10__cxxabiv117__class_type_infoE");
-    mlir::Value vtableEntry = mlir::LLVM::GEPOp::create(
-        b.builder, b.loc, b.ptr(), b.ptr(), vtable,
-        llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(2)},
-        mlir::LLVM::GEPNoWrapFlags::inbounds);
-    mlir::Value undef =
-        mlir::LLVM::UndefOp::create(b.builder, b.loc, typeInfoType);
-    mlir::Value withVtable = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, undef, vtableEntry, llvm::ArrayRef<std::int64_t>{0});
-    mlir::Value complete = mlir::LLVM::InsertValueOp::create(
-        b.builder, b.loc, withVtable, name, llvm::ArrayRef<std::int64_t>{1});
-    mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{complete});
-  }
+
 }
 
 mlir::LLVM::LLVMFuncOp beginLLVMFunction(SupportBuilder &b,
@@ -1780,6 +1761,17 @@ void buildCurrentExceptionClassIdUnchecked(SupportBuilder &b) {
   b.emitTrap(b.i64());
 }
 
+// void LyEH_CarrierCleanup(i32 reason, ptr carrier): the unwinder calls this
+// when an exception it is carrying is deleted without being caught by us.
+void buildCarrierCleanup(SupportBuilder &b) {
+  auto fn = beginLLVMFunction(b, "LyEH_CarrierCleanup", {}, {b.i32(), b.ptr()});
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{entry->getArgument(1)});
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+
 // void end_native_catch_if_active(): closes the __cxa catch scope opened by
 // LyEH_BeginCatch, once.
 void buildEndNativeCatchIfActive(SupportBuilder &b) {
@@ -1796,8 +1788,12 @@ void buildEndNativeCatchIfActive(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&endIf.getThenRegion().front());
+    mlir::Value carrier = mlir::LLVM::LoadOp::create(
+        b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+        /*alignment=*/8);
     mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                               "__cxa_end_catch", mlir::ValueRange{});
+                               "_Unwind_DeleteException",
+                               mlir::ValueRange{carrier});
     mlir::LLVM::StoreOp::create(
         b.builder, b.loc,
         mlir::arith::ConstantIntOp::create(b.builder, b.loc, 0, 1).getResult(),
@@ -1835,14 +1831,8 @@ void buildThrowException(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       flagSlot, /*alignment=*/4);
-  auto carrier = mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{b.ptr()}, "__cxa_allocate_exception",
-      mlir::ValueRange{b.iconst(1)});
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "__cxa_throw",
-      mlir::ValueRange{carrier.getResult(),
-                       b.addrOf("_ZTI17LyPythonException"), b.nullPtr()});
-  // `__cxa_throw` does not return; the trailing return only satisfies the
+  emitRaiseCarrier(b);
+  // The raise does not return; the trailing return only satisfies the
   // verifier, which is why this is not `llvm.unreachable`.
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
@@ -1867,9 +1857,8 @@ void buildBeginCatch(SupportBuilder &b) {
       mlir::arith::OrIOp::create(b.builder, b.loc, objectNull, notPending);
   mlir::LLVM::CondBrOp::create(b.builder, b.loc, invalid, trap, begin);
   b.builder.setInsertionPointToEnd(begin);
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.ptr()},
-                             "__cxa_begin_catch",
-                             mlir::ValueRange{entry->getArgument(0)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, entry->getArgument(0),
+                              b.addrOf("g_current_carrier"), /*alignment=*/8);
   mlir::LLVM::StoreOp::create(
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
@@ -2149,13 +2138,7 @@ void buildRethrowCurrent(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(rethrow);
   mlir::func::CallOp::create(b.builder, b.loc, "end_native_catch_if_active",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  auto carrier = mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{b.ptr()}, "__cxa_allocate_exception",
-      mlir::ValueRange{b.iconst(1)});
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "__cxa_throw",
-      mlir::ValueRange{carrier.getResult(),
-                       b.addrOf("_ZTI17LyPythonException"), b.nullPtr()});
+  emitRaiseCarrier(b);
   mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
   b.builder.setInsertionPointToEnd(trap);
   emitLLVMTrap(b);
@@ -2512,9 +2495,8 @@ void buildRunPythonMain(SupportBuilder &b) {
       mlir::ValueRange{b.nullPtr()});
   mlir::Value exceptionObject = mlir::LLVM::ExtractValueOp::create(
       b.builder, b.loc, pad, llvm::ArrayRef<std::int64_t>{0});
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.ptr()},
-                             "__cxa_begin_catch",
-                             mlir::ValueRange{exceptionObject});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, exceptionObject,
+                              b.addrOf("g_current_carrier"), /*alignment=*/8);
   mlir::Value descriptor = mlir::LLVM::AllocaOp::create(
       b.builder, b.loc, b.ptr(), exceptionPartsType(b), b.iconst32(1),
       /*alignment=*/8);
@@ -2534,8 +2516,11 @@ void buildRunPythonMain(SupportBuilder &b) {
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
+      mlir::ValueRange{mlir::LLVM::LoadOp::create(
+          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+          /*alignment=*/8)});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -2599,8 +2584,11 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
   releaseTaken();
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
+      mlir::ValueRange{mlir::LLVM::LoadOp::create(
+          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+          /*alignment=*/8)});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -2632,8 +2620,11 @@ void buildRunPythonMain(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(exitWithStatus);
   releaseTaken();
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
+      mlir::ValueRange{mlir::LLVM::LoadOp::create(
+          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+          /*alignment=*/8)});
   mlir::Value status = mlir::LLVM::SubOp::create(b.builder, b.loc,
                                                  exitCodeBiased, b.iconst(1));
   mlir::Value status32 =
@@ -2642,8 +2633,11 @@ void buildRunPythonMain(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(exitSilently);
   releaseTaken();
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
+      mlir::ValueRange{mlir::LLVM::LoadOp::create(
+          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+          /*alignment=*/8)});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(0)});
 
@@ -2661,13 +2655,47 @@ void buildRunPythonMain(SupportBuilder &b) {
       mlir::ValueRange{b.iconst32(2), b.iconst8(10)});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{messageCStr});
   releaseTaken();
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                             "__cxa_end_catch", mlir::ValueRange{});
+  mlir::LLVM::CallOp::create(
+      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
+      mlir::ValueRange{mlir::LLVM::LoadOp::create(
+          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+          /*alignment=*/8)});
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 }
 
 } // namespace
+
+// Hands the unwinder a `_Unwind_Exception` of our own -- exception class,
+// cleanup, and the two words libunwind scribbles in -- at the current insertion
+// point. It does not come back: a `_Unwind_RaiseException` that RETURNS means
+// no handler was found anywhere on the stack, which for this compiler is a bug
+// in the driver's own catch-all rather than a program error.
+//
+// ⛔ EMITTED INLINE AT EVERY RAISE rather than called. A function of its own
+// puts one more activation between the raise and the handler, and the unwinder
+// pays for an activation twice -- once to ask its personality whether it
+// handles this, once to step through it.
+void emitRaiseCarrier(SupportBuilder &b) {
+  // sizeof(_Unwind_Exception): the class word, the cleanup pointer and the two
+  // private words. Over-aligned to 16, which the Itanium ABI requires of it.
+  mlir::Value carrier =
+      b.call("malloc", b.ptr(), mlir::ValueRange{b.iconst(32)}).front();
+  // "LYTHPY01" -- the vendor half is ours, so no C++ runtime mistakes this for
+  // one of its own and reads a header that is not there.
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.iconst(0x4C59544850593031LL), carrier,
+                              /*alignment=*/8);
+  mlir::Value cleanupSlot = mlir::LLVM::GEPOp::create(
+      b.builder, b.loc, b.ptr(), b.i64(), carrier,
+      llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(1)});
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              b.addrOf("LyEH_CarrierCleanup"), cleanupSlot,
+                              /*alignment=*/8);
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
+                             "_Unwind_RaiseException",
+                             mlir::ValueRange{carrier});
+}
 
 // ---------------------------------------------------------------------------
 // The exception payload and the chain node (declared in SupportBuilder.h).
@@ -2931,6 +2959,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildTracebackSupport(support);
   declareEHSupport(support);
   buildCurrentExceptionClassIdUnchecked(support);
+  buildCarrierCleanup(support);
   buildEndNativeCatchIfActive(support);
   buildThrowException(support);
   buildBeginCatch(support);
