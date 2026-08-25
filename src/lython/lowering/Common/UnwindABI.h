@@ -10,6 +10,8 @@
 // and nowhere else.
 
 #include "llvm/ADT/StringRef.h"
+
+#include <cstdint>
 #include "llvm/TargetParser/Triple.h"
 
 namespace py::runtime_library {
@@ -18,6 +20,26 @@ namespace py::runtime_library {
 // carrier on its way past knows not to read a `__cxa_exception` header in
 // front of it.
 inline constexpr std::uint64_t kLythonExceptionClass = 0x4C59544850593031ULL;
+
+// The exception carrier: the 32 bytes `_Unwind_Exception` requires, followed by
+// what the personality remembers about the frames it has already read.
+//
+// The call-site table is read linearly, so a raise pays for the entries in front
+// of it; the answer depends on nothing but the return address, so it is worth
+// keeping. Direct-mapped by return address, and IN THE CARRIER because a
+// carrier belongs to one in-flight exception -- no lock, no thread-local, and
+// the entries stay valid for the life of the process, so a carrier handed back
+// by a catch is worth more than a fresh one.
+namespace eh_carrier {
+inline constexpr std::int64_t kHeaderBytes = 32;
+inline constexpr std::int64_t kMemoOffset = kHeaderBytes;
+inline constexpr std::int64_t kMemoEntries = 8;
+// return address, landing pad address, action, action table start, type table
+// base.
+inline constexpr std::int64_t kMemoEntryBytes = 40;
+inline constexpr std::int64_t kTotalBytes =
+    kHeaderBytes + kMemoEntries * kMemoEntryBytes;
+} // namespace eh_carrier
 
 inline constexpr llvm::StringRef kPythonPersonalityName = "LyEH_Personality";
 inline constexpr llvm::StringRef kItaniumPersonalityName =
