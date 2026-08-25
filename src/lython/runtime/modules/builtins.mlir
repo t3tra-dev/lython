@@ -362,7 +362,7 @@ module attributes {
                     "rsplit", "rsplit", "rsplit", "splitlines", "splitlines",
                     "partition", "rpartition", "__hash__", "__format__", "__ascii__",
                     "__fmt_next__", "__fmt_prefix__", "__fmt_tail__", "__fmt_conv__", "__fmt_spec__",
-                    "__fmt_end__", "__fmt_pick__"],
+                    "__fmt_end__", "__fmt_pick__", "__ly_iadd__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -460,7 +460,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -481,7 +482,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance"]
+                    "instance", "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -1634,7 +1635,7 @@ module attributes {
   func.func private @__ly_exc_message_parts(%header: memref<3xi64>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "message_parts", ly.runtime.result_contract = "builtins.str"} {
     %slot = arith.constant 6 : i64
     %two = arith.constant 2 : i64
-    %prefix = arith.constant 24 : i64
+    %prefix = func.call @__ly_unicode_data_offset() : () -> i64
     %msg_ptr = func.call @__ly_exc_ext_get(%header, %slot) : (memref<3xi64>, i64) -> i64
     %words = func.call @__ly_global_view_i64(%msg_ptr, %two) : (i64, i64) -> memref<?xi64>
     %msg_header = memref.cast %words : memref<?xi64> to memref<2xi64>
@@ -10156,7 +10157,8 @@ module attributes {
   //   [0,16)               header [refcount, class id = 4]
   //   [16,24)              shape word: (data byte count << 3) | width, where
   //                        width is 1 (latin-1) / 2 (UCS-2) / 4 (UCS-4)
-  //   [24, 24+len*width)   little-endian code units
+  //   [24,32)              capacity: data bytes the block has room for
+  //   [32, 32+capacity)    little-endian code units
   // The shape word lives OUTSIDE the two-word header (rather than in spare
   // bits of header[1]) because header[1] is the class id that boxed payload
   // handles, repr dispatch and the release hook compare by equality.
@@ -10168,23 +10170,53 @@ module attributes {
   // back. Three bits are enough for the width, and nothing else was using the
   // other sixty-one.
   //
-  // Why NOT a fourth word: it is 8 bytes on every string in the program, and
-  // the box saves 16 per BOXED string, so a program whose strings mostly sit in
-  // variables would pay for one that puts them in containers.
+  // ⭐ AND THE CAPACITY IS RECORDED, WHICH IS WHAT `s += x` NEEDS. CPython's
+  // `unicode_concatenate` resizes the left operand in place when it holds the
+  // only reference; `resize_compact` gets to call realloc, and this cannot --
+  // the memory-safety argument (BoxLayout.h) rests on no allocation moving
+  // under a held word. Room the block already has is the way to append without
+  // moving, so the block carries how much it has.
+  //
+  // Why NOT a fourth word: it is 8 bytes on every string in the program. What
+  // it buys is the difference between O(n) and O(n^2) for an accumulating
+  // append, measured at 160,000 appends of ten bytes: 2.20 s -> the linear
+  // path, against CPython's 0.01 s.
+  //
+  // ⛔ THE CAPACITY IS NOT SLACK BY DEFAULT. Every constructor here asks for
+  // exactly what it stores, so a program that never appends pays the word and
+  // nothing else; `LyUnicode_IAdd` is the only caller that asks for room, and
+  // only when it has already had to move once.
+  //
   // Canonical-form invariant: every constructor picks the smallest width that
   // fits the widest code point, so equal strings always have identical width
-  // and identical code-unit bytes (equality can stay bytewise).
+  // and identical code-unit bytes (equality can stay bytewise). Capacity is not
+  // part of it -- two equal strings may have different room after them.
+  func.func private @__ly_unicode_data_offset() -> i64 {
+    %offset = arith.constant 32 : i64
+    func.return %offset : i64
+  }
+
   func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"} {
     %data_bytes = arith.muli %count, %width : i64
+    %header, %bytes = func.call @__ly_unicode_alloc_capacity(%count, %width, %data_bytes) : (i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_unicode_alloc_capacity(%count: i64, %width: i64, %capacity: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %data_bytes = arith.muli %count, %width : i64
+    %room = arith.maxsi %capacity, %data_bytes : i64
     %byte_count = arith.index_cast %data_bytes : i64 to index
-    %block_prefix = arith.constant 24 : index
-    %block_bytes = arith.addi %byte_count, %block_prefix : index
+    %room_index = arith.index_cast %room : i64 to index
+    %block_prefix = arith.constant 32 : index
+    %block_bytes = arith.addi %room_index, %block_prefix : index
     %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
     %header_offset = arith.constant 0 : index
     %width_offset = arith.constant 16 : index
-    %bytes_offset = arith.constant 24 : index
+    %capacity_offset = arith.constant 24 : index
+    %bytes_offset = arith.constant 32 : index
     %header = memref.view %block[%header_offset][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<2xi64>
     %width_view = memref.view %block[%width_offset][] : memref<?xi8> to memref<1xi64>
+    %capacity_view = memref.view %block[%capacity_offset][] : memref<?xi8> to memref<1xi64>
     %bytes = memref.view %block[%bytes_offset][%byte_count] : memref<?xi8> to memref<?xi8>
     %one = arith.constant 1 : i64
     %layout_str = arith.constant 4 : i64
@@ -10197,6 +10229,7 @@ module attributes {
     memref.store %one, %header[%refcount_slot] : memref<2xi64>
     memref.store %layout_str, %header[%layout_slot] : memref<2xi64>
     memref.store %shape, %width_view[%width_slot] : memref<1xi64>
+    memref.store %room, %capacity_view[%width_slot] : memref<1xi64>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -10225,10 +10258,35 @@ module attributes {
   // not have to carry them. One of these per multi-lane contract is what the
   // box's own width rests on.
   func.func private @__ly_unicode_lane_words(%hdr_ptr: i64) -> (i64, i64) attributes {ly.runtime.contract = "builtins.str", ly.runtime.primitive = "lane_words"} {
-    %prefix = arith.constant 24 : i64
+    %prefix = func.call @__ly_unicode_data_offset() : () -> i64
     %bytes_ptr = arith.addi %hdr_ptr, %prefix : i64
     %byte_len = func.call @__ly_unicode_raw_bytes(%hdr_ptr) : (i64) -> i64
     func.return %bytes_ptr, %byte_len : i64, i64
+  }
+
+  // Data bytes the block has room for (`__ly_unicode_alloc_capacity`).
+  func.func private @__ly_unicode_raw_capacity(%hdr_ptr: i64) -> i64 {
+    %offset = arith.constant 24 : i64
+    %addr = arith.addi %hdr_ptr, %offset : i64
+    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
+    %capacity = llvm.load %llptr : !llvm.ptr -> i64
+    func.return %capacity : i64
+  }
+
+  // Republishes the length after an in-place append. The width does not move --
+  // an append that would widen the string does not take the in-place path.
+  func.func private @__ly_unicode_set_bytes(%hdr_ptr: i64, %byte_len: i64) {
+    %sixteen = arith.constant 16 : i64
+    %shift = arith.constant 3 : i64
+    %mask = arith.constant 7 : i64
+    %shape = func.call @__ly_unicode_shape_word(%hdr_ptr) : (i64) -> i64
+    %width = arith.andi %shape, %mask : i64
+    %shifted = arith.shli %byte_len, %shift : i64
+    %next = arith.ori %shifted, %width : i64
+    %addr = arith.addi %hdr_ptr, %sixteen : i64
+    %llptr = llvm.inttoptr %addr : i64 to !llvm.ptr
+    llvm.store %next, %llptr : i64, !llvm.ptr
+    func.return
   }
 
   // Byte length of a str's code-unit buffer, recovered from the block rather
@@ -10908,9 +10966,17 @@ module attributes {
   // `__ly_unicode_put` each dispatch on the width and reassemble the value a
   // byte at a time, so copying one string into another cost two calls and a
   // branch per character where CPython, when the two kinds agree, calls
-  // memcpy. This loop is the shape LLVM's loop-idiom recognition turns into
-  // one, and the widths agree in every case that matters: an ASCII string
+  // memcpy. The widths agree in every case that matters: an ASCII string
   // concatenated with an ASCII string, sliced, joined or repeated.
+  //
+  // ⛔ IT DOES NOT BECOME A `memcpy`, WHICH THIS SAID IT WOULD. The claim was
+  // that the loop is the shape loop-idiom recognition rewrites; disassembling
+  // the O2 output says otherwise -- the two memrefs may alias for all LLVM
+  // knows, so what comes out is a VECTORIZED copy behind a runtime overlap
+  // check, not a call. That is fast enough to be beside the point: 400,000
+  // concatenations of a thousand bytes take 0.02 s against CPython's 0.03 s.
+  // The note is here because the wrong reason for a right number is how the
+  // next change to this loop gets argued.
   //
   // Why NOT call memcpy directly: the manifest would have to declare it and
   // hand it raw addresses, and the pipeline rejects a descriptor built inline
@@ -10949,6 +11015,95 @@ module attributes {
       }
     }
     func.return
+  }
+
+  // ⭐ CPython's `unicode_concatenate` (ceval.c): when the left operand holds
+  // the ONLY reference, `s += x` appends into the block it already has instead
+  // of building a new string, which is what makes an accumulating append linear
+  // rather than quadratic. Measured at 160,000 appends of ten bytes, the
+  // allocating path is 2.20 s.
+  //
+  // ⛔ THE UNIQUENESS TEST IS THE REFCOUNT AND THE CALL SITE TOGETHER, and
+  // neither alone is enough. A refcount of one does NOT mean unique here: a
+  // borrowed parameter is passed without a bump, so `def f(p): p += x` would
+  // see one and rewrite the CALLER's string. The lowering therefore only routes
+  // to this function when the receiver bundle is OWNED by the frame -- the
+  // frame's own reference is the one being counted -- and hands a borrowed one
+  // to `__add__` instead. The refcount then answers the other half: `t = s;
+  // s += x` leaves t's reference behind, the count is two, and the append
+  // allocates so t keeps what it had.
+  //
+  // ⛔ AND THE RECEIVER IS BORROWED, not transferred. Transferring is what this
+  // means, but saying it that way makes the frame's rebinding a release of a
+  // consumed token -- the affine verifier refuses `s += x` in a loop and on a
+  // parameter for that reason, in the two shapes that matter most. Borrowing
+  // and retaining the result instead leaves the call the same shape as
+  // `__add__`, which every one of those places already accepts.
+  //
+  // ⛔ AND NOT `memref.realloc`. Growing in place is the whole point, and a
+  // realloc moves the block -- the memory-safety argument (BoxLayout.h) rests
+  // on no allocation moving under a held word, so the room has to be there
+  // already. That is what the capacity word is for.
+  func.func @LyUnicode_IAdd(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__ly_iadd__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %one = arith.constant 1 : i64
+    %refcount_slot = arith.constant 0 : index
+    %refcount = memref.load %lhs_header[%refcount_slot] : memref<2xi64>
+    %unique = arith.cmpi eq, %refcount, %one : i64
+    %lhs_width = func.call @__ly_unicode_width(%lhs_header) : (memref<2xi64>) -> i64
+    %rhs_width = func.call @__ly_unicode_width(%rhs_header) : (memref<2xi64>) -> i64
+    %same_kind = arith.cmpi sle, %rhs_width, %lhs_width : i64
+    %lhs_len = func.call @__ly_unicode_count(%lhs_header, %lhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %rhs_len = func.call @__ly_unicode_count(%rhs_header, %rhs_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
+    %total_len = arith.addi %lhs_len, %rhs_len : i64
+    %lhs_ptr_index = memref.extract_aligned_pointer_as_index %lhs_header : memref<2xi64> -> index
+    %lhs_ptr = arith.index_cast %lhs_ptr_index : index to i64
+    %capacity = func.call @__ly_unicode_raw_capacity(%lhs_ptr) : (i64) -> i64
+    %needed = arith.muli %total_len, %lhs_width : i64
+    %has_room = arith.cmpi sle, %needed, %capacity : i64
+    %rhs_ptr_index = memref.extract_aligned_pointer_as_index %rhs_header : memref<2xi64> -> index
+    %rhs_ptr = arith.index_cast %rhs_ptr_index : index to i64
+    // `s += s` reads the block it is writing into. The two runs do not overlap
+    // -- the source ends where the destination begins -- but the source's own
+    // length word moves under the copy, so the self case takes the other path.
+    %distinct = arith.cmpi ne, %lhs_ptr, %rhs_ptr : i64
+    %kind_ok = arith.andi %unique, %same_kind : i1
+    %usable = arith.andi %kind_ok, %distinct : i1
+    %in_place = arith.andi %usable, %has_room : i1
+    %result:2 = scf.if %in_place -> (memref<2xi64>, memref<?xi8>) {
+      %data_offset = func.call @__ly_unicode_data_offset() : () -> i64
+      %data_ptr = arith.addi %lhs_ptr, %data_offset : i64
+      %grown = func.call @__ly_global_view_i8(%data_ptr, %needed) : (i64, i64) -> memref<?xi8>
+      %lhs_at = arith.index_cast %lhs_len : i64 to index
+      %rhs_upper = arith.index_cast %rhs_len : i64 to index
+      func.call @__ly_unicode_copy_run(%grown, %lhs_width, %lhs_at, %rhs_bytes, %rhs_width, %c0, %rhs_upper) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+      func.call @__ly_unicode_set_bytes(%lhs_ptr, %needed) : (i64, i64) -> ()
+      // The result is a reference of its own: the caller releases the binding
+      // this grew out of, and that binding and the result are the same object.
+      %retained = memref.cast %lhs_header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
+      func.call @Ly_IncRef(%retained) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
+      scf.yield %lhs_header, %grown : memref<2xi64>, memref<?xi8>
+    } else {
+      // ⭐ THE ONLY PLACE THAT ASKS FOR SLACK, and it asks the way CPython's
+      // list_resize does: an eighth over, plus a floor. A string that is never
+      // appended to is allocated exactly, so the capacity word costs it 8 bytes
+      // and no more; one that IS appended to stops paying per append after the
+      // first move.
+      %width = arith.maxsi %lhs_width, %rhs_width : i64
+      %exact = arith.muli %total_len, %width : i64
+      %eighth_shift = arith.constant 3 : i64
+      %eighth = arith.shrui %exact, %eighth_shift : i64
+      %floor = arith.constant 32 : i64
+      %slack = arith.addi %exact, %eighth : i64
+      %room = arith.addi %slack, %floor : i64
+      %header, %bytes = func.call @__ly_unicode_alloc_capacity(%total_len, %width, %room) : (i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %lhs_upper = arith.index_cast %lhs_len : i64 to index
+      %rhs_upper = arith.index_cast %rhs_len : i64 to index
+      func.call @__ly_unicode_copy_run(%bytes, %width, %c0, %lhs_bytes, %lhs_width, %c0, %lhs_upper) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+      func.call @__ly_unicode_copy_run(%bytes, %width, %lhs_upper, %rhs_bytes, %rhs_width, %c0, %rhs_upper) : (memref<?xi8>, i64, index, memref<?xi8>, i64, index, index) -> ()
+      scf.yield %header, %bytes : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"} {

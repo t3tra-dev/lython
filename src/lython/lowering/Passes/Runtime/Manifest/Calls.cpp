@@ -37,6 +37,34 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
            << "runtime method receiver has no concrete contract";
   }
 
+  // ⭐ `__ly_iadd__` IS ONLY ITSELF WHEN THE FRAME OWNS THE RECEIVER. It is
+  // `str`'s in-place append, and appending in place is sound exactly when the
+  // reference being appended to is the frame's own: a BORROWED receiver is
+  // passed without a refcount bump, so the runtime uniqueness test inside it
+  // reads one for a parameter whose caller is still holding the string.
+  //
+  //     def build() -> str:
+  //         s = ""
+  //         for i in range(5): s += "x"      # leaves slack in the block
+  //         return s
+  //     def add(p: str) -> str:
+  //         p += "!"                         # would grow into the caller's
+  //         return p
+  //     a = build(); b = add(a); print(a)    # printed "xxxxx!", CPython "xxxxx"
+  //
+  // A borrowed one takes `__add__`, which allocates. The two have the same
+  // signature and the same answer; they differ only in whether the left operand
+  // may be the storage.
+  if (methodName == "__ly_iadd__") {
+    const RuntimeBundle *concrete =
+        RuntimeBundleLowerer::concreteObjectForOwnership(receiver);
+    bool frameOwns =
+        concrete && concrete->kind == RuntimeBundle::Kind::Object &&
+        concrete->objectValue.ownership == ownership::OwnershipKind::Own;
+    if (!frameOwns)
+      methodName = "__add__";
+  }
+
   llvm::ArrayRef<RuntimeSymbol> methods =
       manifest.methodCandidates(receiverContract, methodName);
   if (methods.empty()) {

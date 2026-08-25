@@ -828,16 +828,28 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       llvm::StringRef opKind;
       llvm::StringRef contract;
       llvm::StringRef method;
+      // Whether the call ANSWERS with the new value. A container's in-place
+      // dunder mutates and the name keeps naming the same object; a str's
+      // cannot -- it appends into the block it has when it holds the only
+      // reference and allocates when it does not, so which object the name ends
+      // up on is the call's answer rather than a foregone conclusion.
+      bool rebinds;
     };
     static constexpr InPlaceRewrite kInPlaceRewrites[] = {
-        {"BitOr", "builtins.dict", "update"},
-        {"Add", "builtins.list", "extend"},
+        {"BitOr", "builtins.dict", "update", false},
+        {"Add", "builtins.list", "extend", false},
         // set's four, which were missing and silently rebound a fresh set:
         // `a |= {9}` left every alias of `a` holding the old one.
-        {"BitOr", "builtins.set", "update"},
-        {"Sub", "builtins.set", "difference_update"},
-        {"BitAnd", "builtins.set", "intersection_update"},
-        {"BitXor", "builtins.set", "symmetric_difference_update"},
+        {"BitOr", "builtins.set", "update", false},
+        {"Sub", "builtins.set", "difference_update", false},
+        {"BitAnd", "builtins.set", "intersection_update", false},
+        {"BitXor", "builtins.set", "symmetric_difference_update", false},
+        // ⭐ `s += x` IS THE ONE PLACE A STR CAN GROW WITHOUT COPYING, and it is
+        // a rewrite rather than a dunder because CPython has no `str.__iadd__`
+        // either -- it specializes BINARY_OP in the interpreter, on exactly the
+        // condition this rewrite encodes: the name is about to be rebound, so
+        // the frame is giving up its reference.
+        {"Add", "builtins.str", "__ly_iadd__", true},
     };
     // ⭐ A SLICE TARGET TAKES NO IN-PLACE ROUTE. `a[i:j] += [99]` is
     // `a[i:j] = a[i:j] + [99]` in CPython -- a slice ASSIGNMENT -- and reading
@@ -853,14 +865,22 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       if (const parser::Node *targetSliceNode = ast::node(*target, "slice"))
         sliceTargetSubscript = targetSliceNode->kind == "Slice";
     llvm::StringRef inPlaceMethod;
+    bool inPlaceRebinds = false;
     if (!sliceTargetSubscript)
       for (const InPlaceRewrite &rewrite : kInPlaceRewrites)
         if (op->kind == rewrite.opKind &&
-            exprHasContract(target.get(), rewrite.contract))
+            exprHasContract(target.get(), rewrite.contract)) {
           inPlaceMethod = rewrite.method;
+          inPlaceRebinds = rewrite.rebinds;
+        }
     if (!inPlaceMethod.empty()) {
       parser::NodePtr updateAttr = synth::attribute(target, std::string(inPlaceMethod), statement.range);
       parser::NodePtr updateCall = synth::call(std::move(updateAttr), std::vector<parser::NodePtr>{rhs}, statement.range);
+      if (inPlaceRebinds) {
+        Value updated = emitExpr(updateCall.get());
+        emitAssignTarget(*target, updated);
+        return;
+      }
       parser::NodePtr updateStatement = synth::exprStmt(std::move(updateCall), statement.range);
       emitStatement(*updateStatement);
       return;
