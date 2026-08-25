@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/TargetParser/Triple.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
@@ -95,7 +96,8 @@ void collectPythonCallSiteRanges(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<PythonCallSiteRange> &callSites);
 bool installPythonExceptionCleanupFrames(
-    llvm::Module &module, llvm::ArrayRef<PythonCallSiteRange> callSites);
+    llvm::Module &module, const llvm::Triple &triple,
+    llvm::ArrayRef<PythonCallSiteRange> callSites);
 void installArmStreamingCompatibleMemoryRoutines(llvm::Module &module);
 
 namespace optimizer::pipeline {

@@ -20,7 +20,10 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "Common/UnwindABI.h"
+
 #include "llvm/IR/Instructions.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
@@ -1117,3 +1120,72 @@ TEST(DriverTest, RepeatedCompileIsStable) {
 }
 
 } // namespace
+
+// Every landing pad is a pure cleanup or a catch-ALL, and the personality that
+// reads them counts on it: `LyEH_Personality` decides "this frame catches" from
+// the presence of an action record alone and never looks at a type table, so a
+// clause naming a type would be silently treated as if it named everything.
+TEST(DriverTest, EveryLandingPadIsCleanupOrCatchAll) {
+  CompileResult result = compileSource("def boom() -> int:\n"
+                                       "    raise ValueError('x')\n"
+                                       "\n"
+                                       "def run() -> int:\n"
+                                       "    try:\n"
+                                       "        return boom()\n"
+                                       "    except ValueError:\n"
+                                       "        return 1\n"
+                                       "    except KeyError:\n"
+                                       "        return 2\n"
+                                       "    finally:\n"
+                                       "        print('done')\n"
+                                       "\n"
+                                       "print(run())\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+
+  unsigned pads = 0;
+  for (llvm::Function &function : *result.verified.llvmModule)
+    for (llvm::BasicBlock &block : function) {
+      auto *pad = block.getLandingPadInst();
+      if (!pad)
+        continue;
+      ++pads;
+      EXPECT_TRUE(pad->getNumClauses() > 0 || pad->isCleanup())
+          << "a landing pad in " << function.getName().str()
+          << " that neither cleans up nor catches is never entered";
+      for (unsigned index = 0; index < pad->getNumClauses(); ++index) {
+        EXPECT_TRUE(pad->isCatch(index))
+            << "a filter clause (an exception specification) in "
+            << function.getName().str()
+            << ": LyEH_Personality has no path for one";
+        EXPECT_TRUE(pad->getClause(index)->isNullValue())
+            << "a typed catch clause in " << function.getName().str()
+            << ": LyEH_Personality reads no type table, so this would catch "
+               "everything";
+      }
+    }
+  EXPECT_GT(pads, 0u) << "the program above must produce landing pads at all";
+}
+
+// The personality is chosen from the target, in one place, and both sides ask
+// the same question -- the pass that names it here and the support builder that
+// defines it. A target that cannot have the Python one keeps the C++ ABI's.
+TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
+  CompileResult result = compileSource("try:\n"
+                                       "    raise ValueError('x')\n"
+                                       "except ValueError:\n"
+                                       "    print('caught')\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+
+  llvm::Triple host(llvm::sys::getDefaultTargetTriple());
+  llvm::StringRef expected = py::runtime_library::personalityNameFor(host);
+  unsigned checked = 0;
+  for (llvm::Function &function : *result.verified.llvmModule) {
+    if (!function.hasPersonalityFn())
+      continue;
+    ++checked;
+    EXPECT_EQ(function.getPersonalityFn()->getName(), expected);
+  }
+  EXPECT_GT(checked, 0u);
+}

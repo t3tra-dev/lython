@@ -5,6 +5,7 @@
 
 #include "Common/ExceptionABI.h"
 #include "Common/MemRef1D.h"
+#include "Common/UnwindABI.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -130,10 +131,11 @@ struct SupportBuilder {
   mlir::Location loc;
   mlir::ModuleOp module;
   HostTargetLayout host;
+  llvm::Triple triple;
 
   SupportBuilder(mlir::ModuleOp module, const llvm::Triple &triple)
       : builder(module.getContext()), loc(builder.getUnknownLoc()),
-        module(module), host(hostTargetLayout(triple)) {}
+        module(module), host(hostTargetLayout(triple)), triple(triple) {}
 
   mlir::Type f64() { return builder.getF64Type(); }
   mlir::Type i64() { return builder.getIntegerType(64); }

@@ -1,5 +1,6 @@
 #include "Common/PythonSourceRange.h"
 #include "Common/RuntimeSupport.h"
+#include "Common/UnwindABI.h"
 
 #include "Ownership.h"
 
@@ -209,13 +210,22 @@ llvm::FunctionCallee beginPythonCatch(llvm::Module &module) {
   return module.getOrInsertFunction("LyEH_BeginCatch", type);
 }
 
-llvm::Constant *gxxPersonality(llvm::Module &module) {
+// ⛔ Takes the triple rather than reading `module.getTargetTriple()`. This pass
+// runs on the LLVM IR the moment it is translated, BEFORE the runtime support
+// module is linked in and before the driver stamps the triple on it -- so
+// neither the definition nor the triple is in the module to ask. Both sides
+// call UnwindABI.h with the same triple instead.
+llvm::Constant *pythonPersonality(llvm::Module &module,
+                                  const llvm::Triple &triple) {
   llvm::LLVMContext &context = module.getContext();
   llvm::FunctionType *type =
       llvm::FunctionType::get(llvm::Type::getInt32Ty(context),
                               /*isVarArg=*/true);
   return llvm::cast<llvm::Constant>(
-      module.getOrInsertFunction("__gxx_personality_v0", type).getCallee());
+      module
+          .getOrInsertFunction(py::runtime_library::personalityNameFor(triple),
+                               type)
+          .getCallee());
 }
 
 llvm::Constant *globalCStringPtr(llvm::IRBuilder<> &builder,
@@ -347,7 +357,8 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
 // difference is where it unwinds -- a cleanup that re-raises, or the enclosing
 // try's catch dispatch.
 bool convertCallToPythonInvoke(
-    llvm::CallInst &call, llvm::ArrayRef<PythonCallSiteRange> callSites,
+    llvm::CallInst &call, const llvm::Triple &triple,
+    llvm::ArrayRef<PythonCallSiteRange> callSites,
     llvm::function_ref<llvm::BasicBlock *(llvm::BasicBlock *,
                                           llvm::DILocation &)>
         buildUnwindDest) {
@@ -363,7 +374,8 @@ bool convertCallToPythonInvoke(
     return false;
 
   llvm::Function *function = call.getFunction();
-  function->setPersonalityFn(gxxPersonality(*function->getParent()));
+  function->setPersonalityFn(
+      pythonPersonality(*function->getParent(), triple));
 
   auto splitPoint = call.getIterator();
   ++splitPoint;
@@ -390,9 +402,10 @@ bool convertCallToPythonInvoke(
 }
 
 bool convertCallToPythonInvoke(llvm::CallInst &call,
+                               const llvm::Triple &triple,
                                llvm::ArrayRef<PythonCallSiteRange> callSites) {
   return convertCallToPythonInvoke(
-      call, callSites,
+      call, triple, callSites,
       [&](llvm::BasicBlock *normalDest, llvm::DILocation &debugLoc) {
         buildPythonCleanupBlock(call, normalDest, debugLoc,
                                 matchCallSiteRange(call, callSites, debugLoc));
@@ -428,10 +441,11 @@ bool rewriteTryCatchAnchor(llvm::CallInst &call) {
 }
 
 bool convertCallToPythonTryInvoke(
-    llvm::CallInst &call, const PythonTryCallMarker &marker,
+    llvm::CallInst &call, const llvm::Triple &triple,
+    const PythonTryCallMarker &marker,
     llvm::ArrayRef<PythonCallSiteRange> callSites) {
   return convertCallToPythonInvoke(
-      call, callSites,
+      call, triple, callSites,
       [&](llvm::BasicBlock *, llvm::DILocation &debugLoc) {
         return buildPythonCatchDispatchBlock(
             call, marker.catchBlock, debugLoc,
@@ -471,7 +485,8 @@ void collectPythonCallSiteRanges(
 }
 
 bool installPythonExceptionCleanupFrames(
-    llvm::Module &module, llvm::ArrayRef<PythonCallSiteRange> callSites) {
+    llvm::Module &module, const llvm::Triple &triple,
+    llvm::ArrayRef<PythonCallSiteRange> callSites) {
   llvm::SmallVector<llvm::CallInst *, 16> calls;
   llvm::SmallVector<llvm::CallInst *, 8> anchors;
   llvm::SmallVector<llvm::CallInst *, 16> callSiteMarkers;
@@ -537,13 +552,13 @@ bool installPythonExceptionCleanupFrames(
         PythonTryCallMarker marker{markerInfo->second.id,
                                    markerInfo->second.marker,
                                    target->second.block};
-        if (convertCallToPythonTryInvoke(*call, marker, callSites)) {
+        if (convertCallToPythonTryInvoke(*call, triple, marker, callSites)) {
           changed = true;
           continue;
         }
       }
     }
-    changed |= convertCallToPythonInvoke(*call, callSites);
+    changed |= convertCallToPythonInvoke(*call, triple, callSites);
   }
   for (auto &entry : catchTargets)
     if (entry.second.marker)

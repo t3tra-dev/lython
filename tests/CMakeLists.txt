@@ -194,6 +194,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
+    "DriverTest.EveryLandingPadIsCleanupOrCatchAll"
+    "DriverTest.ThePersonalityIsTheOneTheTargetCanHave"
     "DriverTest.EveryCallIntoTheEHRuntimeMatchesItsDefinition"
     "DriverTest.AModuleGlobalsPointerCellHoldsAPointer"
     "DriverTest.AParkedExceptionIsReachedByPointer"

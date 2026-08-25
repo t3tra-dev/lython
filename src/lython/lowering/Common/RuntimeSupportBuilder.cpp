@@ -1655,6 +1655,26 @@ void declareEHSupport(SupportBuilder &b) {
   // already allocated -- and Lython was at 3.2 us.
   declareLLVMExternal(b, "_Unwind_RaiseException", b.i32(), {b.ptr()});
   declareLLVMExternal(b, "_Unwind_DeleteException", {}, {b.ptr()});
+  if (usePythonPersonality(b.triple)) {
+    // What the personality reads the frame through. All four spell
+    // `_Unwind_Ptr` as i64, which is why UnwindABI.h keeps this off 32-bit
+    // targets.
+    b.declareExternal("_Unwind_GetLanguageSpecificData",
+                      b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
+    b.declareExternal("_Unwind_GetRegionStart",
+                      b.builder.getFunctionType({b.ptr()}, {b.i64()}));
+    b.declareExternal("_Unwind_GetIP",
+                      b.builder.getFunctionType({b.ptr()}, {b.i64()}));
+    b.declareExternal("_Unwind_SetIP",
+                      b.builder.getFunctionType({b.ptr(), b.i64()}, {}));
+    b.declareExternal("_Unwind_SetGR", b.builder.getFunctionType(
+                                           {b.ptr(), b.i32(), b.i64()}, {}));
+  }
+  // ⛔ Declared even where the Python personality exists, because
+  // `LyRunPythonMain` still uses it -- see the note there. An
+  // `llvm.func` whose `personality` names a symbol nothing declares
+  // segfaults MLIR's translator rather than failing verification, so this
+  // declaration is load-bearing in a way nothing downstream would report.
   declareLLVMExternal(b, "__gxx_personality_v0", b.i32(), {},
                       /*isVarArg=*/true);
 
@@ -2443,8 +2463,17 @@ void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name,
 }
 
 // i32 LyRunPythonMain(ptr entry): installs the stack guard, invokes the
-// program body under the C++ personality, and prints the Python traceback (or
-// the native-exception notice) for anything that unwinds out.
+// program body, and prints the Python traceback (or the native-exception
+// notice) for anything that unwinds out.
+//
+// ⛔ THE ONE FRAME THAT KEEPS THE C++ PERSONALITY. `LyEH_Personality` refuses a
+// carrier whose exception class is not ours, so a C++ exception raised behind a
+// ctypes call unwinds past every Python frame -- running their cleanups, being
+// caught by none of them -- which is what "never silently mis-execute" asks
+// for. It then has to be caught SOMEWHERE, or the unwinder terminates the
+// process with no message at all, and this is the frame that reports it. One
+// unwind of one frame per program run pays the C++ ABI's price; the Python
+// frames do not.
 void buildRunPythonMain(SupportBuilder &b) {
   auto fn = beginLLVMFunction(b, "LyRunPythonMain", b.i32(), {b.ptr()});
   fn.setPersonalityAttr(mlir::FlatSymbolRefAttr::get(b.builder.getContext(),
@@ -2664,6 +2693,300 @@ void buildRunPythonMain(SupportBuilder &b) {
                                mlir::ValueRange{b.iconst32(1)});
 }
 
+// One encoded field of an LSDA table, and the pointer just past it. LLVM emits
+// the call-site table as uleb128 where the assembler has LEB128 directives and
+// udata4 where it does not, so both are read here rather than in two copies of
+// the scan.
+void buildEHReadField(SupportBuilder &b) {
+  auto fn = b.beginFunction("ly_eh_read_field",
+                            b.builder.getFunctionType({b.ptr(), b.i32()},
+                                                      {b.i64(), b.ptr()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *fixed = b.builder.createBlock(&body);
+  mlir::Block *step = b.builder.createBlock(&body, {}, {b.i64(), b.i64(), b.ptr()},
+                                            {b.loc, b.loc, b.loc});
+  mlir::Block *done =
+      b.builder.createBlock(&body, {}, {b.i64(), b.ptr()}, {b.loc, b.loc});
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value cursor = entry->getArgument(0);
+  mlir::Value isUdata4 = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                                entry->getArgument(1), b.iconst32(0x03));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, isUdata4, fixed, mlir::ValueRange{}, step,
+      mlir::ValueRange{b.iconst(0), b.iconst(0), cursor});
+
+  b.builder.setInsertionPointToEnd(fixed);
+  mlir::Value word =
+      mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i32(), cursor,
+                                 /*alignment=*/1)
+          .getResult();
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, done,
+      mlir::ValueRange{mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
+                                                  word),
+                       b.gepI8(cursor, b.iconst(4))});
+
+  b.builder.setInsertionPointToEnd(step);
+  mlir::Value acc = step->getArgument(0);
+  mlir::Value shift = step->getArgument(1);
+  mlir::Value at = step->getArgument(2);
+  mlir::Value wide =
+      mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(), b.loadI8(at));
+  mlir::Value merged = mlir::arith::OrIOp::create(
+      b.builder, b.loc, acc,
+      mlir::arith::ShLIOp::create(
+          b.builder, b.loc,
+          mlir::arith::AndIOp::create(b.builder, b.loc, wide, b.iconst(0x7f)),
+          shift));
+  mlir::Value next = b.gepI8(at, b.iconst(1));
+  mlir::Value more = b.cmpi(
+      mlir::arith::CmpIPredicate::ne,
+      mlir::arith::AndIOp::create(b.builder, b.loc, wide, b.iconst(0x80)),
+      b.iconst(0));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, more, step,
+      mlir::ValueRange{merged,
+                       mlir::arith::AddIOp::create(b.builder, b.loc, shift,
+                                                   b.iconst(7)),
+                       next},
+      done, mlir::ValueRange{merged, next});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{done->getArgument(0), done->getArgument(1)});
+}
+
+// ⭐ THE ONLY CLAUSE THIS COMPILER EMITS IS A CATCH-ALL. Every landing pad
+// Passes/Runtime/Cleanup/EH.cpp builds is either pure cleanup (no clause) or
+// `catch (...)` (a null clause): a Python `except` names Python classes, which
+// `LyEH_CurrentExceptionMatches` decides after the landing pad, and there is no
+// second language on this stack whose types a clause could name. So "does this
+// call site have an action at all" IS the match, and the type table exists only
+// to be stepped over.
+//
+// `__gxx_personality_v0` cannot know that. It reads the type table's base and
+// encoding, walks the action chain, decodes a `std::type_info` pointer per
+// action and calls its `can_catch`, checks the exception class to decide
+// whether a `__cxa_exception` header sits in front of the carrier, and handles
+// exception-specification clauses -- to reach the same answer. The scan of the
+// call-site table below is the part that has to happen; the rest of that is
+// what this drops.
+//
+// ⛔ It refuses rather than guesses. An LSDA whose landing pads are relative to
+// something other than the function start, or whose call sites are in an
+// encoding LLVM has never emitted for a DWARF target, aborts -- a personality
+// that returns the wrong landing pad resumes the program at an address of its
+// own invention, which is the one failure this compiler will not risk.
+void buildPythonPersonality(SupportBuilder &b) {
+  EHDataRegisters regs = ehDataRegisters(b.triple);
+  auto fn = b.beginFunction(
+      kPythonPersonalityName,
+      b.builder.getFunctionType({b.i32(), b.i32(), b.i64(), b.ptr(), b.ptr()},
+                                {b.i32()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *haveLSDA = b.builder.createBlock(&body);
+  mlir::Block *skipTypeTable =
+      b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  mlir::Block *readHeader =
+      b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  mlir::Block *scan = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  mlir::Block *readSite = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  mlir::Block *found =
+      b.builder.createBlock(&body, {}, {b.i64(), b.i64()}, {b.loc, b.loc});
+  mlir::Block *searchPhase =
+      b.builder.createBlock(&body, {}, {b.i64()}, {b.loc});
+  mlir::Block *cleanupPhase =
+      b.builder.createBlock(&body, {}, {b.i64(), b.i64()}, {b.loc, b.loc});
+  mlir::Block *install =
+      b.builder.createBlock(&body, {}, {b.i64(), b.i64()}, {b.loc, b.loc});
+  mlir::Block *keepWalking = b.builder.createBlock(&body);
+  mlir::Block *refuse = b.builder.createBlock(&body);
+
+  // _URC_CONTINUE_UNWIND
+  b.builder.setInsertionPointToEnd(keepWalking);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(8)});
+  b.builder.setInsertionPointToEnd(refuse);
+  b.emitTrap(b.i32());
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value actions =
+      mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
+                                 entry->getArgument(1));
+  mlir::Value carrierClass = entry->getArgument(2);
+  mlir::Value carrier = entry->getArgument(3);
+  mlir::Value context = entry->getArgument(4);
+  mlir::Value lsda = b.call("_Unwind_GetLanguageSpecificData", b.ptr(),
+                            mlir::ValueRange{context})
+                         .front();
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, b.ptrEq(lsda, b.nullPtr()),
+                                 keepWalking, mlir::ValueRange{}, haveLSDA,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(haveLSDA);
+  // DW_EH_PE_omit: landing pads are relative to the function start, the only
+  // form LLVM emits for a DWARF target.
+  mlir::Value lpOmitted = b.cmpi(mlir::arith::CmpIPredicate::eq,
+                                 b.loadI8(lsda), b.iconst8(-1));
+  mlir::Value afterLPStart = b.gepI8(lsda, b.iconst(1));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, lpOmitted, skipTypeTable,
+                                 mlir::ValueRange{afterLPStart}, refuse,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(skipTypeTable);
+  mlir::Value ttEncodingAt = skipTypeTable->getArgument(0);
+  mlir::Value afterTTEncoding = b.gepI8(ttEncodingAt, b.iconst(1));
+  mlir::Block *stepOverTTBase =
+      b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
+  b.builder.setInsertionPointToEnd(skipTypeTable);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, b.loadI8(ttEncodingAt),
+             b.iconst8(-1)),
+      readHeader, mlir::ValueRange{afterTTEncoding}, stepOverTTBase,
+      mlir::ValueRange{afterTTEncoding});
+  b.builder.setInsertionPointToEnd(stepOverTTBase);
+  auto skipped = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                        mlir::ValueRange{stepOverTTBase->getArgument(0),
+                                         b.iconst32(0x01)});
+  mlir::cf::BranchOp::create(b.builder, b.loc, readHeader,
+                             mlir::ValueRange{skipped[1]});
+
+  b.builder.setInsertionPointToEnd(readHeader);
+  mlir::Value encodingAt = readHeader->getArgument(0);
+  mlir::Value siteEncoding = mlir::LLVM::ZExtOp::create(
+      b.builder, b.loc, b.i32(), b.loadI8(encodingAt));
+  mlir::Value knownEncoding = b.orBit(
+      b.cmpi(mlir::arith::CmpIPredicate::eq, siteEncoding, b.iconst32(0x01)),
+      b.cmpi(mlir::arith::CmpIPredicate::eq, siteEncoding, b.iconst32(0x03)));
+  auto tableLength =
+      b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+             mlir::ValueRange{b.gepI8(encodingAt, b.iconst(1)),
+                              b.iconst32(0x01)});
+  mlir::Value tableEnd = b.gepI8(tableLength[1], tableLength[0]);
+  mlir::Value regionStart =
+      b.call("_Unwind_GetRegionStart", b.i64(), mlir::ValueRange{context})
+          .front();
+  // The unwinder reports the RETURN address; the call that may transfer to a
+  // pad here is the byte before it.
+  mlir::Value offset = mlir::arith::SubIOp::create(
+      b.builder, b.loc,
+      mlir::arith::SubIOp::create(
+          b.builder, b.loc,
+          b.call("_Unwind_GetIP", b.i64(), mlir::ValueRange{context}).front(),
+          b.iconst(1)),
+      regionStart);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, knownEncoding, scan,
+                                 mlir::ValueRange{tableLength[1]}, refuse,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(scan);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::uge, b.ptrToInt(scan->getArgument(0)),
+             b.ptrToInt(tableEnd)),
+      keepWalking, mlir::ValueRange{}, readSite,
+      mlir::ValueRange{scan->getArgument(0)});
+
+  b.builder.setInsertionPointToEnd(readSite);
+  auto siteStart = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                          mlir::ValueRange{readSite->getArgument(0),
+                                           siteEncoding});
+  auto siteLength = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                           mlir::ValueRange{siteStart[1], siteEncoding});
+  auto sitePad = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                        mlir::ValueRange{siteLength[1], siteEncoding});
+  auto siteAction = b.call("ly_eh_read_field", {b.i64(), b.ptr()},
+                           mlir::ValueRange{sitePad[1], b.iconst32(0x01)});
+  mlir::Value hit = mlir::arith::AndIOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::uge, offset, siteStart[0]),
+      b.cmpi(mlir::arith::CmpIPredicate::ult, offset,
+             mlir::arith::AddIOp::create(b.builder, b.loc, siteStart[0],
+                                         siteLength[0])));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, hit, found,
+      mlir::ValueRange{sitePad[0], siteAction[0]}, scan,
+      mlir::ValueRange{siteAction[1]});
+
+  b.builder.setInsertionPointToEnd(found);
+  mlir::Value padOffset = found->getArgument(0);
+  mlir::Value action = found->getArgument(1);
+  mlir::Value searching = b.cmpi(
+      mlir::arith::CmpIPredicate::ne,
+      mlir::arith::AndIOp::create(b.builder, b.loc, actions, b.iconst(1)),
+      b.iconst(0));
+  mlir::Block *havePad = b.builder.createBlock(&body);
+  b.builder.setInsertionPointToEnd(found);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, padOffset, b.iconst(0)),
+      keepWalking, mlir::ValueRange{}, havePad, mlir::ValueRange{});
+  b.builder.setInsertionPointToEnd(havePad);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, searching, searchPhase,
+                                 mlir::ValueRange{action}, cleanupPhase,
+                                 mlir::ValueRange{padOffset, action});
+
+  b.builder.setInsertionPointToEnd(searchPhase);
+  // A carrier from another language passes through: nothing put its payload in
+  // `g_current_parts`, so a catch-all that took it would hand the handler an
+  // exception object nobody built.
+  mlir::Value handlerHere = mlir::arith::AndIOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::ne, searchPhase->getArgument(0),
+             b.iconst(0)),
+      b.cmpi(mlir::arith::CmpIPredicate::eq, carrierClass,
+             b.iconst(static_cast<std::int64_t>(kLythonExceptionClass))));
+  // _URC_HANDLER_FOUND / _URC_CONTINUE_UNWIND
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{mlir::arith::SelectOp::create(
+          b.builder, b.loc, handlerHere, b.iconst32(6), b.iconst32(8))});
+
+  b.builder.setInsertionPointToEnd(cleanupPhase);
+  // _UA_HANDLER_FRAME is what the search phase promised. Without it, a call
+  // site that catches belongs to a frame this exception is only passing
+  // through -- and a forced unwind, which never sets it, must run cleanups
+  // without ever being caught.
+  mlir::Value entersPad = b.orBit(
+      b.cmpi(mlir::arith::CmpIPredicate::eq, cleanupPhase->getArgument(1),
+             b.iconst(0)),
+      b.cmpi(mlir::arith::CmpIPredicate::ne,
+             mlir::arith::AndIOp::create(b.builder, b.loc, actions,
+                                         b.iconst(4)),
+             b.iconst(0)));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, entersPad, install,
+      mlir::ValueRange{cleanupPhase->getArgument(0),
+                       cleanupPhase->getArgument(1)},
+      keepWalking, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(install);
+  b.call("_Unwind_SetGR", {},
+         mlir::ValueRange{context, b.iconst32(regs.exception),
+                          b.ptrToInt(carrier)});
+  b.call("_Unwind_SetGR", {},
+         mlir::ValueRange{context, b.iconst32(regs.selector),
+                          mlir::arith::SelectOp::create(
+                              b.builder, b.loc,
+                              b.cmpi(mlir::arith::CmpIPredicate::eq,
+                                     install->getArgument(1), b.iconst(0)),
+                              b.iconst(0), b.iconst(1))});
+  b.call("_Unwind_SetIP", {},
+         mlir::ValueRange{context,
+                          mlir::arith::AddIOp::create(
+                              b.builder, b.loc, regionStart,
+                              install->getArgument(0))});
+  // _URC_INSTALL_CONTEXT
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.iconst32(7)});
+}
+
 } // namespace
 
 // Hands the unwinder a `_Unwind_Exception` of our own -- exception class,
@@ -2681,11 +3004,10 @@ void emitRaiseCarrier(SupportBuilder &b) {
   // private words. Over-aligned to 16, which the Itanium ABI requires of it.
   mlir::Value carrier =
       b.call("malloc", b.ptr(), mlir::ValueRange{b.iconst(32)}).front();
-  // "LYTHPY01" -- the vendor half is ours, so no C++ runtime mistakes this for
-  // one of its own and reads a header that is not there.
-  mlir::LLVM::StoreOp::create(b.builder, b.loc,
-                              b.iconst(0x4C59544850593031LL), carrier,
-                              /*alignment=*/8);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc,
+      b.iconst(static_cast<std::int64_t>(kLythonExceptionClass)), carrier,
+      /*alignment=*/8);
   mlir::Value cleanupSlot = mlir::LLVM::GEPOp::create(
       b.builder, b.loc, b.ptr(), b.i64(), carrier,
       llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(1)});
@@ -2958,6 +3280,10 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
       "retain_payload_slot_ptr");
   buildTracebackSupport(support);
   declareEHSupport(support);
+  if (usePythonPersonality(support.triple)) {
+    buildEHReadField(support);
+    buildPythonPersonality(support);
+  }
   buildCurrentExceptionClassIdUnchecked(support);
   buildCarrierCleanup(support);
   buildEndNativeCatchIfActive(support);
