@@ -1,0 +1,13 @@
+16 16 16
+True 1
+['the quick brown ', ''] ('the quick brown ', 'fox', '') ('the quick brown ', 'fox', '')
+the quick brown cat
+the quick brown kitten
+0 0 x
+-1 abc
+2 2 abC
+2 4 3
+bbb
+-1 0 
+3 3 abc!
+0 bab

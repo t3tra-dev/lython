@@ -11229,7 +11229,130 @@ module attributes {
   // `"a" * 19 + "b"`) 11.4 ms here against 12.9 there. A filtered scan is
   // within a third of it on the first and ahead on the second, which is not
   // what four hundred lines of factorization buys back.
+  // ⭐ THE SAME WALK WITH BYTE LOADS, for the case where both strings are
+  // latin-1. `__ly_unicode_get` is a call and a width branch, the walk does two
+  // of them per position and `__ly_unicode_match_at` another two per candidate,
+  // and the widths do not change inside any of those loops. Profiling
+  // `s.replace("the", "THE!")` put 82% of the time in this function.
+  //
+  // Why NOT a width parameter and one body: the branch is what costs, so the
+  // body has to be picked before the loop rather than inside it.
+  func.func private @__ly_unicode_find_fwd_bytes(%s_bytes: memref<?xi8>, %t_bytes: memref<?xi8>, %start: i64, %end: i64, %n: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %minus_one = arith.constant -1 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %true = arith.constant true
+    %false = arith.constant false
+    %mlast = arith.subi %n, %one : i64
+    %mlast_index = arith.index_cast %mlast : i64 to index
+    %last = memref.load %t_bytes[%mlast_index] : memref<?xi8>
+    %last_cp = arith.extui %last : i8 to i64
+    %pre:2 = scf.for %k = %c0 to %mlast_index step %c1 iter_args(%mask = %zero, %gap = %mlast) -> (i64, i64) {
+      %b = memref.load %t_bytes[%k] : memref<?xi8>
+      %cp = arith.extui %b : i8 to i64
+      %next_mask = func.call @__ly_unicode_bloom_add(%mask, %cp) : (i64, i64) -> i64
+      %same = arith.cmpi eq, %b, %last : i8
+      %k64 = arith.index_cast %k : index to i64
+      %behind = arith.subi %mlast, %k64 : i64
+      %candidate = arith.subi %behind, %one : i64
+      %next_gap = arith.select %same, %candidate, %gap : i64
+      scf.yield %next_mask, %next_gap : i64, i64
+    }
+    %mask = func.call @__ly_unicode_bloom_add(%pre#0, %last_cp) : (i64, i64) -> i64
+    %gap_step = arith.addi %pre#1, %one : i64
+    %long_step = arith.addi %n, %one : i64
+    %n_index = arith.index_cast %n : i64 to index
+    %w = arith.subi %end, %n : i64
+    // ⛔ THE BOUNDS TEST ON THE LOOKAHEAD IS HOISTED OUT, because it can only
+    // fail at one position. The character the bloom filter asks about is
+    // `s[i + n]`, which is inside the haystack for every `i < w` and past its
+    // end at exactly `i == w` -- so the walk runs to `w` without the test and
+    // the last alignment is checked after it. CPython does not have this branch
+    // at all: its buffers carry a NUL sentinel and it reads one past the window
+    // unconditionally.
+    %walk:2 = scf.while (%i = %start, %ans = %minus_one) : (i64, i64) -> (i64, i64) {
+      %in_range = arith.cmpi slt, %i, %w : i64
+      %not_yet = arith.cmpi eq, %ans, %minus_one : i64
+      %go = arith.andi %in_range, %not_yet : i1
+      scf.condition(%go) %i, %ans : i64, i64
+    } do {
+    ^bb0(%i: i64, %ans: i64):
+      %at = arith.addi %i, %mlast : i64
+      %at_index = arith.index_cast %at : i64 to index
+      %b = memref.load %s_bytes[%at_index] : memref<?xi8>
+      %is_last = arith.cmpi eq, %b, %last : i8
+      %nextpos = arith.addi %at, %one : i64
+      %next_index = arith.index_cast %nextpos : i64 to index
+      %nb = memref.load %s_bytes[%next_index] : memref<?xi8>
+      %ncp = arith.extui %nb : i8 to i64
+      %present = func.call @__ly_unicode_bloom_has(%mask, %ncp) : (i64, i64) -> i1
+      %skippable = arith.xori %present, %true : i1
+      %step:2 = scf.if %is_last -> (i64, i64) {
+        %i_index = arith.index_cast %i : i64 to index
+        %hit = scf.for %j = %c0 to %n_index step %c1 iter_args(%acc = %true) -> (i1) {
+          %sj = arith.addi %i_index, %j : index
+          %sb = memref.load %s_bytes[%sj] : memref<?xi8>
+          %tb = memref.load %t_bytes[%j] : memref<?xi8>
+          %eq = arith.cmpi eq, %sb, %tb : i8
+          %next = arith.andi %acc, %eq : i1
+          scf.yield %next : i1
+        }
+        %after:2 = scf.if %hit -> (i64, i64) {
+          scf.yield %i, %i : i64, i64
+        } else {
+          %chosen = arith.select %skippable, %long_step, %gap_step : i64
+          %ni = arith.addi %i, %chosen : i64
+          scf.yield %ni, %ans : i64, i64
+        }
+        scf.yield %after#0, %after#1 : i64, i64
+      } else {
+        %chosen = arith.select %skippable, %long_step, %one : i64
+        %ni = arith.addi %i, %chosen : i64
+        scf.yield %ni, %ans : i64, i64
+      }
+      scf.yield %step#0, %step#1 : i64, i64
+    }
+    // The last alignment, whose lookahead would be past the end. Nothing skips
+    // from here, so only the compare is left.
+    %missed = arith.cmpi eq, %walk#1, %minus_one : i64
+    %reached = arith.cmpi sle, %walk#0, %w : i64
+    %check_last = arith.andi %missed, %reached : i1
+    %answer = scf.if %check_last -> (i64) {
+      %tail_index = arith.index_cast %w : i64 to index
+      %hit = scf.for %j = %c0 to %n_index step %c1 iter_args(%acc = %true) -> (i1) {
+        %sj = arith.addi %tail_index, %j : index
+        %sb = memref.load %s_bytes[%sj] : memref<?xi8>
+        %tb = memref.load %t_bytes[%j] : memref<?xi8>
+        %eq = arith.cmpi eq, %sb, %tb : i8
+        %next = arith.andi %acc, %eq : i1
+        scf.yield %next : i1
+      }
+      %found = arith.select %hit, %w, %minus_one : i64
+      scf.yield %found : i64
+    } else {
+      scf.yield %walk#1 : i64
+    }
+    func.return %answer : i64
+  }
+
   func.func private @__ly_unicode_find_fwd(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64) -> i64 {
+    %one_w = arith.constant 1 : i64
+    %s_narrow = arith.cmpi eq, %s_width, %one_w : i64
+    %t_narrow = arith.cmpi eq, %t_width, %one_w : i64
+    %both_narrow = arith.andi %s_narrow, %t_narrow : i1
+    %picked = scf.if %both_narrow -> (i64) {
+      %r = func.call @__ly_unicode_find_fwd_bytes(%s_bytes, %t_bytes, %start, %end, %n) : (memref<?xi8>, memref<?xi8>, i64, i64, i64) -> i64
+      scf.yield %r : i64
+    } else {
+      %r = func.call @__ly_unicode_find_fwd_wide(%s_bytes, %s_width, %t_bytes, %t_width, %start, %end, %n) : (memref<?xi8>, i64, memref<?xi8>, i64, i64, i64, i64) -> i64
+      scf.yield %r : i64
+    }
+    func.return %picked : i64
+  }
+
+  func.func private @__ly_unicode_find_fwd_wide(%s_bytes: memref<?xi8>, %s_width: i64, %t_bytes: memref<?xi8>, %t_width: i64, %start: i64, %end: i64, %n: i64) -> i64 {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
@@ -11409,12 +11532,20 @@ module attributes {
       %target = func.call @__ly_unicode_get(%t_bytes, %t_width, %c0) : (memref<?xi8>, i64, index) -> i64
       %last_pos = arith.subi %end, %one : i64
       %from = arith.select %reverse, %last_pos, %start : i64
-      // ⭐ A LATIN-1 HAYSTACK IS SCANNED AS BYTES, which is what CPython reaches
-      // memchr for. `__ly_unicode_get` is a call and a width branch per
+      // ⭐ A LATIN-1 HAYSTACK IS SCANNED AS BYTES, which is the shape CPython
+      // reaches memchr for. `__ly_unicode_get` is a call and a width branch per
       // position, and the width does not change inside the loop; taking it out
-      // leaves a byte compare LLVM can vectorize. Every ASCII string is here,
-      // and so is every caller that searches one -- find, split, partition,
-      // replace, count, index.
+      // leaves a byte compare. Every ASCII string is here, and so is every
+      // caller that searches one -- find, split, partition, replace, count,
+      // index.
+      //
+      // ⛔ AND CALLING `memchr` ITSELF IS SLOWER, measured rather than reasoned.
+      // The loop cannot vectorize -- it exits when it finds the byte -- so a
+      // libc call that does looks like the answer. It is not: the callers that
+      // matter search SHORT spans. `s.replace("o", "0")` over 880 characters is
+      // sixty searches of about fourteen bytes each, and a call per search cost
+      // more than the scan it replaced: 0.13 s -> 0.19 s, and `find` plus
+      // `split` over the same string 0.59 s -> 0.80 s.
       %byte_wide = arith.cmpi eq, %s_width, %one : i64
       %found = scf.if %byte_wide -> (i64) {
         %byte_max = arith.constant 255 : i64
@@ -17320,6 +17451,7 @@ module attributes {
 
   // OS entropy (macOS libSystem / glibc >= 2.25).
   func.func private @getentropy(%buffer: !llvm.ptr, %length: i64) -> i32
+
 
   func.func private @__ly_hash_secret_keys() -> (i64, i64) {
     %c0 = arith.constant 0 : index

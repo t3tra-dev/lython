@@ -52,7 +52,8 @@ void markBoxLayoutHelpersAlwaysInline(llvm::Module &module) {
       continue;
     llvm::StringRef name = function.getName();
     if (name.starts_with("__ly_box_") || name == "__ly_unicode_copy_run" ||
-        name == "__ly_unicode_copy_bytes")
+        name == "__ly_unicode_copy_bytes" || name == "__ly_unicode_get" ||
+        name == "__ly_unicode_put")
       function.addFnAttr(llvm::Attribute::AlwaysInline);
   }
 }
