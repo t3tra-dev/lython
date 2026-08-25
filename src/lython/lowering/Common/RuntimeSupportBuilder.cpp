@@ -1827,9 +1827,16 @@ void buildEndNativeCatchIfActive(SupportBuilder &b) {
 // while another exception is handled that did not go through the lowering's
 // explicit stash — e.g. a runtime-internal raise) becomes the new exception's
 // implicit __context__.
-void buildThrowException(SupportBuilder &b) {
+// The half of a raise that is not the unwind: the exception becomes the
+// current one, and any exception it interrupted becomes its context.
+//
+// ⭐ SPLIT OUT SO A RAISE CAUGHT IN ITS OWN ACTIVATION CAN STOP THERE. A `try`
+// whose body raises has the handler in the same frame, and the unwinder was
+// being asked to find a landing pad the compiler could already name -- two
+// stack walks, per raise, to arrive back where it started.
+void buildRecordException(SupportBuilder &b) {
   auto fn = b.beginFunction(
-      "LyEH_ThrowException",
+      "LyEH_RecordException",
       b.builder.getFunctionType(exceptionTripleTypes(b.builder), {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -1851,6 +1858,17 @@ void buildThrowException(SupportBuilder &b) {
       b.builder, b.loc,
       mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1).getResult(),
       flagSlot, /*alignment=*/4);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+void buildThrowException(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "LyEH_ThrowException",
+      b.builder.getFunctionType(exceptionTripleTypes(b.builder), {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::func::CallOp::create(b.builder, b.loc, "LyEH_RecordException",
+                             mlir::TypeRange{}, entry->getArguments());
   emitRaiseCarrier(b);
   // The raise does not return; the trailing return only satisfies the
   // verifier, which is why this is not `llvm.unreachable`.
@@ -3486,6 +3504,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildCurrentExceptionClassIdUnchecked(support);
   buildCarrierCleanup(support);
   buildEndNativeCatchIfActive(support);
+  buildRecordException(support);
   buildThrowException(support);
   buildBeginCatch(support);
   buildBorrowCurrentException(support);

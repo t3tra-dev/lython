@@ -104,6 +104,10 @@ void installArmStreamingCompatibleMemoryRoutines(llvm::Module &module);
 // program that are neither ours nor the C library's.
 void collectCtypesForeignSymbols(mlir::ModuleOp module,
                                  llvm::SmallVectorImpl<std::string> &symbols);
+// Turns a raise whose handler is in the same frame into a call that returns to
+// that handler. Runs once the runtime is linked, so the raise primitives have
+// bodies to read.
+bool branchLocalRaisesToTheirHandler(llvm::Module &module);
 void markCLibraryDeclarationsNonUnwinding(
     llvm::Module &module, llvm::ArrayRef<std::string> foreignSymbols);
 

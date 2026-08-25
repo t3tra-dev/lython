@@ -1,0 +1,8 @@
+caught a
+propagated 'b'
+after finally c
+['finally']
+exit ran
+after with d
+chained 'f'
+second 'g'

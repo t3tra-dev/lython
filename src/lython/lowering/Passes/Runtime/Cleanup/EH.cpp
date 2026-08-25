@@ -9,6 +9,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
@@ -490,6 +491,10 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
   if (recordsFrame)
     emitTracebackPush(builder, *module, site, debugLoc);
   builder.CreateBr(catchDest);
+  // Marked so a later pass can find the pads that CATCH, once the runtime is
+  // linked and the raise primitives have bodies to read.
+  landingPad->setMetadata("ly.catch",
+                          llvm::MDNode::get(context, {}));
   return landing;
 }
 
@@ -637,6 +642,98 @@ void markCLibraryDeclarationsNonUnwinding(
       continue;
     function.setDoesNotThrow();
   }
+}
+
+namespace {
+
+// The block a catch pad hands control to once it has taken the exception. The
+// shape is the one `buildPythonCatchDispatchBlock` built, and nothing has run
+// between: a plain branch, or the selector test whose handler arm branches.
+llvm::BasicBlock *dispatchBlockOf(llvm::LandingPadInst *pad) {
+  auto *branch = llvm::dyn_cast<llvm::BranchInst>(pad->getParent()->getTerminator());
+  if (!branch)
+    return nullptr;
+  if (branch->isUnconditional())
+    return branch->getSuccessor(0);
+  auto *handling =
+      llvm::dyn_cast<llvm::BranchInst>(branch->getSuccessor(1)->getTerminator());
+  return handling && handling->isUnconditional() ? handling->getSuccessor(0)
+                                                 : nullptr;
+}
+
+// A raise primitive that does nothing but hand the triple to
+// `LyEH_ThrowException`. Every one in the manifests is written that way; this
+// READS the body rather than trusting the convention, because a fat one would
+// have work that a caller branching past the throw would skip.
+bool isThinRaiseWrapper(llvm::Function &function) {
+  if (function.isDeclaration() || function.size() != 1)
+    return false;
+  llvm::BasicBlock &entry = function.getEntryBlock();
+  auto instruction = entry.begin();
+  auto *call = llvm::dyn_cast<llvm::CallInst>(&*instruction);
+  if (!call || !call->getCalledFunction() ||
+      call->getCalledFunction()->getName() != "LyEH_ThrowException")
+    return false;
+  if (call->arg_size() != function.arg_size())
+    return false;
+  for (unsigned index = 0; index < call->arg_size(); ++index)
+    if (call->getArgOperand(index) != function.getArg(index))
+      return false;
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&*std::next(instruction));
+  return ret && !ret->getReturnValue();
+}
+
+} // namespace
+
+// ⭐ A RAISE CAUGHT IN ITS OWN ACTIVATION IS A BRANCH. `try: raise ValueError`
+// puts the raise and the handler in one frame, and the whole unwinder was being
+// asked to find a landing pad already named in the same function -- a search
+// phase and a cleanup phase, each walking every frame's call-site table, to
+// arrive at a block a few instructions away.
+//
+// The raise becomes `LyEH_RecordException`, which is the half of a raise that
+// is not the unwind, and the call returns to the dispatch chain instead of
+// landing there. The chain tests the arms exactly as it would have; if none
+// match it calls `LyEH_RethrowCurrent`, which raises for real.
+//
+// ⛔ The call STAYS AN INVOKE. Recording an exception can itself unwind (the
+// interrupted exception becomes a context, and building that allocates), and
+// that unwind still has to reach this frame's pad. Only the NORMAL edge moves.
+//
+// ⛔ And only when the raise's unwind edge is the try's catch pad. A `with` or
+// a `finally` in between makes the edge a cleanup instead, and that cleanup has
+// to run; the edge being the catch pad is the proof that nothing else does.
+bool branchLocalRaisesToTheirHandler(llvm::Module &module) {
+  llvm::Function *record = module.getFunction("LyEH_RecordException");
+  if (!record)
+    return false;
+  bool changed = false;
+  for (llvm::Function &function : module)
+    for (llvm::BasicBlock &block : function) {
+      auto *invoke = llvm::dyn_cast<llvm::InvokeInst>(block.getTerminator());
+      if (!invoke)
+        continue;
+      llvm::Function *callee = invoke->getCalledFunction();
+      if (!callee || callee->getFunctionType() != record->getFunctionType())
+        continue;
+      if (callee != module.getFunction("LyEH_ThrowException") &&
+          !(isPythonRuntimeRaiseCall(callee) && isThinRaiseWrapper(*callee)))
+        continue;
+      auto *pad = invoke->getUnwindDest()->getLandingPadInst();
+      if (!pad || !pad->getMetadata("ly.catch"))
+        continue;
+      llvm::BasicBlock *dispatch = dispatchBlockOf(pad);
+      // A dispatch chain reached from two places would need its incoming
+      // values merged, and nothing here builds one.
+      if (!dispatch || !dispatch->phis().empty() ||
+          dispatch == invoke->getNormalDest())
+        continue;
+      invoke->getNormalDest()->removePredecessor(&block);
+      invoke->setNormalDest(dispatch);
+      invoke->setCalledFunction(record);
+      changed = true;
+    }
+  return changed;
 }
 
 void collectCtypesForeignSymbols(mlir::ModuleOp module,

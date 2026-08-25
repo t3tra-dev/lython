@@ -1,5 +1,6 @@
 #include "Common/RuntimeLibrary.h"
 
+#include "Common/RuntimeSupport.h"
 #include "Common/RuntimeSupportBuilder.h"
 #include "embedded.h"
 
@@ -368,6 +369,8 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
   for (std::size_t index = 0; index < embedded::extraModuleCount(); ++index)
     if (mlir::failed(linkEntry(embedded::extraModules()[index])))
       return mlir::failure();
+
+  py::branchLocalRaisesToTheirHandler(llvmModule);
 
   if (sawPlatformNativeSupport && !linkedPlatformNativeSupport) {
     llvm::errs() << "error: no embedded native runtime support module matches "
