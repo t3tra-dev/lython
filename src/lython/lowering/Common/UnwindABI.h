@@ -10,9 +10,9 @@
 // and nowhere else.
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <cstdint>
-#include "llvm/TargetParser/Triple.h"
 
 namespace py::runtime_library {
 
@@ -39,44 +39,8 @@ inline constexpr std::int64_t kMemoEntries = 8;
 inline constexpr std::int64_t kMemoEntryBytes = 40;
 inline constexpr std::int64_t kMemoBytes = kMemoEntries * kMemoEntryBytes;
 
-// And after the memo, the machine state a walk of our own carries: the
-// callee-saved registers an intervening frame may have spilled, plus where that
-// frame is and where it came from. A landing pad entered without these is a
-// function reading someone else's registers.
-inline constexpr std::int64_t kContextOffset = kMemoOffset + kMemoBytes;
-inline constexpr std::int64_t kContextIntRegs = 0;   // x19..x28
-inline constexpr std::int64_t kContextFPRegs = 80;   // d8..d15
-inline constexpr std::int64_t kContextFP = 144;
-inline constexpr std::int64_t kContextSP = 152;
-inline constexpr std::int64_t kContextPC = 160;
-inline constexpr std::int64_t kContextLR = 168;
-inline constexpr std::int64_t kContextPad = 176;
-inline constexpr std::int64_t kContextSelector = 184;
-inline constexpr std::int64_t kContextCarrier = 192;
-inline constexpr std::int64_t kContextHandler = 200;
-inline constexpr std::int64_t kContextActive = 208;
-inline constexpr std::int64_t kContextBytes = 216;
-
-inline constexpr std::int64_t kTotalBytes = kContextOffset + kContextBytes;
+inline constexpr std::int64_t kTotalBytes = kMemoOffset + kMemoBytes;
 } // namespace eh_carrier
-
-// The parts of `__unwind_info` (mach-o/compact_unwind_encoding.h) this reads.
-namespace compact_unwind {
-inline constexpr std::int64_t kHeaderCommonEncodingsOffset = 4;
-inline constexpr std::int64_t kHeaderCommonEncodingsCount = 8;
-inline constexpr std::int64_t kHeaderPersonalitiesOffset = 12;
-inline constexpr std::int64_t kHeaderIndexOffset = 20;
-inline constexpr std::int64_t kHeaderIndexCount = 24;
-inline constexpr std::int64_t kIndexEntryBytes = 12;
-inline constexpr std::int64_t kSecondLevelKindRegular = 2;
-inline constexpr std::int64_t kSecondLevelKindCompressed = 3;
-
-inline constexpr std::int64_t kHasLSDA = 0x40000000;
-inline constexpr std::int64_t kPersonalityMask = 0x30000000;
-inline constexpr std::int64_t kArm64ModeMask = 0x0F000000;
-inline constexpr std::int64_t kArm64ModeFrame = 0x04000000;
-inline constexpr std::int64_t kArm64StackSizeMask = 0x00FFF000;
-} // namespace compact_unwind
 
 inline constexpr llvm::StringRef kPythonPersonalityName = "LyEH_Personality";
 inline constexpr llvm::StringRef kItaniumPersonalityName =
@@ -111,16 +75,15 @@ inline bool usePythonPersonality(const llvm::Triple &triple) {
   }
 }
 
-// ⛔ Darwin/arm64 only, and this is a floor rather than a preference. The walk
-// reads `__unwind_info` and decodes the arm64 compact encoding to restore
-// x19-x28 and d8-d15; every one of those is a per-platform fact, and a walk
-// that restores the wrong register jumps into a handler holding another
-// function's values. Everywhere else keeps `_Unwind_RaiseException`, which is
-// correct on every target and only slower.
-inline bool useFastUnwinder(const llvm::Triple &triple) {
-  return usePythonPersonality(triple) && triple.isOSDarwin() &&
-         (triple.getArch() == llvm::Triple::aarch64 ||
-          triple.getArch() == llvm::Triple::aarch64_be);
+// Whether making every frame x29-based buys anything. Darwin's linker can
+// describe such a frame in one word of `__unwind_info` -- nine bits naming the
+// callee-saved pairs it spilled -- and falls back to a DWARF CFI program when
+// there is no frame pointer to describe it from. Nothing else this compiler
+// targets has a compact unwind format to reach.
+inline bool framePointersEnableCompactUnwind(const llvm::Triple &triple) {
+  return triple.isOSDarwin() && (triple.getArch() == llvm::Triple::aarch64 ||
+                                 triple.getArch() == llvm::Triple::aarch64_be ||
+                                 triple.getArch() == llvm::Triple::x86_64);
 }
 
 inline EHDataRegisters ehDataRegisters(const llvm::Triple &triple) {

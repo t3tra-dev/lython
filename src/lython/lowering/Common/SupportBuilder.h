@@ -179,17 +179,6 @@ struct SupportBuilder {
   mlir::Value nullPtr() {
     return mlir::LLVM::ZeroOp::create(builder, loc, ptr()).getResult();
   }
-  // The address of a `func.func`. `llvm.mlir.addressof` cannot name one before
-  // the conversion to LLVM has run, and this layer builds both dialects at
-  // once; the cast is reconciled by the same pass that converts the callee.
-  mlir::Value funcAddr(llvm::StringRef name, mlir::FunctionType type) {
-    mlir::Value constant = mlir::func::ConstantOp::create(
-        builder, loc, type,
-        mlir::SymbolRefAttr::get(builder.getContext(), name));
-    return mlir::UnrealizedConversionCastOp::create(builder, loc, ptr(),
-                                                    constant)
-        .getResult(0);
-  }
   mlir::Value addrOf(llvm::StringRef name) {
     return mlir::LLVM::AddressOfOp::create(builder, loc, ptr(), name)
         .getResult();
@@ -220,26 +209,6 @@ struct SupportBuilder {
   mlir::Value loadI32(mlir::Value pointer) {
     return mlir::LLVM::LoadOp::create(builder, loc, i32(), pointer,
                                       /*alignment=*/4);
-  }
-  // Unaligned little-endian table reads, widened: the compact unwind tables are
-  // packed and nothing in them is guaranteed to sit on its own alignment.
-  mlir::Value loadU32At(mlir::Value pointer) {
-    return mlir::LLVM::ZExtOp::create(
-        builder, loc, i64(),
-        mlir::LLVM::LoadOp::create(builder, loc, i32(), pointer,
-                                   /*alignment=*/1)
-            .getResult());
-  }
-  mlir::Value loadU32(mlir::Value pointer, std::int64_t byteOffset) {
-    return loadU32At(gepI8(pointer, iconst(byteOffset)));
-  }
-  mlir::Value loadU16(mlir::Value pointer, std::int64_t byteOffset) {
-    return mlir::LLVM::ZExtOp::create(
-        builder, loc, i64(),
-        mlir::LLVM::LoadOp::create(builder, loc, builder.getIntegerType(16),
-                                   gepI8(pointer, iconst(byteOffset)),
-                                   /*alignment=*/1)
-            .getResult());
   }
   mlir::Value iconst1(bool value) {
     return mlir::arith::ConstantIntOp::create(builder, loc, i1(), value);

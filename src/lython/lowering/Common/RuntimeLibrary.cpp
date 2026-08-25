@@ -1,6 +1,7 @@
 #include "Common/RuntimeLibrary.h"
 
 #include "Common/RuntimeSupport.h"
+#include "Common/UnwindABI.h"
 #include "Common/RuntimeSupportBuilder.h"
 #include "embedded.h"
 
@@ -371,6 +372,8 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
       return mlir::failure();
 
   py::branchLocalRaisesToTheirHandler(llvmModule);
+  if (py::runtime_library::framePointersEnableCompactUnwind(targetTriple))
+    py::forceFramePointers(llvmModule);
 
   if (sawPlatformNativeSupport && !linkedPlatformNativeSupport) {
     llvm::errs() << "error: no embedded native runtime support module matches "

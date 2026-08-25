@@ -108,6 +108,9 @@ void collectCtypesForeignSymbols(mlir::ModuleOp module,
 // that handler. Runs once the runtime is linked, so the raise primitives have
 // bodies to read.
 bool branchLocalRaisesToTheirHandler(llvm::Module &module);
+// Makes every frame walkable from x29, which is what lets a raise read the
+// image's compact unwind table instead of its DWARF.
+void forceFramePointers(llvm::Module &module);
 void markCLibraryDeclarationsNonUnwinding(
     llvm::Module &module, llvm::ArrayRef<std::string> foreignSymbols);
 

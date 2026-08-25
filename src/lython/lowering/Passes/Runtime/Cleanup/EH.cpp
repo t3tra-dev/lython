@@ -736,6 +736,42 @@ bool branchLocalRaisesToTheirHandler(llvm::Module &module) {
   return changed;
 }
 
+// ⭐ A FRAME POINTER IS WHAT MAKES A FRAME CHEAP TO LEAVE. Without one the
+// prologue is sp-relative, and Darwin's compact unwind has no encoding for
+// that -- 84% of a program's functions came out as `UNWIND_ARM64_MODE_DWARF`,
+// which is a CFI program to interpret rather than a bitmask to read. With one
+// they are `MODE_FRAME`: nine bits saying which register pairs were spilled,
+// and x29 pointing at the next frame.
+//
+// The cost is one register and two instructions per function, measured over
+// fourteen benchmarks at 1.020x mean -- and the ones long enough to be signal
+// rather than startup noise at 1.001x, 1.014x and 1.019x. A cross-frame raise
+// goes 2540 ns -> 1811 for it. Programs that never raise pay one to two percent.
+//
+// ⛔ AND THAT IS THE WHOLE OF IT. A walk of this compiler's own was built on top
+// of this and is NOT HERE. It works: it reads `__unwind_info` itself (6.8 ns per
+// frame against the 123 ns `_dyld_find_unwind_sections` costs, which is 60% of a
+// raise), steps frames from the compact encoding, and finds the same landing pad
+// the personality does -- but the step that enters the pad is hand-written
+// assembly, because setting x19-x28, d8-d15, sp and the program counter at once
+// is not something LLVM has a value for. That is one such routine per OS and
+// architecture, none of which LLVM would check, and every one of them able to
+// resume a program in a handler holding another function's registers.
+//
+// What settles it is not the asm but the SHAPE: a walk that sometimes runs and
+// otherwise stands down leaves two unwinders to keep correct, and the one that
+// runs rarely is the one that rots. Everything goes through
+// `_Unwind_RaiseException`. Frame pointers are worth having on their own -- they
+// make the unwinder that IS here read a bitmask instead of interpreting a CFI
+// program, and a profiler can walk the stack too.
+void forceFramePointers(llvm::Module &module) {
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration())
+      continue;
+    function.addFnAttr("frame-pointer", "all");
+  }
+}
+
 void collectCtypesForeignSymbols(mlir::ModuleOp module,
                                  llvm::SmallVectorImpl<std::string> &symbols) {
   module.walk([&](mlir::func::FuncOp function) {
