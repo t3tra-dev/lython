@@ -2723,7 +2723,41 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       //
       // The retain half was repaired in the EMITTER instead
       // (`acquireUnionCarriedTokens`, EmitterLoops.cpp), which is why the
-      // over-release is gone. The missing exit release now shows as a LEAK as
+      // over-release is gone -- though only for `while`: that function is
+      // called from `emitWhile`, `emitFor` AND `emitAsyncFor`, while its
+      // counterpart `releaseUnionCarriedTokens` is called from `emitWhile`
+      // alone. Two of the three loop shapes acquire a token they never
+      // discharge. It cannot be demonstrated on its own today, because a
+      // union carried by a `for` fails on the refusal below before the leak
+      // could be weighed.
+      //
+      // ⛔ THREE THINGS MEASURED 2026-08-26, so the next attempt need not
+      // re-measure them.
+      //
+      // WHAT THE VERIFIER ACCEPTS is not any guarded call. A conditional token
+      // is discharged only where `classifyOwnershipConditionBranch` finds a
+      // `cf.cond_br` whose condition is `arith.cmpi eq/ne` against the tag
+      // (`AffineOwnership.cpp`, the `AffineTokenState::Conditional` arm); it
+      // then splits the walk into an active successor that still owns and an
+      // inactive one that does not. The walk is over BLOCKS, so a release
+      // nested in an `scf.if` REGION -- which is what `forEachActiveUnionMember`
+      // emits, and what `py.decref` on a union lowers to -- is invisible to it.
+      // That is the whole reason `if v is not None:` in the source makes the
+      // release placeable: the narrowing IS such a branch, and nothing else
+      // this pass can emit is.
+      //
+      // RELAXING THE FOUR `g.condition` SKIPS is not enough on its own. With
+      // them removed a strategy IS chosen -- `LYTHON_OWNERSHIP_TRACE_PLACEMENT`
+      // reports `strategy=liveness callee=pick offset=1 lanes=1 conditional=1`
+      // -- and no release appears in the IR: `releaseOwnedGroupByLiveness`
+      // declines further down, at one of the twenty-five bails inside it.
+      //
+      // AND THE GUARD CANNOT BE SPELLED IN `emitGroupRelease`. Splitting its
+      // insertion block to emit the `cf.cond_br` the verifier wants regressed
+      // an unrelated function: `runtime/lib/stackguard_support.py` stopped
+      // building with "owned resource from @LyLong_FromI64 result 0 reaches
+      // function exit without release". The same walk places several releases
+      // in one block, and splitting it under them moves the rest. The missing exit release now shows as a LEAK as
       // well as a refusal, measured 2026-08-14: `pick(None, 3)` over a
       // `while v is not None:` loop leaks 52 B -- the entry retain stands
       // alone when the body never runs -- and `pick(None, None)` is clean,
