@@ -124,11 +124,40 @@ mlir::LogicalResult RuntimeBundleLowerer::appendUnionRuntimeValues(
     if (sourceBundle->physicalValues().empty())
       return op->emitError() << "source union has no runtime tag";
     mlir::Value sourceTag = sourceBundle->physicalValues().front();
+    // ⭐ AN INJECTION THAT MOVES NO MEMBER KEEPS THE TAG'S SSA NAME. The
+    // remapping below is a chain of selects that computes the same number when
+    // every member keeps its index, and the copy is not free: the affine
+    // ownership verifier follows a conditional token's tag across CFG edges by
+    // ALIASING, and `arith.select` aliases its result with its operands but
+    // never with its condition -- which is the only place the source tag
+    // appears in that chain. So a loop-carried optional entered its body with
+    // the tag under a name the walk could not connect to the one the group's
+    // condition names, the `while cur is not None` branch went unclassified,
+    // and the narrowed field read inside was refused as "used before its union
+    // tag proves the payload active".
+    bool memberOrderPreserved =
+        sourceUnion.getMemberTypes().size() ==
+        resultUnion.getMemberTypes().size();
+    if (memberOrderPreserved)
+      for (auto [sourceIndex, sourceMember] :
+           llvm::enumerate(sourceUnion.getMemberTypes())) {
+        std::optional<unsigned> resultIndex =
+            RuntimeBundleLowerer::findUnionMemberIndex(resultUnion,
+                                                       sourceMember);
+        if (!resultIndex || *resultIndex != sourceIndex) {
+          memberOrderPreserved = false;
+          break;
+        }
+      }
     mlir::Value remappedTag =
-        mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)
-            .getResult();
+        memberOrderPreserved
+            ? sourceTag
+            : mlir::arith::ConstantIntOp::create(builder, op->getLoc(), 0, 64)
+                  .getResult();
     for (auto [sourceIndex, sourceMember] :
-         llvm::enumerate(sourceUnion.getMemberTypes())) {
+         llvm::enumerate(memberOrderPreserved
+                             ? llvm::ArrayRef<mlir::Type>{}
+                             : sourceUnion.getMemberTypes())) {
       mlir::FailureOr<unsigned> resultIndex =
           RuntimeBundleLowerer::requireUnionMemberIndex(
               op, resultUnion, sourceMember, "union injection");

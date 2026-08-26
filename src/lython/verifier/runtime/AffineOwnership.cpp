@@ -466,6 +466,19 @@ struct AffinePathState {
   // shape that needed it: a resource produced OUTSIDE a cycle and parked
   // INSIDE it, which is every `for i in ...: for j in ...: out.append(i)`.
   llvm::SmallVector<mlir::Operation *, 2> parkedOps;
+  // ⭐ THE UNION TAG FOLLOWS THE SAME RENAMES AS THE GROUP, and it has to be
+  // carried per path for exactly the reason `views` is. A conditional token is
+  // discharged where `classifyOwnershipConditionBranch` finds a `cf.cond_br`
+  // comparing THE TAG, and a loop carries the tag in a block argument: read
+  // from the resource's fixed condition, the comparison is against the tag's
+  // pre-loop name and the loop's own `while cur is not None` never matches, so
+  // the walk enters the body still Conditional and reports the narrowed field
+  // read as a use before the tag proved the payload active.
+  //
+  // Deliberately NOT part of the visited key, for the same reason `views` is
+  // not: it only refines detections, so merging two states that differ only
+  // here can miss one, never accept unsound IR.
+  llvm::SmallVector<mlir::Value, 1> conditionTag;
 };
 
 struct BorrowedEntryResource {
@@ -2272,6 +2285,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
   initial.retained = 0;
   initial.group = resource.values;
   initial.views = resource.views;
+  if (resource.condition && resource.condition->tag)
+    initial.conditionTag.push_back(resource.condition->tag);
   worklist.push_back(std::move(initial));
 
   // ⛔ KNOWN DEFECT reached through this cap, and the cap is the symptom rather
@@ -2491,9 +2506,11 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
 
       if (state.token == AffineTokenState::Conditional) {
         if (resource.condition) {
+          own::OwnershipCondition pathCondition = *resource.condition;
+          if (!state.conditionTag.empty())
+            pathCondition.tag = state.conditionTag.front();
           if (std::optional<own::OwnershipConditionBranch> branch =
-                  own::classifyOwnershipConditionBranch(op,
-                                                        *resource.condition)) {
+                  own::classifyOwnershipConditionBranch(op, pathCondition)) {
             for (auto [successorIndex, nextToken] :
                  {std::pair<unsigned, AffineTokenState>{
                       branch->activeSuccessor, AffineTokenState::Owned},
@@ -2517,6 +2534,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               next.slotParents = state.slotParents;
               next.parkedUnnamed = state.parkedUnnamed;
               next.parkedOps = state.parkedOps;
+              next.conditionTag = remapGroupForSuccessor(
+                  op, successorIndex, successor, state.conditionTag, aliases);
               worklist.push_back(std::move(next));
             }
             op = nullptr;
@@ -2534,8 +2553,28 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             op = op->getNextNode();
             continue;
           }
+          // ⭐ A RETAIN IS NOT A USE OF THE PAYLOAD. It reads the refcount word
+          // and nothing else, and on the arm where there is no payload the
+          // lanes are the immortal dead placeholder, which `Ly_IncRef` steps
+          // over without a write -- the same reason the retain no longer needs
+          // the tag guard it used to be wrapped in. The obligation this walk is
+          // tracking is unchanged either way: a second reference is a second
+          // token, with its own release.
+          if (callRetainsGroup(contracts, call, state.group, aliases)) {
+            op = op->getNextNode();
+            continue;
+          }
         }
+        // ⭐ AN EFFECT-FREE OP CANNOT HAVE READ THE PAYLOAD. What this check
+        // exists to stop is a dereference of lanes that name no object on the
+        // arm the tag selects, and forming a view of them is not one: the
+        // `memref.subview` and `memref.cast` that spell a retain's header
+        // prefix compute an address and touch nothing. They used to sit inside
+        // the tag's `scf.if` and never reached this walk; with a union's
+        // refcounting no longer guarded they sit in the block, and refusing
+        // them would refuse every retain of a union.
         if (!op->hasTrait<mlir::OpTrait::IsTerminator>() &&
+            !mlir::isMemoryEffectFree(op) &&
             groupContainsOperand(op, state.group, aliases))
           return op->emitError()
                  << "conditionally owned resource from "
@@ -3101,6 +3140,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       // counts, so an edge that keeps the charge must keep its provenance or
       // the same retain would be charged again on the far side.
       next.parkedOps = state.parkedOps;
+      next.conditionTag = remapGroupForSuccessor(op, index, successor,
+                                                 state.conditionTag, aliases);
       next.trail = state.trail;
       worklist.push_back(std::move(next));
     }
