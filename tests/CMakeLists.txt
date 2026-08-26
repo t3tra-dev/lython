@@ -194,6 +194,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.IntReprStringIsReleasedByStrDeallocator"
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
+    "DriverTest.AnOptionalResultCarriesItsPayloadOnce"
     "DriverTest.EveryLandingPadClauseIsAPythonClassOrCatchAll"
     "DriverTest.ShapesThatHandleMoreThanTheyNameStayCatchAll"
     "DriverTest.ABareExceptNamesBaseException"

@@ -651,6 +651,28 @@ mlir::LogicalResult RuntimeBundleLowerer::buildReturnedStaticObjectSummaries() {
 
     if (!sawReturn || !allReturnsSummarized || !objectContract)
       return std::nullopt;
+    // ⛔ NOT FOR A UNION RESULT, and this is what stops an optional from being
+    // a different kind of value. This summary names ONE contract, so a
+    // two-member union produced none and the union's own member lanes carried
+    // the obligation -- stamped with `OwnershipCondition{tag, memberIndex}` by
+    // `collectTypedResourceGroups`, which IS the conditional machinery. A
+    // union with one returning arm -- which is every `T | None` -- produced a
+    // summary instead, and the ABI then appended a SECOND copy of the member
+    // and marked that copy owned, with no tag to condition it on.
+    //
+    // `pick() -> "Node | None"` came out as three lanes returning the same
+    // value twice, `owned_results = [2]` naming the duplicate. Carried across
+    // a loop's back edge it reported "owned resource ... without release"
+    // where `A | B` reported "conditionally owned ... without tag-conditioned
+    // release": one obligation tracked as if it could never be absent, which
+    // for an optional is exactly backwards.
+    if (auto callableType =
+            function->getAttrOfType<mlir::TypeAttr>("callable_type"))
+      if (auto callable =
+              mlir::dyn_cast<py::CallableType>(callableType.getValue()))
+        if (!callable.getResultTypes().empty() &&
+            mlir::isa<py::UnionType>(callable.getResultTypes().front()))
+          return std::nullopt;
     ReturnedStaticObjectSummary summary;
     summary.objectContract = *objectContract;
     summary.resultIndex = 0;

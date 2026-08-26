@@ -1236,14 +1236,9 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             static_cast<std::int64_t>(resultTypes.size()));
         ownedResultContracts.push_back(builder.getStringAttr("builtins.object"));
       }
-      // ⭐ A union with MORE THAN ONE owning member owns its OWN member lanes.
-      // With one, the static-object summary below appends a second copy of
-      // that member and marks THAT owned; the summary carries a single
-      // contract, so with two it produces nothing at all and the obligation
-      // reached the exit unnamed ("conditionally owned resource from @pick3
-      // result 4 reaches function exit"). The union's layout already lays each
-      // member out after the tag, so the lanes to name are there -- what was
-      // missing was naming them.
+      // ⭐ A UNION OWNS ITS OWN MEMBER LANES, HOWEVER MANY OWN ONE. The layout
+      // already lays each member out after the tag, so the lanes to name are
+      // there -- what was missing was naming them.
       //
       // ⛔ Why NOT extend the static-object summary to a list of contracts
       // instead, which is the shape the attribute already takes: that appends
@@ -1253,6 +1248,18 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       // -- `collectTypedResourceGroups` already walks them and already stamps
       // each with its `OwnershipCondition{tag, memberIndex}`, so the whole
       // conditional machinery is reached by declaring the offsets.
+      //
+      // ⛔ AND ONE OWNING MEMBER IS NOT A DIFFERENT CASE. It used to be: with
+      // one, this was skipped and the static-object summary below appended a
+      // second copy of that member and marked THAT owned -- unconditionally,
+      // because the summary has no tag. `T | None` has exactly one owning
+      // member, so EVERY optional took that path: `pick() -> "Node | None"`
+      // came out as three lanes with the owned one at offset 2, which is the
+      // duplicate rather than the union's own, and the tag never reached the
+      // resource. That is why an optional carried across a loop's back edge
+      // reported "owned resource ... without release" where a two-member union
+      // reported "conditionally owned ... without tag-conditioned release":
+      // one obligation was being tracked as if it could not be absent.
       if (auto unionResult =
               mlir::dyn_cast_if_present<py::UnionType>(abiResultType)) {
         llvm::SmallVector<std::pair<std::int64_t, std::string>, 2> memberLanes;
@@ -1271,7 +1278,7 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             memberLanes.emplace_back(memberOffset, runtimeContractName(member));
           memberOffset += static_cast<std::int64_t>(memberTypes->size());
         }
-        if (laid && memberLanes.size() > 1) {
+        if (laid && !memberLanes.empty()) {
           for (const auto &[offset, contract] : memberLanes) {
             ownedResultOffsets.push_back(offset);
             ownedResultContracts.push_back(builder.getStringAttr(contract));

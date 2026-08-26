@@ -1278,3 +1278,46 @@ TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
   }
   EXPECT_GT(checked, 0u);
 }
+
+// An optional result carries its payload ONCE. `T | None` is a union with one
+// arm that returns an object, and that used to send it down a different path
+// from `A | B`: the static-object evidence summary appended a SECOND copy of
+// the payload's lanes and marked that copy owned, with no tag to condition the
+// obligation on. The duplicate is observable in the ABI -- the same value came
+// back twice -- and the ownership consequence was that an optional carried
+// across a loop's back edge was diagnosed as unconditionally owned.
+TEST(DriverTest, AnOptionalResultCarriesItsPayloadOnce) {
+  CompileResult result = compileSource("class Node:\n"
+                                       "    def __init__(self) -> None:\n"
+                                       "        pass\n"
+                                       "\n"
+                                       "def one() -> Node:\n"
+                                       "    return Node()\n"
+                                       "\n"
+                                       "def maybe(flag: bool) -> \"Node | None\":\n"
+                                       "    if flag:\n"
+                                       "        return Node()\n"
+                                       "    return None\n"
+                                       "\n"
+                                       "one()\n"
+                                       "maybe(True)\n"
+                                       "print('ok')\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+  llvm::Function *one = result.verified.llvmModule->getFunction("one");
+  llvm::Function *maybe = result.verified.llvmModule->getFunction("maybe");
+  ASSERT_NE(one, nullptr);
+  ASSERT_NE(maybe, nullptr);
+
+  auto *optional = llvm::dyn_cast<llvm::StructType>(maybe->getReturnType());
+  ASSERT_NE(optional, nullptr) << "an optional result is a tag plus lanes";
+  EXPECT_TRUE(optional->getElementType(0)->isIntegerTy(64))
+      << "the first element of an optional result is its tag";
+  ASSERT_EQ(optional->getNumElements(), 2u)
+      << "an optional result is its tag and ONE copy of the payload; a second "
+         "copy is the static-object evidence summary treating the union as a "
+         "single returned object";
+  EXPECT_EQ(optional->getElementType(1), one->getReturnType())
+      << "the lane after the tag is what the payload is returned as on its "
+         "own";
+}
