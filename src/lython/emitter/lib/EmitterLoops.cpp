@@ -50,6 +50,32 @@ void acquireUnionCarriedTokens(mlir::OpBuilder &builder, mlir::Location loc,
       continue;
     if (!mlir::isa<py::UnionType>(local.type))
       continue;
+    // ⭐ ONLY WHAT THE FRAME DOES NOT ALREADY OWN. The loop's first edge
+    // releases whatever it carried in, and that release is the frame token's
+    // death for a value the frame minted -- so retaining as well leaves the
+    // frame holding two references and spending one.
+    //
+    //     n0 = Node(0); n0.nxt = n1
+    //     cur: Optional[Node] = n0
+    //     while cur is not None: cur = cur.nxt
+    //
+    // leaked n0 and, through its field, the whole chain: 352 B per call for a
+    // two-node list up to 2443 B for nine, and under the leak gate's 500 B
+    // floor for a bare instance, which is why the walk's own probe measured
+    // clean. A PARAMETER is the case this retain was added for -- there the
+    // frame holds nothing, and without it the first edge freed the CALLER's
+    // argument.
+    //
+    // ⛔ The test is syntactic on purpose. Whether the frame owns a value is
+    // the ownership pass's question, and the pass declines union groups
+    // (`g.condition`); asking it here would need the answer before it exists.
+    // An entry block argument is the shape that is borrowed by ABI, and it is
+    // the one the record names.
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(initialValues[index]);
+    if (!argument || !argument.getOwner()->isEntryBlock() ||
+        !mlir::isa_and_nonnull<mlir::func::FuncOp>(
+            argument.getOwner()->getParentOp()))
+      continue;
     py::IncRefOp::create(builder, loc, initialValues[index]);
   }
 }
@@ -300,6 +326,23 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
       }
       if (auto view = value.getDefiningOp<py::ProtocolViewOp>()) {
         value = view.getInput();
+        continue;
+      }
+      // ⭐ A UNION WRAP OR UNWRAP IS A VIEW OF THE SAME OBJECT, and the ledger
+      // is about objects. `while cur is not None:` narrows the carried name --
+      // an unwrap -- and every edge out of the body re-wraps it, so the lane
+      // that left the header as `%h` comes back as `wrap(unwrap(%h))`. Without
+      // these two steps the pair reads as a REPLACEMENT: the edge released the
+      // header's token, and on a BREAK edge nothing is retained to replace it
+      // (see `toHeader` below), so the after-block's own release ran on a
+      // token already spent -- "Ly_DecRef observed non-positive refcount", on
+      // a `break` inside a walk over an optional.
+      if (auto unwrap = value.getDefiningOp<py::UnionUnwrapOp>()) {
+        value = unwrap.getInput();
+        continue;
+      }
+      if (auto wrap = value.getDefiningOp<py::UnionWrapOp>()) {
+        value = wrap.getInput();
         continue;
       }
       break;

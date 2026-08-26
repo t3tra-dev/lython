@@ -428,10 +428,71 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         return literal && (literal.getSpelling() == "True" ||
                            literal.getSpelling() == "False");
       };
+      // ⭐ `A and B` PROVES A WHILE B IS READ. Each operand of an `and` is
+      // reached only when every earlier one was true, so their true-narrowings
+      // hold there -- and for `or` it is the false-narrowings, reached only
+      // when every earlier one was false. Without this
+      //
+      //     if limit is not None and n >= limit:
+      //
+      // did not even TYPE: the second operand still saw `limit` as
+      // `int | None`, and the emitter refused it with "static type
+      // builtins.int does not provide manifest method '__ge__'". Spelling the
+      // same test as nested `if`s worked, which is what made this the shape
+      // the Optional idiom cannot be written in.
+      //
+      // ⛔ The bindings are made in ONE scope rather than one per operand: a
+      // later operand may narrow the same name again, and shadowing in place
+      // is what makes the last proof win.
+      auto narrowingScope = types.pushScope();
+      llvm::SmallVector<std::pair<std::string, Value>, 4> restoreValues;
+      // ⛔ THE PROOFS ARE READ ONCE, BEFORE ANY OF THEM IS APPLIED. Asking
+      // again during emission asks a `types` that already carries the answer:
+      // `limit is not None` reads `limit` as `int` by then, `removeNoneFrom`
+      // finds no None to remove, and the narrowing that IS in force reports
+      // itself as absent.
+      llvm::SmallVector<std::optional<BranchTypeNarrowing>, 4> proven;
       bool allBool = true;
-      for (const parser::NodePtr &operand : *operandNodes)
+      for (const parser::NodePtr &operand : *operandNodes) {
         if (!operand || !boolTyped(operand.get()))
           allBool = false;
+        std::optional<BranchTypeNarrowing> narrowing =
+            operand ? optionalBranchTypeNarrowing(*operand, types, module)
+                    : std::nullopt;
+        if (narrowing) {
+          mlir::Type narrowed =
+              isAnd ? narrowing->trueType : narrowing->falseType;
+          if (narrowed) {
+            narrowing->trueType = narrowed;
+            types.bindLocalSymbol(narrowing->name, narrowed);
+          } else {
+            narrowing.reset();
+          }
+        }
+        proven.push_back(std::move(narrowing));
+      }
+      // The VALUE half, emitted where the proof holds: an unwrap at the top of
+      // the block that only runs when the earlier operands decided that way.
+      auto proveValue = [&](unsigned index) {
+        if (index >= proven.size() || !proven[index])
+          return;
+        const BranchTypeNarrowing &narrowing = *proven[index];
+        auto found = values.find(narrowing.name);
+        if (found == values.end() ||
+            !mlir::isa<py::UnionType>(found->second.value.getType()) ||
+            !mlir::cast<py::UnionType>(found->second.value.getType())
+                 .hasMember(narrowing.trueType))
+          return;
+        restoreValues.push_back({narrowing.name, found->second});
+        auto unwrap = py::UnionUnwrapOp::create(
+            builder, loc(*expr), narrowing.trueType, found->second.value);
+        found->second = Value{unwrap.getResult(), narrowing.trueType};
+      };
+      auto restoreNarrowedValues = [&] {
+        for (auto &saved : llvm::reverse(restoreValues))
+          values[saved.first] = saved.second;
+        restoreValues.clear();
+      };
       if (allBool) {
         mlir::Value accumulated =
             emitBoolValue(emitExpr(operandNodes->front().get()), *expr);
@@ -459,8 +520,17 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
                                            merge, mlir::ValueRange{decided},
                                            evalBlock, mlir::ValueRange{});
           builder.setInsertionPointToStart(evalBlock);
+          // ⛔ EVERY EARLIER PROOF, AND SPELLED AGAIN IN THIS BLOCK. The
+          // unwrap has to dominate its use, and the block that proved an
+          // earlier operand does not dominate this one: the merge in between
+          // is also reached by the short-circuit edge. Carrying the unwrap
+          // forward instead of repeating it gave "operand #0 does not
+          // dominate this use" on `a is not None and b is not None and f(a,b)`.
+          for (unsigned earlier = 0; earlier < index; ++earlier)
+            proveValue(earlier);
           mlir::Value next =
               emitBoolValue(emitExpr((*operandNodes)[index].get()), *expr);
+          restoreNarrowedValues();
           mlir::cf::BranchOp::create(builder, loc(*expr), merge,
                                      mlir::ValueRange{next});
           builder.setInsertionPointToStart(merge);
@@ -468,9 +538,12 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         }
         auto boxed = py::CastFromPrimOp::create(builder, loc(*expr),
                                                 types.boolType(), accumulated);
+        restoreNarrowedValues();
         return {boxed.getResult(), types.boolType()};
       }
-      return emitBoolOpValue(*expr, isAnd, *operandNodes);
+      Value result = emitBoolOpValue(*expr, isAnd, *operandNodes);
+      restoreNarrowedValues();
+      return result;
     }
   }
   if (expr->kind == "Lambda")
