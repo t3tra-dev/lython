@@ -14,8 +14,15 @@
 # `acquireUnionCarriedTokens` (EmitterLoops.cpp) retains a union carried local
 # on the loop's ENTRY edge, which is the acquisition the ownership pass places
 # for every other type. The matching release belongs on the way out, and
-# `insertOwnedBlockArgumentReleases` skips any group whose `condition` is set --
-# a union's release is guarded by its tag, so it always has one.
+# `insertOwnedBlockArgumentReleases` skips any group whose `condition` is set.
+#
+# ⛔ THE SECOND HALF OF THAT SENTENCE HAS EXPIRED, 2026-08-27: it used to read
+# "a union's release is guarded by its tag, so it always has one". It is not
+# guarded any more. `forEachActiveUnionMember` retains and releases EVERY
+# member rather than the live one, because an inactive member's lanes are the
+# immortal dead placeholder and the runtime reads the refcount before anything
+# else. The skip is still there, and a conditional group still gets no release
+# from that pass -- but a union's refcounting no longer depends on it.
 #
 # ⭐ THE REPAIR IS THE EMITTER'S, and what settles that is reading
 # `carriedLoopEdgeOperands`: it does not only release the lane the body

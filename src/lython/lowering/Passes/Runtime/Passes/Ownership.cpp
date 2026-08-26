@@ -2687,85 +2687,55 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       ownedValues.insert(duplicate);
     for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
              module, call, deallocators, symbols)) {
-      // ⛔ KNOWN DEFECT, measured, not repaired here: `g.condition` -- a
-      // union, whose release is guarded by its tag -- is skipped, and this
-      // function places BOTH halves of the loop-carried contract. The
+      // ⛔ `g.condition` -- a union member's group -- is skipped here, and
+      // this function places BOTH halves of the loop-carried contract: the
       // borrow-edge retain that compensates the back edge's release, and the
-      // release on the exit edge. A union-carried local gets neither, so
+      // release on the exit edge. A union-carried local gets neither from this
+      // pass.
       //
-      //   def f(s: str | None) -> str:
-      //       while s is not None:
-      //           s = None
-      //       return "start"
+      // ⭐ THAT NO LONGER COSTS THE PROGRAM ANYTHING, because a union's
+      // refcounting stopped being conditional. `forEachActiveUnionMember`
+      // retains and releases EVERY member rather than the live one: an
+      // inactive member's lanes are the immortal dead placeholder, and both
+      // `Ly_IncRef` and every deallocator read the refcount before anything
+      // else, so the arm that is not live costs a load and a branch. What that
+      // bought is the shape this note used to say was out of reach --
       //
-      // frees the CALLER's argument on the first back edge and prints an
-      // empty line (deterministically, rc=0, no diagnostic), while the
-      // exit-release half shows up as "owned resource from @LyLong_Add
-      // result 0 reaches function exit without release". Both spellings and
-      // the seven measured variants are in
-      // tests/probe/wb_union_loop_carried_borrow_overrelease.py.
+      //     cur: "Node | None" = head
+      //     while cur is not None:
+      //         cur = cur.nxt
       //
-      // ⛔ What a repair needs is NOT the tag-guarded call this note used to
-      // name. Read at refcount-elision, the emitter's acquisition is already
-      // guarded -- `py.incref` on a union lowers through
-      // `forEachActiveUnionMember` -- and the tag rides the same edge as the
-      // member lanes, so it is a block argument wherever the release would
-      // go. Spelling the guard is the easy half.
+      // -- because the guard it replaced was an `scf.if`, and the affine
+      // verifier walks BLOCKS: a release nested in a region was invisible to
+      // it, so the token crossing the back edge was reported as reaching the
+      // exit unreleased. Measured after the change: the walk compiles, matches
+      // CPython, and leaks nothing (tests/probe/leak_optionalwalk_loop_*).
       //
-      // The obstacle is that the group is never SEEDED. This function collects
-      // candidates from owned CALL RESULTS and from `owned_local_object`
-      // markers; the reference is minted by an `Ly_IncRef` with no results and
-      // an `aggregate_retain` label, which is neither. The skip below is not
-      // what keeps the release away -- there is no group here to skip.
-      // Measured 2026-08-14, tests/probe/wb_union_carried_exit_release_leak.py,
-      // which also records why moving the acquisition instead breaks one of
-      // the four bisect lines in each of its three placements.
+      // ⛔ WHAT IS STILL ASYMMETRIC, and now measurable rather than masked:
+      // `acquireUnionCarriedTokens` (EmitterLoops.cpp) is called from
+      // `emitWhile`, `emitFor` AND `emitAsyncFor`; its counterpart
+      // `releaseUnionCarriedTokens` from `emitWhile` alone. A union carried by
+      // a `for` used to be refused before the leak could be weighed; it
+      // compiles now, and weighs 0 B per iteration with a `list[int] | None`
+      // carried across the back edge (tests/probe/leak_unionfor_carried_*).
+      // So the missing call is not currently reachable as a leak -- but the
+      // two sides are still spelled in different places.
       //
-      // The retain half was repaired in the EMITTER instead
-      // (`acquireUnionCarriedTokens`, EmitterLoops.cpp), which is why the
-      // over-release is gone -- though only for `while`: that function is
-      // called from `emitWhile`, `emitFor` AND `emitAsyncFor`, while its
-      // counterpart `releaseUnionCarriedTokens` is called from `emitWhile`
-      // alone. Two of the three loop shapes acquire a token they never
-      // discharge. It cannot be demonstrated on its own today, because a
-      // union carried by a `for` fails on the refusal below before the leak
-      // could be weighed.
-      //
-      // ⛔ THREE THINGS MEASURED 2026-08-26, so the next attempt need not
-      // re-measure them.
-      //
-      // WHAT THE VERIFIER ACCEPTS is not any guarded call. A conditional token
-      // is discharged only where `classifyOwnershipConditionBranch` finds a
-      // `cf.cond_br` whose condition is `arith.cmpi eq/ne` against the tag
-      // (`AffineOwnership.cpp`, the `AffineTokenState::Conditional` arm); it
-      // then splits the walk into an active successor that still owns and an
-      // inactive one that does not. The walk is over BLOCKS, so a release
-      // nested in an `scf.if` REGION -- which is what `forEachActiveUnionMember`
-      // emits, and what `py.decref` on a union lowers to -- is invisible to it.
-      // That is the whole reason `if v is not None:` in the source makes the
-      // release placeable: the narrowing IS such a branch, and nothing else
-      // this pass can emit is.
-      //
-      // RELAXING THE FOUR `g.condition` SKIPS is not enough on its own. With
-      // them removed a strategy IS chosen -- `LYTHON_OWNERSHIP_TRACE_PLACEMENT`
-      // reports `strategy=liveness callee=pick offset=1 lanes=1 conditional=1`
-      // -- and no release appears in the IR: `releaseOwnedGroupByLiveness`
-      // declines further down, at one of the twenty-five bails inside it.
-      //
-      // AND THE GUARD CANNOT BE SPELLED IN `emitGroupRelease`. Splitting its
-      // insertion block to emit the `cf.cond_br` the verifier wants regressed
-      // an unrelated function: `runtime/lib/stackguard_support.py` stopped
-      // building with "owned resource from @LyLong_FromI64 result 0 reaches
-      // function exit without release". The same walk places several releases
-      // in one block, and splitting it under them moves the rest. The missing exit release now shows as a LEAK as
-      // well as a refusal, measured 2026-08-14: `pick(None, 3)` over a
-      // `while v is not None:` loop leaks 52 B -- the entry retain stands
-      // alone when the body never runs -- and `pick(None, None)` is clean,
-      // because a None union's release is a no-op and the absence is
-      // invisible. Two of the four leakers a full sweep of tests/golden/cases
-      // found are this shape, and it is the likely attribution for the
-      // "bounded, 62 B each, ATTRIBUTION UNKNOWN" family that had no
-      // reproducer. tests/probe/wb_union_carried_exit_release_leak.py.
+      // ⛔ AND WHAT A CONDITIONAL GROUP'S RELEASE WOULD STILL NEED, measured
+      // 2026-08-26 and left here because the skip below is still a skip. The
+      // verifier discharges a conditional token only where
+      // `classifyOwnershipConditionBranch` finds a `cf.cond_br` whose condition
+      // is `arith.cmpi eq/ne` against the tag. Relaxing the four `g.condition`
+      // skips is not enough on its own: a strategy IS chosen
+      // (`LYTHON_OWNERSHIP_TRACE_PLACEMENT` reports `strategy=liveness
+      // callee=pick offset=1 lanes=1 conditional=1`) and no release appears,
+      // because `releaseOwnedGroupByLiveness` declines at one of the
+      // twenty-five bails inside it. And the guard cannot be spelled in
+      // `emitGroupRelease`: splitting its insertion block regressed
+      // `runtime/lib/stackguard_support.py` with "owned resource from
+      // @LyLong_FromI64 result 0 reaches function exit without release",
+      // because the same walk places several releases in one block and
+      // splitting it under them moves the rest.
       if (!g.deallocator || g.condition)
         continue;
       std::optional<Seeded> seeded = seedGroup(fn, g, call->getBlock());

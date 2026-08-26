@@ -146,19 +146,31 @@ mlir::LogicalResult RuntimeBundleLowerer::forEachActiveUnionMember(
       continue;
     }
 
-    mlir::Value expected = mlir::arith::ConstantIntOp::create(
-        builder, op->getLoc(), static_cast<std::int64_t>(memberIndex), 64);
-    mlir::Value active = mlir::arith::CmpIOp::create(
-        builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
-    auto ifOp = mlir::scf::IfOp::create(builder, op->getLoc(),
-                                        mlir::TypeRange{}, active,
-                                        /*withElseRegion=*/false);
-    // Zero-result scf.if auto-inserts its scf.yield terminator; adding
-    // another would leave a mid-block yield.
-    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    // ⭐ EVERY MEMBER, NOT THE LIVE ONE. An inactive member's lanes are the
+    // immortal dead placeholder -- that is what `appendDeadMember` puts there,
+    // and the return ABI and the boxed-optional read agree -- and the runtime
+    // reads the refcount BEFORE anything else on both sides: `Ly_IncRef` and
+    // `Ly_DecRef` each take a write-free early exit on an immortal header, and
+    // every deallocator (`LyList_DecRef`, `LyBaseException_DecRef`, the
+    // synthesized `__ly_dealloc_*`) touches the object only after the count
+    // reached zero. So retaining and releasing the arm that is not live costs
+    // a load and a branch and changes nothing.
+    //
+    // ⛔ AND THE TAG GUARD WAS NOT FREE. It was an `scf.if`, and the affine
+    // ownership verifier walks BLOCKS: a release nested in a region is
+    // invisible to it, so a token carried across a loop's back edge was
+    // reported as reaching the exit unreleased even though the guarded release
+    // was right there. That is what refused
+    //
+    //     cur: "Node | None" = head
+    //     while cur is not None:
+    //         cur = cur.nxt
+    //
+    // -- the walk every linked structure is read with. Spelling the guard as a
+    // `cf.cond_br` instead would keep the release visible but not discharge the
+    // token, which the retain took on both arms.
     if (mlir::failed(emitMember(member, values.slice(offset, size))))
       return mlir::failure();
-    builder.setInsertionPointAfter(ifOp);
     offset += size;
   }
   return mlir::success();

@@ -716,6 +716,7 @@ void advanceGroupLanesThroughReRoots(FuncContractCache &contracts,
 // Identity merge edges lend the merge argument a token via a retain labeled
 // kBlockArgMergeBorrowLabel; the paired release targets the pre-merge name.
 bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call);
+bool isEmitterIncrefRetain(mlir::func::CallOp call);
 bool groupContainsOperand(mlir::Operation *op,
                           llvm::ArrayRef<mlir::Value> group,
                           AliasAnalysis &aliases);

@@ -2120,6 +2120,15 @@ bool isBlockArgMergeBorrowRetain(mlir::func::CallOp call) {
   return label && label.getValue() == kBlockArgMergeBorrowLabel;
 }
 
+// Is this the retain the EMITTER asked for -- `py.incref`, written where a
+// local stops borrowing and starts owning -- rather than one a slot took to
+// park a token in a holder? The label is the only thing that separates them,
+// and it is the same label the release placer reads (`findReleaseInsertion`).
+bool isEmitterIncrefRetain(mlir::func::CallOp call) {
+  auto label = call->getAttrOfType<mlir::StringAttr>(kAggregateRetainAttr);
+  return label && label.getValue().ends_with(":py.incref");
+}
+
 bool groupContainsOperand(mlir::Operation *op,
                           llvm::ArrayRef<mlir::Value> group,
                           AliasAnalysis &aliases) {

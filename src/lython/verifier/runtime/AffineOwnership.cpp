@@ -2068,8 +2068,23 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
           // that a loop-edge decref later returns through the pre-merge name
           // (e.g. `local = borrowed_arg` then `local = local - 1` in a loop),
           // so it must count toward the retained balance.
+          //
+          // ⭐ AND EXCEPT `py.incref`, for the same reason: it parks nothing.
+          // The emitter writes it where a local has to stop borrowing and
+          // start owning (`cur: "Node | None" = head`), so the frame gains the
+          // reference and the frame's own release discharges it. Skipping it
+          // made the accounting one-sided -- the retain uncounted, the paired
+          // release counted -- and the shape that reads a linked structure
+          //
+          //     cur: "Node | None" = head
+          //     while cur is not None:
+          //         cur = cur.nxt
+          //
+          // was refused with "released or transferred without a prior retain"
+          // over a retain standing three ops above the release.
           if (call->hasAttr(own::kAggregateRetainAttr) &&
-              !isBlockArgMergeBorrowRetain(call)) {
+              !isBlockArgMergeBorrowRetain(call) &&
+              !own::isEmitterIncrefRetain(call)) {
             op = op->getNextNode();
             continue;
           }

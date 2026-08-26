@@ -120,6 +120,8 @@ leak_mutate_selfmethod_append_big.py AGREE
 leak_mutate_selfmethod_append_small.py AGREE
 leak_optionalfield_rebind_big.py AGREE
 leak_optionalfield_rebind_small.py AGREE
+leak_optionalwalk_loop_big.py AGREE
+leak_optionalwalk_loop_small.py AGREE
 leak_rebind_call_dict_big.py AGREE
 leak_rebind_call_dict_small.py AGREE
 leak_rebind_call_int_big.py AGREE
@@ -134,6 +136,8 @@ leak_rebind_param_float_big.py AGREE
 leak_rebind_param_float_small.py AGREE
 leak_rebind_twice_call_list_big.py AGREE
 leak_rebind_twice_call_list_small.py AGREE
+leak_unionfor_carried_big.py AGREE
+leak_unionfor_carried_small.py AGREE
 mutate_call_append.py AGREE
 mutate_call_ddel.py AGREE
 mutate_call_dsetitem.py AGREE
