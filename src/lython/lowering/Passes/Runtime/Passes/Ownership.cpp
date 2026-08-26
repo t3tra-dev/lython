@@ -3132,8 +3132,35 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       if (blockArg.getOwner() == anchorBlock)
         builder.setInsertionPointToStart(anchorBlock);
     } else if (mlir::Operation *definition = retain.header.getDefiningOp()) {
-      if (definition->getBlock() == anchorBlock)
+      if (definition->getBlock() == anchorBlock) {
         builder.setInsertionPointAfter(definition);
+        // ⭐ AFTER THE MARKER WHEN THERE IS ONE, and the definition otherwise.
+        // "Earliest point after the definition" is early enough to precede the
+        // block's decref-on-replace, which is what this placement is for, and
+        // too early to READ the entity: a source class is a `memref.view` of a
+        // fresh block, and its refcount and class words are stored several ops
+        // later. `ly.ownership.owned_local_object` is emitted once those stores
+        // are done -- `verifyInitialisationWindowIn` refuses a marker the word-0
+        // store does not dominate -- so it is the earliest point the prefix can
+        // be spelled at, and it still precedes every release.
+        //
+        // ⛔ Without it the chain-building loop -- `head = Node(0); cur = head;
+        // while ...: cur = fresh` -- was refused outright, because the entry
+        // edge's lend was anchored at the raw view. That is the diagnostic's own
+        // advice ("mark it where it becomes complete") read from the other side:
+        // the marker was already there, and the retain was being written in
+        // front of it.
+        for (mlir::Operation &candidateOp : *anchorBlock) {
+          if (&candidateOp == definition)
+            continue;
+          if (!candidateOp.hasAttr(own::kOwnedLocalObjectAttr))
+            continue;
+          if (!llvm::is_contained(candidateOp.getOperands(), retain.header))
+            continue;
+          builder.setInsertionPointAfter(&candidateOp);
+          break;
+        }
+      }
     }
     // The op the retain will sit in FRONT of, which is what the spellability
     // question is about — not the header's definition, which the three branches

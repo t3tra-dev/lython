@@ -112,6 +112,8 @@ leak_baseline_object_local_big.py AGREE
 leak_baseline_object_local_small.py AGREE
 leak_baseline_str_concat_big.py AGREE
 leak_baseline_str_concat_small.py AGREE
+leak_chainbuild_loop_big.py AGREE
+leak_chainbuild_loop_small.py AGREE
 leak_exceptentity_carry_big.py AGREE
 leak_exceptentity_carry_small.py AGREE
 leak_mutate_call_append_big.py AGREE

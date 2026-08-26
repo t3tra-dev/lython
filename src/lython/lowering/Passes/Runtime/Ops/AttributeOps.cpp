@@ -2003,8 +2003,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     // bundle without re-rooting anything, and no owned-local marker has to
     // follow.
     RuntimeBundle updated = *object;
-    updated.fieldBundles[op.getName()] =
-        std::make_shared<RuntimeBundle>(std::move(*stored));
+    // ⛔ EXCEPT THROUGH A MERGE ARGUMENT, WHICH IS NOT ONE OBJECT. The cache is
+    // keyed on the SSA value, and a block argument of a block with several
+    // predecessors names a DIFFERENT object each time control reaches it. A
+    // loop that builds a chain --
+    //
+    //     tail = head
+    //     while ...:
+    //         node = Node(i); tail.nxt = node; tail = node
+    //     print(tail.nxt is None)
+    //
+    // stores into the second-to-last node and then moves on, so after the loop
+    // the same argument names the LAST node, whose field was never written.
+    // The cache said `Node`, the read believed it and skipped the empty-box
+    // arm, and `Ly_IncRef` ran on a null header: SIGSEGV with no diagnostic.
+    // Without the entry the read falls back to the annotation and rebuilds
+    // both arms, which costs a compare and is right whichever object it is.
+    auto receiver = mlir::dyn_cast<mlir::BlockArgument>(op.getObject());
+    const bool receiverIsAMerge =
+        receiver && !receiver.getOwner()->hasNoPredecessors() &&
+        !llvm::hasSingleElement(receiver.getOwner()->getPredecessors());
+    if (receiverIsAMerge)
+      updated.fieldBundles.erase(op.getName());
+    else
+      updated.fieldBundles[op.getName()] =
+          std::make_shared<RuntimeBundle>(std::move(*stored));
     valueBundles[op.getObject()] = std::move(updated);
     erase.push_back(op);
     return mlir::success();
