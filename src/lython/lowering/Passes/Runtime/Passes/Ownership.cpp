@@ -1174,7 +1174,7 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
                                       const own::ResourceGroup &group,
                                       own::AliasAnalysis &aliases,
                                       bool ownsReference) {
-  if (!group.deallocator || group.condition)
+  if (!group.deallocator)
     return false;
   mlir::Block *defBlock = owner->getBlock();
   if (!defBlock)
@@ -1395,7 +1395,7 @@ bool releaseOwnedGroupByLiveness(
     const own::ReferenceMap &references, bool ownsReference,
     bool consumeIsDeath = false,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators = {}) {
-  if (!group.deallocator || group.condition)
+  if (!group.deallocator)
     return false;
   // The reference this walk is placing for, asked once. Only the liveness
   // exclusion reads it (`namesAnotherMintedReference`); the death test below
@@ -2687,56 +2687,42 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       ownedValues.insert(duplicate);
     for (const own::ResourceGroup &g : own::collectOwnedCallResultGroups(
              module, call, deallocators, symbols)) {
-      // ⛔ `g.condition` -- a union member's group -- is skipped here, and
-      // this function places BOTH halves of the loop-carried contract: the
-      // borrow-edge retain that compensates the back edge's release, and the
-      // release on the exit edge. A union-carried local gets neither from this
-      // pass.
+      // ⭐ A UNION MEMBER'S GROUP IS AN ORDINARY GROUP HERE NOW. It used to be
+      // skipped (`g.condition`), because a union's release was guarded by its
+      // tag and this pass emits only unguarded calls -- and the emitter carried
+      // the missing halves instead, retaining on the loop's entry edge and
+      // releasing at the top of the after-block.
       //
-      // ⭐ THAT NO LONGER COSTS THE PROGRAM ANYTHING, because a union's
-      // refcounting stopped being conditional. `forEachActiveUnionMember`
-      // retains and releases EVERY member rather than the live one: an
-      // inactive member's lanes are the immortal dead placeholder, and both
-      // `Ly_IncRef` and every deallocator read the refcount before anything
-      // else, so the arm that is not live costs a load and a branch. What that
-      // bought is the shape this note used to say was out of reach --
+      // Both reasons are gone. `forEachActiveUnionMember` retains and releases
+      // EVERY member rather than the live one: an inactive member's lanes are
+      // the immortal dead placeholder, and `Ly_IncRef` and every deallocator
+      // read the refcount before anything else, so the arm that is not live
+      // costs a load and a branch. With the guard gone the release is an
+      // ordinary call in an ordinary block, which is all this pass needs.
       //
-      //     cur: "Node | None" = head
-      //     while cur is not None:
+      // ⛔ AND A FIXED POSITION WAS THE WRONG ANSWER FOR THE RELEASE. The
+      // emitter's went at the top of the after-block, which is before every
+      // read of the name that follows the loop:
+      //
+      //     cur: Optional[Node] = head
+      //     while cur is not None and cur.v < want:
       //         cur = cur.nxt
+      //     if cur is not None:
+      //         return cur.v        # read what the release had freed
       //
-      // -- because the guard it replaced was an `scf.if`, and the affine
-      // verifier walks BLOCKS: a release nested in a region was invisible to
-      // it, so the token crossing the back edge was reported as reaching the
-      // exit unreleased. Measured after the change: the walk compiles, matches
-      // CPython, and leaks nothing (tests/probe/leak_optionalwalk_loop_*).
+      // Where a value dies is this pass's question, and it answers it by
+      // liveness. The emitter keeps only the entry-edge retain, which is a
+      // BORROW question ("does the frame already hold this") that the pass
+      // cannot answer for a union group.
       //
-      // ⛔ WHAT IS STILL ASYMMETRIC, and now measurable rather than masked:
-      // `acquireUnionCarriedTokens` (EmitterLoops.cpp) is called from
-      // `emitWhile`, `emitFor` AND `emitAsyncFor`; its counterpart
-      // `releaseUnionCarriedTokens` from `emitWhile` alone. A union carried by
-      // a `for` used to be refused before the leak could be weighed; it
-      // compiles now, and weighs 0 B per iteration with a `list[int] | None`
-      // carried across the back edge (tests/probe/leak_unionfor_carried_*).
-      // So the missing call is not currently reachable as a leak -- but the
-      // two sides are still spelled in different places.
-      //
-      // ⛔ AND WHAT A CONDITIONAL GROUP'S RELEASE WOULD STILL NEED, measured
-      // 2026-08-26 and left here because the skip below is still a skip. The
-      // verifier discharges a conditional token only where
-      // `classifyOwnershipConditionBranch` finds a `cf.cond_br` whose condition
-      // is `arith.cmpi eq/ne` against the tag. Relaxing the four `g.condition`
-      // skips is not enough on its own: a strategy IS chosen
-      // (`LYTHON_OWNERSHIP_TRACE_PLACEMENT` reports `strategy=liveness
-      // callee=pick offset=1 lanes=1 conditional=1`) and no release appears,
-      // because `releaseOwnedGroupByLiveness` declines at one of the
-      // twenty-five bails inside it. And the guard cannot be spelled in
-      // `emitGroupRelease`: splitting its insertion block regressed
-      // `runtime/lib/stackguard_support.py` with "owned resource from
-      // @LyLong_FromI64 result 0 reaches function exit without release",
-      // because the same walk places several releases in one block and
-      // splitting it under them moves the rest.
-      if (!g.deallocator || g.condition)
+      // ⛔ WHAT IS STILL ASYMMETRIC: `acquireUnionCarriedTokens` is called from
+      // `emitWhile`, `emitFor` AND `emitAsyncFor`. Its counterpart is gone
+      // rather than moved, so there is nothing left to call from two of the
+      // three -- but a `for` that carries a borrowed union still takes a retain
+      // this pass has to discharge. Measured: a `list[int] | None` carried
+      // across a `for` back edge weighs 0 B per iteration
+      // (tests/probe/leak_unionfor_carried_*).
+      if (!g.deallocator)
         continue;
       std::optional<Seeded> seeded = seedGroup(fn, g, call->getBlock());
       if (seeded && ownershipTransferTraceEnabled())
@@ -2762,7 +2748,7 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       return;
     for (const own::ResourceGroup &g :
          own::collectOwnedLocalObjectGroups(op, deallocators)) {
-      if (!g.deallocator || g.condition)
+      if (!g.deallocator)
         continue;
       // What is specific to this source: the branch forwards the marker's
       // OPERANDS (the raw allocs), not its results, so the operands are owned

@@ -71,58 +71,37 @@ void acquireUnionCarriedTokens(mlir::OpBuilder &builder, mlir::Location loc,
     // (`g.condition`); asking it here would need the answer before it exists.
     // An entry block argument is the shape that is borrowed by ABI, and it is
     // the one the record names.
-    auto argument = mlir::dyn_cast<mlir::BlockArgument>(initialValues[index]);
+    // ⛔ THROUGH THE WRAP, because the annotation is what puts one there.
+    // `cur: Optional[Node] = head` is a `py.union.wrap` of the parameter, so
+    // the initial value is an op RESULT and the borrow underneath it is
+    // invisible to a test on the value itself -- the loop then released the
+    // caller's argument on its first edge, which is the defect this retain
+    // exists to prevent, reintroduced by the gate that limits it.
+    mlir::Value root = initialValues[index];
+    for (bool moved = true; moved;) {
+      moved = false;
+      mlir::Value next;
+      if (auto wrap = root.getDefiningOp<py::UnionWrapOp>())
+        next = wrap.getInput();
+      else if (auto unwrap = root.getDefiningOp<py::UnionUnwrapOp>())
+        next = unwrap.getInput();
+      else if (auto upcast = root.getDefiningOp<py::ClassUpcastOp>())
+        next = upcast.getInput();
+      else if (auto refine = root.getDefiningOp<py::ClassRefineOp>())
+        next = refine.getInput();
+      else if (auto view = root.getDefiningOp<py::ProtocolViewOp>())
+        next = view.getInput();
+      if (next) {
+        root = next;
+        moved = true;
+      }
+    }
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(root);
     if (!argument || !argument.getOwner()->isEntryBlock() ||
         !mlir::isa_and_nonnull<mlir::func::FuncOp>(
             argument.getOwner()->getParentOp()))
       continue;
     py::IncRefOp::create(builder, loc, initialValues[index]);
-  }
-}
-
-// The other half of the same token: the loop acquired one on the way in, every
-// edge that leaves the body keeps it balanced, and this discharges it on the
-// way out.
-//
-// ⭐ Why releasing whatever is carried AT EXIT is right in all three shapes,
-// which is what a reading of `carriedLoopEdgeOperands` settles: that function
-// does not only release the lane the body replaced, it RE-ACQUIRES the
-// replacement (`acquiringLanes`). So the loop's token rides the carry.
-//
-//   body never runs .......... exit carries v0; release balances the entry retain
-//   body keeps v0 ............ no edge release, no reacquire; same
-//   body rebinds to v1 ....... back edge released v0 and retained v1; the exit
-//                              release discharges THAT token, and v1's own
-//                              producer token is still the pass's to place
-//
-// ⛔ Why NOT gate this on the name being unread after the loop, which is what
-// the earlier record proposed on the reasoning that a rebound-to-fresh value
-// would dangle: it would not. The token released here is the loop's, minted by
-// the reacquire, never the value's only one. The gate was written before
-// `acquiringLanes` was read.
-//
-// ⛔ And why the after-block start rather than the exit edge: with a break the
-// after-block has several predecessors and each carries the token, so one
-// release at the join covers them where an edge release would need one per
-// edge and would still miss the else block's.
-void releaseUnionCarriedTokens(mlir::OpBuilder &builder, mlir::Location loc,
-                               llvm::ArrayRef<CarriedLoopLocal> carried,
-                               mlir::Block *afterBlock,
-                               bool afterForwardsCarried,
-                               llvm::ArrayRef<mlir::Value> headerValues) {
-  for (auto [index, local] : llvm::enumerate(carried)) {
-    if (!mlir::isa<py::UnionType>(local.type))
-      continue;
-    mlir::Value carriedAtExit;
-    if (afterForwardsCarried) {
-      if (index < afterBlock->getNumArguments())
-        carriedAtExit = afterBlock->getArgument(index);
-    } else if (index < headerValues.size()) {
-      carriedAtExit = headerValues[index];
-    }
-    if (!carriedAtExit)
-      continue;
-    py::DecRefOp::create(builder, loc, carriedAtExit);
   }
 }
 
@@ -1422,8 +1401,6 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   }
 
   builder.setInsertionPointToStart(afterBlock);
-  releaseUnionCarriedTokens(builder, loc(statement), carried, afterBlock,
-                            afterForwardsCarried, postTestValues);
   if (afterForwardsCarried) {
     bindCarriedLoopLocals(carried, afterBlock);
   } else {

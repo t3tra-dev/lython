@@ -707,6 +707,52 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
     return inner;
   }
 
+  // ⭐ `A and B` PROVES A ON ITS TRUE SIDE, `A or B` PROVES A ON ITS FALSE ONE.
+  // The operands are emitted with this already (the short-circuit path in
+  // `emitExpr` applies each proof to the ones after it); this is the same fact
+  // asked by the STATEMENT, so `if s is not None and ...:` narrows its body and
+  // `while s is not None and ...:` narrows the loop's.
+  //
+  // ⛔ Without it the body read the union: `while n is not None and n.v < 1: n =
+  // n.nxt` typed `n.nxt` off an un-narrowed `Node | None`, which infers as
+  // `object`, and the back edge then carried an `object` into a header expecting
+  // the union -- "type mismatch for bb argument #0 of successor #0".
+  //
+  // ⛔ ONE NAME, the first operand that proves anything. `BranchTypeNarrowing`
+  // carries a single name, and a conjunction may prove several; the rest are
+  // still applied operand-to-operand where they are read.
+  if (test.kind == "BoolOp") {
+    const parser::Node *op = ast::node(test, "op");
+    const bool isAnd = op && op->kind == "And";
+    const bool isOr = op && op->kind == "Or";
+    if (!isAnd && !isOr)
+      return std::nullopt;
+    const auto *operands = ast::nodeList(test, "values");
+    if (!operands)
+      return std::nullopt;
+    for (const parser::NodePtr &operand : *operands) {
+      if (!operand)
+        continue;
+      std::optional<BranchTypeNarrowing> inner =
+          optionalBranchTypeNarrowing(*operand, types, from);
+      if (!inner)
+        continue;
+      if (isAnd) {
+        inner->falseType = mlir::Type();
+        inner->falseSourceType = mlir::Type();
+        if (!inner->trueType)
+          continue;
+      } else {
+        inner->trueType = mlir::Type();
+        inner->trueSourceType = mlir::Type();
+        if (!inner->falseType)
+          continue;
+      }
+      return inner;
+    }
+    return std::nullopt;
+  }
+
   if (std::optional<NoneComparisonNarrowing> none =
           optionalNoneComparison(test, types)) {
     BranchTypeNarrowing narrowing;
