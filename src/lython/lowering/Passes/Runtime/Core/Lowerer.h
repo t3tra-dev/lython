@@ -147,6 +147,7 @@ private:
   // header word, a zero-lane contract has nothing to hold, and a union is not
   // one object.
   bool classFieldStoredBoxed(mlir::Type fieldContract) const;
+  bool contractIsOneRuntimeLane(mlir::Type contract) const;
   // ⭐ EVERY FIELD LIVES IN THE INSTANCE BODY, which is one block reached
   // through the header's body word:
   //
@@ -197,6 +198,17 @@ private:
                                               mlir::Type fieldType,
                                               unsigned fieldIndex,
                                               llvm::StringRef fieldName);
+  mlir::FailureOr<RuntimeBundle>
+  optionalPayloadBundle(mlir::Operation *op, const RuntimeBundle &value,
+                        py::UnionType unionType, llvm::StringRef purpose);
+  static unsigned optionalPayloadTag(py::UnionType unionType);
+  mlir::FailureOr<RuntimeBundle>
+  storeOptionalBoxedField(mlir::Operation *op, mlir::Value body,
+                          unsigned boxWord, const RuntimeBundle &value,
+                          py::UnionType unionType, llvm::StringRef slotName);
+  mlir::LogicalResult clearBoxedFieldSlot(mlir::Operation *op,
+                                          mlir::Value body, unsigned boxWord,
+                                          llvm::StringRef slotName);
   mlir::FailureOr<RuntimeBundle>
   storeBoxedFieldPayloadInPlace(mlir::Operation *op, mlir::Value body,
                                 unsigned boxWord, const RuntimeBundle &value,
@@ -1676,6 +1688,7 @@ private:
   // Contracts whose runtime layout is being expanded right now. A layout that
   // re-enters itself has no finite expansion (CallableABI.cpp).
   mutable llvm::DenseSet<mlir::Type> expandingContracts;
+  mutable llvm::DenseSet<mlir::Type> laneCountQueries;
   mutable std::optional<llvm::StringSet<>> subclassedContracts;
   llvm::DenseMap<mlir::Value, mlir::Operation *> ownedLocalObjectMarkers;
   llvm::StringMap<ReturnedValueSummary> returnedValueSummaries;

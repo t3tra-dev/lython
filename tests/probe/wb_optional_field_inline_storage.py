@@ -24,40 +24,62 @@
 # golden: tests/golden/cases/optional_field_multilane_member.py (red-checked).
 #
 # ============================================================
-# OPEN, all four the same cause: A UNION FIELD IS STORED INLINE
+# CLOSED 2026-08-27 FOR A MEMBER THAT IS ONE ENTITY; OPEN OTHERWISE
 # ============================================================
-# `classFieldStoredBoxed` returns false for a union -- "its tag plus every
-# member's lanes stay inline, because the box words hold ONE payload handle and
-# a union is not one object" -- so the field's value IS a slice of the
-# instance's SSA lane list. Four consequences, each with its own diagnostic:
+# All four consequences below were "a union field is stored INLINE, so the
+# field's value IS a slice of the instance's SSA lane list". `T | None` is now
+# stored in a BOX -- the same box every object-typed field gets, with a zero
+# entity for None -- WHEN T is one runtime lane. Three of the four are closed
+# for those, and this file's own program is one of them (it was GAP and now
+# AGREEs). `int | None` and `str | None` still take the inline path and still
+# behave exactly as recorded.
 #
-# (1) A STORE THROUGH A PARAMETER is refused, because the splice writes the
-#     callee's own lanes and the caller holds its own copy:
-#         def rebind(b: Box) -> None: b.f = 5     # b.f: int | None
-#     "storing into field 'f' of a receiver that arrived as a parameter is not
-#     supported for this field's type". `self.f = v` inside a METHOD is fine --
-#     the method is inlined at the call site, so the store lands on the
-#     caller's value. Two probes: wb_param_store_optional,
-#     wb_param_store_readboth_optional.
+# ⛔ THE LIMIT IS ONE LANE, and it is the ABSENT read that sets it, not the
+# layout. A box hands back the lanes past the entity through the contract's
+# `lane_words` primitive, which DEREFERENCES the entity: `builtins.str` reads
+# word 2 of the header. The stand-in for an absent object is the immortal dead
+# global, two words wide, so a second lane would be read off the end of it.
+# `builtins.list` and `builtins.bytes` are one lane and are boxed;
+# `builtins.str` is two and is not. Measured: `class Holder: name: str | None`
+# still refuses `got = h.name; print(got)`, and the same program with
+# `list[int] | None` prints CPython's answer.
 #
-# (2) A SELF-REFERENTIAL OPTIONAL FIELD has no finite layout, so the shape
-#     every linked structure is written in is refused outright:
-#         class Node:
-#             def __init__(self, v: int) -> None:
-#                 self.nxt: "Node | None" = None
-#     "class layout for 'Node' contains itself through a union-typed field".
-#     The diagnostic suggests `nxt: "Node"`, which compiles and cannot express
-#     the end of the list.
+# (1) A STORE THROUGH A PARAMETER, CLOSED for a boxed member:
+#         def rebind(b: Box) -> None: b.f = fresh   # b.f: list[int] | None
+#     lands in the instance and the caller reads it back
+#     (wb_param_store_optional_boxed). Still refused for `int | None`
+#     (wb_param_store_optional, wb_param_store_readboth_optional): an int has no
+#     entity to put in a box, so its optional has nowhere else to live.
 #
-# (3) READING THE FIELD WITHOUT NARROWING loses the instance's release:
-#         got = h.name; print(got)
-#     "owned resource from builtin.unrealized_conversion_cast result 0 reaches
-#     function exit without release". The union's lanes alias the instance's,
-#     so a use of the slice is not a use of the group.
+# (2) A SELF-REFERENTIAL OPTIONAL FIELD, CLOSED. `nxt: Optional["Node"]` -- the
+#     shape every linked structure is written in -- has a finite layout now,
+#     because a box is a fixed width whatever it points at.
+#     tests/golden/cases/self_referential_union_field.py.
 #
-# (4) OVERWRITING THE FIELD LEAKS THE WHOLE INSTANCE, and this is the one that
-#     COMPILES. Measured with `tests/leak_gate.py`, one store over a
-#     constructor-set value, every member type:
+# (3) READING THE FIELD WITHOUT NARROWING, CLOSED for a boxed member. The read
+#     takes its own reference (a retain rooted on the box's payload), so the
+#     union's lanes no longer alias the instance's.
+#
+#     ⛔ AND THE RETAIN'S POSITION IS THE WHOLE REPAIR, not its presence. The
+#     release planner puts the instance's death after its LAST USE, and a field
+#     read's only use of the instance is the box body -- so the arm has to be
+#     decided from a SECOND read of the entity word, taken after the retain, or
+#     the instance is deallocated between the lane and the retain. Measured
+#     three ways before it was right: a retain inside an `scf.if` arm is not
+#     rooted at all ("marks a value this frame never acquired" --
+#     `ownedLocalMarkerIsRetainRooted` wants the retain to be the token's
+#     IMMEDIATELY preceding op), a retain after the branch runs on freed memory
+#     ("Ly_IncRef observed non-positive refcount"), and only the branch-free
+#     form with the tag read last places the dealloc after both.
+#
+# (4) OVERWRITING THE FIELD, CLOSED for a boxed member: the store swaps the
+#     box's payload and leaves the instance's lane tuple alone, so the instance
+#     keeps its death. tests/probe/leak_optionalfield_rebind_* measures 0 B per
+#     iteration over create/set/set/clear. The 41 B and 8264 B figures below
+#     stand for the inline members that remain.
+#
+# The measurements that made the inline case legible, kept because they are
+# what the boxed form has to keep beating:
 #
 #         str            net 1 alloc  /    41 B
 #         bytes          net 1 alloc  /    65 B
@@ -67,32 +89,17 @@
 #     ⛔ AND THE FIRST READING WAS WRONG, which is why the numbers are here.
 #     "The splice releases a one-memref member and not a two-lane one" fitted
 #     the first two rows and is false: the IR contains BOTH retains and BOTH
-#     releases for the member, correctly paired
-#     (`aggregate_retain = "builtins.str:class.f"` twice,
-#     `aggregate_release` for the old slot and for the source). What is missing
-#     is the call to `__ly_dealloc_H` -- the deallocator exists, releases the
-#     member, and is never reached. The store RE-ROOTS the instance's lane
-#     tuple (that is what a splice is), and the release planner's identity is
-#     the tuple, so the instance it was tracking no longer has a death. Same
-#     cause as (3), and the leak scales with what the instance holds rather
-#     than with the field.
-#
-#     Identical on the binary before the repair above, so it is exposed by that
-#     repair rather than caused by it.
-#
-# ⭐ THE MECHANISM IS THE ONE `lowerAttrSet` ALREADY NAMES: "Refusing is the
-# floor until the field is stored behind a handle the way every other field
-# is". For `X | None` specifically the box needs NO extra tag word --
-# `objectPayloadHandleWords` already writes word 1 = payload class and returns
-# an all-zero handle for None, so `box[1] != 0` IS the tag, and the layout
-# cycle in (2) disappears because a box is a fixed width. A wider union needs a
-# real tag word (word 15 of the box16 is unused) and a switch on both sides.
+#     releases for the member, correctly paired. What was missing is the call to
+#     `__ly_dealloc_H`: the store RE-ROOTED the instance's lane tuple, and the
+#     release planner's identity is the tuple, so the instance it was tracking
+#     no longer had a death. Boxing the field is exactly what stops the
+#     re-rooting.
 #
 # ⛔ AND ONE MORE, WHICH IS NOT THIS CAUSE and was measured on both binaries:
 # storing into one Optional field after a branch narrowed ANOTHER is
 # "operand #0 does not dominate this use" (b3 below). Pre-existing, unchanged
-# by the repair, and not obviously the same thing -- it is a placement problem
-# in the branch, not a storage one.
+# by either repair, and not obviously the same thing -- it is a placement
+# problem in the branch, not a storage one.
 
 class Holder:
     def __init__(self) -> None:

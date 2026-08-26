@@ -118,6 +118,8 @@ leak_mutate_call_append_big.py AGREE
 leak_mutate_call_append_small.py AGREE
 leak_mutate_selfmethod_append_big.py AGREE
 leak_mutate_selfmethod_append_small.py AGREE
+leak_optionalfield_rebind_big.py AGREE
+leak_optionalfield_rebind_small.py AGREE
 leak_rebind_call_dict_big.py AGREE
 leak_rebind_call_dict_small.py AGREE
 leak_rebind_call_int_big.py AGREE
@@ -273,6 +275,7 @@ wb_bool_argument_to_numeric_builtin.py AGREE
 wb_callable_field_store.py AGREE
 wb_conditional_rebind_element_leak.py SKIP
 wb_const_set_literal_fold.py WRONG-DECLARED
+wb_dispatch_findings_2026_08_21.py AGREE
 wb_duplicate_literal_element_delitem_leak.py AGREE
 wb_finally_loop_local_unwind.py AGREE
 wb_forloop_handler_local_unwind.py AGREE
@@ -300,7 +303,7 @@ wb_method_store_set.py AGREE
 wb_method_store_str.py AGREE
 wb_method_store_tuple.py AGREE
 wb_nested_loop_borrowed_parameter.py AGREE
-wb_optional_field_inline_storage.py GAP
+wb_optional_field_inline_storage.py AGREE
 wb_optional_field_second_instance.py SKIP
 wb_param_1lane_mutate_stringio.py AGREE
 wb_param_1lane_store_stringio.py AGREE
@@ -320,6 +323,7 @@ wb_param_store_list.py AGREE
 wb_param_store_literal_float.py AGREE
 wb_param_store_obj.py AGREE
 wb_param_store_optional.py GAP
+wb_param_store_optional_boxed.py AGREE
 wb_param_store_readboth_bigint.py GAP
 wb_param_store_readboth_bool.py AGREE
 wb_param_store_readboth_bytes.py AGREE

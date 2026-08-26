@@ -228,20 +228,24 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
     }
     return llvm::SmallVector<mlir::Type, 8>{};
   }
-  // ⭐ A layout cannot contain itself. A union-typed field stays INLINE (see
+  // ⭐ A layout cannot contain itself. A union of two OBJECTS stays INLINE (see
   // `classFieldStoredBoxed`), so a class reachable from its own field through
-  // one -- `nxt: Optional["Node"]`, the shape every linked structure is
-  // written in -- expanded forever and the COMPILER died with SIGILL and not
-  // one byte of diagnostic. A crash with no message is the worst answer a
-  // compiler can give, so the cycle is reported where it is entered.
+  // one expanded forever and the COMPILER died with SIGILL and not one byte of
+  // diagnostic. A crash with no message is the worst answer a compiler can
+  // give, so the cycle is reported where it is entered.
   //
-  // `nxt: "Node"` is boxed and works, which is what the message points at.
+  // ⛔ `T | None` no longer arrives here at all: it is stored as a box whose
+  // empty state IS None, so `nxt: Optional["Node"]` -- the shape every linked
+  // structure is written in -- terminates. What remains is the union of two
+  // things that are not the same object, and for that the message can only
+  // name the spellings that are boxed.
   if (!expandingContracts.insert(type).second)
     return op->emitError()
            << "class layout for " << type
-           << " contains itself through a union-typed field, which is stored "
-              "inline and so has no finite layout; give the field the class "
-              "type itself (stored as a reference) instead of a union with it";
+           << " contains itself through a union-typed field of two object "
+              "types, which is stored inline and so has no finite layout; a "
+              "field typed with the class itself, or with a union of it and "
+              "None, is stored as a reference and terminates";
   auto expanding = llvm::make_scope_exit([&] { expandingContracts.erase(type); });
   if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
     llvm::SmallVector<mlir::Type, 8> types{mlir::IntegerType::get(context, 64)};

@@ -77,7 +77,6 @@ errors/prim_tensor_loop_break emit
 errors/prim_to_prim_float_to_int emit
 errors/print_unrenderable_argument emit
 errors/property_no_setter emit
-errors/self_referential_union_field lower
 errors/set_of_int emit
 errors/starred_assignment_target emit
 errors/try_handler_rebind_no_lane emit

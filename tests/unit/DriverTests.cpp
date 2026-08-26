@@ -62,6 +62,15 @@ CompileResult compileSource(llvm::StringRef source,
   CompileResult result;
   mlir::MLIRContext context(testRegistry());
   llvm::raw_string_ostream diag(result.diagnostics);
+  // A refusal raised by a PASS reaches the context's engine, not the driver's
+  // stream, so without this handler `diagnostics` holds only what the frontend
+  // wrote and a lowering refusal can be asserted on nothing but its exit
+  // status -- which any other failure also produces.
+  mlir::ScopedDiagnosticHandler capture(
+      &context, [&](mlir::Diagnostic &diagnostic) {
+        diag << diagnostic.str() << "\n";
+        return mlir::failure(); // let the default handler still print it
+      });
   result.succeeded = mlir::succeeded(lython::driver::compilePythonSourceToLLVMIR(
       source, "<test>.py", "<lython-no-import-dir>", options, context,
       result.verified, diag));
@@ -1277,6 +1286,76 @@ TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
     EXPECT_EQ(function.getPersonalityFn()->getName(), expected);
   }
   EXPECT_GT(checked, 0u);
+}
+
+// `T | None` is one field, not a tag and two layouts. It is stored as a BOX --
+// the same box a plain class-typed field gets -- so a class that names itself
+// through one has a finite layout, and its ABI is the same width as if the
+// field could not be absent.
+TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
+  CompileResult optional = compileSource(
+      "class Node:\n"
+      "    v: int\n"
+      "    nxt: \"Node | None\"\n"
+      "    def __init__(self, v: int) -> None:\n"
+      "        self.v = v\n"
+      "        self.nxt = None\n"
+      "\n"
+      "def take(n: Node) -> int:\n"
+      "    return n.v\n"
+      "\n"
+      "take(Node(1))\n");
+  ASSERT_TRUE(optional.succeeded) << optional.diagnostics;
+  CompileResult plain = compileSource("class Node:\n"
+                                      "    v: int\n"
+                                      "    nxt: \"Node\"\n"
+                                      "    def __init__(self, v: int) -> None:\n"
+                                      "        self.v = v\n"
+                                      "        self.nxt = self\n"
+                                      "\n"
+                                      "def take(n: Node) -> int:\n"
+                                      "    return n.v\n"
+                                      "\n"
+                                      "take(Node(1))\n");
+  ASSERT_TRUE(plain.succeeded) << plain.diagnostics;
+  llvm::Function *optionalTake = optional.verified.llvmModule->getFunction("take");
+  llvm::Function *plainTake = plain.verified.llvmModule->getFunction("take");
+  ASSERT_NE(optionalTake, nullptr);
+  ASSERT_NE(plainTake, nullptr);
+  // The two modules are compiled in separate LLVM contexts, so identical types
+  // are distinct objects; the printed form is what can be compared.
+  std::string optionalSignature;
+  std::string plainSignature;
+  llvm::raw_string_ostream(optionalSignature) << *optionalTake->getFunctionType();
+  llvm::raw_string_ostream(plainSignature) << *plainTake->getFunctionType();
+  EXPECT_EQ(optionalSignature, plainSignature)
+      << "an optional field costs the same lanes as the payload alone; a tag "
+         "and the member's inline lanes would widen the instance";
+}
+
+// A union of two OBJECTS still has no box to be stored in, so a class that
+// names itself through one has no finite layout and is refused. The refusal is
+// what keeps the expansion from recursing until the compiler dies with SIGILL
+// and no diagnostic, which is what it did.
+TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
+  CompileResult result = compileSource("class Leaf:\n"
+                                       "    n: int\n"
+                                       "    def __init__(self, n: int) -> None:\n"
+                                       "        self.n = n\n"
+                                       "\n"
+                                       "class Node:\n"
+                                       "    v: int\n"
+                                       "    nxt: \"Node | Leaf\"\n"
+                                       "    def __init__(self, v: int) -> None:\n"
+                                       "        self.v = v\n"
+                                       "        self.nxt = Leaf(0)\n"
+                                       "\n"
+                                       "print(Node(1).v)\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("contains itself through a union-typed "
+                                    "field of two object types"),
+            std::string::npos)
+      << result.diagnostics;
 }
 
 // An optional result carries its payload ONCE. `T | None` is a union with one

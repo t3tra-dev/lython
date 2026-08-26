@@ -4,6 +4,8 @@
 #include "ExceptionTaxonomy.h"
 #include "Runtime/ABI/BoxLayout.h"
 
+#include "llvm/ADT/ScopeExit.h"
+
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 
@@ -121,14 +123,83 @@ mlir::FailureOr<unsigned> RuntimeBundleLowerer::classFieldValueOffset(
   return offset;
 }
 
+// Does this contract's runtime value fit in ONE lane -- the entity handle and
+// nothing after it?
+//
+// ⛔ ASKED WITHOUT `runtimeValueTypesFor`, which is the whole reason it exists.
+// The only caller is `classFieldStoredBoxed`, and it is called FROM the
+// expansion of the very class it would have to expand again: `nxt:
+// Optional["Node"]` asks about Node while Node's own layout is being built, so
+// the shared expansion guard would report the layout cycle it is there to
+// report. The cycle is the ANSWER here rather than an error -- a class reached
+// through its own boxed field contributes a handle and no lanes -- so a query
+// already in flight answers yes and lets the enclosing one finish.
+bool RuntimeBundleLowerer::contractIsOneRuntimeLane(mlir::Type contract) const {
+  if (!laneCountQueries.insert(contract).second)
+    return true;
+  auto pending =
+      llvm::make_scope_exit([&] { laneCountQueries.erase(contract); });
+  std::string name = runtimeShapeContractName(contract);
+  if (!name.empty())
+    if (const RuntimeValueShape *shape = manifest.valueShape(name))
+      return shape->valueTypes.size() == 1;
+  py::ClassOp classOp = RuntimeBundleLowerer::classForContract(contract);
+  if (!classOp)
+    return false;
+  // An exception-backed class answers with the runtime exception shape, which
+  // is more than one lane.
+  if (RuntimeBundleLowerer::exceptionAncestorContract(classOp))
+    return false;
+  const RuntimeValueShape *objectShape = manifest.valueShape("builtins.object");
+  if (!objectShape || objectShape->valueTypes.size() != 1)
+    return false;
+  // Every field is either in the instance body (primitive) or behind a box;
+  // one that is neither is stored INLINE and widens the class past its handle.
+  for (mlir::Type fieldType :
+       RuntimeBundleLowerer::classFieldContractTypes(classOp))
+    if (!isPrimitiveFieldContract(fieldType) &&
+        !RuntimeBundleLowerer::classFieldStoredBoxed(fieldType))
+      return false;
+  return true;
+}
+
 bool RuntimeBundleLowerer::classFieldStoredBoxed(
     mlir::Type fieldContract) const {
+  // ⭐ `T | None` IS AT MOST ONE OBJECT, and the box already says so: its
+  // entity word is a handle whose ZERO means there is none --
+  // `release_payload_slot_ptr` reads it that way and has since boxes existed.
+  // So an optional field needs no tag and no second set of lanes; it is one
+  // box that may be empty.
+  //
+  // This is what makes a linked structure expressible. A union field stays
+  // INLINE, so `nxt: "Node | None"` -- the shape every linked structure is
+  // written in -- put Node's own layout inside Node and had no finite size;
+  // the diagnostic in CallableABI.cpp told authors to write `nxt: "Node"`,
+  // which cannot hold the end of the list.
+  //
+  // ⛔ ONE LANE ONLY, and the limit is the ABSENT read rather than the layout.
+  // Reading the box back has to hand out lanes on both arms, and the lanes past
+  // the entity come from the contract's `lane_words` primitive, which
+  // DEREFERENCES the entity (`__ly_unicode_shape_word` reads word 2). The
+  // stand-in for an absent object is the immortal dead header, two words wide,
+  // so asking it for a second lane reads off the end of a constant global. A
+  // one-lane contract never asks: its lane is a memref built AT the address,
+  // which is why the arm can be a `select` on the address instead of a region
+  // -- and that is what keeps the read's retain rooted where the verifier and
+  // the release planner can both see it.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(fieldContract)) {
+    if (!unionType.isOptional())
+      return false;
+    mlir::Type payload = unionType.getOptionalPayloadType();
+    return classFieldStoredBoxed(payload) &&
+           RuntimeBundleLowerer::contractIsOneRuntimeLane(payload);
+  }
   // runtimeShapeContractName returns by value; a StringRef binding would
   // dangle past this declaration statement.
   std::string contractName = runtimeShapeContractName(fieldContract);
-  // A union-typed field has no single contract: its tag plus every member's
-  // lanes stay inline, because the box words hold ONE payload handle and a
-  // union is not one object.
+  // A union of two things that are not the same object has no single contract:
+  // its tag plus every member's lanes stay inline, because the box words hold
+  // ONE payload handle.
   if (contractName.empty())
     return false;
   // Zero-lane contracts have nothing that could go stale. Adding a box would
@@ -241,6 +312,136 @@ RuntimeBundleLowerer::classInstanceBody(mlir::Operation *op,
                             builder.getI64Type()));
 }
 
+// Gives up whatever the box held and leaves it empty. An empty box is not a
+// special state: `release_payload_slot_ptr` has always read a zero entity as
+// "no object", which is exactly what `None` is.
+mlir::LogicalResult
+RuntimeBundleLowerer::clearBoxedFieldSlot(mlir::Operation *op, mlir::Value body,
+                                          unsigned boxWord,
+                                          llvm::StringRef slotName) {
+  auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
+      "LyObject_ReleaseBoxedPayloadArraySlotRaw");
+  if (!releaseBoxed)
+    return op->emitError() << "runtime support has no "
+                              "LyObject_ReleaseBoxedPayloadArraySlotRaw to "
+                              "empty "
+                           << slotName;
+  mlir::Location loc = op->getLoc();
+  mlir::Value releaseStorage = body;
+  mlir::Type expectedStorage = releaseBoxed.getFunctionType().getInput(0);
+  if (releaseStorage.getType() != expectedStorage)
+    releaseStorage = mlir::memref::CastOp::create(builder, loc, expectedStorage,
+                                                  releaseStorage)
+                         .getResult();
+  mlir::Value releaseSlot = constantI64(
+      builder, loc, boxWord / static_cast<unsigned>(box_abi::kWordsPerBox));
+  mlir::func::CallOp::create(builder, loc, releaseBoxed,
+                             mlir::ValueRange{releaseStorage, releaseSlot});
+  mlir::Value zero = constantI64(builder, loc, 0);
+  for (std::int64_t word : {box_abi::kEntityWord, box_abi::kOwnedFlagWord}) {
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(boxWord) + word);
+    mlir::memref::StoreOp::create(builder, loc, zero, body, slot);
+  }
+  return mlir::success();
+}
+
+// Fills the box with the payload, or empties it, according to which arm the
+// value carries.
+//
+// ⛔ WHY A BRANCH AND NOT ONE STORE OF WHATEVER THE LANES HOLD. A `None` arm's
+// payload lanes are not nothing -- they are the immortal dead placeholder every
+// producer of a union gives an inactive member -- and its address is not zero.
+// Rooting the box at it would make an empty field read back as PRESENT, and
+// the reader has only the entity word to go on.
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::storeOptionalBoxedField(mlir::Operation *op,
+                                              mlir::Value body,
+                                              unsigned boxWord,
+                                              const RuntimeBundle &value,
+                                              py::UnionType unionType,
+                                              llvm::StringRef slotName) {
+  if (value.physicalValues().empty())
+    return op->emitError() << slotName << " optional value has no runtime tag";
+  mlir::FailureOr<RuntimeBundle> payload =
+      RuntimeBundleLowerer::optionalPayloadBundle(op, value, unionType,
+                                                  "optional field ABI");
+  if (mlir::failed(payload))
+    return mlir::failure();
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Value tag = value.physicalValues().front();
+  mlir::Value present = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, tag,
+      constantI64(builder, loc,
+                  RuntimeBundleLowerer::optionalPayloadTag(unionType)));
+  auto branch = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                        present, /*withElseRegion=*/true);
+  mlir::LogicalResult filled = mlir::success();
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    // The region already has its terminator; the store goes in front of it.
+    mlir::Operation *anchor = branch.thenBlock()->getTerminator();
+    builder.setInsertionPoint(anchor);
+    mlir::FailureOr<RuntimeBundle> stored =
+        RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(anchor, body,
+                                                            boxWord, *payload,
+                                                            slotName);
+    if (mlir::failed(stored))
+      filled = mlir::failure();
+  }
+  if (mlir::failed(filled))
+    return mlir::failure();
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(branch.elseBlock()->getTerminator());
+    if (mlir::failed(RuntimeBundleLowerer::clearBoxedFieldSlot(op, body,
+                                                               boxWord,
+                                                               slotName)))
+      return mlir::failure();
+  }
+  RuntimeBundle result = value;
+  result.objectValue = value.objectValue.withOwnership(
+      ownership::OwnershipKind::Borrow);
+  return result;
+}
+
+// The payload half of an optional value: the lanes after the tag, and the
+// contract they belong to. A bundle read back out of a field has no evidence
+// either, so nothing is lost by rebuilding one from the lanes.
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::optionalPayloadBundle(mlir::Operation *op,
+                                            const RuntimeBundle &value,
+                                            py::UnionType unionType,
+                                            llvm::StringRef purpose) {
+  mlir::Type payloadType = unionType.getOptionalPayloadType();
+  llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+  unsigned payloadIndex = members[0] == payloadType ? 0u : 1u;
+  mlir::FailureOr<unsigned> offset = RuntimeBundleLowerer::unionMemberValueOffset(
+      op, unionType, payloadIndex, purpose);
+  if (mlir::failed(offset))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> payloadTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, payloadType, purpose);
+  if (mlir::failed(payloadTypes))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 4> lanes(value.physicalValues());
+  if (*offset + payloadTypes->size() > lanes.size())
+    return op->emitError() << purpose << ": optional payload lanes exceed "
+                           << value.contract;
+  RuntimeBundle payload = RuntimeBundle::objectWithOwnership(
+      payloadType,
+      mlir::ValueRange(lanes).slice(*offset, payloadTypes->size()),
+      value.objectValue.ownership);
+  return payload;
+}
+
+// Which tag value means "there is a payload".
+unsigned RuntimeBundleLowerer::optionalPayloadTag(py::UnionType unionType) {
+  llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+  return members[0] == unionType.getOptionalPayloadType() ? 0u : 1u;
+}
+
 // Swaps the payload held by an existing box16 slot without re-rooting the
 // slot itself: retain the new payload, release whatever the box owned (a
 // no-op while the owned flag is zero), overwrite the handle words. The box
@@ -258,6 +459,15 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
                            << body.getType();
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
+  // ⭐ `T | None` STORES AS THE PAYLOAD OR AS NOTHING. The box holds one handle
+  // and its zero already means "no object", so the tag never reaches memory:
+  // whichever arm the value carries decides between filling the box and
+  // emptying it.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(value.contract))
+    if (unionType.isOptional())
+      return RuntimeBundleLowerer::storeOptionalBoxedField(op, body, boxWord,
+                                                           value, unionType,
+                                                           slotName);
   mlir::FailureOr<RuntimeBundle> payload =
       RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
   if (mlir::failed(payload))
@@ -462,9 +672,10 @@ RuntimeBundleLowerer::classFieldStorageValueTypes(
   // a class with three of them expanded to four and could not be stored in a
   // container at all.
   //
-  // ⛔ A UNION FIELD STILL TAKES ITS LANES. Its storage is a tag plus the live
-  // member's lanes, and the members do not share a width, so there is no single
-  // box to front it with. A class with one is still as wide as its union.
+  // ⛔ A union of two OBJECTS still takes its lanes. Its storage is a tag plus
+  // the live member's lanes, and the members do not share a width, so there is
+  // no single box to front it with. `T | None` is not one of these: see
+  // `classFieldStoredBoxed`.
   if (isPrimitiveFieldContract(fieldContract) ||
       classFieldStoredBoxed(fieldContract))
     return llvm::SmallVector<mlir::Type, 8>{};
@@ -1394,12 +1605,138 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         return mlir::failure();
       laneTypes = std::move(*contractTypes);
     }
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
-        rebuildBoxedFieldLanes(laneTypes, slot->first, boxWord,
-                               runtimeContractName(loadedContract));
-    if (mlir::failed(rebuilt))
-      return mlir::failure();
-    values = std::move(*rebuilt);
+    // ⭐ `T | None` READS BACK OUT OF THE BOX'S ENTITY. A zero entity is the
+    // None arm -- the same word `release_payload_slot_ptr` has always read that
+    // way -- so the tag is a comparison rather than a stored word, and the
+    // payload's lanes are rebuilt only on the arm that has one. Rebuilding them
+    // unconditionally would follow a null handle for any contract whose other
+    // lanes live behind it.
+    //
+    // ⛔ ASK `loadedContract`, NOT THE ANNOTATION. When the cache still knows
+    // what the field holds, the read is of THAT contract -- the box has a
+    // payload and the arm is already decided -- and the ordinary boxed read
+    // rebuilds its lanes. Testing the annotation instead built the two-arm
+    // read for a bundle whose contract was the payload, and the result was one
+    // tag where the payload's lane belonged.
+    auto optionalField =
+        mlir::dyn_cast_if_present<py::UnionType>(loadedContract);
+    if (optionalField && !optionalField.isOptional())
+      optionalField = nullptr;
+    if (optionalField) {
+      mlir::Type payloadType = optionalField.getOptionalPayloadType();
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> payloadTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, payloadType,
+                                                     "optional field ABI");
+      if (mlir::failed(payloadTypes))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Value entityIndex = mlir::arith::AddIOp::create(
+          builder, loc, boxWord,
+          mlir::arith::ConstantIndexOp::create(builder, loc,
+                                               box_abi::kEntityWord));
+      mlir::Value entityWord =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
+              .getResult();
+      mlir::Value present = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::ne, entityWord,
+          constantI64(builder, loc, 0));
+      // ⭐ THE ABSENT ARM IS AN ADDRESS, NOT A BRANCH. Rebuilding the lane is
+      // arithmetic on the entity -- a memref built AT it, nothing loaded -- so
+      // both arms can be one `select` over which address to build from, and the
+      // read stays a straight-line expression of the box.
+      //
+      // ⛔ AND IT HAS TO. The reference this read takes is rooted by the retain
+      // IMMEDIATELY BEFORE the frame's token (`ownedLocalMarkerIsRetainRooted`
+      // is that literal), and the release planner places the instance's own
+      // death at this read. Building the lane inside an `scf.if` puts the value
+      // the retain names outside the planner's reach: the token was minted
+      // after the branch, the instance was deallocated between the two, and the
+      // retain ran on a freed payload -- "Ly_IncRef observed non-positive
+      // refcount", on a store through a parameter read back by the caller.
+      //
+      // The stand-in is the same immortal dead header every producer of a union
+      // gives an inactive member, so the retain and the release the token earns
+      // both step over it without a write.
+      mlir::FailureOr<RuntimeValue> absent =
+          RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+              op, payloadType, "optional field ABI");
+      if (mlir::failed(absent) || absent->values.empty())
+        return mlir::failure();
+      mlir::Value absentAddress = mlir::arith::IndexCastOp::create(
+          builder, loc, builder.getI64Type(),
+          mlir::memref::ExtractAlignedPointerAsIndexOp::create(
+              builder, loc, absent->values.front()));
+      mlir::Value entity = mlir::arith::SelectOp::create(
+          builder, loc, present, entityWord, absentAddress);
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+          RuntimeBundleLowerer::lanesFromBoxEntity(
+              builder, loc, entity, *payloadTypes,
+              runtimeContractName(payloadType), op);
+      if (mlir::failed(lanes))
+        return mlir::failure();
+      RuntimeValue payloadValue{
+          payloadType, *lanes,
+          ownership::logicalOwnershipKind(payloadType, /*ownsObject=*/false)};
+      std::optional<RuntimeValue> ownedPayload =
+          RuntimeBundleLowerer::retainEvidenceElement(op, payloadValue);
+      llvm::ArrayRef<mlir::Value> payloadLanes =
+          ownedPayload ? llvm::ArrayRef<mlir::Value>(ownedPayload->values)
+                       : llvm::ArrayRef<mlir::Value>(payloadValue.values);
+      // ⭐ THE ARM IS DECIDED FROM A SECOND READ OF THE ENTITY, taken after the
+      // reference is. Reading it twice is free -- nothing between the two can
+      // write the box -- and the order is the one the value actually has: the
+      // payload is taken first, and only then is it asked whether there was
+      // one.
+      //
+      // ⛔ AND THE SECOND READ IS LOAD-BEARING FOR PLACEMENT. The release
+      // planner puts the instance's own death after its last use, and the box
+      // body is the only use a field read has: with the arm decided from the
+      // FIRST read, the instance was deallocated between the lane and the
+      // retain, and the retain then ran on freed memory. Measured on
+      // `r.blob is None` followed by `blob = r.blob` -- "Ly_IncRef observed
+      // non-positive refcount". This is `pinContainerLiveness` for a class,
+      // which has no `__len__` to pin with.
+      builder.setInsertionPoint(op);
+      mlir::Value tagWord =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
+              .getResult();
+      present = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::ne, tagWord,
+          constantI64(builder, loc, 0));
+      unsigned payloadTag =
+          RuntimeBundleLowerer::optionalPayloadTag(optionalField);
+      mlir::FailureOr<unsigned> payloadOffset =
+          RuntimeBundleLowerer::unionMemberValueOffset(op, optionalField,
+                                                       payloadTag,
+                                                       "optional field ABI");
+      if (mlir::failed(payloadOffset))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      values.clear();
+      values.push_back(mlir::arith::SelectOp::create(
+          builder, loc, present, constantI64(builder, loc, payloadTag),
+          constantI64(builder, loc, payloadTag == 0 ? 1 : 0)));
+      for (unsigned index = 1; index < laneTypes.size(); ++index) {
+        if (index >= *payloadOffset &&
+            index < *payloadOffset + payloadLanes.size())
+          values.push_back(payloadLanes[index - *payloadOffset]);
+        else
+          // Unreachable while `isOptional()` means exactly two members one of
+          // which has no lanes; spelled anyway because a lane nobody wrote has
+          // no correct filler.
+          return op.emitError()
+                 << "optional field ABI: lane " << index
+                 << " belongs to no member of " << optionalField;
+      }
+    } else {
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
+          rebuildBoxedFieldLanes(laneTypes, slot->first, boxWord,
+                                 runtimeContractName(loadedContract));
+      if (mlir::failed(rebuilt))
+        return mlir::failure();
+      values = std::move(*rebuilt);
+    }
     // A read TAKES A REFERENCE. The reconstructed values are fresh SSA with no
     // borrowed-entry provenance the planner could trace, and the slot's own
     // reference is not the reader's to rely on: `old = o.f; o.f = fresh` drops

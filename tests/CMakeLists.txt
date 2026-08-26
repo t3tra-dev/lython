@@ -195,6 +195,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.GeneratorObjectArgumentIsReleasedByItsCreatorToo"
     "DriverTest.TheExceptionChainIsWalkedWithPointers"
     "DriverTest.AnOptionalResultCarriesItsPayloadOnce"
+    "DriverTest.AnOptionalFieldIsBoxedLikeThePayloadAlone"
+    "DriverTest.AUnionOfTwoObjectsCannotReachItsOwnClass"
     "DriverTest.EveryLandingPadClauseIsAPythonClassOrCatchAll"
     "DriverTest.ShapesThatHandleMoreThanTheyNameStayCatchAll"
     "DriverTest.ABareExceptNamesBaseException"
