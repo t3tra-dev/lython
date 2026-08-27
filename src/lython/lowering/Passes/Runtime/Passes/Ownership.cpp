@@ -3099,7 +3099,23 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
                      << " views=" << candidate.views.size()
                      << " sound=" << sound << " anyTransfer=" << anyTransfer
                      << " borrowEdges=" << retains.size() << "\n";
-      if (!sound || !anyTransfer)
+      // ⛔ NO `anyTransfer` REQUIREMENT. A merge every edge of which LENDS is
+      // still a merge that has to own its argument: dropped for want of a
+      // transfer, the argument is neither owned nor lent, and the pass then
+      // reads the forward as though the token had moved -- so the source loses
+      // its release on the paths the merge does not carry it out on, and an
+      // unwind out of the merge block finds no cleanup for it either.
+      //
+      //     length = len(line)          # owned
+      //     if ...: m = length          # every edge into the merge borrows
+      //     if m <= col: m = col + 1    # ... and `length` is used after it
+      //     return m
+      //
+      // was refused with "owned resource from @LyLong_FromI64 reaches function
+      // exit without release". Retaining on each edge costs one pair per merge
+      // of borrowed values and makes the argument's ownership the same
+      // question everywhere else in this file already asks.
+      if (!sound)
         toRemove.push_back(entry.first);
       else
         edgeRetains.append(retains.begin(), retains.end());

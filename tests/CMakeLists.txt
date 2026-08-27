@@ -207,7 +207,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AParkedExceptionIsReachedByPointer"
     "DriverTest.ManifestWordOffsetsMatchTheRuntimeStructs"
     "DriverTest.RepeatedCompileIsStable"
-    "DriverTest.InstallsAOTEntryPointBesideAPythonMain")
+    "DriverTest.InstallsAOTEntryPointBesideAPythonMain"
+    "DriverTest.AnOwnedValueSurvivesTwoRebindingIfChains")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

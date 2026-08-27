@@ -1,24 +1,23 @@
-# probe: an owned call result rebound by two sequential if-chains loses its release
-# axes: acquire=call width=int op=rebind flow=two-diamonds observe=refusal
-# CLASSIFICATION @ 2026-08-27: 3 誤って拒否する
+# probe: an owned call result rebound by two sequential if-chains keeps its release
+# axes: acquire=call width=int op=rebind flow=two-diamonds observe=regression
+# CLASSIFICATION @ 2026-08-27: 1 正しい
 #
-# `length` holds an owned `int` from `len()`. Each `if` chain rebinds the name
-# and merges; the second chain's merge is reached by TWO edges from ONE
-# terminator carrying DIFFERENT operands, which is the shape
-# insertBlockArgMergeBorrowRetains declines outright ("Two edges into the merge
-# from one terminator cannot both be retained (only one is taken at runtime)").
-# Declining removes the merge candidate, and with it the release of the value
-# the return did not take:
+# `length` holds an owned `int` from `len()` and each `if` chain rebinds the
+# name. Every edge into the first merge BORROWS -- `length` is read again after
+# it, so none of them can be a move -- and the merge was dropped for having no
+# transfer, which left its argument neither owned nor lent. The pass then read
+# the forward as though the token had moved, so `length` lost its release on the
+# paths the merge does not carry it out on:
 #
 #   owned resource from @LyLong_FromI64 result 0 reaches function exit without
 #   release, transfer, or owned return
 #
-# One chain compiles. Two chains compile when `length` is a PARAMETER rather
-# than a call result. Both chains together on a call result do not.
-#
-# Found while making traceback.py's anchor columns match CPython; the affected
-# code is now runtime/lib/traceback.py's `_marker_end`, written as its own
-# function so the answer is bound once.
+# An all-borrow merge now takes an increment per edge and owns its argument, so
+# both questions -- whether the source still has to be released, and whether an
+# unwind out of the merge block needs a cleanup for it -- are answered the same
+# way as everywhere else. One `if` chain compiled before; two did not, and
+# neither did `_anchors` in runtime/lib/traceback.py, which is where this was
+# found.
 #
 # CPython 3.14 expects: 13
 

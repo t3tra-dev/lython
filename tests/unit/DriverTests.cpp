@@ -1400,3 +1400,28 @@ TEST(DriverTest, AnOptionalResultCarriesItsPayloadOnce) {
       << "the lane after the tag is what the payload is returned as on its "
          "own";
 }
+
+// An owned value whose name is rebound by two sequential `if` chains still gets
+// its release. Every edge into the first merge borrows -- the value is read
+// again after the merge, so none of them can be a move -- and a merge with no
+// transferring edge used to be dropped, leaving its argument neither owned nor
+// lent. The forward was then read as though the token had moved, so the source
+// lost its release on the paths the merge does not carry it out on.
+TEST(DriverTest, AnOwnedValueSurvivesTwoRebindingIfChains) {
+  CompileResult result =
+      compileSource("def f(line: str, col: int, end_col: int) -> int:\n"
+                    "    length = len(line)\n"
+                    "    marker_end = length\n"
+                    "    if end_col > col:\n"
+                    "        marker_end = end_col\n"
+                    "        if marker_end > length:\n"
+                    "            marker_end = length\n"
+                    "    if marker_end <= col:\n"
+                    "        marker_end = col + 1\n"
+                    "        if marker_end > length:\n"
+                    "            marker_end = length\n"
+                    "    return marker_end\n"
+                    "\n"
+                    "print(f('return a // b', 7, 13))\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}

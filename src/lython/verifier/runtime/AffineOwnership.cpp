@@ -65,7 +65,11 @@ bool ownershipStaleTraceEnabled() {
 }
 
 // LYTHON_OWNERSHIP_TRACE_PATH: print the CFG path that reached a rejected
-// double consume, as `^bbN>` ordinals matching a LYTHON_IR_DUMP listing.
+// double consume -- or a token still owned at the return -- as `^bbN>` ordinals
+// matching a LYTHON_IR_DUMP listing. The leak side also prints the GROUP, which
+// is what says whether the walk is still holding the name the releases were
+// written under: a merge argument there where the IR releases the merge's
+// SOURCE is a rename the walk should not have made.
 //
 // Why NOT read it off the diagnostic: the message names the producer and the
 // releasing call, and both are the same symbols on every path through a loop.
@@ -2497,12 +2501,32 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                                             deallocators, aliases);
         bool uses = groupContainsOperand(op, state.group, aliases);
         if (state.token == AffineTokenState::Owned) {
-          if (!consumes)
+          if (!consumes) {
+            if (ownershipPathTraceEnabled()) {
+              llvm::errs() << "[ownership-path] exit without release of "
+                           << resource.producerLabel << " (produced in ^bb"
+                           << blockOrdinal(resource.producer->getBlock())
+                           << ") at ^bb" << blockOrdinal(state.block)
+                           << ", group=";
+              for (mlir::Value g : state.group) {
+                if (auto a = mlir::dyn_cast<mlir::BlockArgument>(g))
+                  llvm::errs() << "arg" << a.getArgNumber() << "@^bb"
+                               << blockOrdinal(a.getOwner()) << " ";
+                else if (mlir::Operation *d = g.getDefiningOp())
+                  llvm::errs() << d->getName() << "@^bb"
+                               << blockOrdinal(d->getBlock()) << " ";
+              }
+              llvm::errs() << ", path=";
+              for (unsigned ordinal : state.trail)
+                llvm::errs() << "^bb" << ordinal << ">";
+              llvm::errs() << "\n";
+            }
             return ret.emitError()
                    << "owned resource from " << resource.producerLabel
                    << " result " << resource.resultOffset
                    << " reaches function exit without release, transfer, or "
                       "owned return";
+          }
           // ⭐ `parkedUnnamed`, not zero: storing a value into a container
           // and returning the same value is balanced -- the container holds
           // its own reference and the return transfers the frame's.
@@ -2752,6 +2776,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
         // Released keeps the AFFINE property checkable -- a second release, under
         // either name, is now a double consume this same walk reports, which is
         // how the normal-path over-release in this family stays caught.
+        //
         bool retains = mentionsTracked &&
                        callRetainsGroup(contracts, call, state.group, aliases);
         // A slot-absorption retain (`aggregate_retain`: an element/field store)

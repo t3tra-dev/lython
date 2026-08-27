@@ -288,6 +288,7 @@ seqlit_slot_retain_in_loop_str.py AGREE
 wb_aggregate_slot_unfold_retain_leak.py SKIP
 wb_argument_boundary_numeric_tower.py AGREE
 wb_bool_argument_to_numeric_builtin.py AGREE
+wb_borrowed_param_rebound_local.py GAP
 wb_callable_field_store.py AGREE
 wb_conditional_rebind_element_leak.py SKIP
 wb_const_set_literal_fold.py WRONG-DECLARED
@@ -360,7 +361,7 @@ wb_param_store_tuple.py AGREE
 wb_param_store_twofloat.py AGREE
 wb_param_store_twolevel_float.py AGREE
 wb_range_elem_into_list_literal.py AGREE
-wb_rebound_call_result_two_diamonds.py GAP
+wb_rebound_call_result_two_diamonds.py AGREE
 wb_reverse_two_carried_optionals.py AGREE
 wb_small_int_set_iteration_order.py AGREE
 wb_source_generator_non_int_yield.py AGREE
