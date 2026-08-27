@@ -23,6 +23,7 @@ a_narrowing_carries_into_the_next_operand.py AGREE
 a_nested_loop_appends_the_outer_element.py AGREE
 a_program_that_binds_range_keeps_its_own.py AGREE
 a_quoted_annotation_is_the_annotation_it_spells.py AGREE
+a_read_back_element_in_a_nested_loop.py AGREE
 a_subclass_body_is_reached_through_the_base.py AGREE
 a_traceback_is_a_chain_of_objects.py EXTRA
 an_erased_value_compared_to_a_literal.py AGREE

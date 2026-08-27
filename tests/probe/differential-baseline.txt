@@ -132,6 +132,8 @@ leak_optionalwalk_break_big.py AGREE
 leak_optionalwalk_break_small.py AGREE
 leak_optionalwalk_loop_big.py AGREE
 leak_optionalwalk_loop_small.py AGREE
+leak_readback_nested_big.py AGREE
+leak_readback_nested_small.py AGREE
 leak_rebind_call_dict_big.py AGREE
 leak_rebind_call_dict_small.py AGREE
 leak_rebind_call_int_big.py AGREE
@@ -323,7 +325,7 @@ wb_method_store_tuple.py AGREE
 wb_nested_loop_borrowed_parameter.py AGREE
 wb_optional_field_inline_storage.py AGREE
 wb_optional_field_second_instance.py SKIP
-wb_outer_local_container_in_inner_loop.py GAP
+wb_outer_local_container_in_inner_loop.py AGREE
 wb_param_1lane_mutate_stringio.py AGREE
 wb_param_1lane_store_stringio.py AGREE
 wb_param_augassign_float.py AGREE

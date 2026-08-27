@@ -443,26 +443,6 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     NodePtr step = synth::name(stepName, range);
     llvm::SmallVector<std::string, 3> names{counterName, stopName};
 
-    // ⛔ THE COUNTER STARTS ONE STEP BACK AND THE BOUND COMES IN ONE STEP TOO,
-    // so that the target is bound from a value the loop BODY defines rather
-    // than from the header's own argument. Written the direct way --
-    //
-    //     i = start
-    //     while i < stop:
-    //         <target> = i
-    //         i = i + step
-    //
-    // -- `<target>` is another name for the header argument, and a container
-    // built from it in a NESTED loop mints an owned-local token whose release
-    // the placer then writes on the OUTER loop's dead edges, which the mint does
-    // not dominate: "operand #0 does not dominate this use".
-    // tests/probe/wb_outer_local_container_in_inner_loop.py is that defect on
-    // its own, in plain Python with no `range` in it.
-    //
-    // ⭐ `i < stop - step` rather than `i + step < stop`, which is the same
-    // inequality over integers and one add per iteration rather than two. The
-    // two-add spelling cost a list comprehension 12% against the range object
-    // it replaces; this one is 11% faster than it.
     NodePtr test;
     if (literalStep && *literalStep > 0) {
       test = synth::compare(counter, "Lt", stop, range);
@@ -485,9 +465,9 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
     NodePtr stepValue = literalStep ? synth::intConstant(*literalStep, range)
                                     : synth::name(stepName, range);
     std::vector<NodePtr> body{
+        synth::assign(parts->target, counter, range),
         synth::assign(counter,
-                      synth::binOp(counter, "Add", stepValue, range), range),
-        synth::assign(parts->target, counter, range)};
+                      synth::binOp(counter, "Add", stepValue, range), range)};
     body.insert(body.end(), parts->body.begin(), parts->body.end());
     NodePtr loop =
         synth::whileStmt(test, std::move(body), parts->orelse, range);
@@ -502,12 +482,10 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
             {synth::raiseValueError("range() arg 3 must not be zero", range)},
             {}, range));
       }
-      emitStatement(*synth::assign(
-          synth::name(stopName, range),
-          synth::binOp(stopExpr, "Sub", stepValue, range), range));
-      emitStatement(*synth::assign(
-          synth::name(counterName, range),
-          synth::binOp(startExpr, "Sub", stepValue, range), range));
+      emitStatement(*synth::assign(synth::name(stopName, range), stopExpr,
+                                   range));
+      emitStatement(*synth::assign(synth::name(counterName, range), startExpr,
+                                   range));
       emitWhile(*loop);
     });
     return true;

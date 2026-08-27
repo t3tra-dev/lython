@@ -1538,6 +1538,38 @@ bool releaseOwnedGroupByLiveness(
       dominance.emplace(selfOp->getParentOfType<mlir::func::FuncOp>());
     return dominance->properlyDominates(user, selfOp);
   };
+  // ⛔ AND A USE THE MINT DOES NOT DOMINATE IS NOT THIS TOKEN'S EITHER, which is
+  // more than "does not precede it": a use in a block the mint merely REACHES
+  // stands in no order to it at all, and on the path that does not pass the
+  // mint the token is not there to be read.
+  //
+  //     while a < 4:
+  //         i = a
+  //         while b < 4:
+  //             ys = [i]          # the element read folds back to `a` and
+  //             total += ys[0]    # mints a retain-rooted token HERE
+  //
+  // The mint is in the inner body and `a`'s other uses are spread over the
+  // outer loop, so the alias-class liveness read "live to the end of the outer
+  // loop" and put the release on the outer loop's dead edges -- which the mint
+  // does not dominate. What that produced was not a leak but unspellable IR:
+  // "operand #0 does not dominate this use".
+  //
+  // ⛔ RETAIN-ROOTED ONLY, and that is the whole soundness argument. Such a
+  // token is an increment taken on top of a value that already holds the
+  // object, so the uses being dropped are kept alive by that value's own
+  // obligation. An ALLOCATION-rooted token has no second holder -- but it also
+  // has no names outside what SSA derives from the alloc, so every use it could
+  // have is dominated anyway and this answers false for all of them.
+  const bool mintedOnAnExistingValue =
+      ownsReference && selfOp && selfOp->hasAttr(own::kOwnedLocalObjectAttr);
+  auto useIsAnotherIncarnations = [&](mlir::Operation *user) {
+    if (!mintedOnAnExistingValue || user == selfOp)
+      return false;
+    if (!dominance)
+      dominance.emplace(selfOp->getParentOfType<mlir::func::FuncOp>());
+    return !dominance->dominates(selfOp, user);
+  };
   // Interior views (canonical-shape tail beyond the release interface) pin
   // the entity: every use is a plain liveness contribution. Box-word
   // reconstructions (borrowed memref views assembled from the entity's box
@@ -2009,7 +2041,7 @@ bool releaseOwnedGroupByLiveness(
         mlir::Operation *user = use.getOwner();
         if (user == selfOp)
           continue;
-        if (usePrecedesDefinition(user))
+        if (usePrecedesDefinition(user) || useIsAnotherIncarnations(user))
           continue;
         if (consumingUseEndsThisToken(use, equivalent)) {
           if (!consumeIsDeath)
@@ -2232,6 +2264,21 @@ bool releaseOwnedGroupByLiveness(
     } else {
       collectEdgeDeaths(block->getTerminator());
     }
+  }
+
+  // The same rule on the placement side: a block the mint does not dominate is
+  // one the token is not in, so it is not a release site either.
+  if (mintedOnAnExistingValue) {
+    mlir::Block *mintBlock = selfOp->getBlock();
+    auto mintReaches = [&](mlir::Block *block) {
+      return block == mintBlock || dominance->dominates(mintBlock, block);
+    };
+    llvm::erase_if(beforeTermReleases,
+                   [&](mlir::Block *block) { return !mintReaches(block); });
+    llvm::erase_if(edgeReleases,
+                   [&](const std::pair<mlir::Operation *, unsigned> &edge) {
+                     return !mintReaches(edge.first->getBlock());
+                   });
   }
 
   // Validate every edge release targets a terminator we can split before we

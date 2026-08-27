@@ -3010,7 +3010,18 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             // component makes that component climb once per iteration, and
             // both are part of the visited key -- retained=1818 first, then
             // borrowed=1818 when only the retain side was excluded.
-            if (!isBlockArgMergeBorrowRetain(call))
+            // ⛔ AND NEITHER IS A SLOT ABSORPTION, by the same arithmetic. The
+            // live arm hands an element store to the CONTAINER
+            // (`slotParents`); this arm counted it, so a container built in a
+            // loop climbed one per trip here even though the live arm had been
+            // taught not to -- "exploration exceeded 20000 states
+            // (retained=1816)" on a list literal in a nested loop. The
+            // exclusions belong together; splitting them across the arms is
+            // what let this one through.
+            const bool absorbedByAHolder =
+                call->hasAttr(own::kAggregateRetainAttr) &&
+                !isBlockArgMergeBorrowRetain(call);
+            if (!isBlockArgMergeBorrowRetain(call) && !absorbedByAHolder)
               ++state.retained;
           }
         } else if (state.token == AffineTokenState::Owned && consumes) {
