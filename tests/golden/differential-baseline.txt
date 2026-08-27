@@ -262,6 +262,7 @@ int_pow_negative_const.py AGREE
 int_round_ndigits.py AGREE
 int_shift_bitwise_hash.py AGREE
 int_with_base.py AGREE
+integer_operators_on_the_unboxed_lane.py AGREE
 interior_view_nested_chain_grow.py AGREE
 interior_view_realloc_publishes.py AGREE
 io_defaults.py AGREE

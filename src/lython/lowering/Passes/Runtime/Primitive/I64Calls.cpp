@@ -6,6 +6,8 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include <limits>
+
 namespace py::lowering {
 
 namespace {
@@ -17,7 +19,18 @@ using lython::common::logicalNot;
 using lython::common::SignedArith;
 using lython::common::signedOverflow;
 
-enum class PrimitiveI64ArithmeticKind { Add, Sub, Mul };
+enum class PrimitiveI64ArithmeticKind {
+  Add,
+  Sub,
+  Mul,
+  FloorDiv,
+  Mod,
+  LShift,
+  RShift,
+  And,
+  Or,
+  Xor
+};
 
 std::optional<PrimitiveI64ArithmeticKind>
 primitiveI64ArithmeticKind(llvm::StringRef methodName) {
@@ -26,7 +39,25 @@ primitiveI64ArithmeticKind(llvm::StringRef methodName) {
       .Case("__add__", PrimitiveI64ArithmeticKind::Add)
       .Case("__sub__", PrimitiveI64ArithmeticKind::Sub)
       .Case("__mul__", PrimitiveI64ArithmeticKind::Mul)
+      .Case("__floordiv__", PrimitiveI64ArithmeticKind::FloorDiv)
+      .Case("__mod__", PrimitiveI64ArithmeticKind::Mod)
+      .Case("__lshift__", PrimitiveI64ArithmeticKind::LShift)
+      .Case("__rshift__", PrimitiveI64ArithmeticKind::RShift)
+      .Case("__and__", PrimitiveI64ArithmeticKind::And)
+      .Case("__or__", PrimitiveI64ArithmeticKind::Or)
+      .Case("__xor__", PrimitiveI64ArithmeticKind::Xor)
       .Default(std::nullopt);
+}
+
+// `&`, `|` and `^` are the three that hand a BOOL back when both operands are
+// bools (`True & True` is `True`, while `True + True` is `2` and `True // True`
+// is `1`), and this path only produces `builtins.int`. Asked here rather than
+// in the builder because the routing decision is made before a result contract
+// exists.
+bool primitiveI64ArithmeticKeepsBool(PrimitiveI64ArithmeticKind kind) {
+  return kind == PrimitiveI64ArithmeticKind::And ||
+         kind == PrimitiveI64ArithmeticKind::Or ||
+         kind == PrimitiveI64ArithmeticKind::Xor;
 }
 
 std::optional<mlir::arith::CmpIPredicate>
@@ -72,6 +103,148 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
                                .getResult();
     return {extended.getLow(), overflow};
   }
+  case PrimitiveI64ArithmeticKind::FloorDiv:
+  case PrimitiveI64ArithmeticKind::Mod: {
+    // ⛔ PYTHON DIVIDES TOWARD MINUS INFINITY AND LLVM TOWARD ZERO. `-7 // 2`
+    // is -4 in Python and -3 for `arith.divsi`, and `-7 % 2` is 1 in Python
+    // against -1 for `arith.remsi`: the remainder takes the DIVISOR's sign.
+    // Correcting by one when the truncated remainder is non-zero and the signs
+    // disagree is the identity CPython's `l_divmod` applies for the same
+    // reason.
+    mlir::Value zero = constantI64(builder, loc, 0);
+    mlir::Value one = constantI64(builder, loc, 1);
+    mlir::Value minusOne = constantI64(builder, loc, -1);
+    mlir::Value intMin = constantI64(builder, loc,
+                                     std::numeric_limits<std::int64_t>::min());
+    mlir::Value byZero =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::eq, rhs, zero)
+            .getResult();
+    mlir::Value minOverMinusOne = mlir::arith::AndIOp::create(
+        builder, loc,
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::eq, lhs, intMin)
+            .getResult(),
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::eq, rhs,
+                                    minusOne)
+            .getResult());
+    // The two pairs this cannot answer: a zero divisor, whose Python answer is
+    // a ZeroDivisionError the boxed path raises, and INT64_MIN // -1, whose
+    // quotient does not fit. Both are also the two that would TRAP, so the
+    // division is given a benign divisor rather than guarded by a branch --
+    // the clone must be able to run this as a rehearsal and observe nothing.
+    mlir::Value refused =
+        mlir::arith::OrIOp::create(builder, loc, byZero, minOverMinusOne)
+            .getResult();
+    mlir::Value divisor =
+        mlir::arith::SelectOp::create(builder, loc, refused, one, rhs)
+            .getResult();
+    mlir::Value truncated =
+        mlir::arith::DivSIOp::create(builder, loc, lhs, divisor).getResult();
+    mlir::Value remainder =
+        mlir::arith::RemSIOp::create(builder, loc, lhs, divisor).getResult();
+    mlir::Value remainderNonZero =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::ne, remainder,
+                                    zero)
+            .getResult();
+    mlir::Value signsDiffer = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne,
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::slt, remainder,
+                                    zero)
+            .getResult(),
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::slt, divisor,
+                                    zero)
+            .getResult())
+                                  .getResult();
+    mlir::Value adjust =
+        mlir::arith::AndIOp::create(builder, loc, remainderNonZero, signsDiffer)
+            .getResult();
+    mlir::Value result;
+    if (kind == PrimitiveI64ArithmeticKind::FloorDiv) {
+      mlir::Value lowered =
+          mlir::arith::SubIOp::create(builder, loc, truncated, one).getResult();
+      result = mlir::arith::SelectOp::create(builder, loc, adjust, lowered,
+                                             truncated)
+                   .getResult();
+    } else {
+      mlir::Value shifted =
+          mlir::arith::AddIOp::create(builder, loc, remainder, divisor)
+              .getResult();
+      result = mlir::arith::SelectOp::create(builder, loc, adjust, shifted,
+                                             remainder)
+                   .getResult();
+    }
+    return {result, refused};
+  }
+  case PrimitiveI64ArithmeticKind::LShift: {
+    // A negative shift count is a ValueError in Python and undefined in LLVM,
+    // and a count at or past the width is undefined too; both go to the boxed
+    // path, which raises or widens as CPython does.
+    mlir::Value zero = constantI64(builder, loc, 0);
+    mlir::Value width = constantI64(builder, loc, 64);
+    mlir::Value outOfRange = mlir::arith::OrIOp::create(
+        builder, loc,
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::slt, rhs, zero)
+            .getResult(),
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::sge, rhs, width)
+            .getResult())
+                                 .getResult();
+    mlir::Value count =
+        mlir::arith::SelectOp::create(builder, loc, outOfRange, zero, rhs)
+            .getResult();
+    mlir::Value shifted =
+        mlir::arith::ShLIOp::create(builder, loc, lhs, count).getResult();
+    // Python widens instead of wrapping, so a shift that loses bits is not an
+    // answer: shifting back has to reproduce the operand.
+    mlir::Value lost = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne,
+        mlir::arith::ShRSIOp::create(builder, loc, shifted, count).getResult(),
+        lhs)
+                           .getResult();
+    return {shifted,
+            mlir::arith::OrIOp::create(builder, loc, outOfRange, lost)
+                .getResult()};
+  }
+  case PrimitiveI64ArithmeticKind::RShift: {
+    // Python's `>>` on a negative int floors, which is an ARITHMETIC shift, and
+    // a count past the width saturates at the sign bit rather than being
+    // undefined -- so the count is clamped and only a negative one is refused.
+    mlir::Value zero = constantI64(builder, loc, 0);
+    mlir::Value last = constantI64(builder, loc, 63);
+    mlir::Value negative =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::slt, rhs, zero)
+            .getResult();
+    mlir::Value tooWide =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::sgt, rhs, last)
+            .getResult();
+    mlir::Value safeCount = mlir::arith::SelectOp::create(
+        builder, loc,
+        mlir::arith::OrIOp::create(builder, loc, negative, tooWide).getResult(),
+        mlir::arith::SelectOp::create(builder, loc, negative, zero, last)
+            .getResult(),
+        rhs)
+                                .getResult();
+    return {mlir::arith::ShRSIOp::create(builder, loc, lhs, safeCount)
+                .getResult(),
+            negative};
+  }
+  case PrimitiveI64ArithmeticKind::And:
+    return {mlir::arith::AndIOp::create(builder, loc, lhs, rhs).getResult(),
+            constantBool(builder, loc, false)};
+  case PrimitiveI64ArithmeticKind::Or:
+    return {mlir::arith::OrIOp::create(builder, loc, lhs, rhs).getResult(),
+            constantBool(builder, loc, false)};
+  case PrimitiveI64ArithmeticKind::Xor:
+    return {mlir::arith::XOrIOp::create(builder, loc, lhs, rhs).getResult(),
+            constantBool(builder, loc, false)};
   }
   llvm_unreachable("unknown primitive i64 arithmetic kind");
 }
@@ -329,11 +502,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
           op, inputs, "binary special method operands need runtime bundles",
           sources)))
     return mlir::failure();
+  std::optional<PrimitiveI64ArithmeticKind> primitiveArithmetic =
+      primitiveI64ArithmeticKind(methodName);
+  // A bool-preserving bitwise op is only routed here when neither operand is a
+  // bool, because this path answers `builtins.int` and `True & True` is `True`.
+  bool boolOperand =
+      sources.size() == 2 && (sources[0]->contractName() == "builtins.bool" ||
+                              sources[1]->contractName() == "builtins.bool");
+  if (primitiveArithmetic && boolOperand &&
+      primitiveI64ArithmeticKeepsBool(*primitiveArithmetic))
+    primitiveArithmetic.reset();
   if (sources.size() == 2 &&
       RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[0]) &&
       RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[1]) &&
-      (primitiveI64ArithmeticKind(methodName) ||
-       primitiveI64ComparePredicate(methodName))) {
+      (primitiveArithmetic || primitiveI64ComparePredicate(methodName))) {
     if (mlir::failed(RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
             op, methodName, sources, resultValue)))
       return mlir::failure();
