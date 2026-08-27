@@ -2202,9 +2202,69 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
       llvm::SmallVector<bool, 4> mappedMask;
       next.group = remapGroupForSuccessor(op, index, successor, state.group,
                                           aliases, &mappedMask);
+      // ⛔ A PREVIOUS NAME THE EDGE REBINDS IS NOT THAT NAME ANY MORE. Every
+      // edge into a block rebinds all of its arguments, so a remembered name
+      // that is one of THIS successor's arguments and is not forwarded here
+      // denotes a different value on the far side -- and crediting a release
+      // through it returns a lend that was taken on something else.
+      //
+      // The linked-list reversal is the shape: `prev = cur; cur = nxt` renames
+      // the group from the cur lane onto the prev lane on the back edge, and
+      // the cur lane is rebound to the freshly read node on the same edge. The
+      // walk then read the loop-exit release of the CUR lane as the return of
+      // the parameter's lend, reached the prev lane's own release with a
+      // balance of zero, and reported "released or transferred without a prior
+      // retain" over IR whose retains and releases pair exactly.
+      //
+      // ⭐ The same rule the group itself is already held to, three lines
+      // below: `groupRedefined` ends tracking when the edge rebinds the group's
+      // name. These are the names the group USED to have, and they die the same
+      // way.
+      auto branchOp = mlir::dyn_cast<mlir::BranchOpInterface>(op);
+      auto edgeRebindsName =
+          [&](const llvm::SmallVector<mlir::Value, 4> &earlier) {
+            if (!branchOp)
+              return false;
+            mlir::SuccessorOperands edgeOperands =
+                branchOp.getSuccessorOperands(index);
+            for (mlir::Value value : earlier) {
+              auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(value);
+              if (!blockArg || blockArg.getOwner() != successor)
+                continue;
+              // An identity self-forward hands the argument back to itself, so
+              // the name survives; anything else rebinds it.
+              unsigned argIndex = blockArg.getArgNumber();
+              mlir::Value forwarded = argIndex < edgeOperands.size()
+                                          ? edgeOperands[argIndex]
+                                          : mlir::Value();
+              if (forwarded != value)
+                return true;
+            }
+            return false;
+          };
+      llvm::erase_if(next.previousGroups, edgeRebindsName);
       // A rename: remember what the group was called, so the lend taken on
       // that name can be credited when it is returned there.
-      if (next.group != state.group) {
+      //
+      // ⛔ UNLESS THIS EDGE REBINDS IT. Every edge into a block rebinds all of
+      // that block's arguments, so a pre-rename name that IS one of them stops
+      // denoting the value the lend was taken on the moment the edge is taken;
+      // crediting a later release through it returns a lend that was taken on
+      // something else.
+      //
+      // The linked-list reversal is the shape. `prev = cur; cur = nxt` renames
+      // the group from the cur lane onto the prev lane on the back edge and
+      // rebinds the cur lane to the freshly read node on that same edge. The
+      // walk kept the cur lane as a previous name, read the loop-exit release
+      // of THAT lane as the return of the parameter's lend, and reached the
+      // prev lane's own release with a balance of zero -- "released or
+      // transferred without a prior retain", over IR whose retains and releases
+      // pair exactly.
+      //
+      // ⭐ The rule the group itself is already held to, forty lines below:
+      // `groupRedefined` ends tracking when the edge rebinds the group's name.
+      // These are the names the group USED to have, and they die the same way.
+      if (next.group != state.group && !edgeRebindsName(state.group)) {
         next.previousGroups.push_back(state.group);
         if (next.previousGroups.size() > kMaxBorrowedPreviousGroups)
           next.previousGroups.erase(next.previousGroups.begin());

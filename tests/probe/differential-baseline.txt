@@ -146,6 +146,8 @@ leak_rebind_param_float_big.py AGREE
 leak_rebind_param_float_small.py AGREE
 leak_rebind_twice_call_list_big.py AGREE
 leak_rebind_twice_call_list_small.py AGREE
+leak_reverse_two_lanes_big.py AGREE
+leak_reverse_two_lanes_small.py AGREE
 leak_unionfor_carried_big.py AGREE
 leak_unionfor_carried_small.py AGREE
 mutate_call_append.py AGREE
@@ -357,7 +359,7 @@ wb_param_store_tuple.py AGREE
 wb_param_store_twofloat.py AGREE
 wb_param_store_twolevel_float.py AGREE
 wb_range_elem_into_list_literal.py AGREE
-wb_reverse_two_carried_optionals.py GAP
+wb_reverse_two_carried_optionals.py AGREE
 wb_small_int_set_iteration_order.py AGREE
 wb_source_generator_non_int_yield.py AGREE
 wb_subclassed_type_object.py SKIP

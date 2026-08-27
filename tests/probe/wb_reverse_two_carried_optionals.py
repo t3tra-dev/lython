@@ -1,38 +1,30 @@
 # probe: two Optional locals carried across one loop, cross-assigned -- the
 # linked-list reversal
-# axes: acquire=param width=optional op=carry flow=loop observe=refusal
-# CLASSIFICATION @ 2026-08-27: 3 loud 拒否 (診断)
-#   borrowed entry argument 0 of @rev is returned as owned without a
-#   dominating retain
+# axes: acquire=param width=optional op=carry flow=loop observe=writeback
+# CLASSIFICATION @ 2026-08-27: 1 正しい
 #
-# The spelling that returns an int rather than the node reports the other half,
-# "released or transferred without a prior retain". Both are the borrowed-entry
-# WALK, not the release placement.
+# FIXED. Three separate things were wrong with the reversal and each hid the
+# next; this file kept the shape while they were found.
 #
-# The walk (one carried Optional) and the build (`cur = fresh`) both run now;
-# this is the shape where TWO carried lanes name one object for part of an
-# iteration.
+#   the field store was an `scf.if` on the tag, and the release planner's
+#   liveness walk gives up on a group whose use sits in a nested region;
 #
-# ⛔ NOT the `cur.nxt = prev` store, and not the borrowed initial value. Both
-# were fixed 2026-08-27 and are covered by
-# tests/golden/cases/a_loop_over_a_borrowed_optional_writes_its_field.py: the
-# store is one `select` on the entity word rather than an `scf.if` the release
-# planner will not place into, and the emitter's entry-edge lend now seeds a
-# merge candidate so this pass discharges it. Dropping `prev = cur` from the
-# body -- one carried lane instead of two -- compiles and matches CPython.
+#   the loop's entry-edge lend seeded no merge candidate, because it is a
+#   `py.incref` the emitter wrote -- a call with no results and no marker --
+#   so nothing discharged it where the body never ran;
 #
-# What is left is the CROSS-ASSIGNMENT: `prev = cur` makes the prev lane
-# acquire on the same edge that the cur lane abandons, so one object is named
-# by two carried lanes for part of an iteration.
-# `carriedLoopEdgeOperands` hands the token over rather than releasing and
-# retaining (`transferred`), and the emitted IR balances -- counted by hand on
-# a one-node chain: one `py.incref` on the parameter, one release of it at the
-# loop's exit. It is the borrowed-entry WALK that refuses, so the next attempt
-# should start by asking which path it takes to reach a release with
-# `retained == 0`, not by re-reading the ledger.
+#   and the borrowed-entry walk credited a release through a name the back
+#   edge had REBOUND. `prev = cur; cur = nxt` renames the group from the cur
+#   lane onto the prev lane and rebinds the cur lane on that same edge, so the
+#   loop-exit release of the cur lane was read as the return of the
+#   parameter's lend -- and the prev lane's own release then found a balance
+#   of zero. That last one is why the IR balanced by hand while the walk
+#   refused: nothing was wrong with what was emitted.
 #
-# ⛔ AND NOT reachable as a wrong answer: it is a refusal at the affine
-# ownership verifier, before any code runs.
+# tests/golden/cases/a_linked_list_is_reversed_in_place.py runs the shape and
+# reverses twice to get the original order back;
+# tests/probe/leak_reverse_two_lanes_* weighs it at 60 B per iteration over
+# 20000 reversals of a five-node chain, each node carrying a list.
 #
 # CPython 3.14 expects: 2 0
 
