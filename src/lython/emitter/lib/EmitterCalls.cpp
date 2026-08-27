@@ -2343,6 +2343,14 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
         builder, loc(expr), builder.getI1Type(), input.value,
         mlir::TypeAttr::get(analysis.targetType));
     bit = test.getResult();
+    for (mlir::Type subclass : analysis.classTestTypes) {
+      auto also = py::ClassTestOp::create(builder, loc(expr),
+                                          builder.getI1Type(), input.value,
+                                          mlir::TypeAttr::get(subclass));
+      bit = mlir::arith::OrIOp::create(builder, loc(expr), bit,
+                                       also.getResult())
+                .getResult();
+    }
   }
   return boxedBool(builder, loc(expr), types, bit);
 }

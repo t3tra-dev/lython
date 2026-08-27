@@ -1913,17 +1913,93 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
         mlir::memref::CastOp::create(builder, loc, dynamicHeaderType, storage)
             .getResult();
 
-  mlir::Value classIdSlot =
-      mlir::arith::ConstantIndexOp::create(builder, loc, 1);
+  // ⛔ AN EXCEPTION KEEPS ITS EXACT CLASS ONE WORD FURTHER IN. Word 1 is the
+  // LAYOUT, and every exception shares BaseException's -- `LyBaseException_New`
+  // writes 5 there and the caller's own id into word 2, which is the word
+  // `LyEH_ClassIdMatches` is given when a handler dispatches. Reading word 1
+  // here made `isinstance(e, ValueError)` compare 5 against 53 and answer
+  // False for an actual ValueError, silently.
+  const std::int64_t kExceptionLayout =
+      py::exceptions::findByName("BaseException")->classId;
+  const bool inputIsBox =
+      runtimeContractName(object->objectValue.contract) == "builtins.object";
+  auto contractIsException = [&](mlir::Type contract) {
+    std::string name = runtimeContractName(contract);
+    llvm::StringRef leaf = llvm::StringRef(name).rsplit('.').second;
+    if (leaf.empty())
+      leaf = name;
+    if (py::exceptions::findByName(leaf))
+      return true;
+    return RuntimeBundleLowerer::exceptionAncestorContractFor(contract)
+        .has_value();
+  };
+
+  mlir::Value classIdSlot = mlir::arith::ConstantIndexOp::create(
+      builder, loc,
+      !inputIsBox && contractIsException(object->objectValue.contract) ? 2 : 1);
   mlir::Value actualClassId =
       mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
           .getResult();
+
+  // A BOX copies the payload's word 1, so the layout is visible without
+  // dereferencing -- but the exact class is not, and word 2 of a two-word
+  // payload like `int` is off the end. So the second read is guarded rather
+  // than selected.
+  if (inputIsBox) {
+    mlir::Value isException = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, actualClassId,
+        mlir::arith::ConstantIntOp::create(builder, loc, kExceptionLayout, 64));
+    auto exact = mlir::scf::IfOp::create(
+        builder, loc, isException,
+        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+          mlir::Value entityWord =
+              mlir::memref::LoadOp::create(
+                  nested, nestedLoc, storage,
+                  mlir::arith::ConstantIndexOp::create(nested, nestedLoc,
+                                                       box_abi::kEntityWord)
+                      .getResult())
+                  .getResult();
+          mlir::MemRefType entityType =
+              mlir::MemRefType::get({3}, nested.getI64Type());
+          mlir::Value entity = RuntimeBundleLowerer::memrefFromBoxWords(
+              nested, nestedLoc, entityWord,
+              mlir::arith::ConstantIntOp::create(nested, nestedLoc, 3, 64)
+                  .getResult(),
+              entityType);
+          mlir::scf::YieldOp::create(
+              nested, nestedLoc,
+              mlir::ValueRange{
+                  mlir::memref::LoadOp::create(
+                      nested, nestedLoc, entity,
+                      mlir::arith::ConstantIndexOp::create(nested, nestedLoc, 2)
+                          .getResult())
+                      .getResult()});
+        },
+        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+          mlir::scf::YieldOp::create(nested, nestedLoc,
+                                     mlir::ValueRange{actualClassId});
+        });
+    actualClassId = exact.getResult(0);
+  }
+
+  // ⭐ `LyEH_ClassIdMatches` AND NOT AN EQUALITY, because the taxonomy is what
+  // decides for the one family whose subclasses this lowering cannot see: the
+  // manifest declares 80-odd exception contracts and none of them reaches here
+  // as a `py.class`. It walks the chain, so `isinstance(e, Exception)` answers
+  // for every one of them -- and for a non-exception id the walk terminates
+  // immediately, which is exactly the equality the compare used to be.
+  mlir::func::FuncOp classIdMatches = getOrCreatePrivateFunction(
+      module, builder, "LyEH_ClassIdMatches",
+      builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
+                              {builder.getI1Type()}));
   mlir::Value result = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
   for (std::int64_t targetId : *targetIds) {
     mlir::Value expected =
         mlir::arith::ConstantIntOp::create(builder, loc, targetId, 64);
-    mlir::Value match = mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::eq, actualClassId, expected);
+    mlir::Value match =
+        mlir::func::CallOp::create(builder, loc, classIdMatches,
+                                   mlir::ValueRange{actualClassId, expected})
+            .getResult(0);
     result = mlir::arith::OrIOp::create(builder, loc, result, match);
   }
 

@@ -592,6 +592,45 @@ TEST(EmitterTest, ACarriedLaneStillTakesAWidenedValue) {
   EXPECT_TRUE(emitted.ok()) << emitted.diagnostics.size();
 }
 
+// WHAT: `isinstance(o, int)` on an `object` answers, and does NOT hand the
+// branch an int. The answer has to include a bool -- Python's bool is an int --
+// and a boxed bool is not an int object, so viewing one as the other read
+// `True + 1` as 1. The refusal is the boundary; the test above it is not.
+TEST(EmitterTest, AnObjectNarrowedByAnIntTestIsStillAnObject) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("def f(o: object) -> int:\n"
+                 "    if isinstance(o, int):\n"
+                 "        return o + 1\n"
+                 "    return -1\n"
+                 "print(f(1))\n",
+                 context);
+  EXPECT_FALSE(emitted.ok());
+  bool found = false;
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    found = found || diagnostic.message.find("builtins.object") !=
+                         std::string::npos;
+  EXPECT_TRUE(found);
+}
+
+// The positive control: every other target DOES narrow, and the narrowed value
+// is a view of the box's entity rather than the box.
+TEST(EmitterTest, AnObjectNarrowedByAClassTestIsThatClass) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("class A:\n"
+                 "    n: int\n"
+                 "    def __init__(self, n: int) -> None:\n"
+                 "        self.n = n\n"
+                 "def f(o: object) -> int:\n"
+                 "    if isinstance(o, A):\n"
+                 "        return o.n\n"
+                 "    return -1\n"
+                 "print(f(A(1)))\n",
+                 context);
+  EXPECT_TRUE(emitted.ok());
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());

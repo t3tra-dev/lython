@@ -1,6 +1,9 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "EmitterPyOps.h"
+
+#include "ExceptionTaxonomy.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -524,6 +527,70 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
   }
 
   if (containsObjectTop(analysis.sourceType, types)) {
+    // ⭐ `object` ITSELF IS A CLASS TEST, not dynamic inspection. The value is
+    // a handle and word 1 of every header is the class id, so
+    // `isinstance(o, A)` is the SAME load-and-compare a source-class receiver
+    // gets -- the target names a statically closed set of ids, and nothing is
+    // asked of the value that its header does not already say.
+    //
+    // ⛔ Only when the source is `object` at the TOP. `list[object]` reaches
+    // here too, and there the question is about the container, whose own class
+    // is known; the members are not what the test names.
+    auto sourceContract =
+        mlir::dyn_cast<py::ContractType>(analysis.sourceType);
+    if (sourceContract &&
+        sourceContract.getContractName() == "builtins.object" &&
+        mlir::isa<py::ContractType>(analysis.targetType)) {
+      // ⛔ THE SUBCLASSES ARE ENUMERATED HERE AND NOWHERE LOWER. The test is an
+      // exact class-id compare, so `isinstance(o, Exception)` has to name every
+      // class that answers yes -- and the taxonomy that says which those are is
+      // `py.class`, which the emitter consumes: no phase after this one has a
+      // single one of them left to walk. Leaving it to the lowering answered
+      // False for `isinstance(True, int)` and for every caught exception.
+      auto addSubclass = [&](mlir::Type candidate) {
+        if (!candidate || candidate == analysis.targetType ||
+            llvm::is_contained(analysis.classTestTypes, candidate))
+          return;
+        if (pythonSubclassOf(candidate, analysis.targetType, types, from))
+          analysis.classTestTypes.push_back(candidate);
+      };
+      // Source classes: the module has a `py.class` for each, which is what
+      // `pythonSubclassOf` reads to answer about them.
+      if (auto enclosing = from->getParentOfType<mlir::ModuleOp>())
+        enclosing.walk([&](py::ClassOp classOp) {
+          if (std::optional<mlir::Type> classType =
+                  types.lookupClass(classOp.getSymName()))
+            addSubclass(*classType);
+        });
+      // ⛔ THE BUILTINS ARE NOT IN THE MODULE. A manifest class has no
+      // `py.class` here -- the walk above finds `class MyErr(Exception)` and
+      // nothing else -- so `bool` under `int`, the one builtin subclass edge
+      // outside the exception taxonomy, is named from the rule that defines it.
+      //
+      // Why NOT the exceptions too: the test compares ids through
+      // `LyEH_ClassIdMatches`, which walks that taxonomy at RUNTIME and covers
+      // user exception classes as well. Naming them here would be 80 redundant
+      // compares in front of a walk that already answers.
+      mlir::MLIRContext *context = analysis.targetType.getContext();
+      addSubclass(py::ContractType::get(context, "builtins.bool"));
+      analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
+      // ⛔ THE TEST NARROWS EVERY TARGET BUT `int` AND `bool`. Narrowing hands
+      // the branch a VIEW of the box's entity, which is right exactly when
+      // every class the test accepts has the target's runtime layout.
+      //
+      // `bool` has no entity at all -- its runtime shape is `i1`, and the
+      // branch failed to compile with "builtins.bool has no statically sized
+      // entity lane". `int` accepts bool, because Python's `bool` IS an `int`
+      // and the test says so; but a boxed bool is `LyBool_Box`'s three-word
+      // immortal singleton and an int is not, so viewing one as the other read
+      // `True + 1` as 1 and `False + 1` as a pointer-shaped integer. The test
+      // keeps answering CPython's answer; only the view is withheld.
+      llvm::StringRef targetName =
+          mlir::cast<py::ContractType>(analysis.targetType).getContractName();
+      if (targetName != "builtins.bool" && targetName != "builtins.int")
+        analysis.trueType = analysis.targetType;
+      return analysis;
+    }
     analysis.failureReason =
         "isinstance on an object-typed value requires dynamic object "
         "inspection, which is excluded from the static evidence kernel";

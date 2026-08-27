@@ -106,6 +106,11 @@ struct IsInstanceAnalysis {
   mlir::Type targetType;
   Kind kind = Kind::Unsupported;
   llvm::SmallVector<mlir::Type, 4> unionMembers;
+  // ClassTest only, and only when the source is `object`: every class the
+  // taxonomy says answers YES, because the class id the test compares is the
+  // EXACT class and a subclass carries its own. Empty means the target's own
+  // id is the whole answer, which the lowering derives on its own.
+  llvm::SmallVector<mlir::Type, 4> classTestTypes;
   mlir::Type trueType;
   mlir::Type falseType;
   std::string failureReason;

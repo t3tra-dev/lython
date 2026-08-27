@@ -681,7 +681,16 @@ mlir::LogicalResult ClassTestOp::verify() {
       nominalClassSymbolName(getOperation(), getTarget());
   if (!target)
     return emitOpError("target must be a nominal class contract");
-  if (!type_object::lookup(getOperation(), *target))
+  // ⛔ A MODULE-QUALIFIED TARGET IS NOT CHECKED HERE. This op is verified
+  // before the runtime manifests are imported, so `builtins.int` has no
+  // `py.class` in scope yet and requiring one refused `isinstance(o, int)`
+  // while accepting the identical test against a source class. A source class
+  // is a bare symbol, so the dot is what separates "not imported yet" from
+  // "misspelled". The manifest's own check is not skipped, only moved:
+  // `runtimeClassIdsForNominalTarget` runs after the import and fails there if
+  // the contract declares no runtime class id.
+  if (!type_object::lookup(getOperation(), *target) &&
+      target->find('.') == std::string::npos)
     return emitOpError("target has no class schema '") << *target << "'";
   return mlir::success();
 }

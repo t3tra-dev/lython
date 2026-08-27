@@ -521,6 +521,54 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
                                                    "alias view ABI");
     if (mlir::failed(expectedTypes))
       return mlir::failure();
+
+    // ⛔ AN `object` VALUE IS A BOX, so refining one to a class is an UNBOX and
+    // not an alias. Its single physical value is the box header, whose word 2
+    // is the entity -- the class's own storage. Aliasing instead handed the
+    // class's lanes the BOX, and the first field read then loaded word 0 of the
+    // entity, which is the refcount: `isinstance(o, A)` followed by `o.n`
+    // printed 1 for every A, silently, because a live object's refcount is 1.
+    //
+    // Why here and not at the `boxedObject` fast path above: that path answers
+    // when the lowering still REMEMBERS the concrete object behind the handle,
+    // which it does not when the value arrived as a parameter -- the only case
+    // where the class test is doing real work.
+    if (runtimeContractName(inputBundle->objectValue.contract) ==
+            "builtins.object" &&
+        runtimeContractName(resultValue.getType()) != "builtins.object" &&
+        inputBundle->physicalValues().size() == 1) {
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op->getLoc();
+      mlir::Value header = inputBundle->physicalValues().front();
+      mlir::Type dynamicHeader = mlir::MemRefType::get(
+          {mlir::ShapedType::kDynamic}, builder.getI64Type());
+      if (header.getType() != dynamicHeader)
+        header = mlir::memref::CastOp::create(builder, loc, dynamicHeader,
+                                              header)
+                     .getResult();
+      mlir::Value entityIndex = mlir::arith::ConstantIndexOp::create(
+          builder, loc, box_abi::kEntityWord);
+      mlir::Value entityWord =
+          mlir::memref::LoadOp::create(builder, loc, header, entityIndex)
+              .getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+          RuntimeBundleLowerer::lanesFromBoxEntity(
+              builder, loc, entityWord, *expectedTypes,
+              runtimeContractName(resultValue.getType()), op);
+      if (mlir::failed(lanes))
+        return mlir::failure();
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, resultValue.getType(), *lanes, result)))
+        return mlir::failure();
+      // The box still owns the entity; this is a view of it for as long as the
+      // box is live, which the narrowed branch is by construction.
+      result.setObjectLogicalOwnership(/*ownsObject=*/false);
+      valueBundles[resultValue] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
+
     if (expectedTypes->size() <= inputBundle->physicalValues().size()) {
       bool prefixMatches = true;
       for (auto [index, expected] : llvm::enumerate(*expectedTypes)) {

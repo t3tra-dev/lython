@@ -646,7 +646,14 @@ RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
   if (!targetName)
     return op->emitError() << "class test target has no nominal class: "
                            << targetType;
-  if (!py::type_object::lookup(op, *targetName))
+  // ⛔ A BUILTIN TARGET HAS NO `py.class` IN SCOPE and does not need one: its
+  // class id is declared by the manifest (`ly.runtime.class_id`), which is the
+  // same word this test compares. Requiring a schema refused
+  // `isinstance(o, int)` on an object-typed value while accepting the
+  // identical question about a source class, whose schema IS here.
+  const bool hasSchema = py::type_object::lookup(op, *targetName) != nullptr;
+  if (!hasSchema &&
+      !RuntimeBundleLowerer::runtimeClassIdForContract(targetType))
     return op->emitError() << "class test target has no class schema: "
                            << *targetName;
 
@@ -663,6 +670,11 @@ RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(
   mlir::LogicalResult status = mlir::success();
   mlir::ModuleOp mutableModule =
       const_cast<RuntimeBundleLowerer *>(this)->module;
+  // No schema means no source class can name it as a base, so the walk below
+  // -- which asks `isSubclassOf` about every declared class -- has nothing to
+  // find and would error on the missing schema instead.
+  if (!hasSchema)
+    return ids;
   mutableModule.walk([&](py::ClassOp classOp) {
     if (mlir::failed(status))
       return;
