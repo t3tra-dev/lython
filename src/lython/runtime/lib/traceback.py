@@ -116,46 +116,6 @@ def _is_operator_char(ch: str) -> bool:
             or ch == ">")
 
 
-def _marker_start(line: str, col: int, length: int) -> int:
-    """Where the underline begins: the recorded column when it lands inside the
-    line, the first non-blank character otherwise.
-
-    ⛔ ITS OWN FUNCTION, and so is `_marker_end`, for one refusal between them:
-    `start = col` inside the caller aliases a BORROWED parameter into a local,
-    which takes a borrow-to-own retain the caller then has to discharge --
-    "borrowed entry argument 1 of @traceback._anchors reaches function exit with
-    1 retained ownership token(s)", and argument 2 for `marker_end = end_col`.
-    Returned from a call the answer is the frame's own from the start.
-    tests/probe/wb_borrowed_param_rebound_local.py has the shape on its own.
-    """
-    if col > 0 and col < length:
-        return col
-    found = 0
-    while found < length and (line[found] == " " or line[found] == "\t"):
-        found += 1
-    return found
-
-
-def _marker_end(length: int, start: int, col: int, end_col: int) -> int:
-    """Where the underline stops: the recorded end column when it is a usable
-    range end and lands inside the line, the end of the line otherwise, and one
-    character when the range is degenerate.
-
-    See `_marker_start` for why this is not written inline.
-    """
-    if end_col > col and end_col > 0:
-        usable = end_col
-        if usable > length:
-            usable = length
-        if usable > start:
-            return usable
-    elif length > start:
-        return length
-    if start + 1 > length:
-        return length
-    return start + 1
-
-
 def _anchors(line: str, col: int, end_col: int, mode: int) -> str:
     """CPython's `~~~^^^` underline for the failing range of `line`.
 
@@ -181,10 +141,23 @@ def _anchors(line: str, col: int, end_col: int, mode: int) -> str:
     length = len(line)
     if length == 0:
         return ""
-    start = _marker_start(line, col, length)
+    start = 0
+    if col > 0 and col < length:
+        start = col
+    else:
+        while start < length and (line[start] == " " or line[start] == "\t"):
+            start += 1
     if start >= length:
         return ""
-    marker_end = _marker_end(length, start, col, end_col)
+    marker_end = length
+    if end_col > col and end_col > 0:
+        marker_end = end_col
+        if marker_end > length:
+            marker_end = length
+    if marker_end <= start:
+        marker_end = start + 1
+        if marker_end > length:
+            marker_end = length
 
     caret_start = -1
     caret_end = -1

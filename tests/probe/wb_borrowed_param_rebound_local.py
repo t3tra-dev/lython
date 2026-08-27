@@ -1,22 +1,32 @@
-# probe: a borrowed int parameter aliased into a local keeps a token at exit
-# axes: acquire=param width=int op=alias flow=branchy observe=refusal
-# CLASSIFICATION @ 2026-08-27: 3 誤って拒否する
+# probe: a borrowed int parameter rebound into a local balances its lend
+# axes: acquire=param width=int op=alias flow=branchy observe=regression
+# CLASSIFICATION @ 2026-08-28: 1 正しい
 #
 # `start = col` and `marker_end = end_col` copy a BORROWED parameter into a
-# local. Each takes a borrow-to-own retain, and in a function this branchy the
-# walk cannot find where the frame gives them back:
+# local, and each takes a borrow-to-own lend. Two things lost the returns:
 #
-#   borrowed entry argument 1 of @_anchors reaches function exit with 1
-#   retained ownership token(s)
+#   1. the walk kept a PRE-RENAME name verbatim across edges, so the release
+#      written under the loop's name for a naming taken before the loop was
+#      invisible and the balance climbed one lend per rename;
+#   2. a `cond_br` that forwards one value to BOTH successors' arguments made
+#      the candidate propagation give up ("group split across successors"), so
+#      the loop header's own arguments were never an owned group -- and the
+#      loop-exit edge then LENT them instead of transferring, a lend nothing
+#      returns.
 #
-# The same two rebinds in a shorter function are fine, and so is either one on
-# its own -- what this needs is the whole body. Written as calls that RETURN the
-# answer (`_marker_start` / `_marker_end` in runtime/lib/traceback.py) it
-# compiles, because the value is then the frame's own from the start; that is
-# why the stdlib module is spelled that way.
+# Either rebind alone is fine, and so is this body without the loop between
+# them: what it takes is a lend across a rename and a merge fed twice by one
+# branch. Refused as "borrowed entry argument 1 of @_anchors reaches function
+# exit with 1 retained ownership token(s)", then argument 2 for the other
+# rebind, over IR whose lends and returns pair exactly except for (2).
+#
+# This is `_anchors` in runtime/lib/traceback.py, which is written this way
+# again now that it compiles.
 #
 # CPython 3.14 expects:
 #        ~~^^~~
+
+
 def _is_operator_char(ch: str) -> bool:
     return (ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%"
             or ch == "@" or ch == "&" or ch == "|" or ch == "^" or ch == "<"

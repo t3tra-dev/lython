@@ -65,11 +65,12 @@ bool ownershipStaleTraceEnabled() {
 }
 
 // LYTHON_OWNERSHIP_TRACE_PATH: print the CFG path that reached a rejected
-// double consume -- or a token still owned at the return -- as `^bbN>` ordinals
-// matching a LYTHON_IR_DUMP listing. The leak side also prints the GROUP, which
-// is what says whether the walk is still holding the name the releases were
-// written under: a merge argument there where the IR releases the merge's
-// SOURCE is a rename the walk should not have made.
+// double consume, a token still owned at the return, or a borrowed argument's
+// unbalanced lend, as `^bbN>` ordinals matching a LYTHON_IR_DUMP listing. Those
+// last two also print the GROUP, which is what says whether the walk is still
+// holding the name the releases were written under: a merge argument there
+// where the IR releases the merge's SOURCE is a rename the walk should not have
+// made, and one the walk did not FOLLOW is a lend whose return it cannot see.
 //
 // Why NOT read it off the diagnostic: the message names the producer and the
 // releasing call, and both are the same symbols on every path through a loop.
@@ -516,6 +517,11 @@ struct BorrowedPathState {
   // Path entered through an exceptional (unwind) edge. Retain balance is
   // required on these paths like any other (rfc/stdlib-semantics.md R2).
   bool exceptional = false;
+  // Block ordinals visited on the way here, kept only under
+  // LYTHON_OWNERSHIP_TRACE_PATH. Same purpose as `AffinePathState::trail`: an
+  // unbalanced lend has to be read against the CFG to tell a missing release
+  // from a rename the walk did not follow.
+  llvm::SmallVector<unsigned, 16> trail;
 };
 
 // How many pre-merge namings one path keeps. A loop renames the group once per
@@ -1960,6 +1966,8 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
              << "borrowed entry ownership CFG exploration exceeded "
              << kMaxBorrowedStates << " states";
 
+    if (ownershipPathTraceEnabled())
+      state.trail.push_back(blockOrdinal(state.block));
     mlir::Operation *op = state.start;
     while (op) {
       if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
@@ -1980,12 +1988,31 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
                       "transferred";
           break;
         }
-        if (state.retained != 0)
+        if (state.retained != 0) {
+          if (ownershipPathTraceEnabled()) {
+            llvm::errs() << "[ownership-path] borrowed arg "
+                         << resource.logicalIndex << " retained="
+                         << state.retained << " at ^bb"
+                         << blockOrdinal(state.block) << ", group=";
+            for (mlir::Value g : state.group) {
+              if (auto a = mlir::dyn_cast<mlir::BlockArgument>(g))
+                llvm::errs() << "arg" << a.getArgNumber() << "@^bb"
+                             << blockOrdinal(a.getOwner()) << " ";
+              else if (mlir::Operation *d = g.getDefiningOp())
+                llvm::errs() << d->getName() << "@^bb"
+                             << blockOrdinal(d->getBlock()) << " ";
+            }
+            llvm::errs() << ", path=";
+            for (unsigned ordinal : state.trail)
+              llvm::errs() << "^bb" << ordinal << ">";
+            llvm::errs() << "\n";
+          }
           return ret.emitError()
                  << "borrowed entry argument " << resource.logicalIndex
                  << " of @" << resource.function.getSymName()
                  << " reaches function exit with " << state.retained
                  << " retained ownership token(s)";
+        }
         break;
       }
 
@@ -2247,6 +2274,25 @@ mlir::LogicalResult verifyBorrowedEntryOnCFGPaths(
             return false;
           };
       llvm::erase_if(next.previousGroups, edgeRebindsName);
+      // ⛔ AND A PREVIOUS NAME THE EDGE FORWARDS KEEPS BEING THAT TOKEN, under
+      // the successor's name for it. A previous naming is another name for the
+      // same token, so it follows the edge exactly as the group does; kept
+      // verbatim it stops matching the moment the branch renames it, and the
+      // lend taken on it can never be credited.
+      //
+      //     start = col            # lend 1: %arg2 -> %45
+      //     ... marker_end ...     # lend 2: %45   -> %166
+      //     while mark < marker_end:   # the loop carries %45 as %202
+      //     ...
+      //     LyLong_DecRef(%166)    # returns lend 2
+      //     LyLong_DecRef(%202)    # returns lend 1 -- under the loop's name
+      //
+      // `_anchors` in runtime/lib/traceback.py is the shape: two rebinds of a
+      // borrowed parameter and a loop between them, refused with "borrowed
+      // entry argument 1 reaches function exit with 1 retained ownership
+      // token(s)" over IR whose lends and returns pair exactly.
+      for (llvm::SmallVector<mlir::Value, 4> &earlier : next.previousGroups)
+        earlier = remapGroupForSuccessor(op, index, successor, earlier, aliases);
       // A rename: remember what the group was called, so the lend taken on
       // that name can be credited when it is returned there.
       //

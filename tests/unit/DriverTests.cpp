@@ -1425,3 +1425,50 @@ TEST(DriverTest, AnOwnedValueSurvivesTwoRebindingIfChains) {
                     "print(f('return a // b', 7, 13))\n");
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
+
+// A borrowed parameter rebound into a local, twice, with a loop between the
+// rebinds. Each rebind lends the parameter to a merge argument, and both
+// returns were lost: the walk kept a pre-rename name verbatim across edges, so
+// the release written under the loop's name for a naming taken before it was
+// invisible; and a `cond_br` forwarding one value to BOTH successors' arguments
+// made the candidate propagation give up, so the loop header's arguments were
+// never owned and the loop-exit edge lent them instead of transferring.
+TEST(DriverTest, ABorrowedParameterRebindsAcrossALoop) {
+  CompileResult result =
+      compileSource("def anchors(line: str, col: int, end_col: int) -> str:\n"
+                    "    length = len(line)\n"
+                    "    start = 0\n"
+                    "    if col > 0 and col < length:\n"
+                    "        start = col\n"
+                    "    else:\n"
+                    "        while start < length and line[start] == ' ':\n"
+                    "            start += 1\n"
+                    "    marker_end = length\n"
+                    "    if end_col > col and end_col > 0:\n"
+                    "        marker_end = end_col\n"
+                    "        if marker_end > length:\n"
+                    "            marker_end = length\n"
+                    "    if marker_end <= start:\n"
+                    "        marker_end = start + 1\n"
+                    "    caret = -1\n"
+                    "    split = start\n"
+                    "    while split < marker_end:\n"
+                    "        if line[split] == '(':\n"
+                    "            caret = split\n"
+                    "            break\n"
+                    "        split += 1\n"
+                    "    if caret < 0:\n"
+                    "        caret = start\n"
+                    "    out = ''\n"
+                    "    mark = start\n"
+                    "    while mark < marker_end:\n"
+                    "        if caret <= mark:\n"
+                    "            out += '^'\n"
+                    "        else:\n"
+                    "            out += '~'\n"
+                    "        mark += 1\n"
+                    "    return out\n"
+                    "\n"
+                    "print(anchors('return a // b', 7, 13))\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}

@@ -208,7 +208,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ManifestWordOffsetsMatchTheRuntimeStructs"
     "DriverTest.RepeatedCompileIsStable"
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain"
-    "DriverTest.AnOwnedValueSurvivesTwoRebindingIfChains")
+    "DriverTest.AnOwnedValueSurvivesTwoRebindingIfChains"
+    "DriverTest.ABorrowedParameterRebindsAcrossALoop")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

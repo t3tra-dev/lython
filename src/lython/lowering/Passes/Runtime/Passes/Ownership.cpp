@@ -2484,36 +2484,47 @@ bool insertOwnedValueReleasesByLiveness(
                                      deallocators);
 }
 
+// The destination group on ONE of `terminator`'s edges: the successor's
+// arguments that receive every value of `group` there, or none when the edge
+// forwards only part of it.
+std::optional<llvm::SmallVector<mlir::Value, 4>>
+forwardedBlockArgGroupOnEdge(mlir::Operation *terminator,
+                             unsigned successorIndex,
+                             llvm::ArrayRef<mlir::Value> group,
+                             own::AliasAnalysis &aliases) {
+  auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(terminator);
+  if (!branch || successorIndex >= terminator->getNumSuccessors())
+    return std::nullopt;
+  mlir::Block *successor = terminator->getSuccessor(successorIndex);
+  mlir::SuccessorOperands ops = branch.getSuccessorOperands(successorIndex);
+  llvm::SmallVector<mlir::Value, 4> destArgs(group.size());
+  unsigned n = std::min<unsigned>(successor->getNumArguments(), ops.size());
+  for (unsigned a = 0; a < n; ++a)
+    for (unsigned j = 0; j < group.size(); ++j)
+      if (ops[a] && aliases.same(ops[a], group[j]))
+        destArgs[j] = successor->getArgument(a);
+  for (mlir::Value arg : destArgs)
+    if (!arg)
+      return std::nullopt; // not every group value forwarded on this edge
+  return destArgs;
+}
+
 // If `terminator` forwards every value of `group` to arguments of a single
 // successor block, return that successor's argument group (in `group` order).
 std::optional<llvm::SmallVector<mlir::Value, 4>>
 forwardedBlockArgGroup(mlir::Operation *terminator,
                        llvm::ArrayRef<mlir::Value> group,
                        own::AliasAnalysis &aliases) {
-  auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(terminator);
-  if (!branch)
-    return std::nullopt;
-  mlir::Block *destBlock = nullptr;
-  llvm::SmallVector<mlir::Value, 4> destArgs(group.size());
+  std::optional<llvm::SmallVector<mlir::Value, 4>> only;
   for (unsigned s = 0, e = terminator->getNumSuccessors(); s < e; ++s) {
-    mlir::Block *successor = terminator->getSuccessor(s);
-    mlir::SuccessorOperands ops = branch.getSuccessorOperands(s);
-    unsigned n = std::min<unsigned>(successor->getNumArguments(), ops.size());
-    for (unsigned a = 0; a < n; ++a)
-      for (unsigned j = 0; j < group.size(); ++j)
-        if (ops[a] && aliases.same(ops[a], group[j])) {
-          if (destBlock && destBlock != successor)
-            return std::nullopt; // group split across successors
-          destBlock = successor;
-          destArgs[j] = successor->getArgument(a);
-        }
+    auto onEdge = forwardedBlockArgGroupOnEdge(terminator, s, group, aliases);
+    if (!onEdge)
+      continue;
+    if (only && *only != *onEdge)
+      return std::nullopt; // group split across successors
+    only = std::move(onEdge);
   }
-  if (!destBlock)
-    return std::nullopt;
-  for (mlir::Value arg : destArgs)
-    if (!arg)
-      return std::nullopt; // not every group value forwarded
-  return destArgs;
+  return only;
 }
 
 
@@ -2556,11 +2567,12 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
   // invisible to the liveness): callers must drop it (leak-safe) rather than
   // risk a premature release.
   auto forwardedViews =
-      [&](mlir::Operation *terminator, llvm::ArrayRef<mlir::Value> views)
+      [&](mlir::Operation *terminator, unsigned edge,
+          llvm::ArrayRef<mlir::Value> views)
       -> std::optional<llvm::SmallVector<mlir::Value, 4>> {
     if (views.empty())
       return llvm::SmallVector<mlir::Value, 4>{};
-    return forwardedBlockArgGroup(terminator, views, aliases);
+    return forwardedBlockArgGroupOnEdge(terminator, edge, views, aliases);
   };
 
   // Every top-level terminator of `fn` that mentions the group -- i.e. every
@@ -2651,18 +2663,23 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     if (escaped || !from || !from->getTerminator())
       return std::nullopt;
 
+    // Per EDGE for the reason the propagation below is: a branch that forwards
+    // the group to two successors seeds both.
     Seeded seeded{0, values.size(), views.size()};
-    for (mlir::Operation *terminator : forwardingTerminators(fn, values)) {
-      auto dest = forwardedBlockArgGroup(terminator, values, aliases);
-      if (!dest)
-        continue;
-      auto destViews = forwardedViews(terminator, views);
-      if (!destViews)
-        continue;
-      candidates.insert(
-          {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
-      ++seeded.candidates;
-    }
+    for (mlir::Operation *terminator : forwardingTerminators(fn, values))
+      for (unsigned edge = 0, edges = terminator->getNumSuccessors();
+           edge < edges; ++edge) {
+        auto dest =
+            forwardedBlockArgGroupOnEdge(terminator, edge, values, aliases);
+        if (!dest)
+          continue;
+        auto destViews = forwardedViews(terminator, edge, views);
+        if (!destViews)
+          continue;
+        candidates.insert(
+            {dest->front(), Candidate{*dest, *destViews, g.deallocator}});
+        ++seeded.candidates;
+      }
     return seeded;
   };
 
@@ -2811,6 +2828,18 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
 
   // Propagate ownership through block-arg -> block-arg forwards (loop headers,
   // chained merges) until no new destination group is discovered.
+  //
+  // ⛔ PER EDGE, NOT PER TERMINATOR. `forwardedBlockArgGroup` answers "one
+  // destination or none", and a `cond_br` that hands the same value to BOTH
+  // successors' arguments is none -- so the group stopped propagating there and
+  // the blocks past it were never owned. That is the ordinary shape of a loop
+  // whose header is fed from the block that also exits it:
+  //
+  //     cond_br %found, ^loop(%a, %b, %i), ^after(%a, %b)
+  //
+  // `^loop`'s arguments were never a candidate, so the loop-exit edge read them
+  // as borrows and LENT them -- a lend nothing returns. Each edge is a
+  // destination of its own, and only one of them runs.
   bool changed = true;
   while (changed) {
     changed = false;
@@ -2826,17 +2855,20 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       if (!fn)
         continue; // a candidate group always lives in the function's own region
       for (mlir::Operation *terminator :
-           forwardingTerminators(fn, candidate.args)) {
-        auto dest = forwardedBlockArgGroup(terminator, candidate.args, aliases);
-        if (!dest)
-          continue;
-        auto destViews = forwardedViews(terminator, candidate.views);
-        if (destViews && !candidates.count(dest->front())) {
-          candidates.insert({dest->front(), Candidate{*dest, *destViews,
-                                                      candidate.deallocator}});
-          changed = true;
+           forwardingTerminators(fn, candidate.args))
+        for (unsigned edge = 0, edges = terminator->getNumSuccessors();
+             edge < edges; ++edge) {
+          auto dest = forwardedBlockArgGroupOnEdge(terminator, edge,
+                                                   candidate.args, aliases);
+          if (!dest)
+            continue;
+          auto destViews = forwardedViews(terminator, edge, candidate.views);
+          if (destViews && !candidates.count(dest->front())) {
+            candidates.insert({dest->front(), Candidate{*dest, *destViews,
+                                                        candidate.deallocator}});
+            changed = true;
+          }
         }
-      }
     }
   }
 
@@ -3063,8 +3095,35 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
             }
             if (!header)
               header = incoming;
-            if (!isOwnedIncoming(incoming) ||
-                !diesOnEdge(incoming, pred->getTerminator(), destBlock))
+            // LYTHON_OWNERSHIP_TRACE_TRANSFERS also prints, per EDGE, the two
+            // facts that decide whether it transfers or lends. `owned=0` on an
+            // edge whose incoming value is a block argument says the source
+            // merge was never made a candidate, which is a different repair
+            // from `dies=0` (the value is still read past the merge) -- and
+            // telling them apart is what the group line above cannot do.
+            bool owned = isOwnedIncoming(incoming);
+            bool dies = diesOnEdge(incoming, pred->getTerminator(), destBlock);
+            if (ownershipTransferTraceEnabled()) {
+              auto blockOf = [&](mlir::Block *block) {
+                unsigned i = 0;
+                for (mlir::Block &b : block->getParent()->getBlocks()) {
+                  if (&b == block)
+                    break;
+                  ++i;
+                }
+                return i;
+              };
+              llvm::errs() << "[ownership-edge] dest ^bb" << blockOf(destBlock)
+                           << " arg" << idx << " from ^bb" << blockOf(pred)
+                           << " incoming=";
+              if (auto a = mlir::dyn_cast<mlir::BlockArgument>(incoming))
+                llvm::errs() << "arg" << a.getArgNumber() << "@^bb"
+                             << blockOf(a.getOwner());
+              else if (mlir::Operation *d = incoming.getDefiningOp())
+                llvm::errs() << d->getName();
+              llvm::errs() << " owned=" << owned << " dies=" << dies << "\n";
+            }
+            if (!owned || !dies)
               transfers = false;
           }
           if (!sound)
@@ -3095,6 +3154,19 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
                             ->getAttrOfType<mlir::StringAttr>(
                                 mlir::SymbolTable::getSymbolAttrName())
                             .getValue()
+                     << " ^bb" << [&] {
+                          unsigned index = 0;
+                          for (mlir::Block &candidateBlock :
+                               destBlock->getParent()->getBlocks()) {
+                            if (&candidateBlock == destBlock)
+                              break;
+                            ++index;
+                          }
+                          return index;
+                        }()
+                     << " arg"
+                     << mlir::cast<mlir::BlockArgument>(candidate.args.front())
+                            .getArgNumber()
                      << ": lanes=" << candidate.args.size()
                      << " views=" << candidate.views.size()
                      << " sound=" << sound << " anyTransfer=" << anyTransfer
