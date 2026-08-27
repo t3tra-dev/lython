@@ -446,6 +446,36 @@ bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
          superContract.getContractName() == "builtins.int";
 }
 
+// ⛔ A SOURCE CLASS UNDER A MANIFEST BASE, which `declaredSubclassOfType`
+// cannot answer: it requires both sides to be source-defined, and the base a
+// `class MyErr(Exception)` records is the bare name it was written with. So
+// `isinstance(e, MyErr)` on an `Exception`-typed value folded to AlwaysFalse
+// and compiled to `return "other"` with no test in it at all -- silently, for
+// the shape every user-defined exception is caught by.
+static bool sourceClassUnderManifestBase(mlir::Type sub, mlir::Type super,
+                                         TypeSystem &types) {
+  auto subContract = mlir::dyn_cast_if_present<py::ContractType>(sub);
+  auto superContract = mlir::dyn_cast_if_present<py::ContractType>(super);
+  if (!subContract || !superContract)
+    return false;
+  if (!isSourceDefinedContract(sub) || isSourceDefinedContract(super))
+    return false;
+  llvm::StringRef superName = superContract.getContractName();
+  llvm::StringRef superLeaf = superName.rsplit('.').second;
+  if (superLeaf.empty())
+    superLeaf = superName;
+  if (types.declaredSubclassOf(subContract.getContractName(), superLeaf))
+    return true;
+  // Written under a base that is itself under the target: `class E(ValueError)`
+  // asked about `Exception`. The taxonomy is the only place that edge exists.
+  for (const py::exceptions::BuiltinExceptionInfo &entry :
+       py::exceptions::kBuiltinExceptions)
+    if (py::exceptions::isBuiltinExceptionSubclassName(entry.name, superLeaf) &&
+        types.declaredSubclassOf(subContract.getContractName(), entry.name))
+      return true;
+  return false;
+}
+
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
                                      mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from) {
@@ -601,7 +631,9 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
       (isAssignableWithStaticEvidence(analysis.targetType, analysis.sourceType,
                                       from) ||
        declaredSubclassOfType(analysis.targetType, analysis.sourceType,
-                              types))) {
+                              types) ||
+       sourceClassUnderManifestBase(analysis.targetType, analysis.sourceType,
+                                    types))) {
     analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
     analysis.trueType = analysis.targetType;
     return analysis;

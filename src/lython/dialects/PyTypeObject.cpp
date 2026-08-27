@@ -1,6 +1,7 @@
 #include "PyTypeObject.h"
 #include "C3Linearization.h"
 #include "PyProtocols.h"
+#include "ExceptionTaxonomy.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/SymbolTable.h"
@@ -165,6 +166,33 @@ bool isKnownSubclassOf(mlir::Operation *from, llvm::StringRef derived,
   mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 8>> mro =
       mroNames(from, derived);
   return mlir::succeeded(mro) && llvm::is_contained(*mro, base);
+}
+
+bool reachesDeclaredBase(mlir::Operation *from, llvm::StringRef derived,
+                         llvm::StringRef base) {
+  ClassOp derivedOp = lookup(from, derived);
+  if (!derivedOp)
+    return false;
+  llvm::SmallVector<llvm::StringRef, 8> worklist{derived};
+  llvm::StringSet<> seen;
+  while (!worklist.empty()) {
+    llvm::StringRef current = worklist.pop_back_val();
+    ClassOp classOp = lookup(from, current);
+    if (!classOp)
+      continue;
+    mlir::FailureOr<llvm::SmallVector<llvm::StringRef, 4>> bases =
+        basesOf(classOp.getOperation(), classOp);
+    if (mlir::failed(bases))
+      return false;
+    for (llvm::StringRef baseName : *bases) {
+      if (baseName == base ||
+          py::exceptions::isBuiltinExceptionSubclassName(baseName, base))
+        return true;
+      if (seen.insert(baseName).second)
+        worklist.push_back(baseName);
+    }
+  }
+  return false;
 }
 
 mlir::FailureOr<bool> isSubclassOf(mlir::Operation *from,

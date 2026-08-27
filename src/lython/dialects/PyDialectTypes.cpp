@@ -1082,6 +1082,11 @@ bool isSubtypeOfImpl(mlir::Type subtype, mlir::Type supertype,
             context.from,
             manifestClassNameForContract(subtypeContract.getContractName()),
             manifestClassNameForContract(supertypeContract.getContractName()));
+      if (!subclass && context.from)
+        subclass = type_object::reachesDeclaredBase(
+            context.from,
+            manifestClassNameForContract(subtypeContract.getContractName()),
+            manifestClassNameForContract(supertypeContract.getContractName()));
       if (!subclass)
         return false;
       return true;

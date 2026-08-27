@@ -89,6 +89,8 @@ def kind(e: Exception) -> str:
         return "zde"
     if isinstance(e, ArithmeticError):
         return "arith"
+    if isinstance(e, MyErr):
+        return "myerr"
     if isinstance(e, ValueError):
         return "value"
     return "other"
@@ -97,6 +99,7 @@ def kind(e: Exception) -> str:
 excs: "list[Exception]" = [
     ZeroDivisionError("a"),
     ValueError("b"),
+    MyErr("c"),
     TypeError("d"),
 ]
 for exc in excs:
@@ -110,3 +113,14 @@ def is_int(o: object) -> bool:
 
 
 sys.stdout.write(str(is_int(True)) + " " + str(is_int(1)) + " " + str(is_int("x")) + "\n")
+
+
+# A source exception class handed to a parameter declared as its manifest base.
+# The base is written by the bare name it was spelled with and has no class of
+# its own here, so the only thing that can say `MyErr` is an `Exception` is the
+# walk over what the class DECLARED.
+def message(e: Exception) -> str:
+    return str(e)
+
+
+sys.stdout.write(message(MyErr("passed")) + " " + message(ValueError("v")) + "\n")

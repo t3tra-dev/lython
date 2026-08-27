@@ -40,6 +40,14 @@ std::optional<mlir::Attribute> pairedAttributeValue(mlir::Operation *op,
                                                     llvm::StringRef name);
 std::optional<mlir::Attribute> staticAttributeValue(ClassOp classOp,
                                                     llvm::StringRef name);
+// ⛔ THE BASE NEED NOT BE A `py.class`, which is what separates this from
+// `isKnownSubclassOf`. A source class records its base by the bare NAME it was
+// written with, and a manifest base -- `class MyErr(Exception)` -- has no
+// symbol to look up here, so that walk answered False and `MyErr` was not an
+// `Exception` to anything that asked the lattice.
+bool reachesDeclaredBase(mlir::Operation *from, llvm::StringRef derived,
+                         llvm::StringRef base);
+
 bool isKnownSubclassOf(mlir::Operation *from, llvm::StringRef derived,
                        llvm::StringRef base);
 } // namespace type_object

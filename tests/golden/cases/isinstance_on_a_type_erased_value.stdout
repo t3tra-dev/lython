@@ -12,5 +12,7 @@ bool
 int
 zde
 value
+myerr
 other
 True True False
+passed v

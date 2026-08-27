@@ -96,9 +96,13 @@ bool callableArgumentAccepts(mlir::Type actual, mlir::Type expected,
   if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(expected))
     if (structuralProtocolArgumentAccepts(actual, protocol))
       return true;
-  if (emitErrors)
-    return py::isAssignableTo(actual, expected, op);
-  return py::isAssignableTo(actual, expected);
+  // ⛔ THE OP IS THE SYMBOL-LOOKUP ANCHOR, NOT A DIAGNOSTIC SINK. Passing it
+  // only when errors were being emitted made the LATTICE depend on that flag:
+  // without it a source class has no `py.class` to walk, so `f(MyErr("x"))`
+  // against `def f(e: Exception)` found no plan on the silent pass and then
+  // reported "arguments do not match Callable contract" on the loud one --
+  // which is the same question answered two ways.
+  return py::isAssignableTo(actual, expected, op);
 }
 
 std::optional<CallableArgumentPlan>
