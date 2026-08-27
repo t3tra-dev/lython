@@ -111,6 +111,24 @@ inline mlir::Value handleProvenanceRoot(mlir::Value handle) {
       handle = view.getSource();
       continue;
     }
+    if (auto reinterpret =
+            mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(definition)) {
+      // Same reasoning as the subview, and the same guard: this narrows the
+      // dead header global, which is allocated wider than any single reader
+      // needs. At offset 0 the words are the source's own; anywhere else they
+      // are not.
+      llvm::SmallVector<mlir::OpFoldResult, 1> offsets =
+          reinterpret.getMixedOffsets();
+      if (offsets.size() != 1)
+        return handle;
+      auto attribute =
+          llvm::dyn_cast_if_present<mlir::Attribute>(offsets.front());
+      auto integer = llvm::dyn_cast_if_present<mlir::IntegerAttr>(attribute);
+      if (!integer || integer.getInt() != 0)
+        return handle;
+      handle = reinterpret.getSource();
+      continue;
+    }
     if (auto cast =
             mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(definition)) {
       // Identity-shaped ownership markers keep types and arity; anything else is

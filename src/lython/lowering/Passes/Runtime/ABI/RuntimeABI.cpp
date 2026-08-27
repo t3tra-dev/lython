@@ -1168,6 +1168,30 @@ static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
            << type;
 
   mlir::MemRefType globalType = concreteDeadMemRefType(memrefType);
+  // ⛔ THE DEAD HEADER IS WIDER THAN THE HEADER IT STANDS IN FOR. A box hands
+  // back the lanes past its entity through the contract's `lane_words`
+  // primitive, and that primitive READS the entity: `__ly_unicode_lane_words`
+  // asks `__ly_unicode_raw_bytes` for the shape word, at offset 16. On the
+  // ABSENT arm of an optional field the entity is this placeholder, so a
+  // two-word global is read one word past its end -- which is why a multi-lane
+  // payload could not be boxed at all (`optionalPayloadRebuildableFromBox`).
+  //
+  // Sixteen words rather than "the widest header the manifest declares":
+  // `lane_words` reads a SHAPE, and a shape word's offset is a property of the
+  // primitive, not of the handle it is declared with. One read-only global per
+  // type, 128 bytes, shared by every absent read of that type.
+  //
+  // The handed-out value keeps the declared narrow type -- everything that
+  // reads it through the memref reads a header's worth -- and only the
+  // ALLOCATION is wide. The pointer is what `lane_words` gets.
+  constexpr std::int64_t kDeadHeaderWords = 16;
+  if (objectHeader && globalType.getRank() == 1 &&
+      globalType.hasStaticShape() &&
+      globalType.getDimSize(0) < kDeadHeaderWords)
+    globalType = mlir::MemRefType::get({kDeadHeaderWords},
+                                       globalType.getElementType(),
+                                       mlir::MemRefLayoutAttrInterface{},
+                                       globalType.getMemorySpace());
   std::string name =
       (objectHeader ? "__ly_dead_header_" : "__ly_dead_payload_") +
       typeSymbolComponent(globalType);
@@ -1190,6 +1214,21 @@ static mlir::FailureOr<mlir::Value> materializeStaticDeadPhysicalValue(
   mlir::Value global =
       mlir::memref::GetGlobalOp::create(builder, loc, globalType, name)
           .getResult();
+  // ⛔ A WIDER GLOBAL NARROWS WITH `reinterpret_cast`, NOT WITH `cast`. Two
+  // static shapes are not cast-compatible, and routing through a dynamic one
+  // (16 -> ? -> 3) verifies for exactly as long as it takes canonicalization to
+  // compose the pair back into the 16 -> 3 it refuses.
+  if (globalType != memrefType && memrefType.hasStaticShape()) {
+    llvm::SmallVector<mlir::OpFoldResult, 1> sizes;
+    llvm::SmallVector<mlir::OpFoldResult, 1> strides;
+    for (std::int64_t extent : memrefType.getShape())
+      sizes.push_back(builder.getIndexAttr(extent));
+    strides.assign(memrefType.getRank(), builder.getIndexAttr(1));
+    global = mlir::memref::ReinterpretCastOp::create(
+                 builder, loc, memrefType, global, builder.getIndexAttr(0),
+                 sizes, strides)
+                 .getResult();
+  }
   if (global.getType() == type)
     return global;
   return mlir::memref::CastOp::create(builder, loc, type, global).getResult();

@@ -142,7 +142,7 @@ RuntimeBundleLowerer::lanesFromBoxEntity(mlir::OpBuilder &builder,
 // `LyBaseException_New`, so every one has its physical shape, and a layout
 // primitive is about the layout.
 std::optional<RuntimeSymbol>
-RuntimeBundleLowerer::laneWordsPrimitiveFor(llvm::StringRef contract) {
+RuntimeBundleLowerer::laneWordsPrimitiveFor(llvm::StringRef contract) const {
   if (std::optional<RuntimeSymbol> direct =
           manifest.primitive(contract, "lane_words"))
     return direct;

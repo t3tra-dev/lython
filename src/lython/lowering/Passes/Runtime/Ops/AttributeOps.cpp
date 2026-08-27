@@ -163,6 +163,43 @@ bool RuntimeBundleLowerer::contractIsOneRuntimeLane(mlir::Type contract) const {
   return true;
 }
 
+// Can a box hand this contract's lanes back? One lane is the address itself.
+// More than one needs the contract's `lane_words` primitive, which computes the
+// rest FROM the entity -- so every lane past the first has to be a memref that
+// primitive can describe, and the ABSENT arm has to survive being asked: it is
+// the immortal dead header, which `materializeStaticDeadPhysicalValue` makes
+// wide enough for a shape read for exactly this reason.
+bool RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(
+    mlir::Type payload) const {
+  std::string name = runtimeShapeContractName(payload);
+  if (name.empty())
+    return false;
+  const RuntimeValueShape *shape = manifest.valueShape(name);
+  // A SOURCE class has no manifest shape and needs none: it is one handle, and
+  // that is what the recursive `nxt: "Node | None"` depends on.
+  if (!shape || shape->valueTypes.empty())
+    return RuntimeBundleLowerer::contractIsOneRuntimeLane(payload);
+  // ⛔ `builtins.bool` IS THE ONE CONTRACT WITH NO ENTITY: its shape is `i1`,
+  // so there is no address for the box's entity word to hold and no header for
+  // the empty arm to compare against -- `LyBool_Shape` returns i1 and the box
+  // read stops at "builtins.bool runtime object header has invalid type 'i1'".
+  // A `bool | None` FIELD therefore stays on the inline lane splice, which is
+  // right wherever the receiver is the frame's own value (`b = B(None)`,
+  // `self` in `__init__`) and refused with a diagnostic where it is not.
+  // Boxing it needs a heap bool to exist first; `list[bool | None]` has one
+  // only because a list element widens to `object` on the way in.
+  if (!mlir::isa<mlir::MemRefType>(shape->valueTypes.front()))
+    return false;
+  if (RuntimeBundleLowerer::contractIsOneRuntimeLane(payload))
+    return true;
+  if (shape->valueTypes.size() < 2)
+    return false;
+  for (unsigned index = 1; index < shape->valueTypes.size(); ++index)
+    if (!mlir::isa<mlir::MemRefType>(shape->valueTypes[index]))
+      return false;
+  return RuntimeBundleLowerer::laneWordsPrimitiveFor(name).has_value();
+}
+
 bool RuntimeBundleLowerer::classFieldStoredBoxed(
     mlir::Type fieldContract) const {
   // ⭐ `T | None` IS AT MOST ONE OBJECT, and the box already says so: its
@@ -177,22 +214,21 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // the diagnostic in CallableABI.cpp told authors to write `nxt: "Node"`,
   // which cannot hold the end of the list.
   //
-  // ⛔ ONE LANE ONLY, and the limit is the ABSENT read rather than the layout.
-  // Reading the box back has to hand out lanes on both arms, and the lanes past
-  // the entity come from the contract's `lane_words` primitive, which
-  // DEREFERENCES the entity (`__ly_unicode_shape_word` reads word 2). The
-  // stand-in for an absent object is the immortal dead header, two words wide,
-  // so asking it for a second lane reads off the end of a constant global. A
-  // one-lane contract never asks: its lane is a memref built AT the address,
-  // which is why the arm can be a `select` on the address instead of a region
-  // -- and that is what keeps the read's retain rooted where the verifier and
-  // the release planner can both see it.
+  // ⛔ THE LIMIT IS THE ABSENT READ RATHER THAN THE LAYOUT. Reading the box
+  // back has to hand out lanes on both arms, and the lanes past the entity come
+  // from the contract's `lane_words` primitive, which DEREFERENCES the entity
+  // (`__ly_unicode_shape_word` reads word 2). The stand-in for an absent object
+  // is the immortal dead header, so a contract whose primitive reads a word
+  // that header does not have cannot be a payload -- which is why the header is
+  // sized for the deepest such read and not for a header.
   if (auto unionType = mlir::dyn_cast<py::UnionType>(fieldContract)) {
     if (!unionType.isOptional())
       return false;
     mlir::Type payload = unionType.getOptionalPayloadType();
-    return classFieldStoredBoxed(payload) &&
-           RuntimeBundleLowerer::contractIsOneRuntimeLane(payload);
+    std::string payloadName = runtimeShapeContractName(payload);
+    if (payloadName.empty() || payloadName == "types.NoneType")
+      return false;
+    return RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(payload);
   }
   // runtimeShapeContractName returns by value; a StringRef binding would
   // dangle past this declaration statement.
@@ -210,6 +246,11 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // already a stable heap slot; their contract lanes are a placeholder the
   // store never reads. Boxing them would add a second storage for the same
   // field and force the load to choose.
+  //
+  // ⛔ Which is why the optional arm above does NOT recurse through here. This
+  // rule is about a field that HAS an inline word; `int | None` has no inline
+  // spelling of absent, so there is no second storage to disagree with -- the
+  // box is the only one.
   if (contractName == "builtins.int" || contractName == "builtins.bool")
     return false;
   return true;

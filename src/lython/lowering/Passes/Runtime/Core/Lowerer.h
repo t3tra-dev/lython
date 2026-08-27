@@ -148,6 +148,7 @@ private:
   // one object.
   bool classFieldStoredBoxed(mlir::Type fieldContract) const;
   bool contractIsOneRuntimeLane(mlir::Type contract) const;
+  bool optionalPayloadRebuildableFromBox(mlir::Type payload) const;
   // ⭐ EVERY FIELD LIVES IN THE INSTANCE BODY, which is one block reached
   // through the header's body word:
   //
@@ -922,7 +923,7 @@ private:
   lanesFromBoxEntity(mlir::OpBuilder &builder, mlir::Location loc,
                      mlir::Value entityWord, llvm::ArrayRef<mlir::Type> laneTypes,
                      llvm::StringRef contract, mlir::Operation *reporter);
-  std::optional<RuntimeSymbol> laneWordsPrimitiveFor(llvm::StringRef contract);
+  std::optional<RuntimeSymbol> laneWordsPrimitiveFor(llvm::StringRef contract) const;
   // Per-program release hook: dispatches a boxed slot's class id to the
   // matching manifest deallocator (the single release implementation).
   mlir::LogicalResult generateBoxedReleaseHook();
