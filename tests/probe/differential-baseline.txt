@@ -323,6 +323,7 @@ wb_method_store_tuple.py AGREE
 wb_nested_loop_borrowed_parameter.py AGREE
 wb_optional_field_inline_storage.py AGREE
 wb_optional_field_second_instance.py SKIP
+wb_outer_local_container_in_inner_loop.py GAP
 wb_param_1lane_mutate_stringio.py AGREE
 wb_param_1lane_store_stringio.py AGREE
 wb_param_augassign_float.py AGREE

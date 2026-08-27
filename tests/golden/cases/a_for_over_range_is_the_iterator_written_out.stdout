@@ -1,0 +1,18 @@
+r5 [0, 1, 2, 3, 4]
+r27 [2, 3, 4, 5, 6]
+rneg [10, 7, 4, 1]
+empty []
+backwards []
+cont [1, 2, 4, 5, 7, 8]
+else ran
+rebind [0, 1, 2, 3, 4]
+bound-once [0, 1, 2]
+nested [0, 1, 10, 11, 20, 21]
+varstep [0, 2, 4, 6, 8]
+varstep-neg [9, 7, 5, 3, 1]
+ValueError: range() arg 3 must not be zero
+ValueError: range() arg 3 must not be zero
+[0, 1, 4, 9, 16, 25] 45
+[0, 1, 2] 3 True
+[0, 2, 4, 6]
+108

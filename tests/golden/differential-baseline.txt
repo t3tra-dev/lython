@@ -9,6 +9,7 @@
 a_break_leaves_an_optional_walk_balanced.py AGREE
 a_chain_is_built_in_a_loop.py AGREE
 a_class_may_be_named_like_a_runtime_one.py AGREE
+a_for_over_range_is_the_iterator_written_out.py AGREE
 a_formatted_traceback_matches_cpython.py AGREE
 a_jump_out_of_a_match_inside_a_try.py AGREE
 a_linked_list_is_reversed_in_place.py AGREE
@@ -20,6 +21,7 @@ a_match_guard_runs_only_when_it_matched.py AGREE
 a_method_local_shadows_the_module.py AGREE
 a_narrowing_carries_into_the_next_operand.py AGREE
 a_nested_loop_appends_the_outer_element.py AGREE
+a_program_that_binds_range_keeps_its_own.py AGREE
 a_quoted_annotation_is_the_annotation_it_spells.py AGREE
 a_subclass_body_is_reached_through_the_base.py AGREE
 a_traceback_is_a_chain_of_objects.py EXTRA

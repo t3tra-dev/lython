@@ -97,6 +97,29 @@ void appendTargetBinding(const NodePtr &target,
 }
 
 // The original loop pieces every rewrite reuses.
+// An `int` the source wrote out, `-3` included: a negative literal parses as a
+// unary minus over a positive one, and the sign is what decides which way a
+// range counts.
+std::optional<std::int64_t> constantIntValue(const parser::Node *node) {
+  if (!node)
+    return std::nullopt;
+  if (node->kind == "Constant")
+    return ast::integer(*node, "value");
+  if (node->kind == "UnaryOp") {
+    auto op = ast::string(*node, "op");
+    const parser::Node *operand = ast::node(*node, "operand");
+    if (op && operand && operand->kind == "Constant") {
+      if (std::optional<std::int64_t> value = ast::integer(*operand, "value")) {
+        if (*op == "USub")
+          return -*value;
+        if (*op == "UAdd")
+          return *value;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 struct ForParts {
   NodePtr target;
   std::vector<NodePtr> body;
@@ -353,6 +376,143 @@ bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
   if (calleeNode->kind != "Name")
     return false;
   llvm::StringRef name = ast::nameSpelling(*calleeNode);
+
+  // ---- range(...) in for position ----------------------------------------
+  //
+  // ⭐ RANGE IS AN ORDINARY ITERATOR, so the loop is written out as the
+  // iterator's own semantics rather than taught to anything downstream. A
+  // `range` object in loop position is not observable -- nothing can name it,
+  // and its only behaviour is to hand back `start`, `start + step`, ... while
+  // the stop has not been passed -- so an int counter and a comparison IS the
+  // iterator, and the ordinary lowering then sees a loop over an `int` local
+  // with nothing builtin about it.
+  //
+  // What that buys is not the iterator call it removes. `range_iterator` is a
+  // manifest object, so `LyRangeIterator_Next` in the body is a call that
+  // ALLOCATES, and a function whose body allocates cannot be given the unboxed
+  // i64 clone (a clone is speculated on before its answer is believed, so it
+  // has to be a rehearsal). One `for i in range(n)` therefore put every int in
+  // the whole function back in a box.
+  // ⛔ `programBindsName`, NOT `isBuiltinIteratorName`. The latter also refuses
+  // a name the TYPE SYSTEM knows as a class, and `range` is bound there as
+  // `builtins.range` -- so that guard is false for `range` always, and the
+  // rewrite below never fired at all until this was the test. What has to be
+  // excluded is a program that binds `range` itself, which is this.
+  if (name == "range" && !programBindsName(name)) {
+    if (!args || args->empty() || args->size() > 3 ||
+        (keywords && !keywords->empty()))
+      return false;
+    // ⛔ A NAME TARGET ONLY. `for a, b in range(3)` is a TypeError in CPython
+    // ("cannot unpack non-iterable int"), which the range object raises and
+    // this rewrite would silently turn into something else.
+    if (!parts->target || parts->target->kind != "Name")
+      return false;
+    // ⛔ AND STATICALLY int ARGUMENTS ONLY. `range(2.0)` is a TypeError, and a
+    // counter loop over a float would run instead of raising -- the one
+    // direction this may never move in. The object path still refuses it.
+    auto isStaticInt = [&](const NodePtr &node) {
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(types.inferExpr(node.get())));
+      return contract && contract.getContractName() == "builtins.int";
+    };
+    for (const NodePtr &arg : *args)
+      if (!arg || !isStaticInt(arg))
+        return false;
+
+    NodePtr startExpr = args->size() == 1 ? synth::intConstant(0, range)
+                                          : argAt(0);
+    NodePtr stopExpr = args->size() == 1 ? argAt(0) : argAt(1);
+    NodePtr stepExpr = args->size() == 3 ? argAt(2)
+                                         : synth::intConstant(1, range);
+    // A literal step is the overwhelmingly common one and decides the
+    // comparison at compile time; anything else carries the sign test and the
+    // zero check the range constructor would have run.
+    // ⛔ A LITERAL ZERO IS NOT A LITERAL DIRECTION. `range(0, 5, 0)` is a
+    // ValueError, so it takes the general path, whose first act is the check
+    // that raises it -- reading a zero as "known step" left the counter with
+    // no direction and the step temp unassigned.
+    std::optional<std::int64_t> literal = constantIntValue(stepExpr.get());
+    std::optional<std::int64_t> literalStep =
+        literal && *literal != 0 ? literal : std::nullopt;
+
+    std::string counterName = scratch("i");
+    std::string stopName = scratch("n");
+    std::string stepName = scratch("k");
+    NodePtr counter = synth::name(counterName, range);
+    NodePtr stop = synth::name(stopName, range);
+    NodePtr step = synth::name(stepName, range);
+    llvm::SmallVector<std::string, 3> names{counterName, stopName};
+
+    // ⛔ THE COUNTER STARTS ONE STEP BACK AND THE BOUND COMES IN ONE STEP TOO,
+    // so that the target is bound from a value the loop BODY defines rather
+    // than from the header's own argument. Written the direct way --
+    //
+    //     i = start
+    //     while i < stop:
+    //         <target> = i
+    //         i = i + step
+    //
+    // -- `<target>` is another name for the header argument, and a container
+    // built from it in a NESTED loop mints an owned-local token whose release
+    // the placer then writes on the OUTER loop's dead edges, which the mint does
+    // not dominate: "operand #0 does not dominate this use".
+    // tests/probe/wb_outer_local_container_in_inner_loop.py is that defect on
+    // its own, in plain Python with no `range` in it.
+    //
+    // ⭐ `i < stop - step` rather than `i + step < stop`, which is the same
+    // inequality over integers and one add per iteration rather than two. The
+    // two-add spelling cost a list comprehension 12% against the range object
+    // it replaces; this one is 11% faster than it.
+    NodePtr test;
+    if (literalStep && *literalStep > 0) {
+      test = synth::compare(counter, "Lt", stop, range);
+    } else if (literalStep && *literalStep < 0) {
+      test = synth::compare(counter, "Gt", stop, range);
+    } else {
+      names.push_back(stepName);
+      test = synth::ifExp(
+          synth::compare(step, "Gt", synth::intConstant(0, range), range),
+          synth::compare(counter, "Lt", stop, range),
+          synth::compare(counter, "Gt", stop, range), range);
+    }
+
+    // ⛔ THE COUNTER ADVANCES AND THE TARGET IS BOUND BEFORE THE BODY, not
+    // after it: `continue` in a `while` jumps to the test, and an advance
+    // written after the body would be skipped by it and never terminate. The
+    // body may still rebind the target, which changes nothing about the
+    // iteration -- as it does not in CPython, where the target and the
+    // iterator's position are two different things.
+    NodePtr stepValue = literalStep ? synth::intConstant(*literalStep, range)
+                                    : synth::name(stepName, range);
+    std::vector<NodePtr> body{
+        synth::assign(counter,
+                      synth::binOp(counter, "Add", stepValue, range), range),
+        synth::assign(parts->target, counter, range)};
+    body.insert(body.end(), parts->body.begin(), parts->body.end());
+    NodePtr loop =
+        synth::whileStmt(test, std::move(body), parts->orelse, range);
+
+    runWithScratchNames(names, [&] {
+      if (!literalStep) {
+        emitStatement(*synth::assign(synth::name(stepName, range), stepExpr,
+                                     range));
+        emitStatement(*synth::ifStmt(
+            synth::compare(synth::name(stepName, range), "Eq",
+                           synth::intConstant(0, range), range),
+            {synth::raiseValueError("range() arg 3 must not be zero", range)},
+            {}, range));
+      }
+      emitStatement(*synth::assign(
+          synth::name(stopName, range),
+          synth::binOp(stopExpr, "Sub", stepValue, range), range));
+      emitStatement(*synth::assign(
+          synth::name(counterName, range),
+          synth::binOp(startExpr, "Sub", stepValue, range), range));
+      emitWhile(*loop);
+    });
+    return true;
+  }
+
   if (name != "enumerate" && name != "zip" && name != "map" &&
       name != "filter" && name != "reversed" && name != "iter")
     return false;
