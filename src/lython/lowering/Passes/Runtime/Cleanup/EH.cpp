@@ -293,12 +293,34 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
   std::int32_t marker = site && !site->noAnchor ? 1 : 0;
 
   llvm::Value *file = globalCStringPtr(builder, fileName, "py.tb.file");
-  llvm::Value *name = globalCStringPtr(builder, functionName, "py.tb.func");
-  builder.CreateCall(
-      tracebackPushCStringRange(module),
-      {file, name, i32Constant(builder, line), i32Constant(builder, column),
-       i32Constant(builder, endLine), i32Constant(builder, endColumn),
-       i32Constant(builder, marker)});
+  // ⛔ THE FRAMES GO INNERMOST FIRST, which is the order the runtime stack is
+  // read back in. A body the emitter inlined has no LLVM function to take a
+  // name from, so the frames it would have contributed ride in the location and
+  // are pushed here: `b.bad()` in `call` is TWO frames, `bad` at the failing
+  // line and `call` at the call, and pushing only the outer one printed the
+  // callee's line under the caller's name.
+  auto push = [&](llvm::StringRef frameName, std::int32_t frameLine,
+                  std::int32_t frameColumn, std::int32_t frameEndLine,
+                  std::int32_t frameEndColumn, std::int32_t frameMarker) {
+    llvm::Value *name = globalCStringPtr(builder, frameName, "py.tb.func");
+    builder.CreateCall(tracebackPushCStringRange(module),
+                       {file, name, i32Constant(builder, frameLine),
+                        i32Constant(builder, frameColumn),
+                        i32Constant(builder, frameEndLine),
+                        i32Constant(builder, frameEndColumn),
+                        i32Constant(builder, frameMarker)});
+  };
+  llvm::StringRef innerName =
+      site && !site->innerFunctionName.empty()
+          ? llvm::StringRef(site->innerFunctionName)
+          : functionName;
+  push(innerName, line, column, endLine, endColumn, marker);
+  if (site)
+    for (const PythonInlineFrame &frame : site->inlinedAt)
+      push(frame.functionName.empty() ? functionName
+                                      : llvm::StringRef(frame.functionName),
+           frame.line, frame.column, frame.endLine, frame.endColumn,
+           frame.noAnchor ? 0 : 1);
 }
 
 void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
@@ -813,6 +835,8 @@ void collectPythonCallSiteRanges(
     site.endLine = source->endLine;
     site.endColumn = source->endColumn;
     site.noAnchor = source->noAnchor;
+    site.innerFunctionName = source->functionName;
+    site.inlinedAt = source->inlinedAt;
     callSites.push_back(std::move(site));
   });
 }

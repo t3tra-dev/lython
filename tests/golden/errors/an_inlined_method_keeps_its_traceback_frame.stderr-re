@@ -1,0 +1,11 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*an_inlined_method_keeps_its_traceback_frame\.py",\ line\ 29,\ in\ <module>\
+\ \ \ \ Box\(3\)\.bad\(\)\
+\ \ \ \ \~\~\~\~\~\~\~\~\~\~\^\^\
+\ \ File\ ".*an_inlined_method_keeps_its_traceback_frame\.py",\ line\ 26,\ in\ bad\
+\ \ \ \ return\ self\.inner\(\)\
+\ \ \ \ \ \ \ \ \ \ \ \~\~\~\~\~\~\~\~\~\~\^\^\
+\ \ File\ ".*an_inlined_method_keeps_its_traceback_frame\.py",\ line\ 23,\ in\ inner\
+\ \ \ \ return\ self\.v\ //\ 0\
+\ \ \ \ \ \ \ \ \ \ \ \~\~\~\~\~\~\~\^\^\~\~\
+ZeroDivisionError:\ division\ by\ zero

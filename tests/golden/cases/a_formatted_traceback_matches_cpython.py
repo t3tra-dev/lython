@@ -12,6 +12,11 @@
 # stdout exactly and the recorded filename is the absolute path the compiler
 # saw. Only the directory goes; the rest of the line is what the module wrote.
 #
+# ⛔ A METHOD BODY IS WRITTEN INTO ITS CALLER, so the frames it would have
+# contributed do not exist by the time anything below this layer could look. The
+# last block is a method calling a method: three frames where a reader of the
+# LLVM IR finds one function.
+#
 # ⛔ CPython 3.14 draws a `~~~^^^` anchor line under the failing sub-expression
 # of SOME frames and not others, and both sides are here: a frame whose whole
 # statement is `return f(...)` or `x = f(...)` gets none, because repeating the
@@ -81,5 +86,26 @@ try:
     mixed(0)
 except ZeroDivisionError as e:
     sys.stdout.write("--- anchors kept ---\n")
+    for line in traceback.format_exception(e):
+        sys.stdout.write(strip_dir(line))
+
+
+class Box:
+    v: int
+
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    def inner(self) -> int:
+        return self.v // 0
+
+    def bad(self) -> int:
+        return self.inner()
+
+
+try:
+    Box(3).bad()
+except ZeroDivisionError as e:
+    sys.stdout.write("--- inlined method ---\n")
     for line in traceback.format_exception(e):
         sys.stdout.write(strip_dir(line))

@@ -266,10 +266,15 @@ void ModuleEmitter::emitInDefiningModuleScope(
   inlineReturnContexts.clear();
   auto savedSupers = std::move(superContexts);
   superContexts.clear();
+  // Same reason as in EmitterCalls: this body becomes an LLVM function of its
+  // own, which is where its traceback frame comes from.
+  auto savedInlineFrames = std::move(inlineFrames);
+  inlineFrames.clear();
   llvm::scope_exit restoreContexts([&] {
     loopControlContexts = std::move(savedLoops);
     inlineReturnContexts = std::move(savedInlineReturns);
     superContexts = std::move(savedSupers);
+    inlineFrames = std::move(savedInlineFrames);
   });
   std::size_t diagnosticStart = diagnostics.size();
   {

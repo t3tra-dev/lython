@@ -227,6 +227,31 @@ mlir::Location ModuleEmitter::loc(const parser::Node &node) const {
   if (anchorlessCall == &node)
     rangeAttrs.push_back(attrBuilder.getNamedAttr("ly.source.no_anchor",
                                                   attrBuilder.getUnitAttr()));
+  if (!inlineFrames.empty()) {
+    rangeAttrs.push_back(attrBuilder.getNamedAttr(
+        "ly.source.function",
+        attrBuilder.getStringAttr(inlineFrames.back().calleeName)));
+    llvm::SmallVector<mlir::Attribute, 4> frames;
+    for (const InlineFrame &frame : llvm::reverse(inlineFrames)) {
+      llvm::SmallVector<mlir::NamedAttribute, 6> entry;
+      entry.push_back(attrBuilder.getNamedAttr(
+          "function", attrBuilder.getStringAttr(frame.callerName)));
+      entry.push_back(attrBuilder.getNamedAttr(
+          "start_line", attrBuilder.getI32IntegerAttr(frame.line)));
+      entry.push_back(attrBuilder.getNamedAttr(
+          "start_col", attrBuilder.getI32IntegerAttr(frame.column)));
+      entry.push_back(attrBuilder.getNamedAttr(
+          "end_line", attrBuilder.getI32IntegerAttr(frame.endLine)));
+      entry.push_back(attrBuilder.getNamedAttr(
+          "end_col", attrBuilder.getI32IntegerAttr(frame.endColumn)));
+      if (frame.noAnchor)
+        entry.push_back(
+            attrBuilder.getNamedAttr("no_anchor", attrBuilder.getUnitAttr()));
+      frames.push_back(attrBuilder.getDictionaryAttr(entry));
+    }
+    rangeAttrs.push_back(attrBuilder.getNamedAttr(
+        "ly.source.inline_at", attrBuilder.getArrayAttr(frames)));
+  }
   return mlir::FusedLoc::get(&context, {start},
                              attrBuilder.getDictionaryAttr(rangeAttrs));
 }

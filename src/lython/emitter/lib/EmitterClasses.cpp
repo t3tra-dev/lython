@@ -3447,7 +3447,21 @@ Value ModuleEmitter::emitInlineMethodBody(
     superContexts.push_back(
         SuperContext{method.definingClass, sig.positionalNames.front()});
   methodsBeingInlined.push_back(method.method);
+  // The frame this body would have had if it were a function: everything it
+  // emits is located inside `bad`, at a call written in whatever function the
+  // inliner is currently writing into.
+  InlineFrame frame;
+  frame.calleeName = ast::string(*method.method, "name").value_or("<lambda>");
+  if (!inlineFrames.empty())
+    frame.callerName = inlineFrames.back().calleeName;
+  frame.line = anchor.range.start.line;
+  frame.column = anchor.range.start.column;
+  frame.endLine = anchor.range.end.line;
+  frame.endColumn = anchor.range.end.column;
+  frame.noAnchor = anchorlessCall == &anchor;
+  inlineFrames.push_back(std::move(frame));
   emitStatements(body);
+  inlineFrames.pop_back();
   methodsBeingInlined.pop_back();
   currentReturnType = enclosingReturnType;
   if (pushedSuperContext)

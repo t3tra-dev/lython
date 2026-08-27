@@ -964,6 +964,27 @@ private:
   // f(x)` and `y = f(x)` show no anchors, `return [f(x)][0]` does -- and the
   // AST exists only in this frame.
   const parser::Node *anchorlessCall = nullptr;
+  // One entry per method body the emitter is currently writing INTO its caller.
+  // A traceback frame comes from an LLVM function, and an inlined body has none
+  // of its own, so the frames it would have contributed are recorded here and
+  // ride out in the location (`ly.source.function`, `ly.source.inline_at`).
+  // Without them `b.bad()` printed ONE frame where CPython prints two, and gave
+  // the surviving one the CALLER's name against the CALLEE's line.
+  struct InlineFrame {
+    // The method being inlined, as a traceback names it: CPython shows
+    // `co_name`, so `bad` and not `Box.bad`.
+    std::string calleeName;
+    // Where the call that brought us here is written, and in which function.
+    // An empty `callerName` means the enclosing LLVM function, which only the
+    // lowering can name.
+    std::string callerName;
+    std::int32_t line = 0;
+    std::int32_t column = 0;
+    std::int32_t endLine = 0;
+    std::int32_t endColumn = 0;
+    bool noAnchor = false;
+  };
+  llvm::SmallVector<InlineFrame, 4> inlineFrames;
   // Solved type arguments per specialized class contract, in parameter order.
   llvm::StringMap<llvm::SmallVector<std::pair<std::string, mlir::Type>, 4>>
       classTypeArguments;

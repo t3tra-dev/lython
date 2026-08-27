@@ -2581,11 +2581,16 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       superContexts.clear();
       auto savedInlining = std::move(methodsBeingInlined);
       methodsBeingInlined.clear();
+      // A real function gets a real LLVM function, so its traceback frame comes
+      // from that; the inline stack belongs to the body being interrupted.
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
       llvm::scope_exit restoreContexts([&] {
         loopControlContexts = std::move(savedLoops);
         inlineReturnContexts = std::move(savedInlineReturns);
         superContexts = std::move(savedSupers);
         methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
       });
       emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
     }

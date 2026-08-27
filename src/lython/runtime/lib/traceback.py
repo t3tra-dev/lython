@@ -106,6 +106,10 @@ def _current_tb() -> Optional[types.TracebackType]:
     return built
 
 
+def _is_closer(ch: str) -> bool:
+    return ch == ")" or ch == "]"
+
+
 def _is_operator_char(ch: str) -> bool:
     return (ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%"
             or ch == "@" or ch == "&" or ch == "|" or ch == "^" or ch == "<"
@@ -116,12 +120,13 @@ def _marker_start(line: str, col: int, length: int) -> int:
     """Where the underline begins: the recorded column when it lands inside the
     line, the first non-blank character otherwise.
 
-    ⛔ ITS OWN FUNCTION for the same reason `_marker_end` is, and a different
-    refusal: `start = col` inside the caller aliases a BORROWED parameter into a
-    local, which takes a borrow-to-own retain the caller then has to discharge,
-    and the walk reports "borrowed entry argument 1 reaches function exit with 1
-    retained ownership token(s)". Returned from a call the answer is the
-    frame's own from the start.
+    ⛔ ITS OWN FUNCTION, and so is `_marker_end`, for one refusal between them:
+    `start = col` inside the caller aliases a BORROWED parameter into a local,
+    which takes a borrow-to-own retain the caller then has to discharge --
+    "borrowed entry argument 1 of @traceback._anchors reaches function exit with
+    1 retained ownership token(s)", and argument 2 for `marker_end = end_col`.
+    Returned from a call the answer is the frame's own from the start.
+    tests/probe/wb_borrowed_param_rebound_local.py has the shape on its own.
     """
     if col > 0 and col < length:
         return col
@@ -136,13 +141,7 @@ def _marker_end(length: int, start: int, col: int, end_col: int) -> int:
     range end and lands inside the line, the end of the line otherwise, and one
     character when the range is degenerate.
 
-    ⛔ WRITTEN AS ITS OWN FUNCTION so the caller binds the answer once. Computed
-    inline it is a name REBOUND by two sequential `if` chains whose first value
-    came from `len()` -- an owned call result -- and the release planner then
-    leaves that result unreleased on the paths where the second chain replaced
-    it: "owned resource from @LyLong_FromI64 result 0 reaches function exit
-    without release". tests/probe/wb_rebound_call_result_two_diamonds.py has the
-    shape on its own.
+    See `_marker_start` for why this is not written inline.
     """
     if end_col > col and end_col > 0:
         usable = end_col
@@ -190,24 +189,43 @@ def _anchors(line: str, col: int, end_col: int, mode: int) -> str:
     caret_start = -1
     caret_end = -1
     if mode != 2:
-        split = start
-        while split < marker_end:
-            if line[split] == "(" or line[split] == "[":
-                caret_start = split
-                caret_end = marker_end
+        # An operator OUTSIDE every bracket is the segment's top node, so it
+        # takes the carets: `f(x) + g(y)` is an addition, not a call.
+        op = start
+        depth = 0
+        while op < marker_end:
+            ch = line[op]
+            if ch == "(" or ch == "[":
+                depth += 1
+            elif ch == ")" or ch == "]":
+                depth -= 1
+            elif depth == 0 and _is_operator_char(ch):
+                run = op + 1
+                while run < marker_end and _is_operator_char(line[run]):
+                    run += 1
+                caret_start = op
+                caret_end = run
                 break
-            split += 1
-        if caret_start < 0:
-            op = start
-            while op < marker_end:
-                if _is_operator_char(line[op]):
-                    run = op + 1
-                    while run < marker_end and _is_operator_char(line[run]):
-                        run += 1
-                    caret_start = op
-                    caret_end = run
-                    break
-                op += 1
+            op += 1
+        if caret_start < 0 and _is_closer(line[marker_end - 1]):
+            # With no operator above them, the LAST bracket group is the call
+            # or subscript being made, and its opener is where the carets
+            # start. Found by matching backwards from the closer rather than
+            # forwards from `start`, which answered `Box(3).bad()` with the
+            # arguments of `Box`.
+            scan = marker_end - 1
+            depth = 0
+            while scan >= start:
+                ch = line[scan]
+                if ch == ")" or ch == "]":
+                    depth += 1
+                elif ch == "(" or ch == "[":
+                    depth -= 1
+                    if depth == 0:
+                        caret_start = scan
+                        caret_end = marker_end
+                        break
+                scan -= 1
     if caret_start < 0:
         if start == 0 and marker_end >= length:
             return ""

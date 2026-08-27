@@ -1,27 +1,29 @@
-# probe: a method inlined into its caller leaves no traceback frame of its own
+# probe: a method inlined into its caller keeps a traceback frame of its own
 # axes: acquire=method-call width=object op=raise flow=inline observe=traceback
-# CLASSIFICATION @ 2026-08-27: 2 誤って実行する
+# CLASSIFICATION @ 2026-08-27: 1 正しい
 #
-# `b.bad()` is inlined by the emitter (the LLVM IR has no `@bad`; `@call` holds
-# the FloorDiv), so no invoke marks the call site and no frame is pushed for it.
-# The traceback then shows ONE frame where CPython shows two, and the surviving
-# frame carries the CALLER's function name against the CALLEE's line -- the
-# entry reads `line 6, in call` while line 6 is inside `bad`. A plain function
-# call (tests/golden/cases/a_formatted_traceback_matches_cpython.py) is not
-# inlined and keeps both frames.
+# `b.bad()` is inlined by the emitter -- the LLVM IR has no `@bad`; `@call`
+# holds the FloorDiv -- so no invoke marks the call site and nothing named the
+# body. The traceback showed ONE frame where CPython shows three, and the
+# surviving one carried the CALLER's name against the CALLEE's line: `line 6,
+# in call` where line 6 is inside `bad`.
 #
-# Pre-existing: `git stash && cmake --build build-rel` at 41177298 prints the
-# same one-frame traceback.
+# The frames an inlined body would have contributed now ride in the location
+# (`ly.source.function` / `ly.source.inline_at`, written by the emitter) and are
+# pushed one per level, innermost first, by both frame-pushing paths: the
+# invoke cleanup for a raise that happens in a callee, and the raise-site push
+# for one the lowering inlined too (`b.at(9)`'s bounds check raises in the
+# caller, not in a callee).
 #
 # CPython 3.14 expects:
 #   Traceback (most recent call last):
-#     File "...", line 9, in <module>
+#     File "...", line 44, in <module>
 #       call(Box(3))
 #       ~~~~^^^^^^^^
-#     File "...", line 8, in call
+#     File "...", line 41, in call
 #       return b.bad()
 #              ~~~~~^^
-#     File "...", line 6, in bad
+#     File "...", line 37, in bad
 #       return self.v // 0
 #              ~~~~~~~^^~~
 #   ZeroDivisionError: division by zero

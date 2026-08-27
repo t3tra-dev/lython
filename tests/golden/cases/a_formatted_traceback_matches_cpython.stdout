@@ -1,28 +1,28 @@
 --- format_exception ---
 Traceback (most recent call last):
-  File "a_formatted_traceback_matches_cpython.py", line 48, in <module>
+  File "a_formatted_traceback_matches_cpython.py", line 53, in <module>
     compute()
     ~~~~~~~^^
-  File "a_formatted_traceback_matches_cpython.py", line 44, in compute
+  File "a_formatted_traceback_matches_cpython.py", line 49, in compute
     return divide(1, 0)
-  File "a_formatted_traceback_matches_cpython.py", line 40, in divide
+  File "a_formatted_traceback_matches_cpython.py", line 45, in divide
     return a // b
            ~~^^~~
 ZeroDivisionError: division by zero
 --- limit=1 ---
 Traceback (most recent call last):
-  File "a_formatted_traceback_matches_cpython.py", line 48, in <module>
+  File "a_formatted_traceback_matches_cpython.py", line 53, in <module>
     compute()
     ~~~~~~~^^
 ZeroDivisionError: division by zero
 --- format_exc ---
 Traceback (most recent call last):
-  File "a_formatted_traceback_matches_cpython.py", line 48, in <module>
+  File "a_formatted_traceback_matches_cpython.py", line 53, in <module>
     compute()
     ~~~~~~~^^
-  File "a_formatted_traceback_matches_cpython.py", line 44, in compute
+  File "a_formatted_traceback_matches_cpython.py", line 49, in compute
     return divide(1, 0)
-  File "a_formatted_traceback_matches_cpython.py", line 40, in divide
+  File "a_formatted_traceback_matches_cpython.py", line 45, in divide
     return a // b
            ~~^^~~
 ZeroDivisionError: division by zero
@@ -32,13 +32,25 @@ KeyboardInterrupt
 NoneType: None
 --- anchors kept ---
 Traceback (most recent call last):
-  File "a_formatted_traceback_matches_cpython.py", line 81, in <module>
+  File "a_formatted_traceback_matches_cpython.py", line 86, in <module>
     mixed(0)
     ~~~~~^^^
-  File "a_formatted_traceback_matches_cpython.py", line 77, in mixed
+  File "a_formatted_traceback_matches_cpython.py", line 82, in mixed
     return helper(n) + 1
            ~~~~~~^^^
-  File "a_formatted_traceback_matches_cpython.py", line 73, in helper
+  File "a_formatted_traceback_matches_cpython.py", line 78, in helper
     return 100 // n
            ~~~~^^~~
+ZeroDivisionError: division by zero
+--- inlined method ---
+Traceback (most recent call last):
+  File "a_formatted_traceback_matches_cpython.py", line 107, in <module>
+    Box(3).bad()
+    ~~~~~~~~~~^^
+  File "a_formatted_traceback_matches_cpython.py", line 103, in bad
+    return self.inner()
+           ~~~~~~~~~~^^
+  File "a_formatted_traceback_matches_cpython.py", line 100, in inner
+    return self.v // 0
+           ~~~~~~~^^~~
 ZeroDivisionError: division by zero

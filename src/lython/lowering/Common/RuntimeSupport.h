@@ -1,5 +1,6 @@
 #pragma once
 
+#include "PythonSourceRange.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/TargetParser/Triple.h"
 #include "mlir/Pass/Pass.h"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace llvm {
 class Module;
@@ -91,6 +93,11 @@ struct PythonCallSiteRange {
   std::int32_t endLine = 0;
   std::int32_t endColumn = 0;
   bool noAnchor = false;
+  // The frames the emitter inlined away, innermost first, and the name of the
+  // function this site is written in when an inlined body replaced it. Both
+  // empty for an ordinary call.
+  std::string innerFunctionName;
+  std::vector<PythonInlineFrame> inlinedAt;
 };
 
 void collectPythonCallSiteRanges(

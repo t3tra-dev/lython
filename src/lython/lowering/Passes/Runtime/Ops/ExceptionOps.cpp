@@ -128,9 +128,16 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
   std::int64_t endLine = line;
   std::int64_t endColumn = 0;
   std::int64_t hasMarker = 0;
+  // The frames of the method bodies the emitter wrote into this function, and
+  // the name this op's own frame goes under. Both empty unless something was
+  // inlined here; see EmitterCore.h's `inlineFrames`.
+  llvm::SmallVector<PythonInlineFrame, 2> inlinedAt;
+  std::string innerFunction;
   if (!mlir::isa<py::RaiseOp, py::RaiseCurrentOp>(op)) {
     if (std::optional<PythonSourceRange> range =
             pythonSourceRange(op->getLoc())) {
+      innerFunction = range->functionName;
+      inlinedAt.assign(range->inlinedAt.begin(), range->inlinedAt.end());
       if (range->endLine == range->line && range->endColumn > range->column) {
         endLine = range->endLine;
         endColumn = range->endColumn;
@@ -156,17 +163,34 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
 
   mlir::func::FuncOp tracebackPush = getOrCreateTracebackPush(module, builder);
   mlir::Value file = materializeByteBuffer(op->getLoc(), filename);
-  mlir::Value function =
-      materializeByteBuffer(op->getLoc(), currentCallableName(op));
   auto i32Const = [&](std::int64_t value) {
     return mlir::arith::ConstantIntOp::create(builder, op->getLoc(), value, 32)
         .getResult();
   };
-  mlir::func::CallOp::create(
-      builder, op->getLoc(), tracebackPush,
-      mlir::ValueRange{file, function, i32Const(line), i32Const(column),
-                       i32Const(endLine), i32Const(endColumn),
-                       i32Const(hasMarker)});
+  // ⛔ ONE PUSH PER INLINED LEVEL, innermost first, which is the order the
+  // stack is read back in. A raise inside a body the emitter wrote into its
+  // caller -- the bounds check of `b.at(9)` is raised in `use`, not in a
+  // callee -- has no LLVM function of its own to be named after, so without the
+  // levels the frame carried the CALLER's name against the CALLEE's line and
+  // the call's own frame was missing entirely.
+  llvm::StringRef enclosing = currentCallableName(op);
+  auto push = [&](llvm::StringRef name, std::int64_t frameLine,
+                  std::int64_t frameColumn, std::int64_t frameEndLine,
+                  std::int64_t frameEndColumn, std::int64_t frameMarker) {
+    mlir::Value function = materializeByteBuffer(op->getLoc(), name);
+    mlir::func::CallOp::create(
+        builder, op->getLoc(), tracebackPush,
+        mlir::ValueRange{file, function, i32Const(frameLine),
+                         i32Const(frameColumn), i32Const(frameEndLine),
+                         i32Const(frameEndColumn), i32Const(frameMarker)});
+  };
+  push(innerFunction.empty() ? enclosing : llvm::StringRef(innerFunction), line,
+       column, endLine, endColumn, hasMarker);
+  for (const PythonInlineFrame &frame : inlinedAt)
+    push(frame.functionName.empty() ? enclosing
+                                    : llvm::StringRef(frame.functionName),
+         frame.line, frame.column, frame.endLine, frame.endColumn,
+         frame.noAnchor ? 0 : 1);
   return mlir::success();
 }
 

@@ -1433,10 +1433,22 @@ void buildPrintMarker(SupportBuilder &b) {
   mlir::Block *scanNext = b.builder.createBlock(&body);
   mlir::Block *haveStart = b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
   mlir::Block *computeEnd = b.builder.createBlock(&body);
-  mlir::Block *splitHead = b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+  mlir::Block *splitHead = b.builder.createBlock(&body, body.end(),
+                                                 {b.i64(), b.i64()},
+                                                 {b.loc, b.loc});
   mlir::Block *splitCheck = b.builder.createBlock(&body);
-  mlir::Block *opHead = b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+  mlir::Block *splitStep = b.builder.createBlock(&body, body.end(), {b.i64()},
+                                                 {b.loc});
+  mlir::Block *opHead = b.builder.createBlock(&body, body.end(),
+                                              {b.i64(), b.i64()},
+                                              {b.loc, b.loc});
   mlir::Block *opCheck = b.builder.createBlock(&body);
+  mlir::Block *opStep = b.builder.createBlock(&body, body.end(),
+                                              {b.i64(), b.i64()},
+                                              {b.loc, b.loc});
+  mlir::Block *opStep2 = b.builder.createBlock(&body);
+  mlir::Block *opRun = b.builder.createBlock(&body, body.end(), {b.i64()},
+                                             {b.loc});
   mlir::Block *opEndHead = b.builder.createBlock(&body, body.end(),
                                                  {b.i64(), b.i64()},
                                                  {b.loc, b.loc});
@@ -1541,40 +1553,8 @@ void buildPrintMarker(SupportBuilder &b) {
   mlir::Value plainRange = b.cmpi(mlir::arith::CmpIPredicate::eq,
                                   entry->getArgument(3), b.iconst32(2));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, plainRange, noAnchor,
-                                 mlir::ValueRange{}, splitHead,
-                                 mlir::ValueRange{start});
-
-  // Anchor pass 1: a call/subscript splits at its first `(` / `[`; the head
-  // renders as tildes, the trailer as carets.
-  b.builder.setInsertionPointToEnd(splitHead);
-  mlir::Value splitIndex = splitHead->getArgument(0);
-  mlir::Value splitDone =
-      b.cmpi(mlir::arith::CmpIPredicate::uge, splitIndex, markerEnd);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, splitDone, opHead,
-                                 mlir::ValueRange{start}, splitCheck,
-                                 mlir::ValueRange{});
-
-  b.builder.setInsertionPointToEnd(splitCheck);
-  mlir::Value splitCh = b.loadI8(b.gepI8(line, splitIndex));
-  mlir::Value isParen =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, splitCh, b.iconst8('('));
-  mlir::Value isBracket =
-      b.cmpi(mlir::arith::CmpIPredicate::eq, splitCh, b.iconst8('['));
-  mlir::Value isSplit = b.orBit(isParen, isBracket);
-  mlir::Value splitNext =
-      mlir::arith::AddIOp::create(b.builder, b.loc, splitIndex, b.iconst(1));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, isSplit, emit,
-                                 mlir::ValueRange{splitIndex, markerEnd},
-                                 splitHead, mlir::ValueRange{splitNext});
-
-  // Anchor pass 2: a binary-operator run gets the carets (`a / b` -> `~~^~~`).
-  b.builder.setInsertionPointToEnd(opHead);
-  mlir::Value opIndex = opHead->getArgument(0);
-  mlir::Value opScanDone =
-      b.cmpi(mlir::arith::CmpIPredicate::uge, opIndex, markerEnd);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, opScanDone, noAnchor,
-                                 mlir::ValueRange{}, opCheck,
-                                 mlir::ValueRange{});
+                                 mlir::ValueRange{}, opHead,
+                                 mlir::ValueRange{start, b.iconst(0)});
 
   auto isOperatorChar = [&](mlir::Value ch) {
     mlir::Value result;
@@ -1585,15 +1565,111 @@ void buildPrintMarker(SupportBuilder &b) {
     }
     return result;
   };
+  auto isOpener = [&](mlir::Value ch) {
+    return b.orBit(b.cmpi(mlir::arith::CmpIPredicate::eq, ch, b.iconst8('(')),
+                   b.cmpi(mlir::arith::CmpIPredicate::eq, ch, b.iconst8('[')));
+  };
+  auto isCloser = [&](mlir::Value ch) {
+    return b.orBit(b.cmpi(mlir::arith::CmpIPredicate::eq, ch, b.iconst8(')')),
+                   b.cmpi(mlir::arith::CmpIPredicate::eq, ch, b.iconst8(']')));
+  };
+
+  // Anchor pass 1: an operator OUTSIDE every bracket is the segment's top
+  // node, so it takes the carets -- `f(x) + g(y)` is an addition and not a
+  // call. Bracketed operators are skipped by the depth counter.
+  b.builder.setInsertionPointToEnd(opHead);
+  mlir::Value opIndex = opHead->getArgument(0);
+  mlir::Value opDepth = opHead->getArgument(1);
+  mlir::Value opScanDone =
+      b.cmpi(mlir::arith::CmpIPredicate::uge, opIndex, markerEnd);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, opScanDone, splitHead,
+                                 mlir::ValueRange{
+                                     mlir::arith::SubIOp::create(
+                                         b.builder, b.loc, markerEnd,
+                                         b.iconst(1))
+                                         .getResult(),
+                                     b.iconst(0)},
+                                 opCheck, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(opCheck);
   mlir::Value opCh = b.loadI8(b.gepI8(line, opIndex));
-  mlir::Value opFound = isOperatorChar(opCh);
+  mlir::Value opOpener = isOpener(opCh);
+  mlir::Value opCloser = isCloser(opCh);
+  mlir::Value opBracket = b.orBit(opOpener, opCloser);
+  mlir::Value opStepDepth = mlir::arith::SelectOp::create(
+      b.builder, b.loc, opOpener,
+      mlir::arith::AddIOp::create(b.builder, b.loc, opDepth, b.iconst(1))
+          .getResult(),
+      mlir::arith::SubIOp::create(b.builder, b.loc, opDepth, b.iconst(1))
+          .getResult());
+  mlir::Value opNextDepth = mlir::arith::SelectOp::create(
+      b.builder, b.loc, opBracket, opStepDepth, opDepth);
   mlir::Value opNext =
       mlir::arith::AddIOp::create(b.builder, b.loc, opIndex, b.iconst(1));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, opFound, opEndHead,
-                                 mlir::ValueRange{opIndex, opNext}, opHead,
-                                 mlir::ValueRange{opNext});
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, opBracket, opStep,
+                                 mlir::ValueRange{opNext, opNextDepth}, opStep2,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(opStep2);
+  mlir::Value opTop = b.cmpi(mlir::arith::CmpIPredicate::eq, opDepth,
+                             b.iconst(0));
+  mlir::Value opFound =
+      mlir::arith::AndIOp::create(b.builder, b.loc, opTop, isOperatorChar(opCh));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, opFound, opRun,
+                                 mlir::ValueRange{opIndex}, opStep,
+                                 mlir::ValueRange{opNext, opDepth});
+
+  b.builder.setInsertionPointToEnd(opStep);
+  mlir::cf::BranchOp::create(b.builder, b.loc, opHead,
+                             mlir::ValueRange{opStep->getArgument(0),
+                                              opStep->getArgument(1)});
+
+  b.builder.setInsertionPointToEnd(opRun);
+  mlir::Value runStart = opRun->getArgument(0);
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, opEndHead,
+      mlir::ValueRange{runStart, mlir::arith::AddIOp::create(
+                                     b.builder, b.loc, runStart, b.iconst(1))
+                                     .getResult()});
+
+  // Anchor pass 2: with no operator above them, the LAST bracket group is the
+  // call or subscript being made, and its opener is where the carets start.
+  // Matched BACKWARDS from the closer: forwards from `start` answered
+  // `Box(3).bad()` with the arguments of `Box`.
+  b.builder.setInsertionPointToEnd(splitHead);
+  mlir::Value splitIndex = splitHead->getArgument(0);
+  mlir::Value splitDepth = splitHead->getArgument(1);
+  mlir::Value splitDone =
+      b.cmpi(mlir::arith::CmpIPredicate::slt, splitIndex, start);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, splitDone, noAnchor,
+                                 mlir::ValueRange{}, splitCheck,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(splitCheck);
+  mlir::Value splitCh = b.loadI8(b.gepI8(line, splitIndex));
+  mlir::Value splitOpener = isOpener(splitCh);
+  mlir::Value splitCloser = isCloser(splitCh);
+  mlir::Value splitOpened =
+      mlir::arith::SubIOp::create(b.builder, b.loc, splitDepth, b.iconst(1));
+  mlir::Value splitClosed =
+      mlir::arith::AddIOp::create(b.builder, b.loc, splitDepth, b.iconst(1));
+  mlir::Value splitAfterOpen = mlir::arith::SelectOp::create(
+      b.builder, b.loc, splitOpener, splitOpened, splitDepth);
+  mlir::Value splitNextDepth = mlir::arith::SelectOp::create(
+      b.builder, b.loc, splitCloser, splitClosed, splitAfterOpen);
+  mlir::Value splitMatched = mlir::arith::AndIOp::create(
+      b.builder, b.loc, splitOpener,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, splitOpened, b.iconst(0)));
+  mlir::Value splitPrev =
+      mlir::arith::SubIOp::create(b.builder, b.loc, splitIndex, b.iconst(1));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, splitMatched, emit,
+                                 mlir::ValueRange{splitIndex, markerEnd},
+                                 splitStep, mlir::ValueRange{splitNextDepth});
+
+  b.builder.setInsertionPointToEnd(splitStep);
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, splitHead,
+      mlir::ValueRange{splitPrev, splitStep->getArgument(0)});
 
   b.builder.setInsertionPointToEnd(opEndHead);
   mlir::Value opStart = opEndHead->getArgument(0);
