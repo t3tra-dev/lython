@@ -2,25 +2,34 @@
 # linked-list reversal
 # axes: acquire=param width=optional op=carry flow=loop observe=refusal
 # CLASSIFICATION @ 2026-08-27: 3 loud 拒否 (診断)
-#   owned resource from builtin.unrealized_conversion_cast result 0 reaches
-#   function exit without release, transfer, or owned return
+#   borrowed entry argument 0 of @rev is returned as owned without a
+#   dominating retain
 #
-# The reduced spellings below report the other half of the same imbalance,
-# "borrowed entry argument 0 of @rev is released or transferred without a
-# prior retain", which is what says the two lanes disagree about who holds it.
+# The spelling that returns an int rather than the node reports the other half,
+# "released or transferred without a prior retain". Both are the borrowed-entry
+# WALK, not the release placement.
 #
 # The walk (one carried Optional) and the build (`cur = fresh`) both run now;
 # this is the shape where TWO carried lanes name one object for part of an
-# iteration. `prev = cur` makes the prev lane acquire what the cur lane is
-# abandoning on the same edge, which `carriedLoopEdgeOperands` handles by
-# handing the token over rather than releasing and retaining -- and the borrowed
-# walk still reports the parameter released without its retain.
+# iteration.
 #
-# ⛔ NOT the `cur.nxt = prev` store: dropping it leaves the same refusal, so it
-# is the two carried lanes and not the field write. Dropping `prev = cur`
-# instead reports the OTHER end of the same imbalance -- "reaches function exit
-# with 1 retained ownership token(s)", the loop's entry retain undischarged --
-# so both halves of that contract are involved and neither is the whole story.
+# ⛔ NOT the `cur.nxt = prev` store, and not the borrowed initial value. Both
+# were fixed 2026-08-27 and are covered by
+# tests/golden/cases/a_loop_over_a_borrowed_optional_writes_its_field.py: the
+# store is one `select` on the entity word rather than an `scf.if` the release
+# planner will not place into, and the emitter's entry-edge lend now seeds a
+# merge candidate so this pass discharges it. Dropping `prev = cur` from the
+# body -- one carried lane instead of two -- compiles and matches CPython.
+#
+# What is left is the CROSS-ASSIGNMENT: `prev = cur` makes the prev lane
+# acquire on the same edge that the cur lane abandons, so one object is named
+# by two carried lanes for part of an iteration.
+# `carriedLoopEdgeOperands` hands the token over rather than releasing and
+# retaining (`transferred`), and the emitted IR balances -- counted by hand on
+# a one-node chain: one `py.incref` on the parameter, one release of it at the
+# loop's exit. It is the borrowed-entry WALK that refuses, so the next attempt
+# should start by asking which path it takes to reach a release with
+# `retained == 0`, not by re-reading the ledger.
 #
 # ⛔ AND NOT reachable as a wrong answer: it is a refusal at the affine
 # ownership verifier, before any code runs.

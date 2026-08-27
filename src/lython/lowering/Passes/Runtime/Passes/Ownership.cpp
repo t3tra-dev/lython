@@ -2762,6 +2762,53 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     }
   });
 
+  // ⭐ AND FROM THE RETAIN THE EMITTER ALREADY WROTE. The two walks above seed
+  // from owned CALL RESULTS and from `owned_local_object` markers, and a loop
+  // that carries a union has neither on the edge that matters: the reference is
+  // minted by a `py.incref` the emitter placed to lend a BORROWED initial value
+  // to the loop (`acquireUnionCarriedTokens`), which is a call with no results
+  // and no marker. With no candidate this pass placed no release for the merge
+  // argument, and the lend was left outstanding wherever the loop's own edges
+  // did not happen to spend it.
+  //
+  // ⛔ THE CONTRACT COMES FROM THE LABEL, not from the lane's type. Every source
+  // class is a `memref<5xi64>` here, so the type cannot say which deallocator
+  // frees it; `<contract>:py.incref` is written by the retain's own lowering and
+  // names it exactly.
+  mlir::func::FuncOp emitterRetainFunction =
+      module.lookupSymbol<mlir::func::FuncOp>("Ly_IncRef");
+  if (emitterRetainFunction)
+    module.walk([&](mlir::func::CallOp call) {
+      if (call.getCallee() != emitterRetainFunction.getSymName() ||
+          call.getNumOperands() != 1)
+        return;
+      mlir::func::FuncOp fn = call->getParentOfType<mlir::func::FuncOp>();
+      if (!fn || own::isRuntimeManifestFunction(fn))
+        return;
+      auto label =
+          call->getAttrOfType<mlir::StringAttr>(own::kAggregateRetainAttr);
+      static constexpr llvm::StringLiteral kIncrefSuffix = ":py.incref";
+      if (!label || !label.getValue().ends_with(kIncrefSuffix))
+        return;
+      llvm::StringRef contract =
+          label.getValue().drop_back(kIncrefSuffix.size());
+      const own::RuntimeDeallocator *chosen = nullptr;
+      for (const own::RuntimeDeallocator &candidate : deallocators)
+        if (candidate.contractName == contract &&
+            candidate.inputTypes.size() == 1)
+          chosen = &candidate;
+      if (!chosen)
+        return;
+      mlir::Value root = retainSpellingRoot(call.getOperand(0));
+      if (!root || root.getType() != chosen->inputTypes.front())
+        return;
+      own::ResourceGroup g;
+      g.values.push_back(root);
+      g.root = root;
+      g.deallocator = chosen;
+      seedGroup(fn, g, call->getBlock());
+    });
+
   // Propagate ownership through block-arg -> block-arg forwards (loop headers,
   // chained merges) until no new destination group is discovered.
   bool changed = true;

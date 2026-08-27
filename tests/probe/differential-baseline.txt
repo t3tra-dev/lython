@@ -120,6 +120,8 @@ leak_mutate_call_append_big.py AGREE
 leak_mutate_call_append_small.py AGREE
 leak_mutate_selfmethod_append_big.py AGREE
 leak_mutate_selfmethod_append_small.py AGREE
+leak_optionalfield_in_loop_big.py AGREE
+leak_optionalfield_in_loop_small.py AGREE
 leak_optionalfield_rebind_big.py AGREE
 leak_optionalfield_rebind_small.py AGREE
 leak_optionalresult_loop_big.py AGREE

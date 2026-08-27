@@ -349,11 +349,28 @@ RuntimeBundleLowerer::clearBoxedFieldSlot(mlir::Operation *op, mlir::Value body,
 // Fills the box with the payload, or empties it, according to which arm the
 // value carries.
 //
-// ⛔ WHY A BRANCH AND NOT ONE STORE OF WHATEVER THE LANES HOLD. A `None` arm's
-// payload lanes are not nothing -- they are the immortal dead placeholder every
-// producer of a union gives an inactive member -- and its address is not zero.
-// Rooting the box at it would make an empty field read back as PRESENT, and
-// the reader has only the entity word to go on.
+// ⭐ ONE STORE, NOT A BRANCH. The payload lanes are valid on BOTH arms -- an
+// absent optional carries the immortal dead placeholder, which the retain and
+// the box's own release step over without a write -- so the arm only decides
+// what reaches the box's ENTITY word: the payload's address, or the zero that
+// means there is none.
+//
+// ⛔ AND AN `scf.if` HERE COST MORE THAN THE BRANCH. The release planner's
+// liveness walk gives up on a group with a consuming call whose use sits in a
+// nested REGION (`ancestorInRegion` returns nothing for it), so wrapping the
+// store made the instance's own release unplaceable wherever a loop carried it:
+//
+//     cur: Optional[Node] = head
+//     while cur is not None:
+//         cur.nxt = prev
+//         ...
+//
+//   "borrowed entry argument 0 of @rev reaches function exit with 1 retained
+//   ownership token(s)"
+//
+// ⛔ AND WHY THE ENTITY WORD CANNOT JUST BE STORED. The placeholder's address is
+// not zero, so an empty field written from it reads back as PRESENT -- the
+// reader has only that word to go on.
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::storeOptionalBoxedField(mlir::Operation *op,
                                               mlir::Value body,
@@ -375,30 +392,41 @@ RuntimeBundleLowerer::storeOptionalBoxedField(mlir::Operation *op,
       builder, loc, mlir::arith::CmpIPredicate::eq, tag,
       constantI64(builder, loc,
                   RuntimeBundleLowerer::optionalPayloadTag(unionType)));
-  auto branch = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
-                                        present, /*withElseRegion=*/true);
-  mlir::LogicalResult filled = mlir::success();
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    // The region already has its terminator; the store goes in front of it.
-    mlir::Operation *anchor = branch.thenBlock()->getTerminator();
-    builder.setInsertionPoint(anchor);
-    mlir::FailureOr<RuntimeBundle> stored =
-        RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(anchor, body,
-                                                            boxWord, *payload,
-                                                            slotName);
-    if (mlir::failed(stored))
-      filled = mlir::failure();
-  }
-  if (mlir::failed(filled))
+  if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(op, *payload,
+                                                             slotName)))
     return mlir::failure();
-  {
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPoint(branch.elseBlock()->getTerminator());
-    if (mlir::failed(RuntimeBundleLowerer::clearBoxedFieldSlot(op, body,
-                                                               boxWord,
-                                                               slotName)))
-      return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+      RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload,
+                                                     /*ownsPayload=*/true);
+  if (mlir::failed(words))
+    return mlir::failure();
+  auto releaseBoxed = module.lookupSymbol<mlir::func::FuncOp>(
+      "LyObject_ReleaseBoxedPayloadArraySlotRaw");
+  if (!releaseBoxed)
+    return op->emitError() << "runtime support has no "
+                              "LyObject_ReleaseBoxedPayloadArraySlotRaw to "
+                              "replace "
+                           << slotName;
+  mlir::Value releaseStorage = body;
+  mlir::Type expectedStorage = releaseBoxed.getFunctionType().getInput(0);
+  if (releaseStorage.getType() != expectedStorage)
+    releaseStorage = mlir::memref::CastOp::create(builder, loc, expectedStorage,
+                                                  releaseStorage)
+                         .getResult();
+  mlir::Value releaseSlot = constantI64(
+      builder, loc, boxWord / static_cast<unsigned>(box_abi::kWordsPerBox));
+  mlir::func::CallOp::create(builder, loc, releaseBoxed,
+                             mlir::ValueRange{releaseStorage, releaseSlot});
+  mlir::Value zero = constantI64(builder, loc, 0);
+  for (auto [wordIndex, word] : llvm::enumerate(*words)) {
+    mlir::Value stored = word;
+    if (static_cast<std::int64_t>(wordIndex) == box_abi::kEntityWord ||
+        static_cast<std::int64_t>(wordIndex) == box_abi::kOwnedFlagWord)
+      stored = mlir::arith::SelectOp::create(builder, loc, present, word, zero)
+                   .getResult();
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(boxWord + wordIndex));
+    mlir::memref::StoreOp::create(builder, loc, stored, body, slot);
   }
   RuntimeBundle result = value;
   result.objectValue = value.objectValue.withOwnership(
