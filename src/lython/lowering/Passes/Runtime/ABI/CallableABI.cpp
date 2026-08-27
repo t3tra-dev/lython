@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include <cstdlib>
+
 #include "llvm/ADT/ScopeExit.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -648,6 +650,29 @@ bool isReplaySafeBody(mlir::func::FuncOp clone,
 // a rehearsal -- transitively, since a clone calling a refused clone inherits
 // that clone's wrong branches. The walk is optimistic about the cycle a
 // recursive clone forms with itself, which is what lets `fib` speculate at all.
+// LYTHON_TRACE_PRIM_CLONE: name the op that cost a function its unboxed clone.
+//
+// Why it is worth a switch: the failure is SILENT and two removes from its
+// cause. A function gets a clone, the clone keeps one manifest call because one
+// operator has no primitive form, the speculation is folded for exactly that
+// reason, and the clone is then dead code -- so what the reader sees is a
+// program with no clone at all and nothing saying which operator it was. The
+// whole `//` / `%` widening was found by printing this line once.
+void tracePrimitiveI64CloneRefusal(
+    mlir::func::FuncOp clone,
+    llvm::function_ref<bool(mlir::func::FuncOp)> isClone) {
+  static const bool enabled = std::getenv("LYTHON_TRACE_PRIM_CLONE") != nullptr;
+  if (!enabled)
+    return;
+  clone.walk([&](mlir::func::CallOp call) {
+    auto callee = mlir::SymbolTable::lookupNearestSymbolFrom<mlir::func::FuncOp>(
+        clone, call.getCalleeAttr());
+    if (!callee || !isClone(callee) || callee.isDeclaration())
+      llvm::errs() << "[prim-clone] " << clone.getSymName()
+                   << " kept a boxed call to " << call.getCallee() << "\n";
+  });
+}
+
 bool RuntimeBundleLowerer::isSpeculablePrimitiveI64Clone(
     mlir::func::FuncOp clone) {
   if (!clone || clone.isDeclaration() ||
@@ -672,8 +697,12 @@ bool RuntimeBundleLowerer::isSpeculablePrimitiveI64Clone(
           if (assumedSafe.insert(callee.getOperation()).second)
             pending.push_back(callee);
           return true;
-        }))
+        })) {
+      tracePrimitiveI64CloneRefusal(current, [this](mlir::func::FuncOp callee) {
+        return RuntimeBundleLowerer::isPrimitiveI64CallableClone(callee);
+      });
       return false;
+    }
   }
   return true;
 }

@@ -1,7 +1,7 @@
-# WHAT: `//`, `%`, `<<`, `>>`, `&`, `|` and `^` on ints, over the operand pairs
-# that separate a machine word's arithmetic from Python's -- negative operands,
-# the i64 boundaries, a zero divisor, a negative shift count, and operands that
-# do not fit a word at all.
+# WHAT: `//`, `%`, `<<`, `>>`, `&`, `|`, `^`, `-x` and `~x` on ints, over the
+# operands that separate a machine word's arithmetic from Python's -- negative
+# operands, the i64 boundaries, a zero divisor, a negative shift count, and
+# operands that do not fit a word at all.
 #
 # WHY THIS IS RUN AND NOT CHECKED AT A LOWER LAYER: each of these now has TWO
 # implementations. The fast one is native i64 in the emitted code, guarded by a
@@ -37,6 +37,14 @@ def shr(a: int, b: int) -> int:
     return a >> b
 
 
+def neg(a: int) -> int:
+    return -a
+
+
+def inv(a: int) -> int:
+    return ~a
+
+
 def sweep(n: int) -> int:
     """Every pair in range, on the raw lane: `sweep` takes and returns an int,
     so it gets the unboxed clone and `i` is a machine word inside it."""
@@ -45,7 +53,7 @@ def sweep(n: int) -> int:
     while i <= n:
         if i != 0:
             total = total + (100 // i) + (100 % i) + (i // 7) + (i % 7)
-            total = total + (i & 255) + (i | 3) + (i ^ 9)
+            total = total + (i & 255) + (i | 3) + (i ^ 9) + (-i) + (~i)
             if i > 0:
                 total = total + (i >> 2) + ((i % 40) << 3)
         i = i + 1
@@ -79,6 +87,9 @@ print(shl(1, 64), shl(1, 200), shr(1, 64), shr(-1, 200), shl(12345, 0),
 print(12 & 10, -12 & 10, 12 & -10, -12 & -10, 0 & -1, HI & LO)
 print(12 | 10, -12 | 10, 12 | -10, -12 | -10, 0 | -1, HI | LO)
 print(12 ^ 10, -12 ^ 10, 12 ^ -10, -12 ^ -10, 0 ^ -1, HI ^ LO)
+print(-7, ~7, -(-7), ~(-7), -0, ~0, -1, ~1)
+print(neg(LO), inv(LO), neg(HI), inv(HI), neg(0), inv(0))
+print(-a, ~a, -(~a), ~(-a))
 print(sweep(60))
 
 # bool keeps its class through `&`, `|` and `^`, and loses it through the rest.
@@ -87,7 +98,7 @@ print(True & True, True | False, True ^ True, True // True, True % True,
 
 # Operands no word can hold: the guard has to send these to the bignum.
 BIG = 1 << 100
-print(BIG % 7, -BIG // 7, BIG >> 90, (BIG + 1) & 255)
+print(BIG % 7, -BIG // 7, BIG >> 90, (BIG + 1) & 255, -BIG, ~BIG, -LO, ~LO)
 print((1 << 62) * 4 // 3)
 
 try:

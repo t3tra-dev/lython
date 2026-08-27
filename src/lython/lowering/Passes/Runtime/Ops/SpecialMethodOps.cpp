@@ -2342,6 +2342,26 @@ RuntimeBundleLowerer::lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
       return mlir::success();
     }
   }
+  // `-x`, `~x` and `abs(x)` on a value that still has its machine word are the
+  // three that would otherwise put a manifest call in the middle of an
+  // otherwise-unboxed function -- and one such call is enough to cost the
+  // function its clone, because a clone that allocates cannot be speculated on.
+  if (primitiveI64UnarySpecialSupported(methodName)) {
+    llvm::SmallVector<mlir::Value, 1> inputs{input};
+    llvm::SmallVector<const RuntimeBundle *, 1> sources;
+    if (mlir::failed(collectObjectSources(
+            op, inputs, "unary special method operand needs a runtime bundle",
+            sources)))
+      return mlir::failure();
+    if (sources.size() == 1 &&
+        RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[0])) {
+      if (mlir::failed(RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
+              op, methodName, sources, resultValue)))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
   return RuntimeBundleLowerer::lowerReceiverMethodResult(
       op, input, resultValue, "unary special method operand", methodName,
       /*preferManifestObjectResult=*/true);

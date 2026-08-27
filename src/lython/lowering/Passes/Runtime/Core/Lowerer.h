@@ -1619,6 +1619,10 @@ private:
                                          mlir::Value rhs,
                                          llvm::StringRef methodName,
                                          mlir::Value resultValue);
+  static bool primitiveI64UnarySpecialSupported(llvm::StringRef methodName);
+  mlir::FailureOr<RuntimePrimitiveI64Evidence> emitPrimitiveI64UnaryEvidence(
+      mlir::Operation *op, llvm::StringRef methodName,
+      const RuntimePrimitiveI64Evidence &operand);
   mlir::LogicalResult lowerPrimitiveI64BinarySpecial(
       mlir::Operation *op, llvm::StringRef methodName,
       llvm::ArrayRef<const RuntimeBundle *> sources, mlir::Value resultValue);

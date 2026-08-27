@@ -54,6 +54,61 @@ primitiveI64ArithmeticKind(llvm::StringRef methodName) {
 // is `1`), and this path only produces `builtins.int`. Asked here rather than
 // in the builder because the routing decision is made before a result contract
 // exists.
+enum class PrimitiveI64UnaryKind { Neg, Invert, Abs };
+
+std::optional<PrimitiveI64UnaryKind>
+primitiveI64UnaryKind(llvm::StringRef methodName) {
+  return llvm::StringSwitch<std::optional<PrimitiveI64UnaryKind>>(methodName)
+      .Case("__neg__", PrimitiveI64UnaryKind::Neg)
+      .Case("__invert__", PrimitiveI64UnaryKind::Invert)
+      .Case("__abs__", PrimitiveI64UnaryKind::Abs)
+      .Default(std::nullopt);
+}
+
+// All three answer `builtins.int` for a bool operand too (`-True` is -1,
+// `~True` is -2, `abs(True)` is 1), so unlike `&` there is nothing to exclude.
+std::pair<mlir::Value, mlir::Value>
+buildPrimitiveI64Unary(mlir::OpBuilder &builder, mlir::Location loc,
+                       PrimitiveI64UnaryKind kind, mlir::Value operand) {
+  mlir::Value zero = constantI64(builder, loc, 0);
+  mlir::Value intMin =
+      constantI64(builder, loc, std::numeric_limits<std::int64_t>::min());
+  // The one operand a word cannot negate: -(-2**63) needs a bit the word does
+  // not have, and Python's answer is the bignum 2**63.
+  auto negatesOutOfRange = [&] {
+    return mlir::arith::CmpIOp::create(builder, loc,
+                                       mlir::arith::CmpIPredicate::eq, operand,
+                                       intMin)
+        .getResult();
+  };
+  switch (kind) {
+  case PrimitiveI64UnaryKind::Neg:
+    return {mlir::arith::SubIOp::create(builder, loc, zero, operand).getResult(),
+            negatesOutOfRange()};
+  case PrimitiveI64UnaryKind::Invert:
+    // `~x` is `-x - 1` and stays inside the word for every operand it has:
+    // `~(-2**63)` is `2**63 - 1` and `~(2**63 - 1)` is `-2**63`.
+    return {mlir::arith::XOrIOp::create(builder, loc, operand,
+                                        constantI64(builder, loc, -1))
+                .getResult(),
+            constantBool(builder, loc, false)};
+  case PrimitiveI64UnaryKind::Abs: {
+    mlir::Value negated =
+        mlir::arith::SubIOp::create(builder, loc, zero, operand).getResult();
+    mlir::Value isNegative =
+        mlir::arith::CmpIOp::create(builder, loc,
+                                    mlir::arith::CmpIPredicate::slt, operand,
+                                    zero)
+            .getResult();
+    return {mlir::arith::SelectOp::create(builder, loc, isNegative, negated,
+                                          operand)
+                .getResult(),
+            negatesOutOfRange()};
+  }
+  }
+  llvm_unreachable("unknown primitive i64 unary kind");
+}
+
 bool primitiveI64ArithmeticKeepsBool(PrimitiveI64ArithmeticKind kind) {
   return kind == PrimitiveI64ArithmeticKind::And ||
          kind == PrimitiveI64ArithmeticKind::Or ||
@@ -251,6 +306,27 @@ buildPrimitiveI64Arithmetic(mlir::OpBuilder &builder, mlir::Location loc,
 
 } // namespace
 
+bool RuntimeBundleLowerer::primitiveI64UnarySpecialSupported(
+    llvm::StringRef methodName) {
+  return primitiveI64UnaryKind(methodName).has_value();
+}
+
+mlir::FailureOr<RuntimePrimitiveI64Evidence>
+RuntimeBundleLowerer::emitPrimitiveI64UnaryEvidence(
+    mlir::Operation *op, llvm::StringRef methodName,
+    const RuntimePrimitiveI64Evidence &operand) {
+  std::optional<PrimitiveI64UnaryKind> kind = primitiveI64UnaryKind(methodName);
+  if (!kind)
+    return op->emitError() << "unsupported primitive i64 unary method "
+                           << methodName;
+  mlir::Location loc = op->getLoc();
+  auto [rawResult, overflow] =
+      buildPrimitiveI64Unary(builder, loc, *kind, operand.value);
+  return RuntimePrimitiveI64Evidence{
+      rawResult, logicalAnd(builder, loc, operand.valid,
+                            logicalNot(builder, loc, overflow))};
+}
+
 mlir::FailureOr<RuntimePrimitiveI64Evidence>
 RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
     mlir::Operation *op, llvm::StringRef methodName,
@@ -274,32 +350,45 @@ RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
 mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     mlir::Operation *op, llvm::StringRef methodName,
     llvm::ArrayRef<const RuntimeBundle *> sources, mlir::Value resultValue) {
-  if (sources.size() != 2 ||
-      !RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[0]) ||
-      !RuntimeBundleLowerer::hasPrimitiveI64Evidence(sources[1]))
+  // One source is a unary operator (`-x`, `~x`, `abs(x)`), two a binary one;
+  // everything from the fallback onwards reads `sources` and needs neither to
+  // know which.
+  if (sources.empty() || sources.size() > 2 ||
+      !llvm::all_of(sources, [this](const RuntimeBundle *source) {
+        return RuntimeBundleLowerer::hasPrimitiveI64Evidence(source);
+      }))
     return op->emitError()
-           << "primitive i64 lowering requires two int operands with evidence";
+           << "primitive i64 lowering requires one or two int operands with "
+              "evidence";
 
+  std::optional<PrimitiveI64UnaryKind> unary =
+      sources.size() == 1 ? primitiveI64UnaryKind(methodName) : std::nullopt;
   std::optional<PrimitiveI64ArithmeticKind> arithmetic =
-      primitiveI64ArithmeticKind(methodName);
+      sources.size() == 2 ? primitiveI64ArithmeticKind(methodName)
+                          : std::nullopt;
   std::optional<mlir::arith::CmpIPredicate> compare =
-      primitiveI64ComparePredicate(methodName);
-  if (!arithmetic && !compare)
+      sources.size() == 2 ? primitiveI64ComparePredicate(methodName)
+                          : std::nullopt;
+  if (!unary && !arithmetic && !compare)
     return op->emitError() << "unsupported primitive i64 special method "
                            << methodName;
 
   builder.setInsertionPoint(op);
   mlir::Location loc = op->getLoc();
   const RuntimePrimitiveI64Evidence &lhs = *sources[0]->primitiveI64;
-  const RuntimePrimitiveI64Evidence &rhs = *sources[1]->primitiveI64;
-  mlir::Value operandsValid = logicalAnd(builder, loc, lhs.valid, rhs.valid);
+  mlir::Value operandsValid =
+      sources.size() == 2
+          ? logicalAnd(builder, loc, lhs.valid, sources[1]->primitiveI64->valid)
+          : lhs.valid;
 
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(
           op->getParentOfType<mlir::func::FuncOp>())) {
-    if (arithmetic) {
+    if (unary || arithmetic) {
       mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
-          RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
-              op, methodName, lhs, rhs);
+          unary ? RuntimeBundleLowerer::emitPrimitiveI64UnaryEvidence(
+                      op, methodName, lhs)
+                : RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
+                      op, methodName, lhs, *sources[1]->primitiveI64);
       if (mlir::failed(fastEvidence))
         return mlir::failure();
       RuntimeBundle result;
@@ -311,8 +400,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
       return mlir::success();
     }
 
-    mlir::Value compared = mlir::arith::CmpIOp::create(builder, loc, *compare,
-                                                       lhs.value, rhs.value)
+    mlir::Value compared = mlir::arith::CmpIOp::create(
+                               builder, loc, *compare, lhs.value,
+                               sources[1]->primitiveI64->value)
                                .getResult();
     mlir::Value fastResult = compared;
     if (!isPinnedTrueFlag(operandsValid)) {
@@ -352,7 +442,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   if (resultContract.empty())
     return op->emitError() << "primitive i64 " << methodName
                            << " result needs a concrete runtime contract";
-  if (arithmetic && resultContract != "builtins.int")
+  if ((unary || arithmetic) && resultContract != "builtins.int")
     return op->emitError() << "primitive i64 arithmetic " << methodName
                            << " must produce builtins.int, got "
                            << resultContract;
@@ -425,10 +515,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     return mlir::success();
   };
 
-  if (arithmetic) {
+  if (unary || arithmetic) {
     mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
-        RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
-            op, methodName, lhs, rhs);
+        unary ? RuntimeBundleLowerer::emitPrimitiveI64UnaryEvidence(
+                    op, methodName, lhs)
+              : RuntimeBundleLowerer::emitPrimitiveI64ArithmeticEvidence(
+                    op, methodName, lhs, *sources[1]->primitiveI64);
     if (mlir::failed(fastEvidence))
       return mlir::failure();
     mlir::Value rawResult = fastEvidence->value;
@@ -464,7 +556,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     return op->emitError() << "primitive i64 comparison " << methodName
                            << " expects a single i1 bool ABI result";
   mlir::Value fastResult =
-      mlir::arith::CmpIOp::create(builder, loc, *compare, lhs.value, rhs.value)
+      mlir::arith::CmpIOp::create(builder, loc, *compare, lhs.value,
+                                  sources[1]->primitiveI64->value)
           .getResult();
   if (isPinnedTrueFlag(operandsValid)) {
     RuntimeBundle result;
