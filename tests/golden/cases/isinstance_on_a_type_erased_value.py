@@ -124,3 +124,27 @@ def message(e: Exception) -> str:
 
 
 sys.stdout.write(message(MyErr("passed")) + " " + message(ValueError("v")) + "\n")
+
+
+# The proof carried by `and`, which is how `__eq__` is spelled. The right
+# operand runs only where the left one holds, so the value it reads is the
+# narrowed one -- binding the NAME without the VALUE left the attribute read
+# looking at an `object`.
+class Point:
+    x: int
+    y: int
+
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Point) and other.x == self.x and other.y == self.y
+
+
+sys.stdout.write(
+    str(Point(1, 2) == Point(1, 2))
+    + " " + str(Point(1, 2) == Point(1, 3))
+    + " " + str(Point(1, 2) == "not a point")
+    + "\n"
+)

@@ -453,8 +453,20 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       // itself as absent.
       llvm::SmallVector<std::optional<BranchTypeNarrowing>, 4> proven;
       bool allBool = true;
-      for (const parser::NodePtr &operand : *operandNodes) {
-        if (!operand || !boolTyped(operand.get()))
+      // ⛔ AN OPERAND THAT DECIDES THE RESULT ENDS THE CHAIN, and the operands
+      // after it are not emitted at all. They are unreachable, but the emitter
+      // still had to TYPE them, and the proof that made the decision is the
+      // same one they were written under:
+      //
+      //     P(1) == "s"    # __eq__: isinstance(other, P) and other.x == ...
+      //
+      // inlines with `other` a str, so the test is statically false and
+      // `other.x` was emitted against a string -- "attr.get object type has no
+      // class schema", for a comparison CPython answers False.
+      unsigned operandCount = static_cast<unsigned>(operandNodes->size());
+      for (unsigned index = 0; index < operandCount; ++index) {
+        const parser::Node *operand = (*operandNodes)[index].get();
+        if (!operand || !boolTyped(operand))
           allBool = false;
         std::optional<BranchTypeNarrowing> narrowing =
             operand ? optionalBranchTypeNarrowing(*operand, types, module)
@@ -470,6 +482,15 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
           }
         }
         proven.push_back(std::move(narrowing));
+        std::optional<bool> decided =
+            operand ? optionalStaticBranchTruth(*operand, types, module)
+                    : std::nullopt;
+        // Only where the whole chain is bool-typed: the general path below
+        // takes the operand vector itself and cannot be handed a prefix.
+        if (allBool && decided && *decided == isOr) {
+          operandCount = index + 1;
+          break;
+        }
       }
       // The VALUE half, emitted where the proof holds: an unwrap at the top of
       // the block that only runs when the earlier operands decided that way.
@@ -478,10 +499,29 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
           return;
         const BranchTypeNarrowing &narrowing = *proven[index];
         auto found = values.find(narrowing.name);
-        if (found == values.end() ||
-            !mlir::isa<py::UnionType>(found->second.value.getType()) ||
-            !mlir::cast<py::UnionType>(found->second.value.getType())
-                 .hasMember(narrowing.trueType))
+        if (found == values.end())
+          return;
+        mlir::Type held = found->second.value.getType();
+        // ⛔ A CLASS TEST NARROWS HERE TOO, and only the union half was
+        // written. `isinstance(other, V) and other.x == self.x` -- which is how
+        // `__eq__` is spelled -- bound the NAME to `V` and left the VALUE an
+        // `object`, so the attribute read that the proof exists for failed with
+        // "attr.get object type has no class schema".
+        if (mlir::isa<py::ContractType>(held) &&
+            mlir::isa<py::ContractType>(narrowing.trueType) &&
+            held != narrowing.trueType &&
+            (py::isAssignableTo(narrowing.trueType, held, module) ||
+             declaredSubclassOfType(narrowing.trueType, held, types) ||
+             mlir::cast<py::ContractType>(held).getContractName() ==
+                 "builtins.object")) {
+          restoreValues.push_back({narrowing.name, found->second});
+          auto refine = py::ClassRefineOp::create(
+              builder, loc(*expr), narrowing.trueType, found->second.value);
+          found->second = Value{refine.getResult(), narrowing.trueType};
+          return;
+        }
+        if (!mlir::isa<py::UnionType>(held) ||
+            !mlir::cast<py::UnionType>(held).hasMember(narrowing.trueType))
           return;
         restoreValues.push_back({narrowing.name, found->second});
         auto unwrap = py::UnionUnwrapOp::create(
@@ -496,7 +536,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       if (allBool) {
         mlir::Value accumulated =
             emitBoolValue(emitExpr(operandNodes->front().get()), *expr);
-        for (unsigned index = 1; index < operandNodes->size(); ++index) {
+        for (unsigned index = 1; index < operandCount; ++index) {
           mlir::Block *origin = builder.getInsertionBlock();
           mlir::Region *region = origin->getParent();
           mlir::Block *evalBlock =
