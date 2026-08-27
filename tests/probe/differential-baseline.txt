@@ -300,6 +300,7 @@ wb_generator_object_argument_leak.py AGREE
 wb_generator_resume_raise_unwind.py AGREE
 wb_global_shadows_stdlib_local.py AGREE
 wb_grid_leftovers_2026_08_16.py AGREE
+wb_inlined_method_traceback_frame.py BOTH-FAIL
 wb_int_module_global_bigint.py SKIP
 wb_loopelse_only_write_lost.py AGREE
 wb_manifest_class_inherits_nothing.py AGREE
@@ -359,6 +360,7 @@ wb_param_store_tuple.py AGREE
 wb_param_store_twofloat.py AGREE
 wb_param_store_twolevel_float.py AGREE
 wb_range_elem_into_list_literal.py AGREE
+wb_rebound_call_result_two_diamonds.py GAP
 wb_reverse_two_carried_optionals.py AGREE
 wb_small_int_set_iteration_order.py AGREE
 wb_source_generator_non_int_yield.py AGREE

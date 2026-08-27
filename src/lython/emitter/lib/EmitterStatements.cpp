@@ -469,7 +469,49 @@ void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
   }
 }
 
+// The call CPython draws no anchors under: the whole right side of `return
+// f(...)` where `f` is a plain name, or of `x = <any call>`. CPython's
+// `_should_show_carets` parses the source line back and refuses those two
+// statement shapes by hand, on the grounds that the underline would repeat what
+// the line already says. Anything else -- `return [f()][0]`, `f()` alone,
+// `x.y = f()`, `x: T = f()` -- keeps its anchors.
+//
+// ⛔ THE CALLEE IS CHECKED FOR `Return` AND NOT FOR `Assign`, WHICH IS NOT A
+// TYPO: CPython's `case ast.Return(value=ast.Call())` arm guards on
+// `isinstance(statement.value.func, ast.Name)` and its `ast.Assign` arm guards
+// only on the target. So `return b.method()` shows anchors and `y =
+// b.method()` does not, and a differential against 3.14 catches the difference.
+static const parser::Node *anchorlessCallOf(const parser::Node &statement) {
+  const parser::Node *value = nullptr;
+  bool calleeMustBeName = false;
+  if (statement.kind == "Return") {
+    value = ast::node(statement, "value");
+    calleeMustBeName = true;
+  } else if (statement.kind == "Assign") {
+    const auto *targets = ast::nodeList(statement, "targets");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name")
+      return nullptr;
+    value = ast::node(statement, "value");
+  }
+  if (!value || value->kind != "Call")
+    return nullptr;
+  if (calleeMustBeName) {
+    const parser::Node *callee = ast::node(*value, "func");
+    if (!callee || callee->kind != "Name")
+      return nullptr;
+  }
+  return value;
+}
+
 void ModuleEmitter::emitStatement(const parser::Node &statement) {
+  // ⛔ SAVED AND RESTORED RATHER THAN JUST ASSIGNED. A call the emitter inlines
+  // emits the callee's statements in the middle of the caller's expression, and
+  // each of those would leave its own answer behind -- so by the time the outer
+  // call op is built and asks `loc` for its location, the flag would be the
+  // last inlined statement's.
+  llvm::SaveAndRestore<const parser::Node *> anchorless(
+      anchorlessCall, anchorlessCallOf(statement));
   if (statement.kind == "Expr") {
     emitExpr(ast::node(statement, "value"));
   } else if (statement.kind == "Import") {

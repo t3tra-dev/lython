@@ -33,6 +33,9 @@ module attributes {
     "_traceback.frame_file",
     "_traceback.frame_name",
     "_traceback.frame_line",
+    "_traceback.frame_col",
+    "_traceback.frame_end_col",
+    "_traceback.frame_marker",
     "_traceback.exc_line"
   ],
   ly.typing.function_names = [
@@ -40,12 +43,18 @@ module attributes {
     "_traceback.frame_file",
     "_traceback.frame_name",
     "_traceback.frame_line",
+    "_traceback.frame_col",
+    "_traceback.frame_end_col",
+    "_traceback.frame_marker",
     "_traceback.exc_line"
   ],
   ly.typing.function_contracts = [
     !py.callable<[], arg_names = [], arg_defaults = [], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.str">]>,
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.str">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[], arg_names = [], arg_defaults = [], returns = [!py.contract<"builtins.str">]>
   ]
@@ -55,6 +64,9 @@ module attributes {
 
   func.func private @LyTraceback_FrameCount() -> i64
   func.func private @LyTraceback_FrameLine(i64) -> i64
+  func.func private @LyTraceback_FrameCol(i64) -> i64
+  func.func private @LyTraceback_FrameEndCol(i64) -> i64
+  func.func private @LyTraceback_FrameMarker(i64) -> i64
   func.func private @LyTraceback_FrameFileLen(i64) -> i64
   func.func private @LyTraceback_FrameNameLen(i64) -> i64
   func.func private @LyTraceback_FrameFileCopy(i64, memref<?xi8>, i64)
@@ -109,5 +121,23 @@ module attributes {
     %header, %bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyTracebackMod_FrameCol(%index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.frame_col", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_frame_col", ly.runtime.result_contract = "builtins.int"} {
+    %word = func.call @LyTraceback_FrameCol(%index) : (i64) -> i64
+    %h = func.call @LyLong_FromI64(%word) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
+  }
+
+  func.func @LyTracebackMod_FrameEndCol(%index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.frame_end_col", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_frame_end_col", ly.runtime.result_contract = "builtins.int"} {
+    %word = func.call @LyTraceback_FrameEndCol(%index) : (i64) -> i64
+    %h = func.call @LyLong_FromI64(%word) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
+  }
+
+  func.func @LyTracebackMod_FrameMarker(%index: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.frame_marker", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_frame_marker", ly.runtime.result_contract = "builtins.int"} {
+    %word = func.call @LyTraceback_FrameMarker(%index) : (i64) -> i64
+    %h = func.call @LyLong_FromI64(%word) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
   }
 }

@@ -13,9 +13,13 @@
 # saw. Only the directory goes; the rest of the line is what the module wrote.
 #
 # ⛔ CPython 3.14 draws a `~~~^^^` anchor line under the failing sub-expression
-# of a frame whose statement has one. Those come from the column range, which
-# the uncaught printer draws and the module cannot reach; the deviation is
-# recorded in lib/traceback.py.
+# of SOME frames and not others, and both sides are here: a frame whose whole
+# statement is `return f(...)` or `x = f(...)` gets none, because repeating the
+# line under itself says nothing, and every other statement gets one. The rule
+# is CPython's `_should_show_carets`, which reads the statement's AST; there is
+# no AST at runtime, so the emitter decides it and the decision rides in the
+# recorded frame. Getting it backwards is a traceback that still reads
+# plausibly, which is why the text is compared and not the flag.
 import os
 import sys
 import traceback
@@ -63,3 +67,19 @@ except BaseException as e:
 
 sys.stdout.write("--- outside ---\n")
 sys.stdout.write(traceback.format_exc())
+
+
+def helper(n: int) -> int:
+    return 100 // n
+
+
+def mixed(n: int) -> int:
+    return helper(n) + 1
+
+
+try:
+    mixed(0)
+except ZeroDivisionError as e:
+    sys.stdout.write("--- anchors kept ---\n")
+    for line in traceback.format_exception(e):
+        sys.stdout.write(strip_dir(line))

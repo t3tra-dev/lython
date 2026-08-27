@@ -224,6 +224,9 @@ mlir::Location ModuleEmitter::loc(const parser::Node &node) const {
   rangeAttrs.push_back(attrBuilder.getNamedAttr(
       "ly.source.end_col",
       attrBuilder.getI32IntegerAttr(node.range.end.column)));
+  if (anchorlessCall == &node)
+    rangeAttrs.push_back(attrBuilder.getNamedAttr("ly.source.no_anchor",
+                                                  attrBuilder.getUnitAttr()));
   return mlir::FusedLoc::get(&context, {start},
                              attrBuilder.getDictionaryAttr(rangeAttrs));
 }

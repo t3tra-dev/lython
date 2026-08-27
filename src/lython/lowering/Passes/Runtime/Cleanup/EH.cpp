@@ -201,7 +201,7 @@ llvm::FunctionCallee tracebackPushCStringRange(llvm::Module &module) {
   llvm::Type *ptr = llvm::PointerType::getUnqual(context);
   llvm::Type *i32 = llvm::Type::getInt32Ty(context);
   llvm::FunctionType *type = llvm::FunctionType::get(
-      llvm::Type::getVoidTy(context), {ptr, ptr, i32, i32, i32, i32},
+      llvm::Type::getVoidTy(context), {ptr, ptr, i32, i32, i32, i32, i32},
       /*isVarArg=*/false);
   return module.getOrInsertFunction("LyTraceback_PushCStringRange", type);
 }
@@ -286,13 +286,19 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
       site ? site->column : static_cast<std::int32_t>(debugLoc.getColumn());
   std::int32_t endLine = site ? site->endLine : line;
   std::int32_t endColumn = site ? site->endColumn : 0;
+  // ⛔ No site means no range: `endColumn` above is 0, and carets drawn from a
+  // range that was never recorded would underline something the program does
+  // not say. A frame without one prints its source line alone, as CPython's
+  // does for a frame whose positions it lacks.
+  std::int32_t marker = site && !site->noAnchor ? 1 : 0;
 
   llvm::Value *file = globalCStringPtr(builder, fileName, "py.tb.file");
   llvm::Value *name = globalCStringPtr(builder, functionName, "py.tb.func");
   builder.CreateCall(
       tracebackPushCStringRange(module),
       {file, name, i32Constant(builder, line), i32Constant(builder, column),
-       i32Constant(builder, endLine), i32Constant(builder, endColumn)});
+       i32Constant(builder, endLine), i32Constant(builder, endColumn),
+       i32Constant(builder, marker)});
 }
 
 void buildPythonCleanupBlock(llvm::CallInst &call, llvm::BasicBlock *unwindDest,
@@ -806,6 +812,7 @@ void collectPythonCallSiteRanges(
     site.column = source->column;
     site.endLine = source->endLine;
     site.endColumn = source->endColumn;
+    site.noAnchor = source->noAnchor;
     callSites.push_back(std::move(site));
   });
 }

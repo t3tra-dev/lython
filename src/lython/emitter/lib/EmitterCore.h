@@ -953,6 +953,17 @@ private:
   // the emitted symbol keeps the two entities distinguishable at the only
   // layer that can tell them apart -- the one that knows which is which.
   llvm::StringMap<std::string> shadowedBuiltinSymbols;
+  // The call whose traceback frame must draw no `~~~^^^` underline, recognized
+  // while its statement is emitted and read back by `loc`.
+  //
+  // ⛔ TRAVELS IN THE LOCATION, NOT IN AN ATTRIBUTE ON THE CALL. The frame is
+  // pushed by installPythonExceptionCleanupFrames, which runs on LLVM IR after
+  // every py op is gone; a location survives that far and an op attribute does
+  // not. It is decided HERE rather than re-derived from the source text at
+  // runtime because CPython decides it from the statement's AST -- `return
+  // f(x)` and `y = f(x)` show no anchors, `return [f(x)][0]` does -- and the
+  // AST exists only in this frame.
+  const parser::Node *anchorlessCall = nullptr;
   // Solved type arguments per specialized class contract, in parameter order.
   llvm::StringMap<llvm::SmallVector<std::pair<std::string, mlir::Type>, 4>>
       classTypeArguments;

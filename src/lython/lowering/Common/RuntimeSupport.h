@@ -90,6 +90,7 @@ struct PythonCallSiteRange {
   std::int32_t column = 0;
   std::int32_t endLine = 0;
   std::int32_t endColumn = 0;
+  bool noAnchor = false;
 };
 
 void collectPythonCallSiteRanges(

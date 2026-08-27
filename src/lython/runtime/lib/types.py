@@ -17,7 +17,9 @@ Deviations from CPython:
   `f_locals` and `f_trace` are the interpreter's frame chain and namespaces;
   the traceback's frames are recorded at raise sites, so there is no live frame
   object behind them to expose.
-- `tb_lasti` is always -1. It is a bytecode offset, and there is none.
+- `tb_lasti` is always -1. It is a bytecode offset, and there is none; the
+  column range it would index into `co_positions()` is carried by the link
+  itself instead.
 - None of the three is constructible from CPython in the general case either
   (`CodeType` needs 18 arguments); they are written with `__init__` here
   because the traceback builder is Python.
@@ -52,16 +54,32 @@ class FrameType:
 
 
 class TracebackType:
-    """A link of the traceback chain, oldest frame first (CPython's order)."""
+    """A link of the traceback chain, oldest frame first (CPython's order).
+
+    ⛔ `tb_colno` / `tb_end_colno` / `tb_marker` ARE THIS LINK'S OWN, and CPython
+    has no such attributes. It reaches the same numbers through
+    `tb_frame.f_code.co_positions()[tb_lasti]` -- the code object's position
+    table, indexed by the bytecode offset that failed. There is neither here, and
+    a recorded frame IS one position, so the link carries it. `tb_marker` is the
+    anchor mode the runtime recorded: 0 draws nothing, 1 applies the call /
+    operator heuristics, 2 renders the plain range.
+    """
 
     tb_next: Optional["TracebackType"]
     tb_frame: FrameType
     tb_lasti: int
     tb_lineno: int
+    tb_colno: int
+    tb_end_colno: int
+    tb_marker: int
 
     def __init__(self, tb_next: Optional["TracebackType"], tb_frame: FrameType,
-                 tb_lasti: int, tb_lineno: int) -> None:
+                 tb_lasti: int, tb_lineno: int, tb_colno: int = 0,
+                 tb_end_colno: int = 0, tb_marker: int = 0) -> None:
         self.tb_next = tb_next
         self.tb_frame = tb_frame
         self.tb_lasti = tb_lasti
         self.tb_lineno = tb_lineno
+        self.tb_colno = tb_colno
+        self.tb_end_colno = tb_end_colno
+        self.tb_marker = tb_marker

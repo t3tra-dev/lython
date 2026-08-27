@@ -24,10 +24,16 @@ Deviations from CPython:
   `__context__` display are not provided. The chain is recorded and the
   uncaught printer walks it; reaching it as a VALUE needs `e.__cause__`, which
   is still refused.
-- `FrameSummary` carries `filename`, `lineno`, `name` and `line`. CPython's also
-  carries `locals` and the column range that draws `~~~^^^` anchors; the anchors
-  are drawn by the uncaught printer, which reads the same stack, and are not
-  reachable from here.
+- `FrameSummary` carries `filename`, `lineno`, `name`, `line` and the column
+  range CPython's `colno` / `end_colno` carry. It does not carry `locals`.
+  `line` is stripped and `_original_line` is not, as in CPython, but both are
+  plain fields rather than properties over a `_lines` pair.
+- WHETHER a frame gets a `~~~^^^` line is decided at COMPILE time, not here.
+  CPython's `_should_show_carets` parses the source line back to ask whether the
+  statement is `return f(...)` or `x = f(...)`, which it draws nothing under;
+  `ast` is not reachable from a compiled program, and the emitter has the tree
+  anyway, so it answers there and the answer arrives as `tb_marker`. WHERE the
+  carets go is decided here, by `_anchors`, from the text.
 - `StackSummary` is a class holding a list rather than a `list` subclass.
 
 ⛔ THE ANNOTATIONS NAME `types.TracebackType`, NOT A RE-EXPORTED `TracebackType`.
@@ -51,7 +57,9 @@ import types
 
 
 def _read_source_line(filename: str, lineno: int) -> str:
-    """The `lineno`-th line of `filename`, stripped, or '' if unreadable.
+    """The `lineno`-th line of `filename` with its trailing newline removed, or
+    '' if unreadable. The LEADING whitespace stays: the recorded columns are
+    absolute, so the anchor line needs to know how much the display strips.
 
     ⛔ The file is checked for BEFORE it is opened rather than opened inside a
     `try`: a name bound in a try body does not escape the statement here, so the
@@ -73,7 +81,7 @@ def _read_source_line(filename: str, lineno: int) -> str:
             found = line
             break
     handle.close()
-    return found.strip()
+    return found.rstrip()
 
 
 def _current_tb() -> Optional[types.TracebackType]:
@@ -91,9 +99,137 @@ def _current_tb() -> Optional[types.TracebackType]:
         code = types.CodeType(_traceback.frame_file(i),
                               _traceback.frame_name(i), line)
         built = types.TracebackType(built, types.FrameType(code, line), -1,
-                                    line)
+                                    line, _traceback.frame_col(i),
+                                    _traceback.frame_end_col(i),
+                                    _traceback.frame_marker(i))
         i += 1
     return built
+
+
+def _is_operator_char(ch: str) -> bool:
+    return (ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%"
+            or ch == "@" or ch == "&" or ch == "|" or ch == "^" or ch == "<"
+            or ch == ">")
+
+
+def _marker_start(line: str, col: int, length: int) -> int:
+    """Where the underline begins: the recorded column when it lands inside the
+    line, the first non-blank character otherwise.
+
+    ⛔ ITS OWN FUNCTION for the same reason `_marker_end` is, and a different
+    refusal: `start = col` inside the caller aliases a BORROWED parameter into a
+    local, which takes a borrow-to-own retain the caller then has to discharge,
+    and the walk reports "borrowed entry argument 1 reaches function exit with 1
+    retained ownership token(s)". Returned from a call the answer is the
+    frame's own from the start.
+    """
+    if col > 0 and col < length:
+        return col
+    found = 0
+    while found < length and (line[found] == " " or line[found] == "\t"):
+        found += 1
+    return found
+
+
+def _marker_end(length: int, start: int, col: int, end_col: int) -> int:
+    """Where the underline stops: the recorded end column when it is a usable
+    range end and lands inside the line, the end of the line otherwise, and one
+    character when the range is degenerate.
+
+    ⛔ WRITTEN AS ITS OWN FUNCTION so the caller binds the answer once. Computed
+    inline it is a name REBOUND by two sequential `if` chains whose first value
+    came from `len()` -- an owned call result -- and the release planner then
+    leaves that result unreleased on the paths where the second chain replaced
+    it: "owned resource from @LyLong_FromI64 result 0 reaches function exit
+    without release". tests/probe/wb_rebound_call_result_two_diamonds.py has the
+    shape on its own.
+    """
+    if end_col > col and end_col > 0:
+        usable = end_col
+        if usable > length:
+            usable = length
+        if usable > start:
+            return usable
+    elif length > start:
+        return length
+    if start + 1 > length:
+        return length
+    return start + 1
+
+
+def _anchors(line: str, col: int, end_col: int, mode: int) -> str:
+    """CPython's `~~~^^^` underline for the failing range of `line`.
+
+    `line` is the DISPLAYED line -- the source with its indentation removed --
+    and the columns have been shifted by that indentation, because the recorded
+    ones are absolute. Returns '' where CPython draws nothing.
+
+    ⭐ THE SAME HEURISTICS THE UNCAUGHT PRINTER USES, and deliberately the same
+    ones: `print_marker` in lowering/Common/TracebackSupportBuilder.cpp reads
+    this exact stack, and a traceback a program formats must not be able to
+    disagree with one the runtime prints. CPython derives the anchors from the
+    instruction that failed; there is no instruction here, so both read the
+    source text -- a call or subscript range splits at its first `(` or `[` and
+    renders `~~~^^^`, an operator range puts the carets over the operator run,
+    and a range with neither renders all carets unless it covers the whole line,
+    which is CPython's last `_should_show_carets` test written without an AST:
+    nothing before the range and nothing after it means the underline would say
+    only "all of it".
+
+    Whether a frame reaches this at all was already decided by the compiler; see
+    the module docstring.
+    """
+    length = len(line)
+    if length == 0:
+        return ""
+    start = _marker_start(line, col, length)
+    if start >= length:
+        return ""
+    marker_end = _marker_end(length, start, col, end_col)
+
+    caret_start = -1
+    caret_end = -1
+    if mode != 2:
+        split = start
+        while split < marker_end:
+            if line[split] == "(" or line[split] == "[":
+                caret_start = split
+                caret_end = marker_end
+                break
+            split += 1
+        if caret_start < 0:
+            op = start
+            while op < marker_end:
+                if _is_operator_char(line[op]):
+                    run = op + 1
+                    while run < marker_end and _is_operator_char(line[run]):
+                        run += 1
+                    caret_start = op
+                    caret_end = run
+                    break
+                op += 1
+    if caret_start < 0:
+        if start == 0 and marker_end >= length:
+            return ""
+        caret_start = start
+        caret_end = marker_end
+
+    out = ""
+    pad = 0
+    while pad < start:
+        if line[pad] == "\t":
+            out += "\t"
+        else:
+            out += " "
+        pad += 1
+    mark = start
+    while mark < marker_end:
+        if caret_start <= mark and mark < caret_end:
+            out += "^"
+        else:
+            out += "~"
+        mark += 1
+    return out
 
 
 class FrameSummary:
@@ -103,13 +239,25 @@ class FrameSummary:
     lineno: int
     name: str
     line: str
+    # The source line with its indentation still on, CPython's
+    # `_original_line`. `line` is what a reader wants and the anchors are
+    # measured against columns that count from the start of the real line, so
+    # the amount `line` dropped has to stay reachable.
+    _original_line: str
+    colno: int
+    end_colno: int
+    marker: int
 
-    def __init__(self, filename: str, lineno: int, name: str,
-                 line: str) -> None:
+    def __init__(self, filename: str, lineno: int, name: str, line: str,
+                 colno: int, end_colno: int, marker: int) -> None:
         self.filename = filename
         self.lineno = lineno
         self.name = name
-        self.line = line
+        self.line = line.strip()
+        self._original_line = line
+        self.colno = colno
+        self.end_colno = end_colno
+        self.marker = marker
 
     def __repr__(self) -> str:
         return ("<FrameSummary file " + self.filename + ", line "
@@ -130,7 +278,20 @@ class StackSummary:
             text = ('  File "' + frame.filename + '", line '
                     + str(frame.lineno) + ", in " + frame.name + "\n")
             if frame.line != "":
-                text += "    " + frame.line + "\n"
+                shown = frame.line
+                text += "    " + shown + "\n"
+                if frame.marker != 0:
+                    original = frame._original_line
+                    indent = len(original) - len(original.lstrip())
+                    col = frame.colno - indent
+                    end = frame.end_colno - indent
+                    if col < 0:
+                        col = 0
+                    if end < 0:
+                        end = 0
+                    anchors = _anchors(shown, col, end, frame.marker)
+                    if anchors != "":
+                        text += "    " + anchors + "\n"
             out.append(text)
         return out
 
@@ -148,7 +309,9 @@ def extract_tb(tb: Optional[types.TracebackType],
         frames.append(FrameSummary(code.co_filename, cur.tb_lineno,
                                    code.co_name,
                                    _read_source_line(code.co_filename,
-                                                     cur.tb_lineno)))
+                                                     cur.tb_lineno),
+                                   cur.tb_colno, cur.tb_end_colno,
+                                   cur.tb_marker))
         taken += 1
         cur = cur.tb_next
     return StackSummary(frames)

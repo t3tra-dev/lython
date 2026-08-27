@@ -16,6 +16,9 @@ struct PythonSourceRange {
   std::int32_t column = 0;
   std::int32_t endLine = 0;
   std::int32_t endColumn = 0;
+  // CPython draws no `~~~^^^` under this range; the emitter decided it from the
+  // statement's AST (EmitterStatements.cpp, `anchorlessCallOf`).
+  bool noAnchor = false;
 };
 
 inline std::optional<mlir::FileLineColLoc>
@@ -56,6 +59,7 @@ sourceRangeFromDict(mlir::DictionaryAttr dict) {
   range.column = *startCol;
   range.endLine = *endLine;
   range.endColumn = *endCol;
+  range.noAnchor = dict.get("ly.source.no_anchor") != nullptr;
   return range;
 }
 

@@ -407,13 +407,13 @@ void buildTracebackPush(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// LyTraceback_PushCStringRange(file, function, line, col, endCol, colValid):
-// C-string push carrying the caret range; marker flag set.
+// LyTraceback_PushCStringRange(file, function, line, col, endLine, endCol,
+// marker): C-string push carrying the caret range and the anchor mode.
 void buildTracebackPushCStringRange(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "LyTraceback_PushCStringRange",
       b.builder.getFunctionType(
-          {b.ptr(), b.ptr(), b.i32(), b.i32(), b.i32(), b.i32()}, {}));
+          {b.ptr(), b.ptr(), b.i32(), b.i32(), b.i32(), b.i32(), b.i32()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *push = b.builder.createBlock(&body);
@@ -437,7 +437,7 @@ void buildTracebackPushCStringRange(SupportBuilder &b) {
   emitFramePush(b, size, fileCopy, functionCopy,
                 {entry->getArgument(2), entry->getArgument(3),
                  entry->getArgument(4), entry->getArgument(5),
-                 b.iconst32(1)});
+                 entry->getArgument(6)});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(trap);
@@ -455,7 +455,8 @@ void buildTracebackPushCString(SupportBuilder &b) {
   b.call("LyTraceback_PushCStringRange", mlir::TypeRange{},
          mlir::ValueRange{entry->getArgument(0), entry->getArgument(1),
                           entry->getArgument(2), entry->getArgument(3),
-                          entry->getArgument(2), b.iconst32(0)});
+                          entry->getArgument(2), b.iconst32(0),
+                          b.iconst32(1)});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -542,11 +543,13 @@ void buildTracebackFrameCount(SupportBuilder &b) {
                                mlir::ValueRange{loadTracebackSize(b)});
 }
 
-// i64 LyTraceback_FrameLine(i64 index): the line the frame recorded, or 0 when
-// the index is out of range -- a reader that raced the stack gets a number, not
-// a wild read.
-void buildTracebackFrameLine(SupportBuilder &b) {
-  auto fn = b.beginFunction("LyTraceback_FrameLine",
+// i64 LyTraceback_Frame<Word>(i64 index): one of the frame's recorded i32 words
+// -- 2 the line, 3 the column, 5 the end column, 6 the anchor mode -- or 0 when
+// the index is out of range, so a reader that raced the stack gets a number
+// rather than a wild read.
+void buildTracebackFrameWord(SupportBuilder &b, llvm::StringRef symbol,
+                             std::int32_t field) {
+  auto fn = b.beginFunction(symbol,
                             b.builder.getFunctionType({b.i64()}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
@@ -564,13 +567,13 @@ void buildTracebackFrameLine(SupportBuilder &b) {
   mlir::Value frame =
       b.call("frame_at", b.ptr(), mlir::ValueRange{entry->getArgument(0)})
           .front();
-  mlir::Value line = mlir::LLVM::LoadOp::create(
+  mlir::Value word = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i32(),
-      b.frameField(tracebackFrameType(b), frame, 2), /*alignment=*/4);
+      b.frameField(tracebackFrameType(b), frame, field), /*alignment=*/4);
   mlir::func::ReturnOp::create(
       b.builder, b.loc,
       mlir::ValueRange{
-          mlir::arith::ExtSIOp::create(b.builder, b.loc, b.i64(), line)
+          mlir::arith::ExtSIOp::create(b.builder, b.loc, b.i64(), word)
               .getResult()});
 
   b.builder.setInsertionPointToEnd(none);
@@ -3361,7 +3364,10 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildTracebackPop(b);
   buildTracebackClear(b);
   buildTracebackFrameCount(b);
-  buildTracebackFrameLine(b);
+  buildTracebackFrameWord(b, "LyTraceback_FrameLine", 2);
+  buildTracebackFrameWord(b, "LyTraceback_FrameCol", 3);
+  buildTracebackFrameWord(b, "LyTraceback_FrameEndCol", 5);
+  buildTracebackFrameWord(b, "LyTraceback_FrameMarker", 6);
   buildTracebackFrameNameLen(b, "LyTraceback_FrameFileLen", 0);
   buildTracebackFrameNameLen(b, "LyTraceback_FrameNameLen", 1);
   buildTracebackFrameNameCopy(b, "LyTraceback_FrameFileCopy", 0);
