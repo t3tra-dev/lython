@@ -428,7 +428,7 @@ TEST(EmitterTest, AUserDefinedSetattrStillWins) {
 
 TEST(EmitterTest, TheExceptionChainAttributesAreRefusedWhereTheyAreWritten) {
   for (const char *attribute :
-       {"__cause__", "__context__", "__traceback__", "__suppress_context__"}) {
+       {"__cause__", "__context__", "__suppress_context__"}) {
     mlir::MLIRContext context(testRegistry());
     lython::emitter::EmitResult emitted =
         emitSource(std::string("try:\n"
@@ -444,6 +444,27 @@ TEST(EmitterTest, TheExceptionChainAttributesAreRefusedWhereTheyAreWritten) {
                            std::string::npos;
     EXPECT_TRUE(found) << attribute;
   }
+}
+
+// `__traceback__` left that group: its type is representable now and the
+// traceback module builds the chain, so the refusal is about the wiring and has
+// to say where the answer IS. A reader who follows the message finds a working
+// call; the old one said the type did not exist.
+TEST(EmitterTest, TheTracebackAttributeNamesWhatToWriteInstead) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted =
+      emitSource("try:\n"
+                 "    raise ValueError('v')\n"
+                 "except ValueError as e:\n"
+                 "    print(e.__traceback__)\n",
+                 context);
+  EXPECT_FALSE(emitted.ok());
+  bool found = false;
+  for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+    found = found ||
+            diagnostic.message.find("traceback.format_exception(e)") !=
+                std::string::npos;
+  EXPECT_TRUE(found);
 }
 
 TEST(EmitterTest, AnExceptionsArgsAndItsOwnFieldsStillRead) {

@@ -2079,11 +2079,32 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   // then failed in the lowering with "attr.get object type has no class
   // schema", which names nothing the reader wrote. The chain itself is real:
   // `raise X from e` records it and the traceback prints it. What is missing is
-  // a way to hand a chain node back as a VALUE -- `BaseException | None` is a
-  // union built at run time, which is a mechanism this compiler does not have,
-  // and __traceback__ has no representable type at all.
+  // a way to hand a chain NODE back as a value.
+  //
+  // ⛔ `__traceback__` is a separate question with its own answer, which is why
+  // it names one. Its type is representable now -- `types.TracebackType` is an
+  // ordinary class (runtime/lib/types.py) and a chain of them is built by
+  // `traceback._current_tb()` out of the frame stack the runtime records. What
+  // is missing is only the WIRING: this attribute would have to emit a call
+  // into a stdlib module, and a module reaches the emitter only when the
+  // program imports it, so an attribute cannot summon one. The message says
+  // what to write instead rather than what cannot be done.
+  if (*attr == "__traceback__")
+    if (!lookupClassField(object.type, *attr) &&
+        py::isAssignableTo(object.type,
+                           types.contract("builtins.BaseException"), module)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "'__traceback__' is not reachable as an attribute: the traceback is "
+          "built from the runtime's frame stack by the traceback module, so "
+          "write `traceback.format_exception(e)` for the formatted form or "
+          "`traceback._current_tb()` for the types.TracebackType chain (both "
+          "describe the exception being handled, which inside an `except` "
+          "block is this one)"});
+      return emitNone(expr);
+    }
   if (*attr == "__cause__" || *attr == "__context__" ||
-      *attr == "__traceback__" || *attr == "__suppress_context__")
+      *attr == "__suppress_context__")
     if (!lookupClassField(object.type, *attr) &&
         py::isAssignableTo(object.type,
                            types.contract("builtins.BaseException"), module)) {

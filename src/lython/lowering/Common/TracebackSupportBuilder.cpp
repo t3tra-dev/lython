@@ -39,6 +39,8 @@ mlir::Type tracebackStackType(SupportBuilder &b) {
 void declareTracebackSupport(SupportBuilder &b) {
   b.declareExternal("malloc",
                     b.builder.getFunctionType({b.i64()}, {b.ptr()}));
+  b.declareExternal("strlen",
+                    b.builder.getFunctionType({b.ptr()}, {b.i64()}));
   b.declareExternal("fopen", b.builder.getFunctionType({b.ptr(), b.ptr()},
                                                        {b.ptr()}));
   b.declareExternal("fgets", b.builder.getFunctionType(
@@ -522,6 +524,286 @@ constexpr std::int64_t kFrameBytes = 40;
 
 // void release_chain_node(ptr node): drop one reference; at zero, release the
 // chained nodes, the traceback snapshot, and the exception payload.
+// ---------------------------------------------------------------------------
+// Reading the frame stack back. The printer below walks it to write a
+// traceback; these let a PROGRAM walk it, which is what `e.__traceback__` and
+// `traceback.py` are built on. Names cross the boundary the way `sys.argv` does
+// -- a length call and a copy into a caller-provided buffer -- because the
+// stack owns its `char *` copies and a manifest cannot hold a raw pointer.
+// ---------------------------------------------------------------------------
+
+// i64 LyTraceback_FrameCount(): frames recorded for the in-flight exception.
+void buildTracebackFrameCount(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyTraceback_FrameCount",
+                            b.builder.getFunctionType({}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{loadTracebackSize(b)});
+}
+
+// i64 LyTraceback_FrameLine(i64 index): the line the frame recorded, or 0 when
+// the index is out of range -- a reader that raced the stack gets a number, not
+// a wild read.
+void buildTracebackFrameLine(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyTraceback_FrameLine",
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *read = b.builder.createBlock(&body);
+  mlir::Block *none = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value size = loadTracebackSize(b);
+  mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::ult,
+                               entry->getArgument(0), size);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, inRange, read,
+                                 mlir::ValueRange{}, none, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(read);
+  mlir::Value frame =
+      b.call("frame_at", b.ptr(), mlir::ValueRange{entry->getArgument(0)})
+          .front();
+  mlir::Value line = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i32(),
+      b.frameField(tracebackFrameType(b), frame, 2), /*alignment=*/4);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{
+          mlir::arith::ExtSIOp::create(b.builder, b.loc, b.i64(), line)
+              .getResult()});
+
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.iconst(0)});
+}
+
+// The frame's name pointer at `field` (0 = file, 1 = function), or the empty
+// answer when the index is out of range or the slot is null. `emitPresent`
+// writes the body for a name that is there; the two callers differ only in it.
+void emitFrameNameAccess(
+    SupportBuilder &b, mlir::func::FuncOp fn, mlir::Value index,
+    std::int32_t field,
+    llvm::function_ref<void(mlir::Value)> emitPresent,
+    llvm::function_ref<void()> emitAbsent) {
+  mlir::Region &body = fn.getBody();
+  mlir::Block *entry = &body.front();
+  mlir::Block *read = b.builder.createBlock(&body);
+  mlir::Block *present = b.builder.createBlock(&body);
+  mlir::Block *absent = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value size = loadTracebackSize(b);
+  mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::ult, index, size);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, inRange, read,
+                                 mlir::ValueRange{}, absent,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(read);
+  mlir::Value frame =
+      b.call("frame_at", b.ptr(), mlir::ValueRange{index}).front();
+  mlir::Value name =
+      b.loadPtrVal(b.frameField(tracebackFrameType(b), frame, field));
+  mlir::Value missing = b.ptrEq(name, b.nullPtr());
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, missing, absent,
+                                 mlir::ValueRange{}, present,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(present);
+  emitPresent(name);
+  b.builder.setInsertionPointToEnd(absent);
+  emitAbsent();
+}
+
+// i64 LyTraceback_FrameFileLen(i64) / LyTraceback_FrameNameLen(i64).
+void buildTracebackFrameNameLen(SupportBuilder &b, llvm::StringRef symbol,
+                                std::int32_t field) {
+  auto fn = b.beginFunction(symbol,
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  emitFrameNameAccess(
+      b, fn, entry->getArgument(0), field,
+      [&](mlir::Value name) {
+        mlir::Value length =
+            b.call("strlen", b.i64(), mlir::ValueRange{name}).front();
+        mlir::func::ReturnOp::create(b.builder, b.loc,
+                                     mlir::ValueRange{length});
+      },
+      [&] {
+        mlir::func::ReturnOp::create(b.builder, b.loc,
+                                     mlir::ValueRange{b.iconst(0)});
+      });
+}
+
+// void LyTraceback_FrameFileCopy(i64 index, memref<?xi8> dest, i64 len) at the
+// lowered ABI (index, alloc, aligned, offset, size, stride, len), and the same
+// for the function name.
+void buildTracebackFrameNameCopy(SupportBuilder &b, llvm::StringRef symbol,
+                                 std::int32_t field) {
+  auto fn = b.beginFunction(
+      symbol, b.builder.getFunctionType({b.i64(), b.ptr(), b.ptr(), b.i64(),
+                                         b.i64(), b.i64(), b.i64()},
+                                        {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  emitFrameNameAccess(
+      b, fn, entry->getArgument(0), field,
+      [&](mlir::Value name) {
+        mlir::Value dest =
+            b.gepI8(entry->getArgument(2), entry->getArgument(3));
+        mlir::LLVM::MemcpyOp::create(b.builder, b.loc, dest, name,
+                                     entry->getArgument(6),
+                                     /*isVolatile=*/false);
+        mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+      },
+      [&] {
+        mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+      });
+}
+
+// ptr exc_line_cstr(): a malloc'd "Label" or "Label: message" for the exception
+// being handled, or null when there is none. The label comes from the class id
+// the handler dispatches on and the message from the same re-encoder the
+// uncaught printer uses, so `traceback.format_exc()` and a traceback printed by
+// the runtime cannot word the last line differently.
+void buildExcLineCStr(SupportBuilder &b) {
+  auto fn = b.beginFunction("exc_line_cstr",
+                            b.builder.getFunctionType({}, {b.ptr()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *build = b.builder.createBlock(&body);
+  mlir::Block *none = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value pending = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
+      /*alignment=*/4);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, pending, build,
+                                 mlir::ValueRange{}, none, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{b.nullPtr()});
+
+  b.builder.setInsertionPointToEnd(build);
+  mlir::Value classId =
+      b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front();
+  mlir::Value label =
+      b.call("exception_class_name", b.ptr(), mlir::ValueRange{classId})
+          .front();
+  mlir::Value labelLen =
+      b.call("strlen", b.i64(), mlir::ValueRange{label}).front();
+  mlir::Value parts = b.addrOf("g_current_parts");
+  mlir::Value msgHeader = b.loadPtrVal(partsField(b, parts, 1, 1));
+  mlir::Value data = b.loadPtrVal(partsField(b, parts, 2, 1));
+  mlir::Value offset = b.loadI64(partsField(b, parts, 2, 2));
+  mlir::Value length = b.loadI64(partsField(b, parts, 2, 3));
+  mlir::Value stride = b.loadI64(partsField(b, parts, 2, 4));
+  mlir::Value message =
+      b.call("utf8_message_cstr", b.ptr(),
+             mlir::ValueRange{msgHeader, data, offset, length, stride})
+          .front();
+  mlir::Value messageLen =
+      b.call("strlen", b.i64(), mlir::ValueRange{message}).front();
+  // "Label" + ": " + message + NUL; the separator is dropped for an empty
+  // message, which is the classOnly arm of the printer's own summary.
+  mlir::Value hasMessage =
+      b.cmpi(mlir::arith::CmpIPredicate::sgt, messageLen, b.iconst(0));
+  mlir::Value separator = mlir::arith::SelectOp::create(
+      b.builder, b.loc, hasMessage, b.iconst(2), b.iconst(0));
+  mlir::Value total = mlir::arith::AddIOp::create(
+      b.builder, b.loc,
+      mlir::arith::AddIOp::create(b.builder, b.loc, labelLen, separator),
+      mlir::arith::AddIOp::create(b.builder, b.loc, messageLen, b.iconst(1)));
+  mlir::Value buffer =
+      b.call("malloc", b.ptr(), mlir::ValueRange{total}).front();
+  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, buffer, label, labelLen,
+                               /*isVolatile=*/false);
+  auto withMessage = mlir::scf::IfOp::create(b.builder, b.loc,
+                                             mlir::TypeRange{}, hasMessage,
+                                             /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToStart(&withMessage.getThenRegion().front());
+    mlir::Value colon = b.gepI8(buffer, labelLen);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst8(':'), colon,
+                                /*alignment=*/1);
+    mlir::LLVM::StoreOp::create(
+        b.builder, b.loc, b.iconst8(' '),
+        b.gepI8(buffer,
+                mlir::arith::AddIOp::create(b.builder, b.loc, labelLen,
+                                            b.iconst(1))),
+        /*alignment=*/1);
+    mlir::LLVM::MemcpyOp::create(
+        b.builder, b.loc,
+        b.gepI8(buffer, mlir::arith::AddIOp::create(b.builder, b.loc, labelLen,
+                                                    b.iconst(2))),
+        message, messageLen, /*isVolatile=*/false);
+  }
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc, b.iconst8(0),
+      b.gepI8(buffer, mlir::arith::SubIOp::create(b.builder, b.loc, total,
+                                                  b.iconst(1))),
+      /*alignment=*/1);
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{message});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{buffer});
+}
+
+// i64 LyTraceback_ExcLineLen() / void LyTraceback_ExcLineCopy(dest, len): the
+// same two-call protocol the frame names use. The line is rebuilt for each
+// call rather than cached; nothing between them can change the exception, and a
+// cache would be a second place for the answer to live.
+void buildTracebackExcLineLen(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyTraceback_ExcLineLen",
+                            b.builder.getFunctionType({}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *measure = b.builder.createBlock(&body);
+  mlir::Block *empty = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value line = b.call("exc_line_cstr", b.ptr(), {}).front();
+  mlir::Value missing = b.ptrEq(line, b.nullPtr());
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, missing, empty,
+                                 mlir::ValueRange{}, measure,
+                                 mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(empty);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.iconst(0)});
+
+  b.builder.setInsertionPointToEnd(measure);
+  mlir::Value length =
+      b.call("strlen", b.i64(), mlir::ValueRange{line}).front();
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{line});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{length});
+}
+
+void buildTracebackExcLineCopy(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "LyTraceback_ExcLineCopy",
+      b.builder.getFunctionType(
+          {b.ptr(), b.ptr(), b.i64(), b.i64(), b.i64(), b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *copy = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value line = b.call("exc_line_cstr", b.ptr(), {}).front();
+  mlir::Value missing = b.ptrEq(line, b.nullPtr());
+  mlir::cf::CondBranchOp::create(b.builder, b.loc, missing, done,
+                                 mlir::ValueRange{}, copy, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(copy);
+  mlir::Value dest = b.gepI8(entry->getArgument(1), entry->getArgument(2));
+  mlir::LLVM::MemcpyOp::create(b.builder, b.loc, dest, line,
+                               entry->getArgument(5), /*isVolatile=*/false);
+  b.call("free", mlir::TypeRange{}, mlir::ValueRange{line});
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 void buildReleaseChainNode(SupportBuilder &b) {
   auto fn = b.beginFunction("release_chain_node",
                             b.builder.getFunctionType({b.ptr()}, {}),
@@ -3078,6 +3360,15 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildTracebackPushCString(b);
   buildTracebackPop(b);
   buildTracebackClear(b);
+  buildTracebackFrameCount(b);
+  buildTracebackFrameLine(b);
+  buildTracebackFrameNameLen(b, "LyTraceback_FrameFileLen", 0);
+  buildTracebackFrameNameLen(b, "LyTraceback_FrameNameLen", 1);
+  buildTracebackFrameNameCopy(b, "LyTraceback_FrameFileCopy", 0);
+  buildTracebackFrameNameCopy(b, "LyTraceback_FrameNameCopy", 1);
+  buildExcLineCStr(b);
+  buildTracebackExcLineLen(b);
+  buildTracebackExcLineCopy(b);
   buildReleaseChainNode(b);
   buildReleaseTakenException(b);
   buildReleaseCurrentChain(b);

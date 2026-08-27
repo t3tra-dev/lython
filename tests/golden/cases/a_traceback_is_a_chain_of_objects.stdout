@@ -1,0 +1,11 @@
+a_traceback_is_a_chain_of_objects.py <module> 32 -1
+a_traceback_is_a_chain_of_objects.py outermost 28 -1
+a_traceback_is_a_chain_of_objects.py middle 24 -1
+a_traceback_is_a_chain_of_objects.py innermost 20 -1
+depth 4
+frames 4
+first <module> outermost()
+last innermost raise ValueError("boom")
+limited 2 outermost
+ValueError: boom
+after True 'NoneType: None\n'

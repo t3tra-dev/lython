@@ -17,17 +17,14 @@ module attributes {
                                     ly.typing.final} {}
   py.class @UnionType attributes {base_names = ["object"], ly.typing.final} {}
 
-  py.class @TracebackType attributes {
-    base_names = ["object"], ly.typing.final,
-    field_names = ["tb_next", "tb_frame", "tb_lasti", "tb_lineno"],
-    field_contract_types = [
-      !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>,
-      !py.contract<"types.FrameType">,
-      !py.contract<"builtins.int">,
-      !py.contract<"builtins.int">
-    ]
-  } {}
-  py.class @FrameType attributes {base_names = ["object"], ly.typing.abstract} {}
+  // ⭐ `TracebackType` and `FrameType` are NOT declared here. They are the only
+  // members of this module a program HOLDS -- `e.__traceback__` hands one back
+  // and `traceback.py` walks it -- and a manifest `py.class` is a typing
+  // contract with no layout, so a value of one cannot exist. They are written
+  // as ordinary classes in runtime/lib/types.py, which gives them a layout, an
+  // allocation and a deallocator; `CodeType` is there too. The contract NAMES
+  // are unchanged, so every `!py.contract<"types.TracebackType">` in the
+  // `__exit__` and `throw` signatures across the manifests still resolves.
   py.class @GenericAlias attributes {base_names = ["object"], ly.typing.abstract} {}
 
   py.class @GeneratorType attributes {

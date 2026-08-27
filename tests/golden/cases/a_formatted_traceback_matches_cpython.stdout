@@ -1,0 +1,27 @@
+--- format_exception ---
+Traceback (most recent call last):
+  File "a_formatted_traceback_matches_cpython.py", line 44, in <module>
+    compute()
+  File "a_formatted_traceback_matches_cpython.py", line 40, in compute
+    return divide(1, 0)
+  File "a_formatted_traceback_matches_cpython.py", line 36, in divide
+    return a // b
+ZeroDivisionError: division by zero
+--- limit=1 ---
+Traceback (most recent call last):
+  File "a_formatted_traceback_matches_cpython.py", line 44, in <module>
+    compute()
+ZeroDivisionError: division by zero
+--- format_exc ---
+Traceback (most recent call last):
+  File "a_formatted_traceback_matches_cpython.py", line 44, in <module>
+    compute()
+  File "a_formatted_traceback_matches_cpython.py", line 40, in compute
+    return divide(1, 0)
+  File "a_formatted_traceback_matches_cpython.py", line 36, in divide
+    return a // b
+ZeroDivisionError: division by zero
+--- no message ---
+KeyboardInterrupt
+--- outside ---
+NoneType: None
