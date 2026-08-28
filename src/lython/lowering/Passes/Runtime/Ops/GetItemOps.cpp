@@ -740,6 +740,35 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
     return mlir::failure();
   }
 
+  // ⭐ A UNION RESULT WIDENS EVERY CANDIDATE FIRST. The candidates are the
+  // members the evidence recorded -- an int and a str have different lane
+  // counts -- so the uniformity check below reported "candidate 1 has a
+  // different physical ABI shape" for `for v in (1, "a")` typed
+  // `tuple[int | str, ...]`, which is a shape mismatch only because nothing
+  // had put them into the union's own form yet.
+  llvm::SmallVector<RuntimeValue, 4> widened;
+  if (auto resultUnion =
+          mlir::dyn_cast<py::UnionType>(resultValue.getType())) {
+    if (llvm::any_of(candidates, [&](const RuntimeValue &candidate) {
+          return candidate.contract != resultValue.getType();
+        })) {
+      for (const RuntimeValue &candidate : candidates) {
+        RuntimeBundle source = RuntimeBundle::objectWithOwnership(
+            candidate.contract, candidate.values, candidate.ownership);
+        llvm::SmallVector<mlir::Value, 8> values;
+        if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
+                op, resultUnion, source, candidate.contract, values)))
+          return mlir::failure();
+        widened.push_back(RuntimeValue{
+            resultValue.getType(),
+            llvm::SmallVector<mlir::Value, 4>(values.begin(), values.end()),
+            ownership::logicalOwnershipKind(resultValue.getType(),
+                                            /*ownsObject=*/false)});
+      }
+      candidates = widened;
+    }
+  }
+
   const RuntimeValue &first = candidates.front();
   if (first.values.empty()) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> expected =
@@ -753,7 +782,7 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
     }
   }
 
-  llvm::ArrayRef<mlir::Value> firstValues = first.values;
+  llvm::ArrayRef<mlir::Value> firstValues = candidates.front().values;
   for (auto [position, candidate] : llvm::enumerate(candidates)) {
     if (!py::isAssignableTo(candidate.contract, resultValue.getType(), op)) {
       op->emitError() << label << " evidence candidate " << position
@@ -1305,22 +1334,6 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(
   return true;
 }
 
-// Shared helpers for runtime-mode container reads: rebuild the result's
-// physical values from a payload box slot and retain the element.
-static mlir::Value loadContainerBoxWord(mlir::OpBuilder &builder,
-                                        mlir::Location loc, mlir::Value array,
-                                        mlir::Value slotBase,
-                                        std::int64_t wordIndex) {
-  mlir::Value offset =
-      mlir::arith::ConstantIntOp::create(builder, loc, wordIndex, 64);
-  mlir::Value word =
-      mlir::arith::AddIOp::create(builder, loc, slotBase, offset).getResult();
-  mlir::Value index = mlir::arith::IndexCastOp::create(
-                          builder, loc, builder.getIndexType(), word)
-                          .getResult();
-  return mlir::memref::LoadOp::create(builder, loc, array, index).getResult();
-}
-
 // `xs[i]` on a runtime-mode list or tuple (identical physical layout: header,
 // length, boxes): runtime bounds check (negative indices normalize),
 // IndexError on miss, element rebuilt from its box words and retained
@@ -1366,11 +1379,20 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
                                                  "runtime list element");
   if (mlir::failed(shapes))
     return mlir::failure();
-  for (mlir::Type shape : *shapes) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
-    if (!memref || memref.getRank() != 1)
-      return false;
-  }
+  // ⭐ A UNION ELEMENT IS BUILT FROM THE BOX, not read as lanes. Its physical
+  // form starts with a TAG, which is an i64 and not a memref, so the shape
+  // check below declined it and the read fell through to a manifest
+  // `__getitem__` that returns no union: "runtime manifest has no
+  // builtins.list.__getitem__ method", for `list[int | str]` whenever the
+  // container arrived as a parameter or was read in a loop -- the two places
+  // the per-element evidence is gone.
+  auto elementUnion = mlir::dyn_cast<py::UnionType>(elementContract);
+  if (!elementUnion)
+    for (mlir::Type shape : *shapes) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+      if (!memref || memref.getRank() != 1)
+        return false;
+    }
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
   mlir::Value raw;
@@ -1445,6 +1467,30 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
           op, container, ContainerInterior::Primary, "runtime list getitem");
   if (mlir::failed(itemsView))
     return mlir::failure();
+  if (elementUnion) {
+    mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
+        builder, loc, box_abi::kWordsPerBox, 64);
+    mlir::Value base =
+        mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
+            .getResult();
+    mlir::Value classWord =
+        box_abi::loadContainerBoxWord(builder, loc, *itemsView, base, 1);
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(builder, loc, *itemsView, base,
+                                                  box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+        RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
+                                                      classWord, entityWord);
+    if (mlir::failed(unionValues))
+      return mlir::failure();
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, elementContract, *unionValues, result)))
+      return mlir::failure();
+    result.setObjectLogicalOwnership(/*ownsObject=*/false);
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return true;
+  }
   if (runtimeContractName(elementContract) == "builtins.object") {
     // Erased read lane: see lowerRuntimeDictGetItem.
     std::optional<RuntimeSymbol> fromSlot =
@@ -1463,7 +1509,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
     mlir::Value base =
         mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
             .getResult();
-    mlir::Value entityWord = loadContainerBoxWord(builder, loc, *itemsView, base,
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(builder, loc, *itemsView, base,
                                                   box_abi::kEntityWord);
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
         RuntimeBundleLowerer::lanesFromBoxEntity(
@@ -1543,11 +1589,18 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
                                                  "runtime dict value");
   if (mlir::failed(shapes))
     return mlir::failure();
-  for (mlir::Type shape : *shapes) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
-    if (!memref || memref.getRank() != 1)
-      return false;
-  }
+  // A union value is rebuilt from the box below; its first physical value is
+  // the tag, so the lane check that follows would decline it -- and declining
+  // here is not a refusal but a fall-through to a `dict.__getitem__` method
+  // the manifest does not have. `d[k]` for a runtime key k on a
+  // `dict[str, int | str]` reported the missing method instead.
+  auto valueUnion = mlir::dyn_cast<py::UnionType>(valueContract);
+  if (!valueUnion)
+    for (mlir::Type shape : *shapes) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+      if (!memref || memref.getRank() != 1)
+        return false;
+    }
   std::optional<RuntimeSymbol> lookupBox =
       manifest.primitive("builtins.dict", "lookup_box_checked");
   if (!lookupBox) {
@@ -1592,6 +1645,33 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
           op, container, ContainerInterior::Secondary, "runtime dict getitem");
   if (mlir::failed(valuesView))
     return mlir::failure();
+  if (valueUnion) {
+    mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
+        builder, loc, box_abi::kWordsPerBox, 64);
+    mlir::Value base =
+        mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
+            .getResult();
+    mlir::Value classWord =
+        box_abi::loadContainerBoxWord(builder, loc, *valuesView, base, 1);
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(
+        builder, loc, *valuesView, base, box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+        RuntimeBundleLowerer::unionValuesFromBoxWords(op, valueUnion, classWord,
+                                                      entityWord);
+    if (mlir::failed(unionValues))
+      return mlir::failure();
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, valueContract, *unionValues, result)))
+      return mlir::failure();
+    result.setObjectLogicalOwnership(/*ownsObject=*/false);
+    valueBundles[op.getResult()] = std::move(result);
+    if (mlir::failed(pinContainerLiveness(op, container,
+                                          /*insertAfterOp=*/true)))
+      return mlir::failure();
+    erase.push_back(op);
+    return true;
+  }
   // See lowerRuntimeSequenceGetItem: "fresh owned object box" is literal, so
   // this branch's element needs marking and NOT retaining.
   bool valueArrivesOwned = false;
@@ -1617,7 +1697,7 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
     mlir::Value base =
         mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
             .getResult();
-    mlir::Value entityWord = loadContainerBoxWord(builder, loc, *valuesView, base,
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(builder, loc, *valuesView, base,
                                                   box_abi::kEntityWord);
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
         RuntimeBundleLowerer::lanesFromBoxEntity(

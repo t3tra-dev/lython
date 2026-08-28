@@ -1290,6 +1290,13 @@ private:
   // because a box and an exception each move the word.
   mlir::FailureOr<mlir::Value> exactRuntimeClassId(mlir::Operation *op,
                                                    const RuntimeBundle &object);
+  mlir::Value exactClassIdFromWords(mlir::Operation *op, mlir::Value classWord,
+                                    mlir::Value entityWord);
+  // A union's physical values -- tag plus every member's lanes -- built from a
+  // box that some container owns.
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
+  unionValuesFromBoxWords(mlir::Operation *op, py::UnionType unionType,
+                          mlir::Value classWord, mlir::Value entityWord);
   mlir::LogicalResult lowerClassTest(py::ClassTestOp op);
   mlir::LogicalResult lowerTypeObject(py::TypeObjectOp op);
   mlir::LogicalResult lowerAttrGet(py::AttrGetOp op);

@@ -1938,19 +1938,30 @@ RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
   if (!inputIsBox)
     return classId;
 
+  mlir::Value entityWord =
+      mlir::memref::LoadOp::create(
+          builder, loc, storage,
+          mlir::arith::ConstantIndexOp::create(builder, loc,
+                                               box_abi::kEntityWord)
+              .getResult())
+          .getResult();
+  return RuntimeBundleLowerer::exactClassIdFromWords(op, classId, entityWord);
+}
+
+// The same question asked of a box's two WORDS rather than of a bundle: a
+// container element is addressed by an interior view, not by a value.
+mlir::Value RuntimeBundleLowerer::exactClassIdFromWords(mlir::Operation *op,
+                                                        mlir::Value classWord,
+                                                        mlir::Value entityWord) {
+  const std::int64_t kExceptionLayout =
+      py::exceptions::findByName("BaseException")->classId;
+  mlir::Location loc = op->getLoc();
   mlir::Value isException = mlir::arith::CmpIOp::create(
-      builder, loc, mlir::arith::CmpIPredicate::eq, classId,
+      builder, loc, mlir::arith::CmpIPredicate::eq, classWord,
       mlir::arith::ConstantIntOp::create(builder, loc, kExceptionLayout, 64));
   auto exact = mlir::scf::IfOp::create(
       builder, loc, isException,
       [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
-        mlir::Value entityWord =
-            mlir::memref::LoadOp::create(
-                nested, nestedLoc, storage,
-                mlir::arith::ConstantIndexOp::create(nested, nestedLoc,
-                                                     box_abi::kEntityWord)
-                    .getResult())
-                .getResult();
         mlir::MemRefType entityType =
             mlir::MemRefType::get({3}, nested.getI64Type());
         mlir::Value entity = RuntimeBundleLowerer::memrefFromBoxWords(
@@ -1969,9 +1980,142 @@ RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
       },
       [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
         mlir::scf::YieldOp::create(nested, nestedLoc,
-                                   mlir::ValueRange{classId});
+                                   mlir::ValueRange{classWord});
       });
   return exact.getResult(0);
+}
+
+// ⭐ A UNION OUT OF A BOX. Its physical form is a TAG plus every member's lanes
+// side by side, so building one from an erased element is: find which member
+// the box's class id names, and give that member its lanes while the others
+// take the dead values an inactive member always carries.
+//
+// ⛔ EACH MEMBER'S LANES ARE GUARDED. `lanesFromBoxEntity` asks the contract's
+// `lane_words` primitive, which DEREFERENCES the entity -- asking str's of an
+// int entity is a wild read -- so the arms are `scf.if`s and not selects.
+//
+// ⛔ BORROWED, all of them: the lanes are views of what the container's box
+// owns, which is the same footing an evidence-backed element read is on.
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
+RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
+                                              py::UnionType unionType,
+                                              mlir::Value classWord,
+                                              mlir::Value entityWord) {
+  mlir::Location loc = op->getLoc();
+  mlir::Value exact =
+      RuntimeBundleLowerer::exactClassIdFromWords(op, classWord, entityWord);
+  llvm::SmallVector<mlir::Value, 8> values;
+  llvm::SmallVector<mlir::Value, 4> matches;
+  mlir::func::FuncOp classIdMatches = getOrCreatePrivateFunction(
+      module, builder, "LyEH_ClassIdMatches",
+      builder.getFunctionType({builder.getI64Type(), builder.getI64Type()},
+                              {builder.getI1Type()}));
+  // ⭐ THE LANE-LESS MEMBER IS THE DEFAULT TAG, NOT A MATCH. `None` has no
+  // physical lanes and no manifest class id, so asking
+  // `runtimeClassIdsForNominalTarget` about it is an error ("no class schema:
+  // types.NoneType") and there is no id to compare against anyway. It is also
+  // the only member a box can hold that no other member's id claims, so the
+  // tag starts there and every identified member overwrites it. Leaving the
+  // tag at 0 instead decoded a `None` element of a `list[int | None]` as an
+  // int -- the same wrong-default the dead materializer records.
+  std::optional<std::int64_t> laneLessTag;
+  for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
+                                                   "union member ABI");
+    if (mlir::failed(laneTypes))
+      return mlir::failure();
+    if (laneTypes->empty()) {
+      laneLessTag = static_cast<std::int64_t>(index);
+      break;
+    }
+  }
+
+  for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+    mlir::Value matched =
+        mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();
+    if (static_cast<std::int64_t>(index) != laneLessTag.value_or(-1)) {
+      mlir::FailureOr<llvm::SmallVector<std::int64_t, 8>> ids =
+          RuntimeBundleLowerer::runtimeClassIdsForNominalTarget(op, member);
+      if (mlir::failed(ids))
+        return mlir::failure();
+      for (std::int64_t id : *ids) {
+        mlir::Value one =
+            mlir::func::CallOp::create(
+                builder, loc, classIdMatches,
+                mlir::ValueRange{
+                    exact, mlir::arith::ConstantIntOp::create(builder, loc, id,
+                                                              64)
+                               .getResult()})
+                .getResult(0);
+        matched = mlir::arith::OrIOp::create(builder, loc, matched, one);
+      }
+    }
+    matches.push_back(matched);
+  }
+
+  mlir::Value tag = mlir::arith::ConstantIntOp::create(
+                        builder, loc, laneLessTag.value_or(0), 64)
+                        .getResult();
+  for (auto [index, matched] : llvm::enumerate(matches))
+    tag = mlir::arith::SelectOp::create(
+              builder, loc, matched,
+              mlir::arith::ConstantIntOp::create(
+                  builder, loc, static_cast<std::int64_t>(index), 64)
+                  .getResult(),
+              tag)
+              .getResult();
+  values.push_back(tag);
+
+  for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
+                                                   "union member ABI");
+    if (mlir::failed(laneTypes))
+      return mlir::failure();
+    if (laneTypes->empty())
+      continue;
+    std::string contractName = runtimeContractName(member);
+    bool armFailed = false;
+    auto built = mlir::scf::IfOp::create(
+        builder, loc, matches[index],
+        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+          mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+              RuntimeBundleLowerer::lanesFromBoxEntity(
+                  nested, nestedLoc, entityWord, *laneTypes, contractName, op);
+          if (mlir::failed(lanes)) {
+            armFailed = true;
+            mlir::scf::YieldOp::create(nested, nestedLoc, mlir::ValueRange{});
+            return;
+          }
+          mlir::scf::YieldOp::create(nested, nestedLoc,
+                                     mlir::ValueRange{*lanes});
+        },
+        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+          // The dead materializer writes through the lowerer's own builder, so
+          // it is pointed into this region rather than handed a second one.
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(nested.getInsertionBlock());
+          mlir::FailureOr<RuntimeValue> dead =
+              RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+                  op, member, "union inactive member ABI");
+          if (mlir::failed(dead)) {
+            armFailed = true;
+            mlir::scf::YieldOp::create(builder, nestedLoc, mlir::ValueRange{});
+            return;
+          }
+          mlir::scf::YieldOp::create(builder, nestedLoc,
+                                     mlir::ValueRange{dead->values});
+        });
+    if (armFailed)
+      return mlir::failure();
+    if (built.getNumResults() != laneTypes->size())
+      return op->emitError()
+             << "union member " << contractName << " needs " << laneTypes->size()
+             << " lanes and the guarded read produced " << built.getNumResults();
+    values.append(built.getResults().begin(), built.getResults().end());
+  }
+  return values;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {

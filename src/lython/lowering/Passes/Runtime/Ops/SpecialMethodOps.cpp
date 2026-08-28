@@ -1871,13 +1871,19 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
                                                  "runtime list element");
   if (mlir::failed(elementShapes))
     return mlir::failure();
-  for (mlir::Type shape : *elementShapes) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
-    if (!memref || memref.getRank() != 1)
-      return op.emitError()
-             << "iteration over a runtime-mode list of " << elementContract
-             << " requires rank-1 memref physical values, got " << shape;
-  }
+  // ⭐ A UNION ELEMENT IS BUILT FROM THE BOX. Its physical form starts with a
+  // TAG, an i64 and not a memref, so this check refused `for v in xs` over a
+  // `list[int | str]` outright -- the read the getitem path answers the same
+  // way one line below.
+  auto elementUnion = mlir::dyn_cast<py::UnionType>(elementContract);
+  if (!elementUnion)
+    for (mlir::Type shape : *elementShapes) {
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(shape);
+      if (!memref || memref.getRank() != 1)
+        return op.emitError()
+               << "iteration over a runtime-mode list of " << elementContract
+               << " requires rank-1 memref physical values, got " << shape;
+    }
 
   mlir::Value slot = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   mlir::Value position =
@@ -1954,6 +1960,58 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
                                                          /*ownsObject=*/false)};
     if (mlir::failed(bindEvidenceObjectResult(op, op.getElement(),
                                               "runtime list element", element)))
+      return mlir::failure();
+    std::optional<RuntimeSymbol> lenPin =
+        manifest.method(iterator.contractName(), "__len__");
+    if (!lenPin)
+      return op.emitError()
+             << "list iteration needs a runtime __len__ to pin the container";
+    llvm::SmallVector<const RuntimeBundle *, 1> pinSources{&iterator};
+    llvm::SmallVector<mlir::Value, 4> pinOperands;
+    if (mlir::failed(buildRuntimeCallOperands(op, *lenPin, pinSources,
+                                              pinOperands,
+                                              /*allowUnusedSources=*/false)))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    RuntimeBundleLowerer::createRuntimeCall(loc, *lenPin, pinOperands);
+    op.getValid().replaceAllUsesWith(valid);
+    valueBundles[op.getNext()] = iterator;
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  if (elementUnion) {
+    mlir::FailureOr<mlir::Value> itemsView =
+        RuntimeBundleLowerer::containerInteriorView(
+            op, iterator, ContainerInterior::Primary, "iterator element");
+    if (mlir::failed(itemsView))
+      return mlir::failure();
+    mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
+        builder, loc, box_abi::kWordsPerBox, 64);
+    mlir::Value base =
+        mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
+            .getResult();
+    // ⛔ On the exhausted branch `safe` is 0, so these are slot 0's words --
+    // in bounds by the payload's own invariant, and never used: the loop reads
+    // the element only where `valid` says there is one. An EMPTY payload's
+    // slot 0 is zeroed, whose class id matches no member, so every lane takes
+    // its dead arm and nothing is dereferenced.
+    mlir::Value classWord =
+        box_abi::loadContainerBoxWord(builder, loc, *itemsView, base, 1);
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(
+        builder, loc, *itemsView, base, box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+        RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
+                                                      classWord, entityWord);
+    if (mlir::failed(unionValues))
+      return mlir::failure();
+    RuntimeBundle element;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+            op, elementContract, *unionValues, element)))
+      return mlir::failure();
+    element.setObjectLogicalOwnership(/*ownsObject=*/false);
+    if (mlir::failed(bindSelectedEvidenceObjectResult(op, op.getElement(),
+                                                      std::move(element))))
       return mlir::failure();
     std::optional<RuntimeSymbol> lenPin =
         manifest.method(iterator.contractName(), "__len__");

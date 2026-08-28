@@ -476,6 +476,16 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   // fields it has -- they live in its body -- unless one of them is a union,
   // whose storage is a tag plus every member's lanes: the members do not share
   // an entity, so no single address names them.
+  //
+  // ⛔ READING a union element out of a container works and WRITING one does
+  // not, and the asymmetry is in the direction, not an oversight. A read has
+  // the box and rebuilds each member's lanes from it under a tag guard
+  // (`unionValuesFromBoxWords`); a write would have to pick the ACTIVE
+  // member's box by the tag and there is no single address to put in the slot,
+  // so it is a tag-dispatched store and not a store. What still lands here is
+  // a union that came OUT of one container going INTO another --
+  // `ys: list[int | str] = [xs[0]]`, and `t[1:]` on a `tuple[int, str]`,
+  // whose slice element is the union of the members.
   if (concrete->physicalValues().size() > 1 &&
       !RuntimeBundleLowerer::laneWordsPrimitiveFor(concrete->contractName()))
     return op->emitError()

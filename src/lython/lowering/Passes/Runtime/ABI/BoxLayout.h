@@ -33,6 +33,7 @@
 // struct types through the manifest surface, and the reason to do it would have
 // to be something other than the pointer words.
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -81,6 +82,23 @@ inline constexpr std::int64_t kHashWord = 4;
 
 inline mlir::MemRefType boxWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());
+}
+
+// One word of the box at `slotBase` inside a container's payload array. Every
+// runtime-mode container read -- subscript, iteration, dict value -- rebuilds
+// its element from these words, so the addressing is written once here.
+inline mlir::Value loadContainerBoxWord(mlir::OpBuilder &builder,
+                                        mlir::Location loc, mlir::Value array,
+                                        mlir::Value slotBase,
+                                        std::int64_t wordIndex) {
+  mlir::Value offset =
+      mlir::arith::ConstantIntOp::create(builder, loc, wordIndex, 64);
+  mlir::Value word =
+      mlir::arith::AddIOp::create(builder, loc, slotBase, offset).getResult();
+  mlir::Value index = mlir::arith::IndexCastOp::create(
+                          builder, loc, builder.getIndexType(), word)
+                          .getResult();
+  return mlir::memref::LoadOp::create(builder, loc, array, index).getResult();
 }
 
 // The stack slot for one transient payload box, placed in the entry block of
