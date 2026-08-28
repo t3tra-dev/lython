@@ -341,6 +341,35 @@ bool statementCanComplete(const parser::Node &statement) {
   }
   if (kind == "With" || kind == "AsyncWith")
     return bodyCanComplete(ast::nodeList(statement, "body"));
+  // ⛔ A `match` WITH AN IRREFUTABLE CASE IS EXHAUSTIVE, which is how a
+  // dispatch-by-value function ends: `case _:` (or a bare capture) always
+  // matches, so if no case body completes, neither does the statement.
+  // Treating a match as always completing refused
+  //
+  //     def classify(v: int) -> str:
+  //         match v:
+  //             case 0: return "zero"
+  //             case _: return "big"
+  //
+  // with "can reach its end without returning", which it cannot.
+  if (kind == "Match") {
+    const auto *cases = ast::nodeList(statement, "cases");
+    if (!cases || cases->empty())
+      return true;
+    bool irrefutable = false;
+    for (const parser::NodePtr &caseNode : *cases) {
+      if (!caseNode)
+        return true;
+      if (bodyCanComplete(ast::nodeList(*caseNode, "body")))
+        return true;
+      const parser::Node *pattern = ast::node(*caseNode, "pattern");
+      // A guard can fail, so the case it guards proves nothing.
+      if (!ast::node(*caseNode, "guard") && pattern &&
+          pattern->kind == "MatchAs" && !ast::node(*pattern, "pattern"))
+        irrefutable = true;
+    }
+    return !irrefutable;
+  }
   if (kind == "Try" || kind == "TryStar") {
     // A finally that cannot complete decides for the whole statement,
     // whichever way its body went.

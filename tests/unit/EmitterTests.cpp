@@ -716,6 +716,48 @@ TEST(EmitterTest, StrSeesThroughAPromotedCell) {
   EXPECT_TRUE(others.ok());
 }
 
+// WHAT: a `match` with an irrefutable case is exhaustive, so a function whose
+// every case returns cannot reach its end. Treating a match as always
+// completing asked for a return the program does not need.
+//
+// The controls are the two ways it is NOT exhaustive: no wildcard at all, and
+// a wildcard whose guard can fail.
+TEST(EmitterTest, AnExhaustiveMatchDoesNotFallThrough) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult exhaustive =
+      emitSource("def f(v: int) -> str:\n"
+                 "    match v:\n"
+                 "        case 0:\n"
+                 "            return \"zero\"\n"
+                 "        case _:\n"
+                 "            return \"other\"\n"
+                 "print(f(0))\n",
+                 context);
+  EXPECT_TRUE(exhaustive.ok());
+
+  lython::emitter::EmitResult partial =
+      emitSource("def f(v: int) -> str:\n"
+                 "    match v:\n"
+                 "        case 0:\n"
+                 "            return \"zero\"\n"
+                 "print(f(0))\n",
+                 context);
+  EXPECT_FALSE(partial.ok());
+  EXPECT_TRUE(
+      reportsDiagnostic(partial, "can reach its end without returning"));
+
+  lython::emitter::EmitResult guarded =
+      emitSource("def f(v: int) -> str:\n"
+                 "    match v:\n"
+                 "        case _ if v > 0:\n"
+                 "            return \"pos\"\n"
+                 "print(f(0))\n",
+                 context);
+  EXPECT_FALSE(guarded.ok());
+  EXPECT_TRUE(
+      reportsDiagnostic(guarded, "can reach its end without returning"));
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
