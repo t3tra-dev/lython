@@ -103,6 +103,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 ### デバッグ用環境変数
 
 - `LYTHON_IR_DUMP=all` またはフェーズ名のカンマ区切り (例: `frontend,runtime-lowering`) — 各 lowering フェーズ後の MLIR / LLVM IR を stderr にダンプ
+- `LYTHON_DUMP_ON_FAILURE=1` — lowering フェーズが失敗したとき、そのフェーズ終了時点のモジュールを stderr にダンプする (`LYTHON_IR_DUMP` は成功したフェーズの後にしか出力しないので、壊れた IR を作ったフェーズ自身の出力はこれでしか見えない)
 - `LYTHON_PERF=1` — フェーズごとの wall time を出力
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 

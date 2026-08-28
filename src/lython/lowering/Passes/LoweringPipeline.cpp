@@ -77,8 +77,13 @@ LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
   PassManager pm(module.getContext());
   pm.enableVerifier(enableVerifier);
   populate(pm);
-  if (failed(pm.run(module)))
+  if (failed(pm.run(module))) {
+    if (llvm::sys::Process::GetEnv("LYTHON_DUMP_ON_FAILURE")) {
+      llvm::errs() << "\n=== [FAILED PHASE " << name << "] ===\n";
+      module->print(llvm::errs(), mlir::OpPrintingFlags().assumeVerified());
+    }
     return failure();
+  }
   if (emittedErrors != 0) {
     module.emitError() << "lowering phase '" << name << "' emitted "
                        << emittedErrors

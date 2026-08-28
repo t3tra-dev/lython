@@ -38,9 +38,30 @@ bool isMethodDescriptorKind(py::AttrGetOp op) {
 // used to be an instance-HEADER word at 4 + i, so a class ran out at
 // kWordsPerBox - 4 of them and the rest fell back to the contract's own lanes,
 // which is a different storage with a different store and a different read.
+// ⭐ ONLY `bool`. An `int` field used to be a body WORD too, which is why
+// `self.v = 2 ** 70` raised OverflowError from a store the author did not
+// write: a Python int is arbitrary precision and a word is 64 bits. It is
+// boxed now like every other object field.
+//
+// ⛔ THE COST IS THE STORE AND ONLY THE STORE, measured on a 2,000,000-trip
+// loop over one instance (jit `phase=execution`, best of 3):
+//
+//     self.total = self.total + self.step    231 ms word -> 307 ms boxed
+//     total      = total      + self.step    279 ms word -> 270 ms boxed
+//
+// A read rebuilds lanes from box words and is no slower than loading a word;
+// a store has to put the value on the heap, which is one allocation per
+// store where the word was free. ⭐ SEEDING THE READ WITH THE UNBOXED LANE
+// DOES NOT RECOVER IT and was measured and reverted: a non-raising
+// `try_unbox.i64` at every boxed int field read (raising is not an option --
+// the value may legitimately be large) fed the `__lyrt_prim_i64`
+// speculation, which removed the `LyLong_Add` call and left the allocation,
+// for 316 ms on the first loop and 296 ms on the second. The speculation was
+// never the missing piece; the word was, and getting it back means a tagged
+// field -- a body word that holds either the value or a pointer to a box --
+// which is a different design and not a predicate.
 bool isPrimitiveFieldContract(mlir::Type fieldType) {
-  std::string contract = runtimeContractName(fieldType);
-  return contract == "builtins.int" || contract == "builtins.bool";
+  return runtimeContractName(fieldType) == "builtins.bool";
 }
 
 bool isBoolFieldType(mlir::Type fieldType) {
@@ -242,16 +263,16 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // be an allocation whose only content is the absence of a value.
   if (contractName == "types.NoneType")
     return false;
-  // int/bool are the two contracts whose value is a single body WORD, which is
-  // already a stable heap slot; their contract lanes are a placeholder the
-  // store never reads. Boxing them would add a second storage for the same
-  // field and force the load to choose.
+  // ⛔ `builtins.bool` HAS NO ENTITY -- its runtime shape is `i1`, so there is
+  // no address a box's entity word could hold (see
+  // optionalPayloadRebuildableFromBox). It stays a single body WORD, which is
+  // a stable heap slot already, and its contract lanes are a placeholder the
+  // store never reads.
   //
   // ⛔ Which is why the optional arm above does NOT recurse through here. This
-  // rule is about a field that HAS an inline word; `int | None` has no inline
-  // spelling of absent, so there is no second storage to disagree with -- the
-  // box is the only one.
-  if (contractName == "builtins.int" || contractName == "builtins.bool")
+  // rule is about a field that HAS an inline word; `bool | None` has no inline
+  // spelling of absent, so there is no second storage to disagree with.
+  if (contractName == "builtins.bool")
     return false;
   return true;
 }
@@ -1847,6 +1868,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       if (cached) {
         read = *cached;
         read.objectValue.values.assign(values.begin(), values.end());
+        read.primitiveI64.reset();
         read.setObjectLogicalOwnership(/*ownsObject=*/false);
       } else {
         read = RuntimeBundle::objectWithOwnership(
@@ -1863,6 +1885,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   if (cached) {
     result = *cached;
     result.objectValue.values.assign(values.begin(), values.end());
+    // ⛔ THE UNBOXED LANE IS NOT A FACT ABOUT THE FIELD, it is an SSA value
+    // from wherever the cache was written -- and that block need not dominate
+    // this read. An `int` field is box-fronted now, so the cache carries one:
+    // `self.i` read after `self.i += 1` in a sibling branch produced
+    // "operand #0 does not dominate this use". The box words ARE the value;
+    // the speculation re-earns its lane where the value is produced.
+    result.primitiveI64.reset();
     result.setObjectLogicalOwnership(/*ownsObject=*/false);
   } else {
     result = RuntimeBundle::objectWithOwnership(
