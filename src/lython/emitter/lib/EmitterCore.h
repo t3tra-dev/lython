@@ -398,6 +398,7 @@ private:
                          std::size_t starIndex, Value source);
   void emitUnpackArityCheck(const parser::Node &target, Value source,
                             std::size_t expected);
+  bool tryEmitFileLineFor(const parser::Node &statement);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,
                            llvm::function_ref<void()> emit);
   // Value form: enumerate/zip/map/filter/reversed/iter as first-class lazy

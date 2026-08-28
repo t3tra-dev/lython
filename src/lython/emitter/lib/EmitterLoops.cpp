@@ -943,6 +943,10 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
       iterNode && iterNode->kind == "Call" &&
       tryEmitItertoolsFor(statement, *iterNode))
     return;
+  // A file iterates by `readline` and not through an iterator object; the
+  // fusion is keyed on the source's TYPE rather than on a call spelling.
+  if (tryEmitFileLineFor(statement))
+    return;
   // ⭐ INSIDE A GENERATOR, A `for` OVER AN INDEXABLE SOURCE BECOMES AN INDEX
   // LOOP. A for loop keeps its position in a function-local cell, and a cell
   // cannot survive a suspension -- so the state machine declines the body and

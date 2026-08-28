@@ -291,6 +291,78 @@ bool ModuleEmitter::hasIndexableEvidence(const parser::Node *expr) {
   return hasIndexWalkableEvidence(types.inferExpr(expr));
 }
 
+// ⭐ A FILE ITERATES BY `readline`, which is what CPython's own file iterator
+// does: read a line, stop on the empty string EOF returns, and keep the newline
+// the line ends with. `for line in f` was refused with "'_io.TextIOWrapper'
+// does not provide manifest method '__iter__'" -- an iterator object the static
+// kernel has no way to hold -- while the method the loop needs was declared all
+// along.
+//
+//     for line in f: BODY
+//     # while True:
+//     #     __ly_line = __ly_file.readline()
+//     #     if __ly_line == "": break
+//     #     line = __ly_line
+//     #     BODY
+//
+// ⛔ A NAME OR AN ATTRIBUTE PATH ONLY, which is the same restriction the fused
+// callables carry and for the same reason: the source is RE-SPELLED on every
+// line, so its lookup has to be side-effect free. Binding a general expression
+// to a scratch name instead would give the loop a second owner of the file, and
+// nothing releases a scratch: `for line in open(path)` reported "owned resource
+// ... reaches function exit without release". `open(...)` in the loop header
+// keeps the object path's diagnostic.
+bool ModuleEmitter::tryEmitFileLineFor(const parser::Node &statement) {
+  const parser::Field *iterField = parser::findField(statement, "iter");
+  if (!iterField || !std::holds_alternative<NodePtr>(iterField->value))
+    return false;
+  NodePtr iterNode = std::get<NodePtr>(iterField->value);
+  if (!iterNode ||
+      (iterNode->kind != "Name" && iterNode->kind != "Attribute"))
+    return false;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(types.inferExpr(iterNode.get())));
+  if (!contract || contract.getContractName() != "_io.TextIOWrapper")
+    return false;
+  std::optional<ForParts> parts = forParts(statement);
+  if (!parts)
+    return false;
+  const parser::SourceRange range = parts->range;
+  std::string lineName =
+      "__lyline$" + std::to_string(++syntheticFunctionCounter);
+  auto line = [&] { return synth::name(lineName, range); };
+
+  // ⛔ THE EOF TEST IS THE LOOP CONDITION AND NOT A `break`. `for ... else`
+  // runs its else exactly when the loop was not broken out of, so ending the
+  // loop with a break made the else unreachable -- the one shape where a
+  // reader can see the difference.
+  //
+  // ⛔ AND THE NEXT LINE IS READ BEFORE THE BODY, for the reason the range
+  // fusion records: `continue` in a `while` jumps to the test, and an advance
+  // written after the body would be skipped by it and never terminate. The
+  // file is therefore one line ahead of the body, which is what CPython's own
+  // buffered file iterator does too.
+  std::vector<NodePtr> body{
+      synth::assign(parts->target, line(), range),
+      synth::assign(line(),
+                    synth::methodCall(iterNode, "readline", {}, range),
+                    range)};
+  body.insert(body.end(), parts->body.begin(), parts->body.end());
+  NodePtr loop = synth::whileStmt(
+      synth::compare(line(), "NotEq", synth::strConstant("", range), range),
+      std::move(body), parts->orelse, range);
+  // ⛔ BOUND BEFORE THE LOOP, not first inside it. A name the loop introduces
+  // is not one of its carried locals, so the reference the last `readline`
+  // left had no release placed for it: "owned resource ... reaches function
+  // exit without release".
+  runWithScratchNames({lineName}, [&] {
+    emitStatement(*synth::assign(
+        line(), synth::methodCall(iterNode, "readline", {}, range), range));
+    emitWhile(*loop);
+  });
+  return true;
+}
+
 bool ModuleEmitter::tryEmitLazyIteratorFor(const parser::Node &statement,
                                            const parser::Node &iterCall) {
   auto reject = [&](llvm::StringRef reason) {

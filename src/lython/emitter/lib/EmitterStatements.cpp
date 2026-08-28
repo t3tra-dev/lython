@@ -1684,6 +1684,35 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
         emitStarredUnpack(target, *elts, starIndex, value);
         return;
       }
+      // ⭐ A NAMED TUPLE UNPACKS BY FIELD, because that is what its elements
+      // ARE. The indexed walk below asks the method table for `__getitem__`,
+      // and a source class does not declare one -- `p[0]` compiles only
+      // because the subscript path folds a literal index to the field. So
+      // `a, b = p` was refused with "'Pt' does not provide manifest method
+      // '__getitem__'", and with it `for a, b in pts`, which is how a list of
+      // pairs is read.
+      if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(value.type)))
+        if (namedTupleContracts.count(contract.getContractName())) {
+          llvm::ArrayRef<std::string> order =
+              classFieldOrders[contract.getContractName()];
+          if (order.size() == elts->size()) {
+            std::string scratch =
+                "__ntunpack" + std::to_string(++syntheticFunctionCounter);
+            values[scratch] = value;
+            types.bindSymbol(scratch, value.type);
+            for (auto [index, elt] : llvm::enumerate(*elts)) {
+              parser::NodePtr read = synth::attribute(
+                  synth::name(scratch, target.range), order[index],
+                  target.range);
+              Value field = emitExpr(read.get());
+              synthesizedIteratorDefs.push_back(std::move(read));
+              emitAssignTarget(*elt, field);
+            }
+            values.erase(scratch);
+            return;
+          }
+        }
       // The count IS checked, against the object: a check on the type alone
       // catches only heterogeneous tuples (a tuple whose members share a type
       // collapses to `tuple[T]`, and a list carries its length in the object),
