@@ -2447,20 +2447,30 @@ them in.
 #
 # ⛔ TWO NEIGHBOURS STAY OPEN, and they are the same erasure:
 #
-# 1. `f(*args)` -> "starred call arguments require a statically sized tuple",
-#    and `a, *rest = (1, 2, 3)` -> "starred assignment target ... a statically
-#    unknown number of elements". A tuple of UNIFORM members is typed
-#    `tuple[T]` with the arity dropped (tupleOfMembers), so `(5, 2)` and a
-#    ten-tuple of ints are the same type -- while `("ab", 2)` keeps
-#    `tuple[str, int]` and `f(*("ab", 2))` works today.
+# 1. FIXED 2026-08-29. `f(*args)` -> "starred call arguments require a
+#    statically sized tuple", and `a, *rest = (1, 2, 3)` -> "starred assignment
+#    target ... a statically unknown number of elements". A tuple of UNIFORM
+#    members was typed `tuple[T]` with the arity dropped (tupleOfMembers), so
+#    `(5, 2)` and a ten-tuple of ints were the same type -- while `("ab", 2)`
+#    kept `tuple[str, int]` and `f(*("ab", 2))` worked.
 #
-#    ⭐ KEEPING THE ARITY WAS MEASURED AND REVERTED: 19 tests fail. A
-#    multi-member tuple is not accepted as a set element, a dict key, or a
-#    __getitem__ receiver, so the collapse is what makes homogeneous tuples
-#    usable in those positions at all. The repair is those three paths, not
-#    the type -- and `f(*t)` needs one more thing after it, because with an
-#    ANNOTATED tuple[int, int, int] the lowering still says "starred positional
-#    arg operand ... needs sequence evidence".
+#    ⭐ THE "19 TESTS FAIL" MEASUREMENT BELOW WAS RIGHT ABOUT THE COUNT AND
+#    WRONG ABOUT THE CAUSE, which is why keeping the arity looked impossible
+#    for a week. It read as "a multi-member tuple is not accepted as a set
+#    element, a dict key, or a __getitem__ receiver", and those three were
+#    SYMPTOMS: `substituteType` collapsed uniform tuples a SECOND time, so a
+#    positional tuple that reached a manifest signature became `tuple[T]` at
+#    application and no longer matched the argument that produced it. Removing
+#    that collapse as well is 887/887, and every one of the three paths accepts
+#    a positional tuple as it stands. ⭐ When a change breaks N tests in three
+#    different-looking places, look for the SECOND copy of the thing being
+#    changed before concluding the change is wrong.
+#
+#    The lowering half is `starredSequenceElements`: sequence evidence when
+#    there is any, and otherwise a runtime read of the payload guarded by a
+#    length check, so an ANNOTATED tuple that lost its evidence at a binding
+#    expands too. `tuple[T]` still has no arity and is still refused.
+#    Pinned by tests/golden/cases/a_starred_argument_expands_a_tuple.py.
 #
 # 2. FIXED THE SAME DAY -- `_replace`, `_asdict`, `_fields` and `tuple(p)` on a
 #    NamedTuple. See the entry below.

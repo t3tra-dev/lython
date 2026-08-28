@@ -3630,20 +3630,13 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       }
     }
   }
+  // ⛔ A STARRED ARGUMENT KEEPS THE CONSTRUCTOR OFF THE INLINE PATH. Inlining
+  // `__init__` needs one Value per parameter and a starred operand is one
+  // Value for several, so the runtime call below takes it -- where the pack's
+  // own expansion (`starredSequenceElements`) does the splitting. It used to
+  // be refused outright here instead.
   bool hasUnpackedPositional = llvm::any_of(
       operands.positionalUnpacked, [](char value) { return value != 0; });
-  if (hasUnpackedPositional) {
-    if (const auto *args = ast::nodeList(expr, "args")) {
-      for (const parser::NodePtr &arg : *args) {
-        if (!arg || arg->kind != "Starred")
-          continue;
-        diagnostics.push_back(parser::Diagnostic{
-            parser::Severity::Error, arg->range.start,
-            "starred arguments are not supported for source class "
-            "instantiation"});
-      }
-    }
-  }
 
   mlir::Type inferredInstanceType = types.inferClassInstantiation(
       instanceType, operands.positionalTypes, operands.keywordTypes);

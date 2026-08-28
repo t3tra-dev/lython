@@ -2,6 +2,9 @@
 
 #include "Runtime/ABI/BoxLayout.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 #include <cstddef>
 
 namespace py::lowering {
@@ -702,10 +705,87 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
   return mlir::success();
 }
 
+// ⭐ A STARRED ARGUMENT IS AN ARITY, AND THE TYPE CARRIES IT. Sequence
+// evidence -- the elements a tuple LITERAL was built from -- is the cheap
+// answer and does not survive a binding, so `add(*ys)` worked for
+// `add(*(1, 2))` and was refused for the same tuple through a name. The
+// static type of a positional tuple says how many members there are, which is
+// all the expansion needs; the elements themselves come out of the payload the
+// way any other container read does.
+//
+// ⛔ THE LENGTH IS CHECKED even though the type asserts it. A tuple that
+// reaches here through a cast or a manifest result whose declared arity is
+// wrong would otherwise read past its payload, which is a wild read and not a
+// wrong answer. `tuple[T]` -- the arity-erased spelling, which is what
+// `tuple[T, ...]` becomes -- has no arity to check against and is still
+// refused.
+mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>>
+RuntimeBundleLowerer::starredSequenceElements(mlir::Operation *op,
+                                              const RuntimeBundle &source,
+                                              llvm::StringRef label) {
+  if (source.kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << label << " must be a lowered object bundle";
+  if (!source.sequenceIndices.empty())
+    return op->emitError() << label << " has only partial sequence evidence";
+  if (!source.sequenceElements.empty())
+    return llvm::SmallVector<RuntimeValue, 4>(source.sequenceElements.begin(),
+                                              source.sequenceElements.end());
+
+  auto tuple =
+      mlir::dyn_cast_if_present<py::ContractType>(source.objectValue.contract);
+  if (!tuple || tuple.getContractName() != "builtins.tuple" ||
+      tuple.getArguments().size() < 2)
+    return op->emitError()
+           << label
+           << " needs sequence evidence or a tuple type that says how many "
+              "members it has";
+  if (!RuntimeBundleLowerer::containerHasRuntimePayload(source))
+    return op->emitError() << label << " has neither elements nor a payload";
+
+  llvm::ArrayRef<mlir::Type> members = tuple.getArguments();
+  mlir::Location loc = op->getLoc();
+  mlir::FailureOr<mlir::Value> lengthOr =
+      RuntimeBundleLowerer::loadContainerLength(op, source, label);
+  if (mlir::failed(lengthOr))
+    return mlir::failure();
+  mlir::Value declared = mlir::arith::ConstantIntOp::create(
+      builder, loc, static_cast<std::int64_t>(members.size()), 64);
+  mlir::Value mismatched = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::ne, *lengthOr, declared);
+  auto guard = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                       mismatched, /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard insertionGuard(builder);
+    builder.setInsertionPointToStart(&guard.getThenRegion().front());
+    if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
+            op, "builtins.TypeError",
+            "starred call argument does not have the number of members its "
+            "type declares")))
+      return mlir::failure();
+  }
+  builder.setInsertionPointAfter(guard);
+
+  mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
+  llvm::SmallVector<RuntimeValue, 4> elements;
+  elements.reserve(members.size());
+  for (auto [index, member] : llvm::enumerate(members)) {
+    mlir::Value slot = mlir::arith::ConstantIntOp::create(
+        builder, loc, static_cast<std::int64_t>(index), 64);
+    bool arrivesOwned = false;
+    mlir::FailureOr<RuntimeValue> element =
+        RuntimeBundleLowerer::payloadElementAt(op, source, slot, one, member,
+                                               label, arrivesOwned);
+    if (mlir::failed(element))
+      return mlir::failure();
+    elements.push_back(*element);
+  }
+  return elements;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::collectPackedObjectSources(
     mlir::Operation *op, mlir::Value packValue, llvm::StringRef label,
     llvm::SmallVectorImpl<const RuntimeBundle *> &sources,
-    llvm::SmallVectorImpl<RuntimeBundle> *unpackedSources) const {
+    llvm::SmallVectorImpl<RuntimeBundle> *unpackedSources) {
   const RuntimeBundle *pack = RuntimeBundleLowerer::bundleFor(packValue);
   if (!pack || pack->kind != RuntimeBundle::Kind::Aggregate)
     return op->emitError() << label << " must be a lowered aggregate bundle";
@@ -735,17 +815,12 @@ mlir::LogicalResult RuntimeBundleLowerer::collectPackedObjectSources(
       if (!unpackedSources)
         return op->emitError()
                << label << " starred operand needs bundle storage";
-      if (source->kind != RuntimeBundle::Kind::Object)
-        return op->emitError()
-               << label << " starred operand must be a Python object bundle";
-      if (!source->sequenceIndices.empty())
-        return op->emitError()
-               << label << " starred operand has only partial sequence "
-               << "evidence";
-      if (source->sequenceElements.empty())
-        return op->emitError()
-               << label << " starred operand needs sequence evidence";
-      for (const RuntimeValue &element : source->sequenceElements) {
+      mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>> elements =
+          RuntimeBundleLowerer::starredSequenceElements(
+              op, *source, (label + " starred operand").str());
+      if (mlir::failed(elements))
+        return mlir::failure();
+      for (const RuntimeValue &element : *elements) {
         unpackedSources->push_back(
             RuntimeBundle::object(element.contract, element.values));
         sources.push_back(&unpackedSources->back());

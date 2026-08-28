@@ -878,6 +878,21 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   unboxSlotElementValues(mlir::Operation *op, mlir::Type contract,
                          llvm::ArrayRef<mlir::Value> values);
+  // One element of a runtime container's payload, at a slot the caller has
+  // already clamped into range. `valid` gates the erased lane's box. The
+  // element is BORROWED from the container unless the erased lane minted a box
+  // for it, which `arrivesOwned` reports.
+  mlir::FailureOr<RuntimeValue>
+  payloadElementAt(mlir::Operation *op, const RuntimeBundle &container,
+                   mlir::Value slot, mlir::Value valid,
+                   mlir::Type elementContract, llvm::StringRef label,
+                   bool &arrivesOwned);
+  // The elements a starred call argument expands to: the sequence evidence
+  // when there is any, and otherwise a runtime read of a statically sized
+  // tuple's payload, guarded by a length check.
+  mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>>
+  starredSequenceElements(mlir::Operation *op, const RuntimeBundle &source,
+                          llvm::StringRef label);
   mlir::LogicalResult
   bindRetainedEvidenceValue(mlir::Operation *op, mlir::Value resultValue,
                             llvm::StringRef label, const RuntimeValue &value,
@@ -1320,7 +1335,7 @@ private:
   mlir::LogicalResult collectPackedObjectSources(
       mlir::Operation *op, mlir::Value packValue, llvm::StringRef label,
       llvm::SmallVectorImpl<const RuntimeBundle *> &sources,
-      llvm::SmallVectorImpl<RuntimeBundle> *unpackedSources = nullptr) const;
+      llvm::SmallVectorImpl<RuntimeBundle> *unpackedSources = nullptr);
   mlir::LogicalResult requireEmptyAggregate(mlir::Operation *op,
                                             mlir::Value packValue,
                                             llvm::StringRef label) const;

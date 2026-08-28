@@ -1334,6 +1334,78 @@ RuntimeBundleLowerer::lowerDictEvidenceGetItem(
   return true;
 }
 
+// One element out of a runtime container's payload. Shared, because a
+// subscript, an iteration step and a starred call argument all rebuild an
+// element the same way and only differ in how they got the slot.
+mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::payloadElementAt(
+    mlir::Operation *op, const RuntimeBundle &container, mlir::Value slot,
+    mlir::Value valid, mlir::Type elementContract, llvm::StringRef label,
+    bool &arrivesOwned) {
+  mlir::Location loc = op->getLoc();
+  arrivesOwned = false;
+  mlir::FailureOr<mlir::Value> itemsView =
+      RuntimeBundleLowerer::containerInteriorView(
+          op, container, ContainerInterior::Primary, label);
+  if (mlir::failed(itemsView))
+    return mlir::failure();
+  mlir::Value wordsPerSlot =
+      mlir::arith::ConstantIntOp::create(builder, loc, box_abi::kWordsPerBox, 64);
+  mlir::Value base =
+      mlir::arith::MulIOp::create(builder, loc, slot, wordsPerSlot).getResult();
+  if (auto elementUnion = mlir::dyn_cast<py::UnionType>(elementContract)) {
+    mlir::Value classWord =
+        box_abi::loadContainerBoxWord(builder, loc, *itemsView, base, 1);
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(
+        builder, loc, *itemsView, base, box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+        RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
+                                                      classWord, entityWord);
+    if (mlir::failed(unionValues))
+      return mlir::failure();
+    return RuntimeValue{
+        elementContract,
+        llvm::SmallVector<mlir::Value, 4>(unionValues->begin(),
+                                          unionValues->end()),
+        ownership::logicalOwnershipKind(elementContract,
+                                        /*ownsObject=*/false)};
+  }
+  llvm::SmallVector<mlir::Value, 4> elementValues;
+  if (runtimeContractName(elementContract) == "builtins.object") {
+    // Erased read lane: see lowerRuntimeDictGetItem.
+    std::optional<RuntimeSymbol> fromSlot =
+        manifest.primitive("builtins.object", "from_slot");
+    if (!fromSlot)
+      return op->emitError()
+             << "runtime manifest has no object from_slot primitive";
+    mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *fromSlot, mlir::ValueRange{*itemsView, slot, valid});
+    elementValues.push_back(boxed.getResult(0));
+    arrivesOwned = true;
+  } else {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> shapes =
+        RuntimeBundleLowerer::slotStorageShapesFor(op, elementContract, label);
+    if (mlir::failed(shapes))
+      return mlir::failure();
+    mlir::Value entityWord = box_abi::loadContainerBoxWord(
+        builder, loc, *itemsView, base, box_abi::kEntityWord);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+        RuntimeBundleLowerer::lanesFromBoxEntity(
+            builder, loc, entityWord, *shapes,
+            runtimeContractName(elementContract), op);
+    if (mlir::failed(lanes))
+      return mlir::failure();
+    elementValues.append(lanes->begin(), lanes->end());
+  }
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
+      RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,
+                                                   elementValues);
+  if (mlir::failed(canonical))
+    return mlir::failure();
+  return RuntimeValue{elementContract, *canonical,
+                      ownership::logicalOwnershipKind(elementContract,
+                                                      /*ownsObject=*/false)};
+}
+
 // `xs[i]` on a runtime-mode list or tuple (identical physical layout: header,
 // length, boxes): runtime bounds check (negative indices normalize),
 // IndexError on miss, element rebuilt from its box words and retained
@@ -1462,78 +1534,28 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   // Retaining both left the erased lane at 2 against one release -- one leaked
   // object per boxed slot read, unbounded.
   bool elementArrivesOwned = false;
-  mlir::FailureOr<mlir::Value> itemsView =
-      RuntimeBundleLowerer::containerInteriorView(
-          op, container, ContainerInterior::Primary, "runtime list getitem");
-  if (mlir::failed(itemsView))
+  mlir::FailureOr<RuntimeValue> element = RuntimeBundleLowerer::payloadElementAt(
+      op, container, safe, inRange, elementContract, "runtime list getitem",
+      elementArrivesOwned);
+  if (mlir::failed(element))
     return mlir::failure();
   if (elementUnion) {
-    mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
-        builder, loc, box_abi::kWordsPerBox, 64);
-    mlir::Value base =
-        mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
-            .getResult();
-    mlir::Value classWord =
-        box_abi::loadContainerBoxWord(builder, loc, *itemsView, base, 1);
-    mlir::Value entityWord = box_abi::loadContainerBoxWord(builder, loc, *itemsView, base,
-                                                  box_abi::kEntityWord);
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
-        RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
-                                                      classWord, entityWord);
-    if (mlir::failed(unionValues))
-      return mlir::failure();
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, elementContract, *unionValues, result)))
+            op, elementContract, element->values, result)))
       return mlir::failure();
     result.setObjectLogicalOwnership(/*ownsObject=*/false);
     valueBundles[op.getResult()] = std::move(result);
     erase.push_back(op);
     return true;
   }
-  if (runtimeContractName(elementContract) == "builtins.object") {
-    // Erased read lane: see lowerRuntimeDictGetItem.
-    std::optional<RuntimeSymbol> fromSlot =
-        manifest.primitive("builtins.object", "from_slot");
-    if (!fromSlot) {
-      op.emitError() << "runtime manifest has no object from_slot primitive";
-      return mlir::failure();
-    }
-    mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *fromSlot, mlir::ValueRange{*itemsView, safe, inRange});
-    elementValues.push_back(boxed.getResult(0));
-    elementArrivesOwned = true;
-  } else {
-    mlir::Value wordsPerSlot = mlir::arith::ConstantIntOp::create(
-        builder, loc, box_abi::kWordsPerBox, 64);
-    mlir::Value base =
-        mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
-            .getResult();
-    mlir::Value entityWord = box_abi::loadContainerBoxWord(builder, loc, *itemsView, base,
-                                                  box_abi::kEntityWord);
-    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
-        RuntimeBundleLowerer::lanesFromBoxEntity(
-            builder, loc, entityWord, *shapes,
-            runtimeContractName(elementContract), op);
-    if (mlir::failed(lanes))
-      return mlir::failure();
-    elementValues.append(lanes->begin(), lanes->end());
-  }
-  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
-      RuntimeBundleLowerer::unboxSlotElementValues(op, elementContract,
-                                                   elementValues);
-  if (mlir::failed(canonical))
-    return mlir::failure();
-  RuntimeValue element{elementContract, *canonical,
-                       ownership::logicalOwnershipKind(elementContract,
-                                                       /*ownsObject=*/false)};
   if (mlir::failed(elementArrivesOwned
                        ? bindOwnedEvidenceValue(op, op.getResult(),
                                                 "runtime sequence __getitem__",
-                                                element)
+                                                *element)
                        : bindRetainedEvidenceValue(op, op.getResult(),
                                                    "runtime sequence __getitem__",
-                                                   element)))
+                                                   *element)))
     return mlir::failure();
   if (mlir::failed(pinContainerLiveness(op, container,
                                         /*insertAfterOp=*/true)))

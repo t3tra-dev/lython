@@ -633,9 +633,15 @@ mlir::Type tupleOfMembers(const TypeSystem &types,
                           llvm::ArrayRef<mlir::Type> members) {
   if (members.empty())
     return types.tupleOf(types.object());
-  bool uniform = llvm::all_of(
-      members, [&](mlir::Type type) { return type == members.front(); });
-  if (uniform)
+  // ⭐ ONLY A ONE-MEMBER SPELLING IS HOMOGENEOUS. `tuple[T]` means "any number
+  // of T" -- it is what `tuple[T, ...]` becomes once the Ellipsis is dropped --
+  // so collapsing uniform members into it threw the ARITY away, and the arity
+  // is the whole of what a starred call needs: `add(*ys)` for
+  // `ys: tuple[int, int]` was refused with "starred call arguments require a
+  // statically sized tuple" about a tuple whose size is written in its own
+  // annotation. Differing members were already kept positionally; uniform ones
+  // now are too, and nothing else distinguishes the two cases.
+  if (members.size() == 1)
     return types.tupleOf(members.front());
   return types.contract("builtins.tuple", members);
 }

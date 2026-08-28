@@ -253,19 +253,15 @@ mlir::LogicalResult RuntimeBundleLowerer::collectFunctionCallSources(
       return op.emitError()
              << "positional arg operand has no lowered runtime bundle";
     if (aggregateOperandIsUnpacked(*posargs, static_cast<unsigned>(index))) {
-      if (source->kind != RuntimeBundle::Kind::Object)
-        return op.emitError()
-               << "starred positional arg operand for function target "
-               << targetName << " must be a lowered object bundle";
-      if (!source->sequenceIndices.empty())
-        return op.emitError()
-               << "starred positional arg operand for function target "
-               << targetName << " has only partial sequence evidence";
-      if (source->sequenceElements.empty())
-        return op.emitError()
-               << "starred positional arg operand for function target "
-               << targetName << " needs sequence evidence";
-      for (const RuntimeValue &element : source->sequenceElements) {
+      mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>> elements =
+          RuntimeBundleLowerer::starredSequenceElements(
+              op, *source,
+              ("starred positional arg operand for function target " +
+               targetName)
+                  .str());
+      if (mlir::failed(elements))
+        return mlir::failure();
+      for (const RuntimeValue &element : *elements) {
         materializedDefaults.push_back(
             RuntimeBundle::object(element.contract, element.values));
         positionalTypes.push_back(element.contract);
