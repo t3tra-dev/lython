@@ -299,13 +299,11 @@ TEST(EmitterTest, ExceptStarAndYieldAreEachStillFineApart) {
 // declares Self).
 TEST(EmitterTest, NamesThePrintKeywordItCannotTake) {
   mlir::MLIRContext context(testRegistry());
-  // `end` needs a write that does not append the newline, and the only builtin
-  // sink does; say which keyword and why rather than reporting the whole
-  // contract as unmatched.
+  // `sep` and `end` are this ladder's own join and terminator; every other
+  // keyword is named rather than reported as an unmatched contract.
   lython::emitter::EmitResult end =
       emitSource("print(\"a\", end=\"\")\n", context);
-  EXPECT_FALSE(end.ok());
-  EXPECT_TRUE(reportsDiagnostic(end, "print(end=...) is not supported"));
+  EXPECT_TRUE(end.ok());
 
   lython::emitter::EmitResult flush =
       emitSource("print(\"a\", flush=True)\n", context);

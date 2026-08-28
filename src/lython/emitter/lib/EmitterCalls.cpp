@@ -3325,6 +3325,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // builtin, so the emitter cannot reach it. Saying that by name beats the
   // contract mismatch, which is what the diagnostic below is for.
   const parser::Node *separatorNode = nullptr;
+  const parser::Node *endNode = nullptr;
   std::string refusedKeyword;
   if (printKeywords)
     for (const parser::NodePtr &keyword : *printKeywords) {
@@ -3338,21 +3339,64 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
         if (separatorNode)
           continue;
       }
+      if (name && *name == "end" && !endNode) {
+        endNode = ast::node(*keyword, "value");
+        if (endNode)
+          continue;
+      }
       refusedKeyword = name ? name->str() : "**";
       break;
     }
   if (!refusedKeyword.empty()) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        refusedKeyword == "end"
-            ? std::string("print(end=...) is not supported: the only runtime "
-                          "write appends the newline, so a different "
-                          "terminator has no sink to reach")
-            : "print() does not take the keyword argument '" + refusedKeyword +
-                  "'"});
+        "print() does not take the keyword argument '" + refusedKeyword + "'"});
     return emitNone(expr);
   }
-  bool noPrintKeywords = !separatorNode;
+  // ⭐ `end=` IS THE FILE'S OWN `write`, which is what CPython's print does:
+  // `builtin_print_impl` writes the joined arguments and then writes `end`,
+  // and the only reason this could not be spelled here was the sink. The
+  // builtin `print` reaches `LyUnicode_PrintLine`, which appends the newline;
+  // `sys.stdout.write` reaches `LyTextIO_Write`, which does not -- and the
+  // binding resolves without an import, because the lowering answers
+  // `py.binding.ref "sys.stdout"` from the manifest primitive.
+  //
+  // ⛔ ONE write and not two: `end` is concatenated onto the joined arguments
+  // rather than written after them, so an interleaved failure cannot leave
+  // half a line. CPython makes two calls, but the difference is only
+  // observable through a `file` this fold does not take.
+  auto writeWithEnd = [&](Value text) -> std::optional<Value> {
+    mlir::Type strContract = types.contract("builtins.str");
+    Value end = coerceValue(emitExpr(endNode), strContract, expr);
+    text = emitBinarySpecial<py::AddOp>(expr, "__add__", text, end,
+                                        strContract);
+    mlir::Type wrapper = types.contract("_io.TextIOWrapper");
+    Value stream = emitBindingRef(expr, "sys.stdout", wrapper, {});
+    std::string streamName =
+        "__lyprintout" + std::to_string(++syntheticFunctionCounter);
+    std::string textName =
+        "__lyprinttext" + std::to_string(++syntheticFunctionCounter);
+    values[streamName] = stream;
+    types.bindSymbol(streamName, wrapper);
+    values[textName] = text;
+    types.bindSymbol(textName, text.type);
+    parser::NodePtr write = synth::methodCall(
+        synth::name(streamName, expr.range), "write",
+        {synth::name(textName, expr.range)}, expr.range);
+    (void)emitExpr(write.get());
+    synthesizedIteratorDefs.push_back(std::move(write));
+    values.erase(streamName);
+    values.erase(textName);
+    return emitNone(expr);
+  };
+  bool noPrintKeywords = !separatorNode && !endNode;
+  if (endNode && (!printArgs || printArgs->empty())) {
+    mlir::Type emptyType = types.literal("\"\"");
+    auto empty = py::StrConstantOp::create(builder, loc(expr), emptyType,
+                                           builder.getStringAttr(""));
+    return writeWithEnd(coerceValue(Value{empty.getResult(), emptyType},
+                                    types.contract("builtins.str"), expr));
+  }
   if (noPrintKeywords && (!printArgs || printArgs->empty())) {
     mlir::Type emptyType = types.literal("\"\"");
     auto empty = py::StrConstantOp::create(builder, loc(expr), emptyType,
@@ -3382,7 +3426,7 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // manifest print would silently drop the keyword.
   bool plainArguments =
       printArgs && (printArgs->size() >= 2 || singleUnionArgument ||
-                    (separatorNode && !printArgs->empty()));
+                    ((separatorNode || endNode) && !printArgs->empty()));
   if (plainArguments)
     for (const parser::NodePtr &argument : *printArgs)
       if (!argument || argument->kind == "Starred")
@@ -3457,6 +3501,8 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
                                             strType);
     }
     if (allConverted) {
+      if (endNode)
+        return writeWithEnd(joined);
       Value printCallee = emitExpr(calleeNode);
       CallOperands operands =
           emitCallOperands(expr, {joined}, /*includeAstArguments=*/false);
