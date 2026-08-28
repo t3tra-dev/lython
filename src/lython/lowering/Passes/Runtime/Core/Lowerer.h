@@ -62,6 +62,16 @@ using lython::common::constantInt;
 using lython::common::logicalAnd;
 using lython::common::logicalNot;
 
+// A run of physical values out of a bundle's lane list: a union member's lanes
+// start at its offset and are as many as its ABI names. Shared, because the
+// union read, the union write and the field read all take the same slice.
+inline void appendValueSlice(mlir::ValueRange values, unsigned begin,
+                             unsigned count,
+                             llvm::SmallVectorImpl<mlir::Value> &out) {
+  for (unsigned index = 0; index < count; ++index)
+    out.push_back(values[begin + index]);
+}
+
 class RuntimeBundleLowerer {
 public:
   explicit RuntimeBundleLowerer(mlir::ModuleOp module);

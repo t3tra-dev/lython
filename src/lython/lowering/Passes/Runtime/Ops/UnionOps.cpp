@@ -4,12 +4,6 @@ namespace py::lowering {
 
 namespace {
 
-void appendValueSlice(mlir::ValueRange values, unsigned begin, unsigned count,
-                      llvm::SmallVectorImpl<mlir::Value> &out) {
-  for (unsigned index = 0; index < count; ++index)
-    out.push_back(values[begin + index]);
-}
-
 } // namespace
 
 std::optional<unsigned>
