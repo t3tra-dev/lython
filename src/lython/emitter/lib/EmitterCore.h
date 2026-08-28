@@ -296,6 +296,9 @@ private:
   // that follow it in this suite; null when they disagree or there are none.
   py::CallableType lambdaCallSeedContract(llvm::StringRef name,
                                           const parser::Node &lambda);
+  // The union `NAME = None` takes when the rest of the suite binds NAME to
+  // something else; null when nothing does or the bindings cannot be typed.
+  mlir::Type noneSeedUnionType(llvm::StringRef name);
   mlir::Type emptyLiteralSeedType(llvm::StringRef name,
                                   llvm::StringRef literalKind);
   bool isModuleGlobalRead(llvm::StringRef name) const;

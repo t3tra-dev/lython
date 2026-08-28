@@ -76,6 +76,10 @@ bool derivesViaStructuralMutation(mlir::Value current, mlir::Value previous);
 
 bool containsObjectTop(mlir::Type type, const TypeSystem &types);
 bool isNoneTypeLike(mlir::Type type);
+// Does this subtree READ `name`? A store is not a read: `x[i] = v` reads `x`,
+// `x = v` does not. Shared by the two forward scans that ask it -- the slot a
+// region-bound name gets, and the union a `None` seed takes.
+bool containsNameLoad(const parser::Node *node, llvm::StringRef name);
 mlir::Type removeNoneFromType(mlir::Type type, TypeSystem &types);
 
 struct NoneComparisonNarrowing {

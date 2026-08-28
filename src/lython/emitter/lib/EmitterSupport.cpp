@@ -1351,6 +1351,47 @@ void collectAssignedNames(const parser::Node *node, llvm::StringSet<> &names) {
   }
 }
 
+// Does anything after this statement in the same suite READ `name`? A store
+// is not a read: `x[i] = v` reads `x`, `x = v` does not.
+bool containsNameLoad(const parser::Node *node, llvm::StringRef name) {
+  if (!node)
+    return false;
+  if (node->kind == "Name")
+    return llvm::StringRef(ast::nameSpelling(*node)) == name;
+  llvm::SmallPtrSet<const parser::Node *, 4> stores;
+  auto noteStoreTarget = [&](const parser::Node *target) {
+    if (target && target->kind == "Name")
+      stores.insert(target);
+  };
+  if (node->kind == "Assign") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        noteStoreTarget(target.get());
+  } else if (node->kind == "AnnAssign" || node->kind == "NamedExpr" ||
+             node->kind == "For" || node->kind == "AsyncFor") {
+    noteStoreTarget(ast::node(*node, "target"));
+  } else if (node->kind == "With" || node->kind == "AsyncWith") {
+    if (const auto *items = ast::nodeList(*node, "items"))
+      for (const parser::NodePtr &item : *items)
+        noteStoreTarget(ast::node(*item, "optional_vars"));
+  }
+
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && !stores.contains(child->get()) &&
+          containsNameLoad(child->get(), name))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child && !stores.contains(child.get()) &&
+            containsNameLoad(child.get(), name))
+          return true;
+    }
+  }
+  return false;
+}
+
 void collectAssignedNames(const std::vector<parser::NodePtr> *statements,
                           llvm::StringSet<> &names) {
   if (!statements)
