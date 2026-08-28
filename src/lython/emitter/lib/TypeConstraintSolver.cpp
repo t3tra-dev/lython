@@ -280,6 +280,29 @@ bool bindTypeList(const TypeSystem &types, mlir::ArrayRef<mlir::Type> expected,
 
 bool bindUnionMember(const TypeSystem &types, py::UnionType expected,
                      mlir::Type actual, TypeBindingMap &bindings) {
+  // ⭐ A NARROWER UNION IS ONE OF THE THINGS A WIDER UNION ACCEPTS. This walk
+  // asked whether the WHOLE actual type binds to some member, and a union
+  // never does, so `f(x)` with `x: int | str` against `def f(v: int | str |
+  // None)` was refused as "call arguments do not match the Callable contract"
+  // -- a subset the type lattice already admits (`union<Ss> <: union<Ts> iff
+  // Ss subset of Ts`) and that `coerceValue` already knows how to inject,
+  // member by member, through `py.union.wrap`.
+  //
+  // ⛔ ALL OF THEM, in ONE speculation: a partial match must leave no
+  // bindings behind, and each member has to find a home for the wrap the
+  // coercion will emit to be total.
+  if (auto actualUnion = mlir::dyn_cast_if_present<py::UnionType>(actual)) {
+    TypeBindingMap candidate = bindings;
+    InferenceContext::Speculation attempt(types.inference());
+    bool all = true;
+    for (mlir::Type member : actualUnion.getMemberTypes())
+      all = all && bindUnionMember(types, expected, member, candidate);
+    if (all) {
+      attempt.commit();
+      bindings = std::move(candidate);
+      return true;
+    }
+  }
   for (mlir::Type member : expected.getMemberTypes()) {
     TypeBindingMap candidate = bindings;
     InferenceContext::Speculation attempt(types.inference());

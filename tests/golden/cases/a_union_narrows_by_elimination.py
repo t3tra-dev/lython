@@ -49,3 +49,13 @@ def four(v: "int | float | str | None") -> str:
 
 
 sys.stdout.write(four(1) + four(1.5) + four("q") + four(None) + "\n")
+
+
+# ⭐ A NARROWER UNION IS ONE OF THE THINGS A WIDER ONE ACCEPTS, which is what
+# lets a value narrowed by one of these guards be handed on.
+def widen(v: "int | str") -> str:
+    return render(v)
+
+
+narrowed: "int | str" = 5
+sys.stdout.write(widen(narrowed) + " " + widen("zz") + "\n")
