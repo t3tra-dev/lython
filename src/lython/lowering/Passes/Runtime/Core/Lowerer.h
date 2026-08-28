@@ -1323,6 +1323,11 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
   unionValuesFromBoxWords(mlir::Operation *op, py::UnionType unionType,
                           mlir::Value classWord, mlir::Value entityWord);
+  // One reference per member, for a union read whose container is released
+  // before the binding dies. See the note at the definition.
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
+  retainUnionMemberValues(mlir::Operation *op, py::UnionType unionType,
+                          llvm::ArrayRef<mlir::Value> values);
   mlir::LogicalResult lowerClassTest(py::ClassTestOp op);
   mlir::LogicalResult lowerTypeObject(py::TypeObjectOp op);
   mlir::LogicalResult lowerAttrGet(py::AttrGetOp op);

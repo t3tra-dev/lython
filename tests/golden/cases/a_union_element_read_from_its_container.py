@@ -36,6 +36,34 @@ for k in sorted(d):
 for w2 in d.values():
     print(type(w2).__name__)
 
+# ⛔ A UNION GOES BACK IN AS THE MEMBER ITS TAG NAMES. The read has to take a
+# reference per member and PIN the container past it: a tuple a function
+# returned was released between the union's build and the retain, so the retain
+# ran on a string already at zero -- and with the write in place one such
+# program answered instead of aborting.
+def split(line: str) -> "tuple[str, int | str]":
+    key, _, raw = line.partition("=")
+    if raw.isdigit():
+        return (key, int(raw))
+    return (key, raw)
+
+
+table: "dict[str, int | str]" = {}
+for line in ["port=8080", "host=local"]:
+    name, parsed = split(line)
+    table[name] = parsed
+for name in sorted(table):
+    stored = table[name]
+    print(name, stored, type(stored).__name__)
+
+copied: "list[int | str]" = []
+for cell in xs:
+    copied.append(cell)
+print(copied)
+
+head, *tail = xs
+print(head, tail)
+
 rows: "list[list[int | str]]" = [[1, "a"], ["b", 2]]
 for row in rows:
     for cell in row:

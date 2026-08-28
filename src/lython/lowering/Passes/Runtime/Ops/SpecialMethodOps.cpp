@@ -2005,13 +2005,32 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
                                                       classWord, entityWord);
     if (mlir::failed(unionValues))
       return mlir::failure();
-    RuntimeBundle element;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, elementContract, *unionValues, element)))
+    // ⛔ A REFERENCE PER MEMBER, not a borrow. The erased branch beside this
+    // one mints an owned box (`from_slot`), and for the same reason: an
+    // unpack's element outlives the container when the container is a
+    // temporary -- `k, v = make(1)` released the tuple and then increfed a str
+    // whose count had already reached zero.
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+        RuntimeBundleLowerer::retainUnionMemberValues(op, elementUnion,
+                                                       *unionValues);
+    if (mlir::failed(owned))
       return mlir::failure();
-    element.setObjectLogicalOwnership(/*ownsObject=*/false);
+    RuntimeBundle element;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op, elementContract, *owned, element,
+            ownership::logicalOwnershipKind(elementContract,
+                                            /*ownsObject=*/true))))
+      return mlir::failure();
     if (mlir::failed(bindSelectedEvidenceObjectResult(op, op.getElement(),
                                                       std::move(element))))
+      return mlir::failure();
+    // ⛔ AND THE CONTAINER IS PINNED PAST THE RETAINS. The release planner puts
+    // a temporary's death after its last USE, and the union's lanes are built
+    // from the box by arithmetic on an ADDRESS -- nothing the planner reads as
+    // a use of the container. It placed the tuple's release between the build
+    // and the retain, so the retain ran on a string already at zero.
+    if (mlir::failed(pinContainerLiveness(op, iterator,
+                                          /*insertAfterOp=*/true)))
       return mlir::failure();
     std::optional<RuntimeSymbol> lenPin =
         manifest.method(iterator.contractName(), "__len__");

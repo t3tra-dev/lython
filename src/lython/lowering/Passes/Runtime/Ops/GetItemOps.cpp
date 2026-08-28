@@ -1540,12 +1540,26 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeSequenceGetItem(
   if (mlir::failed(element))
     return mlir::failure();
   if (elementUnion) {
-    RuntimeBundle result;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, elementContract, element->values, result)))
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+        RuntimeBundleLowerer::retainUnionMemberValues(op, elementUnion,
+                                                       element->values);
+    if (mlir::failed(owned))
       return mlir::failure();
-    result.setObjectLogicalOwnership(/*ownsObject=*/false);
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op, elementContract, *owned, result,
+            ownership::logicalOwnershipKind(elementContract,
+                                            /*ownsObject=*/true))))
+      return mlir::failure();
     valueBundles[op.getResult()] = std::move(result);
+    // ⛔ AND THE CONTAINER IS PINNED PAST THE RETAINS. The release planner puts
+    // a temporary's death after its last USE, and the union's lanes are built
+    // from the box by arithmetic on an ADDRESS -- nothing it reads as a use of
+    // the container. It placed a returned tuple's release between the build
+    // and the retain, so the retain ran on a string already at zero.
+    if (mlir::failed(pinContainerLiveness(op, container,
+                                          /*insertAfterOp=*/true)))
+      return mlir::failure();
     erase.push_back(op);
     return true;
   }

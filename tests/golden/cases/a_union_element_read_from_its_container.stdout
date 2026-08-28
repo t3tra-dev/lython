@@ -11,6 +11,10 @@ a int 2
 b str z
 int
 str
+host local str
+port 8080 int
+['k', 1]
+k [1]
 int 1
 str a
 str b

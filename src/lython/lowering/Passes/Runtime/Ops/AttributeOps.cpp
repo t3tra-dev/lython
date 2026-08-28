@@ -2019,6 +2019,51 @@ mlir::Value RuntimeBundleLowerer::exactClassIdFromWords(mlir::Operation *op,
 //
 // ⛔ BORROWED, all of them: the lanes are views of what the container's box
 // owns, which is the same footing an evidence-backed element read is on.
+// ⭐ A UNION READ OUT OF A CONTAINER TAKES A REFERENCE PER MEMBER. Its lanes
+// are views into the box the container owns, and the container's own release
+// lands immediately after the read: `k, v = make(1)` for a
+// `tuple[str, int | str]` released the tuple and then increfed a str whose
+// refcount had already reached zero. Retaining is unconditional and needs no
+// tag -- an inactive member's lanes are the immortal dead placeholder, whose
+// refcount is saturated, so the retain reads a constant global and changes
+// nothing.
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
+RuntimeBundleLowerer::retainUnionMemberValues(
+    mlir::Operation *op, py::UnionType unionType,
+    llvm::ArrayRef<mlir::Value> values) {
+  if (values.empty())
+    return op->emitError() << "a union value has no tag to retain by";
+  llvm::SmallVector<mlir::Value, 8> retained{values.front()};
+  for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
+                                                   "union member ABI");
+    if (mlir::failed(laneTypes))
+      return mlir::failure();
+    if (laneTypes->empty())
+      continue;
+    mlir::FailureOr<unsigned> offset =
+        RuntimeBundleLowerer::unionMemberValueOffset(op, unionType, index,
+                                                     "union member ABI");
+    if (mlir::failed(offset))
+      return mlir::failure();
+    llvm::SmallVector<mlir::Value, 4> lanes;
+    appendValueSlice(values, *offset, static_cast<unsigned>(laneTypes->size()),
+                     lanes);
+    RuntimeValue memberValue{
+        member, lanes,
+        ownership::logicalOwnershipKind(member, /*ownsObject=*/false)};
+    std::optional<RuntimeValue> owned =
+        RuntimeBundleLowerer::retainEvidenceElement(op, memberValue,
+                                                     /*atOperation=*/true);
+    if (owned)
+      retained.append(owned->values.begin(), owned->values.end());
+    else
+      retained.append(lanes.begin(), lanes.end());
+  }
+  return retained;
+}
+
 mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
 RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
                                               py::UnionType unionType,

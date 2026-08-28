@@ -451,6 +451,62 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
     return op->emitError() << "collection payload element is not an object";
   if (concrete->contractName() == "types.NoneType")
     return emptyHandle();
+  // ⭐ A UNION IS STORED AS THE MEMBER THE TAG NAMES. The read half rebuilds a
+  // union from a slot's box (`unionValuesFromBoxWords`); this is the same
+  // question in the other direction, and without it a value that came OUT of
+  // one container could not go INTO another -- `config[k] = v` after
+  // `k, v = parse(line)`, which is how every such table is built.
+  //
+  // ⛔ SELECTS, NOT BRANCHES, for the reason the optional FIELD store records:
+  // a guarded store leaves the ownership walk with a group it cannot follow.
+  // Every member's handle words are computed unconditionally and the TAG picks
+  // which set is written. That is sound because an inactive member's lanes are
+  // the immortal dead placeholder every producer of a union gives them, so
+  // computing its handle reads a constant global and writes nothing.
+  if (auto unionType =
+          mlir::dyn_cast<py::UnionType>(concrete->objectValue.contract)) {
+    if (concrete->physicalValues().empty())
+      return op->emitError() << "a union payload element has no tag";
+    mlir::Value tag = concrete->physicalValues().front();
+    llvm::SmallVector<mlir::Value, 4> words = emptyHandle();
+    for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
+                                                     "union member ABI");
+      if (mlir::failed(laneTypes))
+        return mlir::failure();
+      if (laneTypes->empty())
+        continue;
+      mlir::FailureOr<unsigned> offset =
+          RuntimeBundleLowerer::unionMemberValueOffset(op, unionType, index,
+                                                       "union member ABI");
+      if (mlir::failed(offset))
+        return mlir::failure();
+      llvm::SmallVector<mlir::Value, 4> lanes;
+      appendValueSlice(concrete->physicalValues(), *offset,
+                       static_cast<unsigned>(laneTypes->size()), lanes);
+      RuntimeBundle memberBundle;
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+              op, member, lanes, memberBundle,
+              concrete->objectValue.ownership)))
+        return mlir::failure();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> memberWords =
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, memberBundle,
+                                                          ownsPayload);
+      if (mlir::failed(memberWords))
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Value active = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::eq, tag,
+          constantI64(builder, loc, static_cast<std::int64_t>(index)));
+      for (auto [slot, word] : llvm::enumerate(words))
+        if (slot < memberWords->size())
+          words[slot] = mlir::arith::SelectOp::create(
+                            builder, loc, active, (*memberWords)[slot], word)
+                            .getResult();
+    }
+    return words;
+  }
   // Slots hold CANONICAL payload handles (word 1 = payload class, words 4+
   // = the payload's own memrefs) so hash/eq/repr dispatch reads them
   // uniformly. An opaque erased `object` (no tracked concrete payload)
