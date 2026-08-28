@@ -2277,7 +2277,8 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
         "second argument to isinstance must be a statically resolved class "
-        "type, or a tuple of them"});
+        "type, or a tuple of them, got " +
+            typeText(types.inferExpr((*args)[1].get()))});
     return emitNone(expr);
   }
 

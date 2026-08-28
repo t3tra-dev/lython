@@ -55,6 +55,12 @@ def describe(o: object) -> str:
         return "exception"
     if isinstance(o, str):
         return "str " + o.upper() + " " + str(len(o))
+    if isinstance(o, list):
+        return "list " + str(len(o))
+    if isinstance(o, dict):
+        return "dict " + str(len(o))
+    if isinstance(o, (tuple, set)):
+        return "seq"
     if isinstance(o, float):
         return "float " + str(o * 2)
     if isinstance(o, bool):
@@ -65,6 +71,10 @@ def describe(o: object) -> str:
 
 
 values: "list[object]" = [
+    [1, 2],
+    {"k": 1},
+    (1, 2, 3),
+    {9},
     Shape(3),
     Square(3),
     Other(),

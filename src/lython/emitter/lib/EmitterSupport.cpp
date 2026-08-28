@@ -362,6 +362,40 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
   if (!node)
     return std::nullopt;
   mlir::Type inferred = types.inferExpr(node);
+  // ⛔ THE GENERIC BUILTINS ARE NOT BOUND AS CLASS OBJECTS. `int` and `str`
+  // infer to `!py.type<...>` and `list`/`dict`/`tuple`/`set` infer to plain
+  // `object`, so `isinstance(o, list)` was refused as "not a statically
+  // resolved class type" while `isinstance(o, str)` was not. The annotation
+  // resolver knows every builtin class spelling; asking it is what makes the
+  // two spellings agree.
+  //
+  // Only from `object`, which says nothing: any other inference is a binding
+  // the program made, and that is what the name means.
+  if (inferred == types.object() && node->kind == "Name")
+    if (mlir::Type annotated =
+            types.annotationType(node))
+      if (auto contract = mlir::dyn_cast<py::ContractType>(annotated))
+        if (annotated != types.object()) {
+          // ⛔ A BARE CONTAINER SPELLING IS THE CONTAINER OF `object`. The
+          // class id compares the same either way, but the NARROWED value has
+          // to be a type with methods on it: an argument-less
+          // `!py.contract<"builtins.list">` answered "does not provide
+          // '__len__'" on the arm that had just proved it was a list. What the
+          // test proves about the elements is nothing, and `object` is how
+          // that is spelled.
+          if (contract.getArguments().empty()) {
+            llvm::StringRef name = contract.getContractName();
+            if (name == "builtins.list")
+              return types.listOf(types.object());
+            if (name == "builtins.set")
+              return types.contract("builtins.set", {types.object()});
+            if (name == "builtins.tuple")
+              return types.tupleOf(types.object());
+            if (name == "builtins.dict")
+              return types.dictOf(types.object(), types.object());
+          }
+          return annotated;
+        }
   auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(inferred);
   if (!typeObject)
     return std::nullopt;
@@ -656,6 +690,42 @@ IsInstanceAnalysis analyzeIsInstanceAny(mlir::Type sourceType,
 
   IsInstanceAnalysis merged;
   merged.sourceType = types.widenLiteral(sourceType);
+
+  // ⛔ EVERY ELEMENT A CLASS TEST IS ONE MERGED CLASS TEST, which is what a
+  // type-erased subject always produces: the tests are independent compares of
+  // the same class-id word, so their OR is the answer. Refusing them together
+  // meant `isinstance(o, (list, tuple))` had to be written as two `if`s.
+  //
+  // ⛔ NO NARROWING out of a merged test. The subject is one of several
+  // classes on the true arm and there is no single type to view it as; the
+  // single-target path above is where a narrowing comes from.
+  {
+    llvm::SmallVector<mlir::Type, 4> classTargets;
+    bool allClassTests = true;
+    for (mlir::Type target : targetTypes) {
+      IsInstanceAnalysis one =
+          analyzeIsInstance(sourceType, target, types, from);
+      if (one.kind == IsInstanceAnalysis::Kind::AlwaysFalse)
+        continue;
+      if (one.kind != IsInstanceAnalysis::Kind::ClassTest) {
+        allClassTests = false;
+        break;
+      }
+      if (!llvm::is_contained(classTargets, one.targetType))
+        classTargets.push_back(one.targetType);
+      for (mlir::Type extra : one.classTestTypes)
+        if (!llvm::is_contained(classTargets, extra))
+          classTargets.push_back(extra);
+    }
+    if (allClassTests && !classTargets.empty()) {
+      merged.kind = IsInstanceAnalysis::Kind::ClassTest;
+      merged.targetType = classTargets.front();
+      merged.classTestTypes.assign(std::next(classTargets.begin()),
+                                   classTargets.end());
+      return merged;
+    }
+  }
+
   llvm::SmallVector<mlir::Type, 4> selected;
   for (mlir::Type target : targetTypes) {
     IsInstanceAnalysis one = analyzeIsInstance(sourceType, target, types, from);
