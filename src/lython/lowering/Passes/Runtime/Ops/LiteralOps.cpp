@@ -217,6 +217,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNone(py::NoneOp op) {
   return mlir::success();
 }
 
+// The stand-in a join needs for a name the incoming path did not bind. It is
+// the same immortal dead value every inactive union member and every exhausted
+// iterator element carries: non-owning, so the retain and release that the
+// merged name earns step over it without a write.
+mlir::LogicalResult RuntimeBundleLowerer::lowerUnbound(py::UnboundOp op) {
+  builder.setInsertionPoint(op);
+  mlir::FailureOr<RuntimeValue> dead =
+      RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+          op, op.getResult().getType(), "unbound local");
+  if (mlir::failed(dead))
+    return mlir::failure();
+  RuntimeBundle bundle;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+          op, op.getResult().getType(), dead->values, bundle, dead->ownership)))
+    return mlir::failure();
+  valueBundles[op.getResult()] = std::move(bundle);
+  erase.push_back(op);
+  return mlir::success();
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerCastFromPrim(py::CastFromPrimOp op) {
   std::string expected = runtimeContractName(op.getResult().getType());

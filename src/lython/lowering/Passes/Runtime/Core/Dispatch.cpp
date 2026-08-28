@@ -33,6 +33,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::BoolConstantOp>(
           [&](auto boolean) { return lowerBoolConstant(boolean); })
       .Case<py::NoneOp>([&](auto none) { return lowerNone(none); })
+      .Case<py::UnboundOp>([&](auto unbound) { return lowerUnbound(unbound); })
       .Case<py::CastFromPrimOp>(
           [&](auto cast) { return lowerCastFromPrim(cast); })
       .Case<py::CastToPrimOp>(

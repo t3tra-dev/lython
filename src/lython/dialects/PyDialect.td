@@ -755,6 +755,27 @@ def Py_NoneOp : Py_Op<"none", [Pure]> {
   let hasVerifier = 1;
 }
 
+def Py_UnboundOp : Py_Op<"unbound", [Pure]> {
+  let summary = "A local that is not bound on this path";
+  let description = [{
+    The value a name has where control reached a join without passing the
+    statement that binds it -- the zero-trip edge of a loop, the untaken arm
+    of an `if` with no `else`. It is never read: every such name is carried
+    with a definedness flag, and a read whose flag is false raises
+    `UnboundLocalError` (`NameError` at module scope) before it gets here.
+
+    It exists so the join has a value of the right TYPE to merge, which the
+    block argument requires and the source does not supply.
+
+    Example:
+      %unbound = py.unbound : !py.contract<"builtins.int">
+  }];
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
 def Py_BoolConstantOp : Py_Op<"bool.constant", [Pure]> {
   let summary = "Produce a Python bool singleton";
   let description = [{

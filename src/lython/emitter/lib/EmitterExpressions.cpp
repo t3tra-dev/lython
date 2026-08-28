@@ -103,8 +103,14 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (found != values.end()) {
       // A boxed (nonlocal-shared) local binds to its cell instance; the
       // expression value is the cell's current content.
-      if (isCellContract(found->second.type))
+      if (isCellContract(found->second.type)) {
+        // A slot that records whether it was written answers the question
+        // CPython answers with a null frame slot, and it answers it HERE --
+        // at the read, which is the only place the answer matters.
+        if (cellTracksBinding(found->second.type))
+          emitUnboundLocalGuard(*expr, found->second, name);
         return emitCellLoad(*expr, found->second);
+      }
       return found->second;
     }
     if (isModuleGlobalRead(name)) {

@@ -252,6 +252,19 @@ mlir::Type ModuleEmitter::postTryLaneCarrierType(mlir::Type type) const {
 void ModuleEmitter::emitTry(const parser::Node &statement) {
   const auto *handlers = ast::nodeList(statement, "handlers");
   const auto *finalbody = ast::nodeList(statement, "finalbody");
+  // A `try` body binds names for the scope around it whether or not it
+  // completes; the handler and else bodies do too. Handler bodies are reached
+  // through their own nodes rather than as one list, so they are added below.
+  {
+    llvm::SmallVector<const std::vector<parser::NodePtr> *, 6> bodies{
+        ast::nodeList(statement, "body"), ast::nodeList(statement, "orelse"),
+        finalbody};
+    if (handlers)
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler)
+          bodies.push_back(ast::nodeList(*handler, "body"));
+    bindConditionallyAssignedLocals(statement, bodies);
+  }
   bool hasFinally = finalbody && !finalbody->empty();
   bool tryBodyHasReturn =
       containsReturnStatement(ast::nodeList(statement, "body"));

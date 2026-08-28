@@ -186,6 +186,12 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     auto found = values.find(assigned.getKey());
     if (found == values.end() || !found->second.value)
       continue;
+    // ⛔ A CELL IS NOT CARRIED. The binding is the cell OBJECT and the body
+    // writes through it, so there is nothing to thread -- and threading it
+    // rebound the name's static type to the cell's own contract, which made
+    // `is_op(ch)` infer as `object` and the `and` around it unrepresentable.
+    if (isCellContract(found->second.type))
+      continue;
     names.push_back(assigned.getKey().str());
   }
   llvm::sort(names);
@@ -917,6 +923,19 @@ bool ModuleEmitter::emitIndexedFor(const parser::Node &statement,
 void ModuleEmitter::emitFor(const parser::Node &statement) {
   const auto *orelse = ast::nodeList(statement, "orelse");
   bool hasElse = orelse && !orelse->empty();
+  // Before anything else: a name the body binds is a local of the enclosing
+  // scope even on the zero-trip path, and `collectCarriedLoopLocals` below
+  // filters on what is already in scope. The target is passed as a hint so a
+  // body that assigns FROM it (`last = v`) can be typed.
+  llvm::StringMap<mlir::Type> targetHints;
+  if (const parser::Node *targetNode = ast::node(statement, "target"))
+    if (targetNode->kind == "Name")
+      if (mlir::Type element =
+              types.iterationElementType(ast::node(statement, "iter")))
+        targetHints[ast::nameSpelling(*targetNode)] = element;
+  bindConditionallyAssignedLocals(statement,
+                                  {ast::nodeList(statement, "body"), orelse},
+                                  &targetHints);
   if (const parser::Node *iterNode = ast::node(statement, "iter");
       iterNode && iterNode->kind == "GeneratorExp") {
     if (hasElse) {
@@ -1222,6 +1241,8 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
 void ModuleEmitter::emitWhile(const parser::Node &statement) {
   const auto *orelse = ast::nodeList(statement, "orelse");
   bool hasElse = orelse && !orelse->empty();
+  bindConditionallyAssignedLocals(statement,
+                                  {ast::nodeList(statement, "body"), orelse});
   const parser::Node *test = ast::node(statement, "test");
   // A walrus in the condition rebinds locals in the loop HEADER, which the
   // carried-local machinery (built around body assignments) cannot balance.

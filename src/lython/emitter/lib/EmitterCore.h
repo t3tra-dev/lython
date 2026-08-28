@@ -876,9 +876,29 @@ private:
   // synthesized one-field class ("__ly_cell$N" with field "v").
   static bool isCellContract(mlir::Type type);
   mlir::Type cellContentType(mlir::Type cellType);
+  // A cell that also records whether its content was ever written: the storage
+  // for a name only SOME paths bind. Reading one is guarded.
+  bool cellTracksBinding(mlir::Type cellType) const;
+  // Bind, in the current scope, a maybe-unbound slot for every name these
+  // bodies assign that the scope does not already have -- so the binding
+  // survives the region and a read before it raises instead of failing to
+  // resolve. Names whose type cannot be settled from the source are left
+  // alone and keep the unresolved-name diagnostic.
+  void bindConditionallyAssignedLocals(
+      const parser::Node &anchor,
+      llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
+      const llvm::StringMap<mlir::Type> *inferenceHints = nullptr);
+  bool nameIsReadAfterCurrentStatement(llvm::StringRef name) const;
+  mlir::Type inferConditionalLocalType(
+      llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
+      llvm::StringRef name);
   mlir::Type ensureCellClass(mlir::Type contentType,
-                             const parser::Node &anchor);
-  Value emitCellAlloc(const parser::Node &anchor, Value initial);
+                             const parser::Node &anchor,
+                             bool tracksBinding = false);
+  Value emitCellAlloc(const parser::Node &anchor, Value initial,
+                      bool tracksBinding = false);
+  void emitUnboundLocalGuard(const parser::Node &anchor, const Value &cell,
+                             llvm::StringRef name);
   Value emitCellLoad(const parser::Node &anchor, const Value &cell);
   void emitCellStore(const parser::Node &anchor, const Value &cell,
                      Value value);
@@ -1174,6 +1194,8 @@ private:
   unsigned listCompCounter = 0;
   // Cell classes are synthesized once per (widened) content type.
   llvm::DenseMap<mlir::Type, mlir::Type> cellClassContracts;
+  llvm::DenseMap<mlir::Type, mlir::Type> bindingCellClassContracts;
+  llvm::StringSet<> bindingCellContractNames;
   unsigned cellClassCounter = 0;
   llvm::SmallVector<WithCleanup, 8> activeWithCleanups;
   // The `with` items whose enters have been scheduled but not yet emitted:

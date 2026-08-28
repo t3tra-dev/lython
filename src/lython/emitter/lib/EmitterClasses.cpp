@@ -3758,10 +3758,27 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
 // ---------------------------------------------------------------------------
 
 static constexpr llvm::StringLiteral kCellClassPrefix{"__ly_cell$"};
+// ⭐ THE SAME STORAGE, PLUS THE QUESTION CPython ANSWERS WITH A NULL SLOT. A
+// name that only some paths bind needs a place to live that outlives the
+// region binding it AND a record of whether it was bound, because reading it
+// unbound is `UnboundLocalError` and not a value. The cell already provides
+// the first; the second is one more field.
+static constexpr llvm::StringLiteral kBindingFieldName{"d"};
+// ⛔ A DIFFERENT PREFIX, because the LOWERING keys on the cell one. A cell is
+// lowered by `lowerCellAttrGet`, which reads the content out of a box slot
+// because a cell's content can be replaced through any frame holding it; that
+// path requires every field to be box-fronted, and the binding flag is a bool,
+// which is an inline word. A maybe-unbound slot needs none of that -- it lives
+// in one frame -- so it is an ORDINARY class and takes the ordinary field
+// path. The emitter still routes reads and writes through it, because
+// `isCellContract` answers for both spellings.
+static constexpr llvm::StringLiteral kSlotClassPrefix{"__ly_slot$"};
 
 bool ModuleEmitter::isCellContract(mlir::Type type) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-  return contract && contract.getContractName().starts_with(kCellClassPrefix);
+  return contract &&
+         (contract.getContractName().starts_with(kCellClassPrefix) ||
+          contract.getContractName().starts_with(kSlotClassPrefix));
 }
 
 mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
@@ -3775,24 +3792,52 @@ mlir::Type ModuleEmitter::cellContentType(mlir::Type cellType) {
   return field == fields->second.end() ? mlir::Type() : field->second;
 }
 
+bool ModuleEmitter::cellTracksBinding(mlir::Type cellType) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(cellType);
+  return contract &&
+         bindingCellContractNames.contains(contract.getContractName());
+}
+
 mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
-                                          const parser::Node &anchor) {
-  auto memoized = cellClassContracts.find(contentType);
-  if (memoized != cellClassContracts.end())
+                                          const parser::Node &anchor,
+                                          bool tracksBinding) {
+  llvm::DenseMap<mlir::Type, mlir::Type> &memo =
+      tracksBinding ? bindingCellClassContracts : cellClassContracts;
+  auto memoized = memo.find(contentType);
+  if (memoized != memo.end())
     return memoized->second;
 
   std::string cellName =
-      (llvm::Twine(kCellClassPrefix) + llvm::Twine(++cellClassCounter)).str();
+      (llvm::Twine(tracksBinding ? kSlotClassPrefix : kCellClassPrefix) +
+       llvm::Twine(++cellClassCounter))
+          .str();
   mlir::Type contract = types.contract(cellName);
+
+  llvm::SmallVector<std::string, 8> fieldNames{"v"};
+  llvm::SmallVector<mlir::Type, 2> fieldTypes{contentType};
+  // ⛔ THE ERASED STORAGE CONTRACT IS THE CELL'S, not every slot's. A cell is
+  // read back through `lowerCellAttrGet`, which rebuilds the content from the
+  // box and knows the declared type; an ORDINARY field read compares the
+  // storage contract against the result and reported "attribute evidence
+  // 'builtins.object' is not assignable to result 'builtins.int'".
+  llvm::SmallVector<mlir::Type, 8> fieldStorage{
+      tracksBinding ? contentType : types.contract("builtins.object")};
+  if (tracksBinding) {
+    fieldNames.push_back(kBindingFieldName.str());
+    fieldTypes.push_back(types.contract("builtins.bool"));
+    fieldStorage.push_back(types.contract("builtins.bool"));
+  }
 
   classBaseNames[cellName] = {};
   classMros[cellName] = {cellName, "builtins.object"};
-  classOwnFieldOrders[cellName] = {"v"};
-  classFieldOrders[cellName] = {"v"};
-  classFieldBindings[cellName]["v"] = contentType;
+  classOwnFieldOrders[cellName] = fieldNames;
+  classFieldOrders[cellName] = fieldNames;
+  for (auto [index, field] : llvm::enumerate(fieldNames))
+    classFieldBindings[cellName][field] = fieldTypes[index];
 
   py::protocols::ProtocolInfo protocolInfo;
-  protocolInfo.fields["v"] = contentType;
+  for (auto [index, field] : llvm::enumerate(fieldNames))
+    protocolInfo.fields[field] = fieldTypes[index];
   py::protocols::Table::getMutable(context).registerClass(
       cellName, std::move(protocolInfo));
 
@@ -3803,18 +3848,13 @@ mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
                      builder.getStringAttr(cellName));
   state.addAttribute("base_names",
                      stringArray(builder, llvm::ArrayRef<std::string>{}));
-  state.addAttribute("field_names",
-                     stringArray(builder, llvm::ArrayRef<std::string>{"v"}));
-  state.addAttribute("field_types",
-                     typeArray(builder, llvm::ArrayRef<mlir::Type>{contentType}));
+  state.addAttribute("field_names", stringArray(builder, fieldNames));
+  state.addAttribute("field_types", typeArray(builder, fieldTypes));
   // The STORAGE contract is the erased object: the existing box-fronted
   // field rule then gives the cell one stable box16 slot (allocation,
   // deallocator and init paths all follow that rule), which is what lets a
   // closure's store reach every other frame holding the cell.
-  state.addAttribute(
-      "field_contract_types",
-      typeArray(builder, llvm::ArrayRef<mlir::Type>{
-                             types.contract("builtins.object")}));
+  state.addAttribute("field_contract_types", typeArray(builder, fieldStorage));
   state.addAttribute("method_names",
                      stringArray(builder, llvm::ArrayRef<std::string>{}));
   state.addAttribute("method_contracts",
@@ -3830,18 +3870,30 @@ mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
   mlir::Operation *op = builder.create(state);
   op->getRegion(0).push_back(new mlir::Block);
 
-  cellClassContracts[contentType] = contract;
+  memo[contentType] = contract;
+  if (tracksBinding)
+    bindingCellContractNames.insert(cellName);
   return contract;
 }
 
-Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial) {
+Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial,
+                                   bool tracksBinding) {
   mlir::Type content = types.widenLiteral(initial.type);
-  mlir::Type cellType = ensureCellClass(content, anchor);
+  mlir::Type cellType = ensureCellClass(content, anchor, tracksBinding);
   Value coerced = coerceValue(initial, content, anchor);
   mlir::Type classType = types.typeObject(cellType);
   auto classObject =
       py::TypeObjectOp::create(builder, loc(anchor), classType, cellType);
-  Value posPack = emitPack({coerced});
+  llvm::SmallVector<Value, 2> initialFields{coerced};
+  if (tracksBinding) {
+    auto falseOp = py::BoolConstantOp::create(
+        builder, loc(anchor), types.literal("False"), builder.getBoolAttr(false));
+    initialFields.push_back(coerceValue({falseOp.getResult(),
+                                         types.literal("False")},
+                                        types.contract("builtins.bool"),
+                                        anchor));
+  }
+  Value posPack = emitPack(initialFields);
   Value namePack = emitPack({});
   Value valuePack = emitPack({});
   auto newOp = py::NewOp::create(
@@ -3854,11 +3906,16 @@ Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial) {
   newOp->setAttr("ly.constructor.new_kind", builder.getStringAttr("class"));
   // Field-record initialization (the no-__init__ construction rule): the
   // initial content boxes into the cell's slot during lowerInit.
-  llvm::SmallVector<mlir::Type, 2> positional{cellType, content};
-  llvm::SmallVector<mlir::StringAttr, 2> positionalNames{
+  llvm::SmallVector<mlir::Type, 3> positional{cellType, content};
+  llvm::SmallVector<mlir::StringAttr, 3> positionalNames{
       builder.getStringAttr("self"), builder.getStringAttr("v")};
-  llvm::SmallVector<mlir::BoolAttr, 2> positionalDefaults{
+  llvm::SmallVector<mlir::BoolAttr, 3> positionalDefaults{
       builder.getBoolAttr(false), builder.getBoolAttr(true)};
+  if (tracksBinding) {
+    positional.push_back(types.contract("builtins.bool"));
+    positionalNames.push_back(builder.getStringAttr(kBindingFieldName));
+    positionalDefaults.push_back(builder.getBoolAttr(true));
+  }
   llvm::SmallVector<mlir::Type, 1> results{types.none()};
   mlir::Type initContract = py::CallableType::get(
       &context, positional, {}, {}, {}, results, positionalNames, {},
@@ -3872,6 +3929,55 @@ Value ModuleEmitter::emitCellAlloc(const parser::Node &anchor, Value initial) {
                   builder.getStringAttr(contract.getContractName()));
   initOp->setAttr("ly.constructor.init_kind", builder.getStringAttr("instance"));
   return {newOp.getInstance(), cellType};
+}
+
+// ⭐ THE GUARD IS AT THE READ, which is where CPython puts it: a name bound on
+// one path and read on another is an error only if the read runs. Raising at
+// the join instead would refuse `if c: x = 1` in a program that never reads
+// `x`, which CPython accepts.
+void ModuleEmitter::emitUnboundLocalGuard(const parser::Node &anchor,
+                                          const Value &cell,
+                                          llvm::StringRef name) {
+  mlir::Type flagType = types.contract("builtins.bool");
+  auto flag = py::AttrGetOp::create(builder, loc(anchor), flagType, cell.value,
+                                    kBindingFieldName);
+  flag->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+  auto contract = mlir::cast<py::ContractType>(cell.type);
+  flag->setAttr("ly.attr.owner",
+                builder.getStringAttr(contract.getContractName()));
+  mlir::Value bound = emitBoolValue({flag.getResult(), flagType}, anchor);
+
+  mlir::Block *entry = builder.getInsertionBlock();
+  mlir::Region *region = entry->getParent();
+  mlir::Block *continuation = entry->splitBlock(builder.getInsertionPoint());
+  mlir::Block *unboundBlock =
+      builder.createBlock(region, continuation->getIterator());
+  builder.setInsertionPointToEnd(entry);
+  mlir::cf::CondBranchOp::create(builder, loc(anchor), bound, continuation,
+                                 unboundBlock);
+
+  builder.setInsertionPointToStart(unboundBlock);
+  // Module scope says NameError and a function body says UnboundLocalError,
+  // which is what CPython reports for the same source in the two places.
+  bool atModuleScope = currentFunctionPrefix.empty();
+  llvm::StringRef className =
+      atModuleScope ? "NameError" : "UnboundLocalError";
+  std::string message =
+      atModuleScope
+          ? ("name '" + name + "' is not defined").str()
+          : ("cannot access local variable '" + name +
+             "' where it is not associated with a value")
+                .str();
+  std::vector<parser::NodePtr> arguments;
+  arguments.push_back(synth::strConstant(message, anchor.range));
+  Value raised = emitExpr(
+      synth::call(synth::name(className, anchor.range), std::move(arguments),
+                  anchor.range)
+          .get());
+  if (raised.value)
+    py::RaiseOp::create(builder, loc(anchor), raised.value, mlir::Value{},
+                        false);
+  builder.setInsertionPointToEnd(continuation);
 }
 
 Value ModuleEmitter::emitCellLoad(const parser::Node &anchor,
@@ -3913,6 +4019,17 @@ void ModuleEmitter::emitCellStore(const parser::Node &anchor, const Value &cell,
                                   coerced.value);
   op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
   auto contract = mlir::cast<py::ContractType>(cell.type);
+  if (cellTracksBinding(cell.type)) {
+    auto trueOp = py::BoolConstantOp::create(
+        builder, loc(anchor), types.literal("True"), builder.getBoolAttr(true));
+    Value flag = coerceValue({trueOp.getResult(), types.literal("True")},
+                             types.contract("builtins.bool"), anchor);
+    auto mark = py::AttrSetOp::create(builder, loc(anchor), cell.value,
+                                      kBindingFieldName, flag.value);
+    mark->setAttr("ly.attr.kind", builder.getStringAttr("field"));
+    mark->setAttr("ly.attr.owner",
+                  builder.getStringAttr(contract.getContractName()));
+  }
   op->setAttr("ly.attr.owner",
               builder.getStringAttr(contract.getContractName()));
 }

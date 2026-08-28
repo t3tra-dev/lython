@@ -1296,6 +1296,7 @@ private:
   mlir::LogicalResult lowerComplexConstant(py::ComplexConstantOp op);
   mlir::LogicalResult lowerBoolConstant(py::BoolConstantOp op);
   mlir::LogicalResult lowerNone(py::NoneOp op);
+  mlir::LogicalResult lowerUnbound(py::UnboundOp op);
   mlir::LogicalResult lowerCastFromPrim(py::CastFromPrimOp op);
   mlir::LogicalResult lowerCastToPrim(py::CastToPrimOp op);
   mlir::LogicalResult lowerUnionWrap(py::UnionWrapOp op);

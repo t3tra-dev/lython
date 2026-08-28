@@ -138,6 +138,11 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   mlir::Value condition = emitBoolValue(emitExpr(test), statement);
   const auto *orelse = ast::nodeList(statement, "orelse");
   bool hasElse = orelse && !orelse->empty();
+  // Before the branches, so a name only one of them binds has somewhere to
+  // live afterwards. Names BOTH arms bind are merged as block arguments
+  // below and are already in scope by the time this runs for them.
+  bindConditionallyAssignedLocals(
+      statement, {ast::nodeList(statement, "body"), orelse});
 
   // Merge candidates: names freshly assigned (not pre-existing) in BOTH
   // branches. Threading them as continuation block arguments lets their value
@@ -459,6 +464,282 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/false);
   else if (narrowing && hasElse && elseTerminates && !thenTerminates)
     applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
+}
+
+namespace {
+
+// The statements that bind `name` here, not counting nested scopes. Only the
+// forms whose type the source states are collected: an annotated assignment
+// says it outright and a plain one says it through its right-hand side. A
+// binding this does not recognise (a `for` target, a `with ... as`, an
+// augmented assignment) leaves the name alone -- it keeps the unresolved-name
+// diagnostic rather than getting a slot whose type would be a guess.
+void collectNameBindingExpressions(
+    const parser::Node *node, llvm::StringRef name,
+    llvm::SmallVectorImpl<const parser::Node *> &values,
+    llvm::SmallVectorImpl<const parser::Node *> &annotations, bool &opaque) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  auto targetsName = [&](const parser::Node *target) {
+    return target && target->kind == "Name" &&
+           llvm::StringRef(ast::nameSpelling(*target)) == name;
+  };
+  if (node->kind == "Assign") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets) {
+        if (targetsName(target.get())) {
+          if (const parser::Node *value = ast::node(*node, "value"))
+            values.push_back(value);
+          else
+            opaque = true;
+        } else {
+          llvm::StringSet<> written;
+          collectAssignedNameTargets(target.get(), written);
+          if (written.contains(name))
+            opaque = true;
+        }
+      }
+  } else if (node->kind == "AnnAssign") {
+    if (targetsName(ast::node(*node, "target"))) {
+      if (const parser::Node *annotation = ast::node(*node, "annotation"))
+        annotations.push_back(annotation);
+      else
+        opaque = true;
+    }
+  } else {
+    llvm::StringSet<> written;
+    if (node->kind == "AugAssign" || node->kind == "NamedExpr" ||
+        node->kind == "For" || node->kind == "AsyncFor" ||
+        node->kind == "With" || node->kind == "AsyncWith")
+      collectAssignedNames(node, written);
+    if (written.contains(name))
+      opaque = true;
+  }
+
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectNameBindingExpressions(child->get(), name, values, annotations,
+                                      opaque);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectNameBindingExpressions(child.get(), name, values, annotations,
+                                        opaque);
+    }
+  }
+}
+
+// Is `name` a loop or `with` TARGET anywhere in this suite? Such a name is
+// rebound per statement and its type is whatever the current iterable yields,
+// which a slot -- one storage with one type -- cannot represent.
+bool containsBindingTarget(const parser::Node *node, llvm::StringRef name) {
+  if (!node)
+    return false;
+  llvm::StringSet<> targets;
+  if (node->kind == "For" || node->kind == "AsyncFor")
+    collectAssignedNameTargets(ast::node(*node, "target"), targets);
+  else if (node->kind == "With" || node->kind == "AsyncWith") {
+    if (const auto *items = ast::nodeList(*node, "items"))
+      for (const parser::NodePtr &item : *items)
+        collectAssignedNameTargets(ast::node(*item, "optional_vars"), targets);
+  } else if (node->kind == "comprehension")
+    collectAssignedNameTargets(ast::node(*node, "target"), targets);
+  if (targets.contains(name))
+    return true;
+
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && containsBindingTarget(child->get(), name))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child && containsBindingTarget(child.get(), name))
+          return true;
+    }
+  }
+  return false;
+}
+
+// Does anything after this statement in the same suite READ `name`? A store
+// is not a read: `x[i] = v` reads `x`, `x = v` does not.
+bool containsNameLoad(const parser::Node *node, llvm::StringRef name) {
+  if (!node)
+    return false;
+  if (node->kind == "Name")
+    return llvm::StringRef(ast::nameSpelling(*node)) == name;
+  llvm::SmallPtrSet<const parser::Node *, 4> stores;
+  auto noteStoreTarget = [&](const parser::Node *target) {
+    if (target && target->kind == "Name")
+      stores.insert(target);
+  };
+  if (node->kind == "Assign") {
+    if (const auto *targets = ast::nodeList(*node, "targets"))
+      for (const parser::NodePtr &target : *targets)
+        noteStoreTarget(target.get());
+  } else if (node->kind == "AnnAssign" || node->kind == "NamedExpr" ||
+             node->kind == "For" || node->kind == "AsyncFor") {
+    noteStoreTarget(ast::node(*node, "target"));
+  } else if (node->kind == "With" || node->kind == "AsyncWith") {
+    if (const auto *items = ast::nodeList(*node, "items"))
+      for (const parser::NodePtr &item : *items)
+        noteStoreTarget(ast::node(*item, "optional_vars"));
+  }
+
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && !stores.contains(child->get()) &&
+          containsNameLoad(child->get(), name))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child && !stores.contains(child.get()) &&
+            containsNameLoad(child.get(), name))
+          return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
+bool ModuleEmitter::nameIsReadAfterCurrentStatement(llvm::StringRef name) const {
+  if (!currentSuite)
+    return false;
+  // ⛔ A LOOP TARGET NEVER GETS A SLOT, whatever reads it later. Its type is
+  // the current iterable's element type and the same spelling is reused across
+  // loops over different things -- `for i, x in enumerate(["a"])` then
+  // `for i, x in enumerate([5])` -- so one storage with one type is the wrong
+  // shape for it. The lazy-iterator fusions make this reachable even where the
+  // source has no assignment: they rewrite the target into a body assignment,
+  // which is what put a `str` slot under an `int` and reported
+  // "builtins.int does not provide manifest method '__add__'".
+  for (const parser::NodePtr &statement : *currentSuite)
+    if (containsBindingTarget(statement.get(), name))
+      return false;
+  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
+       ++index)
+    if (containsNameLoad((*currentSuite)[index].get(), name))
+      return true;
+  return false;
+}
+
+mlir::Type ModuleEmitter::inferConditionalLocalType(
+    llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
+    llvm::StringRef name) {
+  llvm::SmallVector<const parser::Node *, 4> valueNodes;
+  llvm::SmallVector<const parser::Node *, 2> annotationNodes;
+  bool opaque = false;
+  for (const std::vector<parser::NodePtr> *body : bodies) {
+    if (!body)
+      continue;
+    for (const parser::NodePtr &statement : *body)
+      collectNameBindingExpressions(statement.get(), name, valueNodes,
+                                    annotationNodes, opaque);
+  }
+  if (opaque)
+    return {};
+  // An annotation is the author's answer and outranks any inference.
+  if (!annotationNodes.empty()) {
+    mlir::Type annotated = types.annotationType(annotationNodes.front());
+    for (const parser::Node *other : llvm::drop_begin(annotationNodes))
+      if (types.annotationType(other) != annotated)
+        return {};
+    return annotated;
+  }
+  if (valueNodes.empty())
+    return {};
+  llvm::SmallVector<mlir::Type, 4> inferred;
+  for (const parser::Node *value : valueNodes) {
+    mlir::Type type = types.widenLiteral(types.inferExpr(value));
+    if (!type)
+      return {};
+    inferred.push_back(type);
+  }
+  mlir::Type joined = types.join(inferred);
+  // ⛔ ONLY A PLAIN CONTRACT GETS A SLOT. The slot is a synthesized class's
+  // box-fronted field, so whatever goes in it has to be storable there: a
+  // union keeps every member's lanes and is refused at the box, and a `type[X]`
+  // has no object handle at all -- `WPROTO = ctypes.CFUNCTYPE(...)` inside a
+  // nested `if` (runtime/lib/stackguard_support.py) failed to lower as
+  // "collection payload element ... has no physical object handle". A join
+  // that reached the erased top is excluded for the opposite reason: the slot
+  // would accept every write and refuse every read.
+  if (!mlir::isa_and_nonnull<py::ContractType>(joined) ||
+      py::isPyObjectType(joined))
+    return {};
+  return joined;
+}
+
+// ⭐ A NAME BOUND INSIDE A REGION IS STILL A LOCAL OF THE SCOPE AROUND IT.
+// CPython decides that syntactically -- an assignment anywhere in a function
+// body makes the name local to the whole body -- and this compiler decided it
+// by DOMINANCE, so `for v in xs: last = v` followed by `print(last)` was
+// "unresolved name 'last'" for a program CPython runs. The binding is given a
+// slot before the region, which is where the enclosing scope can see it, and
+// the slot records whether it was written so the read can raise.
+void ModuleEmitter::bindConditionallyAssignedLocals(
+    const parser::Node &anchor,
+    llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
+    const llvm::StringMap<mlir::Type> *inferenceHints) {
+  llvm::StringSet<> assigned;
+  for (const std::vector<parser::NodePtr> *body : bodies)
+    collectAssignedNames(body, assigned);
+  llvm::SmallVector<std::string, 4> names;
+  for (const auto &entry : assigned) {
+    llvm::StringRef name = entry.getKey();
+    if (values.find(name) != values.end())
+      continue;
+    // A name the module already owns is a global, not a local of this scope.
+    if (isModuleGlobalRead(name) || moduleGlobals.count(name) ||
+        currentBoxedLocals.contains(name) || types.lookupSymbol(name) ||
+        types.lookupClass(name))
+      continue;
+    // ⭐ ONLY A NAME SOMETHING LATER READS. Every name a region binds could be
+    // given a slot, and giving one to a name used only INSIDE the region
+    // changes the representation of code that already works: a plain SSA local
+    // becomes a heap slot with a guarded read, and 42 tests failed on the
+    // ownership and typing that follows from that. The defect is a read the
+    // scope cannot reach, so the fix is scoped to exactly those reads.
+    //
+    // ⛔ THE SAME SUITE ONLY. A read in a suite further out (the loop is
+    // inside an `if` and the read is after the `if`) is not seen here and
+    // keeps the unresolved-name diagnostic. Widening it means threading the
+    // enclosing suites, which is a bigger change than the one this makes.
+    if (!nameIsReadAfterCurrentStatement(name))
+      continue;
+    names.push_back(name.str());
+  }
+  llvm::sort(names);
+  // ⭐ THE LOOP TARGET IS A HINT AND NOT A BINDING. `for v in xs: last = v`
+  // types `last` from `v`, which is not in scope until the body runs -- and
+  // the slot has to exist BEFORE the loop. The target's type is known from
+  // the iterable, so it is bound for the length of the inference and dropped:
+  // binding it for real here would leak the loop variable into the scope
+  // around the loop with no value behind it.
+  llvm::SmallVector<std::pair<std::string, mlir::Type>, 4> contents;
+  {
+    TypeSystem::Scope hintScope = types.pushScope();
+    if (inferenceHints)
+      for (const auto &hint : *inferenceHints)
+        types.bindSymbol(hint.getKey(), hint.getValue());
+    for (const std::string &name : names)
+      if (mlir::Type content = inferConditionalLocalType(bodies, name))
+        contents.emplace_back(name, content);
+  }
+  for (const auto &[name, content] : contents) {
+    auto unbound = py::UnboundOp::create(builder, loc(anchor), content);
+    Value slot = emitCellAlloc(anchor, Value{unbound.getResult(), content},
+                               /*tracksBinding=*/true);
+    values[name] = slot;
+    types.bindSymbol(name, content);
+  }
 }
 
 } // namespace lython::emitter
