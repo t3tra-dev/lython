@@ -1,0 +1,7 @@
+True True False False
+True True False
+False True
+[$100, $150, $200]
+[Rec(key='a', n=1), Rec(key='a', n=9), Rec(key='b', n=2)]
+True True True True
+first True

@@ -1890,6 +1890,53 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                        llvm::ArrayRef<llvm::StringRef>{}, range),
                           std::move(lenSig));
     }
+    // ⭐ A NamedTuple ORDERS like the tuple it is, field by field. CPython's
+    // namedtuple inherits tuple's comparisons, so `sorted(recs)` over a list
+    // of them is ordinary Python -- and it failed at RUNTIME with "'<' not
+    // supported between operand types" while `Rec(...) < Rec(...)` was refused
+    // at emit. Built as the comparison of two tuples, for the reason the hash
+    // above is: the answer then comes from the same manifest comparison any
+    // other tuple gets, rather than from a second implementation that has to
+    // agree with it.
+    if (isNamedTuple && !order.empty()) {
+      struct Ordering {
+        const char *method;
+        const char *op;
+      };
+      static constexpr Ordering kOrderings[] = {{"__lt__", "Lt"},
+                                                {"__le__", "LtE"},
+                                                {"__gt__", "Gt"},
+                                                {"__ge__", "GtE"}};
+      for (const Ordering &ordering : kOrderings) {
+        if (userDefines(ordering.method))
+          continue;
+        auto fieldTuple = [&](llvm::StringRef receiver) {
+          std::vector<parser::NodePtr> elements;
+          elements.reserve(order.size());
+          for (const std::string &field : order)
+            elements.push_back(synth::selfAttribute(receiver, field, range));
+          parser::NodePtr tuple = parser::makeNode("Tuple", range);
+          parser::addField(*tuple, "elts", std::move(elements));
+          return tuple;
+        };
+        parser::NodePtr comparison =
+            synth::compare(fieldTuple("self"), ordering.op,
+                           fieldTuple("other"), range);
+        FunctionSignature orderSig;
+        orderSig.positionalNames.append({"self", "other"});
+        orderSig.positionalTypes.push_back(types.contract(contractName));
+        orderSig.positionalTypes.push_back(types.contract(contractName));
+        orderSig.positionalDefaults.append({false, false});
+        orderSig.resultType = types.boolType();
+        registerSynthesized(
+            synth::functionDef(ordering.method, toSynthParams({"self", "other"}),
+                               {},
+                               {synth::returnStmt(std::move(comparison), range)},
+                               nullptr, llvm::ArrayRef<llvm::StringRef>{},
+                               range),
+            std::move(orderSig));
+      }
+    }
     if (isNamedTuple && !userDefines("__hash__") && !order.empty()) {
       std::vector<parser::NodePtr> elements;
       elements.reserve(order.size());

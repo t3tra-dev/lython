@@ -1631,18 +1631,50 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     return emitBinarySpecial<py::NeOp>(expr, "__ne__", lhs, rhs,
                                        types.boolType());
   }
-  if (ast::isOperator(op, "Lt"))
+  // ⭐ THE REFLECTED COMPARISON, which is how `>` works on a class that
+  // defines only `__lt__` -- the one Python asks for when a class is written
+  // to be SORTED. CPython tries `a.__gt__(b)` and then `b.__lt__(a)`, so a
+  // class with a single ordering method answers all four spellings; this
+  // compiler asked only for the direct one and refused: "'Money' does not
+  // provide manifest method '__gt__'".
+  //
+  // ⛔ ONLY WHEN THE LEFT CLASS HAS NONE. A manifest type declares both
+  // directions, so nothing here moves for `int` or `str`; and a class that
+  // DOES define the direct method keeps it, because reflecting past a defined
+  // method would answer a different question than the program wrote.
+  auto reflects = [&](llvm::StringRef direct, llvm::StringRef mirror) {
+    return isSourceDefinedContract(types.widenLiteral(lhs.type)) &&
+           !lookupClassMethod(lhs.type, direct) &&
+           lookupClassMethod(rhs.type, mirror);
+  };
+  if (ast::isOperator(op, "Lt")) {
+    if (reflects("__lt__", "__gt__"))
+      return emitBinarySpecial<py::GtOp>(expr, "__gt__", rhs, lhs,
+                                         types.boolType());
     return emitBinarySpecial<py::LtOp>(expr, "__lt__", lhs, rhs,
                                        types.boolType());
-  if (ast::isOperator(op, "LtE"))
+  }
+  if (ast::isOperator(op, "LtE")) {
+    if (reflects("__le__", "__ge__"))
+      return emitBinarySpecial<py::GeOp>(expr, "__ge__", rhs, lhs,
+                                         types.boolType());
     return emitBinarySpecial<py::LeOp>(expr, "__le__", lhs, rhs,
                                        types.boolType());
-  if (ast::isOperator(op, "Gt"))
+  }
+  if (ast::isOperator(op, "Gt")) {
+    if (reflects("__gt__", "__lt__"))
+      return emitBinarySpecial<py::LtOp>(expr, "__lt__", rhs, lhs,
+                                         types.boolType());
     return emitBinarySpecial<py::GtOp>(expr, "__gt__", lhs, rhs,
                                        types.boolType());
-  if (ast::isOperator(op, "GtE"))
+  }
+  if (ast::isOperator(op, "GtE")) {
+    if (reflects("__ge__", "__le__"))
+      return emitBinarySpecial<py::LeOp>(expr, "__le__", rhs, lhs,
+                                         types.boolType());
     return emitBinarySpecial<py::GeOp>(expr, "__ge__", lhs, rhs,
                                        types.boolType());
+  }
   return emitBinarySpecial<py::EqOp>(expr, "__eq__", lhs, rhs,
                                      types.boolType());
 }
