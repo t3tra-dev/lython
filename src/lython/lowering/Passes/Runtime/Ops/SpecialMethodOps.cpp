@@ -212,28 +212,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassName(py::ClassNameOp op) {
       if (!lookup)
         return op.emitError() << "runtime manifest has no builtins.object "
                                  "class_name_from_id primitive";
-      mlir::FailureOr<mlir::Value> header =
-          RuntimeBundleLowerer::objectPhysicalHeader(op,
-                                                    methodReceiver.objectValue);
-      if (mlir::failed(header))
-        return mlir::failure();
       builder.setInsertionPoint(op);
       mlir::Location loc = op.getLoc();
-      mlir::Type dynamicHeaderType =
-          mlir::MemRefType::get({mlir::ShapedType::kDynamic},
-                                builder.getI64Type());
-      mlir::Value storage = *header;
-      if (storage.getType() != dynamicHeaderType)
-        storage = mlir::memref::CastOp::create(builder, loc, dynamicHeaderType,
-                                               storage)
-                      .getResult();
-      mlir::Value classIdSlot =
-          mlir::arith::ConstantIndexOp::create(builder, loc, 1);
-      mlir::Value classId =
-          mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
-              .getResult();
+      // ⛔ NOT word 1 unconditionally. A BOX carries the payload's word 1, and
+      // for an exception that is the shared LAYOUT -- `type(e).__name__` over a
+      // type-erased ValueError answered "BaseException". The shared read knows
+      // where each kind keeps its exact class.
+      mlir::FailureOr<mlir::Value> exact =
+          RuntimeBundleLowerer::exactRuntimeClassId(op, methodReceiver);
+      if (mlir::failed(exact))
+        return mlir::failure();
       mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
-          loc, *lookup, mlir::ValueRange{classId});
+          loc, *lookup, mlir::ValueRange{*exact});
       RuntimeBundle named;
       if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
               op, runtimeContractType(context, "builtins.str"), call, named)))

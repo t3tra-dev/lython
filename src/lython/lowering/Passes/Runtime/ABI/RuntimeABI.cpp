@@ -527,6 +527,25 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassNameHook() {
         *classId,
         py::contracts::displayClassNameForContract(classOp.getSymName())});
   });
+  // ⭐ AND THE MANIFEST'S OWN CLASSES. The walk above sees `py.class` ops, and
+  // by this phase those are the SOURCE classes only -- so `type(v).__name__`
+  // over a type-erased value answered "object" for every builtin, which is the
+  // table's miss fallback and reads like an answer. The ids the manifests
+  // declare are the same word the instance carries.
+  // ⭐ AND `None`, whose id is the ZERO a box's class word holds when there is
+  // no object -- the same zero `__ly_box_hash` reads as None. It has no
+  // initializer to declare an id, so nothing else would put it in the table
+  // and `type(None).__name__` came back "object".
+  if (seen.insert(0).second)
+    entries.push_back(Entry{0, "NoneType"});
+  for (const RuntimeClassIdDefinition &declaration :
+       manifest.classIdDeclarations()) {
+    if (!seen.insert(declaration.classId).second)
+      continue;
+    entries.push_back(
+        Entry{declaration.classId,
+              py::contracts::displayClassNameForContract(declaration.contract)});
+  }
 
   mlir::OpBuilder builder(context);
   builder.setInsertionPointToEnd(module.getBody());

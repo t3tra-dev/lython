@@ -111,6 +111,12 @@ public:
   std::optional<RuntimeSymbol> builtinCallable(llvm::StringRef name) const;
   const RuntimeValueShape *valueShape(llvm::StringRef contract) const;
   std::optional<std::int64_t> classId(llvm::StringRef contract) const;
+  // Every (contract, class id) the manifests declare. The per-program
+  // class-NAME table needs them: it is built from the `py.class` ops in the
+  // module, and by that phase those are the source classes only.
+  llvm::ArrayRef<RuntimeClassIdDefinition> classIdDeclarations() const {
+    return classIdDefinitions;
+  }
   mlir::LogicalResult verify();
 
 private:

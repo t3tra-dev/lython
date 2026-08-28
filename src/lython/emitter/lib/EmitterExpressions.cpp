@@ -2082,7 +2082,13 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   // has subclasses -- which is exactly when tryEmitTypeCall refuses to fold.
   // A manifest contract keeps the fold: `type(5)` is int by construction, and
   // an int's header word 1 is not a class id.
-  if (!isExceptionContractType(subject) &&
+  // ⭐ AND A TYPE-ERASED VALUE, whose class id is the one thing it does carry.
+  // `type(v).__name__` over a `list[object]` was refused outright ("would need
+  // the runtime class"); the runtime class is word 1 of the box, which is what
+  // this op reads.
+  const bool erased = contract.getContractName() == "builtins.object" ||
+                      contract.getContractName() == "typing.Any";
+  if (!erased && !isExceptionContractType(subject) &&
       !isExceptionBackedClass(contract.getContractName()) &&
       !classMros.contains(contract.getContractName()))
     return std::nullopt;

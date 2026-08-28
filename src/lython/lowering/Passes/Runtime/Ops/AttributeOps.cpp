@@ -1883,6 +1883,97 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   return mlir::success();
 }
 
+// ⛔ AN EXCEPTION KEEPS ITS EXACT CLASS ONE WORD FURTHER IN. Word 1 is the
+// LAYOUT, and every exception shares BaseException's -- `LyBaseException_New`
+// writes 5 there and the caller's own id into word 2, which is the word
+// `LyEH_ClassIdMatches` is given when a handler dispatches. Reading word 1
+// made `isinstance(e, ValueError)` compare 5 against 53 and answer False for
+// an actual ValueError, and `type(e).__name__` answer "BaseException".
+//
+// A BOX copies the payload's word 1, so the layout is visible without
+// dereferencing -- but the exact class is not, and word 2 of a two-word
+// payload like `int` is off the end. So the second read is GUARDED rather
+// than selected.
+//
+// ⭐ One answer for both readers. Two sites asked this and each had its own
+// spelling of it; a third would have been the argument for sharing, so it is
+// shared at the second.
+mlir::FailureOr<mlir::Value>
+RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
+                                          const RuntimeBundle &object) {
+  mlir::FailureOr<mlir::Value> header =
+      RuntimeBundleLowerer::objectPhysicalHeader(op, object.objectValue);
+  if (mlir::failed(header))
+    return mlir::failure();
+  mlir::Location loc = op->getLoc();
+  mlir::Type dynamicHeaderType =
+      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI64Type());
+  mlir::Value storage = *header;
+  if (storage.getType() != dynamicHeaderType)
+    storage =
+        mlir::memref::CastOp::create(builder, loc, dynamicHeaderType, storage)
+            .getResult();
+
+  const std::int64_t kExceptionLayout =
+      py::exceptions::findByName("BaseException")->classId;
+  const bool inputIsBox =
+      runtimeContractName(object.objectValue.contract) == "builtins.object";
+  auto contractIsException = [&](mlir::Type contract) {
+    std::string name = runtimeContractName(contract);
+    llvm::StringRef leaf = llvm::StringRef(name).rsplit('.').second;
+    if (leaf.empty())
+      leaf = name;
+    if (py::exceptions::findByName(leaf))
+      return true;
+    return RuntimeBundleLowerer::exceptionAncestorContractFor(contract)
+        .has_value();
+  };
+
+  mlir::Value classIdSlot = mlir::arith::ConstantIndexOp::create(
+      builder, loc,
+      !inputIsBox && contractIsException(object.objectValue.contract) ? 2 : 1);
+  mlir::Value classId =
+      mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
+          .getResult();
+  if (!inputIsBox)
+    return classId;
+
+  mlir::Value isException = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, classId,
+      mlir::arith::ConstantIntOp::create(builder, loc, kExceptionLayout, 64));
+  auto exact = mlir::scf::IfOp::create(
+      builder, loc, isException,
+      [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+        mlir::Value entityWord =
+            mlir::memref::LoadOp::create(
+                nested, nestedLoc, storage,
+                mlir::arith::ConstantIndexOp::create(nested, nestedLoc,
+                                                     box_abi::kEntityWord)
+                    .getResult())
+                .getResult();
+        mlir::MemRefType entityType =
+            mlir::MemRefType::get({3}, nested.getI64Type());
+        mlir::Value entity = RuntimeBundleLowerer::memrefFromBoxWords(
+            nested, nestedLoc, entityWord,
+            mlir::arith::ConstantIntOp::create(nested, nestedLoc, 3, 64)
+                .getResult(),
+            entityType);
+        mlir::scf::YieldOp::create(
+            nested, nestedLoc,
+            mlir::ValueRange{
+                mlir::memref::LoadOp::create(
+                    nested, nestedLoc, entity,
+                    mlir::arith::ConstantIndexOp::create(nested, nestedLoc, 2)
+                        .getResult())
+                    .getResult()});
+      },
+      [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+        mlir::scf::YieldOp::create(nested, nestedLoc,
+                                   mlir::ValueRange{classId});
+      });
+  return exact.getResult(0);
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   const RuntimeBundle *object = RuntimeBundleLowerer::bundleFor(op.getInput());
   if (!object || object->kind != RuntimeBundle::Kind::Object)
@@ -1905,82 +1996,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerClassTest(py::ClassTestOp op) {
   // isinstance(a, B)` failed with "operation's operand is unlinked".
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();
-  mlir::Value storage = *header;
-  mlir::Type dynamicHeaderType =
-      mlir::MemRefType::get({mlir::ShapedType::kDynamic}, builder.getI64Type());
-  if (storage.getType() != dynamicHeaderType)
-    storage =
-        mlir::memref::CastOp::create(builder, loc, dynamicHeaderType, storage)
-            .getResult();
-
-  // ⛔ AN EXCEPTION KEEPS ITS EXACT CLASS ONE WORD FURTHER IN. Word 1 is the
-  // LAYOUT, and every exception shares BaseException's -- `LyBaseException_New`
-  // writes 5 there and the caller's own id into word 2, which is the word
-  // `LyEH_ClassIdMatches` is given when a handler dispatches. Reading word 1
-  // here made `isinstance(e, ValueError)` compare 5 against 53 and answer
-  // False for an actual ValueError, silently.
-  const std::int64_t kExceptionLayout =
-      py::exceptions::findByName("BaseException")->classId;
-  const bool inputIsBox =
-      runtimeContractName(object->objectValue.contract) == "builtins.object";
-  auto contractIsException = [&](mlir::Type contract) {
-    std::string name = runtimeContractName(contract);
-    llvm::StringRef leaf = llvm::StringRef(name).rsplit('.').second;
-    if (leaf.empty())
-      leaf = name;
-    if (py::exceptions::findByName(leaf))
-      return true;
-    return RuntimeBundleLowerer::exceptionAncestorContractFor(contract)
-        .has_value();
-  };
-
-  mlir::Value classIdSlot = mlir::arith::ConstantIndexOp::create(
-      builder, loc,
-      !inputIsBox && contractIsException(object->objectValue.contract) ? 2 : 1);
-  mlir::Value actualClassId =
-      mlir::memref::LoadOp::create(builder, loc, storage, classIdSlot)
-          .getResult();
-
-  // A BOX copies the payload's word 1, so the layout is visible without
-  // dereferencing -- but the exact class is not, and word 2 of a two-word
-  // payload like `int` is off the end. So the second read is guarded rather
-  // than selected.
-  if (inputIsBox) {
-    mlir::Value isException = mlir::arith::CmpIOp::create(
-        builder, loc, mlir::arith::CmpIPredicate::eq, actualClassId,
-        mlir::arith::ConstantIntOp::create(builder, loc, kExceptionLayout, 64));
-    auto exact = mlir::scf::IfOp::create(
-        builder, loc, isException,
-        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
-          mlir::Value entityWord =
-              mlir::memref::LoadOp::create(
-                  nested, nestedLoc, storage,
-                  mlir::arith::ConstantIndexOp::create(nested, nestedLoc,
-                                                       box_abi::kEntityWord)
-                      .getResult())
-                  .getResult();
-          mlir::MemRefType entityType =
-              mlir::MemRefType::get({3}, nested.getI64Type());
-          mlir::Value entity = RuntimeBundleLowerer::memrefFromBoxWords(
-              nested, nestedLoc, entityWord,
-              mlir::arith::ConstantIntOp::create(nested, nestedLoc, 3, 64)
-                  .getResult(),
-              entityType);
-          mlir::scf::YieldOp::create(
-              nested, nestedLoc,
-              mlir::ValueRange{
-                  mlir::memref::LoadOp::create(
-                      nested, nestedLoc, entity,
-                      mlir::arith::ConstantIndexOp::create(nested, nestedLoc, 2)
-                          .getResult())
-                      .getResult()});
-        },
-        [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
-          mlir::scf::YieldOp::create(nested, nestedLoc,
-                                     mlir::ValueRange{actualClassId});
-        });
-    actualClassId = exact.getResult(0);
-  }
+  mlir::FailureOr<mlir::Value> actual =
+      RuntimeBundleLowerer::exactRuntimeClassId(op, *object);
+  if (mlir::failed(actual))
+    return mlir::failure();
+  mlir::Value actualClassId = *actual;
 
   // ⭐ `LyEH_ClassIdMatches` AND NOT AN EQUALITY, because the taxonomy is what
   // decides for the one family whose subclasses this lowering cannot see: the

@@ -1281,6 +1281,10 @@ private:
   mlir::LogicalResult lowerUnionWrap(py::UnionWrapOp op);
   mlir::LogicalResult lowerUnionTest(py::UnionTestOp op);
   mlir::LogicalResult lowerUnionUnwrap(py::UnionUnwrapOp op);
+  // The instance's EXACT class id, from a header or from a box. Shared,
+  // because a box and an exception each move the word.
+  mlir::FailureOr<mlir::Value> exactRuntimeClassId(mlir::Operation *op,
+                                                   const RuntimeBundle &object);
   mlir::LogicalResult lowerClassTest(py::ClassTestOp op);
   mlir::LogicalResult lowerTypeObject(py::TypeObjectOp op);
   mlir::LogicalResult lowerAttrGet(py::AttrGetOp op);
