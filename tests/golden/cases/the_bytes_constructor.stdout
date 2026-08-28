@@ -1,0 +1,9 @@
+b''
+b'\x00\x00\x00'
+b'xy'
+b'ab'
+b'ABC'
+5 [1, 2] b'AZ'
+héllo
+b'hi' b''
+True

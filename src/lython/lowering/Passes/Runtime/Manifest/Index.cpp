@@ -66,6 +66,12 @@ RuntimeManifestIndex::methodCandidates(llvm::StringRef contract,
   return lookupAll(contract, "method", name);
 }
 
+llvm::ArrayRef<RuntimeSymbol>
+RuntimeManifestIndex::initializerCandidates(llvm::StringRef contract,
+                                            llvm::StringRef name) const {
+  return lookupAll(contract, "initializer", name);
+}
+
 std::optional<RuntimeSymbol>
 RuntimeManifestIndex::primitive(llvm::StringRef contract,
                                 llvm::StringRef name) const {
@@ -348,7 +354,12 @@ void RuntimeManifestIndex::record(mlir::func::FuncOp function,
   llvm::SmallVector<RuntimeSymbol, 2> &candidates = symbolSets[key];
   auto existing = symbols.find(key);
   if (existing != symbols.end()) {
-    if (role != "method") {
+    // ⭐ AN INITIALIZER OVERLOADS LIKE A METHOD. `bytes(...)` is four
+    // constructors in CPython -- empty, a size, a bytes-like, and a string
+    // with an encoding -- and one `__new__` per contract could express one of
+    // them. The candidate machinery that picks a method by whether its
+    // operands can be built is the same question asked of a constructor.
+    if (role != "method" && role != "initializer") {
       duplicateSymbols.push_back(
           RuntimeSymbolDuplicate{existing->second.function, function,
                                  contract.str(), role.str(), name.str()});

@@ -152,15 +152,39 @@ mlir::FailureOr<RuntimeSymbol> RuntimeBundleLowerer::selectManifestMethod(
                            << "." << methodName << " method";
   }
 
-  const RuntimeSymbol *method = nullptr;
-  for (const RuntimeSymbol &candidate : methods) {
-    if (!canBuildRuntimeCallOperands(candidate, sources, allowUnusedSources,
-                                     /*classObject=*/nullptr))
-      continue;
-    if (method)
+  // ⭐ AN EXACT MATCH BEATS A PARTIAL ONE. `allowUnusedSources` exists for the
+  // shapes where a source is not an operand, but with it on, an overload that
+  // ignores an argument matches a call that passes one -- so `bytes(3)` was
+  // "ambiguous overloads" between the empty constructor and the sized one, and
+  // `bytes([65, 66])` picked the empty one and answered b''. The first pass
+  // asks who can take EVERY source; only when nobody can does the permissive
+  // question get asked.
+  auto pick = [&](bool allowUnused,
+                  bool &ambiguous) -> const RuntimeSymbol * {
+    const RuntimeSymbol *found = nullptr;
+    ambiguous = false;
+    for (const RuntimeSymbol &candidate : methods) {
+      if (!canBuildRuntimeCallOperands(candidate, sources, allowUnused,
+                                       /*classObject=*/nullptr))
+        continue;
+      if (found) {
+        ambiguous = true;
+        return nullptr;
+      }
+      found = &candidate;
+    }
+    return found;
+  };
+  bool ambiguous = false;
+  const RuntimeSymbol *method = pick(/*allowUnused=*/false, ambiguous);
+  if (ambiguous)
+    return op->emitError() << "runtime manifest has ambiguous overloads for "
+                           << receiverContract << "." << methodName;
+  if (!method && allowUnusedSources) {
+    method = pick(/*allowUnused=*/true, ambiguous);
+    if (ambiguous)
       return op->emitError() << "runtime manifest has ambiguous overloads for "
                              << receiverContract << "." << methodName;
-    method = &candidate;
   }
   if (!method)
     method = &methods.front();
@@ -439,13 +463,33 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
   if (hasKeywords)
     return op.emitError()
            << "runtime manifest __new__ lowering is not keyword-aware yet";
-  if (mlir::failed(verifySelectedRuntimeTarget(op, *initializer)))
-    return mlir::failure();
 
   llvm::SmallVector<const RuntimeBundle *, 8> sources;
   llvm::SmallVector<RuntimeBundle, 8> unpackedSources;
   if (mlir::failed(collectPackedObjectSources(
           op, op.getPosargs(), "positional args", sources, &unpackedSources)))
+    return mlir::failure();
+
+  // ⭐ THE CONSTRUCTOR IS PICKED BY WHAT IT CAN TAKE, the same way a method is.
+  // A contract may declare several -- `bytes()` is empty, a size, a bytes-like
+  // or a string with an encoding -- and the first lookup answers with whichever
+  // was recorded first.
+  llvm::ArrayRef<RuntimeSymbol> constructors =
+      manifest.initializerCandidates(contract, *methodName);
+  for (bool allowUnused : {false, true}) {
+    bool selected = false;
+    for (const RuntimeSymbol &candidate : constructors) {
+      if (!canBuildRuntimeCallOperands(candidate, sources, allowUnused,
+                                       classObject))
+        continue;
+      initializer = candidate;
+      selected = true;
+      break;
+    }
+    if (selected)
+      break;
+  }
+  if (mlir::failed(verifySelectedRuntimeTarget(op, *initializer)))
     return mlir::failure();
 
   llvm::SmallVector<mlir::Value, 8> operands;

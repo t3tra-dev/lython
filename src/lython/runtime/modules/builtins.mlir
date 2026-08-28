@@ -522,7 +522,9 @@ module attributes {
                     "rstrip", "removeprefix", "removesuffix", "isalpha",
                     "isdigit", "isalnum", "isspace", "isascii", "islower",
                     "isupper", "__contains__", "__contains__",
-                    "__lt__", "__le__", "__gt__", "__ge__", "__iter__"],
+                    "__lt__", "__le__", "__gt__", "__ge__", "__iter__",
+                    "__init__", "__init__", "__init__", "__init__",
+                    "__init__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -584,7 +586,15 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes_iterator">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.bytes_iterator">]>,
+      // The four constructor spellings CPython's `bytes(...)` has, plus the
+      // iterable one restricted to `list[int]` -- this port takes a list where
+      // CPython takes any iterable of ints.
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.list", [!py.contract<"builtins.int">]>] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -596,7 +606,8 @@ module attributes {
                     "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance",
+                    "instance", "instance", "instance", "instance", "instance"]
   } {}
   py.class @bytearray attributes {base_names = ["MutableSequence"],
                                  ly.typing.base_args = [[!py.contract<"builtins.int">]],
@@ -4991,6 +5002,109 @@ module attributes {
       memref.store %byte, %result_bytes[%index] : memref<?xi8>
     }
     func.return %header : memref<6xi64>
+  }
+
+  // ⭐ `bytes(...)` HAD NO CALLABLE CONSTRUCTOR. Every bytes METHOD was here --
+  // hex, fromhex, split, decode, the operators -- and the class itself could
+  // not be called: `bytes([65, 66])` reported "builtins.bytes does not provide
+  // manifest method '__init__'". `LyBytes_FromBytes` is declared `__new__` but
+  // its signature is the runtime's (a raw buffer, a start and a length), which
+  // no Python call can spell.
+  //
+  // ⛔ AN EMPTY `__init__` PER SHAPE, for the reason complex's records: the
+  // constructor path calls both, and with no `__init__` of its own the MRO
+  // walk reaches builtins.object's, whose input is a boxed object.
+  func.func @LyBytes_NewEmpty() -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
+    %zero = arith.constant 0 : i64
+    %header = func.call @__ly_bytes_alloc(%zero) : (i64) -> memref<6xi64>
+    func.return %header : memref<6xi64>
+  }
+
+  func.func @LyBytes_InitEmpty(%self: memref<6xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
+  // `bytes(n)` is n zero bytes, which is CPython's buffer spelling.
+  func.func @LyBytes_NewZeros(%count: i64) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
+    %zero = arith.constant 0 : i64
+    %negative = arith.cmpi slt, %count, %zero : i64
+    %length = arith.select %negative, %zero, %count : i64
+    %header = func.call @__ly_bytes_alloc(%length) : (i64) -> memref<6xi64>
+    %payload = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %count_index = arith.index_cast %length : i64 to index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero_byte = arith.constant 0 : i8
+    scf.for %index = %c0 to %count_index step %c1 {
+      memref.store %zero_byte, %payload[%index] : memref<?xi8>
+    }
+    func.return %header : memref<6xi64>
+  }
+
+  func.func @LyBytes_InitZeros(%self: memref<6xi64> {ly.ownership.object_header}, %count: i64) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
+  // `bytes(b)` copies, which is what CPython's constructor does for a
+  // bytes-like argument.
+  func.func @LyBytes_NewCopy(%source: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
+    %c0 = arith.constant 0 : index
+    %length = func.call @LyBytes_Len(%source) : (memref<6xi64>) -> i64
+    %payload = func.call @__ly_bytes_payload(%source) : (memref<6xi64>) -> memref<?xi8>
+    %header = func.call @LyBytes_FromBytes(%payload, %c0, %length) : (memref<?xi8>, index, i64) -> memref<6xi64>
+    func.return %header : memref<6xi64>
+  }
+
+  func.func @LyBytes_InitCopy(%self: memref<6xi64> {ly.ownership.object_header}, %source: memref<6xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
+  // `bytes(s, encoding)`. The encoding is accepted and checked the way
+  // `str.encode` checks it; the payload is UTF-8 either way, which is the only
+  // codec this runtime has.
+  func.func @LyBytes_NewEncoded(%text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
+    %encoded = func.call @LyUnicode_Encode(%text_header, %text_bytes) : (memref<2xi64>, memref<?xi8>) -> memref<6xi64>
+    func.return %encoded : memref<6xi64>
+  }
+
+  func.func @LyBytes_InitEncoded(%self: memref<6xi64> {ly.ownership.object_header}, %text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
+  // `bytes(xs)` over a list of ints. Each slot is a box whose entity word
+  // addresses the int's own header; the byte is that int's low eight bits,
+  // which is what CPython stores after its 0..255 range check.
+  //
+  // ⛔ A LIST, where CPython takes any iterable of ints: this port has no
+  // runtime iteration protocol to consume here, and a list is what the
+  // spelling is written with.
+  func.func @LyBytes_NewFromList(%items: memref<9xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
+    %length = func.call @LyList_Len(%items) : (memref<9xi64>) -> i64
+    %header = func.call @__ly_bytes_alloc(%length) : (i64) -> memref<6xi64>
+    %payload = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
+    %slots = func.call @__ly_list_items(%items) : (memref<9xi64>) -> memref<?xi64>
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
+    %handle_words_index = arith.index_cast %handle_words : i64 to index
+    %count = arith.index_cast %length : i64 to index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %two_words = arith.constant 2 : i64
+    scf.for %index = %c0 to %count step %c1 {
+      %base = arith.muli %index, %handle_words_index : index
+      %entity_slot = arith.addi %base, %c2 : index
+      %entity = memref.load %slots[%entity_slot] : memref<?xi64>
+      %int_view = func.call @__ly_global_view_i64(%entity, %two_words) : (i64, i64) -> memref<?xi64>
+      %int_header = memref.cast %int_view : memref<?xi64> to memref<2xi64>
+      %value = func.call @LyLong_AsI64(%int_header) : (memref<2xi64>) -> i64
+      %byte = arith.trunci %value : i64 to i8
+      memref.store %byte, %payload[%index] : memref<?xi8>
+    }
+    func.return %header : memref<6xi64>
+  }
+
+  func.func @LyBytes_InitFromList(%self: memref<6xi64> {ly.ownership.object_header}, %items: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
+    func.return
   }
 
   func.func @LyBytes_Len(%header: memref<6xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__len__"} {

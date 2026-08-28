@@ -106,6 +106,10 @@ public:
                                       llvm::StringRef name) const;
   llvm::ArrayRef<RuntimeSymbol>
   methodCandidates(llvm::StringRef contract, llvm::StringRef name) const;
+  // Every constructor declared under this name; a contract may declare more
+  // than one, and the call site picks by whether the operands can be built.
+  llvm::ArrayRef<RuntimeSymbol>
+  initializerCandidates(llvm::StringRef contract, llvm::StringRef name) const;
   std::optional<RuntimeSymbol> primitive(llvm::StringRef contract,
                                          llvm::StringRef name) const;
   std::optional<RuntimeSymbol> builtinCallable(llvm::StringRef name) const;
