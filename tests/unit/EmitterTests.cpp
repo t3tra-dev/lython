@@ -629,6 +629,52 @@ TEST(EmitterTest, AnObjectNarrowedByAClassTestIsThatClass) {
   EXPECT_TRUE(emitted.ok());
 }
 
+// WHAT: a function that CAN reach its end, annotated with a result that cannot
+// hold the None a fallthrough returns, is refused by name. The failure it
+// replaces named neither the function nor the missing return: "callable return
+// ABI expected 2 physical values, but lowering produced 0".
+//
+// Emit-layer and not golden: the repair is a static rejection. The controls
+// are the other half -- a body that cannot reach its end has no fallthrough to
+// answer for, and a result that CAN hold None still falls through.
+TEST(EmitterTest, RefusesAFallthroughTheResultCannotHold) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult missing =
+      emitSource("def f(c: bool) -> str:\n"
+                 "    if c:\n"
+                 "        return \"a\"\n"
+                 "print(f(True))\n",
+                 context);
+  EXPECT_FALSE(missing.ok());
+  EXPECT_TRUE(reportsDiagnostic(missing, "can reach its end without returning"));
+
+  lython::emitter::EmitResult raises =
+      emitSource("def f() -> str:\n"
+                 "    try:\n"
+                 "        raise ValueError(\"x\")\n"
+                 "    except ValueError:\n"
+                 "        raise\n"
+                 "f()\n",
+                 context);
+  EXPECT_TRUE(raises.ok());
+
+  lython::emitter::EmitResult optional =
+      emitSource("def f(c: bool) -> \"str | None\":\n"
+                 "    if c:\n"
+                 "        return \"a\"\n"
+                 "print(f(False))\n",
+                 context);
+  EXPECT_TRUE(optional.ok());
+
+  lython::emitter::EmitResult none =
+      emitSource("def f(c: bool) -> None:\n"
+                 "    if c:\n"
+                 "        return\n"
+                 "f(False)\n",
+                 context);
+  EXPECT_TRUE(none.ok());
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());

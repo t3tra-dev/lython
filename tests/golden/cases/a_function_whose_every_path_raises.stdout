@@ -1,0 +1,6 @@
+reraise: inner
+chained: second
+always+: positive
+always0: 'other'
+positive
+caught not positive

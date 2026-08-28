@@ -1,3 +1,4 @@
+#include "AstSynth.h"
 #include "EmitterCore.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
@@ -306,6 +307,70 @@ ModuleEmitter::lookupGenericFunction(llvm::StringRef name) {
   return nullptr;
 }
 
+namespace {
+
+// ⭐ CAN CONTROL REACH THE END OF THIS BODY? The question the function
+// epilogue has to answer before it fabricates a `return None`: a function
+// annotated `-> str` whose every path raises has no fallthrough to give a
+// value to, and one that DOES fall through is a program whose annotation is
+// not true on every path.
+//
+// Both used to end in the same place -- `py.class.upcast None -> str`, which
+// the lowering cannot give lanes to -- and the report was "callable return ABI
+// expected 2 physical values, but lowering produced 0", which names neither
+// the function nor the missing return.
+//
+// ⛔ CONSERVATIVE IN ONE DIRECTION ONLY: anything not recognised is assumed to
+// complete, so the worst this can do is ask for a return that CPython would
+// have defaulted. A `while True:` with no break is not modelled -- reading the
+// loop for a break is a different analysis and it only ever ADDS unreachable
+// ends, never removes one.
+bool bodyCanComplete(const std::vector<parser::NodePtr> *body);
+
+bool statementCanComplete(const parser::Node &statement) {
+  llvm::StringRef kind = statement.kind;
+  if (kind == "Raise" || kind == "Return" || kind == "Break" ||
+      kind == "Continue")
+    return false;
+  if (kind == "If") {
+    const auto *orelse = ast::nodeList(statement, "orelse");
+    if (!orelse || orelse->empty())
+      return true;
+    return bodyCanComplete(ast::nodeList(statement, "body")) ||
+           bodyCanComplete(orelse);
+  }
+  if (kind == "With" || kind == "AsyncWith")
+    return bodyCanComplete(ast::nodeList(statement, "body"));
+  if (kind == "Try" || kind == "TryStar") {
+    // A finally that cannot complete decides for the whole statement,
+    // whichever way its body went.
+    const auto *finalbody = ast::nodeList(statement, "finalbody");
+    if (finalbody && !finalbody->empty() && !bodyCanComplete(finalbody))
+      return false;
+    const auto *orelse = ast::nodeList(statement, "orelse");
+    if (bodyCanComplete(ast::nodeList(statement, "body")) &&
+        (!orelse || orelse->empty() || bodyCanComplete(orelse)))
+      return true;
+    if (const auto *handlers = ast::nodeList(statement, "handlers"))
+      for (const parser::NodePtr &handler : *handlers)
+        if (handler && bodyCanComplete(ast::nodeList(*handler, "body")))
+          return true;
+    return false;
+  }
+  return true;
+}
+
+bool bodyCanComplete(const std::vector<parser::NodePtr> *body) {
+  if (!body)
+    return true;
+  for (const parser::NodePtr &statement : *body)
+    if (statement && !statementCanComplete(*statement))
+      return false;
+  return true;
+}
+
+} // namespace
+
 void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                                          llvm::StringRef symbolName,
                                          const FunctionSignature &sig,
@@ -551,6 +616,41 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
           "primitive function can fall through without returning a value"});
       if (emitPrimitiveFallbackReturn())
         return;
+    }
+    // The declared result has to be producible from `None`, because that is
+    // what a fallthrough returns. Where it is not, the two cases are the two
+    // answers: a body that cannot reach its end has no fallthrough to answer
+    // for, and one that can is a program to refuse by name.
+    if (!isLambda && currentReturnType &&
+        !py::isAssignableTo(types.none(), currentReturnType, module)) {
+      if (!bodyCanComplete(ast::nodeList(callable, "body"))) {
+        // ⛔ A RAISE AND NOT A VALUE. Nothing reaches here, so any value would
+        // be a fiction -- and a fiction that the ABI still has to expand into
+        // the declared result's physical lanes. The raise needs none, and if
+        // the analysis above is ever wrong the program says so instead of
+        // returning a made-up string.
+        parser::NodePtr unreachable = synth::raiseStmt(
+            synth::call(synth::name("RuntimeError", callable.range),
+                        {synth::strConstant(
+                            "function reached its end without returning",
+                            callable.range)},
+                        callable.range),
+            callable.range);
+        emitStatement(*unreachable);
+        synthesizedIteratorDefs.push_back(std::move(unreachable));
+        return;
+      }
+      std::string described;
+      llvm::raw_string_ostream stream(described);
+      stream << currentReturnType;
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, callable.range.start,
+          "this function can reach its end without returning, and its declared "
+          "result " +
+              described +
+              " cannot hold the None a fallthrough returns: return a value on "
+              "every path, or widen the annotation to include None"});
+      return;
     }
     Value none = emitNone(callable);
     Value result = coerceValue(none, currentReturnType, callable);
