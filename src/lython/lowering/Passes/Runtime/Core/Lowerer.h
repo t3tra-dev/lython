@@ -548,6 +548,11 @@ private:
   mlir::FailureOr<RuntimeBundle> boxRuntimeObject(mlir::Operation *op,
                                                   const RuntimeBundle &source,
                                                   bool retainPayload);
+  // The box-ready form of a source: a lazy int materialized, a bool given the
+  // singleton a payload word can point at. Shared by the box ALLOCATOR and by
+  // any writer that fills a box slot in place.
+  mlir::FailureOr<RuntimeBundle> normalizeBoxSource(mlir::Operation *op,
+                                                    const RuntimeBundle &source);
   mlir::FailureOr<RuntimeBundle> boxRuntimeObjectAtCurrentInsertion(
       mlir::Operation *op, const RuntimeBundle &source, bool retainPayload);
   mlir::FailureOr<mlir::Value> objectPhysicalHeader(mlir::Operation *op,
@@ -1293,6 +1298,10 @@ private:
   mlir::LogicalResult lowerBindingRef(py::BindingRefOp op);
   mlir::LogicalResult lowerFunctionBindingRef(py::BindingRefOp op,
                                               mlir::func::FuncOp function);
+  // The captures of one function VALUE, as a block of boxes the object owns.
+  mlir::FailureOr<mlir::Value>
+  materializeClosureStore(mlir::Operation *op,
+                          llvm::ArrayRef<RuntimeValue> captures);
   mlir::LogicalResult appendClosureValues(py::BindingRefOp op,
                                           mlir::func::FuncOp function,
                                           RuntimeBundle &bundle);
@@ -1425,6 +1434,11 @@ private:
   lowerIndirectFunctionObjectCall(py::CallOp op, const RuntimeBundle &callable);
   llvm::SmallVector<mlir::func::FuncOp, 8>
   collectIndirectCallableTargets(py::CallOp op, const RuntimeBundle &callable);
+  // The captures a runtime function VALUE carries, read back off its object.
+  mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>>
+  closureValuesFromFunctionObject(mlir::Operation *op,
+                                  const RuntimeBundle &callable,
+                                  mlir::func::FuncOp target);
   mlir::LogicalResult collectFunctionTargetRuntimeSources(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       const RuntimeBundle &callable,

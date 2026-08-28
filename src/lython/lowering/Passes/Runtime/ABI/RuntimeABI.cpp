@@ -964,14 +964,8 @@ mlir::FailureOr<RuntimeBundle> RuntimeBundleLowerer::boxRuntimeObject(
 }
 
 mlir::FailureOr<RuntimeBundle>
-RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
-    mlir::Operation *op, const RuntimeBundle &source, bool retainPayload) {
-  if (source.kind != RuntimeBundle::Kind::Object)
-    return op->emitError() << "only runtime object bundles can be boxed";
-  if (RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) &&
-      source.boxedObject)
-    return source;
-
+RuntimeBundleLowerer::normalizeBoxSource(mlir::Operation *op,
+                                        const RuntimeBundle &source) {
   RuntimeBundle concrete = source;
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(concrete)) {
     mlir::FailureOr<RuntimeValue> materialized =
@@ -1009,6 +1003,24 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
         concrete.contract, mlir::ValueRange{boxCall.getResult(0)},
         ownership::OwnershipKind::Borrow);
   }
+
+  return concrete;
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+    mlir::Operation *op, const RuntimeBundle &source, bool retainPayload) {
+  if (source.kind != RuntimeBundle::Kind::Object)
+    return op->emitError() << "only runtime object bundles can be boxed";
+  if (RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract) &&
+      source.boxedObject)
+    return source;
+
+  mlir::FailureOr<RuntimeBundle> normalized =
+      RuntimeBundleLowerer::normalizeBoxSource(op, source);
+  if (mlir::failed(normalized))
+    return mlir::failure();
+  RuntimeBundle concrete = std::move(*normalized);
 
   mlir::Location loc = op->getLoc();
   mlir::MemRefType boxType = box_abi::boxWordsType(builder);

@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Runtime/ABI/BoxLayout.h"
+
 #include <cstddef>
 
 namespace py::lowering {
@@ -98,8 +100,20 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
         return;
       closureValues = alternative->closureValues;
     }
-    if (closureTypes.size() != closureValues.size())
+    // ⭐ A RUNTIME FUNCTION VALUE CARRIES ITS CAPTURES ON THE OBJECT, so the
+    // absence of compile-time closure evidence is no longer a reason to drop
+    // the candidate: the arm reads them back out of the object's closure store.
+    // Requiring the arity to match here is what left a closure in a list or a
+    // dict with no candidate at all -- "callable target is not available".
+    if (closureTypes.size() != closureValues.size()) {
+      if (!closureValues.empty())
+        return;
+      if (runtimeContractName(callableBundle.objectValue.contract) !=
+          "builtins.function")
+        return;
+      targets.push_back(function);
       return;
+    }
     for (auto [closureValue, closureType] :
          llvm::zip(closureValues, closureTypes)) {
       if (!py::isAssignableTo(closureValue.contract, closureType,
@@ -177,6 +191,78 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
                          << bundle.contractName() << " with physical values "
                          << describeValueTypes(values) << " to expected ABI "
                          << describeTypeSequence(expectedTypes);
+}
+
+// ⭐ THE CAPTURES, READ BACK OFF THE OBJECT. The function value's word 5 is
+// the closure store the binding wrote: one box per capture, in the target's
+// declared order. Each box hands its lanes back the same way a boxed container
+// element does.
+//
+// ⛔ BORROWED. The store owns the captures for as long as the object lives, and
+// the object lives across the call that is being lowered -- so the lanes are a
+// view, not a transfer, and nothing here releases them.
+mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>>
+RuntimeBundleLowerer::closureValuesFromFunctionObject(
+    mlir::Operation *op, const RuntimeBundle &callable,
+    mlir::func::FuncOp target) {
+  llvm::SmallVector<RuntimeValue, 4> values;
+  llvm::SmallVector<mlir::Type, 4> closureTypes =
+      RuntimeBundleLowerer::callableClosureTypes(target);
+  if (closureTypes.empty())
+    return values;
+  std::optional<RuntimeSymbol> slotOf =
+      manifest.primitive("builtins.function", "closure_slot");
+  if (!slotOf)
+    return op->emitError()
+           << "runtime manifest has no builtins.function closure_slot";
+  llvm::ArrayRef<mlir::Value> physical = callable.physicalValues();
+  if (physical.size() != 1)
+    return op->emitError()
+           << "a function object is one handle, got " << physical.size();
+  mlir::Location loc = op->getLoc();
+  mlir::Value block =
+      mlir::memref::LoadOp::create(
+          builder, loc, physical.front(),
+          mlir::arith::ConstantIndexOp::create(builder, loc, 5).getResult())
+          .getResult();
+  for (auto [index, closureType] : llvm::enumerate(closureTypes)) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(op, closureType,
+                                                   "closure capture ABI");
+    if (mlir::failed(laneTypes))
+      return mlir::failure();
+    mlir::Value slotWord =
+        RuntimeBundleLowerer::createRuntimeCall(
+            loc, *slotOf,
+            mlir::ValueRange{
+                block, mlir::arith::ConstantIntOp::create(
+                           builder, loc, static_cast<std::int64_t>(index), 64)
+                           .getResult()})
+            .getResult(0);
+    mlir::Value slot = RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc, slotWord,
+        mlir::arith::ConstantIntOp::create(builder, loc,
+                                           box_abi::kWordsPerBox, 64)
+            .getResult(),
+        box_abi::boxWordsType(builder));
+    mlir::Value entityWord =
+        mlir::memref::LoadOp::create(
+            builder, loc, slot,
+            mlir::arith::ConstantIndexOp::create(builder, loc,
+                                                 box_abi::kEntityWord)
+                .getResult())
+            .getResult();
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+        RuntimeBundleLowerer::lanesFromBoxEntity(
+            builder, loc, entityWord, *laneTypes,
+            runtimeContractName(closureType), op);
+    if (mlir::failed(lanes))
+      return mlir::failure();
+    values.push_back(RuntimeValue::objectWithOwnership(
+        closureType, mlir::ValueRange{*lanes},
+        ownership::OwnershipKind::Borrow));
+  }
+  return values;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
@@ -354,6 +440,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
                                  "alternative for "
                               << targetName;
       selectedCallable.closureValues = alternative->closureValues;
+    }
+    if (selectedCallable.closureValues.empty()) {
+      builder.setInsertionPointToEnd(targetBlocks[index]);
+      mlir::FailureOr<llvm::SmallVector<RuntimeValue, 4>> fromObject =
+          RuntimeBundleLowerer::closureValuesFromFunctionObject(op, callable,
+                                                               target);
+      if (mlir::failed(fromObject))
+        return mlir::failure();
+      selectedCallable.closureValues.assign(fromObject->begin(),
+                                            fromObject->end());
     }
     llvm::SmallVector<const RuntimeBundle *, 8> sources;
     llvm::SmallVector<RuntimeBundle, 8> materializedDefaults;

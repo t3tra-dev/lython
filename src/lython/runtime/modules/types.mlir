@@ -85,6 +85,10 @@ module attributes {
   func.func private @__ly_entity_word_get(%ptr: i64, %slot: i64) -> i64
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
+  func.func private @free_raw_i64_ptr(%address: i64)
+  func.func private @realloc_raw_i64_ptr(%address: i64, %bytes: i64) -> i64
+  func.func private @release_payload_slot_ptr(%slot: !llvm.ptr)
+  func.func private @__ly_box_word_count() -> i64
 
   func.func @LyGenerator_New(%target_id: i64) -> memref<64xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 63 : i64, ly.runtime.contract = "types.GeneratorType", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
@@ -379,6 +383,83 @@ module attributes {
   }
 
   // ===== impls: function =====
+
+  // ⭐ A CLOSURE STORE, laid out the way an exception's payload block is: word
+  // 0 is the capture count, and box `i` starts at word 1 + i * kWordsPerBox.
+  // The layout is SHARED on purpose -- the box protocol (store an entity,
+  // release whatever the slot owns) is then the one the rest of the runtime
+  // already uses, rather than a second one that has to agree with it.
+  //
+  // ⛔ Why a block and not the five spare words of the function object: a
+  // closure has however many captures the program wrote, and a fixed object
+  // would put a limit where Python has none.
+  func.func @LyFunction_ClosureNew(%count: i64) -> i64 attributes {ly.runtime.contract = "builtins.function", ly.runtime.primitive = "closure_new"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %eight = arith.constant 8 : i64
+    %words = func.call @__ly_box_word_count() : () -> i64
+    %boxes = arith.muli %count, %words : i64
+    %total = arith.addi %boxes, %one : i64
+    %bytes = arith.muli %total, %eight : i64
+    %block = func.call @realloc_raw_i64_ptr(%zero, %bytes) : (i64, i64) -> i64
+    %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+    // Zeroed whole: an unwritten box has to read as "owns nothing", which is
+    // what its owned flag being zero means.
+    %end:1 = scf.while (%i = %zero) : (i64) -> (i64) {
+      %more = arith.cmpi slt, %i, %total : i64
+      scf.condition(%more) %i : i64
+    } do {
+    ^bb0(%i: i64):
+      %slot = llvm.getelementptr %block_ptr[%i] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      llvm.store %zero, %slot : i64, !llvm.ptr
+      %next = arith.addi %i, %one : i64
+      scf.yield %next : i64
+    }
+    llvm.store %count, %block_ptr : i64, !llvm.ptr
+    func.return %block : i64
+  }
+
+  // The address of capture `index`'s box, for a writer or a reader.
+  func.func @LyFunction_ClosureSlot(%block: i64, %index: i64) -> i64 attributes {ly.runtime.contract = "builtins.function", ly.runtime.interior_word, ly.runtime.primitive = "closure_slot"} {
+    %one = arith.constant 1 : i64
+    %words = func.call @__ly_box_word_count() : () -> i64
+    %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+    %base = arith.muli %index, %words : i64
+    %offset = arith.addi %base, %one : i64
+    %slot_ptr = llvm.getelementptr %block_ptr[%offset] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+    %slot_word = llvm.ptrtoint %slot_ptr : !llvm.ptr to i64
+    func.return %slot_word : i64
+  }
+
+  // Drop every capture the store owns, then the store. A zero block is the
+  // "no captures" spelling and releases nothing.
+  func.func @LyFunction_ClosureRelease(%block: i64) attributes {ly.runtime.contract = "builtins.function", ly.runtime.primitive = "closure_release"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %absent = arith.cmpi eq, %block, %zero : i64
+    cf.cond_br %absent, ^done, ^release
+
+  ^release:
+    %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
+    %count = llvm.load %block_ptr : !llvm.ptr -> i64
+    %end:1 = scf.while (%i = %zero) : (i64) -> (i64) {
+      %more = arith.cmpi slt, %i, %count : i64
+      scf.condition(%more) %i : i64
+    } do {
+    ^bb0(%i: i64):
+      %slot_word = func.call @LyFunction_ClosureSlot(%block, %i) : (i64, i64) -> i64
+      %slot_ptr = llvm.inttoptr %slot_word : i64 to !llvm.ptr
+      func.call @release_payload_slot_ptr(%slot_ptr) : (!llvm.ptr) -> ()
+      %next = arith.addi %i, %one : i64
+      scf.yield %next : i64
+    }
+    func.call @free_raw_i64_ptr(%block) : (i64) -> ()
+    cf.br ^done
+
+  ^done:
+    func.return
+  }
+
   func.func @LyFunction_New(%target_id: i64, %defaults: i64, %kwdefaults: i64, %closure: i64, %annotations: i64, %module: i64) -> memref<8xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 6 : i64, ly.runtime.contract = "builtins.function", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %layout_function = arith.constant 6 : i64
@@ -411,6 +492,9 @@ module attributes {
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
+    %closure_slot_index = arith.constant 5 : index
+    %closure_block = memref.load %storage[%closure_slot_index] : memref<8xi64>
+    func.call @LyFunction_ClosureRelease(%closure_block) : (i64) -> ()
     memref.dealloc %storage : memref<8xi64>
     cf.br ^done
 

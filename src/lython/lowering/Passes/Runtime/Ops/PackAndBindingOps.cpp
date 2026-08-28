@@ -424,6 +424,31 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
            << "runtime manifest has no builtins.function.__new__";
 
   builder.setInsertionPoint(op);
+  // ⭐ THE CAPTURES GO ON THE OBJECT. A function VALUE that crosses a boundary
+  // the compiler cannot see through keeps its target id and, until this,
+  // nothing else -- so the candidate walk at the call site dropped every
+  // capture-taking function and the dispatch answered "callable target is not
+  // available". CPython puts them in `__closure__`, which is the word this
+  // fills.
+  //
+  // ⛔ BOXED, one per capture. A box is the one representation that holds any
+  // contract in a single slot, and the read side already knows how to take a
+  // value back out of one.
+  RuntimeBundle captures = bundle;
+  if (mlir::failed(appendClosureValues(op, targetFunction, captures)))
+    return mlir::failure();
+  mlir::Value closureWord =
+      mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
+          .getResult();
+  if (!captures.closureValues.empty()) {
+    mlir::FailureOr<mlir::Value> stored =
+        RuntimeBundleLowerer::materializeClosureStore(op,
+                                                      captures.closureValues);
+    if (mlir::failed(stored))
+      return mlir::failure();
+    closureWord = *stored;
+  }
+
   llvm::SmallVector<mlir::Value, 6> operands;
   operands.push_back(
       mlir::arith::ConstantIntOp::create(
@@ -431,10 +456,15 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
           RuntimeBundleLowerer::functionTargetId(targetFunction.getSymName()),
           64)
           .getResult());
-  for (unsigned index = 0; index < 5; ++index)
-    operands.push_back(
-        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
-            .getResult());
+  auto zero = [&] {
+    return mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 0, 64)
+        .getResult();
+  };
+  operands.push_back(zero()); // defaults
+  operands.push_back(zero()); // kwdefaults
+  operands.push_back(closureWord);
+  operands.push_back(zero()); // annotations
+  operands.push_back(zero()); // module
 
   mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
       op.getLoc(), *initializer, operands);
@@ -447,6 +477,69 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
   valueBundles[op.getResult()] = std::move(bundle);
   erase.push_back(op);
   return mlir::success();
+}
+
+// The closure store for one function object: a block of boxes, one per
+// capture, each holding an owned reference the object drops when it dies.
+mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::materializeClosureStore(
+    mlir::Operation *op, llvm::ArrayRef<RuntimeValue> captures) {
+  std::optional<RuntimeSymbol> makeStore =
+      manifest.primitive("builtins.function", "closure_new");
+  std::optional<RuntimeSymbol> slotOf =
+      manifest.primitive("builtins.function", "closure_slot");
+  if (!makeStore || !slotOf)
+    return op->emitError() << "runtime manifest has no builtins.function "
+                              "closure_new / closure_slot primitive";
+  mlir::Location loc = op->getLoc();
+  mlir::Value count = mlir::arith::ConstantIntOp::create(
+                          builder, loc,
+                          static_cast<std::int64_t>(captures.size()), 64)
+                          .getResult();
+  mlir::Value block =
+      RuntimeBundleLowerer::createRuntimeCall(loc, *makeStore,
+                                              mlir::ValueRange{count})
+          .getResult(0);
+  // ⛔ THE WORDS ARE WRITTEN IN PLACE, not copied out of a box the frame would
+  // then own. Allocating a box here and copying it left an owned
+  // `memref<5xi64>` the refcount phases had to release, and the program
+  // aborted on the release it could not place.
+  for (auto [index, capture] : llvm::enumerate(captures)) {
+    RuntimeBundle one = RuntimeBundle::object(capture.contract, capture.values);
+    mlir::FailureOr<RuntimeBundle> normalized =
+        RuntimeBundleLowerer::normalizeBoxSource(op, one);
+    if (mlir::failed(normalized))
+      return mlir::failure();
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
+        RuntimeBundleLowerer::objectPayloadHandleWords(op, *normalized,
+                                                       /*retainPayload=*/true);
+    if (mlir::failed(words))
+      return mlir::failure();
+    mlir::Value slotWord =
+        RuntimeBundleLowerer::createRuntimeCall(
+            loc, *slotOf,
+            mlir::ValueRange{
+                block,
+                mlir::arith::ConstantIntOp::create(
+                    builder, loc, static_cast<std::int64_t>(index), 64)
+                    .getResult()})
+            .getResult(0);
+    mlir::Value slot = RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc, slotWord,
+        mlir::arith::ConstantIntOp::create(builder, loc,
+                                           box_abi::kWordsPerBox, 64)
+            .getResult(),
+        box_abi::boxWordsType(builder));
+    for (auto [word, value] : llvm::enumerate(*words))
+      mlir::memref::StoreOp::create(
+          builder, loc, value, slot,
+          mlir::arith::ConstantIndexOp::create(
+              builder, loc, static_cast<std::int64_t>(word))
+              .getResult());
+    if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *normalized, "closure.capture")))
+      return mlir::failure();
+  }
+  return block;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::appendClosureValues(
