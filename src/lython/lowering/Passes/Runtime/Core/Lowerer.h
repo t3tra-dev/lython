@@ -1826,6 +1826,17 @@ getOrCreateDiscardCurrentException(mlir::ModuleOp module,
                                     builder.getFunctionType({}, {}));
 }
 
+// Handler completion where the call site KNOWS whether this handler sits
+// inside another: the context pop returns to handling the outer exception, and
+// there is one to return to exactly then.
+inline mlir::func::FuncOp
+getOrCreateDiscardCurrentExceptionEx(mlir::ModuleOp module,
+                                     mlir::OpBuilder &builder) {
+  return getOrCreatePrivateFunction(
+      module, builder, "LyEH_DiscardCurrentExceptionEx",
+      builder.getFunctionType({builder.getI1Type()}, {}));
+}
+
 inline mlir::func::FuncOp
 getOrCreateRethrowCurrent(mlir::ModuleOp module, mlir::OpBuilder &builder) {
   return getOrCreatePrivateFunction(module, builder, "LyEH_RethrowCurrent",

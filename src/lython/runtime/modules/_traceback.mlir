@@ -36,7 +36,10 @@ module attributes {
     "_traceback.frame_col",
     "_traceback.frame_end_col",
     "_traceback.frame_marker",
-    "_traceback.exc_line"
+    "_traceback.exc_line",
+    "_traceback.chain_count",
+    "_traceback.chain_kind",
+    "_traceback.chain_select"
   ],
   ly.typing.function_names = [
     "_traceback.frame_count",
@@ -46,7 +49,10 @@ module attributes {
     "_traceback.frame_col",
     "_traceback.frame_end_col",
     "_traceback.frame_marker",
-    "_traceback.exc_line"
+    "_traceback.exc_line",
+    "_traceback.chain_count",
+    "_traceback.chain_kind",
+    "_traceback.chain_select"
   ],
   ly.typing.function_contracts = [
     !py.callable<[], arg_names = [], arg_defaults = [], returns = [!py.contract<"builtins.int">]>,
@@ -56,7 +62,10 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["index"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
-    !py.callable<[], arg_names = [], arg_defaults = [], returns = [!py.contract<"builtins.str">]>
+    !py.callable<[], arg_names = [], arg_defaults = [], returns = [!py.contract<"builtins.str">]>,
+    !py.callable<[], arg_names = [], arg_defaults = [], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["level"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["level"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>
   ]
 } {
   func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
@@ -71,8 +80,34 @@ module attributes {
   func.func private @LyTraceback_FrameNameLen(i64) -> i64
   func.func private @LyTraceback_FrameFileCopy(i64, memref<?xi8>, i64)
   func.func private @LyTraceback_FrameNameCopy(i64, memref<?xi8>, i64)
+  func.func private @LyTraceback_ChainCount() -> i64
+  func.func private @LyTraceback_ChainKind(i64) -> i64
+  func.func private @LyTraceback_ChainSelect(i64)
   func.func private @LyTraceback_ExcLineLen() -> i64
   func.func private @LyTraceback_ExcLineCopy(memref<?xi8>, i64)
+
+  // The chained exceptions ahead of the one being handled: how many sections
+  // the uncaught printer would write before its own, how each is attached, and
+  // which one the frame/exc-line accessors answer from. A negative level
+  // restores the live stack.
+  func.func @LyTracebackMod_ChainCount() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.chain_count", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_chain_count", ly.runtime.result_contract = "builtins.int"} {
+    %count = func.call @LyTraceback_ChainCount() : () -> i64
+    %h = func.call @LyLong_FromI64(%count) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
+  }
+
+  func.func @LyTracebackMod_ChainKind(%level: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.chain_kind", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_chain_kind", ly.runtime.result_contract = "builtins.int"} {
+    %kind = func.call @LyTraceback_ChainKind(%level) : (i64) -> i64
+    %h = func.call @LyLong_FromI64(%kind) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
+  }
+
+  func.func @LyTracebackMod_ChainSelect(%level: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.chain_select", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_chain_select", ly.runtime.result_contract = "builtins.int"} {
+    func.call @LyTraceback_ChainSelect(%level) : (i64) -> ()
+    %zero = arith.constant 0 : i64
+    %h = func.call @LyLong_FromI64(%zero) : (i64) -> memref<2xi64>
+    func.return %h : memref<2xi64>
+  }
 
   func.func @LyTracebackMod_FrameCount() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_traceback.frame_count", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "traceback_frame_count", ly.runtime.result_contract = "builtins.int"} {
     %count = func.call @LyTraceback_FrameCount() : () -> i64

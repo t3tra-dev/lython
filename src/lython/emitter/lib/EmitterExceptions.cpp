@@ -799,6 +799,14 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   state.addRegion();
   mlir::Operation *rawTry = builder.create(state);
   auto tryOp = mlir::cast<py::TryOp>(rawTry);
+  // ⭐ IS THIS TRY INSIDE A HANDLER BODY? Handler completion pops the
+  // __context__ back to the exception being handled, and there is one to pop
+  // back to exactly when this handler sits inside another. The lowering cannot
+  // ask: its own `enclosingHandlerId` answers which landing pad an exception
+  // here unwinds to, which for a try inside a handler is the pad OUTSIDE that
+  // handler. The walk that knows is this one.
+  if (exceptHandlerDepth != 0)
+    tryOp->setAttr("ly.try.inside_handler", builder.getUnitAttr());
 
   auto appendBoolYield = [&](llvm::SmallVectorImpl<mlir::Value> &yieldValues,
                              bool value) {
@@ -1903,6 +1911,10 @@ void ModuleEmitter::emitTryStar(const parser::Node &statement) {
   state.addRegion();
   mlir::Operation *rawTry = builder.create(state);
   auto tryOp = mlir::cast<py::TryOp>(rawTry);
+  // The same marker `except` carries: handler completion pops the context
+  // only when this handler is inside another.
+  if (exceptHandlerDepth != 0)
+    tryOp->setAttr("ly.try.inside_handler", builder.getUnitAttr());
 
   {
     mlir::OpBuilder::InsertionGuard guard(builder);

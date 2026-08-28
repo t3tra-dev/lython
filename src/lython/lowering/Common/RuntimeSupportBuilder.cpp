@@ -2157,8 +2157,8 @@ void buildReleaseExceptionExtras(SupportBuilder &b) {
 // completion returns to handling the outer exception (CPython's exception
 // stack pop), so a bare `raise` after a nested try re-raises the right one.
 void buildDiscardCurrentException(SupportBuilder &b) {
-  auto fn = b.beginFunction("LyEH_DiscardCurrentException",
-                            b.builder.getFunctionType({}, {}));
+  auto fn = b.beginFunction("LyEH_DiscardCurrentExceptionEx",
+                            b.builder.getFunctionType({b.i1()}, {}));
   mlir::Block *entry = fn.addEntryBlock();
   mlir::Region &body = fn.getBody();
   mlir::Block *release = b.builder.createBlock(&body);
@@ -2206,7 +2206,15 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   b.call("LyTraceback_Clear", mlir::TypeRange{}, {});
   mlir::Value contextSlot = b.addrOf("g_exc_context_node");
   mlir::Value node = b.loadPtrVal(contextSlot);
-  mlir::Value haveContext = b.ptrNe(node, b.nullPtr());
+  // ⛔ RESTORE ONLY WHEN THIS HANDLER IS NESTED INSIDE ANOTHER. The pop
+  // returns to handling the outer exception, and there is one to return to
+  // exactly when the handler that is finishing sits inside it. A raise that
+  // LEFT its handler and was caught further out has no such handler any more,
+  // and restoring there left an already-handled exception pending: a later
+  // uncaught raise printed the old one's chain, and every
+  // `format_exception` after the first accumulated the ones before it.
+  mlir::Value haveContext = mlir::arith::AndIOp::create(
+      b.builder, b.loc, b.ptrNe(node, b.nullPtr()), entry->getArgument(0));
   mlir::cf::CondBranchOp::create(b.builder, b.loc, haveContext, restore,
                                  mlir::ValueRange{}, finish,
                                  mlir::ValueRange{});
@@ -2256,9 +2264,38 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(finish);
+  // Nothing returns to this context, so it is dropped rather than parked:
+  // leaving it in the slot makes the NEXT raise inherit it.
+  //
+  // ⛔ RELEASED THROUGH THE SLOT, and the slot is cleared FIRST. The release
+  // walks the node's own cause/context chain, and a node reachable twice --
+  // the header records that one may be both -- would otherwise be re-entered
+  // through the global it is still in.
+  {
+    mlir::Value parked = b.loadPtrVal(contextSlot);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, b.nullPtr(), contextSlot,
+                                /*alignment=*/8);
+    b.call("release_chain_node", mlir::TypeRange{}, mlir::ValueRange{parked});
+  }
   mlir::LLVM::StoreOp::create(b.builder, b.loc, b.iconst(0),
                               b.addrOf("g_exc_suppress_context"),
                               /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
+// void LyEH_DiscardCurrentException(): handler completion for a handler whose
+// nesting is not known at the call site -- the generator state machine's, which
+// completes a handler inside a resumed frame. Keeps the restoring behaviour it
+// has always had.
+void buildDiscardCurrentExceptionPlain(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyEH_DiscardCurrentException",
+                            b.builder.getFunctionType({}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  b.call("LyEH_DiscardCurrentExceptionEx", mlir::TypeRange{},
+         mlir::ValueRange{
+             mlir::arith::ConstantIntOp::create(b.builder, b.loc, 1, 1)
+                 .getResult()});
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
@@ -3726,6 +3763,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildCurrentExceptionClassId(support);
   buildCurrentExceptionMatches(support);
   buildDiscardCurrentException(support);
+  buildDiscardCurrentExceptionPlain(support);
   buildRethrowCurrent(support);
   buildTakeCurrentDescriptor(support);
   buildStashCurrentException(support);

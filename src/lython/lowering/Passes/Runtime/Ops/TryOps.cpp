@@ -42,13 +42,16 @@ void replaceYields(mlir::OpBuilder &builder, mlir::Region &region,
 
 void replaceExceptYields(mlir::OpBuilder &builder, mlir::Region &region,
                          mlir::Block *continuation,
-                         mlir::func::FuncOp discardCurrentException) {
+                         mlir::func::FuncOp discardCurrentException,
+                         bool nestedInHandler) {
   llvm::SmallVector<py::ExceptYieldOp, 8> yields;
   collectOwnedOps(region, yields);
   for (py::ExceptYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
-    mlir::func::CallOp::create(builder, yield.getLoc(), discardCurrentException,
-                               mlir::ValueRange{});
+    mlir::func::CallOp::create(
+        builder, yield.getLoc(), discardCurrentException,
+        mlir::ValueRange{
+            constantBool(builder, yield.getLoc(), nestedInHandler)});
     mlir::cf::BranchOp::create(builder, yield.getLoc(), continuation,
                                yield.getOperands());
     yield.erase();
@@ -160,13 +163,15 @@ void replaceYieldsWithFinallyEntry(mlir::OpBuilder &builder,
 
 void replaceExceptYieldsWithFinallyEntry(
     mlir::OpBuilder &builder, mlir::Region &region, mlir::Block *finallyEntry,
-    mlir::func::FuncOp discardCurrentException) {
+    mlir::func::FuncOp discardCurrentException, bool nestedInHandler) {
   llvm::SmallVector<py::ExceptYieldOp, 8> yields;
   collectOwnedOps(region, yields);
   for (py::ExceptYieldOp yield : yields) {
     builder.setInsertionPoint(yield);
-    mlir::func::CallOp::create(builder, yield.getLoc(), discardCurrentException,
-                               mlir::ValueRange{});
+    mlir::func::CallOp::create(
+        builder, yield.getLoc(), discardCurrentException,
+        mlir::ValueRange{
+            constantBool(builder, yield.getLoc(), nestedInHandler)});
     llvm::SmallVector<mlir::Value, 4> operands;
     mlir::Value mode = constantBool(builder, yield.getLoc(), false);
     operands.push_back(mode);
@@ -296,7 +301,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   mlir::func::FuncOp discardCurrentException;
   if (hasExcept)
     discardCurrentException =
-        getOrCreateDiscardCurrentException(module, builder);
+        getOrCreateDiscardCurrentExceptionEx(module, builder);
 
   for (mlir::Block &block : op.getTryRegion())
     tryHandlerIds.try_emplace(&block, handlerId);
@@ -357,7 +362,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
         builder, op.getTryRegion(), finallyEntry, /*exceptional=*/false);
     if (hasExcept)
       replaceExceptYieldsWithFinallyEntry(
-          builder, op.getExceptRegion(), finallyEntry, discardCurrentException);
+          builder, op.getExceptRegion(), finallyEntry, discardCurrentException,
+          op->hasAttr("ly.try.inside_handler"));
     if (mlir::failed(replaceRaiseCurrentWithFinallyEntry(
             builder, op.getExceptRegion(), finallyEntry, op)))
       return mlir::failure();
@@ -396,7 +402,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   } else {
     replaceYields<py::TryYieldOp>(builder, op.getTryRegion(), continuation);
     replaceExceptYields(builder, op.getExceptRegion(), continuation,
-                        discardCurrentException);
+                        discardCurrentException,
+                        op->hasAttr("ly.try.inside_handler"));
   }
 
   auto continuationIt = continuation->getIterator();

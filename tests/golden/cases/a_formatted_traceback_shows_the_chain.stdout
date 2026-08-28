@@ -1,0 +1,69 @@
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 38, in <module>
+    raise ValueError("inner")
+ValueError: inner
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 40, in <module>
+    raise RuntimeError("outer") from first
+RuntimeError: outer
+----
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 47, in implicit
+    raise ValueError("a")
+ValueError: a
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 54, in <module>
+    implicit()
+    ~~~~~~~~^^
+  File "a_formatted_traceback_shows_the_chain.py", line 49, in implicit
+    raise RuntimeError("b")
+RuntimeError: b
+----
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 68, in <module>
+    suppressed()
+    ~~~~~~~~~~^^
+  File "a_formatted_traceback_shows_the_chain.py", line 63, in suppressed
+    raise RuntimeError("d") from None
+RuntimeError: d
+----
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 76, in three_deep
+    raise ValueError("e")
+ValueError: e
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 78, in three_deep
+    raise KeyError("f") from x
+KeyError: 'f'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 84, in <module>
+    three_deep()
+    ~~~~~~~~~~^^
+  File "a_formatted_traceback_shows_the_chain.py", line 80, in three_deep
+    raise RuntimeError("g") from y
+RuntimeError: g
+----
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 91, in limited
+    raise ValueError("h")
+ValueError: h
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "a_formatted_traceback_shows_the_chain.py", line 99, in <module>
+    limited()
+    ~~~~~~~^^
+RuntimeError: i

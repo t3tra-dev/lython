@@ -335,16 +335,62 @@ def format_exception_only(exc: BaseException) -> list[str]:
     return [label + ": " + message + "\n"]
 
 
-def format_exception(exc: BaseException, *,
-                     limit: Optional[int] = None) -> list[str]:
-    """The whole traceback of the exception being handled, as CPython lays it
-    out: the header, one entry per frame, then the exception line."""
+_CAUSE_SEPARATOR = ("\nThe above exception was the direct cause of the "
+                    "following exception:\n\n")
+_CONTEXT_SEPARATOR = ("\nDuring handling of the above exception, another "
+                      "exception occurred:\n\n")
+
+
+def _format_section(limit: Optional[int]) -> list[str]:
+    """One traceback section -- header plus frames -- for whatever the read
+    view is pointing at."""
     out: list[str] = []
     frames = format_tb(_current_tb(), limit)
     if len(frames) > 0:
         out.append("Traceback (most recent call last):\n")
         for text in frames:
             out.append(text)
+    return out
+
+
+def _format_chain(limit: Optional[int]) -> list[str]:
+    """The chained exceptions ahead of the one being handled, outermost first,
+    each followed by the connector that attaches it to the next.
+
+    The runtime records the chain (`raise X from e` and a raise that interrupts
+    a handler both build a node), and the uncaught printer walks it; the read
+    view is how a PROGRAM walks the same nodes. `chain_kind` says which of
+    CPython's two connector lines separates a level from what follows it.
+    """
+    out: list[str] = []
+    level = _traceback.chain_count() - 1
+    while level >= 0:
+        kind = _traceback.chain_kind(level)
+        _traceback.chain_select(level)
+        section = _format_section(limit)
+        line = _traceback.exc_line()
+        _traceback.chain_select(-1)
+        for text in section:
+            out.append(text)
+        out.append(line + "\n")
+        if kind == 1:
+            out.append(_CAUSE_SEPARATOR)
+        else:
+            out.append(_CONTEXT_SEPARATOR)
+        level -= 1
+    return out
+
+
+def format_exception(exc: BaseException, *,
+                     limit: Optional[int] = None) -> list[str]:
+    """The whole traceback of the exception being handled, as CPython lays it
+    out: every chained exception first, then the header, one entry per frame,
+    then the exception line."""
+    out: list[str] = []
+    for text in _format_chain(limit):
+        out.append(text)
+    for text in _format_section(limit):
+        out.append(text)
     for text in format_exception_only(exc):
         out.append(text)
     return out
@@ -368,11 +414,10 @@ def format_exc(limit: Optional[int] = None) -> str:
     if line == "":
         return "NoneType: None\n"
     out: list[str] = []
-    frames = format_tb(_current_tb(), limit)
-    if len(frames) > 0:
-        out.append("Traceback (most recent call last):\n")
-        for text in frames:
-            out.append(text)
+    for text in _format_chain(limit):
+        out.append(text)
+    for text in _format_section(limit):
+        out.append(text)
     out.append(line + "\n")
     return "".join(out)
 

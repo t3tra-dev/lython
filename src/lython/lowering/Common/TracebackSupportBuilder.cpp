@@ -73,7 +73,17 @@ void declareTracebackSupport(SupportBuilder &b) {
     // The two node slots hold POINTERS. They are owner sites in the model's
     // sense -- a global holding an owning reference -- and what a site holds is
     // an identity, not a number that happens to be one.
-    for (llvm::StringRef name : {"g_exc_context_node", "g_exc_cause_node"}) {
+    // ⭐ THE READ VIEW. `traceback.format_exception` has to render the CHAINED
+    // exceptions as well as the current one, and every frame accessor reads
+    // the live stack. This slot names a chain node whose own frames and
+    // payload the read accessors answer from instead; null is the live stack,
+    // which is what every other caller sees.
+    //
+    // ⛔ It is a READ view only: the push/pop path keeps `g_traceback_size`
+    // and the stack itself, so a stale view can produce a wrong traceback but
+    // never a corrupted one.
+    for (llvm::StringRef name :
+         {"g_exc_context_node", "g_exc_cause_node", "g_tb_view_node"}) {
       auto global = mlir::LLVM::GlobalOp::create(
           b.builder, b.loc, b.ptr(), /*isConstant=*/false,
           mlir::LLVM::Linkage::Internal, name, mlir::Attribute(),
@@ -533,14 +543,283 @@ constexpr std::int64_t kFrameBytes = 40;
 // stack owns its `char *` copies and a manifest cannot hold a raw pointer.
 // ---------------------------------------------------------------------------
 
+// The frame source the READ accessors answer from: the chain node the view
+// names, or the live stack when there is none. Only the readers use these --
+// the pusher and the popper own the stack unconditionally.
+mlir::Value loadViewNode(SupportBuilder &b) {
+  return b.loadPtrVal(b.addrOf("g_tb_view_node"));
+}
+
+// i64 view_frame_count()
+void buildViewFrameCount(SupportBuilder &b) {
+  auto fn = b.beginFunction("view_frame_count",
+                            b.builder.getFunctionType({}, {b.i64()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *viewed = b.builder.createBlock(&body);
+  mlir::Block *live = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value node = loadViewNode(b);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrNe(node, b.nullPtr()), viewed,
+                                 mlir::ValueRange{}, live, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(viewed);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{b.loadI64(nodeMember(b, node, kNodeFrameCount))});
+
+  b.builder.setInsertionPointToEnd(live);
+  mlir::func::ReturnOp::create(b.builder, b.loc,
+                               mlir::ValueRange{loadTracebackSize(b)});
+}
+
+// ptr view_frame_at(i64 index)
+void buildViewFrameAt(SupportBuilder &b) {
+  auto fn = b.beginFunction("view_frame_at",
+                            b.builder.getFunctionType({b.i64()}, {b.ptr()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *viewed = b.builder.createBlock(&body);
+  mlir::Block *live = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value node = loadViewNode(b);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrNe(node, b.nullPtr()), viewed,
+                                 mlir::ValueRange{}, live, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(viewed);
+  mlir::Value frames = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
+  mlir::Value offset = mlir::arith::MulIOp::create(
+      b.builder, b.loc, entry->getArgument(0), b.iconst(kFrameBytes));
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc, mlir::ValueRange{b.gepI8(frames, offset)});
+
+  b.builder.setInsertionPointToEnd(live);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{
+          b.call("frame_at", b.ptr(), mlir::ValueRange{entry->getArgument(0)})
+              .front()});
+}
+
+// The node one step further out: this node's own cause, else its unsuppressed
+// context. Inline rather than a function so the walk stays a loop.
+mlir::Value chainNextNode(SupportBuilder &b, mlir::Value node) {
+  mlir::Value cause = b.loadPtrVal(nodeMember(b, node, kNodeCause));
+  mlir::Value context = b.loadPtrVal(nodeMember(b, node, kNodeContext));
+  mlir::Value suppress = b.loadI64(nodeMember(b, node, kNodeSuppress));
+  mlir::Value shown = mlir::LLVM::SelectOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, suppress, b.iconst(0)), context,
+      b.nullPtr());
+  return mlir::LLVM::SelectOp::create(
+      b.builder, b.loc, b.ptrNe(cause, b.nullPtr()), cause, shown);
+}
+
+// i64 chain_node_at(i64 level) -> the level-th chained node, 0 = the one
+// nearest the current exception. Null when the level is out of range.
+//
+// ⛔ The WALK IS THE PRINTER'S: a cause wins over a context, and a context is
+// skipped when its owner suppressed it -- so the levels a program can render
+// are exactly the sections the uncaught printer writes.
+void buildChainNodeAt(SupportBuilder &b) {
+  auto fn = b.beginFunction("chain_node_at",
+                            b.builder.getFunctionType({b.i64()}, {b.ptr()}),
+                            /*isPrivate=*/true);
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *head =
+      b.builder.createBlock(&body, body.end(), {b.ptr(), b.i64()},
+                            {b.loc, b.loc});
+  mlir::Block *step = b.builder.createBlock(&body);
+  mlir::Block *found = b.builder.createBlock(&body);
+  mlir::Block *none = b.builder.createBlock(&body);
+
+  // Level 0 is the current exception's own cause, else its unsuppressed
+  // context.
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value cause = b.loadPtrVal(b.addrOf("g_exc_cause_node"));
+  mlir::Value context = b.loadPtrVal(b.addrOf("g_exc_context_node"));
+  mlir::Value suppress = b.loadI64(b.addrOf("g_exc_suppress_context"));
+  mlir::Value shown = mlir::LLVM::SelectOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, suppress, b.iconst(0)), context,
+      b.nullPtr());
+  mlir::Value first = mlir::LLVM::SelectOp::create(
+      b.builder, b.loc, b.ptrNe(cause, b.nullPtr()), cause, shown);
+  mlir::cf::BranchOp::create(b.builder, b.loc, head,
+                             mlir::ValueRange{first, entry->getArgument(0)});
+
+  b.builder.setInsertionPointToEnd(head);
+  mlir::Value node = head->getArgument(0);
+  mlir::Value remaining = head->getArgument(1);
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrEq(node, b.nullPtr()), none,
+                                 mlir::ValueRange{}, step, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(step);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, remaining, b.iconst(0)), found,
+      mlir::ValueRange{}, head,
+      mlir::ValueRange{
+          chainNextNode(b, node),
+          mlir::arith::SubIOp::create(b.builder, b.loc, remaining, b.iconst(1))
+              .getResult()});
+
+  b.builder.setInsertionPointToEnd(found);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{node});
+
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.nullPtr()});
+}
+
+// i64 LyTraceback_ChainCount(): how many chained exceptions precede the one
+// being handled -- the number of sections the uncaught printer would write
+// before its own.
+void buildTracebackChainCount(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyTraceback_ChainCount",
+                            b.builder.getFunctionType({}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *head =
+      b.builder.createBlock(&body, body.end(), {b.i64()}, {b.loc});
+  mlir::Block *more = b.builder.createBlock(&body);
+  mlir::Block *done = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::BranchOp::create(b.builder, b.loc, head,
+                             mlir::ValueRange{b.iconst(0)});
+
+  b.builder.setInsertionPointToEnd(head);
+  mlir::Value count = head->getArgument(0);
+  mlir::Value node =
+      b.call("chain_node_at", b.ptr(), mlir::ValueRange{count}).front();
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrNe(node, b.nullPtr()), more,
+                                 mlir::ValueRange{}, done, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(more);
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, head,
+      mlir::ValueRange{
+          mlir::arith::AddIOp::create(b.builder, b.loc, count, b.iconst(1))
+              .getResult()});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{count});
+}
+
+// i64 LyTraceback_ChainKind(i64 level): 1 = this level is the CAUSE of what
+// follows it, 2 = its context, 0 = no such level. The two answers are the two
+// connector lines CPython writes between sections.
+void buildTracebackChainKind(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyTraceback_ChainKind",
+                            b.builder.getFunctionType({b.i64()}, {b.i64()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *pick = b.builder.createBlock(&body);
+  mlir::Block *fromTop = b.builder.createBlock(&body);
+  mlir::Block *fromOwner = b.builder.createBlock(&body);
+  mlir::Block *answer =
+      b.builder.createBlock(&body, body.end(), {b.i1()}, {b.loc});
+  mlir::Block *none = b.builder.createBlock(&body);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value level = entry->getArgument(0);
+  mlir::Value node =
+      b.call("chain_node_at", b.ptr(), mlir::ValueRange{level}).front();
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrEq(node, b.nullPtr()), none,
+                                 mlir::ValueRange{}, pick, mlir::ValueRange{});
+
+  // Level 0 hangs off the current exception's own slots; every other level
+  // hangs off the node one nearer to it.
+  b.builder.setInsertionPointToEnd(pick);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::eq, level, b.iconst(0)), fromTop,
+      mlir::ValueRange{}, fromOwner, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(fromTop);
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, answer,
+      mlir::ValueRange{
+          b.ptrEq(b.loadPtrVal(b.addrOf("g_exc_cause_node")), node)});
+
+  b.builder.setInsertionPointToEnd(fromOwner);
+  mlir::Value owner =
+      b.call("chain_node_at", b.ptr(),
+             mlir::ValueRange{mlir::arith::SubIOp::create(b.builder, b.loc,
+                                                          level, b.iconst(1))
+                                  .getResult()})
+          .front();
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, answer,
+      mlir::ValueRange{
+          b.ptrEq(b.loadPtrVal(nodeMember(b, owner, kNodeCause)), node)});
+
+  b.builder.setInsertionPointToEnd(answer);
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{mlir::arith::SelectOp::create(
+                           b.builder, b.loc, answer->getArgument(0),
+                           b.iconst(1), b.iconst(2))
+                           .getResult()});
+
+  b.builder.setInsertionPointToEnd(none);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{b.iconst(0)});
+}
+
+// void LyTraceback_ChainSelect(i64 level): point the READ accessors at that
+// chained exception; a negative level restores the live stack.
+void buildTracebackChainSelect(SupportBuilder &b) {
+  auto fn = b.beginFunction("LyTraceback_ChainSelect",
+                            b.builder.getFunctionType({b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *live = b.builder.createBlock(&body);
+  mlir::Block *viewed = b.builder.createBlock(&body);
+  mlir::Block *store =
+      b.builder.createBlock(&body, body.end(), {b.ptr()}, {b.loc});
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value level = entry->getArgument(0);
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::slt, level, b.iconst(0)), live,
+      mlir::ValueRange{}, viewed, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(live);
+  mlir::cf::BranchOp::create(b.builder, b.loc, store,
+                             mlir::ValueRange{b.nullPtr()});
+
+  b.builder.setInsertionPointToEnd(viewed);
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, store,
+      mlir::ValueRange{
+          b.call("chain_node_at", b.ptr(), mlir::ValueRange{level}).front()});
+
+  b.builder.setInsertionPointToEnd(store);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, store->getArgument(0),
+                              b.addrOf("g_tb_view_node"), /*alignment=*/8);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 // i64 LyTraceback_FrameCount(): frames recorded for the in-flight exception.
 void buildTracebackFrameCount(SupportBuilder &b) {
   auto fn = b.beginFunction("LyTraceback_FrameCount",
                             b.builder.getFunctionType({}, {b.i64()}));
   mlir::Block *entry = fn.addEntryBlock();
   b.builder.setInsertionPointToEnd(entry);
-  mlir::func::ReturnOp::create(b.builder, b.loc,
-                               mlir::ValueRange{loadTracebackSize(b)});
+  mlir::func::ReturnOp::create(
+      b.builder, b.loc,
+      mlir::ValueRange{b.call("view_frame_count", b.i64(), {}).front()});
 }
 
 // i64 LyTraceback_Frame<Word>(i64 index): one of the frame's recorded i32 words
@@ -557,7 +836,7 @@ void buildTracebackFrameWord(SupportBuilder &b, llvm::StringRef symbol,
   mlir::Block *none = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value size = loadTracebackSize(b);
+  mlir::Value size = b.call("view_frame_count", b.i64(), {}).front();
   mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::ult,
                                entry->getArgument(0), size);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, inRange, read,
@@ -565,7 +844,7 @@ void buildTracebackFrameWord(SupportBuilder &b, llvm::StringRef symbol,
 
   b.builder.setInsertionPointToEnd(read);
   mlir::Value frame =
-      b.call("frame_at", b.ptr(), mlir::ValueRange{entry->getArgument(0)})
+      b.call("view_frame_at", b.ptr(), mlir::ValueRange{entry->getArgument(0)})
           .front();
   mlir::Value word = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i32(),
@@ -595,7 +874,7 @@ void emitFrameNameAccess(
   mlir::Block *absent = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
-  mlir::Value size = loadTracebackSize(b);
+  mlir::Value size = b.call("view_frame_count", b.i64(), {}).front();
   mlir::Value inRange = b.cmpi(mlir::arith::CmpIPredicate::ult, index, size);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, inRange, read,
                                  mlir::ValueRange{}, absent,
@@ -603,7 +882,7 @@ void emitFrameNameAccess(
 
   b.builder.setInsertionPointToEnd(read);
   mlir::Value frame =
-      b.call("frame_at", b.ptr(), mlir::ValueRange{index}).front();
+      b.call("view_frame_at", b.ptr(), mlir::ValueRange{index}).front();
   mlir::Value name =
       b.loadPtrVal(b.frameField(tracebackFrameType(b), frame, field));
   mlir::Value missing = b.ptrEq(name, b.nullPtr());
@@ -676,7 +955,37 @@ void buildExcLineCStr(SupportBuilder &b) {
   mlir::Block *build = b.builder.createBlock(&body);
   mlir::Block *none = b.builder.createBlock(&body);
 
+  // ⭐ THE VIEW ANSWERS FIRST. `format_exception` renders a chained exception
+  // by selecting its node, and its last line has to come from that node's
+  // payload -- the class id in word 2 of the exception object it owns, and
+  // the message beside it -- not from the exception being handled.
+  mlir::Block *viewed = b.builder.createBlock(&fn.getBody());
+  mlir::Block *live = b.builder.createBlock(&fn.getBody());
+  mlir::Block *ready = b.builder.createBlock(&fn.getBody(),
+                                             fn.getBody().end(),
+                                             {b.ptr(), b.i64()},
+                                             {b.loc, b.loc});
+
   b.builder.setInsertionPointToEnd(entry);
+  mlir::Value view = b.loadPtrVal(b.addrOf("g_tb_view_node"));
+  mlir::cf::CondBranchOp::create(b.builder, b.loc,
+                                 b.ptrNe(view, b.nullPtr()), viewed,
+                                 mlir::ValueRange{}, live, mlir::ValueRange{});
+
+  b.builder.setInsertionPointToEnd(viewed);
+  mlir::Value viewParts = nodeMember(b, view, kNodePayload);
+  mlir::Value aligned = b.loadPtrVal(partsField(b, viewParts, 0, 1));
+  mlir::Value offset0 = b.loadI64(partsField(b, viewParts, 0, 2));
+  mlir::Value stride0 = b.loadI64(partsField(b, viewParts, 0, 4));
+  mlir::Value classSlot = mlir::arith::AddIOp::create(
+      b.builder, b.loc, offset0,
+      mlir::arith::MulIOp::create(b.builder, b.loc, stride0, b.iconst(2))
+          .getResult());
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, ready,
+      mlir::ValueRange{viewParts, b.loadI64(b.gepI64(aligned, classSlot))});
+
+  b.builder.setInsertionPointToEnd(live);
   mlir::Value pending = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.i1(), b.addrOf("g_current_exception"),
       /*alignment=*/4);
@@ -688,14 +997,20 @@ void buildExcLineCStr(SupportBuilder &b) {
                                mlir::ValueRange{b.nullPtr()});
 
   b.builder.setInsertionPointToEnd(build);
-  mlir::Value classId =
-      b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front();
+  mlir::cf::BranchOp::create(
+      b.builder, b.loc, ready,
+      mlir::ValueRange{
+          b.addrOf("g_current_parts"),
+          b.call("LyEH_CurrentExceptionClassId", b.i64(), {}).front()});
+
+  b.builder.setInsertionPointToEnd(ready);
+  mlir::Value parts = ready->getArgument(0);
+  mlir::Value classId = ready->getArgument(1);
   mlir::Value label =
       b.call("exception_class_name", b.ptr(), mlir::ValueRange{classId})
           .front();
   mlir::Value labelLen =
       b.call("strlen", b.i64(), mlir::ValueRange{label}).front();
-  mlir::Value parts = b.addrOf("g_current_parts");
   mlir::Value msgHeader = b.loadPtrVal(partsField(b, parts, 1, 1));
   mlir::Value data = b.loadPtrVal(partsField(b, parts, 2, 1));
   mlir::Value offset = b.loadI64(partsField(b, parts, 2, 2));
@@ -3439,6 +3754,12 @@ void buildTracebackSupport(SupportBuilder &b) {
   buildTracebackPushCString(b);
   buildTracebackPop(b);
   buildTracebackClear(b);
+  buildViewFrameCount(b);
+  buildViewFrameAt(b);
+  buildChainNodeAt(b);
+  buildTracebackChainCount(b);
+  buildTracebackChainKind(b);
+  buildTracebackChainSelect(b);
   buildTracebackFrameCount(b);
   buildTracebackFrameWord(b, "LyTraceback_FrameLine", 2);
   buildTracebackFrameWord(b, "LyTraceback_FrameCol", 3);
