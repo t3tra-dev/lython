@@ -393,6 +393,9 @@ private:
   bool hasIndexableEvidence(const parser::Node *expr);
   // `a, b = xs`: the length comparison CPython's UNPACK_SEQUENCE makes
   // (EmitterStatements.cpp, beside the assignment target walk it guards).
+  void emitStarredUnpack(const parser::Node &target,
+                         const std::vector<parser::NodePtr> &elements,
+                         std::size_t starIndex, Value source);
   void emitUnpackArityCheck(const parser::Node &target, Value source,
                             std::size_t expected);
   void runWithScratchNames(llvm::ArrayRef<std::string> names,

@@ -1,0 +1,11 @@
+1 [2, 3, 4]
+[1, 2, 3] 4
+1 [2, 3, 4] 5
+7 [8, 9]
+5 []
+a ['b', 'c']
+1 ['a']
+2 ['b']
+1 [2, 3, 4]
+V: not enough values to unpack (expected at least 2, got 1)
+V: not enough values to unpack (expected at least 1, got 0)

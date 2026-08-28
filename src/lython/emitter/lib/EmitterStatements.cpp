@@ -1657,14 +1657,33 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       // been bound to before stayed. Where the name did not exist yet the
       // program was refused, which is why this only ever showed up when the
       // target was pre-declared.
-      for (const parser::NodePtr &elt : *elts)
+      // ⭐ A STARRED TARGET IS TWO INDEXED READS AND A SLICE. It takes however
+      // many elements are left, which is not a count this walk can index --
+      // but it IS a slice, and the bound at each end is known: the targets
+      // before the star are read from the front and the ones after it from the
+      // back, so the star's own share is `src[before:-after]` with the ends
+      // counted rather than the middle. Refusing it left `first, *rest = xs`
+      // -- the spelling for "the head and everything else" -- unwritable.
+      //
+      // ⛔ The star's value is a LIST whatever the source was, which is what
+      // CPython builds: `a, *b = (1, 2, 3)` leaves `b == [2, 3]`, a list.
+      std::size_t starIndex = elts->size();
+      unsigned starCount = 0;
+      for (auto [index, elt] : llvm::enumerate(*elts))
         if (elt && elt->kind == "Starred") {
-          diagnostics.push_back(parser::Diagnostic{
-              parser::Severity::Error, elt->range.start,
-              "starred assignment target is not supported: it takes a "
-              "statically unknown number of elements"});
-          return;
+          if (starCount++ == 0)
+            starIndex = index;
         }
+      if (starCount > 1) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, target.range.start,
+            "multiple starred expressions in assignment"});
+        return;
+      }
+      if (starCount == 1) {
+        emitStarredUnpack(target, *elts, starIndex, value);
+        return;
+      }
       // The count IS checked, against the object: a check on the type alone
       // catches only heterogeneous tuples (a tuple whose members share a type
       // collapses to `tuple[T]`, and a list carries its length in the object),
@@ -1711,6 +1730,129 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
 // the tuple/list fast paths in ceval report what they got, the generic
 // iterator path does not know it ("too many values to unpack (expected 2)"
 // for a str source, "(expected 2, got 3)" for a list).
+// The starred unpack, written as the Python it means. `a, *b, c = src` is
+//
+//     if len(src) < 2:
+//         raise ValueError("not enough values to unpack (expected at least 2, "
+//                          "got " + str(len(src)) + ")")
+//     a = src[0]
+//     b = list(src[1:-1])
+//     c = src[-1]
+//
+// ⛔ The VALUES are synthesized and the targets are not: each target is handed
+// to `emitAssignTarget`, the same walk the unstarred case uses, so a nested
+// target keeps working and nothing has to copy an AST node. The values go
+// through synthesis so the slice, the `list()` and the raise come from the
+// paths that already answer for them -- a slice is `__getslice__` and not
+// `__getitem__`, and getting that wrong here is the defect the comment in
+// TypeSystem.cpp records for the inference channel.
+void ModuleEmitter::emitStarredUnpack(
+    const parser::Node &target,
+    const std::vector<parser::NodePtr> &elements, std::size_t starIndex,
+    Value source) {
+  const parser::SourceRange range = target.range;
+  const std::size_t before = starIndex;
+  const std::size_t after = elements.size() - starIndex - 1;
+  const std::size_t least = before + after;
+
+  const parser::Node *starred = elements[starIndex].get();
+  const parser::Node *starTarget = ast::node(*starred, "value");
+  if (!starTarget) {
+    diagnostics.push_back(parser::Diagnostic{parser::Severity::Error,
+                                             starred->range.start,
+                                             "starred target has no name"});
+    return;
+  }
+
+  std::string scratch = "__lystar" + std::to_string(++syntheticFunctionCounter);
+  values[scratch] = source;
+  types.bindSymbol(scratch, source.type);
+  auto src = [&] { return synth::name(scratch, range); };
+  auto num = [&](std::int64_t value) {
+    return synth::intConstant(value, range);
+  };
+  auto emitSynthesized = [&](parser::NodePtr node) {
+    Value emitted = emitExpr(node.get());
+    synthesizedIteratorDefs.push_back(std::move(node));
+    return emitted;
+  };
+
+  // CPython's message, and its two halves: the arity is static, the length is
+  // not.
+  parser::NodePtr check = synth::ifStmt(
+      synth::compare(synth::lenCall(src(), range), "Lt",
+                     num(static_cast<std::int64_t>(least)), range),
+      {synth::raiseStmt(
+          synth::call(
+              synth::name("ValueError", range),
+              {synth::binOp(
+                  synth::binOp(
+                      synth::strConstant(
+                          "not enough values to unpack (expected at least " +
+                              std::to_string(least) + ", got ",
+                          range),
+                      "Add",
+                      synth::call(synth::name("str", range),
+                                  {synth::lenCall(src(), range)}, range),
+                      range),
+                  "Add", synth::strConstant(")", range), range)},
+              range),
+          range)},
+      {}, range);
+  emitStatement(*check);
+  synthesizedIteratorDefs.push_back(std::move(check));
+
+  for (std::size_t index = 0; index < before; ++index)
+    emitAssignTarget(*elements[index],
+                     emitSynthesized(synth::subscript(
+                         src(), num(static_cast<std::int64_t>(index)), range)));
+
+  // ⛔ The star's value is a LIST whatever the source was, which is what
+  // CPython builds: `a, *b = (1, 2, 3)` leaves `b == [2, 3]`, a list.
+  //
+  // ⛔ A HETEROGENEOUS TUPLE IS SPELLED OUT INSTEAD OF SLICED. Its arity is in
+  // its type, and `list(t[1:])` types the elements as their union -- which the
+  // list constructor refuses ("iteration over a runtime-mode list of
+  // !py.union<...>"), so `for n, *names in pairs` over `list[tuple[int, str]]`
+  // did not compile. Naming the indices keeps each element's own type.
+  std::optional<std::size_t> staticArity;
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(source.type)))
+    if (contract.getContractName() == "builtins.tuple" &&
+        contract.getArguments().size() > 1 &&
+        contract.getArguments().size() >= least)
+      staticArity = contract.getArguments().size();
+  parser::NodePtr starValue;
+  if (staticArity) {
+    std::vector<parser::NodePtr> members;
+    for (std::size_t index = before; index < *staticArity - after; ++index)
+      members.push_back(
+          synth::subscript(src(), num(static_cast<std::int64_t>(index)),
+                           range));
+    starValue = parser::makeNode("List", range);
+    parser::addField(*starValue, "elts", std::move(members));
+  } else {
+    parser::NodePtr sliceNode = parser::makeNode("Slice", range);
+    parser::addField(*sliceNode, "lower",
+                     num(static_cast<std::int64_t>(before)));
+    if (after != 0)
+      parser::addField(*sliceNode, "upper",
+                       num(-static_cast<std::int64_t>(after)));
+    starValue = synth::call(
+        synth::name("list", range),
+        {synth::subscript(src(), std::move(sliceNode), range)}, range);
+  }
+  emitAssignTarget(*starTarget, emitSynthesized(std::move(starValue)));
+
+  for (std::size_t index = 0; index < after; ++index)
+    emitAssignTarget(
+        *elements[starIndex + 1 + index],
+        emitSynthesized(synth::subscript(
+            src(), num(-static_cast<std::int64_t>(after - index)), range)));
+
+  values.erase(scratch);
+}
+
 void ModuleEmitter::emitUnpackArityCheck(const parser::Node &target,
                                          Value source, std::size_t expected) {
   mlir::Type sourceType = types.widenLiteral(source.type);
