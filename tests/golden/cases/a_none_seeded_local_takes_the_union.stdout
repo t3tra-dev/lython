@@ -3,5 +3,9 @@ ValueError: empty
 6 0
 none str:text int:5
 b -
+7 0
+['ab', 'cd', 'e']
+[]
 6
 still none
+['ab', 'cd', 'e']

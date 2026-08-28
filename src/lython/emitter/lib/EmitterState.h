@@ -130,10 +130,16 @@ private:
 
 class ScopedCallableEmission {
 public:
+  // ⛔ THE NARROWING RECORD IS PER CALLABLE and was not saved with the rest.
+  // `while cur is not None` in one function left `cur`'s pre-narrowing type
+  // behind, and the NEXT function's own `cur` was then decided from it -- a
+  // local in a string scanner came out as the linked-list node type of a
+  // function above it, with no diagnostic anywhere in between.
   ScopedCallableEmission(llvm::StringMap<Value> &values,
                          mlir::Type &currentReturnType,
                          std::string &currentFunctionPrefix,
                          mlir::Type &currentGeneratorSendType,
+                         llvm::StringMap<mlir::Type> &narrowedFromTypes,
                          const TypeSystem &types)
       : values(values), savedValues(values),
         currentReturnType(currentReturnType),
@@ -142,7 +148,11 @@ public:
         savedFunctionPrefix(currentFunctionPrefix),
         currentGeneratorSendType(currentGeneratorSendType),
         savedGeneratorSendType(currentGeneratorSendType),
-        typeScope(types.pushScope()) {}
+        narrowedFromTypes(narrowedFromTypes),
+        savedNarrowedFromTypes(narrowedFromTypes),
+        typeScope(types.pushScope()) {
+    narrowedFromTypes.clear();
+  }
 
   ScopedCallableEmission(const ScopedCallableEmission &) = delete;
   ScopedCallableEmission &operator=(const ScopedCallableEmission &) = delete;
@@ -152,6 +162,7 @@ public:
     currentReturnType = savedReturnType;
     currentFunctionPrefix = savedFunctionPrefix;
     currentGeneratorSendType = savedGeneratorSendType;
+    narrowedFromTypes = savedNarrowedFromTypes;
   }
 
 private:
@@ -163,6 +174,8 @@ private:
   std::string savedFunctionPrefix;
   mlir::Type &currentGeneratorSendType;
   mlir::Type savedGeneratorSendType;
+  llvm::StringMap<mlir::Type> &narrowedFromTypes;
+  llvm::StringMap<mlir::Type> savedNarrowedFromTypes;
   TypeSystem::Scope typeScope;
 };
 

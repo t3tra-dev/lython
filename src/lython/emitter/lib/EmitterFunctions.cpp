@@ -458,7 +458,8 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
 
   ScopedCallableEmission emissionScope(values, currentReturnType,
                                        currentFunctionPrefix,
-                                       currentGeneratorSendType, types);
+                                       currentGeneratorSendType,
+                                       narrowedFromTypes, types);
 
   mlir::Block *entry = func.addEntryBlock();
   values.clear();

@@ -6,6 +6,18 @@
 # accumulator holds at the end, and the guard that makes each read safe is a
 # runtime test. A name that took the wrong union member would still compile.
 #
+# ⛔ THE GUARD AROUND THE BINDING IS PART OF THE ANSWER. The walk of an
+# optional linked structure binds the accumulator from `cur.value` inside
+# `while cur is not None`, so the scan has to carry that narrowing with it --
+# reading the same statement outside the guard infers an attribute of a union
+# and abandons the seed for a program the guard makes exact.
+#
+# ⛔ AND SO IS A SECOND `= None`. Resetting the accumulator is how a scan
+# starts the next group, and reading that binding as a type gave up on the
+# whole seed -- for the shape the seed is most needed in. The reset also has to
+# KEEP the union rather than pin the name back to None, which is what the
+# annotated spelling has always done.
+#
 # ⛔ A BINDING THAT READS THE NAME IS SKIPPED. `acc = acc + v` is a rebinding,
 # and inferring it with the name still at None answers `object` and throws the
 # whole seed away -- which is the running-total idiom, below.
@@ -79,6 +91,56 @@ def heaviest(items: "list[Item]") -> str:
 print(heaviest([Item("a", 2), Item("b", 5), Item("c", 1)]), heaviest([]))
 
 
+class Node:
+    value: int
+    nxt: "Node | None"
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+        self.nxt = None
+
+
+def largest_in_chain(head: "Node | None") -> int:
+    best = None
+    cur = head
+    while cur is not None:
+        if best is None or cur.value > best:
+            best = cur.value
+        cur = cur.nxt
+    if best is None:
+        return 0
+    return best
+
+
+a = Node(3)
+b = Node(7)
+c = Node(5)
+a.nxt = b
+b.nxt = c
+print(largest_in_chain(a), largest_in_chain(None))
+
+
+def group_words(src: str) -> "list[str]":
+    out: "list[str]" = []
+    cur = None
+    for ch in src:
+        if ch == " ":
+            if cur is not None:
+                out.append(cur)
+                cur = None
+        elif cur is None:
+            cur = ch
+        else:
+            cur = cur + ch
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+print(group_words("ab cd  e"))
+print(group_words(""))
+
+
 def rebound() -> int:
     x = None
     x = 5
@@ -96,3 +158,24 @@ def never_rebound() -> str:
 
 
 print(never_rebound())
+
+
+# ⛔ AND THE NARROWING RECORD IS PER FUNCTION. `while cur is not None` above
+# left `cur`'s pre-narrowing type behind, and this function's own `cur` -- a
+# different local with a different type -- was decided from it, with no
+# diagnostic in between.
+def scan_pairs(src: str) -> "list[str]":
+    seen: "list[str]" = []
+    cur = None
+    for ch in src:
+        if cur is None:
+            cur = ch
+        else:
+            seen.append(cur + ch)
+            cur = None
+    if cur is not None:
+        seen.append(cur)
+    return seen
+
+
+print(scan_pairs("abcde"))

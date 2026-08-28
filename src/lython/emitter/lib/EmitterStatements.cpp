@@ -256,13 +256,18 @@ mlir::Type ModuleEmitter::noneSeedUnionType(llvm::StringRef name) {
     return {};
   TypeSystem::Scope seedScope = types.pushScope();
   preBindSuiteConstants();
+  llvm::SmallVector<mlir::Type, 4> members;
+  bool opaque = false;
   // A loop TARGET is the commonest right-hand side here (`best = v`), and it
   // is not in scope at the point the seed is decided -- the loop has not been
   // emitted. Its type is the iterable's element type, which is known.
+  const std::function<void(const parser::Node *)> *collectInline = nullptr;
   std::function<void(const parser::Node *)> bindLoopTargets =
       [&](const parser::Node *node) {
-        if (!node)
+        if (!node || opaque)
           return;
+        if (collectInline)
+          (*collectInline)(node);
         if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
             node->kind == "ClassDef" || node->kind == "Lambda")
           return;
@@ -288,6 +293,45 @@ mlir::Type ModuleEmitter::noneSeedUnionType(llvm::StringRef name) {
                 if (bound && !py::isPyObjectType(bound))
                   types.bindSymbol(ast::nameSpelling(*targets->front()), bound);
               }
+        // ⭐ AND THE NARROWING THE GUARD AROUND THEM ESTABLISHES. The walk of
+        // an optional linked structure is `while cur is not None: ... best =
+        // cur.value`, and `cur` is `Node | None` here -- so the right-hand
+        // side infers as an attribute of a union and the seed is abandoned for
+        // a program whose guard makes it exact. Only `is not None` on a bare
+        // name, which is the guard this shape is written with.
+        if (node->kind == "While" || node->kind == "If") {
+          llvm::StringRef guarded;
+          if (const parser::Node *test = ast::node(*node, "test"))
+            if (test->kind == "Compare")
+              if (const auto *ops = ast::nodeList(*test, "ops");
+                  ops && ops->size() == 1 && ops->front() &&
+                  ast::isOperator(ops->front().get(), "IsNot"))
+                if (const auto *comparators =
+                        ast::nodeList(*test, "comparators");
+                    comparators && comparators->size() == 1 &&
+                    isNoneConstantNode(comparators->front().get()))
+                  if (const parser::Node *left = ast::node(*test, "left");
+                      left && left->kind == "Name")
+                    guarded = ast::nameSpelling(*left);
+          if (!guarded.empty()) {
+            TypeSystem::Scope guardScope = types.pushScope();
+            if (auto bound = types.lookupSymbol(guarded))
+              if (auto unionType =
+                      mlir::dyn_cast_if_present<py::UnionType>(*bound))
+                if (unionType.isOptional())
+                  types.bindSymbol(guarded, unionType.getOptionalPayloadType());
+            if (const auto *body = ast::nodeList(*node, "body"))
+              for (const parser::NodePtr &child : *body)
+                bindLoopTargets(child.get());
+          } else if (const auto *body = ast::nodeList(*node, "body")) {
+            for (const parser::NodePtr &child : *body)
+              bindLoopTargets(child.get());
+          }
+          if (const auto *orelse = ast::nodeList(*node, "orelse"))
+            for (const parser::NodePtr &child : *orelse)
+              bindLoopTargets(child.get());
+          return;
+        }
         for (const parser::Field &field : node->fields) {
           if (const auto *child = std::get_if<parser::NodePtr>(&field.value))
             bindLoopTargets(child->get());
@@ -297,74 +341,67 @@ mlir::Type ModuleEmitter::noneSeedUnionType(llvm::StringRef name) {
               bindLoopTargets(child.get());
         }
       };
-  llvm::SmallVector<mlir::Type, 4> members;
-  bool opaque = false;
-  std::function<void(const parser::Node *)> collect =
+  // Per NODE: the walk above drives the traversal, so this only answers about
+  // the statement it is handed.
+  std::function<void(const parser::Node *)> collectOne =
       [&](const parser::Node *node) {
         if (!node || opaque)
           return;
-        if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-            node->kind == "ClassDef" || node->kind == "Lambda")
-          return;
         llvm::StringSet<> written;
         collectAssignedNames(node, written);
-        if (written.contains(name)) {
-          bool handled = false;
-          if (node->kind == "Assign")
-            if (const auto *targets = ast::nodeList(*node, "targets"))
-              for (const parser::NodePtr &target : *targets)
-                if (target && target->kind == "Name" &&
-                    llvm::StringRef(ast::nameSpelling(*target)) == name) {
-                  const parser::Node *value = ast::node(*node, "value");
-                  // ⛔ A binding that READS the name says nothing about its
-                  // type. `acc = acc + v` is a rebinding, and inferring it
-                  // with the name still at None answered `object` and threw
-                  // the whole seed away -- which is the running-total idiom.
-                  if (value && containsNameLoad(value, name)) {
-                    handled = true;
-                    continue;
-                  }
-                  mlir::Type bound =
-                      value ? types.widenLiteral(types.inferExpr(value))
-                            : mlir::Type();
-                  if (!bound || py::isPyObjectType(bound) ||
-                      !mlir::isa<py::ContractType>(bound)) {
-                    opaque = true;
-                    return;
-                  }
-                  if (!isNoneTypeLike(bound))
-                    members.push_back(bound);
-                  handled = true;
+        if (!written.contains(name))
+          return;
+        if (node->kind == "Assign") {
+          if (const auto *targets = ast::nodeList(*node, "targets"))
+            for (const parser::NodePtr &target : *targets)
+              if (target && target->kind == "Name" &&
+                  llvm::StringRef(ast::nameSpelling(*target)) == name) {
+                const parser::Node *value = ast::node(*node, "value");
+                // ⛔ A binding that READS the name says nothing about its
+                // type. `acc = acc + v` is a rebinding, and inferring it with
+                // the name still at None answered `object` and threw the whole
+                // seed away -- which is the running-total idiom.
+                if (value && containsNameLoad(value, name))
+                  continue;
+                mlir::Type bound =
+                    value ? types.widenLiteral(types.inferExpr(value))
+                          : mlir::Type();
+                // ⛔ ANOTHER `= None` CONTRIBUTES NOTHING AND IS NOT A
+                // FAILURE. `cur = None` inside the loop is how a scan starts
+                // the next group, and reading it as an unusable type gave up
+                // on the whole seed -- for the shape the seed is most needed
+                // in.
+                if (bound && isNoneTypeLike(bound))
+                  continue;
+                if (!bound || py::isPyObjectType(bound) ||
+                    !mlir::isa<py::ContractType>(bound)) {
+                  opaque = true;
+                  return;
                 }
-          // A binding this does not recognise (`for name in ...`, `name +=`,
-          // `with ... as name`) is not a type this can read off the source.
-          if (!handled &&
-              (node->kind != "Assign" ||
-               !llvm::is_contained(members, mlir::Type()))) {
-            llvm::StringSet<> direct;
-            if (node->kind != "Assign")
-              collectAssignedNameTargets(ast::node(*node, "target"), direct);
-            if (direct.contains(name)) {
-              opaque = true;
-              return;
-            }
-          }
+                members.push_back(bound);
+              }
+          return;
         }
-        for (const parser::Field &field : node->fields) {
-          if (const auto *child = std::get_if<parser::NodePtr>(&field.value))
-            collect(child->get());
-          else if (const auto *children =
-                       std::get_if<std::vector<parser::NodePtr>>(&field.value))
-            for (const parser::NodePtr &child : *children)
-              collect(child.get());
-        }
+        // A binding this does not recognise (`for name in ...`, `name +=`,
+        // `with ... as name`) is not a type this can read off the source.
+        llvm::StringSet<> direct;
+        collectAssignedNameTargets(ast::node(*node, "target"), direct);
+        if (const auto *items = ast::nodeList(*node, "items"))
+          for (const parser::NodePtr &item : *items)
+            collectAssignedNameTargets(ast::node(*item, "optional_vars"),
+                                       direct);
+        if (direct.contains(name))
+          opaque = true;
       };
+
+  // ⛔ ONE WALK, not two. The narrowing a guard establishes lives only while
+  // the walk is inside it, so collecting in a second pass read
+  // `best = cur.value` with `cur` back at `Node | None` and abandoned the seed
+  // for exactly the programs the guard makes exact.
+  collectInline = &collectOne;
   for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
        ++index)
     bindLoopTargets((*currentSuite)[index].get());
-  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
-       ++index)
-    collect((*currentSuite)[index].get());
   if (opaque || members.empty())
     return {};
   mlir::Type joined = types.join(members);
@@ -851,10 +888,30 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
               targets->front()->kind == "Name") {
             llvm::StringRef target = ast::nameSpelling(*targets->front());
             mlir::Type declared = narrowedFromTypes.lookup(target);
+            // ⛔ The BINDING's type, not just the symbol table's: a plain
+            // assignment binds the value and leaves the symbol alone, so a
+            // local that took its union from a seed has it here and nowhere
+            // else.
+            if (!declared)
+              if (auto bound = values.find(target); bound != values.end())
+                declared = bound->second.type;
             if (!declared)
               if (auto flow = types.lookupSymbol(target))
                 declared = *flow;
-            if (!declared || isNoneTypeLike(declared))
+            // ⭐ RESETTING AN OPTIONAL TO None KEEPS THE OPTIONAL. `cur =
+            // None` inside the loop that also builds `cur` is how every
+            // "start a new group" scan is written, and rebinding the name to
+            // `literal<None>` there put the next `cur + ch` back at None -- for
+            // a local the annotated spelling has always kept as its union.
+            auto optionalDeclaration = [&](mlir::Type type) {
+              auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
+              return unionType && unionType.isOptional();
+            };
+            if (declared && optionalDeclaration(types.widenLiteral(declared))) {
+              mlir::Type kept = types.widenLiteral(declared);
+              value = coerceValue(emitExprExpected(rhs, kept), kept, statement);
+              emittedWithContext = true;
+            } else if (!declared || isNoneTypeLike(declared))
               if (mlir::Type seeded = noneSeedUnionType(target)) {
                 value = emitExprExpected(rhs, seeded);
                 value = coerceValue(value, seeded, statement);
