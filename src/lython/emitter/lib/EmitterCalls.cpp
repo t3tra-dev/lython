@@ -3227,6 +3227,8 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
       return contractType &&
              contractType.getContractName() == "builtins.object";
     };
+    if (isCellContract(argumentType))
+      argumentType = types.widenLiteral(cellContentType(argumentType));
     if (CallInferenceResult inference =
             isExceptionContractType(argumentType) ||
                     isErasedObject(argumentType)
@@ -4575,8 +4577,26 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
       (name == "repr" || name == "print")) {
     // Widen literals to their contract (`repr(5)` sees `builtins.int`, not
     // `literal<5>`) so the manifest `__repr__` resolves.
+    //
+    // ⛔ AND LOOK THROUGH A CELL. A name that a `with` body rebinds is promoted
+    // to storage for the duration of the statement, so inside it the name's
+    // static type is the cell and not what the cell holds:
+    //
+    //     count = 0
+    //     with open(p) as f:
+    //         for line in f:
+    //             count += 1
+    //         print(str(count))   # unresolved name 'repr'
+    //
+    // Every other reader of that name demotes on the way in -- `count + 1`,
+    // `len`, `abs`, an f-string and `print` were all measured working in the
+    // same position -- so this ladder is the one that asked the cell for a
+    // `__repr__`, found none, and fell through to a `repr` BINDING that no
+    // program declares.
     mlir::Type argumentType =
         types.widenLiteral(types.inferExpr(args->front().get()));
+    if (isCellContract(argumentType))
+      argumentType = types.widenLiteral(cellContentType(argumentType));
     std::optional<Value> repr;
     // print renders through str(), not repr(): a source-class __str__
     // outranks __repr__ here, and an exception subclass without its own

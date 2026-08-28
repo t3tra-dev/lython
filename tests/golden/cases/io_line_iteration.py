@@ -74,13 +74,14 @@ sys.stdout.write("bytes " + str(total) + "\n")
 empty = "io_line_iteration_empty.tmp"
 with open(empty, "w") as f:
     pass
+# ⛔ `str(count)` inside the `with` is the shape a rebound name is promoted to
+# storage for: its static type there is the cell, not the int.
 count = 0
 with open(empty) as f:
     for line in f:
         count += 1
     else:
-        sys.stdout.write("empty file exhausted\n")
-sys.stdout.write("empty file, " + str(count) + " lines\n")
+        sys.stdout.write("empty file, " + str(count) + " lines\n")
 
 os.remove(path)
 os.remove(empty)

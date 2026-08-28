@@ -675,6 +675,47 @@ TEST(EmitterTest, RefusesAFallthroughTheResultCannotHold) {
   EXPECT_TRUE(none.ok());
 }
 
+// WHAT: `str(x)` where `x` is a name a `with` body rebinds. The name is
+// promoted to storage for the duration of the statement, so its static type
+// inside is the cell -- and the str/repr ladder asked THAT for a `__repr__`,
+// found none, and fell through to a `repr` binding no program declares:
+// "unresolved name 'repr'".
+//
+// Emit-layer and not golden: the failure was a static rejection of a program
+// that has nothing wrong with it. The control is the other readers of the same
+// name in the same position, which demote on the way in and always worked.
+TEST(EmitterTest, StrSeesThroughAPromotedCell) {
+  mlir::MLIRContext context(testRegistry());
+  const char *body =
+      "import sys\n"
+      "class C:\n"
+      "    def __enter__(self) -> str:\n"
+      "        return \"x\"\n"
+      "    def __exit__(self, a: object, b: object, c: object) -> bool:\n"
+      "        return False\n"
+      "count = 0\n"
+      "with C() as s:\n"
+      "    n = 0\n"
+      "    while n < 2:\n"
+      "        count += 1\n"
+      "        n += 1\n";
+  lython::emitter::EmitResult str =
+      emitSource(std::string(body) +
+                     "    sys.stdout.write(str(count) + \"\\n\")\n",
+                 context);
+  EXPECT_TRUE(str.ok());
+
+  lython::emitter::EmitResult repr =
+      emitSource(std::string(body) +
+                     "    sys.stdout.write(repr(count) + \"\\n\")\n",
+                 context);
+  EXPECT_TRUE(repr.ok());
+
+  lython::emitter::EmitResult others =
+      emitSource(std::string(body) + "    print(abs(count) + 1)\n", context);
+  EXPECT_TRUE(others.ok());
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
