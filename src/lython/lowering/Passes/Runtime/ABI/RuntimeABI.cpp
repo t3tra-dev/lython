@@ -2305,9 +2305,32 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     // exception taxonomy dispatches 71 class ids to one BaseException callee,
     // and a source class's method carries no manifest contract at all.
     std::string contract;
+    // ⛔ `def __eq__(self, other: object)` -- the spelling Python's own
+    // protocol is written in -- takes the OTHER side as a BOX, not as this
+    // contract's lanes.
+    bool otherIsBox = false;
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::SmallDenseSet<std::int64_t, 16> seenIds;
+  // ⛔ WHAT THE SECOND PARAMETER IS, ASKED OF THE DECLARATION AND NOT OF ITS
+  // SHAPE. The shapes decided it until a class with three body words met
+  // `object`: both are five i64 words, so `__eq__(self: K, other: object)`
+  // looked symmetric, and the hook handed over the box's ENTITY where a BOX
+  // was expected. Inside, `isinstance(other, K)` read K's own class id out of
+  // word 1 and agreed, and the field read that followed took word 2 -- a field
+  // handle -- for an entity pointer: intermittent SIGSEGV, and `False` on the
+  // runs that did not crash.
+  auto declaredOtherIsObject = [&](mlir::func::FuncOp function) -> bool {
+    auto attr = function->getAttrOfType<mlir::TypeAttr>("callable_type");
+    if (!attr)
+      return false;
+    auto callable = mlir::dyn_cast<py::CallableType>(attr.getValue());
+    llvm::ArrayRef<mlir::Type> positional = callable.getPositionalTypes();
+    if (!callable || positional.size() != 2)
+      return false;
+    auto contract = mlir::dyn_cast<py::ContractType>(positional[1]);
+    return contract && contract.getContractName() == "builtins.object";
+  };
   auto conforms = [&](mlir::func::FuncOp function) {
     mlir::FunctionType type = function.getFunctionType();
     unsigned inputs = type.getNumInputs();
@@ -2317,14 +2340,18 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     for (auto [have, want] : llvm::zip(type.getResults(), calleeResultTypes))
       if (have != want)
         return false;
-    unsigned half = inputs / 2;
     for (unsigned index = 0; index < inputs; ++index) {
       auto memref = mlir::dyn_cast<mlir::MemRefType>(type.getInput(index));
       if (!memref || memref.getRank() != 1)
         return false;
-      if (index >= half && type.getInput(index) != type.getInput(index - half))
-        return false;
     }
+    if (declaredOtherIsObject(function))
+      // One lane each: the receiver's, and the box the other side arrives as.
+      return inputs == 2;
+    unsigned half = inputs / 2;
+    for (unsigned index = half; index < inputs; ++index)
+      if (type.getInput(index) != type.getInput(index - half))
+        return false;
     return true;
   };
   module.walk([&](mlir::func::FuncOp function) {
@@ -2344,8 +2371,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     }
     if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
       return;
-    entries.push_back(
-        HookEntry{*classId, function, contractAttr.getValue().str()});
+    entries.push_back(HookEntry{*classId, function,
+                                contractAttr.getValue().str(),
+                                declaredOtherIsObject(function)});
   });
   if (!sourceClassMethodName.empty()) {
     module.walk([&](py::ClassOp classOp) {
@@ -2361,8 +2389,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
           RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
       if (!classId || !seenIds.insert(*classId).second)
         return;
-      entries.push_back(
-          HookEntry{*classId, function, classOp.getSymName().str()});
+      entries.push_back(HookEntry{*classId, function,
+                                  classOp.getSymName().str(),
+                                  declaredOtherIsObject(function)});
     });
   }
 
@@ -2427,8 +2456,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
       llvm::SmallVector<mlir::Value, 8> operands;
       mlir::func::FuncOp callee = hookEntry.callee;
       mlir::FunctionType type = callee.getFunctionType();
-      unsigned half = type.getNumInputs() / 2;
-      for (mlir::Value slot : {lhsSlot, rhsSlot}) {
+      unsigned half = hookEntry.otherIsBox ? 1u : type.getNumInputs() / 2;
+      auto appendLanesFrom = [&](mlir::Value slot) -> mlir::LogicalResult {
         mlir::Value entityWord = loadWord(builder, slot, box_abi::kEntityWord);
         mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
             RuntimeBundleLowerer::lanesFromBoxEntity(
@@ -2437,6 +2466,28 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
         if (mlir::failed(lanes))
           return mlir::failure();
         operands.append(lanes->begin(), lanes->end());
+        return mlir::success();
+      };
+      if (mlir::failed(appendLanesFrom(lhsSlot)))
+        return mlir::failure();
+      if (hookEntry.otherIsBox) {
+        auto boxType = mlir::dyn_cast<mlir::MemRefType>(type.getInput(1));
+        if (!boxType || !boxType.hasStaticShape() ||
+            boxType.getDimSize(0) != box_abi::kWordsPerBox)
+          return callee.emitError()
+                 << "a boxed dispatch whose other operand is declared "
+                    "builtins.object needs the "
+                 << box_abi::kWordsPerBox << "-word box as its second "
+                 << "parameter, got " << type.getInput(1);
+        mlir::Value rhsWord =
+            mlir::LLVM::PtrToIntOp::create(builder, loc, i64, rhsSlot)
+                .getResult();
+        mlir::Value size = mlir::arith::ConstantIntOp::create(
+            builder, loc, box_abi::kWordsPerBox, 64);
+        operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
+            builder, loc, rhsWord, size, boxType));
+      } else if (mlir::failed(appendLanesFrom(rhsSlot))) {
+        return mlir::failure();
       }
       mlir::func::CallOp call =
           mlir::func::CallOp::create(builder, loc, callee, operands);
