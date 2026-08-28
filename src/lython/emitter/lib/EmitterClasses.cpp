@@ -262,6 +262,15 @@ llvm::StringSet<> classPropertyNames(const parser::Node &classDef) {
 
 } // namespace
 
+// The decorators that constrain the checker or the emitted shape rather than
+// rebinding the name.
+bool ModuleEmitter::isRecognizedNonBindingDecorator(llvm::StringRef leaf) {
+  return leaf == "native" || leaf == "overload" || leaf == "override" ||
+         leaf == "final" || leaf == "runtime_checkable" ||
+         leaf == "staticmethod" || leaf == "classmethod" ||
+         leaf == "property" || leaf == "abstractmethod" || leaf == "dataclass";
+}
+
 void ModuleEmitter::checkDecorators(const parser::Node &node,
                                     DecoratorRole role,
                                     const llvm::StringSet<> *propertyNames) {
@@ -294,7 +303,18 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
       }
       break;
     case DecoratorRole::Function:
-      recognized = leaf == "native" || isTypingMarker(leaf);
+      // ⭐ A DECORATOR THAT NAMES A FUNCTION IS `f = d(f)`, which this compiler
+      // has been able to run since a function value started carrying its
+      // captures -- the hand-written spelling of exactly this program works.
+      // Only the SYNTAX was refused, so `@logged` was rejected while
+      // `double = logged(double)` beside it compiled.
+      //
+      // ⛔ Only a bare NAME. A decorator FACTORY (`@deco(arg)`) is
+      // `f = deco(arg)(f)`, one more call whose intermediate value is a
+      // function the compiler would have to see through; it keeps the refusal
+      // rather than getting a silent partial answer.
+      recognized = leaf == "native" || isTypingMarker(leaf) ||
+                   (decorator->kind == "Name" && moduleFunctionNames.count(leaf));
       break;
     case DecoratorRole::Class:
       recognized = leaf == "dataclass" || isTypingMarker(leaf);
@@ -2835,6 +2855,98 @@ Value ModuleEmitter::emitInlineMethodCall(const parser::Node &expr,
                               positional, keywords);
 }
 
+// ⛔ THE MESSAGE NAMES THE DUNDER'S OWN OPERAND ORDER. CPython builds it from
+// the operator as WRITTEN, and a reflected dispatch (`a < b` reaching
+// `b.__gt__`) would name the two the other way round. The class names and the
+// exception are right either way; only a reflected ordering whose BOTH sides
+// decline can print the pair reversed, and a class that defines `__lt__` alone
+// -- the idiom -- is dispatched directly.
+// `@d1 @d2 def f(...)` is `f = d1(d2(f))`: the decorator closest to the def
+// applies first, so the list is walked backwards.
+void ModuleEmitter::applyFunctionDecorators(const parser::Node &statement) {
+  const auto *decorators = ast::nodeList(statement, "decorator_list");
+  if (!decorators || decorators->empty())
+    return;
+  auto name = ast::string(statement, "name");
+  if (!name)
+    return;
+  for (const parser::NodePtr &decorator : llvm::reverse(*decorators)) {
+    if (!decorator || decorator->kind != "Name")
+      continue;
+    llvm::StringRef spelling = ast::nameSpelling(*decorator);
+    if (!moduleFunctionNames.count(spelling))
+      continue;
+    std::vector<parser::NodePtr> arguments;
+    arguments.push_back(synth::name(*name, statement.range));
+    parser::NodePtr applied = synth::assign(
+        synth::name(*name, statement.range),
+        synth::call(synth::name(spelling, statement.range),
+                    std::move(arguments), statement.range),
+        statement.range);
+    emitStatement(*applied);
+  }
+}
+
+std::optional<ModuleEmitter::NotImplementedFallback>
+ModuleEmitter::comparisonDunderFallback(
+    llvm::StringRef methodName, llvm::ArrayRef<std::string> positionalNames) {
+  static constexpr llvm::StringLiteral kComparisons[] = {
+      "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"};
+  if (!llvm::is_contained(kComparisons, methodName) ||
+      positionalNames.size() != 2)
+    return std::nullopt;
+  return NotImplementedFallback{methodName.str(), positionalNames[0],
+                                positionalNames[1]};
+}
+
+parser::NodePtr
+ModuleEmitter::notImplementedFallbackStatement(const parser::Node &statement) {
+  if (!notImplementedFallback)
+    return nullptr;
+  const parser::Node *returned = ast::node(statement, "value");
+  if (!returned || returned->kind != "Name" ||
+      llvm::StringRef(ast::nameSpelling(*returned)) != "NotImplemented")
+    return nullptr;
+  const NotImplementedFallback &fallback = *notImplementedFallback;
+  parser::SourceRange range = statement.range;
+  auto receiver = [&] { return synth::name(fallback.receiver, range); };
+  auto other = [&] { return synth::name(fallback.other, range); };
+  if (fallback.method == "__eq__" || fallback.method == "__ne__") {
+    parser::NodePtr identical =
+        synth::compare(receiver(), "Is", other(), range);
+    if (fallback.method == "__ne__")
+      identical = synth::notOp(std::move(identical), range);
+    return synth::returnStmt(std::move(identical), range);
+  }
+  llvm::StringRef spelling =
+      llvm::StringSwitch<llvm::StringRef>(fallback.method)
+          .Case("__lt__", "<")
+          .Case("__le__", "<=")
+          .Case("__gt__", ">")
+          .Case("__ge__", ">=")
+          .Default("");
+  if (spelling.empty())
+    return nullptr;
+  auto typeName = [&](parser::NodePtr value) {
+    return synth::attribute(
+        synth::call(synth::name("type", range), {std::move(value)}, range),
+        "__name__", range);
+  };
+  parser::NodePtr message = synth::strConstant(
+      ("'" + spelling + "' not supported between instances of '").str(), range);
+  message = synth::binOp(std::move(message), "Add", typeName(receiver()), range);
+  message = synth::binOp(std::move(message),
+                         "Add", synth::strConstant("' and '", range), range);
+  message = synth::binOp(std::move(message), "Add", typeName(other()), range);
+  message = synth::binOp(std::move(message), "Add",
+                         synth::strConstant("'", range), range);
+  std::vector<parser::NodePtr> arguments;
+  arguments.push_back(std::move(message));
+  return synth::raiseStmt(
+      synth::call(synth::name("TypeError", range), std::move(arguments), range),
+      range);
+}
+
 Value ModuleEmitter::emitInlineMethodBody(
     const parser::Node &anchor, Value receiver, bool bindDescriptorReceiver,
     const MethodBinding &method, llvm::ArrayRef<Value> positional,
@@ -3472,6 +3584,10 @@ Value ModuleEmitter::emitInlineMethodBody(
   mlir::cf::BranchOp::create(builder, loc(anchor), bodyBlock);
   builder.setInsertionPointToStart(bodyBlock);
   inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
+  llvm::SaveAndRestore<std::optional<NotImplementedFallback>> savedFallback(
+      notImplementedFallback,
+      comparisonDunderFallback(ast::string(*method.method, "name").value_or(""),
+                               sig.positionalNames));
   // ⭐ The inlined body's return type, for the statements that ask for it
   // rather than for the context stack.
   //

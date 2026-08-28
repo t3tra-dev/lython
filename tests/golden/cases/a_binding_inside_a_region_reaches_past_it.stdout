@@ -1,0 +1,7 @@
+zero small big
+0
+skipped
+ok:1!:True
+bad:negative:True
+UnboundLocalError: cannot access local variable 'only' where it is not associated with a value
+zero

@@ -47,6 +47,9 @@ void ModuleEmitter::emitStatements(
       // module-lifetime cells (R6). Not ClassDef-exclusive: method defaults
       // registered under a class statement flow through the same cells.
       emitPendingDefaultCells(*statement);
+      if (statement->kind == "FunctionDef" ||
+          statement->kind == "AsyncFunctionDef")
+        applyFunctionDecorators(*statement);
     }
   }
 }
@@ -1080,7 +1083,12 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       values[*name] = function;
       types.bindSymbol(*name, function.type);
     }
+    applyFunctionDecorators(statement);
   } else if (statement.kind == "Return") {
+    if (parser::NodePtr fallback = notImplementedFallbackStatement(statement)) {
+      emitStatement(*fallback);
+      return;
+    }
     const parser::Node *returnValue = ast::node(statement, "value");
     Value value = returnValue
                       ? emitExprExpected(returnValue, currentReturnType)

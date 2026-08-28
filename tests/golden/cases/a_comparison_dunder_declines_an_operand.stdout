@@ -1,0 +1,8 @@
+True False True
+False True False True
+True False
+True False
+[Money(1), Money(2), Money(3)]
+TypeError: '<' not supported between instances of 'Money' and 'int'
+TypeError: '>=' not supported between instances of 'Money' and 'str'
+True False False False False

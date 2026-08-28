@@ -5,6 +5,7 @@
 #include "llvm/ADT/StringExtras.h"
 
 #include "AstAccess.h"
+#include "AstSynth.h"
 #include "CandidateSelection.h"
 #include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
@@ -1635,6 +1636,26 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
   if (const auto *statements = ast::nodeList(moduleNode, "body"))
     for (const parser::NodePtr &statement : *statements)
       collectModuleCallNodes(statement.get(), moduleCalls);
+  if (const auto *statements = ast::nodeList(moduleNode, "body"))
+    for (const parser::NodePtr &statement : *statements) {
+      if (!statement || (statement->kind != "FunctionDef" &&
+                         statement->kind != "AsyncFunctionDef"))
+        continue;
+      auto decorated = ast::string(*statement, "name");
+      const auto *decorators = ast::nodeList(*statement, "decorator_list");
+      if (!decorated || !decorators)
+        continue;
+      for (const parser::NodePtr &decorator : *decorators) {
+        if (!decorator || decorator->kind != "Name")
+          continue;
+        std::vector<parser::NodePtr> arguments;
+        arguments.push_back(synth::name(*decorated, statement->range));
+        decoratorCallNodes.push_back(synth::call(
+            synth::name(ast::nameSpelling(*decorator), statement->range),
+            std::move(arguments), statement->range));
+        moduleCalls.push_back(decoratorCallNodes.back().get());
+      }
+    }
 
   // Module-wide fixpoint: signature sweeps propagate constraints through
   // function bodies (returns), module-level call sites constrain parameters

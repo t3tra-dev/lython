@@ -266,7 +266,15 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
-    py::CallOp op, const RuntimeBundle &callable) {
+    py::CallOp op, const RuntimeBundle &callableRef) {
+  // ⛔ A COPY, because the dispatch below WRITES `valueBundles` -- once per
+  // arm, plus the result binding -- and the argument is a reference into that
+  // map. A rehash left it pointing at freed storage, and the read that
+  // followed reported a function object with zero handles for a bundle that
+  // had one; it needed three callers and two function-valued globals to grow
+  // the map far enough, which is why every smaller spelling of the same
+  // program was fine.
+  RuntimeBundle callable = callableRef;
   if (op.getNumResults() != 1)
     return op.emitError()
            << "Python callable lowering expects exactly one Python result";

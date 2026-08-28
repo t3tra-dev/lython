@@ -308,9 +308,25 @@ RuntimeBundleLowerer::lowerNativeIntGlobalGet(py::GlobalGetOp op) {
 // retained reference. Reads reassemble the group, retain it for the reader
 // (the refcount insertion releases it after use), and an unbound read
 // raises RuntimeError through the shared manifest raise helper.
+// ⭐ A CALLABLE'S CELL HOLDS A FUNCTION OBJECT. `py.callable` is the STATIC
+// spelling of a signature and expands to no physical values at all -- it is
+// compile-time evidence -- so a cell declared with it stored nothing, and a
+// read produced a bundle with zero handles. That is invisible while the call
+// resolves statically (one candidate) and becomes "a function object is one
+// handle, got 0" the moment two globals share a signature and the call has to
+// dispatch. What the cell actually holds is what `LyFunction_New` returns, so
+// the STORAGE contract is `builtins.function` while the result type stays the
+// callable for the call's own checking.
+static mlir::Type globalStorageContract(mlir::MLIRContext *context,
+                                        mlir::Type declared) {
+  if (mlir::isa_and_nonnull<py::CallableType>(declared))
+    return runtimeContractType(context, "builtins.function");
+  return declared;
+}
+
 mlir::LogicalResult
 RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
-  mlir::Type type = op.getResult().getType();
+  mlir::Type type = globalStorageContract(context, op.getResult().getType());
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, type,
                                                  "module global object ABI");
@@ -395,7 +411,7 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
   const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
   if (!value)
     return op.emitError() << "module global assignment value has no bundle";
-  mlir::Type type = op.getValue().getType();
+  mlir::Type type = globalStorageContract(context, op.getValue().getType());
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(op, type,
                                                  "module global object ABI");

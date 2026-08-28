@@ -99,6 +99,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitConstant(*expr);
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);
+    if (!atModuleScope && decoratedModuleFunctions.contains(name) &&
+        values.find(name) == values.end()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr->range.start,
+          "'" + std::string(name) +
+              "' is rebound by a decorator, and a reference from inside a "
+              "function body would resolve to the undecorated function; call "
+              "it from module scope, or pass it in as a parameter"});
+      return emitNone(*expr);
+    }
     auto found = values.find(name);
     if (found != values.end()) {
       // A boxed (nonlocal-shared) local binds to its cell instance; the
@@ -1349,6 +1359,27 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
             builder, loc(expr), literalType, builder.getBoolAttr(truth));
         return Value{constant.getResult(), literalType};
       }
+    // ⭐ TWO DISJOINT TYPES ARE NEVER THE SAME OBJECT, and that is decidable
+    // here. The value-type refusal below is about SAME-type identity, where
+    // interning makes the answer an implementation detail; `p is 5` for a
+    // class instance `p` is not that question, and CPython answers False. It
+    // was refused, which is what stopped a `__eq__` from spelling its own
+    // fallback -- and the argument specializer reaches this with `other` bound
+    // to the caller's int, so the refusal fired on a branch whose answer is a
+    // constant.
+    {
+      mlir::Type lhsDisjoint = types.widenLiteral(lhs.type);
+      mlir::Type rhsDisjoint = types.widenLiteral(rhs.type);
+      if (lhsDisjoint && rhsDisjoint &&
+          !py::isAssignableTo(lhsDisjoint, rhsDisjoint) &&
+          !py::isAssignableTo(rhsDisjoint, lhsDisjoint)) {
+        bool truth = negatedIdentity;
+        mlir::Type literalType = types.literal(truth ? "True" : "False");
+        auto constant = py::BoolConstantOp::create(
+            builder, loc(expr), literalType, builder.getBoolAttr(truth));
+        return Value{constant.getResult(), literalType};
+      }
+    }
     // R6: identity on value types has no stable meaning (interning is an
     // implementation detail even in CPython); require the equality operator.
     auto isValueType = [&](mlir::Type type) {

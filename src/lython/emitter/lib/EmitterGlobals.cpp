@@ -232,7 +232,16 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     if (!value)
       continue;
     mlir::Type inferred = types.widenLiteral(types.inferExpr(value));
-    if (!mlir::isa_and_nonnull<py::ContractType>(inferred))
+    // ⭐ A FUNCTION VALUE IS A GLOBAL LIKE ANY OTHER. `CALLBACK = base` read
+    // from a function body was "unresolved name 'CALLBACK'": the cell was
+    // never declared, because a callable's static type is a `py.callable` and
+    // this filter took contracts only. The VALUE is an ordinary object
+    // (`builtins.function`, a header the cell boxes like a list or a class
+    // instance); it is only the static type that is spelled differently, and
+    // keeping that spelling is what lets the call through the global check its
+    // arguments.
+    if (!mlir::isa_and_nonnull<py::ContractType>(inferred) &&
+        !mlir::isa_and_nonnull<py::CallableType>(inferred))
       continue;
     moduleGlobals[name] = inferred;
     types.bindSymbol(name, inferred);

@@ -480,6 +480,10 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
           ? sig.generatorSendType
           : mlir::Type();
   currentFunctionPrefix = symbolName.str();
+  llvm::SaveAndRestore<std::optional<NotImplementedFallback>> savedFallback(
+      notImplementedFallback,
+      comparisonDunderFallback(ast::string(callable, "name").value_or(""),
+                               sig.positionalNames));
   // ⭐ A GENERATOR CALLING ITSELF GETS A GENERATOR, which is `publicCallable`.
   // `callable` is the body's own signature -- for a generator that is the resume
   // result, None -- so a self-call inside the body typed as None and every

@@ -976,6 +976,10 @@ private:
   // up front so forward references and mutual recursion resolve, so a
   // top-level name means the same thing at every point of the module.
   llvm::StringSet<> moduleFunctionNames;
+  // Module functions whose name is rebound by a decorator. Reading one from
+  // inside a body is refused: see the note at the collection site.
+  llvm::StringSet<> decoratedModuleFunctions;
+  static bool isRecognizedNonBindingDecorator(llvm::StringRef leaf);
   llvm::StringSet<> moduleClassNames;
   // Main-module top-level `def`s whose spelling is also a manifest builtin's
   // binding name (`def len`), mapped to the symbol they are emitted under.
@@ -1161,6 +1165,26 @@ private:
   // around each callable body.
   llvm::StringSet<> currentBoxedLocals;
   bool atModuleScope = false;
+  // ⭐ `return NotImplemented` IS THE PROTOCOL'S FALLBACK, and this compiler
+  // can take it statically. CPython's documented way to write a comparison
+  // dunder is to hand back the singleton for an operand the method does not
+  // handle; the interpreter then tries the reflected method and, if that
+  // declines too, falls back -- to identity for `==`/`!=` and to TypeError for
+  // the four orderings. The operand types are known here, so the fallback is
+  // emitted directly instead of a tri-state riding a `-> bool` return.
+  struct NotImplementedFallback {
+    std::string method;
+    std::string receiver;
+    std::string other;
+  };
+  std::optional<NotImplementedFallback> notImplementedFallback;
+  // The fallback statement `return NotImplemented` stands for, or null when
+  // the enclosing function is not a comparison dunder.
+  static std::optional<NotImplementedFallback>
+  comparisonDunderFallback(llvm::StringRef methodName,
+                           llvm::ArrayRef<std::string> positionalNames);
+  parser::NodePtr notImplementedFallbackStatement(const parser::Node &statement);
+  void applyFunctionDecorators(const parser::Node &statement);
   mlir::Type currentReturnType;
   mlir::Type currentGeneratorSendType;
   std::string currentFunctionPrefix;

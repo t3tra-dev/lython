@@ -107,6 +107,35 @@ void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {
 // answers a missing `type` field from the contract directly, so the spelling
 // cannot be shadowed by a program that binds the name BaseException.
 void ModuleEmitter::emitWith(const parser::Node &statement, bool async) {
+  // Before the desugar: the body is rewritten into a synthesized try/finally
+  // whose suite is not the one the later read lives in, so the slot for a name
+  // the body binds has to be taken here, against the real suite.
+  //
+  // The `as` targets are hints for the same reason a loop target is: a body
+  // that assigns FROM one (`text = f.read()`) cannot be typed until the
+  // manager has been entered, and the slot has to exist before that. Only the
+  // synchronous spelling -- an async `__aenter__` result is behind an await.
+  {
+    const auto *withItems = ast::nodeList(statement, "items");
+    llvm::StringMap<mlir::Type> enterHints;
+    if (!async && withItems)
+      for (const parser::NodePtr &item : *withItems) {
+        if (!item)
+          continue;
+        const parser::Node *bound = ast::node(*item, "optional_vars");
+        if (!bound || bound->kind != "Name")
+          continue;
+        mlir::Type contextType =
+            types.widenLiteral(types.inferExpr(ast::node(*item,
+                                                         "context_expr")));
+        CallInferenceResult entered =
+            types.inferMethodCallWithEvidence(contextType, "__enter__", {});
+        if (entered)
+          enterHints[ast::nameSpelling(*bound)] = entered.resultType;
+      }
+    bindConditionallyAssignedLocals(statement, {ast::nodeList(statement, "body")},
+                                    &enterHints);
+  }
   std::size_t cleanupStart = activeWithCleanups.size();
   std::size_t itemStart = pendingWithItems.size();
   const auto *items = ast::nodeList(statement, "items");

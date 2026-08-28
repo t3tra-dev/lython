@@ -28,6 +28,16 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
     return;
   }
   Value subject = emitExpr(subjectNode);
+  // Every case body is an arm of one statement, and a name any of them binds
+  // is a local of the scope around the match -- the same rule an `if` chain
+  // follows.
+  {
+    llvm::SmallVector<const std::vector<parser::NodePtr> *, 4> bodies;
+    for (const parser::NodePtr &matchCase : *cases)
+      if (matchCase)
+        bodies.push_back(ast::nodeList(*matchCase, "body"));
+    bindConditionallyAssignedLocals(statement, bodies);
+  }
 
   mlir::Block *entry = builder.getInsertionBlock();
   mlir::Region *region = entry->getParent();

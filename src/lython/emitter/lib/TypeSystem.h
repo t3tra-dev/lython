@@ -424,6 +424,13 @@ private:
   // lambdas, and imported source modules run under caller-specific scope
   // contexts a node-keyed cache would conflate.
   llvm::DenseMap<const parser::Node *, FunctionSignature> signatureMemo;
+  // ⭐ A DECORATOR IS A CALL THE SOURCE DOES NOT SPELL. `@d def f` is
+  // `f = d(f)`, and the parameter fixpoint below reads its constraints off
+  // CALL NODES -- so `def d(fn)` with no annotation was refused under the
+  // decorator syntax while the same program written as an assignment beside it
+  // inferred `fn` fine. The applications are synthesized here and kept alive
+  // for as long as the nodes are pointed at.
+  std::vector<parser::NodePtr> decoratorCallNodes;
   // Inference variables standing in for missing annotations, assigned by
   // registerModule's pre-pass and resolved by its module-wide fixpoint.
   // Keyed by arg node (parameters) / function node (result). functionSignature

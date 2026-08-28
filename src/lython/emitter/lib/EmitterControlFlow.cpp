@@ -474,6 +474,8 @@ namespace {
 // binding this does not recognise (a `for` target, a `with ... as`, an
 // augmented assignment) leaves the name alone -- it keeps the unresolved-name
 // diagnostic rather than getting a slot whose type would be a guess.
+bool containsNameLoad(const parser::Node *node, llvm::StringRef name);
+
 void collectNameBindingExpressions(
     const parser::Node *node, llvm::StringRef name,
     llvm::SmallVectorImpl<const parser::Node *> &values,
@@ -491,10 +493,16 @@ void collectNameBindingExpressions(
     if (const auto *targets = ast::nodeList(*node, "targets"))
       for (const parser::NodePtr &target : *targets) {
         if (targetsName(target.get())) {
-          if (const parser::Node *value = ast::node(*node, "value"))
-            values.push_back(value);
-          else
+          const parser::Node *value = ast::node(*node, "value");
+          if (!value)
             opaque = true;
+          // ⛔ A BINDING THAT READS THE NAME SAYS NOTHING ABOUT ITS TYPE.
+          // `result = result + "!"` in a try's `else` is a REBINDING; the type
+          // comes from the bindings that do not depend on it, and inferring
+          // this one (with the name still unbound) answered `object` and took
+          // the whole join down with it.
+          else if (!containsNameLoad(value, name))
+            values.push_back(value);
         } else {
           llvm::StringSet<> written;
           collectAssignedNameTargets(target.get(), written);
