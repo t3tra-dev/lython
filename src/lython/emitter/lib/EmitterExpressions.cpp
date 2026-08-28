@@ -2213,10 +2213,18 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
           lookupClassMethod(object.type, *attr);
       property && property->kind == "property") {
     // A getter is a method, and reading `a.v` through a base-typed `a` is the
-    // same unresolvable dispatch as calling `a.v()` would be.
-    if (refuseUnresolvableDispatch(expr, object, *attr,
-                                   ast::node(expr, "value")))
-      return emitNone(expr);
+    // same unresolvable dispatch as calling `a.v()` would be -- so it gets the
+    // same answer: the synthesized runtime-class dispatcher, asked before the
+    // refusal is filed.
+    if (dispatchIsUnresolvable(object, *attr, ast::node(expr, "value"),
+                               /*throughSuper=*/false)) {
+      if (std::optional<Value> dispatched =
+              tryEmitVirtualPropertyRead(expr, object, *attr))
+        return *dispatched;
+      if (refuseUnresolvableDispatch(expr, object, *attr,
+                                     ast::node(expr, "value")))
+        return emitNone(expr);
+    }
     if (mlir::isa<py::TypeType>(object.type)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,

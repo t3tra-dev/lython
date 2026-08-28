@@ -418,6 +418,11 @@ bool ModuleEmitter::dispatchIsUnresolvable(Value receiver,
     return false;
   if (throughSuper)
     return false;
+  // Inside a property dispatcher's own body: the arms are narrowed to exact
+  // classes and the last one is the base, which is what the dispatcher exists
+  // to resolve.
+  if (virtualPropertyBodyDepth != 0)
+    return false;
   if (receiverNode && receiverNode->kind == "Call") {
     const parser::Node *callee = ast::node(*receiverNode, "func");
     if (callee && callee->kind == "Name" &&
@@ -3486,8 +3491,24 @@ Value ModuleEmitter::emitInlineMethodBody(
   // because there the ordinary emission sets it.
   mlir::Type enclosingReturnType = currentReturnType;
   currentReturnType = resultType;
-  bool pushedSuperContext = bindDescriptorReceiver &&
-                            method.kind == "instance" &&
+  // ⛔ THE UNBOUND SPELLING PUSHES ONE TOO. `bindDescriptorReceiver` says
+  // whether the receiver takes slot 0 implicitly, which is not what `super()`
+  // asks: the body's zero-argument super() names the method's DEFINING class
+  // and its first parameter, and both are the same whether the call was
+  // `b.who()` or `B.who(b)`. Requiring the bound form made the virtual
+  // dispatcher's fallback arm -- which is written `B.who(__ly_recv)` -- inline
+  // a body whose `super()` then had no context:
+  //
+  //     class A: ...          # who()
+  //     class B(A): ...       # who() calls super().who()
+  //     class C(B): ...       # any override at all
+  //     for x in [A(), B(), C()]: x.who()
+  //
+  // Two levels worked, because the arm for B resolves B's body directly; three
+  // needs a dispatcher for `B.who` as well, and its fallback is the unbound
+  // call. The report named B's own `super()` line, in a program whose two-level
+  // form compiles.
+  bool pushedSuperContext = method.kind == "instance" &&
                             !method.definingClass.empty() &&
                             !sig.positionalNames.empty();
   if (pushedSuperContext)

@@ -2417,7 +2417,7 @@ parser::NodePtr sharedField(const parser::Node &node, llvm::StringRef field) {
 const ModuleEmitter::VirtualDispatchHelper *
 ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                                     llvm::StringRef methodName,
-                                    unsigned argumentCount) {
+                                    unsigned argumentCount, bool asProperty) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!contract)
     return nullptr;
@@ -2429,7 +2429,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   std::optional<MethodBinding> base = lookupClassMethod(receiver.type, methodName);
   if (!base || !base->method || base->definingClass.empty())
     return nullptr;
-  if (base->kind != "instance" || base->async ||
+  if (base->kind != (asProperty ? "property" : "instance") || base->async ||
       base->bodySignature.isGeneratorFunction ||
       base->bodySignature.isAsyncGeneratorFunction)
     return nullptr;
@@ -2489,7 +2489,8 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   if (!selfSeen)
     return nullptr;
 
-  std::string key = (receiverClass + "." + methodName).str();
+  std::string key =
+      (receiverClass + "." + methodName + (asProperty ? "$get" : "")).str();
   auto memo = virtualDispatchHelpers.find(key);
   if (memo == virtualDispatchHelpers.end()) {
     // Every class that declares the method and has the receiver's class among
@@ -2542,6 +2543,21 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
         out.push_back(synth::name(name, range));
       return out;
     };
+    // ⭐ A PROPERTY READS INSTEAD OF CALLING, and it has no unbound spelling
+    // to fall back on: `Base.v` through the class is a property OBJECT, which
+    // this compiler does not represent. So the last arm reads through the
+    // parameter itself, and the whole body is emitted with the unresolvable-
+    // dispatch gate suppressed -- which is sound here and nowhere else,
+    // because the candidates are enumerated MOST-DERIVED FIRST and every class
+    // that declares the property is tested before its own ancestors. That
+    // ordering is Python's own resolution, so each arm binds the body an
+    // instance of that class would have run.
+    auto read = [&](parser::NodePtr receiverNode) {
+      return asProperty ? synth::attribute(std::move(receiverNode), methodName,
+                                           range)
+                        : synth::methodCall(std::move(receiverNode), methodName,
+                                            forwarded(), range);
+    };
     std::vector<parser::NodePtr> body;
     for (const auto &candidate : candidates)
       body.push_back(synth::ifStmt(
@@ -2549,19 +2565,22 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                       {synth::name("__ly_recv", range),
                        synth::name(candidate.second, range)},
                       range),
-          {synth::returnStmt(synth::methodCall(synth::name("__ly_recv", range),
-                                               methodName, forwarded(), range),
-                             range)},
-          {}, range));
-    std::vector<parser::NodePtr> fallbackArguments;
-    fallbackArguments.push_back(synth::name("__ly_recv", range));
-    for (parser::NodePtr &argument : forwarded())
-      fallbackArguments.push_back(std::move(argument));
-    body.push_back(synth::returnStmt(
-        synth::call(synth::attribute(synth::name(base->definingClass, range),
-                                     methodName, range),
-                    std::move(fallbackArguments), range),
-        range));
+          {synth::returnStmt(read(synth::name("__ly_recv", range)), range)}, {},
+          range));
+    if (asProperty) {
+      body.push_back(
+          synth::returnStmt(read(synth::name("__ly_recv", range)), range));
+    } else {
+      std::vector<parser::NodePtr> fallbackArguments;
+      fallbackArguments.push_back(synth::name("__ly_recv", range));
+      for (parser::NodePtr &argument : forwarded())
+        fallbackArguments.push_back(std::move(argument));
+      body.push_back(synth::returnStmt(
+          synth::call(synth::attribute(synth::name(base->definingClass, range),
+                                       methodName, range),
+                      std::move(fallbackArguments), range),
+          range));
+    }
 
     parser::NodePtr def = synth::functionDef(symbol, params, {},
                                              std::move(body), returns, {}, range);
@@ -2594,6 +2613,12 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // from that; the inline stack belongs to the body being interrupted.
       auto savedInlineFrames = std::move(inlineFrames);
       inlineFrames.clear();
+      if (asProperty)
+        ++virtualPropertyBodyDepth;
+      llvm::scope_exit restoreSuppression([&, asProperty] {
+        if (asProperty)
+          --virtualPropertyBodyDepth;
+      });
       llvm::scope_exit restoreContexts([&] {
         loopControlContexts = std::move(savedLoops);
         inlineReturnContexts = std::move(savedInlineReturns);
@@ -2646,6 +2671,21 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
 // which reach a method with their operands already emitted. Same dispatcher,
 // same memo: a dunder is a method, and eleven of them were measured silently
 // wrong on a base-typed receiver before the refusal existed.
+std::optional<Value>
+ModuleEmitter::tryEmitVirtualPropertyRead(const parser::Node &anchor,
+                                          Value receiver,
+                                          llvm::StringRef propertyName) {
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      anchor, receiver, propertyName, /*argumentCount=*/0,
+      /*asProperty=*/true);
+  if (!helper)
+    return std::nullopt;
+  Value callee = emitBindingRef(anchor, helper->symbol, helper->callable);
+  return emitCallableDispatch(
+      anchor, callee,
+      emitCallOperands(anchor, {receiver}, /*includeAstArguments=*/false));
+}
+
 std::optional<Value> ModuleEmitter::tryEmitVirtualDispatchWithValues(
     const parser::Node &anchor, Value receiver, llvm::StringRef methodName,
     llvm::ArrayRef<Value> positional) {

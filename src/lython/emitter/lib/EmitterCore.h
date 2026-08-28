@@ -150,7 +150,15 @@ private:
   const VirtualDispatchHelper *virtualDispatcherFor(const parser::Node &anchor,
                                                     Value receiver,
                                                     llvm::StringRef methodName,
-                                                    unsigned argumentCount);
+                                                    unsigned argumentCount,
+                                                    bool asProperty = false);
+  // The same dispatch for a `@property` READ through a base-typed receiver.
+  std::optional<Value> tryEmitVirtualPropertyRead(const parser::Node &anchor,
+                                                  Value receiver,
+                                                  llvm::StringRef propertyName);
+  // Non-zero while a property dispatcher's body is being emitted, where the
+  // unresolvable-dispatch gate is the question the dispatcher answers.
+  unsigned virtualPropertyBodyDepth = 0;
   // Keyed "<class>.<method>", so one dispatcher serves every call site and a
   // method that dispatches on itself terminates. Filled BEFORE the body is
   // emitted for that second reason.
