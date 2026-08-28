@@ -17,3 +17,6 @@ Sub
 MyErr
 ValueError
 KeyError
+int str
+int str
+int str

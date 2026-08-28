@@ -61,3 +61,21 @@ except Exception as e:
 erased: "list[object]" = [ValueError("v"), KeyError("k")]
 for value in erased:
     sys.stdout.write(name_of(value) + "\n")
+
+
+# ⛔ A UNION SUBJECT IS BOUND FIRST. The chain that answers one mentions the
+# subject once per member, so an EXPRESSION would run N times -- which is why
+# this took a NAME only, and why `type(d[k]).__name__` was refused while the
+# same program with `v = d[k]` on the line above compiled.
+table: "dict[str, int | str]" = {"n": 7, "s": "seven"}
+print(type(table["n"]).__name__, type(table["s"]).__name__)
+
+cells: "list[int | str]" = [1, "a"]
+print(type(cells[0]).__name__, type(cells[1]).__name__)
+
+
+def first_kind(items: "list[int | str]") -> str:
+    return type(items[0]).__name__
+
+
+print(first_kind(cells), first_kind(["z", 2]))

@@ -2056,8 +2056,21 @@ ModuleEmitter::tryEmitDynamicClassName(const parser::Node &expr) {
   // mentions it once per member, and re-evaluating a call would run it N times.
   if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(subject)) {
     const parser::Node *subjectNode = args->front().get();
-    if (subjectNode->kind != "Name")
-      return std::nullopt;
+    // ⭐ AN EXPRESSION IS BOUND FIRST. The chain mentions the subject once per
+    // member, so a call or a subscript would run N times -- which is why this
+    // took a NAME only, and why `type(d[k]).__name__` was refused while
+    // `v = d[k]` on the line above made the same program compile. A temporary
+    // is what the source would have written.
+    parser::NodePtr temporary;
+    if (subjectNode->kind != "Name") {
+      std::string name = "__lytypesubject" + std::to_string(++listCompCounter);
+      parser::NodePtr binding = synth::assign(
+          synth::name(name, expr.range), args->front(), expr.range);
+      emitStatement(*binding);
+      synthesizedIteratorDefs.push_back(binding);
+      temporary = synth::name(name, expr.range);
+      subjectNode = temporary.get();
+    }
     llvm::SmallVector<std::pair<mlir::Type, std::string>, 4> members;
     for (mlir::Type rawMember : unionType.getMemberTypes()) {
       mlir::Type member = types.widenLiteral(rawMember);
