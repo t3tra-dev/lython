@@ -76,6 +76,36 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
       }
       if (found->second.value.getType() == narrowed)
         found->second.type = narrowed;
+      // ⭐ A UNION THAT SHRINKS TO A SMALLER UNION IS STILL A PROOF, and the
+      // walk above can only spend it when the result is one MEMBER: a union
+      // value is a tag plus lanes, so re-tagging it as a narrower union would
+      // be a branch, not a view. So the VALUE keeps its shape and the NAME
+      // takes the smaller type, which is what the next test reads:
+      //
+      //     def f(v: int | str | None) -> str:
+      //         if v is None: return "none"
+      //         if isinstance(v, int): return "i" + str(v)
+      //         return "s" + v        # v is str
+      //
+      // The `is None` guard left `v` a three-member union, so the isinstance
+      // after it had TWO members remaining on its false arm and narrowed to
+      // neither -- and the tail was refused. With the name at `int | str` the
+      // false arm has one member left, which the unwrap above can spend.
+      //
+      // ⛔ The value is NOT retyped, so every read still produces what it
+      // physically is; only the static description a later proof reasons from
+      // gets sharper.
+      if (auto valueUnion = mlir::dyn_cast<py::UnionType>(
+              found->second.value.getType()))
+        if (auto narrowedUnion = mlir::dyn_cast<py::UnionType>(narrowed))
+          if (narrowedUnion.getMemberTypes().size() <
+              valueUnion.getMemberTypes().size()) {
+            bool subset = true;
+            for (mlir::Type member : narrowedUnion.getMemberTypes())
+              subset = subset && valueUnion.hasMember(member);
+            if (subset)
+              types.bindSymbol(fact.name, narrowed);
+          }
     }
     if (found == values.end() || found->second.value.getType() == narrowed)
       types.bindSymbol(fact.name, narrowed);

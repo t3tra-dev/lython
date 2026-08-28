@@ -579,8 +579,14 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     analysis.kind = IsInstanceAnalysis::Kind::UnionTest;
     if (analysis.unionMembers.size() == 1)
       analysis.trueType = analysis.unionMembers.front();
-    if (remaining.size() == 1 && !sawUnsupportedMember)
-      analysis.falseType = remaining.front();
+    // ⭐ WHAT IS LEFT, EVEN WHEN IT IS STILL SEVERAL. The false arm used to
+    // narrow only down to a single member, so a union of four narrowed to
+    // nothing after the first elimination and every guard after it started
+    // over from the full set. `join` of one member is that member, so the
+    // single-member case is unchanged; the value is not re-tagged either way
+    // -- `applyBranchNarrowing` spends a multi-member result on the NAME only.
+    if (!remaining.empty() && !sawUnsupportedMember)
+      analysis.falseType = types.join(remaining);
     if (!runtimeClassTestMembers.empty()) {
       analysis.kind = IsInstanceAnalysis::Kind::Unsupported;
       analysis.failureReason =
