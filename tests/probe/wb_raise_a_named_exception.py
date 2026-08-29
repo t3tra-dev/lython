@@ -22,12 +22,25 @@
 #
 # STILL OPEN 1 -- reading the name AFTER the handler, which is what this file
 # runs. The frame gave its reference away and needs it BACK, so this one wants
-# a retain before the raise rather than an exclusion. ⛔ Adding the retain
-# through `unfoldRetainBefore` was measured and does not close it: the release
-# then lands on the dead continuation edge after the raise -- the block a raise
-# falls through to and never reaches -- and the verifier counts that as the
-# second spend. Whoever takes it must stop that release being placed too, and
-# the population to check is every consuming call that never returns.
+# a retain before the raise rather than an exclusion.
+#
+# ⛔ THREE PLACEMENTS PUT A RELEASE BEHIND THE RAISE, and all three have to be
+# stopped before the retain helps. Found by stamping every `emitGroupRelease`
+# with `__builtin_LINE()` under an env var and reading the site off the IR --
+# which is the tool to reach for here, because guessing cost two rounds:
+#
+#     afterUseReleases ..... after the last use in the block
+#     beforeTermReleases ... before the block's terminator
+#     edgeReleases ......... on the terminator's EDGE, and for a `cf.br` that
+#                            is written BEFORE the branch, so it reads exactly
+#                            like the other two and was the last one found
+#
+# ⭐ WITH ALL THREE SKIPPED for a block that raises, the release behind the
+# raise is gone and the retain is in -- and the affine verifier STILL refuses
+# ("released or transferred more than once"). What is left is whether it
+# CREDITS that retain: it is an unfold retain with no ownership attribute, on a
+# `memref.cast` of a subview of the group's root. That is the next thing to
+# read, and it is a question about the VERIFIER rather than the placement.
 #
 # STILL OPEN 2 -- a union-typed exception:
 #
