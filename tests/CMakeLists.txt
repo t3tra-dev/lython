@@ -171,7 +171,12 @@ set(LYTHON_UNIT_PATTERNS_emit
     "DriverTest.ReportsEmitErrorDiagnostics")
 set(LYTHON_UNIT_PATTERNS_abi
     "EntityHeaderPrefixTest.*"
-    "ReferenceMapTest.*")
+    "ReferenceMapTest.*"
+    # `abi` and not `lower` even though it is a DriverTest: it compiles
+    # nothing. It builds target machines and reads the LSDA `@TType` encoding
+    # each one would emit, which is a fact about the exception ABI and costs
+    # what a table lookup costs.
+    "DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads")
 # `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
 # manifest sources and asks a dataflow question about them, which is the suite
 # checking the tree rather than the compiler.

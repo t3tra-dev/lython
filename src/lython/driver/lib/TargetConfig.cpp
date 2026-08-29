@@ -240,11 +240,18 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   applyExceptionUnwindOptions(opt, triple);
   if (!parseConfiguredFloatABI(opt.FloatABIType, options, diag))
     return nullptr;
+  // The relocation model is spelled rather than defaulted, and the reason is
+  // the exception tables: a DWARF target picks its LSDA `@TType` encoding from
+  // it -- `indirect pcrel sdata4` under PIC, `udata4` without -- and the
+  // personality reads one of the two (`ly_eh_lookup_site`). An ELF target
+  // defaults to Reloc::Static, so every raise in an AOT binary would reach the
+  // reader's `refuse` block and abort inside the unwinder. MachO emits the PIC
+  // form whatever the model, which is why this was invisible on macOS.
   std::unique_ptr<llvm::TargetMachine> targetMachine(
       llvmTarget->createTargetMachine(
           triple, codeGenCPUNameForTarget(target, triple, options),
           codeGenFeaturesForTarget(target, triple, options), opt,
-          std::nullopt));
+          llvm::Reloc::PIC_));
   if (!targetMachine)
     diag << "Failed to create target machine for " << targetTripleName << "\n";
   return targetMachine;

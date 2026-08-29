@@ -27,6 +27,8 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -1284,6 +1286,66 @@ TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
       continue;
     ++checked;
     EXPECT_EQ(function.getPersonalityFn()->getName(), expected);
+  }
+  EXPECT_GT(checked, 0u);
+}
+
+// WHAT: the LSDA `@TType` encoding each target this compiler codegens for
+// actually emits. `ly_eh_lookup_site` reads ONE encoding --
+// `DW_EH_PE_indirect | pcrel | sdata4` (0x9b) -- and traps on anything else,
+// so a target that emits a different one turns every raise into an abort
+// inside the unwinder with no message.
+//
+// That is what an ELF host did: the encoding follows the relocation model,
+// ELF defaults to Reloc::Static, and the static form is `udata4` (0x03). 162
+// tests failed on x86-64 Linux. MachO emits the indirect form whatever the
+// model, which is why nothing on macOS could see it -- so the triples here
+// are NAMED rather than taken from the host.
+//
+// ⛔ aarch64 ELF is in the table at 0x9c, which is the same form with
+// `sdata8` entries -- EIGHT-byte, where the reader indexes and sign-extends
+// FOUR. It is listed because it is measured, not because it works: that
+// target still reaches the reader's refuse block, loudly. The gap is recorded
+// in tests/probe/wb_aarch64_elf_type_table_width.py.
+TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmPrinters();
+
+  // DW_EH_PE_indirect (0x80) | DW_EH_PE_pcrel (0x10) | DW_EH_PE_sdata4 (0x0b)
+  constexpr unsigned kIndirectPcrelSdata4 = 0x9b;
+  // The same, with DW_EH_PE_sdata8 (0x0c).
+  constexpr unsigned kIndirectPcrelSdata8 = 0x9c;
+  const std::vector<std::pair<const char *, unsigned>> expected = {
+      {"x86_64-unknown-linux-gnu", kIndirectPcrelSdata4},
+      {"arm64-apple-macosx", kIndirectPcrelSdata4},
+      {"x86_64-apple-macosx", kIndirectPcrelSdata4},
+      {"armv7-unknown-linux-gnueabihf", kIndirectPcrelSdata4},
+      {"aarch64-unknown-linux-gnu", kIndirectPcrelSdata8},
+  };
+
+  unsigned checked = 0;
+  for (auto [triple, encoding] : expected) {
+    lython::driver::DriverOptions options;
+    options.targetTriple = triple;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    std::unique_ptr<llvm::TargetMachine> machine =
+        lython::driver::createCodeGenTargetMachine(
+            py::TensorLoweringTarget{}, options, nullptr, diag);
+    if (!machine)
+      continue; // this build of LLVM does not carry that backend
+    ++checked;
+    // The encoding is decided only once the object-file lowering has an
+    // MCContext: `getTTypeEncoding()` answers 0 before that, which would be a
+    // silent pass rather than a failure.
+    llvm::MCContext context(machine->getTargetTriple(),
+                            machine->getMCAsmInfo(),
+                            machine->getMCRegisterInfo(),
+                            machine->getMCSubtargetInfo());
+    machine->getObjFileLowering()->Initialize(context, *machine);
+    EXPECT_EQ(machine->getObjFileLowering()->getTTypeEncoding(), encoding)
+        << triple;
   }
   EXPECT_GT(checked, 0u);
 }

@@ -524,6 +524,22 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
       return failure();
     }
     auto tmBuilder = std::move(*tmBuilderOrErr);
+    // ⭐ PIC, AND THE REASON IS THE EXCEPTION TABLES, not the code. A DWARF
+    // target picks its LSDA `@TType` encoding from the relocation model:
+    // `indirect pcrel sdata4` (0x9B) under PIC and `udata4` (0x03) without it.
+    // `ly_eh_lookup_site` reads one encoding -- the personality has to know how
+    // to turn a type-table entry into a class id, and the two forms differ by
+    // a pc-relative add and a load -- so an ELF host defaulting to Reloc::Static
+    // made every raise reach a `refuse` block and abort with no message. 162
+    // tests on x86-64 Linux; MachO emits 0x9B whatever the model, so nothing
+    // on macOS could see it.
+    //
+    // ⛔ NOT "teach the reader both encodings", which is the repair that
+    // sounds right: the second form would then be read by exactly one platform
+    // and exercised by no test this suite can run, and a wrong pointer built
+    // in a personality is a crash inside the unwinder. One encoding, produced
+    // on purpose, is the smaller surface.
+    tmBuilder.setRelocationModel(llvm::Reloc::PIC_);
     tmBuilder.setCPU(
         codeGenCPUNameForTarget(tensorTarget, processTriple, Options));
     tmBuilder.setFeatures(
