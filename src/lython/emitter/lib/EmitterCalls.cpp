@@ -236,7 +236,22 @@ ModuleEmitter::emitCallOperands(const parser::Node &expr,
             CallKeywordType{std::string(*name), keywordValue.type});
         continue;
       }
-      operands.keywordValues.push_back(emitExpr(ast::node(*keyword, "value")));
+      // A keyword with no `arg` is `**mapping`, and its names are the
+      // mapping's keys -- which nothing static reads. Pushing the value alone
+      // left `keywordNames` one short of `keywordValues`, and the size was not
+      // checked until callable planning eight phases later, where it reported
+      // "kw names and kw values must have the same size" against a fused
+      // location with no source line in it.
+      //
+      // ⛔ NOT a rewrite of the two shapes that ARE static -- `f(**{"a": 1})`,
+      // whose keys are literals, and `g(**kwargs)` forwarding a parameter that
+      // is itself a dict -- because each needs the callee's keyword ABI, and
+      // this is the boundary that has to refuse first either way.
+      emitExpr(ast::node(*keyword, "value"));
+      operands.valid = false;
+      operands.failureReason =
+          "`**` call arguments require statically known keyword names; spell "
+          "the keywords out";
     }
   }
 

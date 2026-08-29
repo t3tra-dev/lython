@@ -1163,21 +1163,69 @@ void ModuleEmitter::emitTopLevelDeclarations() {
                         statement->kind == "AsyncFunctionDef") &&
           functionBodyContainsYield(*statement))
         types.forgetSignature(statement.get());
+  // A class is emitted when it is first NEEDED rather than where it is
+  // written. `class A` whose method returns `B(1)` used to be refused with
+  // "static type B does not provide manifest method '__init__'": B's contract
+  // registers inside its own emitClassContract, which had not run yet, so a
+  // class -- or a function -- textually above the class it constructs could
+  // not construct it. The iterable/iterator pair is the everyday shape of it:
+  //
+  //     class Range:
+  //         def __iter__(self) -> "RangeIter": return RangeIter(self.stop)
+  //     class RangeIter: ...
+  //
+  // The annotation resolves (predeclareTopLevel binds every class NAME up
+  // front); only the members were missing.
+  //
+  // ⛔ NOT "emit all classes before all functions", which the ⛔ above rejects
+  // for the right reason -- a class body may reference a module-level
+  // function. Pulling forward only what a statement NAMES leaves every other
+  // pair in source order.
+  //
+  // Erasing from `deferred` BEFORE emitting is the cycle guard: two classes
+  // that construct each other resolve the first one's reference to nothing,
+  // which is exactly the old behaviour for that pair and no worse.
+  llvm::StringMap<const parser::Node *> deferred;
+  if (const auto *body = ast::nodeList(moduleNode, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement && statement->kind == "ClassDef")
+        if (auto name = ast::string(*statement, "name"))
+          deferred[*name] = statement.get();
+
+  std::function<void(llvm::StringRef)> emitClassNow;
+  auto emitNamedClassesFirst = [&](const parser::Node &statement) {
+    ast::walk(&statement, [&](const parser::Node &node) {
+      if (node.kind == "Name")
+        emitClassNow(ast::nameSpelling(node));
+      return ast::Walk::Continue;
+    });
+  };
+  emitClassNow = [&](llvm::StringRef name) {
+    auto found = deferred.find(name);
+    if (found == deferred.end())
+      return;
+    const parser::Node *statement = found->second;
+    deferred.erase(found);
+    emitNamedClassesFirst(*statement);
+    if (genericClasses.count(name))
+      drainGenericClassSpecializations(name);
+    else
+      emitClassContract(*statement);
+  };
+
   if (const auto *body = ast::nodeList(moduleNode, "body")) {
     for (const parser::NodePtr &statement : *body) {
       if (!statement)
         continue;
       if (statement->kind == "FunctionDef" ||
           statement->kind == "AsyncFunctionDef") {
+        emitNamedClassesFirst(*statement);
         emitFunctionDecl(*statement);
       } else if (statement->kind == "ClassDef") {
         auto name = ast::string(*statement, "name");
         if (!name)
           continue;
-        if (genericClasses.count(*name))
-          drainGenericClassSpecializations(*name);
-        else
-          emitClassContract(*statement);
+        emitClassNow(*name);
       }
     }
   }

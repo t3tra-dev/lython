@@ -758,6 +758,44 @@ TEST(EmitterTest, AnExhaustiveMatchDoesNotFallThrough) {
       reportsDiagnostic(guarded, "can reach its end without returning"));
 }
 
+// WHAT: `f(**mapping)` in every spelling -- a dict local, a dict display, a
+// `**kwargs` parameter forwarded on -- against a callee that names its
+// parameters and one that collects `**kwargs`. All are refused here, by the
+// emitter, naming `**`. The control is the same calls with the keywords
+// spelled out, which compile.
+//
+// Emit-layer and not golden: the refusal is the whole behaviour, and it used
+// to happen eight phases later as "kw names and kw values must have the same
+// size" against a fused location carrying no source line.
+TEST(EmitterTest, RefusesAMappingUnpackedIntoACall) {
+  mlir::MLIRContext context(testRegistry());
+  const char *collector = "def show(**kwargs: int) -> int:\n"
+                          "    return len(kwargs)\n";
+  const char *named = "def f(a: int, b: int) -> int:\n"
+                      "    return a * 10 + b\n";
+
+  for (const std::string &source :
+       {std::string(collector) + "opts = {\"a\": 7}\nprint(show(**opts))\n",
+        std::string(collector) + "print(show(**{\"a\": 7}))\n",
+        std::string(collector) + "def outer(**kw: int) -> int:\n"
+                                 "    return show(**kw)\n"
+                                 "print(outer(a=1))\n",
+        std::string(named) + "opts = {\"a\": 1, \"b\": 2}\nprint(f(**opts))\n"}) {
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    EXPECT_TRUE(reportsDiagnostic(
+        result, "`**` call arguments require statically known keyword names"))
+        << source;
+  }
+
+  lython::emitter::EmitResult spelled = emitSource(
+      std::string(collector) + "print(show(a=7, b=8))\n", context);
+  EXPECT_TRUE(spelled.ok());
+  lython::emitter::EmitResult positional =
+      emitSource(std::string(named) + "print(f(1, 2))\n", context);
+  EXPECT_TRUE(positional.ok());
+}
+
 TEST(EmitterTest, RepeatedEmitIsStable) {
   for (int round = 0; round < 5; ++round) {
     mlir::MLIRContext context(testRegistry());
