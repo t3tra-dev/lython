@@ -26,6 +26,7 @@
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
@@ -92,6 +93,43 @@ LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
     return failure();
   }
   return success();
+}
+
+// The EH marker calls carry their try id as an OPERAND, and that is exactly
+// what block merging promotes to a block argument: two arms of an `if` inside
+// one `try` are identical apart from their operands, so they merge and the
+// merged marker's id becomes a phi of the two arms' anchor ids. The final EH
+// phase can only wire a call to a handler through a constant id, so it drops
+// the call site, the raising call keeps only its traceback cleanup edge, and
+// the exception escapes a `try` that CPython catches.
+//
+// Restating the id as an ATTRIBUTE makes the two markers non-identical
+// OPERATIONS, and MLIR compares attribute dictionaries before it merges: the
+// arms stay separate exactly when merging would lose the id, and still merge
+// when the ids agree. Nothing reads this attribute.
+//
+// ⛔ NOT "use an EH-safe copy of the merging pass" (tried, for
+// `memref::createExpandStridedMetadataPass` -- which does merge here): six
+// upstream passes in the final phase run the greedy driver with its DEFAULT
+// AGGRESSIVE region simplification, and replacing each one leaves the next
+// release free to add a seventh. ⛔ NOT "resolve the phi in the EH phase"
+// (also tried): the incoming ids DISAGREE by construction, because each arm
+// has its own traceback anchor for its own line number.
+void discriminateEHMarkers(ModuleOp module) {
+  mlir::Builder builder(module.getContext());
+  module.walk([&](mlir::func::CallOp call) {
+    llvm::StringRef callee = call.getCallee();
+    if (callee != "LyEH_TryCallSiteMarker" && callee != "LyEH_TryCatchMarker" &&
+        callee != "LyEH_TryCatchAnchor")
+      return;
+    if (call.getNumOperands() != 1)
+      return;
+    mlir::IntegerAttr id;
+    if (!mlir::matchPattern(call.getOperand(0), mlir::m_Constant(&id)))
+      return;
+    call->setAttr("ly.eh.marker_id",
+                  builder.getI64IntegerAttr(id.getInt()));
+  });
 }
 
 // Canonicalization for phases where the lowered EH skeleton exists (runtime
@@ -353,6 +391,11 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       })))
     return failure();
   dumpMLIRForPass(irDump, "post-verifier-symbol-dce", module);
+
+  {
+    PerfScope perf("lowering.discriminate-eh-markers");
+    discriminateEHMarkers(module);
+  }
 
   // Phase 14: final lowering to LLVM dialect.
   {

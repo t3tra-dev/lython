@@ -27,31 +27,20 @@ print(math.isnan(math.nan), math.isnan(1.0), math.isinf(math.inf), math.isinf(1.
 print(math.isfinite(1.0), math.isfinite(math.inf), math.isfinite(math.nan))
 print(math.pow(2.0, 10.0), math.pow(9.0, 0.5), math.pow(2.0, -1.0))
 
-# ⛔ ONE CALL PER `try`, not a branch over six of them: two call sites of the
-# same raising callee inside one `try` let the exception escape the handler.
-# That is a defect of the EH wiring, recorded in
-# tests/probe/wb_try_two_arms_same_raiser.py, and not of these functions.
-try:
-    math.factorial(-1)
-except ValueError as e:
-    print("factorial ValueError:", e)
-try:
-    math.isqrt(-1)
-except ValueError as e:
-    print("isqrt ValueError:", e)
-try:
-    math.comb(-1, 2)
-except ValueError as e:
-    print("comb-n ValueError:", e)
-try:
-    math.comb(5, -1)
-except ValueError as e:
-    print("comb-k ValueError:", e)
-try:
-    math.perm(-1, 2)
-except ValueError as e:
-    print("perm-n ValueError:", e)
-try:
-    math.perm(5, -1)
-except ValueError as e:
-    print("perm-k ValueError:", e)
+for bad in ["factorial", "isqrt", "comb-n", "comb-k", "perm-n", "perm-k"]:
+    try:
+        if bad == "factorial":
+            math.factorial(-1)
+        elif bad == "isqrt":
+            math.isqrt(-1)
+        elif bad == "comb-n":
+            math.comb(-1, 2)
+        elif bad == "comb-k":
+            math.comb(5, -1)
+        elif bad == "perm-n":
+            math.perm(-1, 2)
+        else:
+            math.perm(5, -1)
+        print(bad, "no error")
+    except ValueError as e:
+        print(bad, "ValueError:", e)

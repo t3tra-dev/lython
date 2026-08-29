@@ -1,0 +1,8 @@
+caught invalid literal for int() with base 10: 'zz'
+caught invalid literal for int() with base 10: 'yy'
+7 7 14 int 7
+zz -1 -1 not an int: zz
+13 13 26 int 13
+yy -1 -1 not an int: yy
+total 22
+KeyError 'from the taken arm'
