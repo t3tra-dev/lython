@@ -19,10 +19,23 @@
 # inside a personality is a crash in the unwinder rather than a failed test.
 # Whoever has the machine should take it; the shape of the repair is above.
 #
-# ⭐ x86-64 ELF got here by a DIFFERENT route and is fixed: its encoding
-# follows the RELOCATION MODEL (0x03 `udata4` under Reloc::Static, 0x9b under
-# PIC), and the driver now spells PIC rather than defaulting. aarch64 is 0x9c
-# under both models, so nothing about the relocation model helps it.
+# ⭐ x86-64 ELF REACHED 0x9c TOO, by a knob aarch64 does not have. Its encoding
+# follows BOTH the relocation model and the CODE MODEL:
+#
+#     Reloc::Static, any code model ... 0x03 `udata4`
+#     PIC, Small or Medium ............ 0x9b  <- the one the reader reads
+#     PIC, Large ...................... 0x9c
+#
+# ORC's default code model is Large, so the JIT emitted 0x9c while the AOT path
+# emitted 0x9b, and only the AOT half of the Linux failure went away when the
+# relocation model was spelled. Both are spelled now. aarch64 is 0x9c under
+# BOTH code models -- the width follows LP64 there -- so no knob reaches it.
+#
+# ⭐ WHICH MAKES sdata8 THE COMMONER FORM THAN IT LOOKED. It is not an aarch64
+# curiosity: it is what x86-64 emits too whenever the code model is not small,
+# so a reader that handles both widths is worth more than this note assumed
+# when it was written. The decode differs ONLY in the entry width and the sign
+# extension; the pc-relative add and the indirect load are identical.
 try:
     raise ValueError("x")
 except ValueError as e:

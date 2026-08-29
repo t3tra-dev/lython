@@ -74,6 +74,12 @@ exceptionModelForTargetTriple(const llvm::Triple &triple);
 void applyExceptionUnwindOptions(llvm::TargetOptions &options,
                                  const llvm::Triple &triple);
 
+// The relocation model and code model the LSDA `@TType` encoding depends on.
+// Both the JIT and the AOT path set them from here; the note at the
+// definition has the measured table.
+llvm::Reloc::Model exceptionTableRelocationModel();
+llvm::CodeModel::Model exceptionTableCodeModel();
+
 std::unique_ptr<llvm::TargetMachine>
 createCodeGenTargetMachine(py::TensorLoweringTarget target,
                            const DriverOptions &options,

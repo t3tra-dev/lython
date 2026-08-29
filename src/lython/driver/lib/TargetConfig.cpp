@@ -218,6 +218,34 @@ void applyExceptionUnwindOptions(llvm::TargetOptions &options,
   options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
 }
 
+// ⭐ THE TWO KNOBS THE EXCEPTION TABLES DEPEND ON, spelled rather than
+// defaulted, and shared so the JIT and the AOT path cannot drift apart.
+//
+// A DWARF target picks its LSDA `@TType` encoding from BOTH of them, and
+// `ly_eh_lookup_site` reads exactly one encoding -- the personality has to
+// turn a type-table entry into a class id, and the forms differ by a
+// pc-relative add, a load, and an entry width. Measured on x86-64 ELF:
+//
+//     Reloc::Static, any code model ... `udata4`               (0x03)
+//     PIC, Small or Medium ........... `indirect pcrel sdata4` (0x9b)  <- read
+//     PIC, Large ..................... `indirect pcrel sdata8` (0x9c)
+//
+// The defaults miss on both axes: ELF defaults to Reloc::Static, so an AOT
+// binary got 0x03, and ORC's own default code model is Large, so the JIT got
+// 0x9c. Each was a separate CI round: 162 tests, then 160 of them again.
+// MachO answers 0x9b whatever either knob says, which is why a machine that
+// runs the whole suite green cannot see any of it.
+//
+// ⛔ Small is not a compromise for the JIT -- it is what LLJIT sets for
+// itself when it configures JITLink (`LLJITBuilderState::prepareForConstruction`).
+// This compiler supplies its OWN object-layer creator, which is the branch
+// that skips that configuration, so the two knobs have to be set by hand.
+llvm::Reloc::Model exceptionTableRelocationModel() { return llvm::Reloc::PIC_; }
+
+llvm::CodeModel::Model exceptionTableCodeModel() {
+  return llvm::CodeModel::Small;
+}
+
 std::unique_ptr<llvm::TargetMachine>
 createCodeGenTargetMachine(py::TensorLoweringTarget target,
                            const DriverOptions &options,
@@ -240,18 +268,11 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   applyExceptionUnwindOptions(opt, triple);
   if (!parseConfiguredFloatABI(opt.FloatABIType, options, diag))
     return nullptr;
-  // The relocation model is spelled rather than defaulted, and the reason is
-  // the exception tables: a DWARF target picks its LSDA `@TType` encoding from
-  // it -- `indirect pcrel sdata4` under PIC, `udata4` without -- and the
-  // personality reads one of the two (`ly_eh_lookup_site`). An ELF target
-  // defaults to Reloc::Static, so every raise in an AOT binary would reach the
-  // reader's `refuse` block and abort inside the unwinder. MachO emits the PIC
-  // form whatever the model, which is why this was invisible on macOS.
   std::unique_ptr<llvm::TargetMachine> targetMachine(
       llvmTarget->createTargetMachine(
           triple, codeGenCPUNameForTarget(target, triple, options),
           codeGenFeaturesForTarget(target, triple, options), opt,
-          llvm::Reloc::PIC_));
+          exceptionTableRelocationModel(), exceptionTableCodeModel()));
   if (!targetMachine)
     diag << "Failed to create target machine for " << targetTripleName << "\n";
   return targetMachine;

@@ -27,7 +27,9 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -1291,31 +1293,46 @@ TEST(DriverTest, ThePersonalityIsTheOneTheTargetCanHave) {
 }
 
 // WHAT: the LSDA `@TType` encoding each target this compiler codegens for
-// actually emits. `ly_eh_lookup_site` reads ONE encoding --
-// `DW_EH_PE_indirect | pcrel | sdata4` (0x9b) -- and traps on anything else,
-// so a target that emits a different one turns every raise into an abort
-// inside the unwinder with no message.
+// actually emits, through BOTH factories -- the AOT one and a JIT target
+// machine builder configured the way tools/CLI.cpp configures it.
+// `ly_eh_lookup_site` reads ONE encoding, `DW_EH_PE_indirect | pcrel | sdata4`
+// (0x9b), and aborts on anything else, so a target that emits a different one
+// turns every raise into an abort inside the unwinder.
 //
-// That is what an ELF host did: the encoding follows the relocation model,
-// ELF defaults to Reloc::Static, and the static form is `udata4` (0x03). 162
-// tests failed on x86-64 Linux. MachO emits the indirect form whatever the
-// model, which is why nothing on macOS could see it -- so the triples here
-// are NAMED rather than taken from the host.
+// It got there twice, on the two knobs the encoding depends on. ELF defaults
+// to `Reloc::Static`, which emits `udata4` (0x03) -- 162 tests. Then ORC's
+// default code model is Large, which emits `sdata8` (0x9c) -- the same 160
+// again, JIT only, while the AOT half passed. MachO answers 0x9b whatever
+// either knob says, which is why the triples here are NAMED: the bug is
+// invisible on the machine that has it.
 //
-// ⛔ aarch64 ELF is in the table at 0x9c, which is the same form with
-// `sdata8` entries -- EIGHT-byte, where the reader indexes and sign-extends
-// FOUR. It is listed because it is measured, not because it works: that
-// target still reaches the reader's refuse block, loudly. The gap is recorded
-// in tests/probe/wb_aarch64_elf_type_table_width.py.
+// The Large row is asserted too, and is not redundant: it is the measurement
+// that says WHY the code model is spelled rather than left to the default.
+//
+// ⛔ aarch64 ELF is 0x9c under BOTH code models -- the width follows LP64
+// there, not the model -- so no knob reaches it and that target still refuses.
+// Recorded in tests/probe/wb_aarch64_elf_type_table_width.py.
 TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
   llvm::InitializeAllAsmPrinters();
 
-  // DW_EH_PE_indirect (0x80) | DW_EH_PE_pcrel (0x10) | DW_EH_PE_sdata4 (0x0b)
+  // DW_EH_PE_indirect (0x80) | DW_EH_PE_pcrel (0x10) | DW_EH_PE_sdata4 (0x0b),
+  // and the same with DW_EH_PE_sdata8 (0x0c).
   constexpr unsigned kIndirectPcrelSdata4 = 0x9b;
-  // The same, with DW_EH_PE_sdata8 (0x0c).
   constexpr unsigned kIndirectPcrelSdata8 = 0x9c;
+
+  auto encodingOf = [](llvm::TargetMachine &machine) {
+    // The encoding is decided only once the object-file lowering has an
+    // MCContext: `getTTypeEncoding()` answers 0 before that, which would be a
+    // silent pass rather than a failure.
+    llvm::MCContext context(machine.getTargetTriple(), machine.getMCAsmInfo(),
+                            machine.getMCRegisterInfo(),
+                            machine.getMCSubtargetInfo());
+    machine.getObjFileLowering()->Initialize(context, machine);
+    return machine.getObjFileLowering()->getTTypeEncoding();
+  };
+
   const std::vector<std::pair<const char *, unsigned>> expected = {
       {"x86_64-unknown-linux-gnu", kIndirectPcrelSdata4},
       {"arm64-apple-macosx", kIndirectPcrelSdata4},
@@ -1330,24 +1347,64 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
     options.targetTriple = triple;
     std::string diagnostics;
     llvm::raw_string_ostream diag(diagnostics);
-    std::unique_ptr<llvm::TargetMachine> machine =
+    std::unique_ptr<llvm::TargetMachine> aot =
         lython::driver::createCodeGenTargetMachine(
             py::TensorLoweringTarget{}, options, nullptr, diag);
-    if (!machine)
+    if (!aot)
       continue; // this build of LLVM does not carry that backend
     ++checked;
-    // The encoding is decided only once the object-file lowering has an
-    // MCContext: `getTTypeEncoding()` answers 0 before that, which would be a
-    // silent pass rather than a failure.
-    llvm::MCContext context(machine->getTargetTriple(),
-                            machine->getMCAsmInfo(),
-                            machine->getMCRegisterInfo(),
-                            machine->getMCSubtargetInfo());
-    machine->getObjFileLowering()->Initialize(context, *machine);
-    EXPECT_EQ(machine->getObjFileLowering()->getTTypeEncoding(), encoding)
-        << triple;
+    EXPECT_EQ(encodingOf(*aot), encoding) << triple << " (AOT)";
+
+    // The JIT reaches codegen through ORC, so it is configured separately and
+    // was wrong on its own for a whole CI round. Same two knobs, same answer.
+    llvm::orc::JITTargetMachineBuilder jitBuilder{llvm::Triple(triple)};
+    // The same three calls CLI.cpp makes, in the same order: the exception
+    // MODEL is a knob too, and armv7 answers 0 without it (EHABI has no
+    // type-table encoding to report).
+    llvm::TargetOptions jitOptions = jitBuilder.getOptions();
+    lython::driver::applyExceptionUnwindOptions(jitOptions,
+                                                llvm::Triple(triple));
+    jitBuilder.setOptions(jitOptions);
+    jitBuilder.setRelocationModel(
+        lython::driver::exceptionTableRelocationModel());
+    jitBuilder.setCodeModel(lython::driver::exceptionTableCodeModel());
+    auto jit = jitBuilder.createTargetMachine();
+    ASSERT_TRUE(static_cast<bool>(jit))
+        << triple << " " << llvm::toString(jit.takeError());
+    EXPECT_EQ(encodingOf(**jit), encoding) << triple << " (JIT)";
   }
   EXPECT_GT(checked, 0u);
+
+  // ⭐ AND THAT THE JIT ACTUALLY ASKS. The two arms above both configure their
+  // own builder, so they agree with each other by construction and would keep
+  // agreeing if the JIT stopped setting a knob -- which is the exact way this
+  // broke: the AOT path was fixed, the JIT path was not, and one whole CI
+  // round went into finding that out. A text check on the source is crude and
+  // it is the only thing here that fails when the call goes missing.
+  {
+    std::ifstream cli(std::string(LYTHON_SOURCE_DIR) + "/tools/CLI.cpp");
+    ASSERT_TRUE(cli.is_open());
+    std::stringstream buffer;
+    buffer << cli.rdbuf();
+    const std::string text = buffer.str();
+    EXPECT_NE(text.find("exceptionTableRelocationModel()"), std::string::npos);
+    EXPECT_NE(text.find("exceptionTableCodeModel()"), std::string::npos);
+  }
+
+  // The measurement the code model is spelled FOR: leave it at ORC's default
+  // and x86-64 moves to eight-byte type-table entries.
+  std::string error;
+  llvm::Triple x86(llvm::Triple::normalize("x86_64-unknown-linux-gnu"));
+  if (const llvm::Target *target =
+          llvm::TargetRegistry::lookupTarget(x86, error)) {
+    llvm::TargetOptions opt;
+    std::unique_ptr<llvm::TargetMachine> large(target->createTargetMachine(
+        x86, "generic", "", opt,
+        lython::driver::exceptionTableRelocationModel(),
+        llvm::CodeModel::Large));
+    ASSERT_TRUE(static_cast<bool>(large));
+    EXPECT_EQ(encodingOf(*large), kIndirectPcrelSdata8);
+  }
 }
 
 // `T | None` is one field, not a tag and two layouts. It is stored as a BOX --
