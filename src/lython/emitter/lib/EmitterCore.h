@@ -892,6 +892,8 @@ private:
       llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
       const llvm::StringMap<mlir::Type> *inferenceHints = nullptr);
   bool nameIsReadAfterCurrentStatement(llvm::StringRef name) const;
+  // Conservative: true whenever the walk cannot see the whole remaining scope.
+  bool nameMayBeReadAfterCurrentStatement(llvm::StringRef name) const;
   mlir::Type inferConditionalLocalType(
       llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
       llvm::StringRef name);
@@ -1112,6 +1114,17 @@ private:
   // the walk is, not what it has decided.
   const std::vector<parser::NodePtr> *currentSuite = nullptr;
   std::size_t currentSuiteIndex = 0;
+  // Every suite currently being emitted, innermost last, each with the index
+  // just past the statement it is emitting. A forward look needs all of them:
+  // "read after this loop" means the rest of this suite AND the rest of every
+  // suite it sits inside, up to the scope it belongs to.
+  llvm::SmallVector<std::pair<const std::vector<parser::NodePtr> *,
+                              std::size_t>, 8>
+      suiteStack;
+  // Where the current CALLABLE's suites start in that stack. A name in a
+  // nested function is a different binding, so the walk stops here rather
+  // than reading the enclosing function's remainder.
+  unsigned suiteStackFloor = 0;
 
   // ⭐ The three module-scope VALUE bindings above, hidden for the duration of
   // a walk that emits ANOTHER module's code. `TypeSystem::ScopeIsolation` does

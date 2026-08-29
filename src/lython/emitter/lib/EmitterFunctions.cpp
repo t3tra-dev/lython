@@ -460,6 +460,11 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                                        currentFunctionPrefix,
                                        currentGeneratorSendType,
                                        narrowedFromTypes, types);
+  // The forward look for a later read stops at this callable's own suites: a
+  // name inside a nested function is a different binding, and the enclosing
+  // function's remainder says nothing about it.
+  llvm::SaveAndRestore<unsigned> savedSuiteFloor(
+      suiteStackFloor, static_cast<unsigned>(suiteStack.size()));
 
   mlir::Block *entry = func.addEntryBlock();
   values.clear();

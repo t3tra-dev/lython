@@ -181,6 +181,26 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
   collectAssignedNames(ast::nodeList(statement, "orelse"), assignedInBody);
   llvm::SmallVector<std::string, 4> names;
   for (const auto &assigned : assignedInBody) {
+    // ⭐ A NAME NOTHING OBSERVES NEED NOT BE CARRIED, and forcing it to be
+    // costs the throwaway spelling its whole purpose:
+    //
+    //     value, _, count = part.partition("x")
+    //     for _ in range(int(count)):     # refused: '_' is str, then int
+    //         ...
+    //
+    // The refusal's reason -- "a loop that runs zero times leaves the earlier
+    // binding in place" -- is a claim about a READ AFTER the loop. With no
+    // read after it and no read INSIDE it, the two bindings never meet: every
+    // read in the body follows the loop's own store, and there is nothing
+    // below to see either. Both halves are needed -- an accumulator
+    // (`total = total + x`) reads itself in the body and must keep carrying.
+    //
+    // ⛔ The after-loop half is conservative by construction: it can see only
+    // the rest of the CURRENT suite, so a loop nested inside anything answers
+    // "may be read" and keeps the refusal.
+    if (!containsNameLoad(&statement, assigned.getKey()) &&
+        !nameMayBeReadAfterCurrentStatement(assigned.getKey()))
+      continue;
     if (excludedNames && excludedNames->contains(assigned.getKey()))
       continue;
     auto found = values.find(assigned.getKey());

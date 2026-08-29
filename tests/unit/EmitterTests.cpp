@@ -554,13 +554,22 @@ TEST(EmitterTest, ALoopCarriedLocalRebornWithAnotherTypeIsRefusedAtTheLoop) {
 
 // The body assignment spelling of the same lane, so the check is not read as
 // being about loop TARGETS.
-TEST(EmitterTest, ALoopBodyCannotRetypeACarriedLocal) {
+//
+// ⭐ THE READ AFTER THE LOOP IS PART OF THE SUBJECT, and was added when the
+// refusal learned to ask for one. It used to end `return 0`, which retypes a
+// name NOTHING observes -- and the refusal's own reason ("a loop that runs
+// zero times leaves the earlier binding in place") is a claim about a read
+// after the loop. With `print(a)` there the claim holds and the refusal is
+// right; without it the program is legal Python that this compiler had no
+// reason to reject, which the second half of this test now pins.
+TEST(EmitterTest, ALoopBodyCannotRetypeACarriedLocalThatIsRead) {
   mlir::MLIRContext context(testRegistry());
   lython::emitter::EmitResult emitted =
       emitSource("def f() -> int:\n"
                  "    a = \"x\"\n"
                  "    for i in [1, 2]:\n"
                  "        a = i\n"
+                 "    print(a)\n"
                  "    return 0\n"
                  "print(f())\n",
                  context);
@@ -570,6 +579,34 @@ TEST(EmitterTest, ALoopBodyCannotRetypeACarriedLocal) {
     found = found || diagnostic.message.find("loop-carried local 'a'") !=
                          std::string::npos;
   EXPECT_TRUE(found);
+
+  // Nothing observes the rebind: no read in the body, none after the loop.
+  // The throwaway name is the everyday spelling of it --
+  // `value, _, count = part.partition("x")` then `for _ in range(...)`.
+  for (const char *source :
+       {"def f() -> int:\n"
+        "    a = \"x\"\n"
+        "    for i in [1, 2]:\n"
+        "        a = i\n"
+        "    return 0\n"
+        "print(f())\n",
+        "def f() -> int:\n"
+        "    _ = \"x\"\n"
+        "    for _ in range(2):\n"
+        "        pass\n"
+        "    return 0\n"
+        "print(f())\n",
+        "def f(text: str) -> int:\n"
+        "    total = 0\n"
+        "    for part in text.split(\",\"):\n"
+        "        value, _, count = part.partition(\"x\")\n"
+        "        for _ in range(int(count)):\n"
+        "            total += len(value)\n"
+        "    return total\n"
+        "print(f(\"ab x2\"))\n"}) {
+    lython::emitter::EmitResult unobserved = emitSource(source, context);
+    EXPECT_TRUE(unobserved.ok()) << source;
+  }
 }
 
 // The negative control: widening a carried lane is not a retype. `n` is bound

@@ -575,6 +575,39 @@ bool containsBindingTarget(const parser::Node *node, llvm::StringRef name) {
 
 } // namespace
 
+// ⭐ IS THIS NAME READ AFTER THE STATEMENT BEING EMITTED, anywhere the type it
+// carries could be observed? Only answerable at the outermost suite of a scope,
+// where "the rest of this suite" IS the rest of the scope; deeper in, the
+// enclosing suites are on the C++ stack and this walk cannot see them, so it
+// says YES and the caller keeps whatever it does when the answer is unknown.
+//
+// Distinct from `nameIsReadAfterCurrentStatement` below, which answers a
+// different question -- it refuses outright for any name the suite BINDS,
+// because a slot is the wrong shape for a loop target. Here the binding is the
+// point.
+bool ModuleEmitter::nameMayBeReadAfterCurrentStatement(
+    llvm::StringRef name) const {
+  // ⛔ NEVER FOR A NAME THE EMITTER ITSELF INTRODUCED. Every synthesized loop
+  // spells its scratch with a `__` stem (`__lyfuse3_v`, `__maxbi1`), and the
+  // reads that go with them are synthesized too -- they are emitted directly
+  // and never appear in the AST this walk reads, so the walk would conclude
+  // that nothing reads them and stop carrying the very value the fold returns.
+  // Seven goldens said so: the max/min index fold, the genexp fusions and the
+  // lambda callee all lost their result.
+  if (suiteStack.empty() || name.starts_with("__"))
+    return true;
+  for (unsigned level = static_cast<unsigned>(suiteStack.size());
+       level > suiteStackFloor; --level) {
+    const auto &[suite, index] = suiteStack[level - 1];
+    if (!suite)
+      return true;
+    for (std::size_t position = index; position < suite->size(); ++position)
+      if (containsNameLoad((*suite)[position].get(), name))
+        return true;
+  }
+  return false;
+}
+
 bool ModuleEmitter::nameIsReadAfterCurrentStatement(llvm::StringRef name) const {
   if (!currentSuite)
     return false;

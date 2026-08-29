@@ -30,10 +30,13 @@ void ModuleEmitter::emitStatements(
   llvm::SaveAndRestore<const std::vector<parser::NodePtr> *> savedSuite(
       currentSuite, statements);
   llvm::SaveAndRestore<std::size_t> savedSuiteIndex(currentSuiteIndex, 0);
+  suiteStack.push_back({statements, 0});
+  auto popSuite = llvm::make_scope_exit([&] { suiteStack.pop_back(); });
   for (const parser::NodePtr &statement : *statements) {
     if (insertionBlockTerminated(builder))
       break;
     ++currentSuiteIndex;
+    suiteStack.back().second = currentSuiteIndex;
     if (statement && (!skipDeclarations || !isTopLevelDecl(*statement)))
       emitStatement(*statement);
     else if (statement && skipDeclarations) {
