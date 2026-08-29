@@ -99,16 +99,6 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitConstant(*expr);
   if (expr->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*expr);
-    if (!atModuleScope && decoratedModuleFunctions.contains(name) &&
-        values.find(name) == values.end()) {
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, expr->range.start,
-          "'" + std::string(name) +
-              "' is rebound by a decorator, and a reference from inside a "
-              "function body would resolve to the undecorated function; call "
-              "it from module scope, or pass it in as a parameter"});
-      return emitNone(*expr);
-    }
     auto found = values.find(name);
     if (found != values.end()) {
       // A boxed (nonlocal-shared) local binds to its cell instance; the
@@ -123,7 +113,10 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       }
       return found->second;
     }
-    if (isModuleGlobalRead(name)) {
+    // ⛔ WHILE THE DECORATION ITSELF RUNS, the subject is the emitted SYMBOL:
+    // `f = d(f)` reads the undecorated function, and the cell it is about to
+    // fill is still empty.
+    if (isModuleGlobalRead(name) && name != decoratorSubjectName) {
       mlir::Type type = moduleGlobals.lookup(name);
       auto op = py::GlobalGetOp::create(builder, loc(*expr), type,
                                         builder.getStringAttr(name));

@@ -39,6 +39,7 @@
 #include "EmitterPyOps.h"
 
 #include "AstAccess.h"
+#include "AstSynth.h"
 #include "ClosureAnalysis.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -53,6 +54,45 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
   const auto *body = ast::nodeList(moduleNode, "body");
   if (!body)
     return;
+  // ⭐ A DECORATED NAME IS A MODULE CELL, because that is what CPython makes it.
+  // `@d def f` rebinds the module name to `d(f)` and every later reference --
+  // a recursion inside f's own body, another function calling f -- resolves
+  // THAT at call time. A body here binds the name to the emitted SYMBOL, which
+  // is the undecorated function, so a decorated `fib(6)` printed 9 where
+  // CPython prints 33. Declaring the cell before any body is typed is what
+  // makes those references read the wrapper.
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || (statement->kind != "FunctionDef" &&
+                       statement->kind != "AsyncFunctionDef"))
+      continue;
+    auto decorated = ast::string(*statement, "name");
+    const auto *decorators = ast::nodeList(*statement, "decorator_list");
+    if (!decorated || !decorators || decorators->empty())
+      continue;
+    if (moduleGlobals.count(*decorated))
+      continue;
+    parser::NodePtr applied = synth::name(*decorated, statement->range);
+    bool rebinding = false;
+    for (const parser::NodePtr &decorator : llvm::reverse(*decorators)) {
+      if (!decorator || decorator->kind != "Name" ||
+          !moduleFunctionNames.count(ast::nameSpelling(*decorator)))
+        continue;
+      std::vector<parser::NodePtr> arguments;
+      arguments.push_back(applied);
+      applied = synth::call(
+          synth::name(ast::nameSpelling(*decorator), statement->range),
+          std::move(arguments), statement->range);
+      rebinding = true;
+    }
+    if (!rebinding)
+      continue;
+    mlir::Type decoratedType = types.widenLiteral(types.inferExpr(applied.get()));
+    if (!mlir::isa_and_nonnull<py::CallableType>(decoratedType))
+      continue;
+    decoratorApplications.push_back(applied);
+    moduleGlobals[*decorated] = decoratedType;
+    types.bindSymbol(*decorated, decoratedType);
+  }
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "AnnAssign")
       continue;

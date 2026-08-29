@@ -2870,6 +2870,11 @@ void ModuleEmitter::applyFunctionDecorators(const parser::Node &statement) {
   auto name = ast::string(statement, "name");
   if (!name)
     return;
+  // ⛔ ONLY THE INNERMOST APPLICATION READS THE SYMBOL. `@a @b def f` is
+  // `f = a(b(f))`, emitted as two assignments; the second must read what the
+  // first stored, and forcing it to the symbol too wrapped the UNDECORATED
+  // function -- `@times_ten @plus_one def triple` answered 60 for 70.
+  bool innermost = true;
   for (const parser::NodePtr &decorator : llvm::reverse(*decorators)) {
     if (!decorator || decorator->kind != "Name")
       continue;
@@ -2883,7 +2888,13 @@ void ModuleEmitter::applyFunctionDecorators(const parser::Node &statement) {
         synth::call(synth::name(spelling, statement.range),
                     std::move(arguments), statement.range),
         statement.range);
-    emitStatement(*applied);
+    {
+      llvm::SaveAndRestore<std::string> subject(
+          decoratorSubjectName, innermost ? std::string(*name)
+                                          : decoratorSubjectName);
+      emitStatement(*applied);
+    }
+    innermost = false;
   }
 }
 

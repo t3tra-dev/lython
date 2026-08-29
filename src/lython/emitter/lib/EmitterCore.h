@@ -979,9 +979,12 @@ private:
   // up front so forward references and mutual recursion resolve, so a
   // top-level name means the same thing at every point of the module.
   llvm::StringSet<> moduleFunctionNames;
-  // Module functions whose name is rebound by a decorator. Reading one from
-  // inside a body is refused: see the note at the collection site.
-  llvm::StringSet<> decoratedModuleFunctions;
+  // The `d(f)` applications a decorated module def stands for, kept alive
+  // because the module globals point at them.
+  std::vector<parser::NodePtr> decoratorApplications;
+  // While the decoration itself is being emitted, the subject name resolves to
+  // the emitted SYMBOL rather than to the cell it is about to fill.
+  std::string decoratorSubjectName;
   static bool isRecognizedNonBindingDecorator(llvm::StringRef leaf);
   llvm::StringSet<> moduleClassNames;
   // Main-module top-level `def`s whose spelling is also a manifest builtin's

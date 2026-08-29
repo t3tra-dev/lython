@@ -11,12 +11,13 @@
 # whose intermediate value is a function, and a partial answer there would be
 # a wrong wrapper rather than a diagnostic.
 #
-# ⛔ AND SO IS A REFERENCE TO THE DECORATED NAME FROM INSIDE A BODY -- a
-# recursion through it, or another function calling it. CPython resolves the
-# name from the module at CALL time, so both go through the wrapper; the name
-# here is a compiled SYMBOL inside a body, which is the undecorated function.
-# A decorated `fib(6)` printed 9 where CPython prints 33, so the reference is
-# refused rather than answered.
+# ⛔ THE DECORATED NAME IS A MODULE CELL, because that is what CPython makes
+# it: every later reference -- a recursion inside the function's own body,
+# another function calling it -- resolves the rebinding at CALL time and goes
+# through the wrapper. A body binds the name to the emitted SYMBOL, which is
+# the undecorated function, so a decorated `fib(6)` printed 9 for 33. Only the
+# INNERMOST application reads the symbol; `@a @b def f` is two assignments and
+# the second must read what the first stored.
 def times_ten(fn):
     def wrapper(n: int) -> int:
         return fn(n) * 10
@@ -53,6 +54,23 @@ def quad(n: int) -> int:
 
 
 print(quad(3))
+
+
+@plus_one
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+print(fib(6))
+
+
+def call_through(n: int) -> int:
+    return double(n)
+
+
+print(call_through(3))
 
 
 def outer() -> int:

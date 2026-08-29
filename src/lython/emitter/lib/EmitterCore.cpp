@@ -185,21 +185,6 @@ void ModuleEmitter::collectTopLevelBindings() {
       continue;
     }
     moduleFunctionNames.insert(*name);
-    // ⛔ A DECORATED NAME MEANS SOMETHING DIFFERENT INSIDE A BODY. `@d def f`
-    // rebinds the module name to `d(f)`, and CPython resolves `f` from the
-    // module at CALL time -- so a recursion through the name goes through the
-    // wrapper on every trip, and another function calling `f` calls the
-    // wrapper too. A body here binds the name to the emitted SYMBOL, which is
-    // the UNDECORATED function, and both shapes then answered plausible wrong
-    // numbers (a decorated `fib(6)` printed 9 where CPython prints 33). The
-    // reference is refused until the name is a module cell rather than a
-    // symbol; the decoration itself is correct at module scope, which is where
-    // the rebinding happens.
-    if (const auto *decorators = ast::nodeList(*statement, "decorator_list"))
-      for (const parser::NodePtr &decorator : *decorators)
-        if (decorator && decorator->kind == "Name" &&
-            !isRecognizedNonBindingDecorator(ast::nameSpelling(*decorator)))
-          decoratedModuleFunctions.insert(*name);
     // The manifest is the authority on which spellings it owns as builtin
     // bindings: asking it, rather than carrying a hand-written list, keeps the
     // set from drifting when a builtin is added to or removed from
