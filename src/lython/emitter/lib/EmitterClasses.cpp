@@ -3923,8 +3923,19 @@ mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
   if (memoized != memo.end())
     return memoized->second;
 
+  // ⛔ AN OPTIONAL CONTENT TAKES THE SLOT SPELLING TOO. The cell-specific
+  // lowering reads its content out of the box with a rank-1 shape check, which
+  // an optional's tag fails -- "nonlocal over `T | None` is not supported yet".
+  // The ORDINARY field path has read an optional since the box-fronted field
+  // work, so a cell holding one is an ordinary class; nothing that used the
+  // cell path before reaches this, because that path refused it.
+  auto optionalContent = [&](mlir::Type type) {
+    auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
+    return unionType && unionType.isOptional();
+  };
+  bool ordinaryStorage = tracksBinding || optionalContent(contentType);
   std::string cellName =
-      (llvm::Twine(tracksBinding ? kSlotClassPrefix : kCellClassPrefix) +
+      (llvm::Twine(ordinaryStorage ? kSlotClassPrefix : kCellClassPrefix) +
        llvm::Twine(++cellClassCounter))
           .str();
   mlir::Type contract = types.contract(cellName);
@@ -3937,7 +3948,7 @@ mlir::Type ModuleEmitter::ensureCellClass(mlir::Type contentType,
   // storage contract against the result and reported "attribute evidence
   // 'builtins.object' is not assignable to result 'builtins.int'".
   llvm::SmallVector<mlir::Type, 8> fieldStorage{
-      tracksBinding ? contentType : types.contract("builtins.object")};
+      ordinaryStorage ? contentType : types.contract("builtins.object")};
   if (tracksBinding) {
     fieldNames.push_back(kBindingFieldName.str());
     fieldTypes.push_back(types.contract("builtins.bool"));

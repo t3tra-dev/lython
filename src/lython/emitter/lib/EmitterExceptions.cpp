@@ -598,7 +598,20 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
       // narrowing) and a primitive tensor have none, so the rebind cannot
       // reach the handler or the continuation at all -- both would read the
       // pre-try value. Reject instead of answering with it.
-      if (!mlir::isa_and_nonnull<py::ContractType>(content)) {
+      // ⭐ AN OPTIONAL IS A CONTRACT-SHAPED SLOT NOW. `T | None` is stored as
+      // ONE box whose empty entity word IS the None -- which is what made a
+      // linked structure expressible -- so a cell can hold it, and the
+      // accumulator every retry loop is written with (`result = None` outside,
+      // `result = attempt()` inside the try) no longer has to be rewritten to
+      // compile. A WIDER union still keeps its lanes inline and has no slot.
+      auto optionalContent = [&](mlir::Type type) {
+        auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type);
+        return unionType && unionType.isOptional() &&
+               mlir::isa_and_nonnull<py::ContractType>(
+                   unionType.getOptionalPayloadType());
+      };
+      if (!mlir::isa_and_nonnull<py::ContractType>(content) &&
+          !optionalContent(content)) {
         std::string typeText;
         {
           llvm::raw_string_ostream stream(typeText);

@@ -79,7 +79,6 @@ errors/print_unrenderable_argument emit
 errors/property_no_setter emit
 errors/set_of_int emit
 errors/try_handler_rebind_no_lane emit
-errors/try_union_local_rebind emit
 errors/unknown_decorator emit
 errors/unresolved_name emit
 errors/unsupported_import emit
