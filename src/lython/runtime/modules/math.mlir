@@ -25,7 +25,17 @@ module attributes {
     "math.copysign",
     "math.degrees",
     "math.radians",
-    "math.isclose"
+    "math.isclose",
+    "math.isnan",
+    "math.isinf",
+    "math.isfinite",
+    "math.pow",
+    "math.gcd",
+    "math.lcm",
+    "math.isqrt",
+    "math.factorial",
+    "math.comb",
+    "math.perm"
   ],
   ly.typing.function_names = [
     "math.floor",
@@ -45,7 +55,17 @@ module attributes {
     "math.copysign",
     "math.degrees",
     "math.radians",
-    "math.isclose"
+    "math.isclose",
+    "math.isnan",
+    "math.isinf",
+    "math.isfinite",
+    "math.pow",
+    "math.gcd",
+    "math.lcm",
+    "math.isqrt",
+    "math.factorial",
+    "math.comb",
+    "math.perm"
   ],
   ly.typing.float_constant_names = ["math.pi", "math.e", "math.tau", "math.inf", "math.nan"],
   ly.typing.float_constant_values = [3.141592653589793 : f64, 2.718281828459045 : f64, 6.283185307179586 : f64, 0x7FF0000000000000 : f64, 0x7FF8000000000000 : f64],
@@ -67,11 +87,23 @@ module attributes {
     !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["x", "y"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.float">]>,
-    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["a", "b"], arg_defaults = [false, false], kwonly = [!py.contract<"builtins.float">, !py.contract<"builtins.float">], kw_names = ["rel_tol", "abs_tol"], kw_defaults = [true, true], returns = [!py.contract<"builtins.bool">]>
+    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["a", "b"], arg_defaults = [false, false], kwonly = [!py.contract<"builtins.float">, !py.contract<"builtins.float">], kw_names = ["rel_tol", "abs_tol"], kw_defaults = [true, true], returns = [!py.contract<"builtins.bool">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.bool">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.bool">]>,
+    !py.callable<[!py.contract<"builtins.float">], arg_names = ["x"], arg_defaults = [false], returns = [!py.contract<"builtins.bool">]>,
+    !py.callable<[!py.contract<"builtins.float">, !py.contract<"builtins.float">], arg_names = ["x", "y"], arg_defaults = [false, false], returns = [!py.contract<"builtins.float">]>,
+    !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], arg_names = ["a", "b"], arg_defaults = [false, false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], arg_names = ["a", "b"], arg_defaults = [false, false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["n"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["n"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], arg_names = ["n", "k"], arg_defaults = [false, false], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], arg_names = ["n", "k"], arg_defaults = [false, false], returns = [!py.contract<"builtins.int">]>
   ]
 } {
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
+  func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "unbox.i64"}
+  func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
 
   // math domain errors. CPython's math_1 checks the operand (and errno) and
@@ -144,6 +176,306 @@ module attributes {
     %as_int = arith.fptosi %truncated : f64 to i64
     %int_header = func.call @LyLong_FromI64(%as_int) : (i64) -> memref<2xi64>
     func.return %int_header : memref<2xi64>
+  }
+
+  // ⭐ THE PREDICATES AND THE INTEGER SURFACE. Every math function here was a
+  // float kernel; `isnan`, `gcd`, `factorial` and their neighbours were simply
+  // absent -- "module 'math' has no attribute 'gcd' in this runtime" for a
+  // spelling every numeric program uses.
+  memref.global "private" constant @__ly_math_factorial_msg : memref<43xi8> = dense<[102, 97, 99, 116, 111, 114, 105, 97, 108, 40, 41, 32, 110, 111, 116, 32, 100, 101, 102, 105, 110, 101, 100, 32, 102, 111, 114, 32, 110, 101, 103, 97, 116, 105, 118, 101, 32, 118, 97, 108, 117, 101, 115]>
+  func.func private @__ly_math_raise_factorial_domain() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 43 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_factorial_msg : memref<43xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<43xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  memref.global "private" constant @__ly_math_isqrt_msg : memref<36xi8> = dense<[105, 115, 113, 114, 116, 40, 41, 32, 97, 114, 103, 117, 109, 101, 110, 116, 32, 109, 117, 115, 116, 32, 98, 101, 32, 110, 111, 110, 110, 101, 103, 97, 116, 105, 118, 101]>
+  func.func private @__ly_math_raise_isqrt_domain() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 36 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_isqrt_msg : memref<36xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<36xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  memref.global "private" constant @__ly_math_n_msg : memref<32xi8> = dense<[110, 32, 109, 117, 115, 116, 32, 98, 101, 32, 97, 32, 110, 111, 110, 45, 110, 101, 103, 97, 116, 105, 118, 101, 32, 105, 110, 116, 101, 103, 101, 114]>
+  func.func private @__ly_math_raise_n_domain() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 32 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_n_msg : memref<32xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<32xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  memref.global "private" constant @__ly_math_k_msg : memref<32xi8> = dense<[107, 32, 109, 117, 115, 116, 32, 98, 101, 32, 97, 32, 110, 111, 110, 45, 110, 101, 103, 97, 116, 105, 118, 101, 32, 105, 110, 116, 101, 103, 101, 114]>
+  // ⛔ ONE GUARD AND ONE RAISE SITE. Two sequential guarded raises inside one
+  // manifest function let the exception escape the caller's handler -- a
+  // `try` around `math.comb(-1, 2)` caught it at module scope and did not
+  // catch it inside a `for` loop. Every other raising kernel here has exactly
+  // one, so the message is chosen inside the helper instead of by the CFG.
+  func.func private @__ly_math_raise_nk_domain(%blame_k: i1) {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 32 : i64
+    %class_id = arith.constant 53 : i64
+    %n_ref = memref.get_global @__ly_math_n_msg : memref<32xi8>
+    %k_ref = memref.get_global @__ly_math_k_msg : memref<32xi8>
+    %n_dyn = memref.cast %n_ref : memref<32xi8> to memref<?xi8>
+    %k_dyn = memref.cast %k_ref : memref<32xi8> to memref<?xi8>
+    %msg_dyn = arith.select %blame_k, %k_dyn, %n_dyn : memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  func.func private @__ly_math_raise_k_domain() {
+    %c0 = arith.constant 0 : index
+    %len = arith.constant 32 : i64
+    %class_id = arith.constant 53 : i64
+    %msg_ref = memref.get_global @__ly_math_k_msg : memref<32xi8>
+    %msg_dyn = memref.cast %msg_ref : memref<32xi8> to memref<?xi8>
+    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
+    func.return
+  }
+
+  func.func @LyMath_IsNan(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.builtin = "math.isnan", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_isnan", ly.runtime.result_contract = "builtins.bool"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    // NaN is the only value that is not equal to itself.
+    %equal = arith.cmpf oeq, %value, %value : f64
+    %true = arith.constant true
+    %is_nan = arith.xori %equal, %true : i1
+    func.return %is_nan : i1
+  }
+
+  func.func @LyMath_IsInf(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.builtin = "math.isinf", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_isinf", ly.runtime.result_contract = "builtins.bool"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %magnitude = math.absf %value : f64
+    %infinity = arith.constant 0x7FF0000000000000 : f64
+    %is_inf = arith.cmpf oeq, %magnitude, %infinity : f64
+    func.return %is_inf : i1
+  }
+
+  func.func @LyMath_IsFinite(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.builtin = "math.isfinite", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_isfinite", ly.runtime.result_contract = "builtins.bool"} {
+    %value = func.call @LyFloat_AsF64(%header) : (memref<3xi64>) -> f64
+    %magnitude = math.absf %value : f64
+    %infinity = arith.constant 0x7FF0000000000000 : f64
+    %below = arith.cmpf olt, %magnitude, %infinity : f64
+    func.return %below : i1
+  }
+
+  // `math.pow` always answers a float, where the `**` operator keeps int
+  // exactness -- that is CPython's split too.
+  func.func @LyMath_Pow(%x_header: memref<3xi64> {ly.ownership.object_header}, %y_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.pow", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_pow", ly.runtime.result_contract = "builtins.float"} {
+    %x = func.call @LyFloat_AsF64(%x_header) : (memref<3xi64>) -> f64
+    %y = func.call @LyFloat_AsF64(%y_header) : (memref<3xi64>) -> f64
+    %result = math.powf %x, %y : f64
+    %header = func.call @LyFloat_FromF64(%result) : (f64) -> memref<3xi64>
+    func.return %header : memref<3xi64>
+  }
+
+  // ⛔ THE INTEGER ONES TAKE THE i64 WINDOW. `gcd`, `lcm`, `isqrt`, `factorial`,
+  // `comb` and `perm` are declared over `builtins.int`, whose values are
+  // arbitrary precision -- these read the machine window and raise
+  // OverflowError past it, which is what `unbox.i64` does for every other
+  // machine-word kernel in this tree. Matching CPython's unbounded answers
+  // needs the LyLong kernels, which is a separate build.
+  func.func @LyMath_Gcd(%a_header: memref<2xi64> {ly.ownership.object_header}, %b_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.gcd", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "math_gcd", ly.runtime.result_contract = "builtins.int"} {
+    %a_raw = func.call @LyLong_AsI64(%a_header) : (memref<2xi64>) -> i64
+    %b_raw = func.call @LyLong_AsI64(%b_header) : (memref<2xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %a_neg = arith.subi %zero, %a_raw : i64
+    %b_neg = arith.subi %zero, %b_raw : i64
+    %a_lt = arith.cmpi slt, %a_raw, %zero : i64
+    %b_lt = arith.cmpi slt, %b_raw, %zero : i64
+    %a0 = arith.select %a_lt, %a_neg, %a_raw : i64
+    %b0 = arith.select %b_lt, %b_neg, %b_raw : i64
+    %result:2 = scf.while (%x = %a0, %y = %b0) : (i64, i64) -> (i64, i64) {
+      %continue = arith.cmpi ne, %y, %zero : i64
+      scf.condition(%continue) %x, %y : i64, i64
+    } do {
+    ^body(%x: i64, %y: i64):
+      %remainder = arith.remsi %x, %y : i64
+      scf.yield %y, %remainder : i64, i64
+    }
+    %header = func.call @LyLong_FromI64(%result#0) : (i64) -> memref<2xi64>
+    func.return %header : memref<2xi64>
+  }
+
+  func.func @LyMath_Lcm(%a_header: memref<2xi64> {ly.ownership.object_header}, %b_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.lcm", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "math_lcm", ly.runtime.result_contract = "builtins.int"} {
+    %a_raw = func.call @LyLong_AsI64(%a_header) : (memref<2xi64>) -> i64
+    %b_raw = func.call @LyLong_AsI64(%b_header) : (memref<2xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %a_zero = arith.cmpi eq, %a_raw, %zero : i64
+    %b_zero = arith.cmpi eq, %b_raw, %zero : i64
+    %either_zero = arith.ori %a_zero, %b_zero : i1
+    %divisor = func.call @LyMath_Gcd(%a_header, %b_header) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    %divisor_raw = func.call @LyLong_AsI64(%divisor) : (memref<2xi64>) -> i64
+    func.call @LyLong_DecRef(%divisor) : (memref<2xi64>) -> ()
+    %one = arith.constant 1 : i64
+    %safe_divisor = arith.select %either_zero, %one, %divisor_raw : i64
+    %product = arith.muli %a_raw, %b_raw : i64
+    %quotient = arith.divsi %product, %safe_divisor : i64
+    %magnitude_neg = arith.subi %zero, %quotient : i64
+    %negative = arith.cmpi slt, %quotient, %zero : i64
+    %magnitude = arith.select %negative, %magnitude_neg, %quotient : i64
+    %result = arith.select %either_zero, %zero, %magnitude : i64
+    %header = func.call @LyLong_FromI64(%result) : (i64) -> memref<2xi64>
+    func.return %header : memref<2xi64>
+  }
+
+  func.func @LyMath_Isqrt(%header_in: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.isqrt", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "math_isqrt", ly.runtime.result_contract = "builtins.int"} {
+    %value = func.call @LyLong_AsI64(%header_in) : (memref<2xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %negative = arith.cmpi slt, %value, %zero : i64
+    cf.cond_br %negative, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_raise_isqrt_domain() : () -> ()
+    cf.br ^ok
+
+  ^ok:
+    // CPython's own loop: x = n; y = (x + 1) // 2; while y < x: x = y;
+    // y = (x + n // x) // 2. `x` is floor(sqrt(n)) when it stops.
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %positive = arith.cmpi sgt, %value, %zero : i64
+    %seed_next_sum = arith.addi %value, %one : i64
+    %seed_next = arith.divsi %seed_next_sum, %two : i64
+    %converged:2 = scf.while (%x = %value, %y = %seed_next) : (i64, i64) -> (i64, i64) {
+      %smaller = arith.cmpi slt, %y, %x : i64
+      scf.condition(%smaller) %x, %y : i64, i64
+    } do {
+    ^body(%x: i64, %y: i64):
+      %quotient = arith.divsi %value, %y : i64
+      %sum = arith.addi %y, %quotient : i64
+      %next = arith.divsi %sum, %two : i64
+      scf.yield %y, %next : i64, i64
+    }
+    %answer = arith.select %positive, %converged#0, %zero : i64
+    %result_header = func.call @LyLong_FromI64(%answer) : (i64) -> memref<2xi64>
+    func.return %result_header : memref<2xi64>
+  }
+
+  func.func @LyMath_Factorial(%header_in: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.factorial", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "math_factorial", ly.runtime.result_contract = "builtins.int"} {
+    %value = func.call @LyLong_AsI64(%header_in) : (memref<2xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %negative = arith.cmpi slt, %value, %zero : i64
+    cf.cond_br %negative, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_raise_factorial_domain() : () -> ()
+    cf.br ^ok
+
+  ^ok:
+    %one = arith.constant 1 : i64
+    %count = arith.index_cast %value : i64 to index
+    %lower = arith.constant 0 : index
+    %step = arith.constant 1 : index
+    %product = scf.for %index = %lower to %count step %step iter_args(%acc = %one) -> (i64) {
+      %term_index = arith.addi %index, %step : index
+      %term = arith.index_cast %term_index : index to i64
+      %next = arith.muli %acc, %term : i64
+      scf.yield %next : i64
+    }
+    %result_header = func.call @LyLong_FromI64(%product) : (i64) -> memref<2xi64>
+    func.return %result_header : memref<2xi64>
+  }
+
+  func.func private @__ly_math_perm_product(%n: i64, %k: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %count = arith.index_cast %k : i64 to index
+    %lower = arith.constant 0 : index
+    %step = arith.constant 1 : index
+    %product = scf.for %index = %lower to %count step %step iter_args(%acc = %one) -> (i64) {
+      %offset = arith.index_cast %index : index to i64
+      %term = arith.subi %n, %offset : i64
+      %next = arith.muli %acc, %term : i64
+      scf.yield %next : i64
+    }
+    func.return %product : i64
+  }
+
+  func.func @LyMath_Perm(%n_header: memref<2xi64> {ly.ownership.object_header}, %k_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.perm", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "math_perm", ly.runtime.result_contract = "builtins.int"} {
+    %n = func.call @LyLong_AsI64(%n_header) : (memref<2xi64>) -> i64
+    %k = func.call @LyLong_AsI64(%k_header) : (memref<2xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %n_negative = arith.cmpi slt, %n, %zero : i64
+    %k_negative = arith.cmpi slt, %k, %zero : i64
+    %true = arith.constant true
+    %n_negative_not = arith.xori %n_negative, %true : i1
+    %negative = arith.ori %n_negative, %k_negative : i1
+    cf.cond_br %negative, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_raise_nk_domain(%n_negative_not) : (i1) -> ()
+    cf.br ^ok
+
+  ^ok:
+    %too_many = arith.cmpi sgt, %k, %n : i64
+    %product = func.call @__ly_math_perm_product(%n, %k) : (i64, i64) -> i64
+    %answer = arith.select %too_many, %zero, %product : i64
+    %result_header = func.call @LyLong_FromI64(%answer) : (i64) -> memref<2xi64>
+    func.return %result_header : memref<2xi64>
+  }
+
+  func.func @LyMath_Comb(%n_header: memref<2xi64> {ly.ownership.object_header}, %k_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.comb", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.int", ly.runtime.primitive = "math_comb", ly.runtime.result_contract = "builtins.int"} {
+    %n = func.call @LyLong_AsI64(%n_header) : (memref<2xi64>) -> i64
+    %k = func.call @LyLong_AsI64(%k_header) : (memref<2xi64>) -> i64
+    %zero = arith.constant 0 : i64
+    %n_negative = arith.cmpi slt, %n, %zero : i64
+    %k_negative = arith.cmpi slt, %k, %zero : i64
+    %true = arith.constant true
+    %n_negative_not = arith.xori %n_negative, %true : i1
+    %negative = arith.ori %n_negative, %k_negative : i1
+    cf.cond_br %negative, ^domain, ^ok
+
+  ^domain:
+    func.call @__ly_math_raise_nk_domain(%n_negative_not) : (i1) -> ()
+    cf.br ^ok
+
+  ^ok:
+    %too_many = arith.cmpi sgt, %k, %n : i64
+    // The smaller of k and n-k keeps the running product inside the window for
+    // the largest range this can answer at all.
+    %complement = arith.subi %n, %k : i64
+    %use_complement = arith.cmpi slt, %complement, %k : i64
+    %effective = arith.select %use_complement, %complement, %k : i64
+    %numerator = func.call @__ly_math_perm_product(%n, %effective) : (i64, i64) -> i64
+    %one = arith.constant 1 : i64
+    %count = arith.index_cast %effective : i64 to index
+    %lower = arith.constant 0 : index
+    %step = arith.constant 1 : index
+    %denominator = scf.for %index = %lower to %count step %step iter_args(%acc = %one) -> (i64) {
+      %offset = arith.index_cast %index : index to i64
+      %term = arith.addi %offset, %one : i64
+      %next = arith.muli %acc, %term : i64
+      scf.yield %next : i64
+    }
+    %quotient = arith.divsi %numerator, %denominator : i64
+    %answer = arith.select %too_many, %zero, %quotient : i64
+    %result_header = func.call @LyLong_FromI64(%answer) : (i64) -> memref<2xi64>
+    func.return %result_header : memref<2xi64>
   }
 
   func.func @LyMath_Sqrt(%header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "math.sqrt", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.float", ly.runtime.primitive = "math_sqrt", ly.runtime.result_contract = "builtins.float"} {

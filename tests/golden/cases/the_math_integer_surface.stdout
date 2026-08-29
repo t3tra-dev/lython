@@ -1,0 +1,16 @@
+6 5 2 7 0
+12 0 12 3
+0 1 3 4 4
+100 9999
+1 1 120 479001600
+10 1 1 0 184756
+20 1 120 0
+True False True False
+True False False
+1024.0 3.0 0.5
+factorial ValueError: factorial() not defined for negative values
+isqrt ValueError: isqrt() argument must be nonnegative
+comb-n ValueError: n must be a non-negative integer
+comb-k ValueError: k must be a non-negative integer
+perm-n ValueError: n must be a non-negative integer
+perm-k ValueError: k must be a non-negative integer
