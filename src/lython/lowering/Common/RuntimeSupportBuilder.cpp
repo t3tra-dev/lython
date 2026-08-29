@@ -1188,6 +1188,55 @@ void buildWriteChar(SupportBuilder &b) {
 // void write_buffered(i32 fd, ptr data, i32 len): snprintf-style results —
 // negative means an encoding error (skipped), otherwise clamp to the 1023-byte
 // buffer capacity and write.
+// void write_hex_i64(i32 fd, i64 value): sixteen hex digits, most significant
+// first. For the refusals below, which have nothing else to say what they saw.
+void buildWriteHexI64(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "write_hex_i64", b.builder.getFunctionType({b.i32(), b.i64()}, {}));
+  mlir::Block *entry = fn.addEntryBlock();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *loop = b.builder.createBlock(&body, {}, {b.i64()}, {b.loc});
+  mlir::Block *emit = b.builder.createBlock(&body, {}, {b.i64(), b.i8()},
+                                            {b.loc, b.loc});
+  mlir::Block *done = b.builder.createBlock(&body);
+  mlir::Value fd = entry->getArgument(0);
+  mlir::Value value = entry->getArgument(1);
+
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::cf::BranchOp::create(b.builder, b.loc, loop,
+                             mlir::ValueRange{b.iconst(60)});
+
+  b.builder.setInsertionPointToEnd(loop);
+  mlir::Value shift = loop->getArgument(0);
+  mlir::Value nibble = mlir::arith::AndIOp::create(
+      b.builder, b.loc,
+      mlir::arith::ShRUIOp::create(b.builder, b.loc, value, shift),
+      b.iconst(15));
+  mlir::Value narrow =
+      mlir::LLVM::TruncOp::create(b.builder, b.loc, b.i8(), nibble);
+  mlir::Value isDigit = b.cmpi(mlir::arith::CmpIPredicate::ult, nibble,
+                               b.iconst(10));
+  mlir::Value digit = mlir::arith::SelectOp::create(
+      b.builder, b.loc, isDigit,
+      mlir::arith::AddIOp::create(b.builder, b.loc, narrow, b.iconst8(48)),
+      mlir::arith::AddIOp::create(b.builder, b.loc, narrow, b.iconst8(87)));
+  mlir::cf::BranchOp::create(b.builder, b.loc, emit,
+                             mlir::ValueRange{shift, digit});
+
+  b.builder.setInsertionPointToEnd(emit);
+  b.call("write_char", mlir::TypeRange{},
+         mlir::ValueRange{fd, emit->getArgument(1)});
+  mlir::Value next = mlir::arith::SubIOp::create(
+      b.builder, b.loc, emit->getArgument(0), b.iconst(4));
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc,
+      b.cmpi(mlir::arith::CmpIPredicate::slt, next, b.iconst(0)), done,
+      mlir::ValueRange{}, loop, mlir::ValueRange{next});
+
+  b.builder.setInsertionPointToEnd(done);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+}
+
 void buildWriteBuffered(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "write_buffered",
@@ -1801,6 +1850,16 @@ void buildCurrentExceptionClassIdUnchecked(SupportBuilder &b) {
   mlir::Value classId = b.loadI64(b.gepI64(aligned, index));
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{classId});
   b.builder.setInsertionPointToEnd(trap);
+  // Named for the same reason the exception-table refusals are: this trap is
+  // reachable FROM THE PERSONALITY -- it asks the raised class id on every
+  // frame it walks -- so a stack that ends in abort under
+  // `_Unwind_RaiseException` can be this rather than a table it could not
+  // read, and the two want different repairs.
+  b.stringGlobal(".eh_no_current_exception",
+                 "lython: the personality asked for the raised exception's "
+                 "class and the carrier is empty\n");
+  b.call("write_cstr", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), b.addrOf(".eh_no_current_exception")});
   b.emitTrap(b.i64());
 }
 
@@ -2961,6 +3020,15 @@ mlir::FunctionType personalityFunctionType(SupportBuilder &b) {
 // -- the call-site table is read linearly, so what was found for a return
 // address is worth keeping, and the answer depends on nothing else.
 void buildEHLookupSite(SupportBuilder &b) {
+  b.stringGlobal(".eh_refuse_lpstart",
+                 "lython: exception table has an LPStart encoding this "
+                 "personality does not read: 0x");
+  b.stringGlobal(".eh_refuse_ttype",
+                 "lython: exception table has a type-table encoding this "
+                 "personality does not read: 0x");
+  b.stringGlobal(".eh_refuse_callsite",
+                 "lython: exception table has a call-site encoding this "
+                 "personality does not read: 0x");
   auto fn = b.beginFunction(
       "ly_eh_lookup_site",
       b.builder.getFunctionType({b.i64(), b.ptr(), b.i64(), b.ptr(), b.ptr()},
@@ -2986,12 +3054,25 @@ void buildEHLookupSite(SupportBuilder &b) {
       &body, {}, {b.i64(), b.i64(), b.ptr(), b.ptr()},
       {b.loc, b.loc, b.loc, b.loc});
   mlir::Block *nothing = b.builder.createBlock(&body);
-  mlir::Block *refuse = b.builder.createBlock(&body);
+  // ⭐ THE REFUSAL SAYS WHAT IT SAW. This block used to abort in silence, and
+  // silence here costs a CI round trip per hypothesis: an ELF host emitting a
+  // type-table encoding this reader does not read killed 162 tests with
+  // nothing in stderr but a stack trace through the unwinder, and the encoding
+  // had to be guessed at from the outside. The two arguments are a message and
+  // the byte that was rejected.
+  mlir::Block *refuse =
+      b.builder.createBlock(&body, {}, {b.ptr(), b.i64()}, {b.loc, b.loc});
 
   b.builder.setInsertionPointToEnd(nothing);
   mlir::func::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst1(false)});
   b.builder.setInsertionPointToEnd(refuse);
+  b.call("write_cstr", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), refuse->getArgument(0)});
+  b.call("write_hex_i64", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), refuse->getArgument(1)});
+  b.call("write_char", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), b.iconst8(10)});
   b.emitTrap(b.i1());
 
   b.builder.setInsertionPointToEnd(entry);
@@ -3030,7 +3111,9 @@ void buildEHLookupSite(SupportBuilder &b) {
       b.builder, b.loc,
       b.cmpi(mlir::arith::CmpIPredicate::eq, b.loadI8(lsda), b.iconst8(-1)),
       readTypeTableBase, mlir::ValueRange{b.gepI8(lsda, b.iconst(1))}, refuse,
-      mlir::ValueRange{});
+      mlir::ValueRange{b.addrOf(".eh_refuse_lpstart"),
+                       mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
+                                                  b.loadI8(lsda))});
 
   b.builder.setInsertionPointToEnd(readTypeTableBase);
   mlir::Value typeEncodingAt = readTypeTableBase->getArgument(0);
@@ -3043,9 +3126,12 @@ void buildEHLookupSite(SupportBuilder &b) {
   mlir::Value knownTypes = b.orBit(
       noTypes,
       b.cmpi(mlir::arith::CmpIPredicate::eq, typeEncoding, b.iconst8(-101)));
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, knownTypes, typeTableKnown,
-                                 mlir::ValueRange{afterTypeEncoding}, refuse,
-                                 mlir::ValueRange{});
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, knownTypes, typeTableKnown,
+      mlir::ValueRange{afterTypeEncoding}, refuse,
+      mlir::ValueRange{b.addrOf(".eh_refuse_ttype"),
+                       mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
+                                                  typeEncoding)});
   b.builder.setInsertionPointToEnd(typeTableKnown);
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc, noTypes, readHeader,
@@ -3079,9 +3165,12 @@ void buildEHLookupSite(SupportBuilder &b) {
   mlir::Value tableEnd = b.gepI8(tableLength[1], tableLength[0]);
   mlir::Value offset =
       mlir::arith::SubIOp::create(b.builder, b.loc, site, regionStart);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, knownEncoding, scan,
-                                 mlir::ValueRange{tableLength[1]}, refuse,
-                                 mlir::ValueRange{});
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, knownEncoding, scan,
+      mlir::ValueRange{tableLength[1]}, refuse,
+      mlir::ValueRange{b.addrOf(".eh_refuse_callsite"),
+                       mlir::LLVM::ZExtOp::create(b.builder, b.loc, b.i64(),
+                                                  siteEncoding)});
 
   b.builder.setInsertionPointToEnd(scan);
   mlir::cf::CondBranchOp::create(
@@ -3161,6 +3250,9 @@ void buildEHLookupSite(SupportBuilder &b) {
 // appends for a pad that also cleans up. Reading it as a catch-all would stop
 // every exception at the first frame with a `finally`.
 void buildEHActionWalk(SupportBuilder &b) {
+  b.stringGlobal(".eh_refuse_action",
+                 "lython: exception table action record names a type this "
+                 "personality cannot resolve: 0x");
   auto fn = b.beginFunction(
       "ly_eh_action_walk",
       b.builder.getFunctionType({b.ptr(), b.i64(), b.ptr(), b.i64(), b.i1()},
@@ -3178,7 +3270,8 @@ void buildEHActionWalk(SupportBuilder &b) {
   mlir::Block *nextAction = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
   mlir::Block *yes = b.builder.createBlock(&body);
   mlir::Block *no = b.builder.createBlock(&body);
-  mlir::Block *refuse = b.builder.createBlock(&body);
+  mlir::Block *refuse =
+      b.builder.createBlock(&body, {}, {b.i64()}, {b.loc});
   b.builder.setInsertionPointToEnd(yes);
   mlir::func::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst1(true)});
@@ -3186,6 +3279,12 @@ void buildEHActionWalk(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst1(false)});
   b.builder.setInsertionPointToEnd(refuse);
+  b.call("write_cstr", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), b.addrOf(".eh_refuse_action")});
+  b.call("write_hex_i64", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), refuse->getArgument(0)});
+  b.call("write_char", mlir::TypeRange{},
+         mlir::ValueRange{b.iconst32(2), b.iconst8(10)});
   b.emitTrap(b.i1());
 
   b.builder.setInsertionPointToEnd(entry);
@@ -3227,9 +3326,9 @@ void buildEHActionWalk(SupportBuilder &b) {
       b.ptrNe(typeTableBase, b.nullPtr()));
   mlir::Block *catchEntry = b.builder.createBlock(&body);
   b.builder.setInsertionPointToEnd(notCleanupEntry);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, usable, catchEntry,
-                                 mlir::ValueRange{}, refuse,
-                                 mlir::ValueRange{});
+  mlir::cf::CondBranchOp::create(
+      b.builder, b.loc, usable, catchEntry, mlir::ValueRange{}, refuse,
+      mlir::ValueRange{notCleanupEntry->getArgument(0)});
   b.builder.setInsertionPointToEnd(catchEntry);
   mlir::cf::CondBranchOp::create(
       b.builder, b.loc, wantCleanup, nextAction,
@@ -3723,6 +3822,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildWriteLen(support);
   buildWriteCStr(support);
   buildWriteChar(support);
+  buildWriteHexI64(support);
   buildWriteBuffered(support);
   buildBoxedIntValue(support);
   buildPrintBytes(support);
