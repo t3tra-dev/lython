@@ -3809,10 +3809,18 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
     //
     // Strict `>` keeps CPython's tie rule: the FIRST maximal element wins.
     //
-    // ⛔ With a KEY only. Without one the carried value would be the element
-    // itself again, and comparing two instances needs the class's own ordering
-    // -- a different question, and one CPython answers with TypeError when the
-    // class has none.
+    // ⭐ WITHOUT A KEY THE COMPARISON IS SPELLED IN PLACE and no second name
+    // is carried: `__src[__i] > __src[__bi]`. Carrying the best ELEMENT is
+    // what the note above rules out, and a key-less fold does not need to --
+    // only the index crosses the loop edge either way, and the two elements
+    // are read as temporaries inside one trip.
+    //
+    // `max(versions)` over a list of instances that order themselves was
+    // refused for a seed it does not need, and the message offered "or an
+    // indexable argument to take the first element from" -- which is what a
+    // list is. `sorted(versions)` beside it has always worked. A class with
+    // no ordering now gets the diagnostic that says so, from the comparison
+    // itself, instead of one about seeding.
     // ⛔ And an INDEXABLE argument only: a generator has no first element to
     // read without consuming it.
     // ⛔ An EMPTY literal is left to the branch below, which raises the
@@ -3826,7 +3834,7 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
           const auto *elts = ast::nodeList(*reducerArgs->front(), "elts");
           return !elts || elts->empty();
         }();
-    if (!placeholder && !reducerDefaultValue && reducerKeyNode && elementType &&
+    if (!placeholder && !reducerDefaultValue && elementType &&
         elementType != types.object() && !emptyLiteralArgument) {
       mlir::Type argType =
           types.widenLiteral(types.inferExpr(reducerArgs->front().get()));
@@ -3868,19 +3876,29 @@ ModuleEmitter::tryEmitReducerCall(const parser::Node &expr,
             {}, expr.range));
         emitStatement(*synth::assign(
             nameOf(bestIndex), synth::intConstant(0, expr.range), expr.range));
-        emitStatement(*synth::assign(
-            nameOf(bestKey), keyOf(elementAt(synth::intConstant(0, expr.range))),
-            expr.range));
-        std::vector<parser::NodePtr> better{
-            synth::assign(nameOf(bestIndex), nameOf(index), expr.range),
-            synth::assign(nameOf(bestKey), nameOf(currentKey), expr.range)};
-        std::vector<parser::NodePtr> body{
-            synth::assign(nameOf(currentKey), keyOf(elementAt(nameOf(index))),
-                          expr.range),
-            synth::ifStmt(synth::compare(nameOf(currentKey),
-                                         reducer == "max" ? "Gt" : "Lt",
-                                         nameOf(bestKey), expr.range),
-                          std::move(better), {}, expr.range)};
+        llvm::StringRef comparison = reducer == "max" ? "Gt" : "Lt";
+        std::vector<parser::NodePtr> body;
+        if (reducerKeyNode) {
+          emitStatement(*synth::assign(
+              nameOf(bestKey),
+              keyOf(elementAt(synth::intConstant(0, expr.range))), expr.range));
+          std::vector<parser::NodePtr> better{
+              synth::assign(nameOf(bestIndex), nameOf(index), expr.range),
+              synth::assign(nameOf(bestKey), nameOf(currentKey), expr.range)};
+          body.push_back(synth::assign(
+              nameOf(currentKey), keyOf(elementAt(nameOf(index))), expr.range));
+          body.push_back(synth::ifStmt(
+              synth::compare(nameOf(currentKey), comparison, nameOf(bestKey),
+                             expr.range),
+              std::move(better), {}, expr.range));
+        } else {
+          std::vector<parser::NodePtr> better{
+              synth::assign(nameOf(bestIndex), nameOf(index), expr.range)};
+          body.push_back(synth::ifStmt(
+              synth::compare(elementAt(nameOf(index)), comparison,
+                             elementAt(nameOf(bestIndex)), expr.range),
+              std::move(better), {}, expr.range));
+        }
         parser::NodePtr span = synth::call(
             nameOf("range"),
             std::vector<parser::NodePtr>{

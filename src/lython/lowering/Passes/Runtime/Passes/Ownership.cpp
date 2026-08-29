@@ -5926,6 +5926,34 @@ public:
               marker->hasAttr(own::kObjectHeaderAttr))
             return true;
         mlir::Value root = own::underlyingObjectValue(value);
+        // ⭐ A MERGE ARGUMENT HOLDS A REFERENCE, so a select that strands one
+        // strands a real token. Every incoming edge of a non-entry block
+        // either transfers an owned value or lends one through the merge
+        // borrow, which is the same thing from the argument's side. Read as
+        // "not frame-owned", the diamond was not built for a loop-carried
+        // local, its loser kept its reference, and the unlabelled unfold
+        // retain that pairs with the branch's read had no payer:
+        //
+        //     bi = 0
+        //     for i in range(1, 3):
+        //         if i > 0:
+        //             bi = i
+        //
+        // leaked one int per trip and the affine verifier refused it outright
+        // ("released owned resource from @LyLong_FromI64 is used after
+        // release"). The list-element spelling of the same loop works only
+        // because its element is a frame temporary, which the first arm above
+        // already recognises.
+        //
+        // ⛔ NOT an ENTRY argument, which is the case the `strandable` test
+        // was added for: a parameter is BORROWED, `def first(a: str, b: str):
+        // return a or b` is a select over two of them, and neither arm holds
+        // a reference to lose.
+        if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(root)) {
+          mlir::Block *owner = argument.getOwner();
+          auto function = mlir::dyn_cast<mlir::func::FuncOp>(owner->getParentOp());
+          return function && !owner->isEntryBlock();
+        }
         mlir::Operation *definition = root.getDefiningOp();
         if (!definition)
           return false;

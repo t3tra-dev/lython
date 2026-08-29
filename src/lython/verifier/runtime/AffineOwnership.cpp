@@ -2975,6 +2975,19 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             // in the leak gate -- the value it pins is right, and the leak it
             // exposes is separate and open.
             //
+            // ⭐ THAT LEAK IS CLOSED (2026-08-29) and the account below is
+            // kept because it is still the right reading of the IR -- only
+            // the conclusion changed. The extra retain is still emitted; what
+            // it was missing was a payer, and the payer is the select-to-
+            // diamond expansion, which was skipping a select over two
+            // loop-carried BLOCK ARGUMENTS because `frameProduces` answers
+            // about defining ops and an argument has none. Re-measured on the
+            // two-element str list: retains 4 vs 3 as below, releases now 9
+            // vs 8, and the leak gate reads net 0 on this shape and on the
+            // range/while spellings of it. The same gap refused
+            // `bi = 0; for i in range(1, 3): if i > 0: bi = i` outright,
+            // which is what led back here.
+            //
             // Localised, for whoever takes it: `refcount-insertion` emits one
             // retain MORE for the conditional shape than for the
             // unconditional one (4 vs 3 on a two-element str list) while both

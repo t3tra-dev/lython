@@ -697,7 +697,13 @@ set(LYTHON_LEAK_GATE_CASES
     class_field_store_inline_independent loop_alias_carry stdlib_json_build
     io_seek scalar_ops cross_float_range_contracts_fields
     loop_iterator_element_into_container_literal dict_iteration_views
-    comprehension)
+    comprehension
+    # A local rebound on ONE arm inside a loop: the rebind lowers to a select
+    # over two loop-carried block arguments, and whichever arm loses keeps its
+    # reference unless the select is put back into a branch. The program did
+    # not compile before the repair, so nothing here could have measured it;
+    # what the gate watches now is the release that repair supplies.
+    a_local_rebound_on_one_arm_of_a_loop)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #
