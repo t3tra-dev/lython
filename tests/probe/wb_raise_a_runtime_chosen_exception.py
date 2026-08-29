@@ -37,12 +37,29 @@
 #    an after-use release behind a raise-like call removes THAT one and another
 #    takes its place from a different insertion path.
 #
-# ⭐ THE REPAIR IS IN THE EMITTER. Narrow the union with the `isinstance` chain
-# the emitter already builds and emit one `py.raise` per member INSIDE the
-# try, so each arm is a plain named raise and the EH wiring comes out right by
-# construction -- which is also why 1 fails: the lowering is too late to build
-# that structure. The same emitter narrowing would answer the open half of
-# tests/probe/wb_raise_a_named_exception.py.
+# ⛔ AND NOT IN THE EMITTER EITHER, which this note proposed until it was
+# tried. Narrowing with an isinstance chain and raising inside each branch --
+# written OUT BY HAND, so no synthesis could be blamed --
+#
+#     for exc in [ValueError("v"), KeyError("k")]:
+#         try:
+#             if isinstance(exc, ValueError):
+#                 raise exc
+#             else:
+#                 raise exc
+#         except Exception as e: ...
+#
+# crashes exactly as the select does. A narrowing is a VIEW: the arm's raise
+# still transfers lanes the union owns, and the loop's release of the element
+# still runs. The same loop over a HOMOGENEOUS list is clean, which is what
+# says the union wrapper is the whole difference.
+#
+# ⭐ SO THE ANSWER IS IN THE OWNERSHIP WALK after all: a raise consuming a
+# value some OTHER group (here the union, elsewhere the frame's binding) also
+# holds. That is the same question wb_raise_a_named_exception.py's open half
+# asks, and the two want one answer -- which is the opposite of what the
+# paragraph this replaced concluded, and the reason it is written down: the
+# emitter route looks right from the IR and is wrong on the machine.
 for exc in [ValueError("v"), KeyError("k")]:
     try:
         raise exc
