@@ -1331,9 +1331,26 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
     }
   }
 
-  if (!values.empty() && storage == DeadObjectStorage::OwningHeap)
+  if (!values.empty() && storage == DeadObjectStorage::OwningHeap) {
     initializeObjectHeader(builder, op->getLoc(), values.front(),
                            /*refcount=*/1, /*classId=*/0);
+    // ⭐ AND SAY SO. The header is written HERE, not at the `memref.alloc`
+    // above, so nothing about the allocation proves the refcount word exists
+    // -- and `prefixIsInitializedAtDefinition` is right to refuse it, because
+    // a retain placed at the alloc would read uninitialised memory. Without
+    // the marker a merge that needs a retain on its edge gets the refusal
+    // instead: two closures over one captured object, returned together,
+    // could not be compiled at all.
+    //
+    // ⛔ NOT `kObjectHeaderAttr` on the alloc, which is the shorter spelling
+    // and claims the wrong thing: that attribute says the prefix is live at
+    // the DEFINITION, and here it is not. The marker says it is live from
+    // this point, which is what the placement actually asks
+    // (`prefixIsInitializedBefore` takes the retain's own point).
+    auto marker = mintOwnedLocalMarker(builder, op->getLoc(), values,
+                                       runtimeContractName(contract));
+    values.assign(marker->getResults().begin(), marker->getResults().end());
+  }
   return RuntimeValue::objectWithOwnership(
       contract, values,
       storage == DeadObjectStorage::StaticNonOwning

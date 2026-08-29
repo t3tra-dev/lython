@@ -716,7 +716,11 @@ set(LYTHON_LEAK_GATE_CASES
     an_exception_raised_through_a_name
     # A union-typed name raised: the repair chooses which member's lanes the
     # raise transfers, and a golden cannot tell one reference from two.
-    an_exception_named_by_a_union)
+    an_exception_named_by_a_union
+    # Two closures over one captured object: the merge's heap dead placeholder
+    # is a real object with a refcount, and marking it complete moves where the
+    # edge retain goes.
+    two_closures_over_one_capture)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #
