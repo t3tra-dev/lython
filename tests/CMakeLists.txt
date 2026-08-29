@@ -713,7 +713,10 @@ set(LYTHON_LEAK_GATE_CASES
     # function was handed. Each transfers a reference to the raise primitive
     # that the frame or the caller also holds, and a golden cannot tell one
     # retain from two.
-    an_exception_raised_through_a_name)
+    an_exception_raised_through_a_name
+    # A union-typed name raised: the repair chooses which member's lanes the
+    # raise transfers, and a golden cannot tell one reference from two.
+    an_exception_named_by_a_union)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #

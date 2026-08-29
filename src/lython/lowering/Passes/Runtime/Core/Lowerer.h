@@ -1402,8 +1402,9 @@ private:
   emitRuntimeExceptionFromMessageObject(mlir::Operation *op,
                                         llvm::StringRef contract,
                                         const RuntimeBundle &messageObject);
-  mlir::LogicalResult emitRaiseExceptionBundle(mlir::Operation *op,
-                                               const RuntimeBundle &exception);
+  mlir::LogicalResult
+  emitRaiseExceptionBundle(mlir::Operation *op, const RuntimeBundle &exception,
+                           mlir::Operation *insertBefore = nullptr);
   mlir::LogicalResult emitSetCurrentCause(mlir::Operation *op,
                                           const RuntimeBundle &cause);
   mlir::LogicalResult lowerRaise(py::RaiseOp op);

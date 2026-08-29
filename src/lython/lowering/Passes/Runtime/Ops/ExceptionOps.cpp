@@ -353,8 +353,49 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
     }
   }
 
+  // ⭐ A UNION WHOSE ACTIVE MEMBER IS STATIC RAISES THAT MEMBER. The wrap
+  // still names the object it wrapped, so this is the plain `raise <a name>`
+  // path; it used to reach the manifest lookup with a UNION contract, which
+  // names no class, and the error read "runtime manifest has no .raise
+  // primitive" with an empty contract in it.
+  //
+  // ⛔ A DYNAMIC one is refused instead, and the three repairs that do not
+  // work are why. The raise must stay in the block the try's anchor guards --
+  // `anchorTrueEdgeGuardedCall` pairs an anchor with the marker at the head of
+  // its false successor -- so the member cannot be chosen by BRANCHING: an arm
+  // per member compiles and runs, and the exception then escapes the `try`
+  // that covers it, because the arm is no longer the block the anchor
+  // guards. That leaves a per-lane select, whose lanes ALIAS the union's;
+  // since a raise TRANSFERS what it is handed, the ownership walk can no
+  // longer tell whether the frame still owes a release. All three guesses at
+  // that were measured and all three are wrong: retaining the select result
+  // leaks whenever the raise escapes the function (341 B over two trips),
+  // never retaining crashes whenever a handler in the same frame resumes
+  // (`Ly_IncRef observed non-positive refcount`), and "retain iff there is a
+  // local try" leaks again as soon as one exception is raised TWICE (355 B).
+  //
+  // ⭐ The repair belongs in the EMITTER, not here: narrow the union with the
+  // `isinstance` chain it already builds and emit one `py.raise` per member
+  // INSIDE the try, where each arm is a plain named raise and the EH wiring
+  // comes out right by construction. Recorded in
+  // tests/probe/wb_raise_a_runtime_chosen_exception.py.
+  if (mlir::isa_and_nonnull<py::UnionType>(exception->contract) &&
+      !exception->unionActiveMember)
+    return op.emitError()
+           << "raising a value whose type is a union of exception classes is "
+              "not supported; narrow it with isinstance() and raise the "
+              "branch";
+
+  const RuntimeBundle *raised = exception;
+  // A union whose active member is STATIC needs no dispatch: the wrap still
+  // names the object it wrapped.
+  if (exception->unionActiveMember &&
+      !mlir::isa_and_nonnull<py::UnionType>(
+          exception->unionActiveMember->contract))
+    raised = exception->unionActiveMember.get();
+
   if (mlir::failed(RuntimeBundleLowerer::emitRaiseExceptionBundle(
-          op.getOperation(), *exception)))
+          op.getOperation(), *raised)))
     return mlir::failure();
   createDeadContinuation(builder, op.getOperation());
   op.erase();
@@ -362,7 +403,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRaise(py::RaiseOp op) {
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
-    mlir::Operation *op, const RuntimeBundle &exception) {
+    mlir::Operation *op, const RuntimeBundle &exception,
+    mlir::Operation *insertBefore) {
   std::optional<RuntimeSymbol> symbol =
       manifest.primitive(exception.contractName(), "raise");
   if (!symbol)
@@ -378,7 +420,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitRaiseExceptionBundle(
 
   llvm::SmallVector<const RuntimeBundle *, 1> sources{&exception};
   llvm::SmallVector<mlir::Value, 8> operands;
-  builder.setInsertionPoint(op);
+  builder.setInsertionPoint(insertBefore ? insertBefore : op);
   if (mlir::failed(emitTracebackFrame(op)))
     return mlir::failure();
   if (mlir::failed(buildRuntimeCallOperands(op, *symbol, sources, operands,
