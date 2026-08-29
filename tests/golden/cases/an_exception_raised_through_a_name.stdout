@@ -1,0 +1,12 @@
+module local: held at module scope
+parameter: passed 0
+message: cannot use input-0
+built: 'built-0'
+parameter: passed 1
+message: cannot use input-1
+built: 'built-1'
+parameter: passed 2
+message: cannot use input-2
+built: 'built-2'
+logged: cannot use second time
+propagated: cannot use second time

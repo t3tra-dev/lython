@@ -447,6 +447,109 @@ bool valueGroupDerivedFromEntryArguments(mlir::func::FuncOp function,
   return true;
 }
 
+// Is this entry argument one the function was HANDED, rather than one it
+// borrows? A generator resume clone is the shape that makes the difference
+// visible: `g.throw(ValueError(...))` transfers the exception into the clone,
+// so the clone's raise of it moves a reference it owns and needs no retain.
+// Its own contract says so -- `transferArgs`/`releaseArgs` -- and reading that
+// is the difference between 128 B leaked per throw and clean.
+bool functionOwnsItsArgument(mlir::func::FuncOp function, mlir::Value value) {
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  if (!argument || function.empty() ||
+      argument.getOwner() != &function.front())
+    return false;
+  mlir::FailureOr<own::FunctionContract> contract =
+      own::readFunctionContract(function);
+  return mlir::succeeded(contract) &&
+         contract->consumesArg(argument.getArgNumber());
+}
+
+// The mirror of the rule below, on the other way a borrowed value leaves a
+// function: a call that CONSUMES its argument takes the reference with it, so
+// a parameter handed to one is a reference given away that the caller still
+// holds. The return rule and this one ask the same question of the same
+// predicate; only the sink differs.
+//
+//     def rethrow(e: Exception) -> None:
+//         raise e                     # the raise primitive consumes it
+//
+//     def fail(msg: str) -> None:
+//         raise ValueError(msg)       # __init__ consumes the message
+//
+// Both were refused outright -- "borrowed entry argument 0 of @f is released
+// or transferred without a prior retain" -- which is the sentence the return
+// rule exists to answer, from the same verifier. The second is the commoner
+// shape by far: every helper that raises with a message it was given.
+//
+// ⛔ NOT a retain at the raise LOWERING, which is where the first looks like a
+// one-liner: `raise ValueError("x")` transfers a TEMPORARY, and a raise never
+// returns, so an extra reference taken there has no point at which to be
+// released. Only ownership knows which of the two a raise is.
+//
+// ⛔ AND ONLY A GROUP DERIVED ENTIRELY FROM ENTRY ARGUMENTS, which is what
+// keeps this disjoint from the owned-group machinery: that machinery counts
+// consumes against tokens in hand and inserts its own unfold retains, and a
+// borrowed group has no token for it to count -- which is why nothing was
+// inserted here at all.
+mlir::LogicalResult insertBorrowedConsumeRetains(
+    mlir::ModuleOp module, FuncContractCache &contracts,
+    mlir::func::FuncOp retain,
+    llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
+    own::AliasAnalysis &aliases) {
+  mlir::LogicalResult result = mlir::success();
+  module.walk([&](mlir::func::FuncOp function) {
+    // The same gate the return rule uses, and for the same reason: this is a
+    // fact about the ABI the EMITTER produces, where a parameter is borrowed.
+    // A manifest helper writes its own ownership by hand --
+    // `__ly_raise_message_object` is handed a message its caller built and
+    // never releases, so a retain there leaks (79 B on `io_seek`) -- and a
+    // manifest attribute does not mark it, because it is a plain private
+    // helper inside builtins.mlir rather than a declared contract.
+    if (mlir::failed(result) || function.empty() ||
+        !own::functionUsesOwnedReturnABI(function))
+      return;
+    function.walk([&](mlir::func::CallOp call) {
+      if (mlir::failed(result) || call.getNumOperands() == 0)
+        return;
+      // ⛔ RAISE-LIKE CALLEES ONLY, measured. Asked of EVERY consuming call
+      // this rule double-pays: the owned-group machinery already counts
+      // consumes against tokens in hand for the shapes it tracks, and the
+      // leak gate went from clean to eighteen failures (dict methods, tuple
+      // slots, io, print) the moment the predicate was widened. What is
+      // special about a raise is that it never returns, so nothing downstream
+      // can be reading the group to make that machinery ask the question.
+      if (own::isRefcountMaintenanceSymbol(call.getCallee()))
+        return;
+      unsigned offset = 0;
+      while (offset < call.getNumOperands()) {
+        const own::RuntimeDeallocator *deallocator =
+            own::findDeallocatorForValueGroup(call.getOperands(), offset,
+                                              deallocators);
+        if (!deallocator) {
+          ++offset;
+          continue;
+        }
+        llvm::SmallVector<mlir::Value, 4> group = own::valueSlice(
+            call.getOperands(), offset,
+            static_cast<unsigned>(deallocator->inputTypes.size()));
+        if (!group.empty() &&
+            (own::valueGroupEqualsEntryArgumentGroup(function, group) ||
+             valueGroupDerivedFromEntryArguments(function, group, aliases)) &&
+            !functionOwnsItsArgument(function, group.front()) &&
+            callConsumesGroup(contracts, call, group, aliases)) {
+          if (mlir::failed(
+                  insertRetain(retain, call.getOperation(), group.front()))) {
+            result = mlir::failure();
+            return;
+          }
+        }
+        offset += static_cast<unsigned>(deallocator->inputTypes.size());
+      }
+    });
+  });
+  return result;
+}
+
 mlir::LogicalResult insertBorrowedReturnRetains(
     mlir::ModuleOp module, mlir::func::FuncOp retain,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
@@ -2204,6 +2307,34 @@ bool releaseOwnedGroupByLiveness(
     for (unsigned index = 0, end = terminator->getNumSuccessors(); index < end;
          ++index) {
       mlir::Block *successor = terminator->getSuccessor(index);
+      // ⛔ ASKED BEFORE LIVENESS, because it is not a liveness fact. An
+      // anchor's TRUE edge is the unwind path out of the call its marker
+      // guards, so it materialises DURING that call -- and if the call
+      // consumes this group, the token moved before the edge existed.
+      //
+      //     e = ValueError("v")
+      //     try:
+      //         raise e
+      //     except ValueError as caught: ...
+      //
+      // put a `LyBaseException_DecRef` on that edge and the affine verifier
+      // refused the program ("released or transferred more than once on one
+      // CFG path"). It was right; the same exclusion is already written for
+      // the unwind-CLEANUP placement, which reaches the question by the other
+      // route.
+      //
+      // ⛔ AND WHEN THE GROUP IS STILL LIVE on that edge this is NOT enough:
+      // `print(str(e))` after the handler reads a name the raise gave away,
+      // so the frame needs its reference BACK. Adding the retain here was
+      // measured and does not close it -- the release then lands on the dead
+      // continuation edge after the raise instead, and the verifier counts
+      // that as the second spend. The remaining shape is recorded in
+      // tests/probe/wb_raise_a_named_exception.py.
+      if (index == 0 && !liveIn[successor])
+        if (mlir::func::CallOp guarded =
+                own::anchorTrueEdgeGuardedCall(terminator))
+          if (callConsumesGroup(contracts, guarded, group.values, aliases))
+            continue;
       if (liveIn[successor])
         continue; // still needed there
       if (forwardsGroupToSuccessor(terminator, index))
@@ -6064,6 +6195,11 @@ public:
       if (mlir::failed(
               insertBorrowedReturnRetains(module, retain, deallocators,
                                           aliases))) {
+        signalPassFailure();
+        return;
+      }
+      if (mlir::failed(insertBorrowedConsumeRetains(
+              module, contracts, retain, deallocators, aliases))) {
         signalPassFailure();
         return;
       }

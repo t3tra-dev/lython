@@ -703,7 +703,12 @@ set(LYTHON_LEAK_GATE_CASES
     # reference unless the select is put back into a branch. The program did
     # not compile before the repair, so nothing here could have measured it;
     # what the gate watches now is the release that repair supplies.
-    a_local_rebound_on_one_arm_of_a_loop)
+    a_local_rebound_on_one_arm_of_a_loop
+    # Exceptions raised THROUGH A NAME -- a local, a parameter, a message the
+    # function was handed. Each transfers a reference to the raise primitive
+    # that the frame or the caller also holds, and a golden cannot tell one
+    # retain from two.
+    an_exception_raised_through_a_name)
 
 # Cases that end with a non-zero status BY DESIGN, as `<dir>/<case>=<code>`.
 #
