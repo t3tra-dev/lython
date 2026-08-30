@@ -1,69 +1,80 @@
-# FIXED 2026-08-29 for three of five shapes; the two that remain are below.
+# FIXED 2026-08-30 for the read-after-the-handler shape; what is left is
+# below.
 #
 # WAS: `raise <a name>` failed in every spelling, in three different sentences.
+# The first two were closed 2026-08-29 (the anchor's true edge is the unwind
+# path out of the raise, so a release there frees what the callee owns; and a
+# borrowed value CONSUMED needs the retain a borrowed value RETURNED always
+# had). The third was reading the name AFTER the handler:
 #
-#   err = ValueError(m); raise err   (caught) -- "owned resource ... released
-#     or transferred more than once on one CFG path". The release sat on the
-#     ANCHOR's true edge, which is the unwind path out of the raise itself, so
-#     the token had already moved into the callee when that edge materialised.
-#     `collectEdgeDeaths` (Passes/Ownership.cpp) now asks that before liveness;
-#     the unwind-CLEANUP placement already carried the same exclusion.
+#     held = ValueError("m")
+#     try:
+#         raise held
+#     except ValueError as e: ...
+#     print(str(held))       # <- the raise gave the reference away
 #
-#   def rethrow(e): raise e -- and -- def fail(msg): raise ValueError(msg) --
-#     "borrowed entry argument 0 of @f is released or transferred without a
-#     prior retain". The mirror of the retain rule that already existed for a
-#     borrowed value RETURNED, now written for a borrowed value CONSUMED
-#     (`insertBorrowedConsumeRetains`). Three exclusions were each measured
-#     into it by the leak gate: a manifest helper writes its own ownership
-#     (`__ly_raise_message_object` is handed a message its caller never
-#     releases -- 79 B on io_seek), a generator resume clone is HANDED its
-#     exception by throw() (128 B on cross_generator_throw_unwind), and only
-#     the emitter's own ABI is what makes a parameter borrowed at all.
+# ⭐ THREE REPAIRS, and each one only exposed the next.
 #
-# STILL OPEN 1 -- reading the name AFTER the handler, which is what this file
-# runs. The frame gave its reference away and needs it BACK, so this one wants
-# a retain before the raise rather than an exclusion.
+#  1. A release stood BEHIND the raise, on the edge out of the raise block.
+#     `collectEdgeDeaths` reached that block because it is live-OUT -- the
+#     handler edge does read the name later -- and concluded the dead edge was
+#     a death. A call in the block had already given the token away, so no edge
+#     out of it is one.
 #
-# ⛔ THREE PLACEMENTS PUT A RELEASE BEHIND THE RAISE, and all three have to be
-# stopped before the retain helps. Found by stamping every `emitGroupRelease`
-# with `__builtin_LINE()` under an env var and reading the site off the IR --
-# which is the tool to reach for here, because guessing cost two rounds:
+#  2. The frame needs its reference BACK, which is what CPython's raise does by
+#     incrementing. A retain before the raise, and only when the group is
+#     LIVE-IN at the handler the anchor branches to: without that test it fires
+#     for every raise whose group has a release scheduled anywhere, and
+#     `an_exception_named_by_a_union` leaked 128 B.
 #
-#     afterUseReleases ..... after the last use in the block
-#     beforeTermReleases ... before the block's terminator
-#     edgeReleases ......... on the terminator's EDGE, and for a `cf.br` that
-#                            is written BEFORE the branch, so it reads exactly
-#                            like the other two and was the last one found
+#  3. The verifier then had to CREDIT it, which the earlier note predicted.
+#     Both models of the unwind take the token state from BEFORE the retain:
+#     the exceptional edge built at `LyEH_TryCallSiteMarker` applies the
+#     consumes between the marker and the guarded call but not the retains, and
+#     the anchor's true edge applies the guarded call's transfer and nothing
+#     else. Both now apply the plain retains standing in front of the guarded
+#     call -- the same argument the consumes were already applied by.
 #
-# ⭐ WITH ALL THREE SKIPPED for a block that raises, the release behind the
-# raise is gone and the retain is in -- and the affine verifier STILL refuses
-# ("released or transferred more than once"). What is left is whether it
-# CREDITS that retain: it is an unfold retain with no ownership attribute, on a
-# `memref.cast` of a subview of the group's root. That is the next thing to
-# read, and it is a question about the VERIFIER rather than the placement.
+# ⭐ THE TOOL: `LYTHON_TRACE_RELEASE_SITE_LINES=1` stamps every release with
+# the line of the placement that wrote it (`ly.debug.release_site`). Three
+# placements write releases that read identically in the IR, and telling them
+# apart by reading the code cost two rounds.
 #
-# STILL OPEN 2 -- a union-typed exception:
+# NEWLY VISIBLE, and a different group: a local assigned INSIDE the handler and
+# read after it, in a function that ALSO reads the raised name after the
+# handler, is refused for the SLOT's own double release
+# ("builtin.unrealized_conversion_cast ... released or transferred more than
+# once", path ^bb2>^bb3>^bb5>^bb11, exceptional=1). Measured to be independent
+# of the retain: with the retain suppressed the same program is refused for the
+# exception group instead, so the slot defect was masked rather than caused.
+# Either half alone compiles -- the handler-assigned local without the later
+# read of the raised name, and the later read without the handler-assigned
+# local.
 #
-#     for exc in [ValueError("v"), KeyError("k")]:
-#         raise exc
-#     # runtime manifest has no .raise primitive
+#     def f() -> str:
+#         problem = KeyError("k")
+#         try:
+#             raise problem
+#         except KeyError as caught:
+#             first = "x"
+#         return first + str(problem)
 #
-# Note the EMPTY contract name in that message: the element's bundle carries no
-# contract, so neither `manifest.primitive` nor the ancestor fallback can name
-# one. A different defect from the two ownership ones.
+# The dynamic union-typed raise has a probe of its own
+# (wb_raise_a_runtime_chosen_exception.py) and is deliberately NOT in this
+# file: the emitter refuses it before the verifier runs, so it would mask the
+# shape above.
 #
-# The three fixed shapes are a golden now
-# (tests/golden/cases/an_exception_raised_through_a_name.py), registered in the
-# leak gate; this file keeps only what still fails.
-held = ValueError("read after the handler")
-try:
-    raise held
-except ValueError as e:
-    print("caught held:", e)
-print(str(held))
-
-for prepared in [ValueError("v"), KeyError("k")]:
+# The fixed shapes are goldens:
+# cases/an_exception_raised_through_a_name.py and
+# cases/an_exception_outlives_the_handler_that_caught_it.py, both registered in
+# the leak gate.
+def slot_and_read(message: str) -> str:
+    problem = KeyError(message)
     try:
-        raise prepared
-    except Exception as e:
-        print(type(e).__name__, e)
+        raise problem
+    except KeyError as caught:
+        first = "x"
+    return first + str(problem)
+
+
+print(slot_and_read("k"))

@@ -719,11 +719,21 @@ bool consumeIsAggregateRelease(mlir::OpOperand &use) {
 mlir::func::CallOp emitGroupRelease(mlir::OpBuilder &builder, mlir::Location loc,
                                     const own::ResourceGroup &group,
                                     mlir::ValueRange values,
-                                    bool ownsReference) {
+                                    bool ownsReference,
+                                    int callSite = __builtin_LINE()) {
   auto call = mlir::func::CallOp::create(builder, loc,
                                          group.deallocator->function, values);
   if (ownsReference && own::perReferenceReleaseLabels())
     call->setAttr(own::kReferenceReleaseAttr, builder.getUnitAttr());
+  // ⭐ WHICH PLACEMENT PUT THIS RELEASE HERE. Three of them write releases
+  // that read identically in the IR -- after the last use, before the
+  // terminator, and on a `cf.br`'s edge (which is written BEFORE the branch) --
+  // and telling them apart by reading the code cost two rounds on the
+  // raise-through-a-name defect. `LYTHON_TRACE_RELEASE_SITE_LINES=1` stamps
+  // each one with the line that called this.
+  if (std::getenv("LYTHON_TRACE_RELEASE_SITE_LINES"))
+    call->setAttr("ly.debug.release_site",
+                  builder.getI64IntegerAttr(callSite));
   return call;
 }
 
@@ -2320,6 +2330,22 @@ bool releaseOwnedGroupByLiveness(
   // and wrote the same four guards in two different orders. Nothing made them
   // stay the same order, or stay four.
   auto collectEdgeDeaths = [&](mlir::Operation *terminator) {
+    // ⭐ A CALL IN THIS BLOCK ALREADY GAVE THE TOKEN AWAY. `raise held` after
+    // `held = ValueError(...)`, with the name read again after the handler,
+    // put a release on the edge OUT of the raise block -- the raise primitive
+    // transfers the exception, so that was the second spend and the affine
+    // verifier refused the program ("released or transferred more than once on
+    // one CFG path"). The block reaches this arm because it is live-OUT: the
+    // handler edge does read the name later. Liveness is right and the
+    // conclusion does not follow from it.
+    //
+    // ⛔ Only for a consume that is not the TERMINATOR itself. A terminator
+    // that forwards the group into some successors and not others is the
+    // conditional-reassignment shape the arm above sends here on purpose, and
+    // its remaining edges DO need releases.
+    for (mlir::Operation *consume : consumeSites)
+      if (consume != terminator && consume->getBlock() == terminator->getBlock())
+        return;
     for (unsigned index = 0, end = terminator->getNumSuccessors(); index < end;
          ++index) {
       mlir::Block *successor = terminator->getSuccessor(index);
@@ -2465,6 +2491,63 @@ bool releaseOwnedGroupByLiveness(
     return delayPastUnwindingCallSites(insertAfter, /*handlerIds=*/nullptr);
   };
 
+  // ⭐ A RAISE TRANSFERS THE EXCEPTION AND THE FRAME STILL NAMES IT.
+  //
+  //     held = ValueError("m")
+  //     try:
+  //         raise held
+  //     except ValueError as e: ...
+  //     print(str(held))          # <- reads the name the raise gave away
+  //
+  // The raise's contract transfers the object, so with a release still
+  // scheduled for the frame the one token was spent twice and the affine
+  // verifier refused the program ("released or transferred more than once on
+  // one CFG path", ^bb1>^bb2>^bb4>^bb11 with `exceptional=1`). CPython's raise
+  // increments the refcount for exactly this reason: the exception and the
+  // binding are two holders.
+  //
+  // ⛔ RAISE-LIKE CONSUMES ONLY, and the reason is the path structure rather
+  // than the callee: a raise never returns, so every continuation the walk can
+  // still reach is an UNWIND out of it -- which means any release it scheduled
+  // is on a path THROUGH this consume, and minting a token here pays for
+  // exactly one of them. For an ordinary consuming call the release may sit on
+  // a path that does not include the call at all, and the retain would leak
+  // there.
+  //
+  // ⛔ And only when a release was scheduled. Without the later read the walk
+  // schedules none (measured: the same program without `print(str(held))` gets
+  // zero releases and the raise's transfer is the whole story), so a retain
+  // would be the leak instead.
+  for (mlir::Operation *consume : consumeSites) {
+    auto call = mlir::dyn_cast<mlir::func::CallOp>(consume);
+    if (!call)
+      continue;
+    auto module = consume->getParentOfType<mlir::ModuleOp>();
+    auto callee =
+        module ? module.lookupSymbol<mlir::func::FuncOp>(call.getCallee())
+               : mlir::func::FuncOp();
+    if (!callee || !own::isRaiseLikeFunction(callee))
+      continue;
+    // ⛔ AND ONLY WHEN THE HANDLER STILL READS IT. The anchor guarding this
+    // raise branches to the handler entry, and the group being LIVE-IN there
+    // is exactly "the name is read after the handler". Without that test the
+    // rule fires for every raise whose group has a release scheduled anywhere
+    // -- `an_exception_named_by_a_union` leaked 128 B, its release already
+    // paid for by the union's own tag-conditioned path.
+    mlir::Block *raiseBlock = consume->getBlock();
+    bool handlerReadsIt = false;
+    for (mlir::Block *predecessor : raiseBlock->getPredecessors()) {
+      mlir::Operation *terminator = predecessor->getTerminator();
+      mlir::func::CallOp guarded = own::anchorTrueEdgeGuardedCall(terminator);
+      if (!guarded || guarded->getBlock() != raiseBlock ||
+          terminator->getNumSuccessors() == 0)
+        continue;
+      if (liveIn[terminator->getSuccessor(0)])
+        handlerReadsIt = true;
+    }
+    if (handlerReadsIt)
+      unfoldRetainBefore.push_back(consume);
+  }
   for (mlir::Operation *afterOp : afterUseReleases) {
     mlir::Operation *anchor = delayPastCallSiteMarkers(afterOp);
     mlir::OpBuilder builder(anchor);

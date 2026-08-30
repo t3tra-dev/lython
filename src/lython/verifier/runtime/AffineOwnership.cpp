@@ -1074,6 +1074,10 @@ private:
 struct AnchorTrueEdge {
   bool isVirtualUnwind = false; // successor 0 is the anchor's unwind edge
   bool consumesGroup = false;   // and the call it guards consumes the group
+  // Plain retains of the group standing between the call-site marker and the
+  // guarded call. They have already run when the unwind happens, exactly like
+  // the consumes this edge applies.
+  unsigned retainsBefore = 0;
 };
 
 template <typename State>
@@ -1090,6 +1094,27 @@ AnchorTrueEdge anchorTrueEdgeOf(OwnershipWalkCache &walk,
   edge.consumesGroup =
       guarded && walk.mentionsTracked(guarded, state) &&
       callConsumesGroup(contracts, guarded, state.group, aliases);
+  // ⭐ AND THE RETAINS IN FRONT OF IT. This edge is the unwind out of the
+  // guarded call, so everything between the marker and that call has already
+  // executed -- the consume above says so, and a retain is the same fact in
+  // the other direction. `raise held` with the name read after the handler
+  // takes its reference back right there, and dropping it made the handler
+  // path see a release with no token.
+  if (guarded)
+    for (mlir::Operation *before = guarded->getPrevNode(); before;
+         before = before->getPrevNode()) {
+      auto call = mlir::dyn_cast<mlir::func::CallOp>(before);
+      if (!call)
+        continue;
+      if (call.getCallee() == "LyEH_TryCallSiteMarker")
+        break;
+      if (call->hasAttr(own::kAggregateRetainAttr) &&
+          !own::isBlockArgMergeBorrowRetain(call))
+        continue; // parked against a container, not a plain token
+      if (walk.mentionsTracked(call, state) &&
+          callRetainsGroup(contracts, call, state.group, aliases))
+        ++edge.retainsBefore;
+    }
   return edge;
 }
 
@@ -1444,6 +1469,13 @@ verifyStraightLineResource(FuncContractCache &contracts,
               resource.reference, {group, resource.views}, call))
         continue;
       bool retains = callRetainsGroup(contracts, call, group, aliases);
+      if (std::getenv("LYTHON_TRACE_AFFINE_RETAIN") &&
+          call.getCallee() == "Ly_IncRef")
+        llvm::errs() << "[affine] Ly_IncRef retains=" << retains
+                     << " consumes=" << consumes << " token="
+                     << static_cast<int>(token) << " operand="
+                     << call.getOperand(0) << "\n   group.front=" << group.front()
+                     << "\n";
       if (callPartiallyConsumesGroup(contracts, call, group, aliases))
         return call.emitError()
                << "ownership-consuming call only consumes part of owned "
@@ -2758,6 +2790,34 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
               else if (!next.slotParents.empty())
                 next.slotParents.pop_back();
             };
+            // ⭐ AND A RETAIN THERE RUNS BEFORE THE UNWIND TOO. The argument
+            // for applying consumes on this edge is that everything between
+            // the marker and the guarded call has already executed when the
+            // unwind happens, and it does not distinguish direction: the
+            // retain a frame takes back before giving its exception away
+            //
+            //     held = ValueError("m")
+            //     try:
+            //         raise held
+            //     except ValueError as e: ...
+            //     print(str(held))
+            //
+            // sits exactly there, and dropping it made the handler path see a
+            // release with no token -- "released or transferred more than once
+            // on one CFG path" over a program whose refcounts balance.
+            auto applyEdgeRetain = [&](mlir::func::CallOp retainer) {
+              if (!callRetainsGroup(contracts, retainer, next.group, aliases))
+                return;
+              // A slot-absorption retain is parked against its container
+              // rather than counted here; only a plain token is credited.
+              if (retainer->hasAttr(own::kAggregateRetainAttr) &&
+                  !isBlockArgMergeBorrowRetain(retainer))
+                return;
+              // The same ceiling the borrowed walk uses, spelled here because
+              // this walk has no constant of its own.
+              if (next.retained < 64)
+                ++next.retained;
+            };
             // Release helpers scheduled between the marker and the guarded
             // call (a raise statement's dying locals) run BEFORE any unwind,
             // so their consume effects apply on the exceptional edge just
@@ -2766,9 +2826,11 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
             for (mlir::Operation *between = op->getNextNode();
                  between && guarded && between != guarded.getOperation();
                  between = between->getNextNode())
-              if (auto releaseCall =
-                      mlir::dyn_cast<mlir::func::CallOp>(between))
-                applyEdgeConsume(releaseCall);
+              if (auto betweenCall =
+                      mlir::dyn_cast<mlir::func::CallOp>(between)) {
+                applyEdgeRetain(betweenCall);
+                applyEdgeConsume(betweenCall);
+              }
             if (guarded)
               applyEdgeConsume(guarded);
             next.block = handler;
@@ -3219,6 +3281,8 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       llvm::SmallVector<std::int64_t, 2> nextSlotParents = state.slotParents;
       bool nextExceptional =
           state.exceptional || (anchor.isVirtualUnwind && index == 0);
+      if (index == 0 && anchor.retainsBefore && nextRetained < 64)
+        nextRetained += anchor.retainsBefore;
       if (anchor.consumesGroup && index == 0) {
         if (nextToken == AffineTokenState::Owned ||
             nextToken == AffineTokenState::Conditional)

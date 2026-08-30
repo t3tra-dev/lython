@@ -718,6 +718,10 @@ set(LYTHON_LEAK_GATE_CASES
     # A union-typed name raised: the repair chooses which member's lanes the
     # raise transfers, and a golden cannot tell one reference from two.
     an_exception_named_by_a_union
+    # A raised name READ AFTER the handler: the raise takes a reference the
+    # binding also holds, and the retain that pays for it is exactly the kind
+    # of change a golden passes either way.
+    an_exception_outlives_the_handler_that_caught_it
     # Two closures over one captured object: the merge's heap dead placeholder
     # is a real object with a refcount, and marking it complete moves where the
     # edge retain goes.
