@@ -28,6 +28,12 @@ Value ModuleEmitter::emitBinarySpecial(const parser::Node &anchor,
     return emitInlineOperatorCall(anchor, lhs, *binding, {rhs});
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(lhs.type, method, {rhs.type});
+  // The left operand has no answer: CPython asks the right one for the
+  // reflected operator before giving up (tryEmitReflectedBinary).
+  if (!inference)
+    if (std::optional<Value> reflected =
+            tryEmitReflectedBinary(anchor, method, lhs, rhs))
+      return *reflected;
   if (!requireStaticEvidence(anchor, inference))
     return emitNone(anchor);
   if (inference)

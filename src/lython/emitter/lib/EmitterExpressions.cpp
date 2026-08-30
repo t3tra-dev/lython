@@ -1820,6 +1820,44 @@ std::optional<Value> ModuleEmitter::emitOptionalCompare(
   return Value{result, resultType};
 }
 
+// ⭐ THE RIGHT OPERAND'S TURN, which CPython takes when the left one has no
+// answer. `2 * vec` and `1 + money` were refused outright -- the manifest
+// `int.__mul__` has no overload for a source class and nothing looked further
+// -- while `vec * 2` worked, so the same expression written the other way
+// round was the difference between running and not.
+//
+// ⛔ ARITHMETIC AND BITWISE ONLY. A comparison's reflection is the OPPOSITE
+// operator on the other operand (`a < b` tries `b.__gt__(a)`), which is a
+// different rule and not a name transformation; routing it through here would
+// call `__rlt__`, which is not a protocol.
+//
+// ⛔ And only when the left side has no answer of its own: this runs after the
+// manifest inference has failed, so an operator that already resolves keeps
+// resolving the way it did.
+std::optional<Value>
+ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
+                                      llvm::StringRef method, Value lhs,
+                                      Value rhs) {
+  static constexpr llvm::StringLiteral kReflectable[] = {
+      llvm::StringLiteral("__add__"),      llvm::StringLiteral("__sub__"),
+      llvm::StringLiteral("__mul__"),      llvm::StringLiteral("__matmul__"),
+      llvm::StringLiteral("__truediv__"),  llvm::StringLiteral("__floordiv__"),
+      llvm::StringLiteral("__mod__"),      llvm::StringLiteral("__pow__"),
+      llvm::StringLiteral("__lshift__"),   llvm::StringLiteral("__rshift__"),
+      llvm::StringLiteral("__and__"),      llvm::StringLiteral("__or__"),
+      llvm::StringLiteral("__xor__")};
+  if (!llvm::is_contained(kReflectable, method))
+    return std::nullopt;
+  auto rightContract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(rhs.type));
+  if (!rightContract || !isSourceDefinedContract(rightContract))
+    return std::nullopt;
+  std::string reflected = ("__r" + method.drop_front(2)).str();
+  if (!lookupClassMethod(rightContract, reflected))
+    return std::nullopt;
+  return tryEmitClassDunder(anchor, rhs, reflected, {lhs});
+}
+
 Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
   // ⭐ A NamedTuple's literal subscript IS the field at that position: the
   // instance is a tuple whose members are the declared fields, and the index

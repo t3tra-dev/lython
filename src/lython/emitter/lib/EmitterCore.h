@@ -758,6 +758,12 @@ private:
   // return: without it, `for x in b` over a subclass-overridden __iter__
   // printed the refusal and then a second complaint about __next__ on the
   // None the refusal handed back.
+  // `a OP b` where a's type has no such operator and b's class provides the
+  // REFLECTED one. Returns nothing when the operator is not reflectable or
+  // the right operand is not a source class that defines it.
+  std::optional<Value> tryEmitReflectedBinary(const parser::Node &anchor,
+                                              llvm::StringRef method,
+                                              Value lhs, Value rhs);
   std::optional<Value> tryEmitClassDunder(const parser::Node &anchor,
                                           Value receiver,
                                           llvm::StringRef dunder,
