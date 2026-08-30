@@ -20,6 +20,78 @@ bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
          llvm::all_of(callable.getResultTypes(), isRuntimePrimitive);
 }
 
+// ⭐ WHICH OBJECT DOES THIS LANE VALUE NAME. The generator suspend lanes are
+// deduped so that one entity crossing twice takes one token per lane, and the
+// comparison has to survive the two ways the same object reaches them: the
+// logical value differs when a structural mutation rebinds it, and the
+// PHYSICAL value differs again when each lane arrives as its own block
+// argument of the suspend block. `yield current` guarded by `if
+// len(current) == size` is both at once -- lane 2 was `memref<9xi64>` block
+// argument 1 and lane 7 was block argument 9 of the same block, with every
+// predecessor forwarding one value into both.
+//
+// So a block argument resolves to what its predecessors forward when they all
+// forward the same thing, and to itself otherwise. Answering "the same" for
+// two different objects costs a retain nobody releases (a leak, which the gate
+// measures); answering "different" for one object is the abort this exists to
+// stop.
+//
+// Why NOT a general alias query: the ownership model's alias relation is built
+// for slots and edges, and what is needed here is only "is this the value that
+// other lane carries", on a CFG whose suspend block is reached by branches
+// that forward it directly.
+mlir::Value resolveLaneEntity(mlir::Value value,
+                              llvm::SmallPtrSetImpl<mlir::Value> &visiting) {
+  value = ownership::underlyingObjectValue(value);
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  if (!argument)
+    return value;
+  mlir::Block *block = argument.getOwner();
+  if (block->isEntryBlock() || block->hasNoPredecessors())
+    return value;
+  // A back edge reaches the argument it defines; stopping keeps the answer
+  // conservative rather than making it up.
+  if (!visiting.insert(value).second)
+    return value;
+  mlir::Value common;
+  for (mlir::Block *predecessor : block->getPredecessors()) {
+    auto branch =
+        mlir::dyn_cast<mlir::BranchOpInterface>(predecessor->getTerminator());
+    if (!branch) {
+      visiting.erase(value);
+      return value;
+    }
+    mlir::Value forwarded;
+    bool found = false;
+    for (unsigned index = 0, count = predecessor->getNumSuccessors();
+         index < count; ++index) {
+      if (predecessor->getSuccessor(index) != block)
+        continue;
+      mlir::Value candidate =
+          branch.getSuccessorOperands(index)[argument.getArgNumber()];
+      if (!candidate || (found && candidate != forwarded)) {
+        visiting.erase(value);
+        return value;
+      }
+      forwarded = candidate;
+      found = true;
+    }
+    if (!found) {
+      visiting.erase(value);
+      return value;
+    }
+    mlir::Value resolved = resolveLaneEntity(forwarded, visiting);
+    if (!common)
+      common = resolved;
+    else if (common != resolved) {
+      visiting.erase(value);
+      return value;
+    }
+  }
+  visiting.erase(value);
+  return common ? common : value;
+}
+
 bool isErasedObjectResult(mlir::Type type) {
   return runtimeContractName(type) == "builtins.object";
 }
@@ -198,7 +270,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
             result = mlir::failure();
             return mlir::WalkResult::interrupt();
           }
+          // ⭐ THE SAME OBJECT REACHES TWO LANES AS TWO DIFFERENT SSA
+          // VALUES. `yield current` after `current.append(v)` yields the
+          // call's rebound result while the frame lane carries the block
+          // argument the loop threads -- two logical operands, one entity, so
+          // this set never saw a duplicate, neither lane retained, and the
+          // second trip aborted the program in `Ly_DecRef` with a
+          // non-positive refcount. The physical group is where they meet:
+          // both lanes resolved to `memref<9xi64>` block argument 6.
           bool duplicate = !laneCarriedValues.insert(operand).second;
+          if (!bundle->physicalValues().empty()) {
+            llvm::SmallPtrSet<mlir::Value, 8> visiting;
+            if (std::getenv("LYTHON_TRACE_LANES")) {
+              llvm::SmallPtrSet<mlir::Value, 8> probe;
+              llvm::errs() << "[lane] idx=" << operandIndex << " phys="
+                           << bundle->physicalValues().front() << "\n    -> "
+                           << resolveLaneEntity(
+                                  bundle->physicalValues().front(), probe)
+                           << "\n";
+            }
+            if (!laneCarriedValues
+                     .insert(resolveLaneEntity(
+                         bundle->physicalValues().front(), visiting))
+                     .second)
+              duplicate = true;
+          }
           unsigned before = static_cast<unsigned>(operands.size());
           if (mlir::failed(
                   RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
