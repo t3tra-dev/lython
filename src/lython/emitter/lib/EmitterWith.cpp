@@ -17,6 +17,25 @@ void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {
       Value contextValue = emitExpr(ast::node(item, "context_expr"));
       Value entered;
       if (async) {
+        // ⭐ THE ASYNC TWINS OF THE RULE BELOW. `__enter__`/`__exit__` on a
+        // source class are inlined here; `__aenter__`/`__aexit__` were not, so
+        // `async with R():` over a Python context manager reached the lowering
+        // and was refused there -- "runtime manifest has no R.__aexit__
+        // method" -- while the synchronous spelling of the same class worked.
+        // ⛔ NOT awaited here: the inline dispatch emits the method BODY, so
+        // what comes back is the value the coroutine would have resolved to.
+        // The manifest arm awaits because its op yields an awaitable object.
+        if (std::optional<Value> opened =
+                tryEmitClassDunder(item, contextValue, "__aenter__")) {
+          entered = *opened;
+          if (const parser::Node *optional = ast::node(item, "optional_vars"))
+            emitAssignTarget(*optional, entered);
+          if (std::optional<MethodBinding> exit =
+                  lookupClassMethod(contextValue.type, "__aexit__"))
+            refuseUnrepresentableExitArguments(item, *exit);
+          activeWithCleanups.push_back(WithCleanup{contextValue, async});
+          return;
+        }
         AsyncContextMethodInferenceResult enterInference =
             types.inferAsyncContextEnterWithEvidence(contextValue.type);
         if (!requireStaticEvidence(item, enterInference))
@@ -217,9 +236,18 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
   Value none{noneOp.getResult(), types.none()};
   Value exception = exceptionNode ? emitExpr(exceptionNode) : none;
   if (cleanup.async) {
-    // ⛔ Three Nones even on the exception path: emitWithEnter has no inlined
-    // source arm for __aenter__, so this is always the MANIFEST op, and a
-    // manifest __aexit__ is a native function with no slots for the triple.
+    // The source arm, which CAN carry the exception: a Python `__aexit__`
+    // declares the three parameters, so the manifest's shape below is not the
+    // constraint here.
+    if (std::optional<Value> exited = tryEmitClassDunder(
+            anchor, cleanup.manager, "__aexit__", {none, exception, none})) {
+      Value suppress = *exited;
+      emitWithExitDecision(anchor, exceptionNode ? &suppress : nullptr);
+      return;
+    }
+    // ⛔ Three Nones even on the exception path once the manifest op is what
+    // runs: a manifest __aexit__ is a native function with no slots for the
+    // triple.
     AsyncContextMethodInferenceResult exitInference =
         types.inferAsyncContextExitWithEvidence(
             cleanup.manager.type, {none.type, none.type, none.type});
