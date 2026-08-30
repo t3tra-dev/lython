@@ -722,6 +722,10 @@ set(LYTHON_LEAK_GATE_CASES
     # binding also holds, and the retain that pays for it is exactly the kind
     # of change a golden passes either way.
     an_exception_outlives_the_handler_that_caught_it
+    # Locals that outlive a raise: the dying-local cleanup runs BEFORE the
+    # raise, so what it frees decides whether the handler path reads live
+    # memory -- and a freed str still prints.
+    a_local_survives_the_raise_that_passed_it
     # Two closures over one captured object: the merge's heap dead placeholder
     # is a real object with a refcount, and marking it complete moves where the
     # edge retain goes.

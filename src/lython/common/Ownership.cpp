@@ -1788,8 +1788,22 @@ mlir::func::CallOp precedingTryCallSiteMarker(mlir::Operation *call) {
         return {};
       continue;
     }
-    if (candidate.getCallee() == "LyEH_TryCallSiteMarker")
+    llvm::StringRef callee = candidate.getCallee();
+    if (callee == "LyEH_TryCallSiteMarker")
       return candidate;
+    // ⭐ THE MIRROR SKIPS WHAT THE FORWARD WALK SKIPS. `guardedCallAfterMarker`
+    // steps over the release helpers and the traceback frame that ownership
+    // insertion schedules between a marker and its guarded call, and says
+    // outright that its mirror must too. This one did not: it stopped at the
+    // first call of any kind, so a retain placed in front of a guarded raise
+    // made `precedingTryCallSiteMarker` answer "unguarded" -- and an unguarded
+    // raise leaves the function for good, so the cleanup pass put the frame's
+    // dying-local releases directly before the raise. The local handler then
+    // read a name that had already been freed, and the verifier refused the
+    // program for the local's double release.
+    if (isRefcountMaintenanceSymbol(callee) ||
+        callee.starts_with("LyTraceback_"))
+      continue;
     return {};
   }
   return {};

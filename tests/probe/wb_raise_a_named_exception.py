@@ -1,5 +1,6 @@
-# FIXED 2026-08-30 for the read-after-the-handler shape; what is left is
-# below.
+# FIXED. Every shape in this file compiles and agrees with CPython; it is kept
+# for the trail, because the last defect took four repairs and each one only
+# exposed the next.
 #
 # WAS: `raise <a name>` failed in every spelling, in three different sentences.
 # The first two were closed 2026-08-29 (the anchor's true edge is the unwind
@@ -40,34 +41,26 @@
 # placements write releases that read identically in the IR, and telling them
 # apart by reading the code cost two rounds.
 #
-# NEWLY VISIBLE, and a different group: a local assigned INSIDE the handler and
-# read after it, in a function that ALSO reads the raised name after the
-# handler, is refused for the SLOT's own double release
-# ("builtin.unrealized_conversion_cast ... released or transferred more than
-# once", path ^bb2>^bb3>^bb5>^bb11, exceptional=1). Measured to be independent
-# of the retain: with the retain suppressed the same program is refused for the
-# exception group instead, so the slot defect was masked rather than caused.
-# Either half alone compiles -- the handler-assigned local without the later
-# read of the raised name, and the later read without the handler-assigned
-# local.
-#
-#     def f() -> str:
-#         problem = KeyError("k")
-#         try:
-#             raise problem
-#         except KeyError as caught:
-#             first = "x"
-#         return first + str(problem)
+# ⭐ AND A FOURTH, found the same way and fixed the same day: with the retain
+# in place, `precedingTryCallSiteMarker` stopped recognising the raise as
+# GUARDED -- it stopped at the first call of any kind, and the retain is one.
+# An unguarded raise leaves the function for good, so the cleanup pass put the
+# frame's dying-local releases directly BEFORE the raise, and the local handler
+# then read names that had already been freed. Its forward twin
+# `guardedCallAfterMarker` already skips exactly these calls and says in a
+# comment that the mirror must too; it did not. Golden:
+# cases/a_local_survives_the_raise_that_passed_it.
 #
 # The dynamic union-typed raise has a probe of its own
 # (wb_raise_a_runtime_chosen_exception.py) and is deliberately NOT in this
 # file: the emitter refuses it before the verifier runs, so it would mask the
 # shape above.
 #
-# The fixed shapes are goldens:
-# cases/an_exception_raised_through_a_name.py and
-# cases/an_exception_outlives_the_handler_that_caught_it.py, both registered in
-# the leak gate.
+# The goldens: cases/an_exception_raised_through_a_name.py,
+# cases/an_exception_outlives_the_handler_that_caught_it.py and
+# cases/a_local_survives_the_raise_that_passed_it.py, all three registered in
+# the leak gate -- a golden cannot tell one reference from two, and every one
+# of these repairs is a reference.
 def slot_and_read(message: str) -> str:
     problem = KeyError(message)
     try:
