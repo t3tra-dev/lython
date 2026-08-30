@@ -495,9 +495,43 @@ namespace {
 // binding this does not recognise (a `for` target, a `with ... as`, an
 // augmented assignment) leaves the name alone -- it keeps the unresolved-name
 // diagnostic rather than getting a slot whose type would be a guess.
+// A binding site for one name: the expression it takes its value from, and --
+// for a tuple unpack -- which element of that expression is the name's.
+struct NameBindingSite {
+  const parser::Node *value;
+  int element = -1;
+};
+
+// ⭐ WHICH ELEMENT OF THE UNPACK IS THIS NAME. `key, _, value = s.partition(c)`
+// inside a loop bound NEITHER name for the scope around it: an unpack target
+// went to the `opaque` arm below, which is the answer for a target this walk
+// cannot read a type out of -- a subscript, an attribute, a star. A flat tuple
+// of names is not that: the value's type has the element in it. Every such
+// binding was refused as "unresolved name" after the region, for the spelling
+// that reads a split line.
+int unpackElementFor(const parser::Node *target, llvm::StringRef name) {
+  if (!target || (target->kind != "Tuple" && target->kind != "List"))
+    return -1;
+  const auto *elements = ast::nodeList(*target, "elts");
+  if (!elements)
+    return -1;
+  int found = -1;
+  for (std::size_t index = 0; index < elements->size(); ++index) {
+    const parser::Node *element = (*elements)[index].get();
+    // A star target absorbs a variable number of elements, so no fixed index
+    // describes anything after it -- and the star's own name is a list whose
+    // length is not known here either.
+    if (!element || element->kind != "Name")
+      return -1;
+    if (llvm::StringRef(ast::nameSpelling(*element)) == name)
+      found = static_cast<int>(index);
+  }
+  return found;
+}
+
 void collectNameBindingExpressions(
     const parser::Node *node, llvm::StringRef name,
-    llvm::SmallVectorImpl<const parser::Node *> &values,
+    llvm::SmallVectorImpl<NameBindingSite> &values,
     llvm::SmallVectorImpl<const parser::Node *> &annotations, bool &opaque) {
   if (!node)
     return;
@@ -521,7 +555,14 @@ void collectNameBindingExpressions(
           // this one (with the name still unbound) answered `object` and took
           // the whole join down with it.
           else if (!containsNameLoad(value, name))
-            values.push_back(value);
+            values.push_back({value, -1});
+        } else if (int element = unpackElementFor(target.get(), name);
+                   element >= 0) {
+          const parser::Node *value = ast::node(*node, "value");
+          if (!value || containsNameLoad(value, name))
+            opaque = true;
+          else
+            values.push_back({value, element});
         } else {
           llvm::StringSet<> written;
           collectAssignedNameTargets(target.get(), written);
@@ -696,7 +737,7 @@ bool ModuleEmitter::loopTargetOutlivesLoop(
 mlir::Type ModuleEmitter::inferConditionalLocalType(
     llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
     llvm::StringRef name) {
-  llvm::SmallVector<const parser::Node *, 4> valueNodes;
+  llvm::SmallVector<NameBindingSite, 4> valueNodes;
   llvm::SmallVector<const parser::Node *, 2> annotationNodes;
   bool opaque = false;
   for (const std::vector<parser::NodePtr> *body : bodies) {
@@ -719,10 +760,34 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   if (valueNodes.empty())
     return {};
   llvm::SmallVector<mlir::Type, 4> inferred;
-  for (const parser::Node *value : valueNodes) {
-    mlir::Type type = types.widenLiteral(types.inferExpr(value));
+  for (const NameBindingSite &site : valueNodes) {
+    mlir::Type type = types.widenLiteral(types.inferExpr(site.value));
     if (!type)
       return {};
+    if (site.element >= 0) {
+      auto source = mlir::dyn_cast<py::ContractType>(type);
+      if (!source)
+        return {};
+      llvm::StringRef sourceName = source.getContractName();
+      if (sourceName == "builtins.tuple") {
+        if (static_cast<std::size_t>(site.element) >=
+            source.getArguments().size())
+          return {};
+        type = source.getArguments()[site.element];
+      } else if (sourceName == "builtins.list" &&
+                 source.getArguments().size() == 1) {
+        // `k, v = line.split("=")` unpacks a homogeneous sequence: how many
+        // elements it has is a RUNTIME question (and the wrong count is a
+        // ValueError there, not here), but every one of them has the same
+        // type, so the index does not change the answer.
+        type = source.getArguments().front();
+      } else {
+        return {};
+      }
+      type = types.widenLiteral(type);
+      if (!type)
+        return {};
+    }
     inferred.push_back(type);
   }
   mlir::Type joined = types.join(inferred);
