@@ -43,8 +43,10 @@ void ModuleEmitter::emitStatements(
       // The class contract was declared up front, but its attribute
       // initializers evaluate here -- at the class statement's position in
       // module flow, like CPython's class-body execution.
-      if (statement->kind == "ClassDef")
+      if (statement->kind == "ClassDef") {
         emitClassAttrInitializers(*statement);
+        emitInitSubclassHook(*statement);
+      }
       // A skipped module-level def still EXECUTES here in CPython terms:
       // its non-constant defaults evaluate at this spot, once, into their
       // module-lifetime cells (R6). Not ClassDef-exclusive: method defaults

@@ -1,0 +1,3 @@
+before []
+after ['Alpha', 'Beta', 'Gamma']
+no hook ['Alpha', 'Beta', 'Gamma']

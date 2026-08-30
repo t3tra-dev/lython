@@ -191,6 +191,10 @@ private:
   // Evaluates the class body's attribute initializers into their global
   // slots; runs at the ClassDef statement position in module flow.
   void emitClassAttrInitializers(const parser::Node &classDef);
+  // CPython calls a base's `__init_subclass__` when a subclass is DEFINED.
+  // Emitted at the class statement's position in module flow, beside the
+  // attribute initializers, for the same reason.
+  void emitInitSubclassHook(const parser::Node &classDef);
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,

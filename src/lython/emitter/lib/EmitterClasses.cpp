@@ -615,6 +615,42 @@ ModuleEmitter::resolveClassAttrSlot(llvm::StringRef className,
   return std::nullopt;
 }
 
+// ⭐ `__init_subclass__` RUNS WHEN THE SUBCLASS IS DEFINED, and nothing ran it:
+// `class Sub(Meta): pass` printed nothing where CPython prints what the hook
+// prints, with no diagnostic -- the one shape on this sweep that answered
+// differently rather than refusing.
+//
+// It is an implicit classmethod, so the call is spelled through the SUBCLASS
+// (`Sub.__init_subclass__()`): looking an inherited classmethod up through the
+// subclass binds `cls` to it, which is the argument CPython passes.
+//
+// ⛔ NOT when the class declares its own, and that shape is still missing its
+// parent's hook. CPython runs the PARENT's for the new class, never the
+// class's own on itself, and the spelling above would run the class's own.
+// Reaching the parent's with `cls` bound to the NEW class is what `super()`
+// does inside a method body and there is no expression for it out here:
+// `Base.__init_subclass__()` binds `cls` to Base, which is a wrong answer
+// rather than a missing one. Measured in
+// tests/probe/wb_init_subclass_through_a_middle_class.py.
+void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
+  auto name = ast::string(classDef, "name");
+  if (!name)
+    return;
+  std::optional<MethodBinding> hook =
+      lookupClassMethod(types.contract(*name), "__init_subclass__");
+  if (!hook || !hook->method || hook->definingClass == *name)
+    return;
+  // The hook takes no arguments beyond `cls`; anything else is a shape this
+  // does not model, and calling it would pass the wrong count.
+  if (hook->bodySignature.positionalNames.size() != 1)
+    return;
+  parser::NodePtr call = synth::call(
+      synth::attribute(synth::name(*name, classDef.range),
+                       "__init_subclass__", classDef.range),
+      std::vector<parser::NodePtr>{}, classDef.range);
+  emitStatement(*synth::exprStmt(std::move(call), classDef.range));
+}
+
 void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
   auto name = ast::string(classDef, "name");
   if (!name)
