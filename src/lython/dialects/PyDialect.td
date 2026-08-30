@@ -995,6 +995,7 @@ def Py_BitAndOp : Py_BinaryMethodOp<"bitand">;
 def Py_BitOrOp : Py_BinaryMethodOp<"bitor">;
 def Py_BitXorOp : Py_BinaryMethodOp<"bitxor">;
 def Py_PowOp : Py_BinaryMethodOp<"pow">;
+def Py_MatMulOp : Py_BinaryMethodOp<"matmul">;
 
 def Py_LeOp : Py_BinaryMethodOp<"le", Py_ContractType, [Pure]>;
 def Py_LtOp : Py_BinaryMethodOp<"lt", Py_ContractType, [Pure]>;

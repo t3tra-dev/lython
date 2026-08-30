@@ -966,6 +966,16 @@ Value ModuleEmitter::emitBinary(const parser::Node &expr) {
     return emitBinarySpecial<py::PowOp>(expr, "__pow__", lhs, rhs, result);
   if (ast::isOperator(op, "Add"))
     return emitBinarySpecial<py::AddOp>(expr, "__add__", lhs, rhs, result);
+  // ⭐ THE ONE OPERATOR THIS TABLE WAS MISSING. Every other binary spelling
+  // reaches its dunder here, and `@` reached the refusal below -- so a class
+  // with `__matmul__` was rejected while the same class's `__mul__`,
+  // `__lshift__` and `__pow__` all worked. The augmented form was already
+  // wired (`__imatmul__`, EmitterStatements.cpp), which is what says this is a
+  // missing entry rather than a missing mechanism. The tensor and primitive
+  // paths take `@` before this point, so nothing that worked changes.
+  if (ast::isOperator(op, "MatMult"))
+    return emitBinarySpecial<py::MatMulOp>(expr, "__matmul__", lhs, rhs,
+                                           result);
   // A fall-through to __add__ here would silently mis-execute unhandled
   // operators (`a @ b` on non-tensors used to become an addition).
   std::string spelling = op ? op->kind : std::string("<missing>");

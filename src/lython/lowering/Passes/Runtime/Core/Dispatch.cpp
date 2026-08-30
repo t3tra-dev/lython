@@ -109,7 +109,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto unary) { return lowerUnaryMethodOp(unary); })
       .Case<py::AddOp, py::SubOp, py::MulOp, py::DivOp, py::FloorDivOp,
             py::ModOp, py::LShiftOp, py::RShiftOp, py::BitAndOp, py::BitOrOp,
-            py::BitXorOp, py::PowOp, py::EqOp, py::NeOp, py::LtOp, py::LeOp,
+            py::BitXorOp, py::PowOp, py::MatMulOp, py::EqOp, py::NeOp,
+            py::LtOp, py::LeOp,
             py::GtOp,
             py::GeOp>([&](auto binary) { return lowerBinaryMethodOp(binary); })
       .Case<py::ReprOp>(

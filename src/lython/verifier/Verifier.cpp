@@ -593,6 +593,9 @@ mlir::LogicalResult BitXorOp::verify() {
 mlir::LogicalResult PowOp::verify() {
   return verifySpecialMethod(getOperation());
 }
+mlir::LogicalResult MatMulOp::verify() {
+  return verifySpecialMethod(getOperation());
+}
 mlir::LogicalResult LeOp::verify() {
   return verifySpecialMethod(getOperation());
 }
