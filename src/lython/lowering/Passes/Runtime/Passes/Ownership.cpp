@@ -3233,6 +3233,51 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
     // Per pass over the candidate set: an emitter incref may pay for only one
     // lane, and the set is rebuilt because the candidates are.
     llvm::DenseSet<mlir::Operation *> creditedIncrefs;
+    // ⭐ ONE TOKEN CANNOT BE TRANSFERRED TWICE ON ONE EDGE. A terminator may
+    // forward the SAME value into two destination arguments -- a generator
+    // loop whose body conditionally yields does exactly that, sending the
+    // carried local both to the argument that carries it on and to the
+    // argument the merge releases as "the value that was replaced". Each
+    // group asked `diesOnEdge` on its own and each got yes (the destination
+    // reads only its arguments), so both took the one token, the merge freed
+    // the value the loop was still using, and the next trip aborted in
+    // `Ly_IncRef` on a dead object. The same loop outside a generator is
+    // sound because there the release names the pre-merge value directly,
+    // which keeps it live and makes the edge lend instead.
+    //
+    // The lowest destination argument index keeps the transfer and the rest
+    // lend, so the choice does not depend on the candidate map's iteration
+    // order.
+    llvm::DenseMap<std::pair<mlir::Operation *, unsigned>,
+                   llvm::DenseMap<mlir::Value, unsigned>>
+        edgeTokenClaims;
+    for (auto &entry : candidates) {
+      auto *destBlock =
+          mlir::cast<mlir::BlockArgument>(entry.second.args.front()).getOwner();
+      for (mlir::Block *pred : destBlock->getPredecessors()) {
+        auto branch =
+            mlir::dyn_cast<mlir::BranchOpInterface>(pred->getTerminator());
+        if (!branch)
+          continue;
+        for (unsigned s = 0, e = pred->getTerminator()->getNumSuccessors();
+             s < e; ++s) {
+          if (pred->getTerminator()->getSuccessor(s) != destBlock)
+            continue;
+          mlir::SuccessorOperands ops = branch.getSuccessorOperands(s);
+          for (mlir::Value arg : entry.second.args) {
+            unsigned idx =
+                mlir::cast<mlir::BlockArgument>(arg).getArgNumber();
+            mlir::Value incoming = idx < ops.size() ? ops[idx] : mlir::Value();
+            if (!incoming)
+              continue;
+            auto &claims = edgeTokenClaims[{pred->getTerminator(), s}];
+            auto found = claims.find(incoming);
+            if (found == claims.end() || idx < found->second)
+              claims[incoming] = idx;
+          }
+        }
+      }
+    }
     for (auto &entry : candidates) {
       Candidate &candidate = entry.second;
       auto firstArg = mlir::cast<mlir::BlockArgument>(candidate.args.front());
@@ -3281,6 +3326,14 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
             // telling them apart is what the group line above cannot do.
             bool owned = isOwnedIncoming(incoming);
             bool dies = diesOnEdge(incoming, pred->getTerminator(), destBlock);
+            if (dies) {
+              auto claims = edgeTokenClaims.find({pred->getTerminator(), s});
+              if (claims != edgeTokenClaims.end()) {
+                auto claimed = claims->second.find(incoming);
+                if (claimed != claims->second.end() && claimed->second != idx)
+                  dies = false;
+              }
+            }
             if (ownershipTransferTraceEnabled()) {
               auto blockOf = [&](mlir::Block *block) {
                 unsigned i = 0;
