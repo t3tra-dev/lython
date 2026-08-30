@@ -11,7 +11,9 @@ dict; dict subclassing is outside the static surface, so this port is a
 COMPOSITION over a `dict[str, int]` field with the same observable method
 semantics:
   - c[missing] returns 0 (CPython Counter.__missing__), and does NOT insert
-  - Counter(iterable) counts elements of an iterable of keys, like update
+  - Counter(iterable) counts elements of an iterable of keys, like update;
+    a str counts its characters, as CPython's own `Counter("mississippi")`
+    example does
   - update/subtract count elements of an iterable of keys
   - most_common() orders by count descending, insertion-ordered on ties
     (matches CPython's stable sort ordering); most_common(None) == all
@@ -61,9 +63,15 @@ __all__ = ["Counter", "OrderedDict"]
 
 
 class Counter:
-    def __init__(self, iterable: list[str] | None = None) -> None:
+    def __init__(self, iterable: "list[str] | str | None" = None) -> None:
         self.data: dict[str, int] = {}
-        if iterable is not None:
+        # ⛔ The isinstance arm and not `if iterable is not None: update(...)`:
+        # eliminating None from a THREE-member union does not narrow the value
+        # this call passes, so `update` was handed its own parameter type plus
+        # None. Each arm here hands it one member.
+        if isinstance(iterable, str):
+            self.update(iterable)
+        elif iterable is not None:
             self.update(iterable)
 
     def __getitem__(self, key: str) -> int:
@@ -129,19 +137,41 @@ class Counter:
         # matching CPython's ordering.
         return self - (self - other)
 
-    def update(self, iterable: list[str]) -> None:
-        for elem in iterable:
-            if elem in self.data:
-                self.data[elem] = self.data[elem] + 1
-            else:
-                self.data[elem] = 1
+    def update(self, iterable: "list[str] | str") -> None:
+        # A STR IS AN ITERABLE OF ITS CHARACTERS, which is how CPython's
+        # `Counter("mississippi")` -- the example in its own docstring -- counts
+        # letters. This port took `list[str]` and refused the string, which is a
+        # deviation typeshed does not have (`Iterable[_T]`).
+        #
+        # ⛔ Written as an isinstance branch and not as one loop over the union:
+        # iterating a union is refused ("static type !py.union<...> ..."), so
+        # the narrowing is what makes each arm a single concrete iterable.
+        if isinstance(iterable, str):
+            for ch in iterable:
+                if ch in self.data:
+                    self.data[ch] = self.data[ch] + 1
+                else:
+                    self.data[ch] = 1
+        else:
+            for elem in iterable:
+                if elem in self.data:
+                    self.data[elem] = self.data[elem] + 1
+                else:
+                    self.data[elem] = 1
 
-    def subtract(self, iterable: list[str]) -> None:
-        for elem in iterable:
-            if elem in self.data:
-                self.data[elem] = self.data[elem] - 1
-            else:
-                self.data[elem] = -1
+    def subtract(self, iterable: "list[str] | str") -> None:
+        if isinstance(iterable, str):
+            for ch in iterable:
+                if ch in self.data:
+                    self.data[ch] = self.data[ch] - 1
+                else:
+                    self.data[ch] = -1
+        else:
+            for elem in iterable:
+                if elem in self.data:
+                    self.data[elem] = self.data[elem] - 1
+                else:
+                    self.data[elem] = -1
 
     def keys(self) -> list[str]:
         result: list[str] = []
