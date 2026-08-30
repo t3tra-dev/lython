@@ -844,4 +844,34 @@ TEST(EmitterTest, RepeatedEmitIsStable) {
   }
 }
 
-} // namespace
+// What: a class that declares `__del__` is refused, and the message says the
+// finalizer would never run. Nothing calls it -- not at scope exit, not when a
+// container drops its last reference, not at module teardown -- so accepting
+// the class means printing one line fewer than CPython with no diagnostic.
+TEST(EmitterTest, AClassWithAFinalizerIsRefused) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult refused =
+      emitSource("class R:\n"
+                 "    def __init__(self, n: int) -> None:\n"
+                 "        self.n = n\n"
+                 "    def __del__(self) -> None:\n"
+                 "        print(self.n)\n"
+                 "R(1)\n",
+                 context);
+  EXPECT_FALSE(refused.ok());
+  bool named = false;
+  for (const lython::parser::Diagnostic &diagnostic : refused.diagnostics)
+    named = named || diagnostic.message.find("__del__ is not supported") !=
+                         std::string::npos;
+  EXPECT_TRUE(named);
+
+  mlir::MLIRContext accepting(testRegistry());
+  lython::emitter::EmitResult accepted =
+      emitSource("class R:\n"
+                 "    def __init__(self, n: int) -> None:\n"
+                 "        self.n = n\n"
+                 "R(1)\n",
+                 accepting);
+  EXPECT_TRUE(accepted.ok());
+}
+}
