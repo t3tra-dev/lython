@@ -754,6 +754,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             {llvm::StringLiteral("round"), llvm::StringLiteral("__round__")},
             {llvm::StringLiteral("reversed"),
              llvm::StringLiteral("__reversed__")},
+            {llvm::StringLiteral("bytes"), llvm::StringLiteral("__bytes__")},
+            {llvm::StringLiteral("complex"),
+             llvm::StringLiteral("__complex__")},
         };
     // ⛔ Not len() and not hash(): those two already reach a source class
     // through their own folds, and hash's fold is not just the call -- it
@@ -762,8 +765,17 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     llvm::StringRef builtinName = ast::nameSpelling(*calleeNode);
     const auto *dunderArgs = ast::nodeList(expr, "args");
     const auto *dunderKeywords = ast::nodeList(expr, "keywords");
-    if (dunderArgs && dunderArgs->size() == 1 && dunderArgs->front() &&
-        dunderArgs->front()->kind != "Starred" &&
+    // ⛔ `round` IS THE ONE WITH A SECOND ARGUMENT, and `round(c, 2)` reached
+    // the lowering as "runtime manifest has no C.__round__ method" while
+    // `round(c)` dispatched here. Only round: `int(x, base)` is a different
+    // manifest overload and must NOT be routed to `__int__`.
+    std::size_t maximumArguments = builtinName == "round" ? 2u : 1u;
+    if (dunderArgs && !dunderArgs->empty() &&
+        dunderArgs->size() <= maximumArguments &&
+        llvm::none_of(*dunderArgs,
+                      [](const parser::NodePtr &argument) {
+                        return !argument || argument->kind == "Starred";
+                      }) &&
         (!dunderKeywords || dunderKeywords->empty()) &&
         !programBindsName(builtinName))
       for (const auto &[name, dunder] : kDunderBuiltins) {
@@ -776,8 +788,11 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // path below emits it.
         if (lookupClassMethod(argumentType, dunder)) {
           Value receiver = emitExpr(dunderArgs->front().get());
+          llvm::SmallVector<Value, 1> extra;
+          for (const parser::NodePtr &argument : llvm::drop_begin(*dunderArgs))
+            extra.push_back(emitExpr(argument.get()));
           if (std::optional<Value> dispatched =
-                  tryEmitClassDunder(expr, receiver, dunder))
+                  tryEmitClassDunder(expr, receiver, dunder, extra))
             return *dispatched;
         }
         break;
