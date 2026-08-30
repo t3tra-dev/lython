@@ -948,14 +948,46 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   // filters on what is already in scope. The target is passed as a hint so a
   // body that assigns FROM it (`last = v`) can be typed.
   llvm::StringMap<mlir::Type> targetHints;
-  if (const parser::Node *targetNode = ast::node(statement, "target"))
-    if (targetNode->kind == "Name")
-      if (mlir::Type element =
-              types.iterationElementType(ast::node(statement, "iter")))
+  if (const parser::Node *targetNode = ast::node(statement, "target")) {
+    mlir::Type element = types.iterationElementType(ast::node(statement, "iter"));
+    if (element) {
+      if (targetNode->kind == "Name") {
         targetHints[ast::nameSpelling(*targetNode)] = element;
+      } else if (targetNode->kind == "Tuple" || targetNode->kind == "List") {
+        // `for k, v in d.items()` binds two names, and the element type is the
+        // pair they destructure.
+        const auto *elements = ast::nodeList(*targetNode, "elts");
+        auto pair = mlir::dyn_cast<py::ContractType>(element);
+        if (elements && pair && pair.getContractName() == "builtins.tuple" &&
+            pair.getArguments().size() == elements->size())
+          for (size_t index = 0; index < elements->size(); ++index)
+            if (const parser::NodePtr &name = (*elements)[index];
+                name && name->kind == "Name")
+              targetHints[ast::nameSpelling(*name)] = pair.getArguments()[index];
+      }
+    }
+  }
+  // ⭐ THE TARGET SURVIVES THE LOOP, which is what CPython does: `for i in
+  // range(3): pass` leaves `i` bound to 2, and the idiom that reads the last
+  // index after the walk was refused outright with "unresolved name 'i'".
+  // The earlier reading -- that a loop introducing the name has no value to
+  // carry on the zero-trip path, so refusing is safer -- is answered by the
+  // slot these bindings already use: `tracksBinding` makes the unbound read
+  // raise NameError, which is exactly what CPython raises for `for x in []:
+  // pass` / `print(x)`. Refusing was inventing a static error for a program
+  // whose only failure is dynamic and conditional.
+  //
+  // ⛔ NOT the comprehension targets, and nothing here excludes them: the
+  // comprehension and genexpr paths restore the bindings they made when they
+  // finish, so a slot created inside one is gone by the time the read after it
+  // is resolved. `[x for x in xs]` / `print(x)` keeps its refusal (measured).
+  llvm::StringMap<mlir::Type> targetLocals;
+  for (const auto &hint : targetHints)
+    if (loopTargetOutlivesLoop(hint.getKey(), statement))
+      targetLocals[hint.getKey()] = hint.getValue();
   bindConditionallyAssignedLocals(statement,
                                   {ast::nodeList(statement, "body"), orelse},
-                                  &targetHints);
+                                  &targetHints, &targetLocals);
   if (const parser::Node *iterNode = ast::node(statement, "iter");
       iterNode && iterNode->kind == "GeneratorExp") {
     if (hasElse) {

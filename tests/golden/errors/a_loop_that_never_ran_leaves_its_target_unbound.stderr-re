@@ -1,0 +1,7 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*a_loop_that_never_ran_leaves_its_target_unbound\.py",\ line\ 11,\ in\ <module>\
+\ \ \ \ print\(first_index\(0\)\)\
+\ \ \ \ \ \ \ \ \ \ \~\~\~\~\~\~\~\~\~\~\~\^\^\^\
+\ \ File\ ".*a_loop_that_never_ran_leaves_its_target_unbound\.py",\ line\ 8,\ in\ first_index\
+\ \ \ \ return\ i\
+UnboundLocalError:\ cannot\ access\ local\ variable\ 'i'\ where\ it\ is\ not\ associated\ with\ a\ value

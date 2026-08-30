@@ -650,6 +650,49 @@ bool ModuleEmitter::nameIsReadAfterCurrentStatement(llvm::StringRef name) const 
   return false;
 }
 
+// ⭐ CPYTHON LEAVES THE TARGET BOUND, and refusing the read after the loop
+// made the idiom that reports the last index reachable only by declaring the
+// name first. `nameIsReadAfterCurrentStatement` cannot answer this: it says NO
+// for every name the suite binds, which is what keeps a REUSED target spelling
+// (`for i, x in enumerate(["a"])` then `for i, x in enumerate([5])`) from being
+// forced through one slot of one type. That rule is about the spelling being
+// bound MORE THAN ONCE, so this asks exactly that instead.
+//
+// ⛔ ONE BINDING SITE, not one type. Two loops whose targets happen to agree
+// still keep the refusal here (`for i in range(3): for i in range(2): pass` /
+// `print(i)`) -- checking that would mean inferring an element type per site,
+// and the sites that disagree are the reason the restriction exists at all.
+//
+// ⛔ AND ONE SUITE. The read has to be in the suite the loop is in, so an
+// INNER loop's target read after the OUTER loop (`for row in rows: for cell in
+// row: ...` / `print(cell)`) keeps the refusal: `currentSuite` is the inner
+// body by then and the enclosing suites are on the C++ stack.
+bool ModuleEmitter::loopTargetOutlivesLoop(
+    llvm::StringRef name, const parser::Node &statement) const {
+  if (!currentSuite)
+    return false;
+  for (const parser::NodePtr &other : *currentSuite)
+    if (other.get() != &statement && containsBindingTarget(other.get(), name))
+      return false;
+  // Rebound inside the loop, so the element type is not what the slot holds.
+  for (const char *field : {"body", "orelse"})
+    if (const auto *body = ast::nodeList(statement, field))
+      for (const parser::NodePtr &inner : *body)
+        if (containsBindingTarget(inner.get(), name))
+          return false;
+  // The `else` clause runs on the exit edge and reads the target like anything
+  // after the loop does -- `for i in r: pass` / `else: print(i)`.
+  if (const auto *orelse = ast::nodeList(statement, "orelse"))
+    for (const parser::NodePtr &inner : *orelse)
+      if (containsNameLoad(inner.get(), name))
+        return true;
+  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
+       ++index)
+    if (containsNameLoad((*currentSuite)[index].get(), name))
+      return true;
+  return false;
+}
+
 mlir::Type ModuleEmitter::inferConditionalLocalType(
     llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
     llvm::StringRef name) {
@@ -707,10 +750,14 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
 void ModuleEmitter::bindConditionallyAssignedLocals(
     const parser::Node &anchor,
     llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
-    const llvm::StringMap<mlir::Type> *inferenceHints) {
+    const llvm::StringMap<mlir::Type> *inferenceHints,
+    const llvm::StringMap<mlir::Type> *boundWithKnownType) {
   llvm::StringSet<> assigned;
   for (const std::vector<parser::NodePtr> *body : bodies)
     collectAssignedNames(body, assigned);
+  if (boundWithKnownType)
+    for (const auto &entry : *boundWithKnownType)
+      assigned.insert(entry.getKey());
   llvm::SmallVector<std::string, 4> names;
   for (const auto &entry : assigned) {
     llvm::StringRef name = entry.getKey();
@@ -732,7 +779,8 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
     // inside an `if` and the read is after the `if`) is not seen here and
     // keeps the unresolved-name diagnostic. Widening it means threading the
     // enclosing suites, which is a bigger change than the one this makes.
-    if (!nameIsReadAfterCurrentStatement(name))
+    if (!(boundWithKnownType && boundWithKnownType->count(name)) &&
+        !nameIsReadAfterCurrentStatement(name))
       continue;
     names.push_back(name.str());
   }
@@ -749,9 +797,28 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
     if (inferenceHints)
       for (const auto &hint : *inferenceHints)
         types.bindSymbol(hint.getKey(), hint.getValue());
-    for (const std::string &name : names)
+    for (const std::string &name : names) {
+      // The known type wins: the loop target's type is the iterable's element
+      // type, and a body that reassigns the target to something else would
+      // otherwise decide the slot.
+      if (boundWithKnownType) {
+        auto known = boundWithKnownType->find(name);
+        if (known != boundWithKnownType->end()) {
+          // The same storability rule `inferConditionalLocalType` ends with:
+          // `for x in []` has an erased element type, and a slot for it
+          // accepts every write and refuses every read -- the program left
+          // the emitter and died in the lowering as "a type-erased `object`
+          // value cannot be stored in field 'class.v'". With no slot it keeps
+          // the unresolved-name refusal, which is what it had before.
+          if (mlir::isa_and_nonnull<py::ContractType>(known->getValue()) &&
+              !py::isPyObjectType(known->getValue()))
+            contents.emplace_back(name, known->getValue());
+          continue;
+        }
+      }
       if (mlir::Type content = inferConditionalLocalType(bodies, name))
         contents.emplace_back(name, content);
+    }
   }
   for (const auto &[name, content] : contents) {
     auto unbound = py::UnboundOp::create(builder, loc(anchor), content);

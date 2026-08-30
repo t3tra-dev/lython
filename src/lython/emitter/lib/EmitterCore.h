@@ -887,11 +887,20 @@ private:
   // survives the region and a read before it raises instead of failing to
   // resolve. Names whose type cannot be settled from the source are left
   // alone and keep the unresolved-name diagnostic.
+  // `boundWithKnownType` names are bound with the type given rather than one
+  // inferred from the bodies -- a loop target, whose type comes from the
+  // iterable and not from any assignment inside the region.
   void bindConditionallyAssignedLocals(
       const parser::Node &anchor,
       llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
-      const llvm::StringMap<mlir::Type> *inferenceHints = nullptr);
+      const llvm::StringMap<mlir::Type> *inferenceHints = nullptr,
+      const llvm::StringMap<mlir::Type> *boundWithKnownType = nullptr);
   bool nameIsReadAfterCurrentStatement(llvm::StringRef name) const;
+  // Should this loop's target keep its binding after the loop, the way
+  // CPython's does? Only when this statement is the one place in the suite
+  // that binds the spelling, so one slot with one type is the whole story.
+  bool loopTargetOutlivesLoop(llvm::StringRef name,
+                              const parser::Node &statement) const;
   // Conservative: true whenever the walk cannot see the whole remaining scope.
   bool nameMayBeReadAfterCurrentStatement(llvm::StringRef name) const;
   mlir::Type inferConditionalLocalType(
