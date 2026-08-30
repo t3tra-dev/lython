@@ -1,43 +1,41 @@
-# A generator that YIELDS an object and keeps binding it aborts at runtime:
-# `Ly_DecRef observed non-positive refcount` on a later trip. The value goes to
-# the consumer AND stays in the suspended frame, which is TWO references, and
-# the suspend lanes carry one.
+# FIXED 2026-08-30, in two repairs, and this program needed both.
 #
-# ⭐ THE LANE MACHINERY ALREADY STATES THE RULE. `appendGeneratorLaneReturnOperands`
-# (Ops/GeneratorStateMachine.cpp) retains when `forceRetain` says "the SAME
-# value carried by two lanes, and two lanes are two references however the
-# first one was obtained". Its caller (ABI/Returns.cpp) computes that with
+# It yields a list it also keeps binding, so the value has TWO holders at every
+# suspend -- the consumer and the frame -- and it aborted in `Ly_DecRef` on the
+# second trip.
 #
-#     bool duplicate = !laneCarriedValues.insert(operand).second;
+# ⭐ THE LANE COMPARISON WAS ASKING ABOUT THE WRONG THING.
+# `appendGeneratorLaneReturnOperands` already retains when two lanes carry one
+# value; the caller (ABI/Returns.cpp) deduped on the LOGICAL return operand,
+# and `current.append(v)` rebinds it, so the yield lane held the call result
+# and the frame lane the block argument the loop threads. Comparing the
+# physical group fixes that; comparing what every predecessor forwards into
+# each lane's block argument fixes the conditional yield, where the two lanes
+# arrive as arguments 1 and 9 of one suspend block. `resolveLaneEntity` is
+# both steps.
 #
-# on the LOGICAL operand -- and one entity reaches the yield lane and the frame
-# lane through two py-dialect values, so the set never sees a duplicate and
-# neither lane retains. Traced by printing each lane's index, contract and
-# resolved value at that line.
+# ⭐ AND ONE TOKEN CANNOT BE TRANSFERRED TWICE ON ONE EDGE. With the lanes
+# fixed the abort moved to `Ly_IncRef` on a dead object: the loop's merge takes
+# both the value it carries on and the value it releases as "replaced", and on
+# the trip that did not rebind they are the same object. Each argument group
+# asked `diesOnEdge` alone and each said yes. The same loop outside a generator
+# is sound only because there the release names the pre-merge value directly --
+# a use past the edge -- which is why "the same loop, not in a generator" read
+# as clean and made this look like a generator-only defect.
 #
-# ⛔ COMPARING THE PHYSICAL ENTITY IS NOT ENOUGH EITHER, measured. Keying on
-# `underlyingObjectValue(bundle->physicalValues().front())` fixes the plain
-# `yield x; x = []` loop; the CONDITIONAL yield then still fails, because the
-# two lanes arrive as two ARGUMENTS (index 1 and index 9) of the same suspend
-# block. Walking each block argument back to the value every predecessor
-# forwards fixes that one too -- and the shape below, whose only difference is
-# that the condition names a PARAMETER, still aborts. That last step is where
-# the reduction stopped being trustworthy: three bisects in a row put the
-# boundary somewhere the next program contradicted.
+# The earlier note recorded two keys that each fixed one shape and left the
+# next; the boundary they could not characterise was the second repair, not a
+# third key. THE NEIGHBOURS, all measured green now:
+#   yield without a rebind, rebind without the append, the same loop outside a
+#   generator, `for` over a list parameter, `list(chunks(...))`, a
+#   comprehension, two generators of this shape in one module.
 #
-# ⛔ SO NOTHING IS SHIPPED. Both keys above are correct as far as they go and
-# neither characterises the boundary, and a refcount change whose boundary is
-# not characterised is the one kind this compiler must not carry. What is
-# recorded is the mechanism and the two keys, so the next attempt starts from
-# the lane comparison rather than from the crash.
+# ⛔ A yield inside a `try` in a loop is still refused -- "unwind cleanup cannot
+# target a handler entry with block arguments" -- which is a different
+# mechanism and not a mis-execution.
 #
-# THE NEIGHBOURS, all measured:
-#   yield without a rebind ............................ clean
-#   rebind without the append (nothing mutates) ....... clean
-#   the same accumulate/rebind loop NOT in a generator  clean
-#   `for` over a list parameter instead of range ...... aborts
-#   `list(chunks(...))` or a comprehension ............ aborts
-#   two generators of this shape in one module ........ aborts
+# Goldens: cases/a_generator_yields_the_list_it_keeps_filling (first repair),
+# cases/a_generator_replaces_the_list_it_just_yielded (second).
 def chunks(values: list[int], size: int):
     current: list[int] = []
     for v in values:
