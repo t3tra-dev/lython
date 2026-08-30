@@ -2110,10 +2110,26 @@ bool releaseOwnedGroupByLiveness(
       // pin, so treat that like a top-level terminator use (ignored).
       if (user->hasTrait<mlir::OpTrait::IsTerminator>())
         continue;
-      mlir::Operation *blockUser =
-          groupHasConsumingCall && user->getBlock()->getParent() != region
-              ? nullptr
-              : ancestorInRegion(user, region);
+      // ⭐ A VIEW READ INSIDE A REGION OP PINS AT THE REGION OP, consuming
+      // call or not. The extra condition here answered "no ancestor" for a
+      // group that has a consuming call and a view used in a nested region,
+      // and the caller reads that as "place nothing" -- so the worklist loop
+      //
+      //     pending = ["a"]
+      //     for n in range(2):
+      //         for task in pending:  # the element load, inside an scf.if
+      //             pass
+      //         pending = []
+      //
+      // got NO releases at all for its carried list, and the affine verifier
+      // refused the program: "owned resource from @LyList_FromLength result 0
+      // reaches function exit without release". The back edge's
+      // decref-on-replace was there; the loop's EXIT edge had nothing.
+      //
+      // ⛔ The bail is kept for a use with no ancestor in this region at all,
+      // which is the case the null check was written for -- the walk cannot
+      // place a release for a use it cannot reach from here.
+      mlir::Operation *blockUser = ancestorInRegion(user, region);
       if (!blockUser)
         return false;
       if (blockUser->hasTrait<mlir::OpTrait::IsTerminator>())
