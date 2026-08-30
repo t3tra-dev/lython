@@ -1826,10 +1826,10 @@ std::optional<Value> ModuleEmitter::emitOptionalCompare(
 // -- while `vec * 2` worked, so the same expression written the other way
 // round was the difference between running and not.
 //
-// ⛔ ARITHMETIC AND BITWISE ONLY. A comparison's reflection is the OPPOSITE
-// operator on the other operand (`a < b` tries `b.__gt__(a)`), which is a
-// different rule and not a name transformation; routing it through here would
-// call `__rlt__`, which is not a protocol.
+// ⭐ A COMPARISON REFLECTS BY THE OPPOSITE OPERATOR, not by an `r` prefix:
+// `a < b` tries `b.__gt__(a)`, and `__rlt__` is not a protocol. Two tables,
+// because they are two rules -- `1 < money` was refused exactly like `2 * vec`
+// was, and for the same reason.
 //
 // ⛔ And only when the left side has no answer of its own: this runs after the
 // manifest inference has failed, so an operator that already resolves keeps
@@ -1837,7 +1837,17 @@ std::optional<Value> ModuleEmitter::emitOptionalCompare(
 std::optional<Value>
 ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
                                       llvm::StringRef method, Value lhs,
-                                      Value rhs) {
+                                      Value rhs,
+                                      bool leftInferenceSucceeded) {
+  // ⭐ A MANIFEST METHOD CANNOT KNOW ABOUT A SOURCE CLASS, so an inference that
+  // "succeeds" for `1 == m` did it through `object` and the lowering then
+  // failed outright ("cannot adapt M to runtime input 1 of
+  // builtins.int.__eq__"). CPython answers that call with NotImplemented and
+  // asks the right operand, which is what this does. A SOURCE class on the
+  // left keeps its own answer whenever it has one.
+  if (leftInferenceSucceeded &&
+      isSourceDefinedContract(types.widenLiteral(lhs.type)))
+    return std::nullopt;
   static constexpr llvm::StringLiteral kReflectable[] = {
       llvm::StringLiteral("__add__"),      llvm::StringLiteral("__sub__"),
       llvm::StringLiteral("__mul__"),      llvm::StringLiteral("__matmul__"),
@@ -1846,13 +1856,30 @@ ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
       llvm::StringLiteral("__lshift__"),   llvm::StringLiteral("__rshift__"),
       llvm::StringLiteral("__and__"),      llvm::StringLiteral("__or__"),
       llvm::StringLiteral("__xor__")};
-  if (!llvm::is_contained(kReflectable, method))
-    return std::nullopt;
+  static constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral>
+      kMirrored[] = {
+          {llvm::StringLiteral("__lt__"), llvm::StringLiteral("__gt__")},
+          {llvm::StringLiteral("__gt__"), llvm::StringLiteral("__lt__")},
+          {llvm::StringLiteral("__le__"), llvm::StringLiteral("__ge__")},
+          {llvm::StringLiteral("__ge__"), llvm::StringLiteral("__le__")},
+          {llvm::StringLiteral("__eq__"), llvm::StringLiteral("__eq__")},
+          {llvm::StringLiteral("__ne__"), llvm::StringLiteral("__ne__")}};
+  std::string reflected;
+  if (llvm::is_contained(kReflectable, method)) {
+    reflected = ("__r" + method.drop_front(2)).str();
+  } else {
+    for (const auto &[spelling, mirror] : kMirrored)
+      if (method == spelling) {
+        reflected = mirror.str();
+        break;
+      }
+    if (reflected.empty())
+      return std::nullopt;
+  }
   auto rightContract =
       mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(rhs.type));
   if (!rightContract || !isSourceDefinedContract(rightContract))
     return std::nullopt;
-  std::string reflected = ("__r" + method.drop_front(2)).str();
   if (!lookupClassMethod(rightContract, reflected))
     return std::nullopt;
   return tryEmitClassDunder(anchor, rhs, reflected, {lhs});

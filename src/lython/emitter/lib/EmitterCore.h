@@ -763,7 +763,8 @@ private:
   // the right operand is not a source class that defines it.
   std::optional<Value> tryEmitReflectedBinary(const parser::Node &anchor,
                                               llvm::StringRef method,
-                                              Value lhs, Value rhs);
+                                              Value lhs, Value rhs,
+                                              bool leftInferenceSucceeded);
   std::optional<Value> tryEmitClassDunder(const parser::Node &anchor,
                                           Value receiver,
                                           llvm::StringRef dunder,
