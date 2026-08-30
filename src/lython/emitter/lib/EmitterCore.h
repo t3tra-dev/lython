@@ -761,6 +761,11 @@ private:
   // `a OP b` where a's type has no such operator and b's class provides the
   // REFLECTED one. Returns nothing when the operator is not reflectable or
   // the right operand is not a source class that defines it.
+  // `x in obj` where obj's class has no `__contains__` but is iterable:
+  // CPython falls back to iteration, and so does this, by rewriting to
+  // `any(<x> == <element> for <element> in obj)` before the operands are
+  // emitted. Returns nothing when the shape does not apply.
+  std::optional<Value> tryEmitIterableMembership(const parser::Node &expr);
   std::optional<Value> tryEmitReflectedBinary(const parser::Node &anchor,
                                               llvm::StringRef method,
                                               Value lhs, Value rhs,

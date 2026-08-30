@@ -1078,11 +1078,86 @@ std::optional<Value> ModuleEmitter::emitComplexBinary(const parser::Node &expr,
                                       *promotedRhs, complexType);
 }
 
+// ⭐ `in` FALLS BACK TO ITERATION, which is what CPython does for a class with
+// no `__contains__`. A container class that defines `__iter__` (or the
+// `__len__`/`__getitem__` sequence pair) answered `4 in seq` with "static type
+// 'Seq' does not provide manifest method '__contains__'", while `for v in seq`
+// over the same object worked -- so the membership test was the one place the
+// iteration protocol did not reach.
+//
+// The rewrite is `any(<needle> == <element> for <element> in <container>)`,
+// built before either operand is emitted so the container is evaluated exactly
+// once (the genexpr's iterable position). It goes through the generator-
+// expression fusion, which already runs in expression position inside `and` /
+// `or` chains.
+//
+// ⛔ ONLY A NEEDLE THAT COSTS NOTHING TO EVALUATE TWICE. The rewrite puts it
+// inside the loop body, so it runs once per element; `f() in seq` would call
+// `f` per element instead of once and keeps its refusal. A name, a constant or
+// an attribute read is safe, which is what the shape almost always is.
+std::optional<Value>
+ModuleEmitter::tryEmitIterableMembership(const parser::Node &expr) {
+  const auto *ops = ast::nodeList(expr, "ops");
+  const auto *comparators = ast::nodeList(expr, "comparators");
+  if (!ops || ops->size() != 1 || !comparators || comparators->size() != 1)
+    return std::nullopt;
+  const parser::Node *op = (*ops)[0].get();
+  bool negated = ast::isOperator(op, "NotIn");
+  if (!negated && !ast::isOperator(op, "In"))
+    return std::nullopt;
+  const parser::Field *leftField = parser::findField(expr, "left");
+  if (!leftField || !std::holds_alternative<parser::NodePtr>(leftField->value))
+    return std::nullopt;
+  parser::NodePtr needle = std::get<parser::NodePtr>(leftField->value);
+  parser::NodePtr container = (*comparators)[0];
+  if (!needle || !container)
+    return std::nullopt;
+  if (needle->kind != "Name" && needle->kind != "Constant" &&
+      needle->kind != "Attribute")
+    return std::nullopt;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      types.widenLiteral(types.inferExpr(container.get())));
+  if (!contract || !isSourceDefinedContract(contract))
+    return std::nullopt;
+  if (lookupClassMethod(contract, "__contains__"))
+    return std::nullopt;
+  bool iterable = lookupClassMethod(contract, "__iter__").has_value() ||
+                  (lookupClassMethod(contract, "__len__").has_value() &&
+                   lookupClassMethod(contract, "__getitem__").has_value());
+  if (!iterable || programBindsName("any"))
+    return std::nullopt;
+
+  parser::SourceRange range = expr.range;
+  std::string element =
+      "__lymember" + std::to_string(++listCompCounter) + "_v";
+  parser::NodePtr generator = parser::makeNode("comprehension", range);
+  parser::addField(*generator, "target", synth::name(element, range));
+  parser::addField(*generator, "iter", container);
+  parser::addField(*generator, "ifs", std::vector<parser::NodePtr>{});
+  parser::addField(*generator, "is_async", static_cast<std::int64_t>(0));
+  parser::NodePtr genexp = parser::makeNode("GeneratorExp", range);
+  parser::addField(*genexp, "elt",
+                   synth::compare(needle, "Eq", synth::name(element, range),
+                                  range));
+  parser::addField(*genexp, "generators",
+                   std::vector<parser::NodePtr>{std::move(generator)});
+  parser::NodePtr found = synth::call(synth::name("any", range),
+                                      std::vector<parser::NodePtr>{std::move(genexp)},
+                                      range);
+  if (negated)
+    found = synth::notOp(std::move(found), range);
+  Value result{};
+  runWithScratchNames({element}, [&] { result = emitExpr(found.get()); });
+  return result;
+}
+
 Value ModuleEmitter::emitCompare(const parser::Node &expr) {
   // Membership against dict views rewrites before operand emission — the
   // views have no runtime object (EmitterIterators.cpp).
   if (std::optional<Value> view = tryEmitDictViewMembership(expr))
     return *view;
+  if (std::optional<Value> membership = tryEmitIterableMembership(expr))
+    return *membership;
   Value lhs = emitExpr(ast::node(expr, "left"));
   const auto *comparators = ast::nodeList(expr, "comparators");
   const auto *ops = ast::nodeList(expr, "ops");
