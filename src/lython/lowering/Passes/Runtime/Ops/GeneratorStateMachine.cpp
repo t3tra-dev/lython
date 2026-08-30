@@ -1179,20 +1179,33 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     // and is what the continuation reads the value back from, so a lane
     // carrying nothing would still need a rematerialization at the far end.
     // This does that rematerialization once, where the value is defined.
+    //
+    // ⭐ AND A CONSTANT, for the same reason and with a worse symptom. The i1
+    // a `continue` leaves live across a yield is `arith.constant true` -- a
+    // machine bit with no runtime contract, so no lane can be keyed on it and
+    // the generator went to the tier below, which refused it for a limit it
+    // was never there for ("yields whose runtime value is a single lane", of a
+    // `str`). Every operand-free pure op with one result is rematerializable
+    // by the argument above, so the sink asks that instead of naming ops.
     {
-      llvm::SmallVector<py::TypeObjectOp, 4> typeObjects;
-      clone.walk([&](py::TypeObjectOp op) { typeObjects.push_back(op); });
-      for (py::TypeObjectOp typeObject : typeObjects) {
+      llvm::SmallVector<mlir::Operation *, 8> rematerializable;
+      clone.walk([&](mlir::Operation *op) {
+        if (op->getNumOperands() == 0 && op->getNumResults() == 1 &&
+            op->getRegions().empty() && mlir::isMemoryEffectFree(op) &&
+            !op->hasTrait<mlir::OpTrait::IsTerminator>())
+          rematerializable.push_back(op);
+      });
+      for (mlir::Operation *op : rematerializable) {
         llvm::SmallVector<mlir::OpOperand *, 4> uses;
-        for (mlir::OpOperand &use : typeObject.getResult().getUses())
+        for (mlir::OpOperand &use : op->getResult(0).getUses())
           uses.push_back(&use);
         for (mlir::OpOperand *use : uses) {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPoint(use->getOwner());
-          mlir::Operation *copy = builder.clone(*typeObject.getOperation());
+          mlir::Operation *copy = builder.clone(*op);
           use->set(copy->getResult(0));
         }
-        typeObject.erase();
+        op->erase();
       }
     }
 

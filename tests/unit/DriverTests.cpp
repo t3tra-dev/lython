@@ -1420,13 +1420,12 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
 // Driver-layer and not golden: the whole behaviour is a refusal, and the
 // control is the same generator without the skip, which compiles.
 TEST(DriverTest, ARefusedGeneratorNamesWhatSentItDown) {
-  CompileResult refused = compileSource("def lines(text: str):\n"
-                                        "    for line in text.splitlines():\n"
-                                        "        if not line:\n"
-                                        "            continue\n"
-                                        "        yield line\n"
-                                        "for line in lines(\"a\\n\\nb\"):\n"
-                                        "    print(line)\n");
+  CompileResult refused = compileSource("def keys(d: \"dict[str, int]\"):\n"
+                                        "    for k, v in d.items():\n"
+                                        "        yield k\n"
+                                        "        print(v)\n"
+                                        "for k in keys({\"a\": 1}):\n"
+                                        "    print(k)\n");
   EXPECT_FALSE(refused.succeeded);
   EXPECT_NE(refused.diagnostics.find("declined this generator because"),
             std::string::npos)
@@ -1435,10 +1434,15 @@ TEST(DriverTest, ARefusedGeneratorNamesWhatSentItDown) {
             std::string::npos)
       << refused.diagnostics;
 
+  // A `continue` before the yield leaves an `arith.constant true` live across
+  // the suspension; it is rematerialized at its uses now rather than needing a
+  // lane, so the whole shape compiles.
   CompileResult accepted = compileSource("def lines(text: str):\n"
                                          "    for line in text.splitlines():\n"
+                                         "        if not line:\n"
+                                         "            continue\n"
                                          "        yield line\n"
-                                         "for line in lines(\"a\\nb\"):\n"
+                                         "for line in lines(\"a\\n\\nb\"):\n"
                                          "    print(line)\n");
   EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
 }
