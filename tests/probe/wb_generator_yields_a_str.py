@@ -1,21 +1,36 @@
-# A generator that yields a STR is refused outright:
+# A generator that yields a STR from a loop with a `continue` is refused:
 #
 #   source generator next lowering currently supports yields whose runtime
 #   value is a single lane, and '!py.contract<"builtins.str">' has 2
 #
-# A str is a header plus a payload descriptor, and the resume path assumes one
-# lane. Every line-filtering generator is written this way -- the reduction is
-# the shape `config.py` parsers use.
+# ⛔ THE MESSAGE NAMES THE LANE COUNT AND THE TRIGGER IS THE `continue`. The
+# same generator without it compiles and runs:
 #
-# ⛔ NOT THE SAME DEFECT as wb_generator_yields_what_it_keeps.py even though
-# both are about what crosses a yield: this one is a REFUSAL in the state
-# machine's lane model, that one is a refcount the lanes do carry. A two-lane
-# yield has to be modelled before its ownership can be got wrong.
+#     def lines(text: str):
+#         for line in text.splitlines():
+#             yield line            # fine
+#
+#     def lines(text: str):
+#         for line in text.splitlines():
+#             if not line:
+#                 continue
+#             yield line            # refused
+#
+# A str is two lanes either way, so the count is not what changed -- the
+# `continue` edge is, and it makes the yielded value a merge whose lanes the
+# resume path counts differently. Reading the message as "multi-lane yields are
+# unsupported" is what this note exists to prevent: they are supported, and
+# every line-filtering generator is written with the skip.
+#
+# ⭐ AN EARLIER DRAFT OF THIS PROBE CLAIMED THE PLAIN SHAPE FAILED, and it does
+# not. The claim was written from the failing PROGRAM rather than from a
+# reduction, and the reduction says something else. Run the probe before
+# writing what it proves.
 def lines(text: str):
     for line in text.splitlines():
-        stripped = line.strip()
-        if stripped:
-            yield stripped
+        if not line:
+            continue
+        yield line
 
 
 for line in lines("a\n\nb\n"):
