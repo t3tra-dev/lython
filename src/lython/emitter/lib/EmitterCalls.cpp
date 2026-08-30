@@ -784,6 +784,55 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       }
   }
 
+  // ⭐ AND THE MODULE FUNCTIONS WHOSE JOB IS THE SAME ONE. `math.floor(x)`
+  // calls `type(x).__floor__(x)` in CPython, so a class that provides one is
+  // the argument these take -- and it reached the manifest signature instead
+  // ("!py.callable<[builtins.float], returns = [builtins.int]> is not
+  // callable: call arguments do not match the Callable contract"), while
+  // `abs()` and `round()` next to it dispatched the class's own dunder. Same
+  // table shape as the builtins above, keyed by the qualified name.
+  if (calleeNode && calleeNode->kind == "Attribute") {
+    static constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral>
+        kDunderModuleFunctions[] = {
+            {llvm::StringLiteral("math.floor"),
+             llvm::StringLiteral("__floor__")},
+            {llvm::StringLiteral("math.ceil"),
+             llvm::StringLiteral("__ceil__")},
+            {llvm::StringLiteral("math.trunc"),
+             llvm::StringLiteral("__trunc__")},
+        };
+    const parser::Node *spaceNode = ast::node(*calleeNode, "value");
+    llvm::StringRef attribute = ast::string(*calleeNode, "attr").value_or("");
+    const auto *moduleArgs = ast::nodeList(expr, "args");
+    const auto *moduleKeywords = ast::nodeList(expr, "keywords");
+    if (spaceNode && spaceNode->kind == "Name" && !attribute.empty() &&
+        moduleArgs && moduleArgs->size() == 1 && moduleArgs->front() &&
+        moduleArgs->front()->kind != "Starred" &&
+        (!moduleKeywords || moduleKeywords->empty())) {
+      llvm::StringRef space = ast::nameSpelling(*spaceNode);
+      // A local of the module's name keeps its own dispatch, exactly as the
+      // module-attribute diagnostic above requires.
+      if (!values.count(space)) {
+        std::string qualified = (space + "." + attribute).str();
+        for (const auto &[name, dunder] : kDunderModuleFunctions) {
+          if (qualified != name)
+            continue;
+          mlir::Type argumentType =
+              types.widenLiteral(types.inferExpr(moduleArgs->front().get()));
+          // Presence first, so the argument is not emitted twice when the
+          // manifest path below is the one that runs.
+          if (lookupClassMethod(argumentType, dunder)) {
+            Value receiver = emitExpr(moduleArgs->front().get());
+            if (std::optional<Value> dispatched =
+                    tryEmitClassDunder(expr, receiver, dunder))
+              return *dispatched;
+          }
+          break;
+        }
+      }
+    }
+  }
+
   // ⭐ `divmod(x, y)` on a SOURCE class calls its __divmod__, for the same
   // reason the one-argument builtins above call theirs: the builtin is a
   // manifest free function with numeric overloads, and a user class reached

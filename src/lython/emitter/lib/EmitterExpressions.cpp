@@ -1873,6 +1873,31 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
       sliceNode && sliceNode->kind == "Slice")
     return emitSliceSubscript(expr, container, *sliceNode);
   Value index = emitExpr(ast::node(expr, "slice"));
+  // ⭐ A SEQUENCE INDEX GOES THROUGH `__index__`. CPython's sequences ask the
+  // index object for an integer, and a class that provides one was refused in
+  // the lowering -- "sequence index of contract C has no statically unboxable
+  // integer value" -- while every other protocol on the same class (`__len__`,
+  // `__getitem__`, `__abs__`, `__call__`) worked.
+  //
+  // ⛔ ONLY FOR THE BUILTIN SEQUENCES, which is where CPython uses it: a dict
+  // subscript takes a KEY, so converting there would look the wrong entry up,
+  // and a source class's `__getitem__` receives what it declares.
+  if (auto containerContract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(container.type))) {
+    llvm::StringRef name = containerContract.getContractName();
+    bool builtinSequence = name == "builtins.list" || name == "builtins.tuple" ||
+                           name == "builtins.str" || name == "builtins.bytes" ||
+                           name == "builtins.bytearray" ||
+                           name == "builtins.range";
+    if (builtinSequence)
+      if (auto indexContract = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(index.type));
+          indexContract && isSourceDefinedContract(indexContract) &&
+          lookupClassMethod(indexContract, "__index__"))
+        if (std::optional<Value> converted =
+                tryEmitClassDunder(expr, index, "__index__", {}))
+          index = *converted;
+  }
   if (std::optional<Value> item =
           tryEmitClassDunder(expr, container, "__getitem__", {index}))
     return *item;
