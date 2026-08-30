@@ -262,6 +262,9 @@ public:
   void bindDeclaredBases(llvm::StringRef name,
                          llvm::ArrayRef<std::string> bases);
   bool declaredSubclassOf(llvm::StringRef sub, llvm::StringRef super) const;
+  // The nearest SOURCE class every member derives from, or null when there is
+  // none -- what a join of source classes returns instead of a union of them.
+  mlir::Type nearestCommonSourceBase(mlir::ArrayRef<mlir::Type> members) const;
   // Monomorphization of `class C[T]`: the py ABI has no runtime
   // representation for a type parameter, so a generic class is never a
   // contract of its own — every ground instantiation becomes a separate

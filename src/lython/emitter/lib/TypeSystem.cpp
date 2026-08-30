@@ -3971,7 +3971,61 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
     return object();
   if (present.size() == 1)
     return present.front();
+  // ⭐ SOURCE CLASSES JOIN AT THEIR BASE, not into a union of themselves.
+  // `[Dog(), Cat()]` and `Dog() if c else Cat()` both inferred
+  // `Cat | Dog`, and a union provides no method, so `a.speak()` was refused --
+  // for the two spellings of the polymorphism this compiler already supports
+  // through a base-typed receiver. `list[Animal]` and a function returning
+  // `Animal` both work, so what was missing is only the inference: the
+  // dispatch, the coercion of a subclass into a base-typed value, and the
+  // boxed list element are all in place.
+  //
+  // ⛔ ONLY when the base is a SOURCE class. Collapsing at `object` is the
+  // erased top and loses everything; a builtin base (a user exception under
+  // `ValueError`) is not a receiver this can dispatch through either, so the
+  // walk asks `lookupClass` and stops where the source classes stop.
+  //
+  // Why NOT resolve it at the method lookup instead, leaving the union: the
+  // value is physically a union there -- lanes and a tag -- so calling
+  // through it needs a tag switch with a call per member. This is the same
+  // answer one step earlier, where the coercion already exists.
+  if (mlir::Type base = nearestCommonSourceBase(present))
+    return base;
   return py::UnionType::getNormalized(&context, present);
+}
+
+mlir::Type
+TypeSystem::nearestCommonSourceBase(mlir::ArrayRef<mlir::Type> members) const {
+  llvm::SmallVector<llvm::StringRef, 4> names;
+  for (mlir::Type member : members) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(member);
+    if (!contract || !contract.getArguments().empty() ||
+        !lookupClass(contract.getContractName()))
+      return {};
+    names.push_back(contract.getContractName());
+  }
+  // Candidates in nearest-first order: the first member, then its bases
+  // breadth-first, which is the order a common base should be found in.
+  llvm::SmallVector<llvm::StringRef, 8> candidates{names.front()};
+  llvm::StringSet<> seen;
+  for (unsigned index = 0; index < candidates.size(); ++index) {
+    auto entry = declaredBases.find(candidates[index]);
+    if (entry == declaredBases.end())
+      continue;
+    for (const std::string &base : entry->second)
+      if (seen.insert(base).second)
+        candidates.push_back(base);
+  }
+  for (llvm::StringRef candidate : candidates) {
+    std::optional<mlir::Type> candidateType = lookupClass(candidate);
+    if (!candidateType)
+      continue;
+    if (llvm::all_of(names, [&](llvm::StringRef name) {
+          return declaredSubclassOf(name, candidate);
+        }))
+      return *candidateType;
+  }
+  return {};
 }
 
 mlir::Type TypeSystem::widenLiteral(mlir::Type type) const {
