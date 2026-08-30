@@ -188,11 +188,24 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
                                                  "source generator yield ABI");
   if (mlir::failed(elementLanes))
     return mlir::failure();
-  if (elementLanes->size() != 1)
-    return op->emitError()
-           << "source generator next lowering currently supports yields whose "
-              "runtime value is a single lane, and "
-           << elementType << " has " << elementLanes->size();
+  if (elementLanes->size() != 1) {
+    // ⭐ AND WHY THE PROGRAM IS DOWN HERE AT ALL, when the state machine said.
+    // This tier's own limit is almost never the reason a generator reached it:
+    // a str yield runs fine above until something makes an unlaneable value
+    // live across the suspension, and reading this message alone sends the
+    // reader after the yield instead of after that value.
+    mlir::InFlightDiagnostic diagnostic =
+        op->emitError()
+        << "source generator next lowering currently supports yields whose "
+           "runtime value is a single lane, and "
+        << elementType << " has " << elementLanes->size();
+    auto declined = generatorDeclineReasons.find(target.getSymName());
+    if (declined != generatorDeclineReasons.end())
+      diagnostic << "; the state machine that does support it declined this "
+                    "generator because "
+                 << declined->second;
+    return diagnostic;
+  }
   const RuntimeBundle *delegatedSource = nullptr;
   const RuntimeBundle *delegatedIndexedIterable = nullptr;
   const RuntimeBundle *delegatedManifestIterator = nullptr;

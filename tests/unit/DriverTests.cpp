@@ -1407,6 +1407,42 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
   }
 }
 
+// WHAT: the refusal a generator gets when the state machine declines it names
+// the value that made it decline, not just the tier's own limit.
+//
+// `def lines(text): for line in text.splitlines(): if not line: continue;
+// yield line` lands in the single-lane tier and is refused for yielding a str
+// -- and the same generator WITHOUT the `continue` compiles, so the yield is
+// not what changed. What changed is that the skip makes the loop's own `i1`
+// flag live across the suspension, and a frame lane is keyed on a runtime
+// contract. Reading the lower message alone sends the reader after the yield.
+//
+// Driver-layer and not golden: the whole behaviour is a refusal, and the
+// control is the same generator without the skip, which compiles.
+TEST(DriverTest, ARefusedGeneratorNamesWhatSentItDown) {
+  CompileResult refused = compileSource("def lines(text: str):\n"
+                                        "    for line in text.splitlines():\n"
+                                        "        if not line:\n"
+                                        "            continue\n"
+                                        "        yield line\n"
+                                        "for line in lines(\"a\\n\\nb\"):\n"
+                                        "    print(line)\n");
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_NE(refused.diagnostics.find("declined this generator because"),
+            std::string::npos)
+      << refused.diagnostics;
+  EXPECT_NE(refused.diagnostics.find("is live across a yield"),
+            std::string::npos)
+      << refused.diagnostics;
+
+  CompileResult accepted = compileSource("def lines(text: str):\n"
+                                         "    for line in text.splitlines():\n"
+                                         "        yield line\n"
+                                         "for line in lines(\"a\\nb\"):\n"
+                                         "    print(line)\n");
+  EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
+}
+
 // `T | None` is one field, not a tag and two layouts. It is stored as a BOX --
 // the same box a plain class-typed field gets -- so a class that names itself
 // through one has a finite layout, and its ABI is the same width as if the

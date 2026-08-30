@@ -1102,6 +1102,10 @@ private:
     std::string finalizeName;
   };
   llvm::StringMap<GeneratorResumeInfo> generatorResumeClones;
+  // Why the state machine DECLINED a generator, keyed by the source function.
+  // The tier below refuses for its own reason, which is never the reason the
+  // program landed there -- see the note at `declineStateMachineGenerator`.
+  llvm::StringMap<std::string> generatorDeclineReasons;
   // Lane ABI helpers (GeneratorStateMachine.cpp). The resume-clone lookup
   // maps a clone function back to its GeneratorResumeInfo through the
   // kPrimitiveI64CloneAttr original-name attribute.

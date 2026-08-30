@@ -38,10 +38,9 @@
 # and the claim helpers. That is the size of it, which is why it is recorded
 # rather than attempted here.
 #
-# ⛔ AND THE DIAGNOSTIC IS ITS OWN DEFECT. Every program that reaches this
-# message is told about a lane count it cannot act on, when what happened is a
-# value with no lane one tier up. The fallback should say which value sent it
-# there.
+# ⭐ THE DIAGNOSTIC WAS ITS OWN DEFECT AND IS FIXED: the refusal now carries
+# the state machine's reason, so the message names the i1 rather than the lane
+# count alone. Pinned by `DriverTest.ARefusedGeneratorNamesWhatSentItDown`.
 #
 # ⭐ AN EARLIER DRAFT OF THIS PROBE CLAIMED THE PLAIN SHAPE FAILED, and it does
 # not. The claim was written from the failing PROGRAM rather than from a

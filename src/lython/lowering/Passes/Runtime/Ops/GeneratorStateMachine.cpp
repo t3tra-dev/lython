@@ -1219,6 +1219,20 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         for (mlir::Value live : lives) {
           std::string contract = laneEligibleContract(live.getType());
           if (contract.empty()) {
+            // ⭐ SAY WHICH VALUE, because the tier below cannot. It refuses
+            // for its own reason -- "yields whose runtime value is a single
+            // lane" -- and that reason is never why the program came down to
+            // it: a generator yielding a str is fine there until a `continue`
+            // makes the loop's own `i1` flag live across the suspension, and
+            // an i1 has no runtime contract to key a frame lane on. Reading
+            // the lower message cost a whole investigation before this line
+            // existed.
+            std::string reason;
+            llvm::raw_string_ostream stream(reason);
+            stream << "a value of type " << live.getType()
+                   << " is live across a yield and has no generator frame "
+                      "lane (a frame lane is keyed on a runtime contract)";
+            generatorDeclineReasons[body.getSymName()] = reason;
             livesEligible = false;
             break;
           }
