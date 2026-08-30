@@ -42,6 +42,27 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), narrowed, found->second.value);
           found->second.value = unwrap.getResult();
+        } else if (auto narrowedUnion =
+                       mlir::dyn_cast<py::UnionType>(narrowed);
+                   narrowedUnion &&
+                   llvm::all_of(narrowedUnion.getMemberTypes(),
+                                [&](mlir::Type member) {
+                                  return unionType.hasMember(member);
+                                })) {
+          // ⭐ ELIMINATION LEAVES A SUB-UNION, and that is not a MEMBER. Two
+          // members narrow to one and land in the arm above; three narrow to
+          // two, `hasMember` says no, and the narrowing silently did nothing:
+          //
+          //     def outer(value: "int | str | None") -> int:
+          //         if value is not None:
+          //             return take(value)   # still int | str | None
+          //
+          // was refused for passing the un-narrowed type. `py.union.unwrap`
+          // has taken a union RESULT since it was written -- it remaps the tag
+          // member by member -- so the op this needs already existed.
+          auto unwrap = py::UnionUnwrapOp::create(
+              builder, loc(anchor), narrowedUnion, found->second.value);
+          found->second.value = unwrap.getResult();
         } else if (sourceType && unionType.hasMember(sourceType)) {
           auto unwrap = py::UnionUnwrapOp::create(
               builder, loc(anchor), sourceType, found->second.value);
