@@ -683,6 +683,24 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
     }
     if (!value)
       continue;
+    // ⭐ `__set_name__` IS CALLED WHEN THE INSTANCE BECOMES A CLASS ATTRIBUTE,
+    // and nothing calls it here -- `a = Field()` in a class body printed
+    // nothing where CPython prints what the hook prints, with no diagnostic.
+    // Refused at the assignment rather than at the method's declaration: the
+    // hook is defined on the DESCRIPTOR class, which a program may define and
+    // call by hand, and this is the one place the call is implicit.
+    //
+    // ⛔ NOT implemented, because the owner argument is the CLASS and a class
+    // has no object handle: `f(C)` for `def f(o: object)` already dies in the
+    // lowering ("cannot pass ... as builtins.object"), which is the standard
+    // signature's parameter type. It waits on a type object as a runtime
+    // value, recorded in [[lython-remaining-mechanisms]].
+    if (mlir::Type valueType = types.widenLiteral(types.inferExpr(value));
+        valueType && lookupClassMethod(valueType, "__set_name__"))
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement->range.start,
+          "a class attribute whose class defines __set_name__ is not "
+          "supported: the hook CPython calls here is never run"});
     if (value->kind == "Call") {
       auto [callee, spelling] = decoratorCallee(*value);
       if (decoratorLeafName(spelling) == "field") {
@@ -1673,6 +1691,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         }
       if (*methodName == "__new__" && kind == "instance")
         kind = "class";
+      // ⭐ THE TWO IMPLICIT CLASSMETHODS, which CPython wraps for you: written
+      // without `@classmethod` (the way everyone writes them) their `cls`
+      // reached the ordinary parameter rule and the class was refused with
+      // "function parameter 'cls' requires an annotation". `__new__` above is
+      // the same rule for the same reason.
+      if ((*methodName == "__init_subclass__" ||
+           *methodName == "__class_getitem__") &&
+          kind == "instance")
+        kind = "classmethod";
       bool propertyAccessor = kind == "property" || kind == "property_setter";
       std::optional<llvm::StringRef> receiverName;
       if (kind == "instance" || propertyAccessor)

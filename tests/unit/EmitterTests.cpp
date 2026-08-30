@@ -874,4 +874,35 @@ TEST(EmitterTest, AClassWithAFinalizerIsRefused) {
                  accepting);
   EXPECT_TRUE(accepted.ok());
 }
+
+// What: the two class-body hooks CPython calls implicitly. `__init_subclass__`
+// runs for the subclass and needs no `@classmethod` to be written; a class
+// attribute whose class defines `__set_name__` is refused, because the hook
+// CPython calls at that assignment is never run here.
+TEST(EmitterTest, TheImplicitClassHooksAreAccountedFor) {
+  mlir::MLIRContext undecorated(testRegistry());
+  lython::emitter::EmitResult accepted =
+      emitSource("class Base:\n"
+                 "    def __init_subclass__(cls) -> None:\n"
+                 "        print(\"hook\")\n"
+                 "class Sub(Base):\n"
+                 "    pass\n",
+                 undecorated);
+  EXPECT_TRUE(accepted.ok());
+
+  mlir::MLIRContext named(testRegistry());
+  lython::emitter::EmitResult refused =
+      emitSource("class Field:\n"
+                 "    def __set_name__(self, owner: object, name: str) -> None:\n"
+                 "        print(name)\n"
+                 "class Holder:\n"
+                 "    a = Field()\n",
+                 named);
+  EXPECT_FALSE(refused.ok());
+  bool told = false;
+  for (const lython::parser::Diagnostic &diagnostic : refused.diagnostics)
+    told = told ||
+           diagnostic.message.find("__set_name__") != std::string::npos;
+  EXPECT_TRUE(told);
+}
 }
