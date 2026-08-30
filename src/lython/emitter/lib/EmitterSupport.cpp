@@ -510,6 +510,40 @@ static bool sourceClassUnderManifestBase(mlir::Type sub, mlir::Type super,
   return false;
 }
 
+// ⭐ THE ARGUMENTS OF AN `isinstance` TARGET ARE NOT PART OF THE QUESTION.
+// A bare class name resolves to its contract with the top filled in --
+// `tuple` becomes `tuple[object]` -- so `pythonSubclassOf(tuple[int, int],
+// tuple[object])` compared two DIFFERENT contracts and answered False. On a
+// `list[int] | tuple[int, int]` value that made `isinstance(value, tuple)`
+// fold to AlwaysFalse: the true arm was dropped and the `else` still held the
+// whole union, so `for item in value` was refused for a method the tuple arm
+// was the only one lacking. The same union with a `str` member worked, because
+// `str` carries no arguments to disagree about.
+//
+// Why NOT relax `pythonSubclassOf` itself: it answers `issubclass` too, where
+// the arguments DO carry meaning, and it is the assignability check that the
+// narrowing then trusts to place a value. Only the isinstance target is known
+// to be an unsubscripted name -- CPython raises TypeError for a parameterised
+// generic there, so arguments on it can only be the filler.
+static bool sameClassIgnoringArguments(mlir::Type member, mlir::Type target) {
+  auto memberContract = mlir::dyn_cast_if_present<py::ContractType>(member);
+  auto targetContract = mlir::dyn_cast_if_present<py::ContractType>(target);
+  if (!memberContract || !targetContract ||
+      memberContract.getContractName() != targetContract.getContractName())
+    return false;
+  return llvm::all_of(targetContract.getArguments(), [](mlir::Type argument) {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(argument);
+    return contract && contract.getContractName() == "builtins.object" &&
+           contract.getArguments().empty();
+  });
+}
+
+static bool isinstanceClassMatch(mlir::Type member, mlir::Type target,
+                                 TypeSystem &types, mlir::Operation *from) {
+  return sameClassIgnoringArguments(member, target) ||
+         pythonSubclassOf(member, target, types, from);
+}
+
 IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
                                      mlir::Type targetType, TypeSystem &types,
                                      mlir::Operation *from) {
@@ -532,7 +566,8 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     analysis.falseType = analysis.sourceType;
   };
 
-  if (pythonSubclassOf(analysis.sourceType, analysis.targetType, types, from)) {
+  if (isinstanceClassMatch(analysis.sourceType, analysis.targetType, types,
+                           from)) {
     setAlwaysTrue();
     return analysis;
   }
@@ -543,7 +578,7 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     bool sawUnsupportedMember = false;
     for (mlir::Type rawMember : unionType.getMemberTypes()) {
       mlir::Type member = types.widenLiteral(rawMember);
-      if (pythonSubclassOf(member, analysis.targetType, types, from)) {
+      if (isinstanceClassMatch(member, analysis.targetType, types, from)) {
         analysis.unionMembers.push_back(rawMember);
       } else if (containsObjectTop(member, types)) {
         sawUnsupportedMember = true;
@@ -556,6 +591,16 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     }
 
     if (analysis.unionMembers.size() == unionType.getMemberTypes().size()) {
+      // ⛔ AND THE TRUE ARM IS STILL THE UNION when every member is the SAME
+      // class differently parameterised -- `list[list[int]] | list[int]` under
+      // `isinstance(v, list)`. The test is genuinely always true, so there is
+      // nothing here to narrow WITH; what the arm needs is for the union
+      // itself to answer `__iter__`, which it does not: the same annotation
+      // without any isinstance at all is refused identically. Measured on
+      // b6 (`for row in value` over that union) -- so this is the union member
+      // lookup, not the narrowing, and fixing it here would only move the
+      // refusal. Before this rule the fold went the other way and the loop
+      // body was DEAD, printing 0 where CPython prints 3.
       setAlwaysTrue();
       return analysis;
     }
