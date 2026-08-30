@@ -16,11 +16,32 @@
 #                 continue
 #             yield line            # refused
 #
-# A str is two lanes either way, so the count is not what changed -- the
-# `continue` edge is, and it makes the yielded value a merge whose lanes the
-# resume path counts differently. Reading the message as "multi-lane yields are
-# unsupported" is what this note exists to prevent: they are supported, and
-# every line-filtering generator is written with the skip.
+# A str is two lanes either way, so the count is not what changed, and the
+# message is not about the yield at all: it is the FALLBACK path's complaint.
+#
+# ⭐ THE CAUSE, read off the state machine's eligibility scan by printing what
+# it declines (`GeneratorStateMachine.cpp`, the `laneEligibleContract` call over
+# `liveAfterYield`):
+#
+#     [gen-eligible] live value has no lane: i1
+#
+# The `continue` makes a raw `i1` -- the loop's own condition flag -- LIVE
+# across the suspension, and a generator frame lane is keyed on a runtime
+# CONTRACT. A bare i1 has none, so the whole generator is declined and falls to
+# the single-lane tier, which then refuses the str for a reason that has
+# nothing to do with why it got there.
+#
+# ⛔ SO THE REPAIR IS A PRIMITIVE FRAME LANE, not a wider yield. The frame
+# already carries i1s -- every control lane is an (i64, i1) pair -- but
+# `GeneratorResumeLane` is built from a contract name and its physical parts,
+# so a scalar lane is a new kind threaded through the frame layout, the save
+# and the claim helpers. That is the size of it, which is why it is recorded
+# rather than attempted here.
+#
+# ⛔ AND THE DIAGNOSTIC IS ITS OWN DEFECT. Every program that reaches this
+# message is told about a lane count it cannot act on, when what happened is a
+# value with no lane one tier up. The fallback should say which value sent it
+# there.
 #
 # ⭐ AN EARLIER DRAFT OF THIS PROBE CLAIMED THE PLAIN SHAPE FAILED, and it does
 # not. The claim was written from the failing PROGRAM rather than from a
