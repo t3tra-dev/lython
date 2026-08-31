@@ -769,6 +769,12 @@ private:
   // CPython falls back to iteration, and so does this, by rewriting to
   // `any(<x> == <element> for <element> in obj)` before the operands are
   // emitted. Returns nothing when the shape does not apply.
+  // The `:=` targets inside `node`, typed under `hints`, for the names that
+  // are not bound in the enclosing scope yet. PEP 572 binds them THERE, and a
+  // region that binds one needs the slot before it runs.
+  llvm::StringMap<mlir::Type>
+  walrusTargetsToBind(const parser::Node &node,
+                      const llvm::StringMap<mlir::Type> &hints);
   std::optional<Value> tryEmitIterableMembership(const parser::Node &expr);
   std::optional<Value> tryEmitReflectedBinary(const parser::Node &anchor,
                                               llvm::StringRef method,

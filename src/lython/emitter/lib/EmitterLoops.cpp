@@ -985,6 +985,13 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   for (const auto &hint : targetHints)
     if (loopTargetOutlivesLoop(hint.getKey(), statement))
       targetLocals[hint.getKey()] = hint.getValue();
+  // ⭐ `:=` BINDS IN THE SCOPE AROUND THE LOOP (PEP 572), and a genexpr fused
+  // into a loop is a region emitted mid-expression -- so `sum((y := x + 1) for
+  // x in xs)` followed by `y` in the same call reported "unresolved name 'y'".
+  // The slot goes in before the loop, where the enclosing scope can see it,
+  // exactly as the loop target's does.
+  for (const auto &walrus : walrusTargetsToBind(statement, targetHints))
+    targetLocals[walrus.getKey()] = walrus.getValue();
   bindConditionallyAssignedLocals(statement,
                                   {ast::nodeList(statement, "body"), orelse},
                                   &targetHints, &targetLocals);

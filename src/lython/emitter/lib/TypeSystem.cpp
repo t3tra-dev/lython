@@ -3017,6 +3017,13 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     return boolType();
   if (node->kind == "BoolOp")
     return boolType();
+  // ⭐ `(y := e)` IS `e`. Without this the walk answered `object` for the
+  // assignment expression, and a set comprehension whose element is one --
+  // `sorted({(k := x) for x in xs})` -- typed its result as a set of object
+  // and `sorted` refused it. The name it binds is the emitter's business; the
+  // VALUE is the expression's own.
+  if (node->kind == "NamedExpr")
+    return recurse(ast::node(*node, "value"));
   if (node->kind == "IfExp")
     // Mirrors the emitter: literal arms widen to their contracts (CPython
     // types a ternary of two literals by the common class).

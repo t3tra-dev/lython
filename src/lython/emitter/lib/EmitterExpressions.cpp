@@ -2661,8 +2661,85 @@ Value ModuleEmitter::emitDictComp(const parser::Node &expr) {
   return emitComprehension(expr, /*isDict=*/true);
 }
 
+namespace {
+
+// The `:=` targets in a subtree, with the expression each takes its value
+// from. Nested functions and lambdas have their own scope and are skipped.
+void collectWalrusTargets(
+    const parser::Node *node,
+    llvm::SmallVectorImpl<std::pair<std::string, const parser::Node *>>
+        &targets) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "Lambda" || node->kind == "ClassDef")
+    return;
+  if (node->kind == "NamedExpr")
+    if (const parser::Node *target = ast::node(*node, "target");
+        target && target->kind == "Name")
+      targets.push_back(
+          {std::string(ast::nameSpelling(*target)), ast::node(*node, "value")});
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectWalrusTargets(child->get(), targets);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        collectWalrusTargets(child.get(), targets);
+    }
+  }
+}
+
+} // namespace
+
+llvm::StringMap<mlir::Type>
+ModuleEmitter::walrusTargetsToBind(const parser::Node &node,
+                                   const llvm::StringMap<mlir::Type> &hints) {
+  llvm::SmallVector<std::pair<std::string, const parser::Node *>, 2> walrus;
+  collectWalrusTargets(&node, walrus);
+  llvm::StringMap<mlir::Type> bound;
+  if (walrus.empty())
+    return bound;
+  // The value's type is read with the region's own targets in scope:
+  // `(y := x * 2)` is about the element, which is not bound anywhere yet. The
+  // hint scope is dropped again immediately.
+  TypeSystem::Scope hintScope = types.pushScope();
+  for (const auto &hint : hints)
+    types.bindSymbol(hint.getKey(), hint.getValue());
+  for (const auto &[name, value] : walrus)
+    if (values.find(name) == values.end())
+      if (mlir::Type type = types.widenLiteral(types.inferExpr(value)))
+        bound[name] = type;
+  return bound;
+}
+
 Value ModuleEmitter::emitComprehension(const parser::Node &expr,
                                        bool isDict, bool isSet) {
+  // ⭐ `:=` INSIDE A COMPREHENSION BINDS IN THE SCOPE AROUND IT (PEP 572), and
+  // the comprehension's own loop is a region -- so the name was bound inside
+  // it and `print([x for x in xs if (y := x * 2) > 2], y)` reported
+  // "unresolved name 'y'" for the second argument of the same call. The slot
+  // these bindings already use is what makes a name written in a region
+  // readable outside it; the comprehension only erases its own TARGETS, so a
+  // slot made here survives the loop.
+  {
+    llvm::StringMap<mlir::Type> hints;
+    if (const auto *generators = ast::nodeList(expr, "generators"))
+      for (const parser::NodePtr &generator : *generators) {
+        if (!generator)
+          continue;
+        const parser::Node *target = ast::node(*generator, "target");
+        if (!target || target->kind != "Name")
+          continue;
+        if (mlir::Type element =
+                types.iterationElementType(ast::node(*generator, "iter")))
+          hints[ast::nameSpelling(*target)] = element;
+      }
+    llvm::StringMap<mlir::Type> walrusLocals = walrusTargetsToBind(expr, hints);
+    if (!walrusLocals.empty())
+      bindConditionallyAssignedLocals(expr, {}, nullptr, &walrusLocals);
+  }
   auto reject = [&](const std::string &message) {
     diagnostics.push_back(
         parser::Diagnostic{parser::Severity::Error, expr.range.start, message});
