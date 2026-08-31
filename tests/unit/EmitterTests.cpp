@@ -938,4 +938,34 @@ TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
                     std::string::npos;
   EXPECT_TRUE(saidClass);
 }
+
+TEST(EmitterTest, AModuleLevelLambdaCannotFreezeAReboundName) {
+  // A module name bound more than once gets no cell, so a lambda that reads
+  // it would carry the value it had when the lambda was built. The def
+  // spelling of the same read is already refused; this one used to run and
+  // print the stale value.
+  mlir::MLIRContext rebound(testRegistry());
+  lython::emitter::EmitResult stale =
+      emitSource("x = 1\nf = lambda: x\nx = 2\nprint(f())\n", rebound);
+  EXPECT_FALSE(stale.ok());
+  bool saidRebound = false;
+  for (const lython::parser::Diagnostic &diagnostic : stale.diagnostics)
+    saidRebound = saidRebound ||
+                  diagnostic.message.find("rebound after this point") !=
+                      std::string::npos;
+  EXPECT_TRUE(saidRebound);
+
+  // The loop spelling is the same defect: the target is rebound every trip.
+  mlir::MLIRContext looped(testRegistry());
+  lython::emitter::EmitResult loop = emitSource(
+      "fs = []\nfor i in range(3):\n    fs.append(lambda: i)\n", looped);
+  EXPECT_FALSE(loop.ok());
+
+  // A module name bound once is still capturable: there is nothing to go
+  // stale against.
+  mlir::MLIRContext once(testRegistry());
+  lython::emitter::EmitResult stable =
+      emitSource("xs = [1, 2, 3]\nf = lambda: len(xs)\nprint(f())\n", once);
+  EXPECT_TRUE(stable.ok());
+}
 }

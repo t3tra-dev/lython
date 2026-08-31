@@ -31,6 +31,11 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable);
 // apart from a name the module rebinds.
 llvm::StringSet<> singleAssignmentNames(const parser::Node &scope);
 
+// The complement: names `scope` binds MORE than once, a loop target counted
+// as more than once. A lambda that captures one of these froze a value the
+// scope goes on to replace.
+llvm::StringSet<> reboundNames(const parser::Node &scope);
+
 std::string sanitizedSymbolPart(llvm::StringRef text);
 
 } // namespace lython::emitter

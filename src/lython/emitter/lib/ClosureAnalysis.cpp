@@ -128,6 +128,44 @@ void collectDirectNestedFunctions(
   }
 }
 
+// ⭐ Collected SEPARATELY from the nested defs above, whose list exists for
+// `nonlocal` declarations -- which a lambda, having no statements, cannot
+// make. That list is also the readers list for the boxing decision below, and
+// there a lambda counts exactly as much as a def:
+//
+//     def run() -> None:
+//         x = 1
+//         f = lambda: x
+//         x = 2
+//         print(f())      # printed 1; CPython prints 2
+//
+// A def nested inside is skipped: what it reads is already collected as its
+// own capture set, and a lambda inside THAT belongs to its scope, not this one.
+void collectDirectNestedLambdas(
+    const parser::Node *node,
+    llvm::SmallVectorImpl<const parser::Node *> &nested) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
+      node->kind == "ClassDef")
+    return;
+  if (node->kind == "Lambda") {
+    nested.push_back(node);
+    return;
+  }
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectDirectNestedLambdas(child->get(), nested);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectDirectNestedLambdas(child.get(), nested);
+    }
+  }
+}
+
 void collectFunctionLocalNames(const parser::Node &callable,
                                llvm::StringSet<> &locals) {
   collectParameterNames(ast::node(callable, "args"), locals);
@@ -312,6 +350,9 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
   // boxing every captured name would put a cell behind every read-only
   // capture in the program.
   llvm::SmallVector<const parser::Node *, 4> readers = nested;
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      collectDirectNestedLambdas(statement.get(), readers);
   llvm::StringSet<> readByNested;
   for (const parser::Node *inner : readers)
     for (const std::string &capture : lexicalCaptureNames(*inner))
@@ -348,6 +389,16 @@ llvm::StringSet<> singleAssignmentNames(const parser::Node &scope) {
     if (entry.getValue() == 1)
       once.insert(entry.getKey());
   return once;
+}
+
+llvm::StringSet<> reboundNames(const parser::Node &scope) {
+  llvm::StringMap<unsigned> counts;
+  countNameAssignments(ast::nodeList(scope, "body"), counts);
+  llvm::StringSet<> rebound;
+  for (const auto &entry : counts)
+    if (entry.getValue() > 1)
+      rebound.insert(entry.getKey());
+  return rebound;
 }
 
 std::string sanitizedSymbolPart(llvm::StringRef text) {

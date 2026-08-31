@@ -976,13 +976,53 @@ mlir::ArrayAttr ModuleEmitter::emitCallableDefaultValues(
   return builder.getArrayAttr(slots);
 }
 
+const llvm::StringSet<> &ModuleEmitter::reboundModuleNames() {
+  if (!reboundModuleNamesComputed) {
+    reboundModuleNamesComputed = true;
+    reboundModuleNamesCache = reboundNames(moduleNode);
+  }
+  return reboundModuleNamesCache;
+}
+
 Value ModuleEmitter::emitLambda(const parser::Node &expr,
                                 py::CallableType expected) {
   llvm::SmallVector<Capture, 4> captures;
+  // ⭐ A capture is the value the name holds NOW, and at module scope a
+  // rebound name goes stale in it. CPython reads the binding at CALL time:
+  //
+  //     x = 1
+  //     f = lambda: x
+  //     x = 2
+  //     print(f())                        # printed 1; CPython prints 2
+  //
+  //     fs = []
+  //     for i in range(3):
+  //         fs.append(lambda: i)
+  //     print([f() for f in fs])          # printed [0, 1, 2]; CPython [2, 2, 2]
+  //
+  // ⛔ Why REFUSED and not repaired: the def spelling of the same read is
+  // already refused ("unresolved name 'x'") because a module name bound more
+  // than once gets no cell -- `x = 1` then `x = "a"` is legal Python that one
+  // cell cannot hold, which is why the bound-once restriction exists in
+  // EmitterGlobals. The lambda took the value instead and was the only
+  // spelling that mis-executed silently. Inside a FUNCTION the same read is
+  // repaired rather than refused: nonlocalBoxedNames boxes a rebound local
+  // that any nested callable reads, lambdas included.
+  llvm::StringSet<> moduleRebound;
+  if (atModuleScope)
+    moduleRebound = reboundModuleNames();
   for (const std::string &captureName : lexicalCaptureNames(expr)) {
     auto found = values.find(captureName);
-    if (found != values.end())
-      captures.push_back(Capture{captureName, found->second});
+    if (found == values.end())
+      continue;
+    if (moduleRebound.contains(captureName)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "lambda reads module-level name '" + captureName +
+              "', which is rebound after this point"});
+      continue;
+    }
+    captures.push_back(Capture{captureName, found->second});
   }
 
   FunctionSignature sig = types.functionSignature(expr, std::nullopt, expected);

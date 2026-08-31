@@ -995,6 +995,35 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   bindConditionallyAssignedLocals(statement,
                                   {ast::nodeList(statement, "body"), orelse},
                                   &targetHints, &targetLocals);
+  // ⭐ A BOXED LOOP TARGET'S CELL BELONGS TO THE FRAME, NOT TO THE TRIP.
+  // The boxed path allocates a cell at the target's FIRST BINDING, and for a
+  // loop target that site runs once per iteration -- so every closure built
+  // in the body got its own cell and read back the value from its own trip:
+  //
+  //     fs = []
+  //     for i in range(3):
+  //         fs.append(lambda: i)
+  //     [f() for f in fs]     # gave [0, 1, 2]; CPython gives [2, 2, 2]
+  //
+  // ⛔ Not left to bindConditionallyAssignedLocals above, which skips boxed
+  // names on purpose: its slots are for a name the scope AROUND the loop
+  // reads, and it decides that by looking for such a read. This one is needed
+  // whether or not anything reads the target afterwards.
+  for (const auto &hint : targetHints) {
+    llvm::StringRef name = hint.getKey();
+    if (!currentBoxedLocals.contains(name) || values.count(name))
+      continue;
+    mlir::Type content = hint.getValue();
+    // The same storability rule the conditional slots end with: a slot for an
+    // erased element type accepts every write and refuses every read.
+    if (!mlir::isa_and_nonnull<py::ContractType>(content) ||
+        py::isPyObjectType(content))
+      continue;
+    auto unbound = py::UnboundOp::create(builder, loc(statement), content);
+    values[name] = emitCellAlloc(statement, Value{unbound.getResult(), content},
+                                 /*tracksBinding=*/true);
+    types.bindSymbol(name, content);
+  }
   if (const parser::Node *iterNode = ast::node(statement, "iter");
       iterNode && iterNode->kind == "GeneratorExp") {
     if (hasElse) {

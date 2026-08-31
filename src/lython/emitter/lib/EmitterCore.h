@@ -1215,6 +1215,12 @@ private:
   // around each callable body.
   llvm::StringSet<> currentBoxedLocals;
   bool atModuleScope = false;
+  // Module-level names the module binds more than once, computed on first
+  // use: a lambda that captures one of them would freeze a value the
+  // program goes on to replace.
+  llvm::StringSet<> reboundModuleNamesCache;
+  bool reboundModuleNamesComputed = false;
+  const llvm::StringSet<> &reboundModuleNames();
   // ⭐ `return NotImplemented` IS THE PROTOCOL'S FALLBACK, and this compiler
   // can take it statically. CPython's documented way to write a comparison
   // dunder is to hand back the singleton for an operand the method does not
