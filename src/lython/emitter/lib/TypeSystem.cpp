@@ -17,6 +17,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
@@ -1582,6 +1583,8 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
     ordered.append(component.begin(), component.end());
 
   auto sweep = [&](bool memoize) {
+    llvm::SaveAndRestore<bool> duringFixpoint(defaultsDescribeParameters,
+                                              memoize);
     for (unsigned index : ordered) {
       const TopLevelFunction &function = functions[index];
       FunctionSignature sig = functionSignature(*function.node);
@@ -4103,6 +4106,20 @@ TypeSystem::functionSignature(const parser::Node &function,
         return std::nullopt;
       return inferenceState.zonk(found->second);
     };
+    // A default is a complete static description of its parameter when
+    // nothing else supplies one. Not folded into the parameter's inference
+    // variable: a caller that passes something else has to WIDEN the
+    // parameter rather than conflict with the default, so this is read back
+    // where the variable is resolved, not unified into it.
+    auto defaultParameterType =
+        [&](const parser::Node *defaultNode) -> mlir::Type {
+      if (!defaultNode)
+        return {};
+      mlir::Type inferred = inferenceState.zonk(inferExpr(defaultNode));
+      if (!inferred || py::containsPyInferVar(inferred))
+        return {};
+      return widenLiteral(inferred);
+    };
     auto recordAnnotationIssue = [&](const parser::Node *annotation,
                                      llvm::StringRef parameterName) {
       if (!annotation) {
@@ -4149,16 +4166,36 @@ TypeSystem::functionSignature(const parser::Node &function,
           !annotation && !isSelfParameter && !fromExpectedCallable
               ? overriddenParameterType(*arg)
               : std::nullopt;
+      mlir::Type fromDefault;
+      if (!annotation && !isSelfParameter && !fromExpectedCallable &&
+          hasDefault(index, positional.size(), defaults))
+        fromDefault = defaultParameterType(
+            (*ast::nodeList(*arguments, "defaults"))[index + defaults -
+                                                     positional.size()]
+                .get());
       if (isSelfParameter)
         type = selfType ? selfType : py::SelfType::get(&context);
       if (fromExpectedCallable)
         type = expectedPositional[index];
       if (overridden) {
         type = *overridden;
-        if (py::containsPyInferVar(type))
-          sig.missingParameterAnnotations.push_back(name);
+        if (py::containsPyInferVar(type)) {
+          // Only once the module fixpoint has stopped: substituting the
+          // default earlier would replace the variable the CALL SITES bind
+          // through, and every argument would then be checked against the
+          // default's type instead of widening the parameter.
+          if (fromDefault && defaultsDescribeParameters)
+            type = fromDefault;
+          else if (!fromDefault || !defaultsDescribeParameters)
+            sig.missingParameterAnnotations.push_back(name);
+        } else if (fromDefault && !py::isAssignableTo(fromDefault, type)) {
+          type = join({type, fromDefault});
+        }
       } else if (!isSelfParameter && !fromExpectedCallable) {
-        recordAnnotationIssue(annotation, name);
+        if (fromDefault)
+          type = fromDefault;
+        else
+          recordAnnotationIssue(annotation, name);
       }
       sig.positionalNames.push_back(std::move(name));
       sig.positionalTypes.push_back(type);
@@ -4179,19 +4216,32 @@ TypeSystem::functionSignature(const parser::Node &function,
         std::optional<mlir::Type> overridden =
             !annotation && !fromExpectedCallable ? overriddenParameterType(*arg)
                                                  : std::nullopt;
+        bool hasKwDefault = false;
+        if (const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults"))
+          hasKwDefault = index < kwDefaults->size() && (*kwDefaults)[index];
+        mlir::Type fromDefault;
+        if (!annotation && !fromExpectedCallable && hasKwDefault)
+          fromDefault = defaultParameterType(
+              (*ast::nodeList(*arguments, "kw_defaults"))[index].get());
         if (fromExpectedCallable)
           type = expectedKwOnly[index];
         if (overridden) {
           type = *overridden;
-          if (py::containsPyInferVar(type))
-            sig.missingParameterAnnotations.push_back(name);
+          if (py::containsPyInferVar(type)) {
+            if (fromDefault && defaultsDescribeParameters)
+              type = fromDefault;
+            else if (!fromDefault || !defaultsDescribeParameters)
+              sig.missingParameterAnnotations.push_back(name);
+          } else if (fromDefault && !py::isAssignableTo(fromDefault, type)) {
+            type = join({type, fromDefault});
+          }
         } else if (!fromExpectedCallable) {
-          recordAnnotationIssue(annotation, name);
+          if (fromDefault)
+            type = fromDefault;
+          else
+            recordAnnotationIssue(annotation, name);
         }
         sig.kwOnlyTypes.push_back(type);
-        bool hasKwDefault = false;
-        if (const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults"))
-          hasKwDefault = index < kwDefaults->size() && (*kwDefaults)[index];
         sig.kwOnlyDefaults.push_back(hasKwDefault);
         ++index;
       }

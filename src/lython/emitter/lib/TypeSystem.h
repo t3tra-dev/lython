@@ -440,6 +440,10 @@ private:
   // reads them through zonk, so provisional and final signature computation
   // share one code path.
   llvm::DenseMap<const parser::Node *, mlir::Type> parameterTypeOverrides;
+  // False only while the module fixpoint is still propagating: a parameter
+  // whose inference variable is unresolved takes its default's type, but not
+  // before the call sites have had their rounds to bind that variable.
+  mutable bool defaultsDescribeParameters = true;
   llvm::DenseMap<const parser::Node *, mlir::Type> resultTypeOverrides;
   std::string targetTriple;
   llvm::StringMap<mlir::Type> symbols;
