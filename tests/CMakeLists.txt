@@ -727,6 +727,10 @@ set(LYTHON_LEAK_GATE_CASES
     # raise, so what it frees decides whether the handler path reads live
     # memory -- and a freed str still prints.
     a_local_survives_the_raise_that_passed_it
+    # An object returned from inside a handler rides the try region's result
+    # payload, and the path that did NOT run has to discard its own -- which
+    # is exactly what a golden cannot see.
+    a_handler_returns_a_container
     # Two closures over one captured object: the merge's heap dead placeholder
     # is a real object with a refcount, and marking it complete moves where the
     # edge retain goes.

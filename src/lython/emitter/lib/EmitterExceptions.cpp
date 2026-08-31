@@ -299,10 +299,23 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
   bool supportsNoneReturnThroughFinally =
       completionEligible && currentReturnType == types.none() &&
       (protectedBodyHasReturn || finalbodyHasReturn);
+  // ⭐ WITHOUT A `finally` ANY CONTRACT CAN RIDE. The carrier list above is
+  // the set of types the finally lowering can synthesize an exceptional
+  // DEFAULT for; with no finally there is no such path to default, and the
+  // payload is just the try region's result -- which a `str` (two lanes,
+  // owned, discarded on the inactive path) already rode. So `except KeyError:
+  // return []` was "return inside except handler is not implemented yet"
+  // while `return 0` in the same handler compiled, and the difference was the
+  // list of names rather than anything about a list.
+  //
+  // ⛔ WITH a finally the old set stands: the lowering says why -- "can only
+  // synthesize exceptional defaults for statically defaultable completion
+  // results" -- and a container has no static default.
   bool supportsValueReturnThroughFinally =
       completionEligible && currentReturnType != types.none() &&
       protectedBodyHasReturn &&
-      isSupportedFinallyReturnCarrierType(currentReturnType);
+      (isSupportedFinallyReturnCarrierType(currentReturnType) ||
+       (!hasFinally && mlir::isa<py::ContractType>(currentReturnType)));
   bool supportsReturnThroughFinally =
       supportsNoneReturnThroughFinally || supportsValueReturnThroughFinally;
   bool supportsLoopControlThroughFinally =
