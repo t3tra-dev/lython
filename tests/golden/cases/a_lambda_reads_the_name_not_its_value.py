@@ -49,3 +49,17 @@ def a_parameter(n: int) -> int:
 
 
 print(a_parameter(5))
+
+
+# A comprehension's target is a binding of the comprehension's own frame, and
+# every closure the body builds shares it -- all three spellings.
+print([f() for f in [lambda: i for i in range(3)]])
+print([f() for f in list(lambda: i for i in range(3))])
+squares = {i: (lambda: i * i) for i in range(3)}
+print([squares[k]() for k in sorted(squares)])
+
+# The same at module scope, where there is no enclosing function to box into.
+module_level = []
+for m in range(4):
+    module_level.append(lambda: m)
+print([f() for f in module_level])

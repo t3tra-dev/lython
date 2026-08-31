@@ -955,11 +955,13 @@ TEST(EmitterTest, AModuleLevelLambdaCannotFreezeAReboundName) {
                       std::string::npos;
   EXPECT_TRUE(saidRebound);
 
-  // The loop spelling is the same defect: the target is rebound every trip.
+  // The loop spelling is REPAIRED rather than refused: a target a callable in
+  // the body reads gets a cell before the loop, so the capture is by
+  // reference and reads the last value, as CPython does.
   mlir::MLIRContext looped(testRegistry());
   lython::emitter::EmitResult loop = emitSource(
       "fs = []\nfor i in range(3):\n    fs.append(lambda: i)\n", looped);
-  EXPECT_FALSE(loop.ok());
+  EXPECT_TRUE(loop.ok());
 
   // A module name bound once is still capturable: there is nothing to go
   // stale against.

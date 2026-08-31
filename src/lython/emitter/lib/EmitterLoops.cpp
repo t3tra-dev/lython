@@ -4,6 +4,7 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "ClosureAnalysis.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -1009,9 +1010,20 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   // names on purpose: its slots are for a name the scope AROUND the loop
   // reads, and it decides that by looking for such a read. This one is needed
   // whether or not anything reads the target afterwards.
+  llvm::StringSet<> readByNestedCallables =
+      namesReadByNestedCallables(ast::nodeList(statement, "body"));
   for (const auto &hint : targetHints) {
     llvm::StringRef name = hint.getKey();
-    if (!currentBoxedLocals.contains(name) || values.count(name))
+    // ⛔ The boxed set is not enough on its own: it is the enclosing
+    // FUNCTION's, and a comprehension's target belongs to the comprehension --
+    // `[lambda: i for i in range(3)]` gave [0, 1, 2] for CPython's [2, 2, 2]
+    // in all three comprehension spellings, at module scope where there is no
+    // enclosing function at all. What the cell is needed for is a callable
+    // nested in THIS body reading the target, which is a question about this
+    // loop.
+    if ((!currentBoxedLocals.contains(name) &&
+         !readByNestedCallables.contains(name)) ||
+        values.count(name))
       continue;
     mlir::Type content = hint.getValue();
     // The same storability rule the conditional slots end with: a slot for an

@@ -1015,7 +1015,11 @@ Value ModuleEmitter::emitLambda(const parser::Node &expr,
     auto found = values.find(captureName);
     if (found == values.end())
       continue;
-    if (moduleRebound.contains(captureName)) {
+    // A cell capture is by REFERENCE, so it reads the binding when it runs
+    // and there is nothing to go stale: a loop target read by a callable in
+    // the loop body is given one before the loop (emitFor).
+    if (moduleRebound.contains(captureName) &&
+        !isCellContract(found->second.type)) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, expr.range.start,
           "lambda reads module-level name '" + captureName +

@@ -278,11 +278,14 @@ void countNameAssignments(const parser::Node *node,
     for (const auto &entry : targets)
       ++counts[entry.getKey()];
   }
-  if (node->kind == "For" || node->kind == "AsyncFor")
+  if (node->kind == "For" || node->kind == "AsyncFor" ||
+      node->kind == "comprehension")
     if (const parser::Node *target = ast::node(*node, "target")) {
       llvm::StringSet<> targets;
       collectAssignedNameTargets(target, targets);
-      // A loop target is rebound every trip, which is more than once.
+      // A loop target is rebound every trip, which is more than once -- and a
+      // comprehension's target is rebound every element, in a frame of its own
+      // that every closure built in the body shares.
       for (const auto &entry : targets)
         counts[entry.getKey()] += 2;
     }
@@ -389,6 +392,21 @@ llvm::StringSet<> singleAssignmentNames(const parser::Node &scope) {
     if (entry.getValue() == 1)
       once.insert(entry.getKey());
   return once;
+}
+
+llvm::StringSet<> namesReadByNestedCallables(
+    const std::vector<parser::NodePtr> *body) {
+  llvm::SmallVector<const parser::Node *, 4> readers;
+  if (body)
+    for (const parser::NodePtr &statement : *body) {
+      collectDirectNestedFunctions(statement.get(), readers);
+      collectDirectNestedLambdas(statement.get(), readers);
+    }
+  llvm::StringSet<> names;
+  for (const parser::Node *reader : readers)
+    for (const std::string &capture : lexicalCaptureNames(*reader))
+      names.insert(capture);
+  return names;
 }
 
 llvm::StringSet<> reboundNames(const parser::Node &scope) {

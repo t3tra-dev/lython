@@ -36,6 +36,12 @@ llvm::StringSet<> singleAssignmentNames(const parser::Node &scope);
 // scope goes on to replace.
 llvm::StringSet<> reboundNames(const parser::Node &scope);
 
+// Names that a function or lambda nested directly in `body` reads from the
+// scope around it. A binding one of these names must be a CELL: the closure
+// reads it when it RUNS, not when it was built.
+llvm::StringSet<>
+namesReadByNestedCallables(const std::vector<parser::NodePtr> *body);
+
 std::string sanitizedSymbolPart(llvm::StringRef text);
 
 } // namespace lython::emitter
