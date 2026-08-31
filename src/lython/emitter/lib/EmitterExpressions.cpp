@@ -1563,11 +1563,17 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   // runtime question here. Both types are known at this point, which is the
   // whole question, exactly as for the dataclass fold below.
   //
-  // ⛔ Only families whose cross-family answer is unconditionally False. NOT
-  // container kinds: `{1} == frozenset({1})` is True, and a set and a
-  // frozenset are as different as a str and an int look from here. NOT source
+  // ⛔ Only families whose cross-family answer is unconditionally False. A set
+  // and a frozenset are ONE family for exactly that reason -- `{1} ==
+  // frozenset({1})` is True -- and so are bytes and bytearray. NOT source
   // classes: a hand-written __eq__ answers whatever it likes, which is the
   // measurement recorded on the dataclass fold below.
+  //
+  // ⭐ THE CONTAINERS ARE FAMILIES TOO, one per kind, and leaving them out is
+  // what made `[1] == 1`, `{} == 1`, `[1] == (1,)` and `None == []` die in the
+  // lowering -- for comparisons CPython answers False by the same
+  // NotImplemented rule that decides `"a" == 1`. `[1] == [2]` is a within-
+  // family pair and still goes the ordinary way.
   if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
     auto valueFamily = [&](mlir::Type type) -> llvm::StringRef {
       // None is a family of one. `x == None` for a concrete x is False, and
@@ -1587,6 +1593,16 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
         return "text";
       if (name == "builtins.bytes" || name == "builtins.bytearray")
         return "binary";
+      if (name == "builtins.list")
+        return "list";
+      if (name == "builtins.tuple")
+        return "tuple";
+      if (name == "builtins.dict")
+        return "dict";
+      if (name == "builtins.set" || name == "builtins.frozenset")
+        return "set";
+      if (name == "builtins.range")
+        return "range";
       return {};
     };
     llvm::StringRef lhsFamily = valueFamily(lhs.type);
