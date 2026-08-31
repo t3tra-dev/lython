@@ -2399,6 +2399,49 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
           "block is this one)"});
       return emitNone(expr);
     }
+  // ⭐ THE NUMERIC TOWER'S FOUR CONSTANT ATTRIBUTES, which are folds and not
+  // storage: `n.real` IS n, `n.imag` is zero, `n.numerator` is n and
+  // `n.denominator` is one. Every one of them reached the LOWERING and died
+  // there as "attr.get object type has no class schema" -- an internal
+  // sentence at the wrong layer for `(3).real`. CPython's own values are what
+  // these fold to, and a bool's are an int's (`True.numerator` is 1).
+  //
+  // ⛔ `numerator`/`denominator` for an int only: a float has neither in
+  // CPython (AttributeError), and complex has no `.numerator` either -- those
+  // keep whatever answer they had. complex's `.real`/`.imag` are real lanes
+  // rather than folds and are not this.
+  if (*attr == "real" || *attr == "imag" || *attr == "numerator" ||
+      *attr == "denominator") {
+    mlir::Type receiver = types.widenLiteral(object.type);
+    bool receiverIsInt =
+        receiver == types.intType() || receiver == types.boolType();
+    bool receiverIsFloat = receiver == types.floatType();
+    if (receiverIsInt && (*attr == "real" || *attr == "numerator"))
+      return receiver == types.boolType() ? emitIntFromBool(expr, object)
+                                          : object;
+    if (receiverIsFloat && *attr == "real")
+      return object;
+    if (receiverIsInt && (*attr == "imag" || *attr == "denominator"))
+      return emitExpr(
+          synth::intConstant(*attr == "imag" ? 0 : 1, expr.range).get());
+    if (receiverIsFloat && *attr == "imag") {
+      Value zero = emitExpr(synth::intConstant(0, expr.range).get());
+      return emitFloatFromInt(expr, zero);
+    }
+    // ⛔ complex's two are REAL LANES and not folds -- slots 2 and 3 of its
+    // header -- and the manifest declares no accessor for either. Said here
+    // because the alternative is the lowering's "attr.get object type has no
+    // class schema", which describes the compiler rather than the program.
+    if (receiver == types.contract("builtins.complex") &&
+        (*attr == "real" || *attr == "imag")) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "complex." + std::string(*attr) +
+              " is not available: the runtime stores the two parts but "
+              "declares no accessor for them"});
+      return emitNone(expr);
+    }
+  }
   if (*attr == "__cause__" || *attr == "__context__" ||
       *attr == "__suppress_context__")
     if (!lookupClassField(object.type, *attr) &&
