@@ -370,10 +370,42 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
 
   mlir::Location loc = op->getLoc();
   llvm::StringRef spelling = kind.getValue();
+
+  // A union parameter has no contract name of its own, so a default is
+  // bundled at the contract its own KIND names and then wrapped into the
+  // union's lanes. Not fixed by giving the union a contract name for
+  // bundleRawObjectValues to resolve: the union's ABI is a tag plus the
+  // active member's lanes, which is what the wrap builds and a single
+  // contract cannot describe.
+  auto bundleDefault = [&](llvm::StringRef contractName,
+                           mlir::ValueRange values) -> mlir::LogicalResult {
+    auto unionType = mlir::dyn_cast<py::UnionType>(parameterType);
+    mlir::Type memberType =
+        unionType ? runtimeContractType(context, contractName) : parameterType;
+    RuntimeBundle member;
+    if (mlir::failed(RuntimeBundleLowerer::bundleRawObjectValues(
+            op, memberType, values, member)))
+      return mlir::failure();
+    if (!unionType) {
+      bundle = std::move(member);
+      return mlir::success();
+    }
+    llvm::SmallVector<mlir::Value, 8> wrapped;
+    RuntimeBundle lanesSource;
+    if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
+            op, unionType, member, memberType, wrapped, &lanesSource)))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(op, unionType,
+                                                            wrapped, bundle)))
+      return mlir::failure();
+    bundle.unionActiveMember =
+        std::make_shared<RuntimeBundle>(std::move(lanesSource));
+    return mlir::success();
+  };
+
   if (spelling == "none") {
     // A None default's payload is always the NoneType singleton even when
-    // the parameter is an optional union (the union has no contract name of
-    // its own for bundleRawObjectValues to resolve).
+    // the parameter is an optional union.
     return RuntimeBundleLowerer::bundleRawObjectValues(
         op, runtimeContractType(context, "types.NoneType"), mlir::ValueRange{},
         bundle);
@@ -385,8 +417,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     mlir::Value bit =
         mlir::arith::ConstantIntOp::create(builder, loc, value.getValue(), 1)
             .getResult();
-    return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType, bit,
-                                                       bundle);
+    return bundleDefault("builtins.bool", bit);
   }
   if (spelling == "int") {
     auto value = dict.getAs<mlir::StringAttr>("value");
@@ -399,8 +430,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
     mlir::Value integer =
         mlir::arith::ConstantIntOp::create(builder, loc, parsed, 64)
             .getResult();
-    return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType,
-                                                       integer, bundle);
+    return bundleDefault("builtins.int", integer);
   }
   if (spelling == "float") {
     auto value = dict.getAs<mlir::FloatAttr>("value");
@@ -410,8 +440,7 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
         mlir::arith::ConstantFloatOp::create(builder, loc, builder.getF64Type(),
                                              value.getValue())
             .getResult();
-    return RuntimeBundleLowerer::bundleRawObjectValues(op, parameterType,
-                                                       number, bundle);
+    return bundleDefault("builtins.float", number);
   }
   if (spelling == "str") {
     auto value = dict.getAs<mlir::StringAttr>("value");
@@ -426,8 +455,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
             builder, loc, static_cast<std::int64_t>(value.getValue().size()),
             64)
             .getResult();
-    return RuntimeBundleLowerer::bundleRawObjectValues(
-        op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);
+    return bundleDefault("builtins.str",
+                         mlir::ValueRange{bytes, start, length});
   }
   if (spelling == "bytes") {
     auto value = dict.getAs<mlir::StringAttr>("value");
@@ -442,8 +471,8 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultValue(
             builder, loc, static_cast<std::int64_t>(value.getValue().size()),
             64)
             .getResult();
-    return RuntimeBundleLowerer::bundleRawObjectValues(
-        op, parameterType, mlir::ValueRange{bytes, start, length}, bundle);
+    return bundleDefault("builtins.bytes",
+                         mlir::ValueRange{bytes, start, length});
   }
   if (spelling == "global") {
     // R6 definition-time defaults: the value was evaluated once when
