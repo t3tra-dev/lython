@@ -3537,6 +3537,36 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // Rendering it here -- by tag, member by member -- is the only place that
   // question can be answered, because only the emitter still knows the
   // members.
+  // ⛔ A CLASS IS NOT A VALUE HERE, and the lowering could not say so: it
+  // reported "runtime method receiver has no concrete contract" for
+  // `print(type(1))` and `print(x.__class__)`, which describes the dispatch
+  // rather than the program. A type object is compile-time evidence in this
+  // compiler and has no object handle to render; `type(x).__name__` and
+  // `type(x) is int` are folds and keep working.
+  //
+  // ⛔ The two SPELLINGS and not only the inferred type: `type(x)` is folded by
+  // the emitter and the inference walk does not model the fold, so it answers
+  // `object` for the very expression this is about.
+  auto rendersAClass = [&](const parser::Node &argument) {
+    if (mlir::isa_and_nonnull<py::TypeType>(
+            types.widenLiteral(types.inferExpr(&argument))))
+      return true;
+    if (argument.kind == "Call")
+      return callsUnshadowedBuiltin(ast::node(argument, "func"), "type");
+    return argument.kind == "Attribute" &&
+           ast::string(argument, "attr") == "__class__";
+  };
+  if (printArgs)
+    for (const parser::NodePtr &argument : *printArgs)
+      if (argument && argument->kind != "Starred" &&
+          rendersAClass(*argument)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start,
+            "print() cannot render a class: a type object is compile-time "
+            "evidence here and has no runtime value, so write "
+            "`type(x).__name__` for the name"});
+        return emitNone(expr);
+      }
   bool singleUnionArgument =
       printArgs && printArgs->size() == 1 && printArgs->front() &&
       printArgs->front()->kind != "Starred" &&

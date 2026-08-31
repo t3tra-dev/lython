@@ -2442,6 +2442,17 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       return emitNone(expr);
     }
   }
+  // ⛔ `__doc__` IS NOT STORED. A docstring is dropped at emit time, so the
+  // attribute had nothing to read and reached the lowering's "attr.get object
+  // type has no class schema" -- an internal sentence for a read CPython
+  // answers with a string.
+  if (*attr == "__doc__" && !lookupClassField(object.type, *attr)) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "'__doc__' is not available: docstrings are not retained at run "
+        "time"});
+    return emitNone(expr);
+  }
   if (*attr == "__cause__" || *attr == "__context__" ||
       *attr == "__suppress_context__")
     if (!lookupClassField(object.type, *attr) &&

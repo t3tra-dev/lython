@@ -905,4 +905,37 @@ TEST(EmitterTest, TheImplicitClassHooksAreAccountedFor) {
            diagnostic.message.find("__set_name__") != std::string::npos;
   EXPECT_TRUE(told);
 }
+
+// What: three reads that used to reach the LOWERING and fail there with a
+// sentence about the compiler. `(3).real` is a fold and now answers; `__doc__`
+// and a class in `print()` cannot answer at all and say so about the PROGRAM.
+TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
+  mlir::MLIRContext folded(testRegistry());
+  lython::emitter::EmitResult numeric =
+      emitSource("print((3).real, (3).imag, (3).numerator, (3).denominator)\n",
+                 folded);
+  EXPECT_TRUE(numeric.ok());
+
+  mlir::MLIRContext documented(testRegistry());
+  lython::emitter::EmitResult doc =
+      emitSource("print((1).__doc__)\n", documented);
+  EXPECT_FALSE(doc.ok());
+  bool saidDoc = false;
+  for (const lython::parser::Diagnostic &diagnostic : doc.diagnostics)
+    saidDoc = saidDoc ||
+              diagnostic.message.find("docstrings are not retained") !=
+                  std::string::npos;
+  EXPECT_TRUE(saidDoc);
+
+  mlir::MLIRContext classy(testRegistry());
+  lython::emitter::EmitResult rendered =
+      emitSource("print(type(1))\n", classy);
+  EXPECT_FALSE(rendered.ok());
+  bool saidClass = false;
+  for (const lython::parser::Diagnostic &diagnostic : rendered.diagnostics)
+    saidClass = saidClass ||
+                diagnostic.message.find("cannot render a class") !=
+                    std::string::npos;
+  EXPECT_TRUE(saidClass);
+}
 }
