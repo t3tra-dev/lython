@@ -963,6 +963,12 @@ module attributes {
   py.class @range attributes {base_names = ["Sequence", "Hashable"],
                              ly.typing.base_args = [[!py.contract<"builtins.int">], []],
                              ly.typing.final,
+    field_names = ["start", "stop", "step"],
+    field_contract_types = [
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.int">
+    ],
     method_names = ["__new__", "__new__", "__new__", "__init__", "__iter__",
                     "__eq__", "__ne__"],
     method_contracts = [
@@ -24726,6 +24732,20 @@ module attributes {
   // instead, which is why they were declared-but-unimplemented without showing
   // up in a method_names sweep. len(r), r[i] and `v in r` all resolved through
   // the Sequence tower to a builtins.range method that did not exist.
+  // ⭐ range.start / .stop / .step are the three words the object already
+  // stores, boxed. Without them an attribute read reached the lowering's
+  // "attr.get object type has no class schema" -- an internal sentence for
+  // three attributes CPython answers with the numbers the constructor was
+  // given. `which` is 0/1/2 and the caller passes a constant.
+  func.func @LyRange_Field(%self: memref<5xi64> {ly.ownership.object_header}, %which: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.primitive = "field", ly.runtime.result_contract = "builtins.int"} {
+    %two = arith.constant 2 : i64
+    %slot_i64 = arith.addi %which, %two : i64
+    %slot = arith.index_cast %slot_i64 : i64 to index
+    %raw = memref.load %self[%slot] : memref<5xi64>
+    %boxed = func.call @LyLong_FromI64(%raw) : (i64) -> memref<2xi64>
+    func.return %boxed : memref<2xi64>
+  }
+
   func.func @LyRange_Len(%self: memref<5xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.range", ly.runtime.method = "__len__"} {
     %length = func.call @__ly_range_length(%self) : (memref<5xi64>) -> i64
     func.return %length : i64

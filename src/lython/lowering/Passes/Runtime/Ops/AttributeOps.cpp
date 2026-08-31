@@ -1139,6 +1139,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     return mlir::success();
   }
 
+  // ⭐ range.start / .stop / .step read the words the object stores. Without
+  // this the attribute reached the failure below -- "has no class schema for
+  // attribute 'start'" -- for three reads CPython answers with the numbers the
+  // constructor was given, and `len(r)` and `r[i]` over the same object both
+  // worked.
+  if (object->kind == RuntimeBundle::Kind::Object &&
+      runtimeContractName(op.getObject().getType()) == "builtins.range") {
+    llvm::StringRef field = op.getName();
+    std::optional<std::int64_t> which =
+        field == "start" ? std::optional<std::int64_t>(0)
+        : field == "stop" ? std::optional<std::int64_t>(1)
+        : field == "step" ? std::optional<std::int64_t>(2)
+                          : std::nullopt;
+    if (which) {
+      std::optional<RuntimeSymbol> fieldPrimitive =
+          manifest.primitive("builtins.range", "field");
+      if (!fieldPrimitive)
+        return op.emitError() << "runtime manifest has no range field "
+                                 "primitive";
+      builder.setInsertionPoint(op);
+      llvm::SmallVector<mlir::Value, 2> operands(
+          object->physicalValues().begin(), object->physicalValues().end());
+      operands.push_back(
+          mlir::arith::ConstantIntOp::create(builder, op.getLoc(), *which, 64));
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op.getLoc(), *fieldPrimitive, operands);
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+              op, op.getResult().getType(), call, result)))
+        return mlir::failure();
+      valueBundles[op.getResult()] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
+
   // exception.args materializes from the message payload through the
   // BaseException manifest primitive: builtin exceptions have no field
   // storage to read (a 3-word header plus the message pair).
