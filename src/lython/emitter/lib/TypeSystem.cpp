@@ -2906,6 +2906,28 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           if (std::optional<mlir::Type> property = lookupClassPropertyType(
                   contractType.getContractName(), *attr))
             return *property;
+          // ⭐ A METHOD READ WITHOUT A CALL IS THE BOUND METHOD, not the value
+          // that calling it would give. The arm below answers with the RESULT
+          // of a zero-argument call, which is right for the manifest reads
+          // this compiler folds to a value and wrong for a method used as one:
+          // the emitter builds the bound object (emitMethodObject), so
+          // `m = c.go` then `m()` worked, while `[c.go]` -- whose element type
+          // comes from this channel -- was `list[int]` and then "builtins.int
+          // is not callable". A method that takes an argument did not even
+          // reach the arm, because a zero-argument call does not resolve it.
+          //
+          // ⛔ Source classes and an INSTANCE receiver only: `C.go` read off
+          // the class is the plain function, which binds nothing.
+          if (!mlir::isa<py::TypeType>(widenLiteral(objectType)) &&
+              lookupClass(contractType.getContractName())) {
+            std::vector<py::protocols::ContractResolution> methods =
+                table.methodContractCandidatesWithEvidence(receiverInstance,
+                                                           *attr);
+            if (methods.size() == 1 &&
+                !methods.front().method.signature.getPositionalTypes().empty())
+              return py::protocols::bindReceiverCallable(
+                  methods.front().method.signature);
+          }
         }
         if (std::optional<CallSolution> method =
                 tryManifestMethod(*this, widenLiteral(objectType), *attr, {}))
