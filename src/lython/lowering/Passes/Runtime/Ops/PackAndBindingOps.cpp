@@ -413,6 +413,32 @@ RuntimeBundleLowerer::lowerFunctionBindingRef(py::BindingRefOp op,
     return mlir::success();
   }
 
+  // ⭐ AN OBJECT'S IDENTITY IS THE SOURCE FUNCTION'S, never the unboxed
+  // clone's. The retarget above is for a DIRECT call from inside the unboxed
+  // lane, where calling the clone is the whole point; here a real function
+  // object is being built, and its target id is what every call site compares
+  // against -- and a call site dispatches on the SOURCE symbol. A generator
+  // that yields a function was the shape that showed it, because a generator
+  // body IS a clone:
+  //
+  //     def five() -> int: return 5
+  //     def gen(): yield five
+  //     for f in gen(): print(f())   # TypeError: callable target is not
+  //                                  # available -- the object carried the
+  //                                  # clone's id, the dispatch compared the
+  //                                  # source's
+  //
+  // The str- and float-returning spellings worked: neither has a clone. The
+  // unboxed lane is not lost -- the call site still reaches the clone through
+  // emitPrimitiveI64CloneFallbackResult, which is keyed on the source symbol.
+  if (targetFunction != function) {
+    targetFunction = function;
+    bundle = RuntimeBundle::object(functionContract, {});
+    bundle.functionTarget = targetFunction.getSymName().str();
+    if (mlir::failed(appendClosureValues(op, targetFunction, bundle)))
+      return mlir::failure();
+  }
+
   if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
     return op.emitError()
            << "protocol-typed function '" << op.getBinding()
