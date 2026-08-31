@@ -140,6 +140,9 @@ mlir::FailureOr<mlir::Value> pythonDefault(mlir::OpBuilder &builder,
       return py::PackOp::create(builder, anchor->getLoc(), type,
                                 mlir::ValueRange{})
           .getResult();
+    // Anything else: the unbound placeholder, which is what this value is --
+    // never read, only released. The emitter's twin says the same.
+    return py::UnboundOp::create(builder, anchor->getLoc(), type).getResult();
   }
   return anchor->emitError()
          << "py.try finally lowering can only synthesize exceptional defaults "

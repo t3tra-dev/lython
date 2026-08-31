@@ -36,6 +36,19 @@ def mapping(flag: int) -> "dict[str, int]":
         print("mapped")
 
 
+class Result:
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+
+def held(flag: int) -> Result:
+    with Span():
+        if flag > 0:
+            return Result("kept")
+        return Result("other")
+
+
 print(guarded({"a": 1}, "a"), guarded({"a": 1}, "z"))
+print(held(1).tag, held(-1).tag)
 print(inside_with([1, 2]))
 print(sorted(mapping(3).items()), sorted(mapping(-1).items()))

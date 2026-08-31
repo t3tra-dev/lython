@@ -56,12 +56,10 @@ bool isSupportedFinallyReturnCarrierType(mlir::Type type) {
     llvm::StringRef name = contract.getContractName();
     // The set `defaultCompletionValue` (Ops/TryOps.cpp) can synthesize an
     // exceptional default for -- the containers are empty literals there.
-    return name == "types.NoneType" || name == "builtins.bool" ||
-           name == "builtins.int" || name == "builtins.float" ||
-           name == "builtins.str" || name == "builtins.object" ||
-           name == "builtins.list" || name == "builtins.tuple" ||
-           name == "builtins.set" || name == "builtins.frozenset" ||
-           name == "builtins.dict" || name == "builtins.bytes";
+    (void)name;
+    // Every contract has a default now: a scalar constant, an empty container,
+    // or the unbound placeholder -- see `emitDefaultReturnValue`.
+    return true;
   }
   return false;
 }
@@ -935,6 +933,15 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                                      mlir::ValueRange{});
         return {op.getResult(), target};
       }
+      // ⭐ AND ANYTHING ELSE IS THE UNBOUND PLACEHOLDER, which is what this
+      // value IS: the payload on the path that did not return, never read
+      // (the return flag beside it is false) and only ever released. `py.
+      // unbound` lowers to the non-owning dead object the cell machinery
+      // already uses, so `with lock: return Result(...)` -- a SOURCE class,
+      // which has no literal to default to -- stops being "return value type
+      // through try/finally is not implemented yet".
+      auto unbound = py::UnboundOp::create(builder, loc(statement), target);
+      return {unbound.getResult(), target};
     }
     return emitNone(statement);
   };
