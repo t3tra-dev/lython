@@ -2522,7 +2522,15 @@ void ModuleEmitter::collectClassFields(
               "' requires a statically inferred type"});
       return;
     }
-    mlir::Type storedType = types.widenLiteral(type);
+    // ⭐ A LAMBDA FIELD'S RESULT IS AN INFERENCE, NOT A PROMISE. widenLiteral
+    // is shallow, so `self.fn = lambda: 6` typed the field `Callable[[], 6]`
+    // while the lambda's own callable is literal-widened before it is checked
+    // against that field -- "lambda body is not compatible with its Callable
+    // annotation", for a field that has no annotation at all. The named-def
+    // spelling worked because a def's result comes from its return annotation.
+    mlir::Type storedType = mlir::isa_and_nonnull<py::CallableType>(type)
+                                ? widenInferredLiterals(type, types)
+                                : types.widenLiteral(type);
     for (auto [index, existing] : llvm::enumerate(fieldNames)) {
       if (existing != name)
         continue;
