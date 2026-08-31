@@ -803,21 +803,12 @@ bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
   if (!nextMethod || !nextMethod->method)
     return false;
   const auto *orelse = ast::nodeList(statement, "orelse");
-  if (orelse && !orelse->empty())
-    return false;
   const parser::Field *targetField = parser::findField(statement, "target");
   const parser::Field *iterField = parser::findField(statement, "iter");
   const auto *body = ast::nodeList(statement, "body");
   if (!targetField || !iterField || !body ||
       !std::holds_alternative<parser::NodePtr>(targetField->value) ||
       !std::holds_alternative<parser::NodePtr>(iterField->value))
-    return false;
-  // ⛔ A `break` or `continue` the body writes would leave the try's else, and
-  // that is unsupported below the emitter -- a carried local turns it into
-  // "break/continue through try/finally", and without one it reached the
-  // lowering as a block with no terminator. Declining leaves the original
-  // refusal, which is a diagnostic; the alternative was a crash report.
-  if (containsLoopLevelJump(body))
     return false;
   parser::NodePtr target = std::get<parser::NodePtr>(targetField->value);
   parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
@@ -842,6 +833,27 @@ bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
                    std::vector<parser::NodePtr>{synth::assign(
                        synth::name(doneName, range),
                        synth::constantBool(true, range), range)});
+  // ⭐ THE BODY RUNS AFTER THE TRY, GUARDED BY THE FLAG. It used to go in the
+  // try's ELSE, and a `break` or `continue` the body writes is then a jump out
+  // of a try -- unsupported below the emitter, so the whole rewrite declined
+  // and the loop fell back to asking the MANIFEST for `__next__`, which a
+  // source class has no entry in:
+  //
+  //     for v in Counter(5):
+  //         if v < 2:
+  //             break
+  //     # runtime manifest has no Counter.__next__ method
+  //
+  // After the try the user's jumps are at loop level, where they always were
+  // in the program the author wrote. The else existed because a name bound
+  // inside a try did not escape to the statements after it; conditionally
+  // assigned locals get a slot before the region now, so it does.
+  //
+  // ⛔ The TARGET stays inside the try. Landing the element in a scratch name
+  // and unpacking after works for a plain name and not for a tuple target --
+  // `for a, b in Pairs(3)` was "operand #0 does not dominate this use",
+  // because the scratch gets no slot and the unpack reads the try region's
+  // own SSA value.
   parser::NodePtr tryNode = parser::makeNode("Try", range);
   parser::addField(
       *tryNode, "body",
@@ -852,27 +864,37 @@ bool ModuleEmitter::emitSourceIteratorFor(const parser::Node &statement,
           range)});
   parser::addField(*tryNode, "handlers",
                    std::vector<parser::NodePtr>{std::move(handler)});
-  // The body goes in the try's ELSE, not after it: a name BOUND inside a try
-  // does not escape to the statements that follow, so `for v in it:` left `v`
-  // unresolved one line later. The else runs in the try's own scope and only
-  // when no exception was raised, which is also exactly the iteration
-  // condition.
+  parser::addField(*tryNode, "orelse", std::vector<parser::NodePtr>{});
+  parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
+
   std::vector<parser::NodePtr> guarded;
   for (const parser::NodePtr &each : *body)
     if (each)
       guarded.push_back(each);
-  // An empty else region is a block with no terminator by the time the
-  // lowering sees it; a `pass` is what the source form of an empty suite is.
+  // An empty guard is a block with no terminator by the time the lowering sees
+  // it; a `pass` is what the source form of an empty suite is.
   if (guarded.empty())
     guarded.push_back(parser::makeNode("Pass", range));
-  parser::addField(*tryNode, "orelse", std::move(guarded));
-  parser::addField(*tryNode, "finalbody", std::vector<parser::NodePtr>{});
 
   std::vector<parser::NodePtr> loopBody{std::move(tryNode)};
+  loopBody.push_back(synth::ifStmt(
+      synth::notOp(synth::name(doneName, range), range), std::move(guarded), {},
+      range));
 
+  // ⭐ AND THE `else` IS THE WHILE'S OWN. A for's else means "the body wrote no
+  // break", and this while exits through its CONDITION only when the handler
+  // set the done flag -- exhaustion -- while a body break leaves without it.
+  // The two are already distinguished by the shape; the earlier note said they
+  // were not, from when the body sat in the try's else and a break was refused
+  // outright.
+  std::vector<parser::NodePtr> loopElse;
+  if (orelse)
+    for (const parser::NodePtr &each : *orelse)
+      if (each)
+        loopElse.push_back(each);
   parser::NodePtr loop = synth::whileStmt(
       synth::notOp(synth::name(doneName, range), range), std::move(loopBody),
-      {}, range);
+      std::move(loopElse), range);
   runWithScratchNames({iteratorName, doneName}, [&] {
     emitStatement(*synth::assign(synth::name(doneName, range),
                                  synth::constantBool(false, range), range));

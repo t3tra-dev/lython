@@ -138,3 +138,42 @@ print([a + b for a, b in Pairs(3)])
 # --- the iterator is CONSUMED: a second pass sees nothing ------------------
 once = Count(3)
 print(list(once), list(once))
+
+
+# --- break, continue and else, which the rewrite used to decline ------------
+for v in Count(5):
+    if v == 3:
+        continue
+    if v == 1:
+        break
+    print("jump", v)
+
+total = 0
+for v in Count(4):
+    if v == 0:
+        break
+    total += v
+print("total", total)
+
+for v in Count(2):
+    print("ran", v)
+else:
+    print("exhausted")
+
+for v in Count(3):
+    if v == 2:
+        break
+else:
+    print("not reached")
+print("after")
+
+for outer in Count(3):
+    for inner in Count(2):
+        if inner == 0:
+            break
+        print("nested", outer, inner)
+
+for a, b in Pairs(3):
+    if a == 1:
+        break
+    print("pair", a, b)
