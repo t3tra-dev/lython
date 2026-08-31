@@ -731,6 +731,9 @@ set(LYTHON_LEAK_GATE_CASES
     # payload, and the path that did NOT run has to discard its own -- which
     # is exactly what a golden cannot see.
     a_handler_returns_a_container
+    # The finally form of the same thing: the non-returning path yields an
+    # EMPTY container as its default, and that object has to be released.
+    a_container_returned_through_a_finally
     # Two closures over one captured object: the merge's heap dead placeholder
     # is a real object with a refcount, and marking it complete moves where the
     # edge retain goes.

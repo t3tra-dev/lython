@@ -54,9 +54,14 @@ bool isSupportedFinallyReturnCarrierType(mlir::Type type) {
   }
   if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
     llvm::StringRef name = contract.getContractName();
+    // The set `defaultCompletionValue` (Ops/TryOps.cpp) can synthesize an
+    // exceptional default for -- the containers are empty literals there.
     return name == "types.NoneType" || name == "builtins.bool" ||
            name == "builtins.int" || name == "builtins.float" ||
-           name == "builtins.str" || name == "builtins.object";
+           name == "builtins.str" || name == "builtins.object" ||
+           name == "builtins.list" || name == "builtins.tuple" ||
+           name == "builtins.set" || name == "builtins.frozenset" ||
+           name == "builtins.dict" || name == "builtins.bytes";
   }
   return false;
 }
@@ -915,6 +920,20 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                         .getResult(),
                     literalType};
         return coerceValue(value, target, statement);
+      }
+      // ⭐ AN EMPTY CONTAINER, the same default `defaultCompletionValue`
+      // synthesizes in the lowering. Falling through to `emitNone` below gave
+      // the payload lane a None where a list was expected, and the report was
+      // about the ABI ("cannot adapt runtime bundle types.NoneType with
+      // physical values () to expected ABI (memref<9xi64>)") rather than about
+      // the program -- for `with open(...) as f: return [x]`, which is what a
+      // `with` desugars into.
+      if (name == "builtins.list" || name == "builtins.tuple" ||
+          name == "builtins.set" || name == "builtins.frozenset" ||
+          name == "builtins.dict" || name == "builtins.bytes") {
+        auto op = py::PackOp::create(builder, loc(statement), target,
+                                     mlir::ValueRange{});
+        return {op.getResult(), target};
       }
     }
     return emitNone(statement);

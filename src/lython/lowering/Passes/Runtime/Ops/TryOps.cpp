@@ -122,6 +122,25 @@ mlir::FailureOr<mlir::Value> pythonDefault(mlir::OpBuilder &builder,
       return upcast.getResult();
     }
   }
+  // ⭐ AN EMPTY CONTAINER IS A STATIC DEFAULT TOO, and its absence is what
+  // refused `with open(...) as f: return [x]` -- a `with` desugars to
+  // try/finally, so every container return from inside one was "return value
+  // type through try/finally is not implemented yet" while the same return of
+  // an `int` compiled. The value's only job is to be released by the discard
+  // on the path that did not return, so an empty one costs an allocation on
+  // the exceptional path and nothing on the normal one.
+  //
+  // ⛔ A SOURCE CLASS still has none: there is no literal for it and calling
+  // its `__init__` would run a program the author did not write.
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+    llvm::StringRef name = contract.getContractName();
+    if (name == "builtins.list" || name == "builtins.tuple" ||
+        name == "builtins.set" || name == "builtins.frozenset" ||
+        name == "builtins.dict" || name == "builtins.bytes")
+      return py::PackOp::create(builder, anchor->getLoc(), type,
+                                mlir::ValueRange{})
+          .getResult();
+  }
   return anchor->emitError()
          << "py.try finally lowering can only synthesize exceptional defaults "
             "for statically defaultable completion results, got "
