@@ -4013,7 +4013,63 @@ mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {
   // answer one step earlier, where the coercion already exists.
   if (mlir::Type base = nearestCommonSourceBase(present))
     return base;
+  if (mlir::Type callable = commonCallableJoin(present))
+    return callable;
   return py::UnionType::getNormalized(&context, present);
+}
+
+// ⭐ TWO FUNCTIONS OF THE SAME SHAPE JOIN AT ONE FUNCTION, not into a union of
+// themselves. `[lambda: 1, lambda: 2]` inferred
+// `Callable[[], 1] | Callable[[], 2]`, and a union is not callable, so
+// `fs[0]()` and `[f() for f in fs]` were both refused -- for a list of
+// same-signature functions, which is what a jump table IS in Python. The same
+// list written with two `def`s already worked, because their annotated
+// results were already the one type.
+//
+// ⛔ ONLY when the parameter shapes are identical, which is checked by
+// rebuilding each member with the joined result and requiring the rebuilds to
+// agree: a real join over differing parameters is a MEET on each one
+// (contravariance), and a callable that claims to accept more than a member
+// does would be unsound at the call the union member cannot serve.
+mlir::Type
+TypeSystem::commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const {
+  llvm::SmallVector<py::CallableType, 4> callables;
+  llvm::SmallVector<mlir::Type, 4> results;
+  for (mlir::Type member : members) {
+    auto callable = mlir::dyn_cast_if_present<py::CallableType>(member);
+    if (!callable || callable.getResultTypes().size() != 1)
+      return {};
+    callables.push_back(callable);
+    // The literal widening is what makes the two spellings the same shape at
+    // all: `lambda: 1` and `lambda: 2` return `literal<1>` and `literal<2>`.
+    results.push_back(widenLiteral(callable.getResultTypes().front()));
+  }
+  if (callables.size() < 2)
+    return {};
+  // ⛔ And only when the RESULTS agree too. `[lambda: 1, lambda: 2.0]` joins
+  // to `Callable[[], int | float]`, and an indirect call cannot return a union
+  // -- the program left the emitter and died in the lowering ("runtime bundle
+  // value 0 for builtins.bool"). A union of callables keeps the emit-boundary
+  // refusal it already had, which is the honest answer for it.
+  mlir::Type joinedResult = join(results);
+  if (!joinedResult || mlir::isa<py::UnionType>(joinedResult) ||
+      isObjectTop(*this, joinedResult))
+    return {};
+  auto withResult = [&](py::CallableType callable) {
+    llvm::SmallVector<mlir::Type, 1> single{joinedResult};
+    return py::CallableType::get(
+        &context, callable.getPositionalTypes(), callable.getKwOnlyTypes(),
+        callable.getVarargType(), callable.getKwargType(), single,
+        callable.getPositionalNames(), callable.getKwOnlyNames(),
+        callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
+        callable.getVarargName(), callable.getKwargName(),
+        callable.getPositionalOnlyCount());
+  };
+  py::CallableType joined = withResult(callables.front());
+  for (py::CallableType callable : llvm::ArrayRef(callables).drop_front())
+    if (withResult(callable) != joined)
+      return {};
+  return joined;
 }
 
 mlir::Type

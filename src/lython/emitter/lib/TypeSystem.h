@@ -380,6 +380,9 @@ public:
                           mlir::ArrayRef<mlir::Type> positional,
                           mlir::ArrayRef<CallKeywordType> keywords) const;
   mlir::Type join(mlir::ArrayRef<mlir::Type> types) const;
+  // Same-shape callables collapse to one callable whose result is the join of
+  // theirs, instead of a union nothing can call.
+  mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;
   mlir::Type widenLiteral(mlir::Type type) const;
 
   // Synthesized-function support (lazy iterator desugars): pins an
