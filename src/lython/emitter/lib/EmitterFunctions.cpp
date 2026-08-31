@@ -363,6 +363,13 @@ bool statementCanComplete(const parser::Node &statement) {
       if (bodyCanComplete(ast::nodeList(*caseNode, "body")))
         return true;
       const parser::Node *pattern = ast::node(*caseNode, "pattern");
+      // `case _ as name:` is the same irrefutable capture wearing a second
+      // name, and reading only the outer node called it refutable -- so a
+      // match whose last case was written that way was reported as able to
+      // reach the function's end.
+      while (pattern && pattern->kind == "MatchAs" &&
+             ast::node(*pattern, "pattern"))
+        pattern = ast::node(*pattern, "pattern");
       // A guard can fail, so the case it guards proves nothing.
       if (!ast::node(*caseNode, "guard") && pattern &&
           pattern->kind == "MatchAs" && !ast::node(*pattern, "pattern"))

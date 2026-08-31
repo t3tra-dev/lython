@@ -78,6 +78,43 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
     ScopedEmitterScope scope(values, types);
     builder.setInsertionPointToStart(check);
 
+    // The subject as the chain now knows it: a `case None:` above this one
+    // (or a class test) has already ruled members out, and a capture that
+    // bound the whole union would be refused for operators the remaining
+    // member has. Emitted lazily so a case that captures nothing adds no op.
+    std::optional<Value> narrowedSubject;
+    auto capturedSubject = [&]() -> Value {
+      if (narrowedSubject)
+        return *narrowedSubject;
+      narrowedSubject = subject;
+      if (matchSubjectType != subject.type &&
+          mlir::isa<py::UnionType>(subject.value.getType()) &&
+          mlir::isa<py::ContractType>(matchSubjectType)) {
+        auto unwrap = py::UnionUnwrapOp::create(builder, loc(statement),
+                                                matchSubjectType,
+                                                subject.value);
+        narrowedSubject = Value{unwrap.getResult(), matchSubjectType};
+      }
+      return *narrowedSubject;
+    };
+
+    // ⭐ `<pattern> as <name>` BINDS THE WHOLE SUBJECT and then matches the
+    // pattern -- two independent things the chain below can do separately, and
+    // it refused the pair outright ("match pattern 'MatchAs' is not
+    // implemented") while `case name:` and `case [x]:` each worked on their
+    // own. The name is bound here, where the capture-only form binds it, and
+    // the chain sees the inner pattern; the case's own scope keeps the binding
+    // from outliving a case whose condition then fails.
+    while (pattern->kind == "MatchAs" && ast::node(*pattern, "pattern")) {
+      if (std::optional<std::string_view> name =
+              ast::string(*pattern, "name")) {
+        Value bound = capturedSubject();
+        values[std::string(*name)] = bound;
+        types.bindSymbol(*name, bound.type);
+      }
+      pattern = ast::node(*pattern, "pattern");
+    }
+
     // A nullopt condition means the pattern is irrefutable; unsupported
     // pattern kinds are rejected below with a diagnostic instead of silently
     // falling through.
@@ -87,8 +124,15 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
     if (pattern->kind == "MatchAs" && !ast::node(*pattern, "pattern")) {
       if (std::optional<std::string_view> name =
               ast::string(*pattern, "name")) {
-        values[std::string(*name)] = subject;
-        types.bindSymbol(*name, subject.type);
+        // ⭐ THE CAPTURE SEES WHAT THE CHAIN ALREADY RULED OUT. `case None:`
+        // above this one excludes None from what can still arrive, and the
+        // capture bound the WHOLE union anyway -- so `case n: return str(n +
+        // 1)` on an `int | None` was refused for an operator the remaining
+        // member has. The class arm already keeps this bookkeeping in
+        // `matchSubjectType`; the captures are the other place that read it.
+        Value captured = capturedSubject();
+        values[std::string(*name)] = captured;
+        types.bindSymbol(*name, captured.type);
       }
     } else if (pattern->kind == "MatchValue") {
       condition = equalsConstant(*pattern, ast::node(*pattern, "value"));
@@ -109,6 +153,20 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       } else {
         unsupported = true;
       }
+      // ⭐ FALLING THROUGH THIS CASE MEANS THE SUBJECT IS NOT None, which is
+      // the same bookkeeping the class arm keeps: without it every later case
+      // still saw the None member and `case n: return str(n + 1)` was refused.
+      if (!unsupported)
+        if (auto unionType =
+                mlir::dyn_cast_if_present<py::UnionType>(matchSubjectType)) {
+          llvm::SmallVector<mlir::Type, 4> remaining;
+          for (mlir::Type member : unionType.getMemberTypes())
+            if (types.widenLiteral(member) != types.none())
+              remaining.push_back(member);
+          if (!remaining.empty() &&
+              remaining.size() < unionType.getMemberTypes().size())
+            matchSubjectType = types.join(remaining);
+        }
     } else if (pattern->kind == "MatchSingleton") {
       // `case True:` / `case False:` — use the subject's truthiness (its
       // runtime `__eq__` is not available). Only sound for a bool subject,
