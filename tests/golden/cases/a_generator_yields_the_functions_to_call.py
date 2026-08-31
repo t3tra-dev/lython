@@ -44,3 +44,24 @@ def with_arguments():
 
 for f in with_arguments():
     print(f(21))
+
+
+# A closure the generator builds over its OWN loop target: the cell is a frame
+# lane, and the value each function answers with is the only thing that shows
+# the lane carried the cell rather than a copy of it.
+def closures(n: int):
+    for i in range(n):
+        yield lambda: i
+
+
+print([f() for f in list(closures(3))])
+print([f() for f in closures(3)])
+
+
+def named(n: int):
+    for i in range(n):
+        k = i * 10
+        yield lambda: k
+
+
+print([f() for f in list(named(3))])

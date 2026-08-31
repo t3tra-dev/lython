@@ -63,3 +63,22 @@ module_level = []
 for m in range(4):
     module_level.append(lambda: m)
 print([f() for f in module_level])
+
+
+# A name the loop BODY binds is a binding of the frame too, and the container
+# it lands in has to be typed from what the lambda actually returns.
+def scaled() -> "list[int]":
+    fs = []
+    for i in range(3):
+        k = i * 10
+        fs.append(lambda: k)
+    return [f() for f in fs]
+
+
+print(scaled())
+
+texts = []
+for word in ["a", "bb"]:
+    shout = word.upper()
+    texts.append(lambda: shout)
+print([f() for f in texts])

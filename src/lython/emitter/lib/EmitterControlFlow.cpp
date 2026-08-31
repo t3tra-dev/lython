@@ -3,6 +3,7 @@
 #include "EmitterSupport.h"
 
 #include "AstAccess.h"
+#include "ClosureAnalysis.h"
 
 #include "llvm/ADT/ScopeExit.h"
 
@@ -823,6 +824,22 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
   if (boundWithKnownType)
     for (const auto &entry : *boundWithKnownType)
       assigned.insert(entry.getKey());
+  // ⭐ A NAME A NESTED CALLABLE READS NEEDS ITS SLOT HERE EVEN IF NOTHING
+  // AFTER THE REGION READS IT. The boxed path makes the cell at the first
+  // BINDING, and inside a loop that site runs once per trip, so each closure
+  // got a cell of its own:
+  //
+  //     for i in range(3):
+  //         k = i * 10
+  //         fs.append(lambda: k)     # [0, 10, 20]; CPython [20, 20, 20]
+  //
+  // The slot made here is before the region, which is where the frame's cell
+  // belongs. This is why such a name is no longer skipped for being boxed:
+  // being boxed is the reason it needs the slot, not a reason to leave it.
+  llvm::StringSet<> readByNested;
+  for (const std::vector<parser::NodePtr> *body : bodies)
+    for (const auto &entry : namesReadByNestedCallables(body))
+      readByNested.insert(entry.getKey());
   llvm::SmallVector<std::string, 4> names;
   for (const auto &entry : assigned) {
     llvm::StringRef name = entry.getKey();
@@ -830,8 +847,8 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
       continue;
     // A name the module already owns is a global, not a local of this scope.
     if (isModuleGlobalRead(name) || moduleGlobals.count(name) ||
-        currentBoxedLocals.contains(name) || types.lookupSymbol(name) ||
-        types.lookupClass(name))
+        (currentBoxedLocals.contains(name) && !readByNested.contains(name)) ||
+        types.lookupSymbol(name) || types.lookupClass(name))
       continue;
     // ⭐ ONLY A NAME SOMETHING LATER READS. Every name a region binds could be
     // given a slot, and giving one to a name used only INSIDE the region
@@ -845,7 +862,7 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
     // keeps the unresolved-name diagnostic. Widening it means threading the
     // enclosing suites, which is a bigger change than the one this makes.
     if (!(boundWithKnownType && boundWithKnownType->count(name)) &&
-        !nameIsReadAfterCurrentStatement(name))
+        !readByNested.contains(name) && !nameIsReadAfterCurrentStatement(name))
       continue;
     names.push_back(name.str());
   }

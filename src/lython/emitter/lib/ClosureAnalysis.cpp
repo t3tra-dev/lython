@@ -258,10 +258,25 @@ namespace {
 // counting only bindings of the enclosing scope itself -- a nested function's
 // own assignments bind its own locals.
 void countNameAssignments(const std::vector<parser::NodePtr> *statements,
-                          llvm::StringMap<unsigned> &counts);
+                          llvm::StringMap<unsigned> &counts,
+                          unsigned weight = 1);
 
+// ⭐ ONE ASSIGNMENT INSIDE A LOOP IS NOT ONE BINDING. The loop-target rule
+// below said so for the target and nothing said it for the body, so
+// `for i in ...: k = i * 10` left `k` bound once -- and a closure over it took
+// a copy per trip instead of sharing the frame's cell:
+//
+//     def named(n: int):
+//         for i in range(n):
+//             k = i * 10
+//             yield lambda: k
+//     [f() for f in list(named(3))]   # gave [0, 10, 20]; CPython [20, 20, 20]
+//
+// The weight is what a loop multiplies, so a single write anywhere under one
+// counts as the repetition it is.
 void countNameAssignments(const parser::Node *node,
-                          llvm::StringMap<unsigned> &counts) {
+                          llvm::StringMap<unsigned> &counts,
+                          unsigned weight = 1) {
   if (!node)
     return;
   if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
@@ -276,7 +291,7 @@ void countNameAssignments(const parser::Node *node,
       for (const parser::NodePtr &target : *targetList)
         collectAssignedNameTargets(target.get(), targets);
     for (const auto &entry : targets)
-      ++counts[entry.getKey()];
+      counts[entry.getKey()] += weight;
   }
   if (node->kind == "For" || node->kind == "AsyncFor" ||
       node->kind == "comprehension")
@@ -287,23 +302,26 @@ void countNameAssignments(const parser::Node *node,
       // comprehension's target is rebound every element, in a frame of its own
       // that every closure built in the body shares.
       for (const auto &entry : targets)
-        counts[entry.getKey()] += 2;
+        counts[entry.getKey()] += 2 * weight;
     }
+  const bool repeats = node->kind == "For" || node->kind == "AsyncFor" ||
+                       node->kind == "While" || node->kind == "comprehension";
+  unsigned childWeight = repeats ? weight * 2 : weight;
   for (const parser::Field &field : node->fields) {
     if (const auto *child = std::get_if<parser::NodePtr>(&field.value))
-      countNameAssignments(child->get(), counts);
+      countNameAssignments(child->get(), counts, childWeight);
     else if (const auto *children =
                  std::get_if<std::vector<parser::NodePtr>>(&field.value))
-      countNameAssignments(children, counts);
+      countNameAssignments(children, counts, childWeight);
   }
 }
 
 void countNameAssignments(const std::vector<parser::NodePtr> *statements,
-                          llvm::StringMap<unsigned> &counts) {
+                          llvm::StringMap<unsigned> &counts, unsigned weight) {
   if (!statements)
     return;
   for (const parser::NodePtr &statement : *statements)
-    countNameAssignments(statement.get(), counts);
+    countNameAssignments(statement.get(), counts, weight);
 }
 } // namespace
 

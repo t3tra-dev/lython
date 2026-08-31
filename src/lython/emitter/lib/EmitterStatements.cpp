@@ -621,10 +621,40 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
         continue;
       }
       if (const auto *children =
-              std::get_if<std::vector<parser::NodePtr>>(&field.value))
-        for (const parser::NodePtr &child : *children)
-          if (child)
-            recurse(*child, recurse);
+              std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+        // ⭐ AND A NAME THE SUITE BINDS, for the reason above one line on: the
+        // seed is often computed just before the append, and a scan that has
+        // not bound it infers `object` from a name that is plainly an int --
+        // which then decides the container's element type:
+        //
+        //     for i in range(3):
+        //         k = i * 10
+        //         fs.append(lambda: k)   # element was Callable[[], object]
+        //
+        // Bound AFTER the statement is scanned, so an assignment does not see
+        // itself, and only for the rest of THIS suite.
+        std::optional<TypeSystem::Scope> suiteScope;
+        for (const parser::NodePtr &child : *children) {
+          if (!child)
+            continue;
+          recurse(*child, recurse);
+          if (child->kind != "Assign")
+            continue;
+          const auto *assignTargets = ast::nodeList(*child, "targets");
+          const parser::Node *assigned = ast::node(*child, "value");
+          if (!assignTargets || assignTargets->size() != 1 ||
+              !assignTargets->front() ||
+              assignTargets->front()->kind != "Name" || !assigned)
+            continue;
+          mlir::Type bound = types.widenLiteral(types.inferExpr(assigned));
+          if (!bound || bound == types.object())
+            continue;
+          if (!suiteScope)
+            suiteScope.emplace(types.pushScope());
+          types.bindLocalSymbol(ast::nameSpelling(*assignTargets->front()),
+                                bound);
+        }
+      }
     }
   };
 

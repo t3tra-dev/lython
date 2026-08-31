@@ -3632,6 +3632,26 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     return strict ? fail("call expression is missing a callee") : object();
   }
   if (node->kind == "Lambda") {
+    // ⭐ A LAMBDA'S BODY IS INFERRED IN THE SCOPE THAT CONTAINS IT. The
+    // signature walk sees only the symbol table, and a body walk's locals
+    // (assignments, loop targets) live beside it -- so a lambda that reads one
+    // answered `object`:
+    //
+    //     def gen(n: int):
+    //         for i in range(n):
+    //             yield lambda: i     # yields Callable[[], object]
+    //
+    // and the generator's frame lane for that erased result then failed in the
+    // lowering. The parameter-reading spelling (`yield lambda: n`) worked all
+    // along, because a parameter IS in the symbol table.
+    auto lambdaScope = pushScope();
+    if (ctx) {
+      if (ctx->localSymbols)
+        for (const auto &entry : *ctx->localSymbols)
+          bindLocalSymbol(entry.getKey(), entry.getValue());
+      for (const auto &entry : ctx->localCallables)
+        bindLocalSymbol(entry.getKey(), entry.getValue());
+    }
     return functionSignature(*node).callable;
   }
   return object();
