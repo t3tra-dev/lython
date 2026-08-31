@@ -1225,6 +1225,66 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
     return result;
   }
 
+  // ⭐ `set.pop()` IS `dict.popitem()` WITH ONE LANE, and it was the one
+  // container method with no path at all -- "static type builtins.set does not
+  // provide manifest method 'pop'" -- while `add`, `remove`, `discard`,
+  // `clear`, `copy` and the whole set algebra are natives. It cannot BE a
+  // native for the same reason `popitem` is not: the result is an ELEMENT, and
+  // a manifest method has one fixed result contract, so the element would have
+  // to be rebuilt from its box in the lowering.
+  //
+  // CPython removes an arbitrary element and takes the FIRST in its table
+  // order, so this takes the first of the iteration order -- the same order
+  // the program can already observe, and the one that agrees element for
+  // element on the shapes anyone writes (`while s: s.pop()` prints the same
+  // sequence as CPython, measured).
+  //
+  // ⛔ The same O(len) deviation `popitem` documents: the elements are
+  // materialized to find one. And a named receiver only -- the removal has to
+  // name the same object the snapshot came from.
+  if (*attr == "pop" && argCount == 0 &&
+      exprHasContract(receiver.get(), "builtins.set")) {
+    if (receiver->kind != "Name")
+      return rejectSugar("set.pop() is supported on a named set");
+    std::string elementsName = scratch("sp_els");
+    std::string valueName = scratch("sp_v");
+    std::string eachName = scratch("sp_x");
+    std::optional<Value> result;
+    runWithScratchNames({elementsName, valueName, eachName}, [&] {
+      NodePtr emptyTest = synth::compare(synth::lenCall(receiver, range), "Eq",
+                                         synth::intConstant(0, range), range);
+      NodePtr keyError = synth::call(
+          synth::name("KeyError", range),
+          {synth::strConstant("pop from an empty set", range)}, range);
+      emitStatement(*synth::ifStmt(std::move(emptyTest),
+                                   {synth::raiseStmt(std::move(keyError),
+                                                     range)},
+                                   {}, range));
+      NodePtr comprehension = parser::makeNode("comprehension", range);
+      parser::addField(*comprehension, "target", synth::name(eachName, range));
+      parser::addField(*comprehension, "iter", receiver);
+      parser::addField(*comprehension, "ifs", std::vector<NodePtr>{});
+      parser::addField(*comprehension, "is_async", std::int64_t{0});
+      NodePtr elementsComp = parser::makeNode("ListComp", range);
+      parser::addField(*elementsComp, "elt", synth::name(eachName, range));
+      parser::addField(*elementsComp, "generators",
+                       std::vector<NodePtr>{std::move(comprehension)});
+      emitStatement(*synth::assign(synth::name(elementsName, range),
+                                   std::move(elementsComp), range));
+      emitStatement(*synth::assign(
+          synth::name(valueName, range),
+          synth::subscript(synth::name(elementsName, range),
+                           synth::intConstant(0, range), range),
+          range));
+      emitStatement(*synth::exprStmt(
+          synth::methodCall(receiver, "remove",
+                            {synth::name(valueName, range)}, range),
+          range));
+      result = emitExpr(synth::name(valueName, range).get());
+    });
+    return result;
+  }
+
   if (*attr != "get" && *attr != "setdefault" && *attr != "popitem")
     return std::nullopt;
   if (!isDictTypedExpr(receiver.get()))
