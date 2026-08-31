@@ -78,7 +78,29 @@ RuntimeBundleLowerer::canonicalizeSlotElementBundle(mlir::Operation *op,
 mlir::LogicalResult RuntimeBundleLowerer::bindEvidenceObjectResult(
     mlir::Operation *op, mlir::Value resultValue, llvm::StringRef label,
     const RuntimeValue &value) {
-  if (!py::isAssignableTo(value.contract, resultValue.getType(), op))
+  // ⭐ EVERY SIGNATURE IS ONE RUNTIME CONTRACT. A stored function reads back
+  // as `builtins.function`, which is not assignable to any particular
+  // Callable -- so a dict of functions died here for a table the LIST
+  // spelling has always compiled:
+  //
+  //     table = {"x": a, "y": b}
+  //     table["x"]()   # dict __getitem__ evidence contract
+  //                    # 'builtins.function' is not assignable to result
+  //                    # '!py.callable<[], returns = ["builtins.str"]>'
+  //
+  // ⛔ Why NOT teach isAssignableTo that builtins.function accepts a Callable:
+  // that would accept ANY function wherever a signature is declared, which is
+  // the one thing the static contract is for. Here the container's element
+  // type IS the promise about which signature, and it is what this result
+  // already carries; the relabel below then puts it on the bundle.
+  auto erasedFunctionEvidence = [&] {
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(value.contract);
+    return contract && contract.getArguments().empty() &&
+           contract.getContractName() == "builtins.function" &&
+           mlir::isa<py::CallableType>(resultValue.getType());
+  };
+  if (!py::isAssignableTo(value.contract, resultValue.getType(), op) &&
+      !erasedFunctionEvidence())
     return op->emitError() << label << " evidence contract " << value.contract
                            << " is not assignable to result "
                            << resultValue.getType();
