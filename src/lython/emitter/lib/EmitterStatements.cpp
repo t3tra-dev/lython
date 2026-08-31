@@ -638,6 +638,24 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
           if (!child)
             continue;
           recurse(*child, recurse);
+          // A nested def binds its name here too. The recursion above declines
+          // to look INSIDE one (its own binding order), which is a different
+          // question from what the name it leaves behind is worth:
+          // `for i in ...: def f() -> int: return i` then `fs.append(f)` had
+          // the element decided from a name the scan had no type for.
+          if (child->kind == "FunctionDef" ||
+              child->kind == "AsyncFunctionDef") {
+            auto nestedName = ast::string(*child, "name");
+            if (!nestedName)
+              continue;
+            FunctionSignature nested = types.functionSignature(*child);
+            if (!nested.publicCallable)
+              continue;
+            if (!suiteScope)
+              suiteScope.emplace(types.pushScope());
+            types.bindLocalSymbol(*nestedName, nested.publicCallable);
+            continue;
+          }
           if (child->kind != "Assign")
             continue;
           const auto *assignTargets = ast::nodeList(*child, "targets");

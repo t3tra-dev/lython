@@ -65,3 +65,15 @@ def named(n: int):
 
 
 print([f() for f in list(named(3))])
+
+
+# A def declared in the loop body is a name the yield walk has to know the
+# type of, and the closure it makes reads the frame's cell like any other.
+def declared(n: int):
+    for i in range(n):
+        def step() -> int:
+            return i + 100
+        yield step
+
+
+print([f() for f in list(declared(3))])

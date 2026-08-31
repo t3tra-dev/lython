@@ -388,8 +388,20 @@ void collectGeneratorFunctionAnalysis(
     mlir::Type generatorSendHint, GeneratorFunctionAnalysis &analysis) {
   if (!node)
     return;
-  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
-      node->kind == "Lambda" || node->kind == "ClassDef")
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef") {
+    // ⭐ The walk declines to look INSIDE a nested def, which is about its own
+    // binding order; what the NAME it leaves behind is worth is a different
+    // question, and nothing answered it. `yield f` for a def declared in the
+    // loop body yielded `Callable[[], object]`, and the generator's frame lane
+    // for that erased result then failed in the lowering.
+    if (auto nestedName = ast::string(*node, "name")) {
+      FunctionSignature nested = types.functionSignature(*node);
+      if (nested.publicCallable)
+        analysis.localSymbols[*nestedName] = nested.publicCallable;
+    }
+    return;
+  }
+  if (node->kind == "Lambda" || node->kind == "ClassDef")
     return;
   if (node->kind == "Yield") {
     analysis.hasYield = true;
