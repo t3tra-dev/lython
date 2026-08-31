@@ -2762,12 +2762,24 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           return false;
       return true;
     };
+    // ⭐ THE SECOND GENERATOR ITERATES THE FIRST ONE'S TARGET. `{y for x in
+    // rows for y in x}` asks the element type of `x`, which is bound by the
+    // generator before it and nowhere else -- so the walk answered `object`
+    // for the whole comprehension and `sorted(...)` over it was refused,
+    // while the same comprehension with ONE generator typed fine and `len()`
+    // of the nested one worked (it needs no element type). The generator
+    // EXPRESSION branch of `iterationElementType` already binds them into a
+    // pushed scope as it goes; this is the same thing for the comprehension
+    // forms.
+    auto generatorScope = pushScope();
     for (const parser::NodePtr &generator : *generators) {
       if (!generator)
         return object();
       mlir::Type element = iterationElementType(ast::node(*generator, "iter"));
       if (!bindTarget(ast::node(*generator, "target"), element, bindTarget))
         return object();
+      for (const auto &entry : bound)
+        bindLocalSymbol(entry.getKey(), entry.getValue());
     }
     static const llvm::StringMap<mlir::Type> kNoCallables;
     ExprInferenceContext inner{ctx ? ctx->localCallables : kNoCallables,
