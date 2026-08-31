@@ -633,6 +633,46 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     values[*preboundTypeObjectName] = Value{typeObject.getResult(), classType};
     types.bindSymbol(*preboundTypeObjectName, classType);
   }
+  // ⭐ A NESTED DEF CALLING ITSELF. The self-call resolves through the symbol
+  // bound above, and for a nested def that symbol is the mangled one, so the
+  // SOURCE name was unresolved inside its own body:
+  //
+  //     def outer(n: int) -> int:
+  //         def rec(k: int) -> int:
+  //             if k <= 0: return 0
+  //             return k + rec(k - 1)     # emit error: unresolved name 'rec'
+  //         return rec(n)
+  //
+  // The reference carries THIS instance's closure arguments, which is what
+  // makes it the same closure and not a fresh one: CPython's inner function
+  // reads the enclosing frame's cell, and these arguments are that cell's
+  // contents. Nothing is materialized when the only use is the call itself.
+  //
+  // ⛔ Not the enclosing scope's binding, which is what a capture would be:
+  // the def statement has not finished executing when the body is emitted, so
+  // there is no value there to capture -- which is why the capture walk in
+  // emitNestedFunctionDecl finds nothing and drops the name.
+  if (!isLambda)
+    if (auto selfName = ast::string(callable, "name");
+        selfName && llvm::StringRef(selfName->data(), selfName->size()) !=
+                        symbolName &&
+        !values.count(llvm::StringRef(selfName->data(), selfName->size()))) {
+      llvm::StringRef selfSpelling(selfName->data(), selfName->size());
+      llvm::SmallVector<Value, 4> selfCaptures;
+      for (auto [index, capture] : llvm::enumerate(captures))
+        selfCaptures.push_back(Value{entry->getArgument(captureOffset + index),
+                                     capture.value.type});
+      mlir::Type selfType =
+          sig.isGeneratorFunction || sig.isAsyncGeneratorFunction
+              ? sig.publicCallable
+              : sig.callable;
+      if (selfType && llvm::is_contained(lexicalCaptureNames(callable),
+                                         selfSpelling.str())) {
+        values[selfSpelling] =
+            emitBindingRef(callable, symbolName, selfType, selfCaptures);
+        types.bindSymbol(selfSpelling, selfType);
+      }
+    }
   if (isLambda) {
     Value body = coerceValue(emitExpr(ast::node(callable, "body")),
                              currentReturnType, callable);

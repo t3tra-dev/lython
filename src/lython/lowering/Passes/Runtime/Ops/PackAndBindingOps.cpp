@@ -587,8 +587,30 @@ mlir::LogicalResult RuntimeBundleLowerer::appendClosureValues(
     if (!captureBundle || captureBundle->kind != RuntimeBundle::Kind::Object)
       return op.emitError() << "closure capture " << index
                             << " must be a lowered Python object bundle";
+    // ⭐ EVERY SIGNATURE IS ONE RUNTIME CONTRACT, so a captured FUNCTION reads
+    // back as the erased `builtins.function` and no particular Callable
+    // accepts it -- a nested def that captures a sibling nested def was
+    // refused here for a program whose types agree:
+    //
+    //     def outer(n: int) -> int:
+    //         def helper(k: int) -> int: return k + 1
+    //         def rec(k: int) -> int: return helper(k)
+    //         return rec(n)
+    //
+    // ⛔ Why NOT teach isAssignableTo that builtins.function accepts a
+    // Callable: that gives up the static contract everywhere it is declared.
+    // The closure input's declared type is the promise about which signature,
+    // and it is the type this lane already carries.
+    auto erasedFunctionCapture = [&] {
+      auto contract =
+          mlir::dyn_cast_if_present<py::ContractType>(captureBundle->contract);
+      return contract && contract.getArguments().empty() &&
+             contract.getContractName() == "builtins.function" &&
+             mlir::isa<py::CallableType>(closureTypes[index]);
+    };
     if (!py::isAssignableTo(captureBundle->contract, closureTypes[index],
-                            op.getOperation()))
+                            op.getOperation()) &&
+        !erasedFunctionCapture())
       return op.emitError()
              << "closure capture " << index << " has type "
              << captureBundle->contract << ", expected " << closureTypes[index];
