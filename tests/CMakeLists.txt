@@ -215,7 +215,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.InstallsAOTEntryPointBesideAPythonMain"
     "DriverTest.AnOwnedValueSurvivesTwoRebindingIfChains"
     "DriverTest.ABorrowedParameterRebindsAcrossALoop"
-    "DriverTest.ARefusedGeneratorNamesWhatSentItDown")
+    "DriverTest.ARefusedGeneratorNamesWhatSentItDown"
+    "DriverTest.ARecursiveGeneratorMethodNamesTheRealLimit")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

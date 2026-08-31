@@ -1631,3 +1631,47 @@ TEST(DriverTest, ABorrowedParameterRebindsAcrossALoop) {
                     "print(anchors('return a // b', 7, 13))\n");
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
+
+// What: a generator method that recurses into its children is refused for the
+// DELEGATION limit rather than for a method the class plainly declares. The
+// old message named `walk` as missing and pointed at its own `def`, because
+// the yield-type inference walks the body before the method is published.
+TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
+  CompileResult refused = compileSource(
+      "from typing import Iterator\n"
+      "class Tree:\n"
+      "    def __init__(self, value: int) -> None:\n"
+      "        self.value = value\n"
+      "        self.children: list[\"Tree\"] = []\n"
+      "    def walk(self) -> \"Iterator[int]\":\n"
+      "        yield self.value\n"
+      "        for child in self.children:\n"
+      "            for nested in child.walk():\n"
+      "                yield nested\n"
+      "print(list(Tree(1).walk()))\n");
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_NE(refused.diagnostics.find("recursive delegation has no static "
+                                     "expansion"),
+            std::string::npos)
+      << refused.diagnostics;
+  EXPECT_EQ(refused.diagnostics.find("does not provide manifest method"),
+            std::string::npos)
+      << refused.diagnostics;
+
+  // A generator method called from a SIBLING still compiles: the publication
+  // change must not disturb the case that already worked.
+  CompileResult accepted = compileSource(
+      "from typing import Iterator\n"
+      "class Bag:\n"
+      "    def __init__(self, value: int) -> None:\n"
+      "        self.value = value\n"
+      "    def each(self) -> \"Iterator[int]\":\n"
+      "        yield self.value\n"
+      "    def total(self) -> int:\n"
+      "        n = 0\n"
+      "        for x in self.each():\n"
+      "            n += x\n"
+      "        return n\n"
+      "print(Bag(5).total())\n");
+  EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
+}

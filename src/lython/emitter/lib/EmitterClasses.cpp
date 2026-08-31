@@ -198,6 +198,27 @@ decoratorCallee(const parser::Node &decorator) {
   return {callee, std::move(spelling)};
 }
 
+// Does this subtree read an attribute of this name anywhere -- `self.walk`,
+// `k.walk`, any receiver? Used to decide whether a generator names itself.
+bool bodyMentionsAttribute(const parser::Node &node, llvm::StringRef attr) {
+  if (node.kind == "Attribute")
+    if (auto name = ast::string(node, "attr");
+        name && llvm::StringRef(*name) == attr)
+      return true;
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && bodyMentionsAttribute(**child, attr))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child && bodyMentionsAttribute(*child, attr))
+          return true;
+    }
+  }
+  return false;
+}
+
 llvm::StringRef decoratorLeafName(llvm::StringRef spelling) {
   std::size_t dot = spelling.rfind('.');
   return dot == llvm::StringRef::npos ? spelling : spelling.drop_front(dot + 1);
@@ -1711,20 +1732,69 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
         receiverType = types.contract(contractName);
       else if (kind == "class" || kind == "classmethod")
         receiverType = types.typeObject(types.contract(contractName));
-      FunctionSignature bodySig = types.functionSignature(
-          *statement,
-          kind == "static" ? std::optional<llvm::StringRef>() : receiverName,
-          py::CallableType(), receiverType);
-      if (kind == "instance" || propertyAccessor)
-        replaceSelfInSignature(bodySig, types.contract(contractName), types);
-      else if (kind == "class" || kind == "classmethod") {
-        replaceSelfInSignature(
-            bodySig, types.typeObject(types.contract(contractName)), types);
-        if (!bodySig.positionalTypes.empty()) {
-          bodySig.positionalTypes.front() =
-              types.typeObject(types.contract(contractName));
-          types.refreshCallable(bodySig);
+      std::size_t firstPassDiagnostics = diagnostics.size();
+      auto computeBodySignature = [&] {
+        FunctionSignature computed = types.functionSignature(
+            *statement,
+            kind == "static" ? std::optional<llvm::StringRef>() : receiverName,
+            py::CallableType(), receiverType);
+        if (kind == "instance" || propertyAccessor)
+          replaceSelfInSignature(computed, types.contract(contractName), types);
+        else if (kind == "class" || kind == "classmethod") {
+          replaceSelfInSignature(
+              computed, types.typeObject(types.contract(contractName)), types);
+          if (!computed.positionalTypes.empty()) {
+            computed.positionalTypes.front() =
+                types.typeObject(types.contract(contractName));
+            types.refreshCallable(computed);
+          }
         }
+        return computed;
+      };
+      FunctionSignature bodySig = computeBodySignature();
+      // ⭐ A GENERATOR THAT CALLS ITSELF NEEDS TO BE PUBLISHED FIRST. Computing
+      // a generator's signature WALKS its body to infer the yield type, and a
+      // recursive `k.walk()` in there resolves against a table that does not
+      // have `walk` yet -- the publication below happens after this. The tree
+      // walk every iterable tree is written as
+      //
+      //     def walk(self):
+      //         yield self.v
+      //         for k in self.kids:
+      //             for x in k.walk():
+      //                 yield x
+      //
+      // was refused with "static type 'T' does not provide manifest method
+      // 'walk'" pointing at the `def`, while the same method called from a
+      // SIBLING method compiled: the sibling runs after the whole walk.
+      //
+      // So a generator that names itself is published from the first pass and
+      // its signature recomputed. The second pass is what the annotation makes
+      // exact; an UNANNOTATED self-recursive generator still ends at `object`,
+      // which is the boundary the progressive publication already documents
+      // for two unannotated methods that call each other.
+      if ((bodySig.isGeneratorFunction || bodySig.isAsyncGeneratorFunction) &&
+          bodyMentionsAttribute(*statement, *methodName)) {
+        // ⭐ THE ANNOTATION IS WHAT THE FIRST PASS PUBLISHES. A generator's
+        // public result is the INFERRED generator type, and on the first pass
+        // that inference is exactly what the missing entry spoiled -- so
+        // publishing it would hand the second pass the same `object` back.
+        // With `-> Iterator[int]` written down the answer is already there.
+        FunctionSignature published = bodySig;
+        if (const parser::Node *returns = ast::node(*statement, "returns"))
+          if (mlir::Type annotated = types.annotationType(returns)) {
+            published.inferredGeneratorType = annotated;
+            types.refreshCallable(published);
+          }
+        addProtocolMethod(progressiveInfo, *methodName,
+                          published.publicCallable);
+        publishProgress();
+        std::size_t before = diagnostics.size();
+        bodySig = computeBodySignature();
+        // The first pass reported what the missing entry caused; the second is
+        // the one whose report is about the program.
+        diagnostics.erase(diagnostics.begin() + firstPassDiagnostics,
+                          diagnostics.begin() + before);
       }
       if (propertyAccessor) {
         // Accessors inline at attribute-access sites only: no standalone
