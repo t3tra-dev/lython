@@ -4898,6 +4898,24 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
         return emitNone(expr);
       return emitCallableDispatch(expr, *builtin, operands, types.none());
     }
+    // ⭐ A FUNCTION VALUE HAS NO REPRESENTATION, and saying so here is the
+    // difference between a sentence about the program and one about the
+    // compiler. Nothing above resolves a `__repr__` for a callable, and the
+    // fall-through then tried to resolve the NAME `repr` -- so `print(f)`,
+    // `str(f)` and `repr(f)` all read "unresolved name 'repr'", which is a
+    // builtin the program never mentioned. CPython renders the function's
+    // identity (`<function g at 0x...>`), which is an address this compiler
+    // does not keep.
+    if (mlir::isa_and_nonnull<py::CallableType>(argumentType) ||
+        (mlir::isa_and_nonnull<py::ProtocolType>(argumentType) &&
+         mlir::cast<py::ProtocolType>(argumentType).getProtocolName() ==
+             "Callable")) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start,
+          "a function value has no repr(): CPython renders its identity and "
+          "address, which this compiler does not keep"});
+      return emitNone(expr);
+    }
   }
   return std::nullopt;
 }

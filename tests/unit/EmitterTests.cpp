@@ -1015,4 +1015,29 @@ TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
       derived);
   EXPECT_TRUE(inherited.ok());
 }
+
+TEST(EmitterTest, AFunctionValueSaysItHasNoRepr) {
+  // Nothing resolves a `__repr__` for a callable, and the fall-through used
+  // to try to resolve the NAME `repr` -- so all three spellings read
+  // "unresolved name 'repr'", a builtin the program never mentioned.
+  for (const char *source :
+       {"f = lambda: 3\nprint(str(f))\n", "f = lambda: 3\nprint(repr(f))\n",
+        "def g() -> int:\n    return 1\nprint(g)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool saidFunction = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      saidFunction = saidFunction ||
+                     diagnostic.message.find("a function value has no repr()") !=
+                         std::string::npos;
+    EXPECT_TRUE(saidFunction) << source;
+  }
+
+  // The ordinary receivers still render.
+  mlir::MLIRContext values(testRegistry());
+  lython::emitter::EmitResult ok =
+      emitSource("print(repr(1), repr(\"a\"), repr([1]))\n", values);
+  EXPECT_TRUE(ok.ok());
+}
 }
