@@ -2511,8 +2511,12 @@ void ModuleEmitter::collectClassFields(
     llvm::SmallVectorImpl<std::string> &fieldNames,
     llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
     bool includeAnnAssignDefaults) {
+  // Field names whose only assignment so far was an EMPTY container literal,
+  // which has no element type of its own: the next assignment replaces it.
+  llvm::StringSet<> provisionalFields;
   auto setField = [&](llvm::StringRef name, mlir::Type type,
-                      bool overwriteExisting, const parser::Node &anchor) {
+                      bool overwriteExisting, const parser::Node &anchor,
+                      bool provisional = false) {
     if (name.empty())
       return;
     if (!type) {
@@ -2531,15 +2535,54 @@ void ModuleEmitter::collectClassFields(
     mlir::Type storedType = mlir::isa_and_nonnull<py::CallableType>(type)
                                 ? widenInferredLiterals(type, types)
                                 : types.widenLiteral(type);
+    // ⭐ AN EMPTY LITERAL DOES NOT GET TO DECIDE THE ELEMENT TYPE. The first
+    // assignment seen wins, and with regions walked that first one is often
+    // the empty arm:
+    //
+    //     def __init__(self, xs: "list[int] | None" = None) -> None:
+    //         if xs is None:
+    //             self.xs = []          # list[object]
+    //         else:
+    //             self.xs = xs          # list[int] -- "not assignable"
+    //
+    // A `[]` has no element type of its own, which is the same rule the
+    // generator body walk states for a rebinding; here it means an erased
+    // argument yields to a real one on the same contract.
+    auto refinesErasedArguments = [](mlir::Type existing, mlir::Type refined) {
+      auto before = mlir::dyn_cast_if_present<py::ContractType>(existing);
+      auto after = mlir::dyn_cast_if_present<py::ContractType>(refined);
+      if (!before || !after ||
+          before.getContractName() != after.getContractName() ||
+          before.getArguments().size() != after.getArguments().size() ||
+          before.getArguments().empty())
+        return false;
+      bool improves = false;
+      for (auto [old, fresh] :
+           llvm::zip(before.getArguments(), after.getArguments())) {
+        if (old == fresh)
+          continue;
+        if (!py::isPyObjectType(old))
+          return false;
+        improves = true;
+      }
+      return improves;
+    };
     for (auto [index, existing] : llvm::enumerate(fieldNames)) {
       if (existing != name)
         continue;
-      if (overwriteExisting)
+      if (overwriteExisting ||
+          refinesErasedArguments(fieldTypes[index], storedType) ||
+          (provisionalFields.contains(name) && !provisional)) {
         fieldTypes[index] = storedType;
+        if (!provisional)
+          provisionalFields.erase(name);
+      }
       return;
     }
     fieldNames.push_back(name.str());
     fieldTypes.push_back(storedType);
+    if (provisional)
+      provisionalFields.insert(name);
   };
 
   auto collectInitArgTypes = [&](const parser::Node &method,
@@ -2565,7 +2608,8 @@ void ModuleEmitter::collectClassFields(
   };
 
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
-  auto collectTarget = [&](const parser::Node &target, mlir::Type type) {
+  auto collectTarget = [&](const parser::Node &target, mlir::Type type,
+                           bool provisional = false) {
     if (target.kind != "Attribute")
       return;
     const parser::Node *object = ast::node(target, "value");
@@ -2575,7 +2619,7 @@ void ModuleEmitter::collectClassFields(
       // `self.<prop> = ...` runs the property setter; it declares no field.
       if (propertyNames.contains(*attr))
         return;
-      setField(*attr, type, /*overwriteExisting=*/false, target);
+      setField(*attr, type, /*overwriteExisting=*/false, target, provisional);
     }
   };
 
@@ -2633,30 +2677,88 @@ void ModuleEmitter::collectClassFields(
         untypedLocals.erase(name);
         types.bindLocalSymbol(name, type);
       };
-      if (const auto *stmts = ast::nodeList(*method, "body")) {
-        for (const parser::NodePtr &stmt : *stmts) {
-          if (!stmt)
-            continue;
-          if (stmt->kind == "AnnAssign") {
-            const parser::Node *target = ast::node(*stmt, "target");
-            if (!target)
-              continue;
-            mlir::Type declared =
-                types.annotationType(ast::node(*stmt, "annotation"));
-            bindInitLocal(target, declared);
-            collectTarget(*target, declared);
-          } else if (stmt->kind == "Assign") {
-            mlir::Type valueType = valueTypeOf(ast::node(*stmt, "value"));
-            if (const auto *targets = ast::nodeList(*stmt, "targets"))
-              for (const parser::NodePtr &target : *targets) {
+      // ⭐ A FIELD ASSIGNED INSIDE A REGION IS STILL A FIELD. The walk read
+      // only `__init__`'s top-level statements, so the two-branch constructor
+      // every optional field is written as declared nothing:
+      //
+      //     class C:
+      //         def __init__(self, flag: bool) -> None:
+      //             if flag:
+      //                 self.n = 1
+      //             else:
+      //                 self.n = 2
+      //     C(True).n      # 'C' object has no attribute 'n'
+      //
+      // The `for`, `while`, `try` and `with` spellings were the same. Only an
+      // UNCONDITIONAL assignment before the region made the field exist, which
+      // is why `self.n = 0` then `if flag: self.n = 1` worked.
+      //
+      // ⛔ Nested defs and classes are not entered: a `self` inside one is a
+      // different scope's, and the first type seen still wins
+      // (`overwriteExisting=false`), so two branches that disagree take the
+      // first and the other store is a type error where it is written.
+      std::function<void(const std::vector<parser::NodePtr> *)> walkInitBody =
+          [&](const std::vector<parser::NodePtr> *stmts) {
+            if (!stmts)
+              return;
+            for (const parser::NodePtr &stmt : *stmts) {
+              if (!stmt)
+                continue;
+              if (stmt->kind == "AnnAssign") {
+                const parser::Node *target = ast::node(*stmt, "target");
                 if (!target)
                   continue;
-                bindInitLocal(&*target, valueType);
-                collectTarget(*target, valueType);
+                mlir::Type declared =
+                    types.annotationType(ast::node(*stmt, "annotation"));
+                bindInitLocal(target, declared);
+                collectTarget(*target, declared);
+                continue;
               }
-          }
-        }
-      }
+              if (stmt->kind == "Assign") {
+                const parser::Node *value = ast::node(*stmt, "value");
+                mlir::Type valueType = valueTypeOf(value);
+                // ⭐ AN EMPTY LITERAL DOES NOT GET TO DECIDE THE FIELD. `[]`
+                // has no element type of its own, and with regions walked it
+                // is often the FIRST assignment seen -- the branch that
+                // supplies a real one then does not fit the field it named:
+                //
+                //     if xs is None:
+                //         self.xs = []       # list[object]
+                //     else:
+                //         self.xs = xs       # "not assignable to field"
+                //
+                // The same rule the generator body walk states for a
+                // rebinding, applied where the field is declared.
+                bool provisional = false;
+                if (value) {
+                  if (value->kind == "List" || value->kind == "Tuple" ||
+                      value->kind == "Set") {
+                    const auto *elements = ast::nodeList(*value, "elts");
+                    provisional = !elements || elements->empty();
+                  } else if (value->kind == "Dict") {
+                    const auto *keys = ast::nodeList(*value, "keys");
+                    provisional = !keys || keys->empty();
+                  }
+                }
+                if (const auto *targets = ast::nodeList(*stmt, "targets"))
+                  for (const parser::NodePtr &target : *targets) {
+                    if (!target)
+                      continue;
+                    bindInitLocal(&*target, valueType);
+                    collectTarget(*target, valueType, provisional);
+                  }
+                continue;
+              }
+              if (stmt->kind == "FunctionDef" ||
+                  stmt->kind == "AsyncFunctionDef" || stmt->kind == "ClassDef")
+                continue;
+              for (llvm::StringRef region :
+                   {"body", "orelse", "finalbody", "handlers"})
+                if (const auto *nested = ast::nodeList(*stmt, region))
+                  walkInitBody(nested);
+            }
+          };
+      walkInitBody(ast::nodeList(*method, "body"));
     }
   }
 }
