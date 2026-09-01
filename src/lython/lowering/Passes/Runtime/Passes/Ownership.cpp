@@ -2252,9 +2252,26 @@ bool releaseOwnedGroupByLiveness(
           // conservative bail: they forward the token out through a region
           // result under a new name this walk cannot track, so a release at
           // the ancestor would be premature.
+          // ⭐ A CONSUMING CALL SOMEWHERE IN THE GROUP IS NOT A REASON TO GIVE
+          // UP ON A PLAIN NESTED USE. Bailing there placed NO releases at all,
+          // and the obligation then reached the function exit unmet:
+          //
+          //     async def main() -> None:
+          //         for i in range(3):
+          //             await work(i)
+          //     # owned resource from @LyLong_FromI64 result 0 reaches
+          //     # function exit without release, transfer, or owned return
+          //
+          // The await splits the loop body around an `scf.if` whose arms read
+          // the boxed loop counter, so every async loop that passes its target
+          // to the awaited call reached the bail. The synchronous spelling of
+          // the same loop has no region op in it and was always released.
+          //
+          // ⛔ The nested TERMINATOR bail stays: an scf.yield forwards the
+          // token out through a region result under a name this walk cannot
+          // track, and a release at the ancestor would be premature.
           mlir::Operation *blockUser =
-              (user->hasTrait<mlir::OpTrait::IsTerminator>() ||
-               groupHasConsumingCall)
+              user->hasTrait<mlir::OpTrait::IsTerminator>()
                   ? nullptr
                   : ancestorInRegion(user, region);
           if (!blockUser ||
