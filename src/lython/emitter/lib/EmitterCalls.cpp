@@ -330,6 +330,30 @@ Value ModuleEmitter::emitCallableDispatch(const parser::Node &anchor,
         parser::Severity::Error, anchor.range.start, operands.failureReason});
     return emitNone(anchor);
   }
+  // ⭐ A CALLEE REFERENCE THAT THE ARGUMENTS LEFT BEHIND IS RE-EMITTED HERE.
+  // The callee is emitted before its arguments, and an argument that needs a
+  // fused REGION (a comprehension, a reducer) ends the block it was emitted
+  // in -- so the reference had to cross a block boundary. Inside a generator
+  // the state machine then threads it as a frame lane, and a builtin callable
+  // has no runtime object to put in one:
+  //
+  //     def g():
+  //         print(sum([1, 2]))     # cannot adapt runtime bundle
+  //         yield 0                # builtins.function with physical values ()
+  //                                # to expected ABI (memref<8xi64>)
+  //
+  // A binding reference with no captures is a pure name lookup with no
+  // operands, so re-emitting it where the call is built is exact -- and
+  // binding the same call's argument to a local first has always worked,
+  // which is the same value reached without the crossing.
+  if (auto ref = callee.value.getDefiningOp<py::BindingRefOp>();
+      ref && ref.getCaptures().empty() &&
+      ref->getBlock() != builder.getInsertionBlock()) {
+    auto reemitted = py::BindingRefOp::create(
+        builder, ref.getLoc(), ref.getResult().getType(),
+        ref.getBindingAttr(), mlir::ValueRange{});
+    callee.value = reemitted.getResult();
+  }
   Value posPack = emitPack(operands.positional, operands.positionalUnpacked);
   Value namePack = emitPack(operands.keywordNames);
   Value valuePack = emitPack(operands.keywordValues);
