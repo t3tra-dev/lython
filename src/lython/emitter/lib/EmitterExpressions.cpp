@@ -3216,10 +3216,38 @@ Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
            name == "builtins.int" || name == "builtins.float";
   };
 
+  // ⭐ AN EMPTY LITERAL OPERAND CONTRIBUTES NO ELEMENT TYPE, which is what
+  // `xs or []` -- the commonest default-value idiom in Python -- ran into:
+  // `[]` joins as `list[object]`, the join with the kept `list[int]` reaches
+  // the erased top, and the whole expression was rejected as having no
+  // statically representable result. It has one; the empty arm just has
+  // nothing to say about it. Same rule as the conditional expression's arms
+  // and the container literal's siblings.
+  auto isEmptyLiteralOperand = [](const parser::Node *operand) {
+    if (!operand)
+      return false;
+    if (operand->kind == "List" || operand->kind == "Tuple" ||
+        operand->kind == "Set") {
+      const auto *elements = ast::nodeList(*operand, "elts");
+      return !elements || elements->empty();
+    }
+    if (operand->kind == "Dict") {
+      const auto *keys = ast::nodeList(*operand, "keys");
+      return !keys || keys->empty();
+    }
+    return false;
+  };
+  bool anyNonEmptyOperand = false;
+  for (const parser::NodePtr &operand : operands)
+    if (!isEmptyLiteralOperand(operand.get()))
+      anyNonEmptyOperand = true;
+
   llvm::SmallVector<mlir::Type, 4> parts;
   for (auto [index, operand] : llvm::enumerate(operands)) {
     if (!operand)
       return reject("malformed boolean operation");
+    if (anyNonEmptyOperand && isEmptyLiteralOperand(operand.get()))
+      continue;
     mlir::Type operandType =
         types.widenLiteral(types.inferExpr(operand.get()));
     if (index + 1 == operands.size()) {

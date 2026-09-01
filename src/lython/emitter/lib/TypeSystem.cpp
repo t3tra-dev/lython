@@ -3064,8 +3064,48 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
   }
   if (node->kind == "Compare")
     return boolType();
-  if (node->kind == "BoolOp")
-    return boolType();
+  if (node->kind == "BoolOp") {
+    // ⭐ `a or b` IS AN OPERAND, NOT A BOOL. CPython yields the value that
+    // decided the expression, and the EMITTER builds exactly that (the join
+    // of what each position can contribute) -- this channel answered `bool`,
+    // so every reader that asks the type first disagreed with it. The
+    // class-field walk is one: `self.v = xs or []` declared a bool field and
+    // then refused the list the emitter stored into it.
+    //
+    // ⛔ Falls back to bool when the join is not representable, which is the
+    // shape the emitter rejects anyway -- a condition asks this channel too,
+    // and answering `object` there would be worse than answering `bool`.
+    const auto *operands = ast::nodeList(*node, "values");
+    const parser::Node *op = ast::node(*node, "op");
+    if (!operands || operands->empty())
+      return boolType();
+    const bool isOr = op && op->kind == "Or";
+    llvm::SmallVector<mlir::Type, 4> parts;
+    llvm::SmallVector<const parser::Node *, 4> partNodes;
+    for (auto [index, operand] : llvm::enumerate(*operands)) {
+      if (!operand)
+        return boolType();
+      mlir::Type operandType = widenLiteral(lenientRecurse(operand.get()));
+      if (isOr && index + 1 != operands->size())
+        if (auto unionType =
+                mlir::dyn_cast_if_present<py::UnionType>(operandType)) {
+          // `or` keeps a TRUTHY non-final operand: an Optional's kept value is
+          // its present member.
+          llvm::SmallVector<mlir::Type, 4> present;
+          for (mlir::Type member : unionType.getMemberTypes())
+            if (member != none() && widenLiteral(member) != none())
+              present.push_back(member);
+          if (present.size() == 1)
+            operandType = widenLiteral(present.front());
+        }
+      parts.push_back(operandType);
+      partNodes.push_back(operand.get());
+    }
+    mlir::Type joined = joinIgnoringEmptyLiterals(*this, parts, partNodes);
+    if (!joined || isObjectTop(*this, joined))
+      return boolType();
+    return joined;
+  }
   // ⭐ `(y := e)` IS `e`. Without this the walk answered `object` for the
   // assignment expression, and a set comprehension whose element is one --
   // `sorted({(k := x) for x in xs})` -- typed its result as a set of object
