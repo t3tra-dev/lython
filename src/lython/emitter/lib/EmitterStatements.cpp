@@ -1354,8 +1354,20 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
              statement.kind == "AsyncFunctionDef") {
     Value function = emitNestedFunctionDecl(statement);
     if (auto name = ast::string(statement, "name")) {
-      values[*name] = function;
-      types.bindSymbol(*name, function.type);
+      llvm::StringRef spelling(name->data(), name->size());
+      // ⭐ A `def` INSIDE A REGION WRITES THROUGH ITS SLOT, the same way an
+      // assignment to a conditionally bound local does. The slot is made
+      // before the region so the scope around it can see the name, and
+      // rebinding `values` here instead left it unwritten -- the read after
+      // the region then raised NameError for a definition that ran.
+      auto bound = values.find(spelling);
+      if (bound != values.end() && isCellContract(bound->second.type)) {
+        emitCellStore(statement, bound->second, function);
+        types.bindSymbol(spelling, cellContentType(bound->second.type));
+      } else {
+        values[spelling] = function;
+        types.bindSymbol(spelling, function.type);
+      }
     }
     applyFunctionDecorators(statement);
   } else if (statement.kind == "Return") {

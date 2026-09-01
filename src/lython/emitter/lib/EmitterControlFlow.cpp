@@ -530,6 +530,57 @@ int unpackElementFor(const parser::Node *target, llvm::StringRef name) {
   return found;
 }
 
+// Every `def` directly inside the region, by name.
+void collectRegionDefNames(const parser::Node *node, llvm::StringSet<> &names) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef") {
+    if (auto declared = ast::string(*node, "name"))
+      names.insert(llvm::StringRef(declared->data(), declared->size()));
+    return;
+  }
+  if (node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectRegionDefNames(child->get(), names);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectRegionDefNames(child.get(), names);
+    }
+  }
+}
+
+// A `def` directly inside the region, by name. Nested callables and classes
+// are their own scopes, so the walk does not enter them.
+void collectRegionDefs(const parser::Node *node, llvm::StringRef name,
+                       llvm::SmallVectorImpl<const parser::Node *> &defs) {
+  if (!node)
+    return;
+  if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef") {
+    if (auto declared = ast::string(*node, "name");
+        declared && llvm::StringRef(declared->data(), declared->size()) == name)
+      defs.push_back(node);
+    return;
+  }
+  if (node->kind == "ClassDef" || node->kind == "Lambda")
+    return;
+  for (const parser::Field &field : node->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectRegionDefs(child->get(), name, defs);
+    } else if (const auto *children =
+                   std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectRegionDefs(child.get(), name, defs);
+    }
+  }
+}
+
 void collectNameBindingExpressions(
     const parser::Node *node, llvm::StringRef name,
     llvm::SmallVectorImpl<NameBindingSite> &values,
@@ -738,6 +789,42 @@ bool ModuleEmitter::loopTargetOutlivesLoop(
 mlir::Type ModuleEmitter::inferConditionalLocalType(
     llvm::ArrayRef<const std::vector<parser::NodePtr> *> bodies,
     llvm::StringRef name) {
+  // ⭐ A `def` INSIDE THE REGION BINDS ITS NAME THERE, and CPython makes that
+  // binding a local of the whole scope -- so the conditional definition every
+  // configuration switch is written as was "unresolved name 'go'":
+  //
+  //     if flag:
+  //         def go() -> int: return 1
+  //     else:
+  //         def go() -> int: return 2
+  //     print(go())
+  //
+  // Its type is the callable the signature already computes, not an inference
+  // over a value expression: a def statement has none.
+  //
+  // ⛔ All the definitions must agree. Two arms that declare different
+  // signatures have no single slot to share, and the name keeps its refusal
+  // rather than getting one that fits neither.
+  {
+    llvm::SmallVector<const parser::Node *, 2> defs;
+    for (const std::vector<parser::NodePtr> *body : bodies)
+      if (body)
+        for (const parser::NodePtr &statement : *body)
+          collectRegionDefs(statement.get(), name, defs);
+    if (!defs.empty()) {
+      mlir::Type declared;
+      for (const parser::Node *def : defs) {
+        FunctionSignature sig = types.functionSignature(*def);
+        if (!sig.publicCallable)
+          return {};
+        if (!declared)
+          declared = sig.publicCallable;
+        else if (declared != sig.publicCallable)
+          return {};
+      }
+      return declared;
+    }
+  }
   llvm::SmallVector<NameBindingSite, 4> valueNodes;
   llvm::SmallVector<const parser::Node *, 2> annotationNodes;
   bool opaque = false;
@@ -821,6 +908,12 @@ void ModuleEmitter::bindConditionallyAssignedLocals(
   llvm::StringSet<> assigned;
   for (const std::vector<parser::NodePtr> *body : bodies)
     collectAssignedNames(body, assigned);
+  // A `def` in the region binds its name too; `collectAssignedNames` stops at
+  // one because its own question is which locals a LOOP must carry.
+  for (const std::vector<parser::NodePtr> *body : bodies)
+    if (body)
+      for (const parser::NodePtr &statement : *body)
+        collectRegionDefNames(statement.get(), assigned);
   if (boundWithKnownType)
     for (const auto &entry : *boundWithKnownType)
       assigned.insert(entry.getKey());
