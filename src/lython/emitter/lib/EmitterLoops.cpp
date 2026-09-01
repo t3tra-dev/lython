@@ -660,10 +660,109 @@ void ModuleEmitter::emitGeneratorExpFor(const parser::Node &statement,
 // source is not one this may rewrite, leaving the ordinary path to run.
 bool ModuleEmitter::emitGeneratorIndexedFor(const parser::Node &statement,
                                             const parser::Node &iterNode) {
-  if (!exprHasContract(&iterNode, "builtins.list") &&
-      !exprHasContract(&iterNode, "builtins.tuple"))
+  if (exprHasContract(&iterNode, "builtins.list") ||
+      exprHasContract(&iterNode, "builtins.tuple"))
+    return emitIndexedFor(statement, iterNode);
+
+  // ⭐ A DICT OR SET YIELDED FROM WALKS ITS KEYS THROUGH A LIST. The loop's
+  // iterator is a compile-time token whose position lives in a function-level
+  // cell, and the state machine wants a frame lane keyed on a runtime
+  // contract, which a token has none of -- so a yield INSIDE the loop was
+  // refused:
+  //
+  //     def keys(d: "dict[str, int]"):
+  //         for k in d:
+  //             yield k
+  //     # ... a value of type !py.protocol<"Iterator", [builtins.str]> is live
+  //     # across a yield and has no generator frame lane
+  //
+  // `list(d)` is the keys in insertion order and an int index into it rides a
+  // frame lane, which is the rewrite the list source already takes.
+  //
+  // ⛔ THE MUTATION GUARD COMES WITH IT, because the cell carried one: the
+  // runtime iterator remembers the container's size when it is made and raises
+  // when it changes, which is what CPython does. Walking a snapshot silently
+  // would make `for k in d: d[k + "!"] = 1` iterate where CPython raises, and
+  // that program raises today from the very cell this replaces -- trading a
+  // refusal for a silent divergence is the trade this compiler does not make.
+  //
+  // ⛔ Only inside a generator, where the alternative is a refusal. Outside
+  // one the cell walks the live table, which is closer to CPython than a copy
+  // and costs no list.
+  if (iterNode.kind == "Name" &&
+      llvm::StringRef(ast::nameSpelling(iterNode)).starts_with("__lygdict"))
     return false;
-  return emitIndexedFor(statement, iterNode);
+  const bool overDict = exprHasContract(&iterNode, "builtins.dict");
+  const bool overSet = exprHasContract(&iterNode, "builtins.set") ||
+                       exprHasContract(&iterNode, "builtins.frozenset");
+  if (!overDict && !overSet)
+    return false;
+  const parser::Field *targetField = parser::findField(statement, "target");
+  const parser::Field *iterField = parser::findField(statement, "iter");
+  const auto *body = ast::nodeList(statement, "body");
+  if (!targetField || !iterField || !body ||
+      !std::holds_alternative<parser::NodePtr>(targetField->value) ||
+      !std::holds_alternative<parser::NodePtr>(iterField->value))
+    return false;
+  parser::NodePtr target = std::get<parser::NodePtr>(targetField->value);
+  parser::NodePtr source = std::get<parser::NodePtr>(iterField->value);
+  if (!target || !source)
+    return false;
+
+  parser::SourceRange range = statement.range;
+  unsigned serial = ++listCompCounter;
+  std::string sourceName = "__lygdict" + std::to_string(serial) + "_s";
+  std::string keysName = "__lygdict" + std::to_string(serial) + "_k";
+  std::string sizeName = "__lygdict" + std::to_string(serial) + "_n";
+  auto nameRef = [&](const std::string &name) {
+    return synth::name(name, range);
+  };
+
+  auto sizeGuard = [&] {
+    return synth::ifStmt(
+        synth::compare(synth::lenCall(nameRef(sourceName), range), "NotEq",
+                       nameRef(sizeName), range),
+        {synth::raiseCall("RuntimeError",
+                          overDict ? "dictionary changed size during iteration"
+                                   : "Set changed size during iteration",
+                          range)},
+        {}, range);
+  };
+  std::vector<parser::NodePtr> guarded;
+  guarded.push_back(sizeGuard());
+  for (const parser::NodePtr &each : *body)
+    if (each)
+      guarded.push_back(each);
+
+  // ⭐ AND ONCE MORE ON EXHAUSTION. CPython checks the size in every
+  // `__next__`, including the call that finds the container empty -- so
+  // `for k in d: d[k + "!"] = 1` over a one-key dict raises on the SECOND
+  // step, which this loop reaches by running out. A for's `else` is exactly
+  // "the iterator was exhausted and the body wrote no break", which is
+  // exactly when that call happens; a break makes no further call and must
+  // not raise.
+  std::vector<parser::NodePtr> orelseCopy;
+  orelseCopy.push_back(sizeGuard());
+  if (const auto *orelse = ast::nodeList(statement, "orelse"))
+    for (const parser::NodePtr &each : *orelse)
+      if (each)
+        orelseCopy.push_back(each);
+
+  parser::NodePtr loop =
+      synth::forStmt(target, nameRef(keysName), std::move(guarded),
+                     std::move(orelseCopy), range);
+  runWithScratchNames({sourceName, keysName, sizeName}, [&] {
+    emitStatement(*synth::assign(nameRef(sourceName), source, range));
+    emitStatement(*synth::assign(
+        nameRef(keysName),
+        synth::call(synth::name(std::string("list"), range),
+                    std::vector<parser::NodePtr>{nameRef(sourceName)}, range),
+        range));
+    emitStatement(*synth::assign(
+        nameRef(sizeName), synth::lenCall(nameRef(sourceName), range), range));
+    emitFor(*loop);
+  });
+  return true;
 }
 
 // ⭐ THE SEQUENCE PROTOCOL. A class with `__len__` and `__getitem__` and no

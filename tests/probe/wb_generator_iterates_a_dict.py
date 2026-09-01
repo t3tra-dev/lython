@@ -42,15 +42,20 @@
 # a_generator_walks_a_dict_before_it_yields), and so does `list(d)` inside a
 # generator.
 #
-# ⛔ WHAT REMAINS is the yield INSIDE the loop, which is a different refusal:
-# the state machine declines because the protocol-typed token is live across a
-# yield and a frame lane is keyed on a runtime contract, which a compile-time
-# token does not have. The position is an i64 and the frame already carries i64
-# lanes, so the cell can be saved at the suspend and written back at the
-# resume, keyed as `builtins.int`. A rewrite that materialized the keys instead
-# would have to carry CPython's per-step size guard ("dictionary changed size
-# during iteration"), which a copy does not have -- trading a refusal for a
-# silent divergence is the trade this compiler does not make.
+# FIXED (the first message, 2026-09-01): with `list(d)` compiling inside a
+# generator, the yield INSIDE the loop takes the same rewrite the list source
+# does -- the keys through a list, whose int index rides a frame lane where the
+# token's cell cannot. The per-step size guard the cell carried comes with it,
+# checked at the top of every trip AND on exhaustion, which is where CPython
+# raises for a one-key dict grown in its own loop (goldens:
+# a_generator_yields_a_dicts_keys, errors/a_generator_that_grows_the_dict_it_
+# walks).
+#
+# ⛔ Only inside a generator. Outside one the cell walks the live table, which
+# is closer to CPython than a copy and costs no list.
+#
+# THIS PROBE IS KEPT for the shape, not for a live defect: both spellings above
+# compile now. It is the record of what the two messages meant.
 def keys_of(d: "dict[str, int]"):
     for k in d:
         yield k

@@ -1410,22 +1410,28 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
 // WHAT: the refusal a generator gets when the state machine declines it names
 // the value that made it decline, not just the tier's own limit.
 //
-// `def lines(text): for line in text.splitlines(): if not line: continue;
-// yield line` lands in the single-lane tier and is refused for yielding a str
-// -- and the same generator WITHOUT the `continue` compiles, so the yield is
-// not what changed. What changed is that the skip makes the loop's own `i1`
-// flag live across the suspension, and a frame lane is keyed on a runtime
-// contract. Reading the lower message alone sends the reader after the yield.
+// `prev: "int | None"` carried across the suspension lands in the single-lane
+// tier and is refused for yielding a two-lane union -- and the same generator
+// with a plain int prev compiles, so the yield's arity is not the whole story.
+// What sent it down is the UNION being live across the yield with no frame
+// lane, and a frame lane is keyed on a runtime contract. Reading the lower
+// message alone sends the reader after the yield.
+//
+// The dict.items() spelling this used to assert is compiled now (a generator's
+// dict walk goes through its keys); the probe for the union is
+// tests/probe/wb_generator_carries_an_optional.py.
 //
 // Driver-layer and not golden: the whole behaviour is a refusal, and the
-// control is the same generator without the skip, which compiles.
+// control is the same generator without the union, which compiles.
 TEST(DriverTest, ARefusedGeneratorNamesWhatSentItDown) {
-  CompileResult refused = compileSource("def keys(d: \"dict[str, int]\"):\n"
-                                        "    for k, v in d.items():\n"
-                                        "        yield k\n"
-                                        "        print(v)\n"
-                                        "for k in keys({\"a\": 1}):\n"
-                                        "    print(k)\n");
+  CompileResult refused =
+      compileSource("def pairwise(xs: \"list[int]\"):\n"
+                    "    prev: \"int | None\" = None\n"
+                    "    for x in xs:\n"
+                    "        if prev is not None:\n"
+                    "            yield prev + x\n"
+                    "        prev = x\n"
+                    "print(list(pairwise([1, 2, 3])))\n");
   EXPECT_FALSE(refused.succeeded);
   EXPECT_NE(refused.diagnostics.find("declined this generator because"),
             std::string::npos)

@@ -1,0 +1,7 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*a_generator_that_grows_the_dict_it_walks\.py",\ line\ 11,\ in\ <module>\
+\ \ \ \ print\(list\(grow\(\{"a":\ 1\}\)\)\)\
+\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \~\~\~\~\^\^\^\^\^\^\^\^\^\^\
+\ \ File\ ".*a_generator_that_grows_the_dict_it_walks\.py",\ line\ 6,\ in\ grow\
+\ \ \ \ for\ k\ in\ d:\
+RuntimeError:\ dictionary\ changed\ size\ during\ iteration
