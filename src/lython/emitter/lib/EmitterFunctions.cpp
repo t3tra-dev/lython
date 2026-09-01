@@ -473,6 +473,36 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   llvm::SaveAndRestore<unsigned> savedSuiteFloor(
       suiteStackFloor, static_cast<unsigned>(suiteStack.size()));
 
+  // ⭐ THIS IS A REAL FUNCTION, whatever it was emitted from. A method body is
+  // INLINED at its call site, so a nested def written inside one was emitted
+  // with the inliner's state still standing and its `return` branched to the
+  // INLINER's continuation block -- "reference to block defined in another
+  // region", for an ordinary helper:
+  //
+  //     class C:
+  //         def m(self) -> int:
+  //             def h(n: int) -> int:
+  //                 return n + 1
+  //             return h(1)
+  //
+  // The loop context goes with it for the same reason: a `break` in this body
+  // would have branched out of another region too.
+  //
+  // ⛔ ONLY the two that produce a cross-region BRANCH. The virtual-dispatch
+  // helper (EmitterCalls.cpp) clears the super and inline-frame state as well,
+  // and that is right for a SYNTHESIZED function and wrong here: a method is
+  // itself emitted through this function, with its super context pushed by the
+  // caller, so clearing it made `super()` in every method body "zero-argument
+  // super() requires an enclosing class method body" -- 7 goldens.
+  auto savedLoops = std::move(loopControlContexts);
+  loopControlContexts.clear();
+  auto savedInlineReturns = std::move(inlineReturnContexts);
+  inlineReturnContexts.clear();
+  llvm::scope_exit restoreEmissionContexts([&] {
+    loopControlContexts = std::move(savedLoops);
+    inlineReturnContexts = std::move(savedInlineReturns);
+  });
+
   mlir::Block *entry = func.addEntryBlock();
   values.clear();
   llvm::StringSet<> savedGlobalDecls = std::move(currentGlobalDecls);
