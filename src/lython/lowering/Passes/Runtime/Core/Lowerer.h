@@ -1727,6 +1727,10 @@ private:
   mlir::LogicalResult dropControlFlowLogicalBranchOperands();
   mlir::LogicalResult eraseControlFlowLogicalBlockArguments();
   const RuntimeBundle *bundleFor(mlir::Value value) const;
+  // An evidence iterator is a compile-time token with a function-level cell,
+  // so a block argument that forwards one has no bundle of its own: follow the
+  // forwarding edges back to the value that does.
+  const RuntimeBundle *evidenceIteratorBundleFor(mlir::Value value) const;
   mlir::Value materializeByteBuffer(mlir::Location loc, llvm::StringRef text);
   std::optional<std::int64_t> currentTryHandlerId() const;
   void emitTryCallSiteMarker(mlir::Location loc, std::int64_t id);

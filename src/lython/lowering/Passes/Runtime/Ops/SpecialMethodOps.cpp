@@ -2196,11 +2196,69 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   return mlir::success();
 }
 
+const RuntimeBundle *
+RuntimeBundleLowerer::evidenceIteratorBundleFor(mlir::Value value) const {
+  llvm::SmallPtrSet<mlir::Value, 8> seen;
+  llvm::SmallVector<mlir::Value, 8> worklist{value};
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!current || !seen.insert(current).second)
+      continue;
+    if (const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(current);
+        bundle && bundle->evidenceIteratorCell)
+      return bundle;
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(current);
+    if (!argument)
+      continue;
+    mlir::Block *block = argument.getOwner();
+    for (mlir::Block *predecessor : block->getPredecessors()) {
+      mlir::Operation *terminator = predecessor->getTerminator();
+      auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(terminator);
+      if (!branch)
+        continue;
+      for (unsigned index = 0, end = terminator->getNumSuccessors(); index < end;
+           ++index) {
+        if (terminator->getSuccessor(index) != block)
+          continue;
+        mlir::SuccessorOperands operands = branch.getSuccessorOperands(index);
+        if (argument.getArgNumber() < operands.size())
+          worklist.push_back(operands[argument.getArgNumber()]);
+      }
+    }
+  }
+  return nullptr;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
   const RuntimeBundle *iterator =
       RuntimeBundleLowerer::bundleFor(op.getIterator());
   if (!iterator)
     return op.emitError() << "next iterator has no lowered runtime bundle";
+  // ⭐ AN EVIDENCE ITERATOR IS A COMPILE-TIME TOKEN AND A BLOCK ARGUMENT
+  // CANNOT CARRY ONE. A list, dict or set is iterated by POSITION through a
+  // cell alloca'd once per function -- there is no runtime iterator object --
+  // so a block argument that forwards the token has a bundle built from its
+  // TYPE, which is the bare `Iterator` protocol. Inside a generator the state
+  // machine threads the loop's values through the resume function's block
+  // arguments, so every generator that iterated a dict or a set was refused:
+  //
+  //     def keys(d: "dict[str, int]"):
+  //         for k in d:
+  //             yield k
+  //     # protocol-typed receiver '!py.protocol<"Iterator", [builtins.str]>'
+  //     # has no concrete runtime method evidence for __next__
+  //
+  // The cell is a function-level alloca, so it is valid in every block of the
+  // function: following the forwarding edges back to the value that owns the
+  // token is the whole repair. The same loop in a plain function was never
+  // threaded and always worked.
+  RuntimeBundle forwardedIterator;
+  if (!iterator->evidenceIteratorCell)
+    if (const RuntimeBundle *forwarded =
+            RuntimeBundleLowerer::evidenceIteratorBundleFor(op.getIterator())) {
+      forwardedIterator = *forwarded;
+      iterator = &forwardedIterator;
+    }
   if (iterator->evidenceIteratorCell) {
     if (iterator->sequenceElements.empty() && !iterator->sequenceEvidenceBacked)
       return RuntimeBundleLowerer::lowerListRuntimeNext(op, *iterator);

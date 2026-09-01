@@ -28,18 +28,29 @@
 # dict's takes a key. `.keys()`, `.values()` and `.items()` all reduce to this
 # same plain iteration (EmitterIterators.cpp), so all three are refused too.
 #
-# ⛔ AND MATERIALIZING IS NOT A WAY AROUND IT FROM THE SOURCE: `list(d)` and
-# `sorted(d)` inside the generator are refused as well, because building them
-# iterates the dict in the same place. Only a list handed IN as a parameter
-# avoids it. A rewrite that materialized would also have to carry CPython's
-# per-step size guard ("dictionary changed size during iteration"), which a
-# copy does not have -- trading a refusal for a silent divergence is the trade
-# this compiler does not make.
+# ⛔ MATERIALIZING WAS NOT A WAY AROUND IT EITHER, until the second message was
+# repaired: `list(d)` and `sorted(d)` inside the generator were refused as well,
+# because building them iterates the dict in the same place.
 #
-# THE SHAPE OF THE REPAIR, if it is taken: the position is an i64 and the frame
-# already carries i64 lanes, so the cell can be saved at the suspend and
-# written back at the resume, keyed as `builtins.int`. The second message says
-# the evidence has to reach the clone as well, which is the larger half.
+# FIXED (the second message, 2026-09-01): the evidence iterator is a
+# compile-time token whose position lives in a function-level cell, and the
+# resume clone threads the loop's values through BLOCK ARGUMENTS -- where the
+# bundle was rebuilt from the type, which is the bare protocol. `lowerNext`
+# follows the forwarding edges back to the value that owns the token, and the
+# cell is valid in every block of the function. A dict or set walked before the
+# first yield now compiles (golden:
+# a_generator_walks_a_dict_before_it_yields), and so does `list(d)` inside a
+# generator.
+#
+# ⛔ WHAT REMAINS is the yield INSIDE the loop, which is a different refusal:
+# the state machine declines because the protocol-typed token is live across a
+# yield and a frame lane is keyed on a runtime contract, which a compile-time
+# token does not have. The position is an i64 and the frame already carries i64
+# lanes, so the cell can be saved at the suspend and written back at the
+# resume, keyed as `builtins.int`. A rewrite that materialized the keys instead
+# would have to carry CPython's per-step size guard ("dictionary changed size
+# during iteration"), which a copy does not have -- trading a refusal for a
+# silent divergence is the trade this compiler does not make.
 def keys_of(d: "dict[str, int]"):
     for k in d:
         yield k
