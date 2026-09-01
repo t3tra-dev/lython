@@ -2580,6 +2580,41 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (methodBinding && !methodBinding->symbolName.empty())
     return emitMethodObject(expr, object, *methodBinding);
 
+  // ⭐ AN ATTRIBUTE A SOURCE CLASS DOES NOT HAVE IS REFUSED HERE. Nothing
+  // resolved it -- not a field, not a class attribute, not a method, not a
+  // property, and not a manifest member it inherits -- so the read was emitted
+  // anyway and died in the LOWERING as "class C has no field 'missing'", an
+  // internal sentence for a program CPython answers with AttributeError.
+  //
+  // ⛔ Source classes only, and only when the MANIFEST cannot resolve it
+  // either: a class deriving from a manifest one (an Exception subclass and
+  // its `args`) reads members this emitter never sees, and those are resolved
+  // where the lowering knows the base's schema.
+  if (!field && !staticAttr && !methodBinding) {
+    mlir::Type receiverInstance = object.type;
+    if (auto typeObject =
+            mlir::dyn_cast_if_present<py::TypeType>(receiverInstance))
+      receiverInstance = typeObject.getInstanceType();
+    if (auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(receiverInstance);
+        contract && types.lookupClass(contract.getContractName())) {
+      const py::protocols::Table &table = py::protocols::Table::get(context);
+      if (!table.resolveFieldContractWithEvidence(receiverInstance, *attr) &&
+          table.methodContractCandidatesWithEvidence(receiverInstance, *attr)
+              .empty()) {
+        std::string message = "'" + contract.getContractName().str() +
+                              "' object has no attribute '" +
+                              std::string(*attr) + "'";
+        if (lookupClassMethod(receiverInstance, "__getattr__"))
+          message += ": __getattr__ is not called for a statically unresolved "
+                     "attribute";
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start, std::move(message)});
+        return emitNone(expr);
+      }
+    }
+  }
+
   auto op =
       py::AttrGetOp::create(builder, loc(expr), result, object.value, *attr);
   if (field)

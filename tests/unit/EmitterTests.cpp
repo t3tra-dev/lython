@@ -970,4 +970,49 @@ TEST(EmitterTest, AModuleLevelLambdaCannotFreezeAReboundName) {
       emitSource("xs = [1, 2, 3]\nf = lambda: len(xs)\nprint(f())\n", once);
   EXPECT_TRUE(stable.ok());
 }
+
+TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
+  // Nothing resolves the read -- not a field, a class attribute, a method or
+  // a property -- and it used to be emitted anyway and die in the lowering as
+  // "class C has no field 'missing'".
+  mlir::MLIRContext missing(testRegistry());
+  lython::emitter::EmitResult absent = emitSource(
+      "class C:\n    def __init__(self) -> None:\n        self.a = 1\n"
+      "print(C().missing)\n",
+      missing);
+  EXPECT_FALSE(absent.ok());
+  bool saidAttribute = false;
+  for (const lython::parser::Diagnostic &diagnostic : absent.diagnostics)
+    saidAttribute =
+        saidAttribute ||
+        diagnostic.message.find("has no attribute 'missing'") !=
+            std::string::npos;
+  EXPECT_TRUE(saidAttribute);
+
+  // A class that declares __getattr__ is told that the hook is not the answer,
+  // rather than being refused with the same sentence as one that does not.
+  mlir::MLIRContext hooked(testRegistry());
+  lython::emitter::EmitResult hook = emitSource(
+      "class C:\n    def __init__(self) -> None:\n        self.a = 1\n"
+      "    def __getattr__(self, name: str) -> int:\n        return 0\n"
+      "print(C().missing)\n",
+      hooked);
+  EXPECT_FALSE(hook.ok());
+  bool saidHook = false;
+  for (const lython::parser::Diagnostic &diagnostic : hook.diagnostics)
+    saidHook = saidHook ||
+               diagnostic.message.find("__getattr__ is not called") !=
+                   std::string::npos;
+  EXPECT_TRUE(saidHook);
+
+  // An attribute a manifest BASE provides is not this: the lowering resolves
+  // it from the base's schema.
+  mlir::MLIRContext derived(testRegistry());
+  lython::emitter::EmitResult inherited = emitSource(
+      "class MyError(Exception):\n    pass\n"
+      "try:\n    raise MyError(\"x\")\nexcept MyError as e:\n"
+      "    print(e.args)\n",
+      derived);
+  EXPECT_TRUE(inherited.ok());
+}
 }
