@@ -3073,11 +3073,79 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
   // VALUE is the expression's own.
   if (node->kind == "NamedExpr")
     return recurse(ast::node(*node, "value"));
-  if (node->kind == "IfExp")
+  if (node->kind == "IfExp") {
     // Mirrors the emitter: literal arms widen to their contracts (CPython
     // types a ternary of two literals by the common class).
-    return join({widenLiteral(lenientRecurse(ast::node(*node, "body"))),
-                 widenLiteral(lenientRecurse(ast::node(*node, "orelse")))});
+    //
+    // ⭐ AND EACH ARM SEES THE NARROWING ITS SIDE OF THE TEST PROVES, which
+    // the EMITTER already applies. The two channels disagreeing is what a
+    // pre-pass reads: the class-field walk types `self.xs = [] if xs is None
+    // else xs` from here, got `list[object] | list[int] | None` where the
+    // emitter stores a `list[int]`, and declared a field nothing could be
+    // read out of ("does not provide manifest method '__len__'").
+    //
+    // ⛔ The None comparison only. The emitter's narrowing analysis lives a
+    // layer up (it needs the emitted values to unwrap through), and the
+    // isinstance and truthiness forms it also handles have no reader down
+    // here that has been measured to need them.
+    const parser::Node *bodyNode = ast::node(*node, "body");
+    const parser::Node *elseNode = ast::node(*node, "orelse");
+    const parser::Node *testNode = ast::node(*node, "test");
+    llvm::StringRef narrowedName;
+    mlir::Type narrowedPayload;
+    bool trueBranchIsNone = false;
+    if (testNode && testNode->kind == "Compare") {
+      const auto *comparators = ast::nodeList(*testNode, "comparators");
+      const auto *ops = ast::nodeList(*testNode, "ops");
+      if (comparators && comparators->size() == 1 && ops && ops->size() == 1) {
+        const parser::Node *op = ops->front().get();
+        bool isIs = ast::isOperator(op, "Is");
+        bool isIsNot = ast::isOperator(op, "IsNot");
+        const parser::Node *left = ast::node(*testNode, "left");
+        const parser::Node *right = comparators->front().get();
+        const parser::Node *named = nullptr;
+        if (left && right && left->kind == "Name" &&
+            right->kind == "Constant" && isNoneConstant(right))
+          named = left;
+        else if (left && right && right->kind == "Name" &&
+                 left->kind == "Constant" && isNoneConstant(left))
+          named = right;
+        if (named && (isIs || isIsNot)) {
+          llvm::StringRef spelling = ast::nameSpelling(*named);
+          if (std::optional<mlir::Type> current = lookupSymbol(spelling))
+            if (auto unionType =
+                    mlir::dyn_cast_if_present<py::UnionType>(*current)) {
+              llvm::SmallVector<mlir::Type, 4> payload;
+              for (mlir::Type member : unionType.getMemberTypes())
+                if (member != none() && widenLiteral(member) != none())
+                  payload.push_back(member);
+              if (!payload.empty() &&
+                  payload.size() != unionType.getMemberTypes().size()) {
+                narrowedName = spelling;
+                narrowedPayload = join(payload);
+                trueBranchIsNone = isIs;
+              }
+            }
+        }
+      }
+    }
+    auto armType = [&](const parser::Node *arm,
+                       bool conditionIsTrue) -> mlir::Type {
+      if (narrowedName.empty())
+        return widenLiteral(lenientRecurse(arm));
+      mlir::Type narrowed = conditionIsTrue == trueBranchIsNone
+                                ? none()
+                                : narrowedPayload;
+      auto scope = pushScope();
+      bindLocalSymbol(narrowedName, narrowed);
+      return widenLiteral(lenientRecurse(arm));
+    };
+    llvm::SmallVector<mlir::Type, 2> collected{
+        armType(bodyNode, /*conditionIsTrue=*/true),
+        armType(elseNode, /*conditionIsTrue=*/false)};
+    llvm::SmallVector<const parser::Node *, 2> armNodes{bodyNode, elseNode};
+    return joinIgnoringEmptyLiterals(*this, collected, armNodes);
+  }
   if (node->kind == "UnaryOp") {
     if (strict && !recurse(ast::node(*node, "operand")))
       return {};
