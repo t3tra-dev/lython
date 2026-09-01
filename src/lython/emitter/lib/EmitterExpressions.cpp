@@ -383,9 +383,44 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       types.bindLocalSymbol(narrowing->name, narrowed);
       return types.widenLiteral(types.inferExpr(arm));
     };
-    mlir::Type resultType = types.join(
-        {armType(bodyNode, /*conditionIsTrue=*/true),
-         armType(elseNode, /*conditionIsTrue=*/false)});
+    // ⭐ AN EMPTY LITERAL ARM CONTRIBUTES NO ELEMENT TYPE. `[]` has none of
+    // its own, so joining its `list[object]` with the other arm's `list[int]`
+    // built a union of two lists that nothing accepts -- and the ownership
+    // walk then saw a fresh allocation and a BORROWED parameter merged under
+    // one marker:
+    //
+    //     def f(xs: "list[int] | None" = None) -> "list[int]":
+    //         return [] if xs is None else xs
+    //     # ly.ownership.owned_local_object marks a value this frame never
+    //     # acquired
+    //
+    // The `if` STATEMENT spelling of the same choice worked, because its two
+    // returns are typed against the declared result one at a time. This is
+    // the rule the container-literal join already states for a sibling, and
+    // the rule the field walk states for a rebinding.
+    //
+    // ⛔ Only when the OTHER arm has one: `[] if c else []` has nothing to
+    // take a type from and keeps the erased element it always had.
+    auto isEmptyLiteralArm = [](const parser::Node *arm) {
+      if (!arm)
+        return false;
+      if (arm->kind == "List" || arm->kind == "Tuple" || arm->kind == "Set") {
+        const auto *elements = ast::nodeList(*arm, "elts");
+        return !elements || elements->empty();
+      }
+      if (arm->kind == "Dict") {
+        const auto *keys = ast::nodeList(*arm, "keys");
+        return !keys || keys->empty();
+      }
+      return false;
+    };
+    mlir::Type bodyArmType = armType(bodyNode, /*conditionIsTrue=*/true);
+    mlir::Type elseArmType = armType(elseNode, /*conditionIsTrue=*/false);
+    if (isEmptyLiteralArm(bodyNode) && !isEmptyLiteralArm(elseNode))
+      bodyArmType = elseArmType;
+    else if (isEmptyLiteralArm(elseNode) && !isEmptyLiteralArm(bodyNode))
+      elseArmType = bodyArmType;
+    mlir::Type resultType = types.join({bodyArmType, elseArmType});
     mlir::Value condition = emitBoolValue(emitExpr(testNode), *expr);
 
     auto emitArm = [&](const parser::Node *arm, bool conditionIsTrue) {
