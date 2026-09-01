@@ -2240,8 +2240,60 @@ std::optional<Value> ModuleEmitter::tryEmitContainerConstructorCall(
   if (!calleeNode || calleeNode->kind != "Name")
     return std::nullopt;
   llvm::StringRef ctor = ast::nameSpelling(*calleeNode);
-  if (ctor != "list" && ctor != "set" && ctor != "tuple" && ctor != "dict")
+  if (ctor != "list" && ctor != "set" && ctor != "tuple" && ctor != "dict" &&
+      ctor != "frozenset")
     return std::nullopt;
+  // ⭐ `frozenset(x)` IS `frozenset(set(x))` FOR EVERYTHING BUT A SET OR LIST.
+  // Its manifest constructor is declared over `set[$T]` and `list[$T]`, which
+  // are the two arguments that carry an element parameter for `$T` to bind to
+  // -- so a str, a tuple, a range or a dict left it unbound and the call was
+  // "class instantiation leaves unbound static type parameters for
+  // 'frozenset'", while `set("ab")`, `list("ab")` and `tuple("ab")` all
+  // worked.
+  //
+  // A set of the elements and then a frozenset of that IS the answer: both
+  // drop duplicates, neither has an order, and every one of the five sources
+  // already builds a set. `frozenset(set("ab"))` compiles today, which is the
+  // same value reached by hand.
+  //
+  // ⛔ Not by adding frozenset to the DESUGAR below: the comprehension that
+  // desugar builds produces a `builtins.set`, and there is no literal spelling
+  // for a frozenset to produce instead. This wraps the argument and leaves the
+  // constructor where it is.
+  if (ctor == "frozenset") {
+    if (values.count(ctor) || genericFunctions.count(ctor))
+      return std::nullopt;
+    const auto *frozenArgs = ast::nodeList(expr, "args");
+    const auto *frozenKeywords = ast::nodeList(expr, "keywords");
+    if (!frozenArgs || frozenArgs->size() != 1 || !frozenArgs->front() ||
+        frozenArgs->front()->kind == "Starred" ||
+        (frozenKeywords && !frozenKeywords->empty()))
+      return std::nullopt;
+    auto argumentContract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(frozenArgs->front().get())));
+    if (!argumentContract)
+      return std::nullopt;
+    llvm::StringRef name = argumentContract.getContractName();
+    // ⛔ AN ALLOWLIST, not "everything but set and list". `set(x)` is what
+    // this wraps with, and it does not accept every argument -- a generator
+    // expression is "unsupported expression kind 'GeneratorExp'", and wrapping
+    // one turned that clean refusal into a crash. These are the five sources
+    // whose `set(...)` compiles today, plus frozenset, which has no overload
+    // of its own.
+    if (name != "builtins.str" && name != "builtins.bytes" &&
+        name != "builtins.bytearray" && name != "builtins.tuple" &&
+        name != "builtins.range" && name != "builtins.dict" &&
+        name != "builtins.frozenset")
+      return std::nullopt;
+    NodePtr wrapped = synth::call(
+        synth::name(std::string("set"), expr.range),
+        std::vector<NodePtr>{frozenArgs->front()}, expr.range);
+    NodePtr rebuilt = synth::call(
+        synth::name(std::string("frozenset"), expr.range),
+        std::vector<NodePtr>{std::move(wrapped)}, expr.range);
+    synthesizedIteratorDefs.push_back(rebuilt);
+    return emitExpr(rebuilt.get());
+  }
   if (!isBuiltinIteratorName(ctor)) // reuses the user-shadowing guard
     return std::nullopt;
 
