@@ -61,6 +61,29 @@ bool isSupportedFinallyReturnCarrierType(mlir::Type type) {
     // or the unbound placeholder -- see `emitDefaultReturnValue`.
     return true;
   }
+  // ⭐ A UNION'S DEFAULT IS ITS None MEMBER. The completion payload is lanes
+  // plus a TAG, so its default has to name an ACTIVE member -- and the release
+  // on the discard path is tag-conditioned. None is the member that makes both
+  // free: it is a non-owning singleton, so the tag-conditioned release does
+  // nothing whichever way it is read. `def pick(f: int) -> "int | None"` with
+  // a return inside a try was "return value type through try/finally is not
+  // implemented yet" while every other carrier had a default.
+  //
+  // ⛔ Only a union that HAS one. A union of two owning members would need a
+  // default that is released on the discard path, and the tag-conditioned
+  // release for a block argument is the shape recorded in
+  // wb_union_loop_carried_borrow_overrelease.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      if (auto literal = mlir::dyn_cast<py::LiteralType>(member);
+          literal && literal.getSpelling() == "None")
+        return true;
+      if (auto contract = mlir::dyn_cast<py::ContractType>(member);
+          contract && contract.getContractName() == "types.NoneType")
+        return true;
+    }
+    return false;
+  }
   return false;
 }
 
@@ -881,6 +904,10 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
         return {op.getResult(), target};
       }
     }
+    // The None member the carrier check found: wrapped into the union, which
+    // is what an ordinary `x: int | None = None` already emits.
+    if (mlir::isa<py::UnionType>(target))
+      return coerceValue(emitNone(statement), target, statement);
     if (auto contract = mlir::dyn_cast<py::ContractType>(target)) {
       llvm::StringRef name = contract.getContractName();
       if (name == "types.NoneType" || name == "builtins.object") {

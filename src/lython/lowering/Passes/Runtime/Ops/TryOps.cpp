@@ -144,6 +144,24 @@ mlir::FailureOr<mlir::Value> pythonDefault(mlir::OpBuilder &builder,
     // never read, only released. The emitter's twin says the same.
     return py::UnboundOp::create(builder, anchor->getLoc(), type).getResult();
   }
+  // ⭐ A UNION'S DEFAULT IS ITS None MEMBER, WRAPPED. The payload is lanes plus
+  // a TAG, so the default has to name an active member, and the release on the
+  // discard path is tag-conditioned: None is the member that makes both free,
+  // because it owns nothing whichever way the tag is read. The emitter's twin
+  // picks the same member and only accepts a union that HAS one.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      auto literal = mlir::dyn_cast<py::LiteralType>(member);
+      auto contract = mlir::dyn_cast<py::ContractType>(member);
+      if (!(literal && literal.getSpelling() == "None") &&
+          !(contract && contract.getContractName() == "types.NoneType"))
+        continue;
+      auto none = py::NoneOp::create(builder, anchor->getLoc(), member);
+      return py::UnionWrapOp::create(builder, anchor->getLoc(), type,
+                                     none.getResult())
+          .getResult();
+    }
+  }
   return anchor->emitError()
          << "py.try finally lowering can only synthesize exceptional defaults "
             "for statically defaultable completion results, got "
