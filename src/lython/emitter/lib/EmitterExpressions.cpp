@@ -2114,6 +2114,31 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
   if (std::optional<Value> item =
           tryEmitClassDunder(expr, container, "__getitem__", {index}))
     return *item;
+  // ⭐ A UNION IS INDEXED BY TAG, the same way it is counted and added. Both
+  // members of a `list[int] | str` answer `__getitem__`, which is what
+  // `def f(x: "list[int] | str"): return x[0]` needs and what CPython does
+  // without knowing which one is live.
+  if (auto containerUnion = mlir::dyn_cast_if_present<py::UnionType>(
+          types.widenLiteral(container.type)))
+    if (mlir::Type joined = types.unionOperatorResult(
+            container.type, "__getitem__", {index.type}))
+      return emitUnionMemberDispatch(
+          expr, container, containerUnion, joined, [&](Value member) {
+            CallInferenceResult memberInference =
+                types.inferMethodCallWithEvidence(member.type, "__getitem__",
+                                                  {index.type});
+            // ⛔ The ARM's own result type, not the join: an op cannot have a
+            // union result, and the join is what the arms are coerced to on
+            // the way out. `list[int] | str` indexes to `int | str`, and the
+            // int arm has to be an int before it is wrapped.
+            mlir::Type memberResult =
+                memberInference ? memberInference.resultType : joined;
+            auto memberOp = py::GetItemOp::create(
+                builder, loc(expr), memberResult,
+                mlir::FlatSymbolRefAttr::get(&context, "__getitem__"),
+                callProtocolFor(memberInference), member.value, index.value);
+            return Value{memberOp.getResult(), memberResult};
+          });
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
       container.type, "__getitem__", {index.type});
   if (!requireStaticEvidence(expr, inference))

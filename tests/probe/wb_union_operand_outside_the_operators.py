@@ -11,7 +11,7 @@
 #   bool(u), str(u), repr(u), "{}".format(u) ......... correct
 #   max(u, 1) ........................................ correct
 #   len(u) ........................................... correct (2026-09-02)
-#   u[0] ............................................. '__getitem__'
+#   u[0] ............................................. correct (2026-09-02)
 #   [v for v in u] ................................... '__iter__'
 #   hash(u) .......................................... runtime method receiver
 #                                                      has no concrete contract
@@ -32,10 +32,16 @@
 # handle for the whole value, which a union does not have (see
 # wb_union_bool_member_in_a_container for the same wall on a container
 # element).
+#
+# ⛔ AND ITERATION IS NOT A CALL. Dispatching `for v in u` per member would
+# duplicate the LOOP BODY, and dispatching only the `__iter__` gives back an
+# iterator whose type is itself a union -- which then needs a slot to live in
+# across the loop, which is the storage wall this family keeps meeting. That is
+# why the two members' answers joining is not enough here.
 def mk(n: int):
     if n < 0:
         return "ab"
     return [1, 2]
 
 
-print(mk(-1)[0], mk(1)[0])
+print([v for v in mk(-1)], [v for v in mk(1)])

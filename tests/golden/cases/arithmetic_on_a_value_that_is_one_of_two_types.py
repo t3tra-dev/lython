@@ -76,3 +76,17 @@ def measured(n: int):
 
 
 print(len(measured(-1)), len(measured(1)), len(measured(-1)) + len(measured(1)))
+
+
+# And indexed by tag: both members answer `__getitem__`, and the element types
+# join -- so the answer has to be decoded to tell which arm produced it.
+def head(x: "list[str] | str") -> str:
+    return x[0]
+
+
+print(head(["ab", "cd"]), head("xy"), head(["z"]) + head("q"))
+
+first = measured(-1)[0]
+second = measured(1)[0]
+print(first, second, isinstance(first, str), isinstance(second, int))
+print(measured(-1)[-1], measured(1)[-1])

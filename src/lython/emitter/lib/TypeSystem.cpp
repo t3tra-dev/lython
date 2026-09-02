@@ -3089,11 +3089,17 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
           widenLiteral(container), "__getitem__", {index});
       if (inference)
         return inference.resultType;
+      if (mlir::Type unionResult =
+              unionOperatorResult(container, "__getitem__", {index}))
+        return unionResult;
       return fail(inference.failureReason);
     }
     if (std::optional<CallSolution> result = tryManifestMethod(
             *this, widenLiteral(container), "__getitem__", {index}))
       return result->result;
+    if (mlir::Type unionResult =
+            unionOperatorResult(container, "__getitem__", {index}))
+      return unionResult;
     return object();
   }
   if (node->kind == "Compare")

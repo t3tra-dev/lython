@@ -4526,11 +4526,13 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
           expr, input, inputUnion, joined, [&](Value member) {
             CallInferenceResult memberInference =
                 types.inferMethodCallWithEvidence(member.type, "__len__", {});
+            mlir::Type memberResult =
+                memberInference ? memberInference.resultType : joined;
             auto memberOp = py::LenOp::create(
-                builder, loc(expr), joined,
+                builder, loc(expr), memberResult,
                 mlir::FlatSymbolRefAttr::get(&context, "__len__"),
                 callProtocolFor(memberInference), member.value);
-            return Value{memberOp.getResult(), joined};
+            return Value{memberOp.getResult(), memberResult};
           });
     CallInferenceResult inference =
         types.inferMethodCallWithEvidence(input.type, "__len__", {});
