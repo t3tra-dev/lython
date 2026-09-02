@@ -1055,6 +1055,11 @@ private:
     bool isInt = false;
     // types.NoneType lane: dead immortal placeholders cross the boundary.
     bool isNone = false;
+    // builtins.bool ARGUMENT lane: one bare i1 part, stored in ONE frame word
+    // rather than the (pointer, size) pair an object part takes. `bool`'s
+    // manifest value shape is an i1, which no frame slot could hold, so a
+    // generator with a bool parameter had no argument lane at all.
+    bool isBool = false;
     unsigned physicalCount = 0;
     // The contract's physical parts, carried on the lane rather than looked up
     // from the manifest on each use.

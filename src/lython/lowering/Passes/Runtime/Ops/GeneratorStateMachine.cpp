@@ -503,6 +503,8 @@ unsigned RuntimeBundleLowerer::generatorLaneFrameWords(
 // argument), then the frame lanes.
 unsigned RuntimeBundleLowerer::generatorArgumentFrameWords(
     const GeneratorResumeLane &lane) const {
+  if (lane.isBool)
+    return 1; // the bit, widened into one word
   return lane.isInt ? 2 : 2 * lane.physicalCount;
 }
 
@@ -760,6 +762,17 @@ RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
                 .getResult();
       }
     }
+    // ⛔ A BARE i1 PART TAKES ONE WORD, not the (pointer, size) pair: it has
+    // no pointer to take. Falling through here stored two zero words and the
+    // load rebuilt a memref from them.
+    if (!memref && value.getType().isInteger(1)) {
+      mlir::Value bitWord =
+          mlir::arith::ExtUIOp::create(builder, loc, i64, value).getResult();
+      mlir::memref::StoreOp::create(builder, loc, bitWord, storage,
+                                    wordIndex(word));
+      word += 1;
+      continue;
+    }
     mlir::memref::StoreOp::create(builder, loc, pointerWord, storage,
                                   wordIndex(word));
     mlir::memref::StoreOp::create(builder, loc, sizeWord, storage,
@@ -890,6 +903,19 @@ RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
   llvm::SmallVector<mlir::Value, 6> results;
   unsigned word = 0;
   for (unsigned part = 0; part < lane.physicalCount; ++part) {
+    if (laneTypes[part].isInteger(1)) {
+      mlir::Value bitWord =
+          mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(word))
+              .getResult();
+      mlir::Value zero =
+          mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+      results.push_back(mlir::arith::CmpIOp::create(
+                            builder, loc, mlir::arith::CmpIPredicate::ne,
+                            bitWord, zero)
+                            .getResult());
+      word += 1;
+      continue;
+    }
     mlir::Value pointerWord =
         mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(word))
             .getResult();
@@ -1051,6 +1077,30 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       GeneratorResumeLane lane;
       lane.contract = contract;
       lane.isInt = contract == "builtins.int";
+      // ⭐ A BOOL ARGUMENT IS ONE WORD. `builtins.bool`'s manifest value shape
+      // is a bare `i1` (LyBool_Shape), and `generatorLaneParts` requires every
+      // part to be a rank-1 memref because a frame slot holds (pointer, size)
+      // pairs -- so a bool parameter had no lane, `argumentsEligible` went
+      // false, and the state machine skipped EVERY generator with one without
+      // recording a reason. The tier below then refused `def g(flag: bool): if
+      // flag: yield 1 else: yield 2` for its own limit, which was never why
+      // the program was there; a str, float or list parameter deciding the
+      // same branch compiles, because all three have memref shapes.
+      //
+      // ⛔ The ARGUMENT lane only, and the bit is passed to the clone AS an
+      // i1: converting the word inside the clone's entry put an op in a block
+      // the flattening then made unreachable from the resume dispatch
+      // ("operand #0 does not dominate this use"). A bool live across a YIELD
+      // still has no frame lane -- that path goes through
+      // `laneEligibleContract`, which is left alone.
+      lane.isBool = !lane.isInt && contract == "builtins.bool";
+      if (lane.isBool) {
+        lane.physicalCount = 1;
+        lane.physicalTypes.assign(
+            {mlir::IntegerType::get(context, 1)});
+        argumentLanes.push_back(lane);
+        continue;
+      }
       if (!lane.isInt) {
         std::optional<llvm::SmallVector<mlir::Type, 4>> parts =
             RuntimeBundleLowerer::generatorLaneParts(body.getOperation(),
