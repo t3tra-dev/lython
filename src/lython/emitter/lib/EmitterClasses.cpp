@@ -3718,11 +3718,16 @@ Value ModuleEmitter::emitInlineMethodBody(
     // ⛔ Only for source-defined contracts on both sides. A manifest contract's
     // assignability is the manifest's business, and `isAssignableTo` is the one
     // that knows the protocol and subtype relations there.
+    // ⛔ NO DOT TEST. It read "a name with a dot is a manifest contract", and
+    // an IMPORTED class's name is dotted too (`shapes2.Right`), so passing an
+    // imported subclass where the imported base is declared was refused --
+    // "argument 'inner' of '__init__' is declared shapes2.Base and this call
+    // gives it shapes2.Right" -- while the same hierarchy in ONE file was
+    // accepted. The MRO map is the answer on its own: it holds exactly the
+    // classes this compiler declared, and a manifest contract is never in it.
     if (auto expectedContract = mlir::dyn_cast<py::ContractType>(expected))
       if (auto actualContract = mlir::dyn_cast<py::ContractType>(actual))
-        if (!expectedContract.getContractName().contains('.') &&
-            !actualContract.getContractName().contains('.') &&
-            llvm::is_contained(classMro(actualContract.getContractName()),
+        if (llvm::is_contained(classMro(actualContract.getContractName()),
                                expectedContract.getContractName()))
           return;
     // ⭐ A BARE generic contract accepts any instantiation of itself. A generic
