@@ -2783,17 +2783,15 @@ void ModuleEmitter::collectClassFields(
                 //
                 // The same rule the generator body walk states for a
                 // rebinding, applied where the field is declared.
-                bool provisional = false;
-                if (value) {
-                  if (value->kind == "List" || value->kind == "Tuple" ||
-                      value->kind == "Set") {
-                    const auto *elements = ast::nodeList(*value, "elts");
-                    provisional = !elements || elements->empty();
-                  } else if (value->kind == "Dict") {
-                    const auto *keys = ast::nodeList(*value, "keys");
-                    provisional = !keys || keys->empty();
-                  }
-                }
+                //
+                // ⛔ Asked through the canonical predicate and not a local
+                // node-kind test, which is what stood here and what left
+                // `xs = list()`, `d = dict()` and `s = set()` outside the rule
+                // that `[]` and `{}` were inside. The zero-argument
+                // constructor is the same empty container and the same absence
+                // of an element type -- and `set()` is the only spelling there
+                // is for one.
+                bool provisional = isEmptyContainerExpression(value);
                 if (const auto *targets = ast::nodeList(*stmt, "targets"))
                   for (const parser::NodePtr &target : *targets) {
                     if (!target)

@@ -3360,8 +3360,28 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
   // expectation was dropped) and the branch join became
   // `list[int] | list[object] | None`, which nothing accepts -- while the
   // same assignment under the bare `list[int]` expectation was exact.
+  // ⭐ AND `list()` IS `[]` FOR THIS RULE. It reads the node's KIND, so the
+  // zero-argument constructor spelling of the same empty container never
+  // reached it and kept the erased element the callee contract gives it:
+  //
+  //     def f(xs: "list[int] | None" = None) -> "list[int]":
+  //         if xs is None:
+  //             xs = list()
+  //         return xs
+  //     # cannot adapt  return value to callable return ABI 0 of f
+  //
+  // The branch join became `list[int] | list[object]` where the `[]` spelling
+  // of the same function joins at `list[int]`. `set()` is the spelling that
+  // has no literal at all, so the class that gives each instance its own set
+  // could only be written the way that did not compile.
+  std::string constructorContract;
+  if (expr->kind == "Call" && isEmptyContainerExpression(expr)) {
+    llvm::StringRef callee = ast::nameSpelling(*ast::node(*expr, "func"));
+    if (!programBindsName(callee))
+      constructorContract = ("builtins." + callee).str();
+  }
   if (auto unionExpected = mlir::dyn_cast<py::UnionType>(expected)) {
-    llvm::StringRef wanted;
+    llvm::StringRef wanted = constructorContract;
     if (expr->kind == "List")
       wanted = "builtins.list";
     else if (expr->kind == "Tuple")
@@ -3390,6 +3410,17 @@ Value ModuleEmitter::emitExprExpected(const parser::Node *expr,
     return emitContainerLiteral(*expr, expected);
   if (expr->kind == "Set")
     return emitSetLiteral(*expr, expected);
+  // ⛔ The constructor is EMITTED and then retyped, where the literal is built
+  // at the expectation directly: a call's result type comes from the callee
+  // contract, so the expectation cannot reach the construction. An empty
+  // container holds nothing, which is what makes the retyping sound -- it is
+  // the same upcast `s: "set[int]" = set()` has always taken at its
+  // annotation, asked here so the union spelling reaches it too.
+  if (!constructorContract.empty())
+    if (auto contractExpected = mlir::dyn_cast<py::ContractType>(expected);
+        contractExpected &&
+        contractExpected.getContractName() == constructorContract)
+      return coerceValue(emitExpr(expr), expected, *expr);
   // `b: Box[int] = Box(5)`: a bare generic-class construction takes its
   // instantiation from the expectation. The specialization is already
   // allocated (the annotation spelled it), so this only has to redirect the

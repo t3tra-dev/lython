@@ -1059,8 +1059,18 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
               // empty literal is built at whatever it is handed. AnnAssign has
               // always coerced for exactly this reason, which is why
               // `s: set[int] = set()` worked while `s = set()` did not.
-              if (!constructedKind.empty())
-                value = coerceValue(value, declared, statement);
+              // ⛔ And NOT back into the union it was narrowed out of.
+              // `emitExprExpected` now retypes the constructor at the member
+              // the expectation names, so a second coercion to the whole
+              // `list[int] | None` wrapped the exact value in a tag the branch
+              // join then could not merge with the other arm's bare list.
+              if (!constructedKind.empty()) {
+                auto declaredUnion = mlir::dyn_cast_if_present<py::UnionType>(
+                    types.widenLiteral(declared));
+                if (!declaredUnion ||
+                    !declaredUnion.hasMember(types.widenLiteral(value.type)))
+                  value = coerceValue(value, declared, statement);
+              }
               emittedWithContext = true;
             }
           }
