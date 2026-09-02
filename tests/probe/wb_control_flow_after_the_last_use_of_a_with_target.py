@@ -16,6 +16,7 @@
 #       another `handle.read()` after it .................. correct
 #   the same arithmetic OUTSIDE the with .................. correct
 #   `total = n + 1` with no call at all ................... correct
+#   the same body with the `with` inside a FOR loop ....... correct
 #
 # The split is what matters, not the operator: an `if` does it, and so does the
 # guarded fast/slow diamond an int add emits when both operands carry a lane
