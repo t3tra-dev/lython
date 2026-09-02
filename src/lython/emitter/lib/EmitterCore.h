@@ -1113,6 +1113,23 @@ private:
   const std::string *frozenInitContract = nullptr;
   llvm::StringMap<llvm::StringMap<mlir::Type>> classStaticAttrBindings;
   llvm::StringMap<llvm::StringMap<MethodBinding>> classMethodBindings;
+  // ⭐ A METHOD BODY EMITTED AFTER EVERY CLASS IS DECLARED. Two sibling
+  // subclasses that both call a base-typed method could not be compiled in any
+  // order: the first one's body needs the second's method bindings, which its
+  // own `emitClassContract` has not filled yet, and swapping them only swaps
+  // which of the two is refused. The bindings are all that a body needs from
+  // another class, and they are registered before the bodies are, so the top
+  // level declares every class first and drains this queue afterwards.
+  struct DeferredMethodBody {
+    const parser::Node *statement = nullptr;
+    FunctionSignature signature;
+    std::string symbolName;
+    std::string kind;
+    std::string contractName;
+  };
+  std::vector<DeferredMethodBody> deferredMethodBodies;
+  bool deferClassMethodBodies = false;
+  void emitDeferredMethodBodies();
   // Canonical (resolved) base contract names per class, in declaration order.
   llvm::StringMap<llvm::SmallVector<std::string, 4>> classBaseNames;
   // C3 linearization per class (self first, canonical contract names).

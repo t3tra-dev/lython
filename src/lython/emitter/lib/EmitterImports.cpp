@@ -5,6 +5,8 @@
 #include "AstAccess.h"
 #include "PyProtocols.h"
 
+#include "llvm/Support/SaveAndRestore.h"
+
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1157,6 +1159,43 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     // ⛔ Over the RAW body, because the flattener DROPS what it cannot decide
     // and the refusal is precisely for what gets dropped.
     refuseImportTimeStatements(types, *rawBody, sourceName, diagnostics);
+    // ⭐ THE SAME DECLARE-THEN-DEFINE ORDER THE MAIN MODULE TAKES. Two sibling
+    // subclasses in an IMPORTED module that both recurse through the base read
+    // as "static type shapes.Right does not provide manifest method 'show'":
+    // the first one's body needs the second's method bindings, which its own
+    // `emitClassContract` fills, and this walk emitted bodies as it went.
+    //
+    // ⛔ The queue is drained INSIDE this module's scope, not with the main
+    // module's: the bodies are typed against `sourceName`, the module's own
+    // import scope and its isolated type scopes, all of which are restored
+    // below. A hierarchy split across two imported modules therefore keeps the
+    // old answer -- one module at a time is what this walk can promise.
+    llvm::SaveAndRestore<bool> deferBodies(deferClassMethodBodies, true);
+    std::vector<DeferredMethodBody> outerDeferred;
+    outerDeferred.swap(deferredMethodBodies);
+    for (const parser::NodePtr &statement : body) {
+      if (!statement || !isTopLevelClass(*statement))
+        continue;
+      std::size_t classDiagnosticStart = diagnostics.size();
+      if (std::optional<std::string_view> name =
+              ast::string(*statement, "name")) {
+        std::string classSymbol =
+            sourceModuleClassSymbol(source.moduleName, *name);
+        if (genericClasses.count(classSymbol)) {
+          // A specialization's bodies are typed inside the scope that binds
+          // its type parameters; see the same guard in the main module's
+          // puller.
+          llvm::SaveAndRestore<bool> emitNow(deferClassMethodBodies, false);
+          drainGenericClassSpecializations(classSymbol);
+        } else {
+          emitClassContract(*statement, classSymbol);
+        }
+      }
+      for (std::size_t index = classDiagnosticStart; index < diagnostics.size();
+           ++index)
+        if (diagnostics[index].filename.empty())
+          diagnostics[index].filename = sourceName;
+    }
     for (const parser::NodePtr &statement : body) {
       if (!statement)
         continue;
@@ -1185,19 +1224,6 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
           recordMonomorphicFunction(canonical, *statement, sig, canonical,
                                     &source);
         }
-      } else if (isTopLevelClass(*statement)) {
-        std::optional<std::string_view> name = ast::string(*statement, "name");
-        if (!name)
-          continue;
-        // Generic classes were registered during predeclaration; the generic
-        // itself is never emitted, and its specializations take its place at
-        // this position so a later class can inherit from one.
-        std::string classSymbol =
-            sourceModuleClassSymbol(source.moduleName, *name);
-        if (genericClasses.count(classSymbol))
-          drainGenericClassSpecializations(classSymbol);
-        else
-          emitClassContract(*statement, classSymbol);
       } else {
         continue;
       }
@@ -1206,6 +1232,15 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
         if (diagnostics[index].filename.empty())
           diagnostics[index].filename = sourceName;
     }
+    {
+      std::size_t bodyDiagnosticStart = diagnostics.size();
+      emitDeferredMethodBodies();
+      for (std::size_t index = bodyDiagnosticStart; index < diagnostics.size();
+           ++index)
+        if (diagnostics[index].filename.empty())
+          diagnostics[index].filename = sourceName;
+    }
+    deferredMethodBodies.swap(outerDeferred);
     activePackageName = std::move(savedPackageName);
     sourceName = std::move(savedSourceName);
   }
@@ -1533,30 +1568,62 @@ void ModuleEmitter::emitTopLevelDeclarations() {
     const parser::Node *statement = found->second;
     deferred.erase(found);
     emitNamedClassesFirst(*statement);
-    if (genericClasses.count(name))
+    if (genericClasses.count(name)) {
+      // ⛔ A SPECIALIZATION'S BODIES ARE NEVER DEFERRED. They are typed inside
+      // the scope that binds the class's type parameters to this
+      // instantiation's arguments, so emitting them later types `T` as itself
+      // -- "static type list[builtins.T] does not provide manifest method
+      // 'append'", which is what two generic goldens said when the queue took
+      // them.
+      llvm::SaveAndRestore<bool> emitNow(deferClassMethodBodies, false);
       drainGenericClassSpecializations(name);
-    else
+    } else {
       emitClassContract(*statement);
+    }
   };
 
-  if (const auto *body = ast::nodeList(moduleNode, "body")) {
-    for (const parser::NodePtr &statement : *body) {
-      if (!statement)
-        continue;
-      if (statement->kind == "FunctionDef" ||
-          statement->kind == "AsyncFunctionDef") {
-        emitNamedClassesFirst(*statement);
-        emitFunctionDecl(*statement);
-      } else if (statement->kind == "ClassDef") {
-        auto name = ast::string(*statement, "name");
-        if (!name)
+  // ⭐ EVERY CLASS IS DECLARED BEFORE ANY METHOD BODY IS EMITTED. Two sibling
+  // subclasses that both call a method through the base could not be compiled
+  // in any order:
+  //
+  //     class Expr:  def show(self) -> str: ...
+  //     class Add(Expr):  def show(self): return self.a.show() + ...
+  //     class Mul(Expr):  def show(self): return self.a.show() + ...
+  //     # 'Mul.show' is used before 'Mul' is defined
+  //
+  // and swapping Add and Mul only swaps which of the two is refused, because
+  // each one's body needs the dispatcher over the base, and the dispatcher
+  // needs every subclass's method bindings. Those bindings are registered by
+  // `emitClassContract` BEFORE it emits any body, so declaring every class
+  // first is enough -- the bodies are queued and drained below.
+  //
+  // ⛔ This is NOT "emit all classes before all functions", which the ⛔ above
+  // rejects because a class body may reference a module-level function. What
+  // runs early here is the DECLARATION; the bodies still run last, after the
+  // function declarations, so both orders hold at once.
+  {
+    llvm::SaveAndRestore<bool> deferBodies(deferClassMethodBodies, true);
+    if (const auto *body = ast::nodeList(moduleNode, "body")) {
+      for (const parser::NodePtr &statement : *body) {
+        if (!statement || statement->kind != "ClassDef")
           continue;
-        emitClassNow(*name);
+        if (auto name = ast::string(*statement, "name"))
+          emitClassNow(*name);
+      }
+      for (const parser::NodePtr &statement : *body) {
+        if (!statement)
+          continue;
+        if (statement->kind == "FunctionDef" ||
+            statement->kind == "AsyncFunctionDef") {
+          emitNamedClassesFirst(*statement);
+          emitFunctionDecl(*statement);
+        }
       }
     }
   }
   // Stub-declared and never-walked generics still owe their specializations.
   drainGenericClassSpecializations();
+  emitDeferredMethodBodies();
 }
 
 } // namespace lython::emitter

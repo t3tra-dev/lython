@@ -692,6 +692,36 @@ void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
   emitStatement(*synth::exprStmt(std::move(call), classDef.range));
 }
 
+// The queue `emitClassContract` fills while the top level is declaring classes.
+// Everything the body loop there sets up per method is reconstructed from the
+// contract name it was queued with: the `super()` context is the class and the
+// body's own first positional name, and the frozen-dataclass exemption is the
+// class again.
+void ModuleEmitter::emitDeferredMethodBodies() {
+  // ⛔ Index, not a range-for: emitting a body can demand a generic
+  // specialization, whose class contract queues bodies of its own onto this
+  // very vector.
+  for (std::size_t index = 0; index < deferredMethodBodies.size(); ++index) {
+    DeferredMethodBody entry = deferredMethodBodies[index];
+    if (!entry.statement)
+      continue;
+    bool instanceBody =
+        entry.kind == "instance" && !entry.signature.positionalNames.empty();
+    if (instanceBody)
+      superContexts.push_back(SuperContext{
+          entry.contractName, entry.signature.positionalNames.front()});
+    std::optional<llvm::SaveAndRestore<const std::string *>> frozenInit;
+    if (ast::string(*entry.statement, "name").value_or("") == "__init__" &&
+        frozenDataclassContracts.count(entry.contractName))
+      frozenInit.emplace(frozenInitContract, &entry.contractName);
+    emitCallableFunction(*entry.statement, entry.symbolName, entry.signature,
+                         {}, /*isLambda=*/false);
+    if (instanceBody)
+      superContexts.pop_back();
+  }
+  deferredMethodBodies.clear();
+}
+
 void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
   auto name = ast::string(classDef, "name");
   if (!name)
@@ -2373,6 +2403,24 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   py::protocols::Table::getMutable(context).registerClass(
       contractName, std::move(protocolInfo));
 
+  // ⭐ QUEUED, NOT EMITTED, WHILE THE TOP LEVEL IS STILL DECLARING CLASSES. A
+  // body is the only thing in a class that reads ANOTHER class's method
+  // bindings, and this loop is the only thing in `emitClassContract` that runs
+  // after those bindings are registered -- so moving it out is what lets two
+  // sibling subclasses call the same base-typed method. `emitTopLevelDeclarations`
+  // drains the queue once every class has been declared.
+  if (deferClassMethodBodies) {
+    for (auto [statement, bodySig, symbolName, kind] :
+         llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
+                         pendingBodyKinds))
+      deferredMethodBodies.push_back(
+          DeferredMethodBody{statement, bodySig, symbolName, std::string(kind),
+                             std::string(contractName)});
+    pendingBodies.clear();
+    pendingBodySigs.clear();
+    pendingBodySymbols.clear();
+    pendingBodyKinds.clear();
+  }
   for (auto [statement, bodySig, symbolName, kind] :
        llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
                        pendingBodyKinds)) {
