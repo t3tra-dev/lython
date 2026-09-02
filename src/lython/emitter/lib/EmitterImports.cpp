@@ -266,6 +266,10 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   // value carries no protocol contract, so any attempt to dispatch on it (call,
   // len, iteration) is rejected for lack of evidence rather than erased.
   types.bindCanonicalSymbol(localName, module, types.object());
+  // A source stdlib module is a module too, and the attribute check needs to
+  // know it: without this, `os.nonexistent` and `time.nonexistent` fell
+  // through to the dynamic read the manifest modules no longer take.
+  types.noteImportedModuleName(localName);
   const auto *rawBody = ast::nodeList(*source->moduleNode, "body");
   if (!rawBody)
     return true;

@@ -256,6 +256,38 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         }
         return emitBindingRef(*expr, binding, *symbol);
       }
+      // ⭐ AN ATTRIBUTE A MODULE DOES NOT HAVE IS A STATIC ERROR. Nothing
+      // resolved `sys.version_info`, so it fell through to a dynamic attribute
+      // read on the module object -- which no lowering can answer, and the
+      // message it produced named the MODULE and not the attribute, one phase
+      // too late:
+      //
+      //     import sys
+      //     print(sys.version_info)
+      //     # unresolved runtime binding 'sys'
+      //     # Failed to run lowering pipeline
+      //
+      // Every runtime module answered the same way for every attribute it does
+      // not export, `math.nonexistent` included. The refusal belongs at the
+      // earliest static boundary, which is here.
+      //
+      // ⛔ Only when the RECEIVER is itself a module. `sys.stdout.write` has a
+      // qualified name that does not resolve either, and its receiver is a
+      // TextIOWrapper -- an ordinary object whose attributes are found by the
+      // dispatch below.
+      if (const parser::Node *receiverNode = ast::node(*expr, "value")) {
+        std::string receiverQualified = ast::qualifiedName(receiverNode);
+        std::optional<std::string_view> attribute = ast::string(*expr, "attr");
+        if (!receiverQualified.empty() && attribute &&
+            types.isImportedModuleName(receiverQualified)) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr->range.start,
+              "module '" + receiverQualified +
+                  "' has no attribute '" + std::string(*attribute) +
+                  "' that resolves statically"});
+          return emitNone(*expr);
+        }
+      }
     }
     return emitAttribute(*expr);
   }

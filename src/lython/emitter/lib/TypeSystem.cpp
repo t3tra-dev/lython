@@ -2040,6 +2040,14 @@ TypeSystem::lookupClassStaticMethod(llvm::StringRef className,
   return found->second;
 }
 
+bool TypeSystem::isImportedModuleName(llvm::StringRef name) const {
+  return importedModuleLocalNames.contains(name);
+}
+
+void TypeSystem::noteImportedModuleName(llvm::StringRef name) {
+  importedModuleLocalNames.insert(name);
+}
+
 bool TypeSystem::bindImportedModule(llvm::StringRef module,
                                     llvm::StringRef localName) {
   std::string localStorage;
@@ -2050,8 +2058,10 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
 
   bool handled = false;
   auto bindModuleObject = [&] {
-    if (!handled)
+    if (!handled) {
       bindSymbol(localName, object());
+      importedModuleLocalNames.insert(localName);
+    }
     handled = true;
   };
 
@@ -2135,6 +2145,12 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
   if (bindManifestModuleConstants(*this, module, localName))
     handled = true;
 
+  // A manifest module (math, os, time, json ...) binds its exports without
+  // going through `bindModuleObject`, so the local name has to be recorded
+  // here as well -- it is what tells an unresolvable attribute on it apart
+  // from one on an ordinary object.
+  if (handled)
+    importedModuleLocalNames.insert(localName);
   return handled;
 }
 

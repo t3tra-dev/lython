@@ -1016,6 +1016,42 @@ TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   EXPECT_TRUE(inherited.ok());
 }
 
+TEST(EmitterTest, AnAttributeAModuleDoesNotHaveIsRefusedAtEmit) {
+  // Nothing resolved these, so they fell through to a dynamic attribute read
+  // on the module object -- which no lowering can answer. The message came out
+  // one phase later and named the MODULE rather than the attribute:
+  // "unresolved runtime binding 'sys'".
+  // ⛔ Manifest modules only: this harness emits a module on its own, without
+  // the embedded stdlib SOURCE modules `lyc` links, so `os` and `json` do not
+  // resolve here at all. The same refusal covers them in the compiler.
+  for (const char *source :
+       {"import sys\nprint(sys.version_info)\n",
+        "import sys\nprint(sys.path)\n",
+        "import math\nprint(math.nonexistent)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool named = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      named = named || (diagnostic.message.find("has no attribute") !=
+                            std::string::npos &&
+                        diagnostic.message.find("module '") !=
+                            std::string::npos);
+    EXPECT_TRUE(named) << source;
+  }
+
+  // The attributes these modules DO have still resolve, and an attribute on a
+  // module's non-module member is not this question: `sys.stderr` is an
+  // ordinary object whose `write` the dispatch finds.
+  for (const char *source :
+       {"import math\nprint(math.sqrt(4.0))\n",
+        "import sys\nprint(sys.maxsize > 0)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_TRUE(result.ok()) << source;
+  }
+}
+
 TEST(EmitterTest, NextWithAnUnrelatedDefaultIsRefusedInItsOwnTerms) {
   // A default that joins with the element at a wider union than an Optional
   // has no slot to be carried out of the desugared try, and the refusal used

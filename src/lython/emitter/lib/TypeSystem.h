@@ -9,6 +9,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <functional>
 #include <optional>
@@ -330,6 +331,13 @@ public:
   lookupClassStaticMethod(llvm::StringRef className,
                           llvm::StringRef methodName) const;
   bool bindImportedModule(llvm::StringRef module, llvm::StringRef localName);
+  // Whether a name in scope is a MODULE this compiler bound, as opposed to an
+  // ordinary value that happens to be `object`-typed. A module binds its local
+  // name to `object`, so the two are otherwise indistinguishable -- and the
+  // difference decides whether an unresolvable attribute on it is a static
+  // error or a dynamic read.
+  bool isImportedModuleName(llvm::StringRef name) const;
+  void noteImportedModuleName(llvm::StringRef name);
   bool bindImportedName(llvm::StringRef module, llvm::StringRef exportedName,
                         llvm::StringRef localName);
 
@@ -439,6 +447,7 @@ private:
 
   mlir::MLIRContext &context;
   mutable InferenceContext inferenceState;
+  llvm::StringSet<llvm::MallocAllocator> importedModuleLocalNames;
   // Signatures resolved by registerModule's pre-pass, keyed by function
   // node. Only module top-level functions are memoized: nested defs,
   // lambdas, and imported source modules run under caller-specific scope
