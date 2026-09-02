@@ -1016,6 +1016,28 @@ TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   EXPECT_TRUE(inherited.ok());
 }
 
+TEST(EmitterTest, NextWithAnUnrelatedDefaultIsRefusedInItsOwnTerms) {
+  // A default that joins with the element at a wider union than an Optional
+  // has no slot to be carried out of the desugared try, and the refusal used
+  // to be reported on `__lynext1` -- a name the program never wrote, with
+  // advice ("bind the reassignment to a new name") that cannot be followed for
+  // a scratch the emitter owns.
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result =
+      emitSource("xs = iter([1])\nprint(next(xs, \"z\"))\n", context);
+  EXPECT_FALSE(result.ok());
+  bool named = false;
+  bool leakedScratch = false;
+  for (const lython::parser::Diagnostic &diagnostic : result.diagnostics) {
+    named = named || diagnostic.message.find("next(iterator, default)") !=
+                         std::string::npos;
+    leakedScratch = leakedScratch ||
+                    diagnostic.message.find("__lynext") != std::string::npos;
+  }
+  EXPECT_TRUE(named);
+  EXPECT_FALSE(leakedScratch);
+}
+
 TEST(EmitterTest, AUnionIsNotDisjointFromItsOwnMember) {
   // `is` against a member of the value's own union is refused, not answered.
   // The disjointness fold decided both `is` and `is not` from the whole type,

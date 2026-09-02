@@ -3508,6 +3508,27 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         return contract("_io.TextIOWrapper");
       }
       if (name == "next") {
+        // ⭐ `next(it, default)` IS THE JOIN of the element and the default,
+        // and this channel only knew the one-argument form -- so it answered
+        // `object` for the two-argument one while the emitter built the union.
+        // The disagreement surfaced wherever the value was USED without being
+        // bound to a name first:
+        //
+        //     xs = iter([1])
+        //     print(next(xs, None))
+        //     # unnarrowed !py.union<int, None> cannot be used where a
+        //     # concrete object is required
+        //
+        // `v = next(xs, None); print(v)` worked, because the binding carries
+        // the emitter's answer and nothing re-asks this one.
+        if (positional.size() == 2) {
+          CallInferenceResult inference = inferMethodCallWithEvidence(
+              widenLiteral(positional.front()), "__next__", {});
+          if (!inference)
+            return strict ? fail(inference.failureReason) : object();
+          return join({widenLiteral(inference.resultType),
+                       widenLiteral(positional[1])});
+        }
         if (strict) {
           if (positional.size() != 1)
             return fail("next expects one positional argument");

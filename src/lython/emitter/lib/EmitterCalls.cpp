@@ -4581,7 +4581,59 @@ ModuleEmitter::tryEmitNextCall(const parser::Node &expr,
       priors.push_back({scratch, prior});
     }
     emitStatement(*assign(nameNode(iteratorName), args->front()));
-    emitStatement(*assign(nameNode(resultName), (*args)[1]));
+    // ⭐ THE SCRATCH IS PRE-BOUND AT THE JOIN, not at the default's own type.
+    // `next(it, None)` bound it `literal<None>`, and the try then reassigned
+    // it to the element -- which is the one shape the carry-out rule refuses,
+    // reported about a name the program never wrote:
+    //
+    //     xs = iter([1])
+    //     print(next(xs, None))
+    //     # local '__lynext1' is reassigned inside this try and its type
+    //     # !py.literal<None> cannot be carried out of the statement
+    //
+    // `next(it, 0)` worked because a widened int is the same contract the
+    // element is. The join is what both spellings actually need, and for a
+    // None default it is the Optional the rule accepts.
+    //
+    // ⛔ Only when the element type is known: an iterator whose `__next__` has
+    // no static evidence keeps the plain binding, which is the diagnostic that
+    // question deserves rather than one about a scratch name.
+    mlir::Type joinedType;
+    if (auto iterator = values.find(iteratorName); iterator != values.end())
+      if (CallInferenceResult elementInference =
+              types.inferMethodCallWithEvidence(iterator->second.type,
+                                                "__next__", {}))
+        if (mlir::Type defaultType =
+                types.widenLiteral(types.inferExpr((*args)[1].get())))
+          joinedType = types.join(
+              {types.widenLiteral(elementInference.resultType), defaultType});
+    if (auto joinedUnion =
+            mlir::dyn_cast_if_present<py::UnionType>(joinedType)) {
+      // ⛔ A WIDER union than an Optional has no slot to be carried out of the
+      // try in, which is the same wall every other union-typed local meets.
+      // Saying so HERE is the difference between a sentence about the program
+      // and one about the compiler: the refusal is reported on `__lynext1`, a
+      // name the program never wrote, and its advice ("bind the reassignment
+      // to a new name") cannot be followed for a scratch the emitter owns.
+      if (!joinedUnion.isOptional() ||
+          !mlir::isa_and_nonnull<py::ContractType>(
+              joinedUnion.getOptionalPayloadType())) {
+        std::string text;
+        llvm::raw_string_ostream stream(text);
+        stream << "next(iterator, default) needs a default that fits the "
+                  "iterator's element type or is None; these join at "
+               << joinedType;
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr.range.start, text});
+        return emitNone(expr);
+      }
+      Value defaultValue = coerceValue(
+          emitExprExpected((*args)[1].get(), joinedType), joinedType, expr);
+      values[resultName] = defaultValue;
+      types.bindSymbol(resultName, joinedType);
+    } else {
+      emitStatement(*assign(nameNode(resultName), (*args)[1]));
+    }
     emitStatement(*tryNode);
     auto bound = values.find(resultName);
     if (bound == values.end() || !bound->second.value) {
