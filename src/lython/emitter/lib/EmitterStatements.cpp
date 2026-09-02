@@ -563,6 +563,45 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
       }
     }
     if (node.kind == "Assign") {
+      // ⭐ A LATER REBIND SEEDS IT TOO. `out = []` followed by `out = [1]` in
+      // the same suite is the accumulator written the other way round, and
+      // only the first assignment decided the name's type -- so the reversed
+      // order (`out = [1]` then `out = []`) compiled and this one did not:
+      //
+      //     def f(flag: bool) -> "list[int]":
+      //         out = []
+      //         if flag:
+      //             out = [1]
+      //         return out         # cannot adapt return value
+      //
+      // ⛔ A rebind that MENTIONS the name is skipped for the same reason the
+      // subscript seeds are: `out = out + [1]` reads `out` at the type this
+      // scan is deciding.
+      if (const auto *targets = ast::nodeList(node, "targets"))
+        for (const parser::NodePtr &target : *targets) {
+          if (!target || target->kind != "Name" ||
+              llvm::StringRef(ast::nameSpelling(*target)) != name)
+            continue;
+          const parser::Node *rebound = ast::node(node, "value");
+          if (!rebound || isEmptyContainerExpression(rebound) ||
+              mentionsName(rebound, mentionsName))
+            continue;
+          llvm::StringRef wanted = isMapping ? "Dict" : literalKind;
+          if (rebound->kind != wanted)
+            continue;
+          if (isMapping) {
+            const auto *keys = ast::nodeList(*rebound, "keys");
+            const auto *vals = ast::nodeList(*rebound, "values");
+            if (keys && !keys->empty())
+              noteExpr(key, keys->front().get(), note);
+            if (vals && !vals->empty())
+              noteExpr(element, vals->front().get(), note);
+            continue;
+          }
+          if (const auto *elements = ast::nodeList(*rebound, "elts");
+              elements && !elements->empty())
+            noteExpr(element, elements->front().get(), note);
+        }
       if (const auto *targets = ast::nodeList(node, "targets"))
         for (const parser::NodePtr &target : *targets) {
           if (!target || target->kind != "Subscript")

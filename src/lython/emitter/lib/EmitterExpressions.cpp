@@ -401,18 +401,8 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     //
     // ⛔ Only when the OTHER arm has one: `[] if c else []` has nothing to
     // take a type from and keeps the erased element it always had.
-    auto isEmptyLiteralArm = [](const parser::Node *arm) {
-      if (!arm)
-        return false;
-      if (arm->kind == "List" || arm->kind == "Tuple" || arm->kind == "Set") {
-        const auto *elements = ast::nodeList(*arm, "elts");
-        return !elements || elements->empty();
-      }
-      if (arm->kind == "Dict") {
-        const auto *keys = ast::nodeList(*arm, "keys");
-        return !keys || keys->empty();
-      }
-      return false;
+    auto isEmptyLiteralArm = [&](const parser::Node *arm) {
+      return isEmptyContainerExpression(arm);
     };
     mlir::Type bodyArmType = armType(bodyNode, /*conditionIsTrue=*/true);
     mlir::Type elseArmType = armType(elseNode, /*conditionIsTrue=*/false);
@@ -3223,19 +3213,8 @@ Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
   // statically representable result. It has one; the empty arm just has
   // nothing to say about it. Same rule as the conditional expression's arms
   // and the container literal's siblings.
-  auto isEmptyLiteralOperand = [](const parser::Node *operand) {
-    if (!operand)
-      return false;
-    if (operand->kind == "List" || operand->kind == "Tuple" ||
-        operand->kind == "Set") {
-      const auto *elements = ast::nodeList(*operand, "elts");
-      return !elements || elements->empty();
-    }
-    if (operand->kind == "Dict") {
-      const auto *keys = ast::nodeList(*operand, "keys");
-      return !keys || keys->empty();
-    }
-    return false;
+  auto isEmptyLiteralOperand = [&](const parser::Node *operand) {
+    return isEmptyContainerExpression(operand);
   };
   bool anyNonEmptyOperand = false;
   for (const parser::NodePtr &operand : operands)

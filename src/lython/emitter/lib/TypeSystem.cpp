@@ -29,6 +29,41 @@
 #include <string>
 
 namespace lython::emitter {
+
+// ⭐ An expression that builds an EMPTY container and so carries no element
+// type of its own. Five joins ask this -- the container literal's siblings, a
+// conditional expression's arms, a boolean operator's operands, a class
+// field's assignments and a parameter's default -- and each absence of it
+// surfaced as a different message.
+//
+// ⛔ The zero-argument CONSTRUCTOR counts, because `set()` is the only
+// spelling an empty set has: `set() if flag else {1}` reached the same erased
+// join a `[]` arm did and was refused for it.
+bool isEmptyContainerExpression(const parser::Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == "List" || node->kind == "Tuple" || node->kind == "Set") {
+    const auto *elements = ast::nodeList(*node, "elts");
+    return !elements || elements->empty();
+  }
+  if (node->kind == "Dict") {
+    const auto *keys = ast::nodeList(*node, "keys");
+    return !keys || keys->empty();
+  }
+  if (node->kind == "Call") {
+    const parser::Node *callee = ast::node(*node, "func");
+    if (!callee || callee->kind != "Name")
+      return false;
+    llvm::StringRef name = ast::nameSpelling(*callee);
+    if (name != "set" && name != "list" && name != "dict" &&
+        name != "tuple" && name != "frozenset")
+      return false;
+    const auto *args = ast::nodeList(*node, "args");
+    const auto *keywords = ast::nodeList(*node, "keywords");
+    return (!args || args->empty()) && (!keywords || keywords->empty());
+  }
+  return false;
+}
 namespace {
 
 bool isNoneConstant(const parser::Node *node) {
@@ -254,17 +289,7 @@ std::optional<mlir::Type> generatorYieldFromElementType(
 // ⛔ Only when a non-empty sibling exists. `[[], []]` and `{0: []}` have
 // nothing to take a type from and keep the erased element they always had.
 bool isEmptyContainerLiteral(const parser::Node *node) {
-  if (!node)
-    return false;
-  if (node->kind == "List" || node->kind == "Tuple" || node->kind == "Set") {
-    const auto *elements = ast::nodeList(*node, "elts");
-    return !elements || elements->empty();
-  }
-  if (node->kind == "Dict") {
-    const auto *keys = ast::nodeList(*node, "keys");
-    return !keys || keys->empty();
-  }
-  return false;
+  return isEmptyContainerExpression(node);
 }
 
 // The join over `types`, with the entries whose node is an empty container
@@ -4385,12 +4410,20 @@ TypeSystem::functionSignature(const parser::Node &function,
               ? overriddenParameterType(*arg)
               : std::nullopt;
       mlir::Type fromDefault;
+      // ⛔ AN EMPTY CONTAINER DEFAULT DESCRIBES THE PARAMETER ONLY UNTIL A
+      // CALL SITE DOES. `def f(xs=[])` called `f([1, 2])` joined `list[object]`
+      // with `list[int]` into a union nothing accepts; `[]` has no element
+      // type of its own, which is the rule four other joins already state.
+      bool defaultIsEmptyContainer = false;
       if (!annotation && !isSelfParameter && !fromExpectedCallable &&
-          hasDefault(index, positional.size(), defaults))
-        fromDefault = defaultParameterType(
+          hasDefault(index, positional.size(), defaults)) {
+        const parser::Node *defaultNode =
             (*ast::nodeList(*arguments, "defaults"))[index + defaults -
                                                      positional.size()]
-                .get());
+                .get();
+        fromDefault = defaultParameterType(defaultNode);
+        defaultIsEmptyContainer = isEmptyContainerExpression(defaultNode);
+      }
       if (isSelfParameter)
         type = selfType ? selfType : py::SelfType::get(&context);
       if (fromExpectedCallable)
@@ -4406,7 +4439,8 @@ TypeSystem::functionSignature(const parser::Node &function,
             type = fromDefault;
           else if (!fromDefault || !defaultsDescribeParameters)
             sig.missingParameterAnnotations.push_back(name);
-        } else if (fromDefault && !py::isAssignableTo(fromDefault, type)) {
+        } else if (fromDefault && !py::isAssignableTo(fromDefault, type) &&
+                   !defaultIsEmptyContainer) {
           type = join({type, fromDefault});
         }
       } else if (!isSelfParameter && !fromExpectedCallable) {

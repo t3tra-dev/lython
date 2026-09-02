@@ -78,6 +78,10 @@ struct CallInferenceResult {
 // Strict expression-inference context: names resolve against the enclosing
 // function's local callables first, and inference failures propagate as a
 // null type with a recorded reason instead of falling back to object().
+// An expression that builds an EMPTY container and so carries no element type
+// of its own (`[]`, `{}`, `()`, and the zero-argument constructors).
+bool isEmptyContainerExpression(const parser::Node *node);
+
 struct ExprInferenceContext {
   const llvm::StringMap<mlir::Type> &localCallables;
   llvm::SmallVectorImpl<std::string> *failureReasons = nullptr;
