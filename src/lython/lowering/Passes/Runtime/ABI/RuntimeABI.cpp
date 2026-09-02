@@ -172,15 +172,17 @@ std::string defaultReprTypeName(llvm::StringRef contract) {
     return "object";
   if (contract.starts_with("builtins."))
     return contract.rsplit('.').second.str();
-  if (!contract.contains('.')) {
-    // A monomorphized generic's contract is the internal "<class>$specN"; the
-    // repr is program-visible text, so it has to read as the class the source
-    // wrote (the same reason dataclass reprs and exception names strip it).
-    std::string qualified = "__main__.";
-    qualified += contracts::displayClassNameForContract(contract);
-    return qualified;
-  }
-  return contract.str();
+  // A monomorphized generic's contract is the internal "<class>$specN"; the
+  // repr is program-visible text, so it has to read as the class the source
+  // wrote (the same reason dataclass reprs and exception names strip it).
+  std::string display = contracts::displayClassNameForContract(contract);
+  // ⛔ The module prefix is not always "__main__": a class IMPORTED from
+  // another source module carries it in the contract ("lib.Base"), which is
+  // the module CPython names in the repr. Prefixing those too printed
+  // "<__main__.lib.Base object at ...>".
+  if (display.find('.') != std::string::npos)
+    return display;
+  return "__main__." + display;
 }
 
 bool declaredRuntimeContractMatchesClass(mlir::ModuleOp module,
@@ -523,9 +525,12 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassNameHook() {
         RuntimeBundleLowerer::runtimeClassIdForClass(classOp);
     if (!classId || !seen.insert(*classId).second)
       return;
-    entries.push_back(Entry{
-        *classId,
-        py::contracts::displayClassNameForContract(classOp.getSymName())});
+    // ⭐ THE QUALIFIED name, not the leaf. The one table answers two
+    // questions -- the default repr's class name and `type(v).__name__` --
+    // and only the repr wants the module. Storing the leaf forced the repr to
+    // paste "__main__." back on, which is wrong for an imported class; the
+    // name reader strips back to the leaf instead, which is right for both.
+    entries.push_back(Entry{*classId, defaultReprTypeName(classOp.getSymName())});
   });
   // ⭐ AND THE MANIFEST'S OWN CLASSES. The walk above sees `py.class` ops, and
   // by this phase those are the SOURCE classes only -- so `type(v).__name__`

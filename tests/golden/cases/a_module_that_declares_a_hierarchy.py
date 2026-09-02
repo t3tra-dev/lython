@@ -25,3 +25,11 @@ class Circle(Shape):
 
 class Marked(Square):
     pass
+
+
+class Trouble(Exception):
+    pass
+
+
+class Fault(Trouble):
+    pass

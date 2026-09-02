@@ -2740,12 +2740,16 @@ module attributes {
   ^known:
     %buffer = memref.alloca() : memref<64xi8>
     %true_scan = arith.constant true
-    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+    %dot = arith.constant 46 : i8
+    // ⛔ The table entry is the class's QUALIFIED name ("__main__.A",
+    // "lib.Base") because the repr needs the module; `__name__` is always the
+    // leaf, so the scan also carries where the last '.' left off.
+    %scan:3 = scf.while (%i = %c0, %go = %true_scan, %start = %c0) : (index, i1, index) -> (index, i1, index) {
       %in_bounds = arith.cmpi ult, %i, %cap : index
       %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go : index, i1
+      scf.condition(%continue) %i, %go, %start : index, i1, index
     } do {
-    ^bb0(%i: index, %go: i1):
+    ^bb0(%i: index, %go: i1, %start: index):
       %i_i64 = arith.index_cast %i : index to i64
       %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
       %byte = llvm.load %slot : !llvm.ptr -> i8
@@ -2757,16 +2761,18 @@ module attributes {
       }
       %next = arith.addi %i, %c1 : index
       %kept = arith.select %is_nul, %i, %next : index
-      scf.yield %kept, %not_nul : index, i1
+      %is_dot = arith.cmpi eq, %byte, %dot : i8
+      %next_start = arith.select %is_dot, %next, %start : index
+      scf.yield %kept, %not_nul, %next_start : index, i1, index
     }
-    %name_len = arith.index_cast %scan#0 : index to i64
+    %leaf_len_index = arith.subi %scan#0, %scan#2 : index
+    %name_len = arith.index_cast %leaf_len_index : index to i64
     %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
-    %nh, %nb = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %nh, %nb = func.call @LyUnicode_FromBytes(%name_dyn, %scan#2, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %nh, %nb : memref<2xi64>, memref<?xi8>
   }
 
   memref.global "private" constant @__ly_class_name_object : memref<6xi8> = dense<[111, 98, 106, 101, 99, 116]>
-  memref.global "private" constant @__ly_repr_prefix_main : memref<10xi8> = dense<[60, 95, 95, 109, 97, 105, 110, 95, 95, 46]>
   memref.global "private" constant @__ly_repr_prefix_plain : memref<1xi8> = dense<[60]>
   memref.global "private" constant @__ly_repr_suffix : memref<13xi8> = dense<[32, 111, 98, 106, 101, 99, 116, 32, 97, 116, 32, 48, 120]>
 
@@ -2795,7 +2801,6 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c6 = arith.constant 6 : index
-    %c10 = arith.constant 10 : index
     %c13 = arith.constant 13 : index
     %c64 = arith.constant 64 : index
     %zero_i8 = arith.constant 0 : i8
@@ -2819,11 +2824,12 @@ module attributes {
     cf.br ^suffix(%unknown_len : index)
 
   ^known:
-    %main = memref.get_global @__ly_repr_prefix_main : memref<10xi8>
-    scf.for %i = %c0 to %c10 step %c1 {
-      %byte = memref.load %main[%i] : memref<10xi8>
-      memref.store %byte, %buffer[%i] : memref<128xi8>
-    }
+    // ⛔ Only "<": the table entry is the qualified name, so pasting
+    // "__main__." here printed "<__main__.lib.Base object at ...>" for a class
+    // imported from another source module.
+    %open = memref.get_global @__ly_repr_prefix_plain : memref<1xi8>
+    %open_byte = memref.load %open[%c0] : memref<1xi8>
+    memref.store %open_byte, %buffer[%c0] : memref<128xi8>
     %true_scan = arith.constant true
     %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
       %in_bounds = arith.cmpi ult, %i, %c64 : index
@@ -2838,14 +2844,14 @@ module attributes {
       %true_x = arith.constant true
       %not_nul = arith.xori %is_nul, %true_x : i1
       scf.if %not_nul {
-        %at = arith.addi %i, %c10 : index
+        %at = arith.addi %i, %c1 : index
         memref.store %byte, %buffer[%at] : memref<128xi8>
       }
       %next = arith.addi %i, %c1 : index
       %kept = arith.select %is_nul, %i, %next : index
       scf.yield %kept, %not_nul : index, i1
     }
-    %known_len = arith.addi %scan#0, %c10 : index
+    %known_len = arith.addi %scan#0, %c1 : index
     cf.br ^suffix(%known_len : index)
 
   ^suffix(%len: index):
@@ -2882,12 +2888,17 @@ module attributes {
     // 64 caps a runaway pointer rather than a real name.
     %buffer = memref.alloca() : memref<64xi8>
     %true_scan = arith.constant true
-    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+    %dot_byte = arith.constant 46 : i8
+    // ⛔ The taxonomy name is MODULE-QUALIFIED ("lib.SubErr") because the
+    // traceback prints it that way, and CPython's `__name__` and `repr(e)` are
+    // the LEAF -- so the scan also records where the last '.' left off, and the
+    // leaf is shifted down to offset 0 for every reader below.
+    %scan:3 = scf.while (%i = %c0, %go = %true_scan, %start = %c0) : (index, i1, index) -> (index, i1, index) {
       %in_bounds = arith.cmpi ult, %i, %cap : index
       %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go : index, i1
+      scf.condition(%continue) %i, %go, %start : index, i1, index
     } do {
-    ^bb0(%i: index, %go: i1):
+    ^bb0(%i: index, %go: i1, %start: index):
       %i_i64 = arith.index_cast %i : index to i64
       %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
       %byte = llvm.load %slot : !llvm.ptr -> i8
@@ -2899,9 +2910,17 @@ module attributes {
       }
       %next = arith.addi %i, %c1 : index
       %kept = arith.select %is_nul, %i, %next : index
-      scf.yield %kept, %not_nul : index, i1
+      %is_dot = arith.cmpi eq, %byte, %dot_byte : i8
+      %next_start = arith.select %is_dot, %next, %start : index
+      scf.yield %kept, %not_nul, %next_start : index, i1, index
     }
-    %name_len = arith.index_cast %scan#0 : index to i64
+    scf.for %i = %scan#2 to %scan#0 step %c1 {
+      %byte = memref.load %buffer[%i] : memref<64xi8>
+      %at = arith.subi %i, %scan#2 : index
+      memref.store %byte, %buffer[%at] : memref<64xi8>
+    }
+    %leaf_len = arith.subi %scan#0, %scan#2 : index
+    %name_len = arith.index_cast %leaf_len : index to i64
     %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
     %name_h, %name_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %name_h, %name_b : memref<2xi64>, memref<?xi8>
@@ -2922,12 +2941,17 @@ module attributes {
     // names are short ASCII; 64 caps runaway pointers, not real names).
     %buffer = memref.alloca() : memref<64xi8>
     %true_scan = arith.constant true
-    %scan:2 = scf.while (%i = %c0, %go = %true_scan) : (index, i1) -> (index, i1) {
+    %dot_byte = arith.constant 46 : i8
+    // ⛔ The taxonomy name is MODULE-QUALIFIED ("lib.SubErr") because the
+    // traceback prints it that way, and CPython's `__name__` and `repr(e)` are
+    // the LEAF -- so the scan also records where the last '.' left off, and the
+    // leaf is shifted down to offset 0 for every reader below.
+    %scan:3 = scf.while (%i = %c0, %go = %true_scan, %start = %c0) : (index, i1, index) -> (index, i1, index) {
       %in_bounds = arith.cmpi ult, %i, %cap : index
       %continue = arith.andi %in_bounds, %go : i1
-      scf.condition(%continue) %i, %go : index, i1
+      scf.condition(%continue) %i, %go, %start : index, i1, index
     } do {
-    ^bb0(%i: index, %go: i1):
+    ^bb0(%i: index, %go: i1, %start: index):
       %i_i64 = arith.index_cast %i : index to i64
       %slot = llvm.getelementptr %name_ptr[%i_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8
       %byte = llvm.load %slot : !llvm.ptr -> i8
@@ -2939,9 +2963,17 @@ module attributes {
       }
       %next = arith.addi %i, %c1 : index
       %kept = arith.select %is_nul, %i, %next : index
-      scf.yield %kept, %not_nul : index, i1
+      %is_dot = arith.cmpi eq, %byte, %dot_byte : i8
+      %next_start = arith.select %is_dot, %next, %start : index
+      scf.yield %kept, %not_nul, %next_start : index, i1, index
     }
-    %name_len = arith.index_cast %scan#0 : index to i64
+    scf.for %i = %scan#2 to %scan#0 step %c1 {
+      %byte = memref.load %buffer[%i] : memref<64xi8>
+      %at = arith.subi %i, %scan#2 : index
+      memref.store %byte, %buffer[%at] : memref<64xi8>
+    }
+    %leaf_len = arith.subi %scan#0, %scan#2 : index
+    %name_len = arith.index_cast %leaf_len : index to i64
     %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
     // ExceptionGroup carrying members renders CPython's two-argument form:
     // Name('msg', [member reprs...]); every other exception (and a group
