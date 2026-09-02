@@ -1285,6 +1285,12 @@ private:
   llvm::DenseMap<const parser::Node *,
                  llvm::SmallVector<std::pair<unsigned, unsigned>, 2>>
       nestedDefaultCaptures;
+  // CPython evaluates a nested callable's non-constant defaults when the
+  // statement (or the expression) that creates it runs, in the ENCLOSING
+  // frame. Both spellings need that; see the note at the definition.
+  void evaluateNestedDefaults(const parser::Node &function,
+                              const FunctionSignature &signature,
+                              llvm::SmallVectorImpl<Capture> &captures);
   unsigned syntheticFunctionCounter = 0;
   unsigned listCompCounter = 0;
   // Cell classes are synthesized once per (widened) content type.

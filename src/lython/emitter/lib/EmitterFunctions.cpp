@@ -774,26 +774,28 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   }
 }
 
-Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
-  auto name = ast::string(function, "name");
-  if (!name)
-    return emitNone(function);
-  checkDecorators(function, DecoratorRole::Function);
-
-  llvm::SmallVector<Capture, 4> captures;
-  for (const std::string &captureName : lexicalCaptureNames(function)) {
-    auto found = values.find(captureName);
-    if (found != values.end())
-      captures.push_back(Capture{captureName, found->second});
-  }
-
-  FunctionSignature sig = types.functionSignature(function);
-
-  // CPython evaluates a def statement's non-constant defaults when the def
-  // executes — for a nested def that is once per ENCLOSING execution, in the
-  // enclosing frame. Evaluate them here (the builder still sits in the
-  // enclosing body) and thread each value in as a synthetic capture; every
-  // omitted-argument call of this instance then shares the one evaluation.
+// CPython evaluates a nested callable's non-constant defaults when the
+// statement -- or the EXPRESSION -- that creates it runs, once per enclosing
+// execution and in the enclosing frame. They are evaluated here, where the
+// builder still sits in that frame, and threaded in as synthetic captures;
+// every omitted-argument call of this instance then shares the one evaluation.
+//
+// ⭐ THE LAMBDA SPELLING NEEDS IT TOO, and only the def spelling had it. So
+// the idiom Python has for capturing a loop variable by value was refused in
+// the form everyone writes it:
+//
+//     fs = []
+//     for i in range(3):
+//         fs.append(lambda i=i: i * 2)
+//     # default expression must not capture enclosing local variable 'i'
+//
+// while the same three lines written with a `def` compiled and printed
+// CPython's [0, 2, 4]. The refusal is the zero-argument PROVIDER fallback's,
+// which is called with no closure environment -- correct for a default that
+// nothing evaluated here, and never reached once this has.
+void ModuleEmitter::evaluateNestedDefaults(
+    const parser::Node &function, const FunctionSignature &sig,
+    llvm::SmallVectorImpl<Capture> &captures) {
   auto evaluateNestedDefault = [&](const parser::NodePtr &expr,
                                    unsigned slot) {
     if (!expr)
@@ -819,21 +821,39 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
         {slot, static_cast<unsigned>(captures.size())});
     captures.push_back(Capture{captureName, coerced});
   };
-  if (const parser::Node *arguments = ast::node(function, "args")) {
-    unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
-    if (const auto *defaults = ast::nodeList(*arguments, "defaults");
-        defaults && !defaults->empty()) {
-      unsigned firstDefault =
-          positionalCount - static_cast<unsigned>(defaults->size());
-      for (auto [index, value] : llvm::enumerate(*defaults))
-        evaluateNestedDefault(value,
-                              firstDefault + static_cast<unsigned>(index));
-    }
-    if (const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults"))
-      for (auto [index, value] : llvm::enumerate(*kwDefaults))
-        evaluateNestedDefault(value,
-                              positionalCount + static_cast<unsigned>(index));
+  const parser::Node *arguments = ast::node(function, "args");
+  if (!arguments)
+    return;
+  unsigned positionalCount = static_cast<unsigned>(sig.positionalTypes.size());
+  if (const auto *defaults = ast::nodeList(*arguments, "defaults");
+      defaults && !defaults->empty()) {
+    unsigned firstDefault =
+        positionalCount - static_cast<unsigned>(defaults->size());
+    for (auto [index, value] : llvm::enumerate(*defaults))
+      evaluateNestedDefault(value, firstDefault + static_cast<unsigned>(index));
   }
+  if (const auto *kwDefaults = ast::nodeList(*arguments, "kw_defaults"))
+    for (auto [index, value] : llvm::enumerate(*kwDefaults))
+      evaluateNestedDefault(value,
+                            positionalCount + static_cast<unsigned>(index));
+}
+
+Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
+  auto name = ast::string(function, "name");
+  if (!name)
+    return emitNone(function);
+  checkDecorators(function, DecoratorRole::Function);
+
+  llvm::SmallVector<Capture, 4> captures;
+  for (const std::string &captureName : lexicalCaptureNames(function)) {
+    auto found = values.find(captureName);
+    if (found != values.end())
+      captures.push_back(Capture{captureName, found->second});
+  }
+
+  FunctionSignature sig = types.functionSignature(function);
+
+  evaluateNestedDefaults(function, sig, captures);
 
   std::string symbolName =
       (llvm::Twine(currentFunctionPrefix.empty() ? "__main__"
@@ -1136,6 +1156,7 @@ Value ModuleEmitter::emitLambda(const parser::Node &expr,
        llvm::Twine(expr.range.start.line) + "_" +
        llvm::Twine(expr.range.start.column))
           .str();
+  evaluateNestedDefaults(expr, sig, captures);
   emitCallableFunction(expr, symbolName, sig, captures, /*isLambda=*/true);
   return emitFunctionObject(expr, symbolName, sig.callable, captures);
 }
