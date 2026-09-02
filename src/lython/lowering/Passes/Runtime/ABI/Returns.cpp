@@ -513,9 +513,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         return appendPrimitiveReturnEvidence(bundle);
       }
 
-      return op.emitError() << "cannot adapt " << bundle.contractName() << " "
-                            << label << " to callable return ABI "
-                            << resultIndex << " of " << function.getSymName();
+      // ⛔ The TYPE when the bundle has no contract name. A union's name is
+      // empty, and a union is exactly what reaches here when a loop condition
+      // narrows a name the return then reads -- so the sentence came out as
+      // "cannot adapt  return value to callable return ABI 0 of f", naming
+      // nothing at all.
+      std::string named = bundle.contractName();
+      if (named.empty()) {
+        llvm::raw_string_ostream stream(named);
+        stream << bundle.contract;
+      }
+      return op.emitError() << "cannot adapt " << named << " " << label
+                            << " to callable return ABI " << resultIndex
+                            << " of " << function.getSymName();
     };
 
     for (mlir::Value operand : op.getOperands()) {
