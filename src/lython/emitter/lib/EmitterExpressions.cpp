@@ -2305,15 +2305,25 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
                             llvm::Twine(anchor.range.start.line) + "_" +
                             llvm::Twine(anchor.range.start.column))
                                .str();
-  bool pushedSuperContext = methodBinding.kind == "instance" &&
+  // ⭐ THE WRAPPER'S BODY FORWARDS TO THE DISPATCHER when the receiver's class
+  // has an overriding subclass. Restating the base's method here is what made
+  // `m = x.f; m()` answer the base's body while `x.f()` answered the
+  // subclass's -- see `virtualMethodObjectDef`. Everything else about the
+  // wrapper is unchanged: same captures, same bound signature, same offset.
+  const parser::Node *wrapped = methodBinding.method;
+  if (const parser::Node *dispatching =
+          virtualMethodObjectDef(anchor, object, methodBinding))
+    wrapped = dispatching;
+  bool pushedSuperContext = wrapped == methodBinding.method &&
+                            methodBinding.kind == "instance" &&
                             !methodBinding.definingClass.empty() &&
                             !methodBinding.bodySignature.positionalNames.empty();
   if (pushedSuperContext)
     superContexts.push_back(
         {methodBinding.definingClass,
          methodBinding.bodySignature.positionalNames.front()});
-  emitCallableFunction(*methodBinding.method, symbolName, boundBodySig,
-                       captures, /*isLambda=*/false,
+  emitCallableFunction(*wrapped, symbolName, boundBodySig, captures,
+                       /*isLambda=*/false,
                        /*positionalNodeOffset=*/1, preboundTypeObject);
   if (pushedSuperContext)
     superContexts.pop_back();

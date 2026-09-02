@@ -1107,9 +1107,47 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
   if (calleeNode && calleeNode->kind == "Name") {
     llvm::StringRef name = ast::nameSpelling(*calleeNode);
     auto local = values.find(name);
-    if (local != values.end() && local->second.boundMethod)
-      return emitInlineMethodCall(expr, local->second.boundMethod->receiver,
-                                  local->second.boundMethod->method);
+    if (local != values.end() && local->second.boundMethod) {
+      const BoundMethodValue &bound = *local->second.boundMethod;
+      // ⭐ A BOUND METHOD DISPATCHES TOO. `x.f()` on a base-typed receiver goes
+      // through the synthesized dispatcher; `m = x.f` then `m()` inlined the
+      // STATIC method instead, so the same question asked in two spellings
+      // answered the base's body for a subclass instance:
+      //
+      //     x: Base = Sub()
+      //     m = x.f
+      //     print(m())      # printed "B"; CPython prints "S"
+      //
+      // silently, and `x.f()` one line over was right. The receiver and the
+      // method are both in hand here, which is everything the dispatcher takes.
+      //
+      // ⛔ The helper is asked BEFORE the arguments are emitted, the same
+      // order `tryEmitVirtualMethodCall` keeps: a bail after emitting them
+      // would evaluate every argument twice.
+      std::optional<std::string_view> boundName =
+          bound.method.method ? ast::string(*bound.method.method, "name")
+                              : std::nullopt;
+      const auto *boundKeywords = ast::nodeList(expr, "keywords");
+      const auto *boundArgs = ast::nodeList(expr, "args");
+      bool plainCall = boundName && (!boundKeywords || boundKeywords->empty());
+      if (plainCall && boundArgs)
+        for (const parser::NodePtr &argument : *boundArgs)
+          if (argument && argument->kind == "Starred")
+            plainCall = false;
+      if (plainCall &&
+          virtualDispatcherFor(
+              expr, bound.receiver, *boundName,
+              boundArgs ? static_cast<unsigned>(boundArgs->size()) : 0)) {
+        llvm::SmallVector<Value, 4> positional;
+        if (boundArgs)
+          for (const parser::NodePtr &argument : *boundArgs)
+            positional.push_back(emitExpr(argument.get()));
+        if (std::optional<Value> dispatched = tryEmitVirtualDispatchWithValues(
+                expr, bound.receiver, *boundName, positional))
+          return *dispatched;
+      }
+      return emitInlineMethodCall(expr, bound.receiver, bound.method);
+    }
     if (values.find(name) == values.end())
       if (std::optional<std::string> canonical =
               types.lookupCanonicalBinding(name)) {
@@ -2704,6 +2742,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     // which came back as the refusal for a program the dispatcher was already
     // being built for.
     virtualDispatchHelpers[key].callable = sig.publicCallable;
+    // ⛔ Bound as a NAME as well as a symbol: a bound method object's wrapper
+    // reaches the dispatcher from a synthesized body, where the only spelling
+    // available is a name. `$` cannot appear in a source identifier, so the
+    // binding cannot shadow one.
+    types.bindSymbol(symbol, sig.publicCallable);
     {
       // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
       // inside an inlined method body. Emitting it under the inliner's state
@@ -2743,6 +2786,88 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   if (!memo->second.callable)
     return nullptr;
   return &memo->second;
+}
+
+// ⭐ A METHOD OBJECT DISPATCHES TOO, and it did not: `x.m()` on a base-typed
+// receiver goes through the dispatcher above, while `m = x.m` built a wrapper
+// around the STATIC body -- so one question asked in two spellings gave two
+// answers, silently:
+//
+//     x: Base = Sub()
+//     m = x.f
+//     print(m())          # printed "B"; CPython prints "S", and `x.f()` does
+//
+// and every way of letting the object escape carried the same wrong body:
+// passed as a `Callable` argument, stored in a list, rebound through a second
+// name. The wrapper's body is the only thing that has to change: it forwards
+// to the dispatcher instead of restating the base's method.
+//
+// ⛔ Not a new dispatcher, and not a new shape rule: `virtualDispatcherFor`
+// decides both, so a method object over a shape the dispatch cannot restate
+// (a generator, a property, defaults, *args) keeps the static wrapper it had.
+const parser::Node *
+ModuleEmitter::virtualMethodObjectDef(const parser::Node &anchor, Value receiver,
+                                      const MethodBinding &binding) {
+  if (binding.kind != "instance" || !binding.method)
+    return nullptr;
+  std::optional<std::string_view> methodName = ast::string(*binding.method, "name");
+  if (!methodName)
+    return nullptr;
+  const parser::Node *arguments = ast::node(*binding.method, "args");
+  if (!arguments)
+    return nullptr;
+  parser::NodePtr returns = sharedField(*binding.method, "returns");
+  if (!returns)
+    return nullptr;
+
+  parser::SourceRange range = anchor.range;
+  llvm::SmallVector<synth::Param, 4> params;
+  llvm::SmallVector<std::string, 4> forwardedNames;
+  std::string receiverName;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+  if (!contract)
+    return nullptr;
+  for (llvm::StringRef field : {"posonlyargs", "args"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      for (const parser::NodePtr &argument : *list) {
+        if (!argument)
+          return nullptr;
+        llvm::StringRef name = ast::nameSpelling(*argument);
+        if (receiverName.empty()) {
+          receiverName = name.str();
+          params.push_back(synth::Param{
+              receiverName, synth::name(contract.getContractName(), range)});
+          continue;
+        }
+        parser::NodePtr annotation = sharedField(*argument, "annotation");
+        if (!annotation)
+          return nullptr;
+        forwardedNames.push_back(name.str());
+        params.push_back(synth::Param{name.str(), std::move(annotation)});
+      }
+  if (receiverName.empty())
+    return nullptr;
+
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      anchor, receiver, *methodName,
+      static_cast<unsigned>(forwardedNames.size()));
+  if (!helper)
+    return nullptr;
+
+  std::vector<parser::NodePtr> callArguments;
+  callArguments.push_back(synth::name(receiverName, range));
+  for (const std::string &name : forwardedNames)
+    callArguments.push_back(synth::name(name, range));
+  std::vector<parser::NodePtr> body;
+  body.push_back(synth::returnStmt(
+      synth::call(synth::name(helper->symbol, range), std::move(callArguments),
+                  range),
+      range));
+  parser::NodePtr def = synth::functionDef(
+      "__lyvbound$" + std::to_string(++syntheticFunctionCounter), params, {},
+      std::move(body), std::move(returns), {}, range);
+  synthesizedIteratorDefs.push_back(def);
+  return def.get();
 }
 
 // The AST call site: `x.m(a, b)` with a base-typed `x`.

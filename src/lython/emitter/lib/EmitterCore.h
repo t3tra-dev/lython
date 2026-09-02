@@ -155,6 +155,13 @@ private:
                                                     llvm::StringRef methodName,
                                                     unsigned argumentCount,
                                                     bool asProperty = false);
+  // The forwarding body a bound METHOD OBJECT needs when the receiver's class
+  // has an overriding subclass: `def m(self, ...): return __lyvdisp$N(self,
+  // ...)`. Null when no dispatcher covers the shape, in which case the method
+  // object keeps the static body it always had.
+  const parser::Node *virtualMethodObjectDef(const parser::Node &anchor,
+                                             Value receiver,
+                                             const MethodBinding &binding);
   // The same dispatch for a `@property` READ through a base-typed receiver.
   std::optional<Value> tryEmitVirtualPropertyRead(const parser::Node &anchor,
                                                   Value receiver,
