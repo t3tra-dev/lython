@@ -509,8 +509,14 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   //                           #  function return"
   //
   // Returning an element of a container built in the SAME frame is the whole
-  // shape; a parameter (`def f(xs): return xs[0]`) is fine, and so is an int
-  // or a str element, which have no token to move. Returning the ITERATION
+  // shape; a parameter (`def f(xs): return xs[0]`) is fine, and so is a str
+  // element, which has no token to move.
+  //
+  // ⛔ AN INT ELEMENT IS NO LONGER EXEMPT (measured 2026-09-02): `xs = [1, 2]`
+  // then `return xs[0]` fails the same way, and so do the tuple and dict
+  // spellings of it. An int element is box-fronted now and carries a token
+  // like any other, so the sentence above -- written when it did not -- names
+  // one type too many. The refusal reaches an ordinary two-line function. Returning the ITERATION
   // element lands here too, with the other half of the message --
   //
   //     def f(xs: list[int]) -> int:
@@ -526,11 +532,19 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   // write side ("three releases for two references") -- the same *args and
   // **kwargs shapes (`return args[0]`, `return kwargs["a"]`) land here too.
   //
-  // Four repairs measured, none right. The three in that note, plus: clearing
+  // Five repairs measured, none right. The three in that note, plus: clearing
   // `kOwnedLocalObjectAttr` from the marker at the move, so this predicate
   // stops seeing a token the frame gave away. Measured -- the refusal did not
   // move AND two goldens broke (enum_desugar, cross_enum_generic_handler), so
   // the marker is load-bearing for something past the move as well.
+  //
+  // And the fifth (2026-09-02): asking at the READ whether the token was
+  // already moved -- the move is visible as a release carrying
+  // `ly.ownership.aggregate_release` ending in `.source` -- and declining the
+  // borrow when it was. Measured by forcing `valueIsOwnedLocalToken` to answer
+  // NO unconditionally: the refusal does not move at all, so the token this
+  // return carries is not the one this predicate hands out. Whatever binds it
+  // is upstream of here, which is where the sixth attempt has to look.
   //
   // The next attempt still needs what that note asks for: WHICH bundle the
   // later mint reads. Suppressing a release is not it.
