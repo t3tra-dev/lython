@@ -1131,6 +1131,26 @@ TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   EXPECT_TRUE(inherited.ok());
 }
 
+// What: a module name used where a value goes. It has no runtime object, and
+// the refusal names the module rather than arriving as "unresolved runtime
+// binding 'sys'" from the lowering.
+TEST(EmitterTest, AModuleUsedAsAValueIsRefusedAtEmit) {
+  for (const char *source :
+       {"import sys\nL = sys\nprint(L.platform)\n",
+        "import sys\nprint(sys)\n",
+        "import math\nxs = [math]\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool named = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      named = named || diagnostic.message.find("is not a value: a module has "
+                                               "no runtime object") !=
+                           std::string::npos;
+    EXPECT_TRUE(named) << source;
+  }
+}
+
 TEST(EmitterTest, AnAttributeAModuleDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolved these, so they fell through to a dynamic attribute read
   // on the module object -- which no lowering can answer. The message came out

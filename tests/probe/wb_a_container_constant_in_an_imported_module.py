@@ -13,6 +13,7 @@
 #   NAMES = ["a"] ..... the message above
 #   TABLE = {"k": 1} .. the message above
 #   PAIR = (1, 2) ..... the message above
+#   NOTHING = None .... the message above (re-measured 2026-09-03)
 #
 # and every one of them is readable from the module's own body.
 #
@@ -33,3 +34,4 @@ import a_module_with_constants as constants
 
 print(constants.COUNT, constants.TEXT, constants.FLAG)
 print(constants.NAMES, constants.TABLE, constants.PAIR, constants.RATIO)
+print(constants.NOTHING is None)

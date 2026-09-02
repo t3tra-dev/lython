@@ -6,3 +6,4 @@ RATIO = 1.5
 NAMES = ["a", "b"]
 TABLE = {"k": 1}
 PAIR = (1, 2)
+NOTHING = None

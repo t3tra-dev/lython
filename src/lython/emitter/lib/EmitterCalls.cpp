@@ -608,8 +608,15 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       std::optional<mlir::Type> spaceType = types.lookupSymbol(space);
       // The namespace root is the object placeholder and nothing else: a
       // local of the same name (or a real value) keeps its own dispatch.
+      // ⛔ AND THE ALIAS SPELLING. `lookupSourceModule` takes the module's
+      // own name, so `import m as x` left `x` unrecognised here and the call
+      // fell through to a receiver the module namespace has no value for --
+      // reported against `x` itself rather than against the attribute it does
+      // not have. `isImportedModuleName` is the binding, under whichever
+      // spelling the import chose.
       bool knownModule = !table.moduleCallableExports(space).empty() ||
-                         lookupSourceModule(space) != nullptr;
+                         lookupSourceModule(space) != nullptr ||
+                         types.isImportedModuleName(space);
       if (knownModule &&
           !types.lookupSymbol(qualified) && !types.lookupClass(qualified) &&
           !values.count(space) && spaceType && *spaceType == types.object()) {

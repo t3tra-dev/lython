@@ -186,6 +186,31 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
               "determine its type arguments"});
       return emitNone(*expr);
     }
+    // ⭐ A MODULE NAME IS NOT A VALUE, and using one as an expression bound the
+    // module NAMESPACE into the program -- which has no runtime object, so the
+    // failure surfaced one phase later as the compiler's own sentence:
+    //
+    //     import lib
+    //     L = lib
+    //     # unresolved runtime binding 'lib'
+    //     # Failed to run lowering pipeline
+    //
+    // `print(lib)` and `[lib]` said the same thing. This is the shape the
+    // missing module ATTRIBUTE had before it was refused at emit, with the
+    // same fix: the earliest static boundary is here, where the name is known
+    // to be a module and nothing else claimed it.
+    //
+    // ⛔ Last, after every constant fold and after the local/global lookups
+    // above: a local or a module global of the same spelling is a value and
+    // wins, which is what CPython does with a rebound name too.
+    if (types.isImportedModuleName(name)) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr->range.start,
+          "module '" + std::string(name) +
+              "' is not a value: a module has no runtime object, so its name "
+              "can only be the receiver of an attribute"});
+      return emitNone(*expr);
+    }
     return emitBindingRef(*expr, binding, *symbolType);
   }
   if (expr->kind == "Call")
