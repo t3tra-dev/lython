@@ -30,7 +30,13 @@
 # contain. `return xs[0] + xs[1]` in the same function is fine, which is what
 # makes this look like a diagnostic problem rather than an accounting one.
 #
-# ⛔ FIVE REPAIRS MEASURED, none right; the fifth is recorded at the predicate.
+# ⛔ SEVEN REPAIRS MEASURED, none right; all seven are recorded at the
+# predicate. The last two are the useful ones: declining the borrow when the
+# source was moved changes nothing (the token the return carries is not the one
+# those predicates hand out), and minting the read's token AT the read moves the
+# refusal onto the retained call result instead. The counts are right -- three
+# references taken, one given back -- and what cannot follow them is the alias
+# MODEL, which has one owner per entity where this shape has two.
 def first() -> int:
     xs = [1, 2]
     return xs[0]

@@ -546,8 +546,23 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   // return carries is not the one this predicate hands out. Whatever binds it
   // is upstream of here, which is where the sixth attempt has to look.
   //
-  // The next attempt still needs what that note asks for: WHICH bundle the
-  // later mint reads. Suppressing a release is not it.
+  // Two more measured 2026-09-02, and together they say where the repair is
+  // NOT. (6) Declining the borrow when the source was moved -- the move is
+  // visible as an `aggregate_release`-marked release, so the question is
+  // answerable by looking -- in BOTH borrow paths, this one and
+  // `existingOwnedLocalToken`. The refusal did not move: forcing
+  // `valueIsOwnedLocalToken` to answer NO unconditionally changes nothing
+  // either, so the token the return carries is not one of these. (7) Minting
+  // the read's token AT THE READ instead of at the value's defining op, so the
+  // release stands before the mint rather than between the mint and the use.
+  // The refusal moved from the marker to the retained CALL RESULT
+  // ("released owned resource from @LyLong_FromI64 is used by function
+  // return") -- the alias analysis identifies the two references to one entity
+  // whichever order they are in.
+  //
+  // So the counts are right and the MODEL is what cannot follow them: one
+  // entity has one owner in it, and this shape has two (the frame's read and
+  // the container's slot). The next attempt has to be there, not here.
   //
   // The value may already BE the token rather than have one beside it, which is
   // the cheaper question and so the one asked first (`valueIsOwnedLocalToken`).
