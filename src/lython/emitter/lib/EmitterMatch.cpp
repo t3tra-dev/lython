@@ -31,12 +31,119 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
   // Every case body is an arm of one statement, and a name any of them binds
   // is a local of the scope around the match -- the same rule an `if` chain
   // follows.
+  llvm::SmallVector<std::pair<std::string, Value>, 4> promotedCells;
   {
     llvm::SmallVector<const std::vector<parser::NodePtr> *, 4> bodies;
     for (const parser::NodePtr &matchCase : *cases)
       if (matchCase)
         bodies.push_back(ast::nodeList(*matchCase, "body"));
     bindConditionallyAssignedLocals(statement, bodies);
+
+    // ⭐ A LOCAL BOUND BEFORE THE MATCH AND REASSIGNED INSIDE A CASE KEPT ITS
+    // OLD VALUE:
+    //
+    //     def f(n: int) -> int:
+    //         total = 100
+    //         match n:
+    //             case 0:
+    //                 total = 1
+    //         return total
+    //     print(f(0))       # printed 100; CPython prints 1
+    //
+    // A silent wrong answer for every assignment in a case body -- and the
+    // same program written with `if` is right. Each case is emitted in its own
+    // scope, because a value defined in one case's block does not dominate the
+    // next case's, and the assignment therefore landed in a scope that is
+    // popped when the case ends.
+    //
+    // A name bound ONLY inside the match already worked, because
+    // `bindConditionallyAssignedLocals` gives that one a CELL -- storage the
+    // arms write through. The name that was already bound is skipped there (it
+    // has a binding), so it kept plain SSA and had nowhere to put the write.
+    // It gets the same storage here.
+    //
+    // ⛔ NOT continuation block arguments, which is what `if` threads. That
+    // machinery balances ownership tokens across edges that assign and edges
+    // that do not, and a match has one continuation with an arm per case plus
+    // a fall-through; the cell is the mechanism this statement already uses
+    // for the name one line over, and it carries the tokens itself.
+    //
+    // ⛔ ONLY A NAME SOMETHING LATER READS, the same rule (and the same
+    // same-suite limitation) `bindConditionallyAssignedLocals` documents: a
+    // write nobody reads needs no storage, and giving one to every name a case
+    // assigns changes the representation of code that already works.
+    // ⛔ NOT WHEN A CASE JUMPS OUT OF AN ENCLOSING LOOP. A `continue` leaves
+    // the match without passing the continuation that loads the cell back,
+    // so the loop's carried local would be handed the CELL where its own
+    // block argument is the content -- "cannot adapt runtime bundle
+    // __ly_cell$2 ... to expected ABI". The shape keeps the old answer and is
+    // recorded in tests/probe/wb_a_match_case_that_jumps_out_of_a_loop.py.
+    llvm::StringRef jumpKinds[] = {"Break", "Continue"};
+    bool jumpsOut = false;
+    for (const std::vector<parser::NodePtr> *body : bodies)
+      jumpsOut = jumpsOut ||
+                 containsStatementKind(body, jumpKinds, /*stopAtLoops=*/true);
+    llvm::StringSet<> assigned;
+    for (const std::vector<parser::NodePtr> *body : bodies)
+      collectAssignedNames(body, assigned);
+    llvm::SmallVector<std::string, 4> promoted;
+    for (const auto &entry : assigned) {
+      llvm::StringRef name = entry.getKey();
+      auto bound = values.find(name);
+      if (bound == values.end() || isCellContract(bound->second.type))
+        continue;
+      // ⛔ The CONSERVATIVE reader, not the same-suite one
+      // `bindConditionallyAssignedLocals` uses. That one cannot see a read in
+      // an enclosing suite, which is exactly where the commonest shape puts it
+      // -- a match inside a loop whose accumulator is read after the loop --
+      // and here the cheap direction is safe: the cell is loaded back into SSA
+      // at the continuation, so promoting a name nobody reads costs a heap
+      // slot and changes nothing.
+      if (!nameMayBeReadAfterCurrentStatement(name))
+        continue;
+      promoted.push_back(name.str());
+    }
+    llvm::sort(promoted);
+    // ⛔ AND REFUSED, not silently dropped, when a sibling case leaves the
+    // loop. A `continue` exits the match without passing the continuation
+    // that loads the cell back, so the loop's carried local would be handed
+    // the CELL where its block argument is the content. The name keeps the
+    // value it had before the match otherwise -- the same wrong answer this
+    // whole block exists to remove -- so the shape says so instead.
+    //
+    // ⛔ A name the enclosing `try` already promoted is not a candidate (it is
+    // cell-backed before this runs), which is why
+    // tests/golden/cases/a_jump_out_of_a_match_inside_a_try.py keeps working:
+    // that mechanism carries the write across the jump on its own.
+    if (jumpsOut && !promoted.empty()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, statement.range.start,
+          "local '" + promoted.front() +
+              "' is reassigned in a match case while another case leaves the "
+              "loop, and the write cannot reach that jump: bind the result to "
+              "a new name inside the case, or put the match in a `try`"});
+      return;
+    }
+    for (const std::string &name : promoted) {
+      Value outer = values.find(name)->second;
+      mlir::Type inner = inferConditionalLocalType(bodies, name);
+      mlir::Type content = types.join(
+          {types.widenLiteral(outer.type),
+           inner ? types.widenLiteral(inner) : types.widenLiteral(outer.type)});
+      // ⛔ The same storability rule the conditional-slot path ends with: a
+      // cell whose content is the erased top accepts every write and refuses
+      // every read, which trades a wrong answer for a lowering sentence.
+      if (!mlir::isa_and_nonnull<py::ContractType>(content) ||
+          py::isPyObjectType(content))
+        continue;
+      Value initial = coerceValue(outer, content, statement);
+      if (initial.type != content)
+        continue;
+      Value cell = emitCellAlloc(statement, initial, /*tracksBinding=*/false);
+      values[name] = cell;
+      types.bindSymbol(name, content);
+      promotedCells.emplace_back(name, cell);
+    }
   }
 
   mlir::Block *entry = builder.getInsertionBlock();
@@ -879,6 +986,16 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
       mlir::cf::BranchOp::create(builder, loc(statement), continuation);
   }
   builder.setInsertionPointToStart(continuation);
+  // ⛔ AND BACK TO SSA on the far side. The cell exists for the arms to write
+  // through, not for the rest of the scope: leaving the name cell-backed makes
+  // it a heap slot everything after the match reads through, and a match
+  // inside a LOOP would then hand the loop a cell where its carried local is
+  // an int. The load here is the value the executed arm left.
+  for (const auto &[promotedName, cell] : promotedCells) {
+    Value loaded = emitCellLoad(statement, cell);
+    values[promotedName] = loaded;
+    types.bindSymbol(promotedName, loaded.type);
+  }
 }
 
 

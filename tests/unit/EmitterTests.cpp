@@ -1151,6 +1151,31 @@ TEST(EmitterTest, AModuleUsedAsAValueIsRefusedAtEmit) {
   }
 }
 
+// What: a local reassigned in one match case while a sibling case leaves the
+// loop. The write is carried by a cell the match allocates, and a jump leaves
+// the match without passing the point that reads it back -- so the shape is
+// refused rather than answered with the pre-match value.
+TEST(EmitterTest, RefusesAMatchWriteThatCannotReachAJump) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result = emitSource(
+      "def f(xs: \"list[int]\") -> str:\n"
+      "    out = \"\"\n"
+      "    for v in xs:\n"
+      "        match v:\n"
+      "            case 1:\n                out = out + \"one\"\n"
+      "            case 2:\n                break\n"
+      "            case _:\n                out = out + \"?\"\n"
+      "    return out\n\n\nprint(f([1, 2]))\n",
+      context);
+  EXPECT_FALSE(result.ok());
+  bool named = false;
+  for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+    named = named || diagnostic.message.find(
+                         "is reassigned in a match case while another case "
+                         "leaves the loop") != std::string::npos;
+  EXPECT_TRUE(named);
+}
+
 TEST(EmitterTest, AnAttributeAModuleDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolved these, so they fell through to a dynamic attribute read
   // on the module object -- which no lowering can answer. The message came out
