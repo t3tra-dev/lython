@@ -2357,6 +2357,25 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     // protocol is written in -- takes the OTHER side as a BOX, not as this
     // contract's lanes.
     bool otherIsBox = false;
+    // ⭐ WHICH RIGHT-HAND CLASSES THIS ENTRY MAY BE HANDED. The callee takes
+    // the other side as its own contract's LANES, so the box on the right has
+    // to have that layout -- which is what the caller's "same class id" gate
+    // was standing in for, and what made a SUBCLASS answer wrong:
+    //
+    //     class P:
+    //         def __lt__(self, o: "P") -> bool: ...
+    //     class Q(P): pass
+    //     xs: "list[P]" = [Q(1)]
+    //     print(P(1) in xs)             # printed False; CPython prints True
+    //     print(sorted([Q(2), P(1)]))   # TypeError; CPython sorts
+    //
+    // Two objects may take this entry when they resolve the SAME
+    // implementation: that is exactly when both have the declaring class in
+    // their MRO, so both boxes carry its lanes. Empty means "this entry's own
+    // id only", which is every manifest class.
+    llvm::SmallVector<std::int64_t, 4> acceptedRightIds;
+    // The resolved implementation, used only to compute the set above.
+    std::string calleeSymbol;
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::SmallDenseSet<std::int64_t, 16> seenIds;
@@ -2439,8 +2458,21 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
         return;
       entries.push_back(HookEntry{*classId, function,
                                   classOp.getSymName().str(),
-                                  declaredOtherIsObject(function)});
+                                  declaredOtherIsObject(function),
+                                  {},
+                                  *symbol});
     });
+  }
+
+  // Every entry that resolves the same implementation shares a layout, so each
+  // one accepts the others on the right. A manifest entry has no symbol here
+  // and keeps its own id alone.
+  for (HookEntry &hookEntry : entries) {
+    if (hookEntry.calleeSymbol.empty())
+      continue;
+    for (const HookEntry &other : entries)
+      if (other.calleeSymbol == hookEntry.calleeSymbol)
+        hookEntry.acceptedRightIds.push_back(other.classId);
   }
 
   mlir::OpBuilder builder(context);
@@ -2454,12 +2486,13 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
   hookResultTypes.push_back(i1);
   auto hook = mlir::func::FuncOp::create(
       builder, loc, hookName,
-      builder.getFunctionType({ptrType, ptrType, i64}, hookResultTypes));
+      builder.getFunctionType({ptrType, ptrType, i64, i64}, hookResultTypes));
 
   mlir::Block *entry = hook.addEntryBlock();
   mlir::Value lhsSlot = entry->getArgument(0);
   mlir::Value rhsSlot = entry->getArgument(1);
   mlir::Value classValue = entry->getArgument(2);
+  mlir::Value rightClassValue = entry->getArgument(3);
 
   mlir::Block *miss = hook.addBlock();
   {
@@ -2494,6 +2527,33 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
           builder, loc, hookEntry.classId, 64);
       mlir::Value matches = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::eq, classValue, expected);
+      // The right-hand box has to carry the callee's lanes; see the note on
+      // `acceptedRightIds`. A callee that takes the other side as a BOX asks
+      // nothing of its class.
+      if (!hookEntry.otherIsBox) {
+        llvm::SmallVector<std::int64_t, 4> accepted =
+            hookEntry.acceptedRightIds;
+        if (accepted.empty())
+          accepted.push_back(hookEntry.classId);
+        mlir::Value rightMatches;
+        for (std::int64_t acceptedId : accepted) {
+          mlir::Value candidate =
+              mlir::arith::ConstantIntOp::create(builder, loc, acceptedId, 64);
+          mlir::Value isCandidate = mlir::arith::CmpIOp::create(
+              builder, loc, mlir::arith::CmpIPredicate::eq, rightClassValue,
+              candidate);
+          rightMatches =
+              rightMatches ? mlir::arith::OrIOp::create(builder, loc,
+                                                        rightMatches,
+                                                        isCandidate)
+                                 .getResult()
+                           : isCandidate;
+        }
+        if (rightMatches)
+          matches =
+              mlir::arith::AndIOp::create(builder, loc, matches, rightMatches)
+                  .getResult();
+      }
       mlir::cf::CondBranchOp::create(builder, loc, matches, handle,
                                      mlir::ValueRange{}, next,
                                      mlir::ValueRange{});

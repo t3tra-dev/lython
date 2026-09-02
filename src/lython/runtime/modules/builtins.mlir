@@ -17909,7 +17909,7 @@ module attributes {
   // Uniform per-element hash/eq dispatch, generated per program by the
   // lowering (class id -> the manifest __hash__ / __eq__); resolved at link.
   func.func private @__ly_hash_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (i64, i1)
-  func.func private @__ly_eq_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64) -> (i1, i1)
+  func.func private @__ly_eq_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
 
   // "unhashable type: '<name>'"
   memref.global "private" constant @__ly_hash_msg_unhashable_list : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 108, 105, 115, 116, 39]>
@@ -18301,13 +18301,13 @@ module attributes {
           %r = func.call @__ly_box_equal_numeric(%lhs, %lhs_class, %rhs, %rhs_class) : (!llvm.ptr, i64, !llvm.ptr, i64) -> i1
           scf.yield %r : i1
         } else {
-          %same_result = scf.if %same -> (i1) {
-            %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class) : (!llvm.ptr, !llvm.ptr, i64) -> (i1, i1)
-            %r = arith.andi %eq, %handled : i1
-            scf.yield %r : i1
-          } else {
-            scf.yield %false : i1
-          }
+          // ⭐ A SUBCLASS SHARES ITS BASE'S IMPLEMENTATION, so "same class id"
+          // was the wrong gate: `P(1) in [Q(1)]` compared a P against a Q,
+          // found the ids unequal, and answered False without asking anything.
+          // The hook decides now -- it accepts a right-hand class that resolves
+          // the same implementation -- and `%handled` is the whole answer.
+          %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+          %same_result = arith.andi %eq, %handled : i1
           scf.yield %same_result : i1
         }
         scf.yield %num_result : i1
@@ -18514,7 +18514,7 @@ module attributes {
     func.return %ne : i1
   }
 
-  func.func private @__ly_lt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64) -> (i1, i1)
+  func.func private @__ly_lt_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
 
   // "'<' not supported between operand types"
   memref.global "private" constant @__ly_cmp_msg_unorderable : memref<39xi8> = dense<[39, 60, 39, 32, 110, 111, 116, 32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 32, 98, 101, 116, 119, 101, 101, 110, 32, 111, 112, 101, 114, 97, 110, 100, 32, 116, 121, 112, 101, 115]>
@@ -18620,17 +18620,15 @@ module attributes {
       }
       scf.yield %ordered : i1
     } else {
-      %inner = scf.if %same -> (i1) {
-        %lt, %handled = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %lhs_class) : (!llvm.ptr, !llvm.ptr, i64) -> (i1, i1)
-        scf.if %handled {
-        } else {
-          func.call @__ly_cmp_raise_unorderable() : () -> ()
-        }
-        scf.yield %lt : i1
+      // The same rule as the equality hook: a subclass resolves its base's
+      // `__lt__`, so the two ids need not be equal for the callee's lanes to be
+      // there. `sorted([Q(2), P(1)])` raised TypeError where CPython sorts.
+      %lt, %handled = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+      scf.if %handled {
       } else {
         func.call @__ly_cmp_raise_unorderable() : () -> ()
-        scf.yield %false : i1
       }
+      %inner = arith.select %handled, %lt, %false : i1
       scf.yield %inner : i1
     }
     func.return %result : i1

@@ -1,0 +1,9 @@
+[1, 2, 3]
+True False True
+[Point(1), Point(2), Point(3)]
+True True False
+True False
+3 1
+[1, 2]
+[1, 2, 3] ['a', 'c'] [0.5, 1.5]
+True True True False
