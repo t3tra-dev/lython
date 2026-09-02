@@ -1212,6 +1212,50 @@ TEST(EmitterTest, RefusesAUnionRebindOfALoopCarriedLocal) {
   EXPECT_TRUE(named);
 }
 
+// What: a statement in a class body that would have run. A class body executes
+// in CPython and declares here, so a call or a loop in one was dropped without
+// a word -- `log.append("body")` in a class body appended nothing.
+TEST(EmitterTest, RefusesAStatementInAClassBody) {
+  for (const char *source :
+       {"log: \"list[str]\" = []\n\n\nclass C:\n    log.append(\"body\")\n"
+        "\n    def f(self) -> int:\n        return 1\n\n\nprint(log)\n",
+        "class C:\n    for i in range(3):\n        pass\n\n"
+        "    def f(self) -> int:\n        return 1\n\n\nprint(1)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool named = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      named = named || diagnostic.message.find(
+                           "statement in a class body is not supported") !=
+                           std::string::npos;
+    EXPECT_TRUE(named) << source;
+  }
+}
+
+// What: a class declared inside another class. The refusal for a class inside
+// a FUNCTION lives where statements are emitted, which never sees a class
+// body, so this one was accepted, silently dropped, and reported only at a use
+// -- as a missing "manifest method".
+TEST(EmitterTest, RefusesAClassDeclaredInsideAClass) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result = emitSource(
+      "class Outer:\n"
+      "    class Inner:\n"
+      "        pass\n"
+      "\n"
+      "\n"
+      "print(1)\n",
+      context);
+  EXPECT_FALSE(result.ok());
+  bool named = false;
+  for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+    named = named || diagnostic.message.find(
+                         "a class defined inside a function or another class") !=
+                         std::string::npos;
+  EXPECT_TRUE(named);
+}
+
 TEST(EmitterTest, AnAttributeAModuleDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolved these, so they fell through to a dynamic attribute read
   // on the module object -- which no lowering can answer. The message came out

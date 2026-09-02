@@ -1720,6 +1720,58 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
+      // ⭐ A NESTED CLASS IS DROPPED, and only its USE said so. The refusal for
+      // a class declared inside a function lives in `emitStatement`, which
+      // never sees a class BODY -- so `class Outer: class Inner: ...` was
+      // accepted, the inner class was never emitted, and `Outer.Inner()`
+      // reported "static type !py.type<Outer> does not provide manifest method
+      // 'Inner'": a sentence about a method, for a class the source declares.
+      // The same limitation, said at the same boundary, in the same words.
+      if (statement && statement->kind == "ClassDef") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement->range.start,
+            "a class defined inside a function or another class is not "
+            "supported: a class is a module-level contract here, so declare '" +
+                std::string(ast::nameSpelling(*statement)) +
+                "' at module scope"});
+        continue;
+      }
+      // ⭐ AND A STATEMENT THAT WOULD HAVE RUN. A class body executes in
+      // CPython, and here it DECLARES -- so everything this walk does not
+      // recognise was dropped in silence:
+      //
+      //     log: "list[str]" = []
+      //     class C:
+      //         log.append("body")     # printed nothing; CPython appends
+      //
+      // and a `for` in a class body lost its side effects the same way. The
+      // recognised set is the declarations plus the two shapes with no effect
+      // at all: a docstring and `pass`. A `type` alias declares as well.
+      //
+      // ⛔ Including a decidable `if`, which the platform-switch idiom writes
+      // (`if sys.platform == "win32": tag = "win"`). Flattening it the way the
+      // module walk does would mean threading a rewritten body through the
+      // nine walks of this one, and the shape is not silent today -- it
+      // reports "'C' object has no attribute 'tag'" at the use, which this
+      // refusal replaces with a sentence about the declaration.
+      if (statement && statement->kind != "FunctionDef" &&
+          statement->kind != "AsyncFunctionDef" &&
+          statement->kind != "AnnAssign" && statement->kind != "Assign" &&
+          statement->kind != "Pass" && statement->kind != "TypeAlias") {
+        bool docstring = false;
+        if (statement->kind == "Expr")
+          if (const parser::Node *value = ast::node(*statement, "value"))
+            docstring = value->kind == "Constant";
+        if (!docstring) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, statement->range.start,
+              "a '" + statement->kind +
+                  "' statement in a class body is not supported: a class body "
+                  "here declares members and does not run, so this statement "
+                  "would be dropped in silence"});
+          continue;
+        }
+      }
       if (!statement || (statement->kind != "FunctionDef" &&
                          statement->kind != "AsyncFunctionDef"))
         continue;
