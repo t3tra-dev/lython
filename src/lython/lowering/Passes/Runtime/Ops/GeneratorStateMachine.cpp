@@ -597,9 +597,38 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
                                           ? &info.argumentLanes[index]
                                           : nullptr;
     if (!lane || lane->isInt || lane->isControl()) {
-      if (!source->primitiveI64)
-        return op->emitError() << "state-machine generator frame sources must "
-                                  "carry primitive int evidence";
+      // ⭐ AN int ARGUMENT WITH NO WORD IS UNBOXED HERE. The creation-site
+      // argument lane is the pair alone -- unlike a FRAME lane, which keeps
+      // the box beside it -- and an int read out of a container is a boxed
+      // object with no word, so passing one refused the whole program:
+      //
+      //     def gen(k: int):
+      //         yield k
+      //         yield k + 1
+      //     print([v for v in gen(xs[0])])
+      //     # state-machine generator frame sources must carry primitive int
+      //     # evidence
+      //
+      // while `gen(len(xs))` compiled, because a call result carries one.
+      //
+      // ⛔ `try_unbox.i64` rather than the raising `unbox.i64`: a value wider
+      // than the window has no word, and this is the boundary that discovers
+      // it. The pair it hands over says so, which is what every reader of a
+      // lane already tests.
+      if (!source->primitiveI64) {
+        std::optional<RuntimeSymbol> tryUnbox =
+            manifest.primitive("builtins.int", "try_unbox.i64");
+        if (!tryUnbox || source->physicalValues().size() !=
+                             tryUnbox->function.getNumArguments())
+          return op->emitError() << "state-machine generator frame sources must "
+                                    "carry primitive int evidence";
+        builder.setInsertionPoint(op);
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            op->getLoc(), *tryUnbox, source->physicalValues());
+        operands.push_back(call.getResult(0));
+        operands.push_back(call.getResult(1));
+        continue;
+      }
       operands.push_back(source->primitiveI64->value);
       operands.push_back(source->primitiveI64->valid);
       continue;
@@ -650,6 +679,63 @@ RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
       builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
   mlir::Block *entry = function.addEntryBlock();
   builder.setInsertionPointToStart(entry);
+  // ⭐ THE INT LANE'S WORD IS REBUILT FROM ITS BOX WHEN THE WORD IS INVALID.
+  // A generator's int lane is a BOX plus an (i64, valid) pair, and the resume
+  // entry forwards only the PAIR into the clone body (its block arguments are
+  // the unboxed prim-i64 shape). So a value that never had a word -- an int
+  // read out of a container is a boxed object with no lane -- came back as
+  // `(0, false)` with its box dropped, and the next suspend's guard raised:
+  //
+  //     def gen(xs: "list[int]"):
+  //         total = 0
+  //         for x in xs:
+  //             total = x
+  //             yield total
+  //     print([v for v in gen([1, 2])])
+  //     # ValueError: int too large to convert to a native 64-bit integer
+  //
+  // for the int 1. The same loop in a plain function carries the box and is
+  // right; `range` is right (the counter has a word); a str accumulator is
+  // right (no lane at all). The box IS still here, so the word is recoverable.
+  //
+  // ⛔ `try_unbox.i64` and not `unbox.i64`: a value genuinely wider than the
+  // window has no word, and the raise it would make here is the one the
+  // suspend guard already makes with the right message. This one reports.
+  //
+  // ⛔ Under a branch on the valid bit, not unconditionally: the common lane
+  // arrives valid, and this function runs once per int frame lane per resume.
+  if (lane.isInt && lane.physicalCount == 1 && types.size() == 3) {
+    if (std::optional<RuntimeSymbol> tryUnbox =
+            manifest.primitive("builtins.int", "try_unbox.i64")) {
+      mlir::Value box = entry->getArgument(0);
+      mlir::Value raw = entry->getArgument(1);
+      mlir::Value valid = entry->getArgument(2);
+      mlir::Value trueValue =
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 1).getResult();
+      mlir::Value invalid =
+          mlir::arith::XOrIOp::create(builder, loc, valid, trueValue)
+              .getResult();
+      auto recovered = mlir::scf::IfOp::create(
+          builder, loc, mlir::TypeRange{raw.getType(), valid.getType()},
+          invalid, /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard thenGuard(builder);
+        builder.setInsertionPointToStart(recovered.thenBlock());
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            loc, *tryUnbox, mlir::ValueRange{box});
+        mlir::scf::YieldOp::create(builder, loc, call.getResults());
+      }
+      {
+        mlir::OpBuilder::InsertionGuard elseGuard(builder);
+        builder.setInsertionPointToStart(recovered.elseBlock());
+        mlir::scf::YieldOp::create(builder, loc, mlir::ValueRange{raw, valid});
+      }
+      mlir::func::ReturnOp::create(
+          builder, loc,
+          mlir::ValueRange{box, recovered.getResult(0), recovered.getResult(1)});
+      return function;
+    }
+  }
   mlir::func::ReturnOp::create(builder, loc, entry->getArguments());
   return function;
 }

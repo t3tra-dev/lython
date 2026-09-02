@@ -7409,6 +7409,23 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
+  // ⭐ THE UNBOX THAT REPORTS INSTEAD OF RAISING. `unbox.i64` below is the
+  // program-visible conversion and raises for a value wider than the window
+  // ("never silently mis-execute"); this one answers the same question for a
+  // reader that has a fallback -- the generator frame's int lane, which keeps
+  // the BOX beside the word and only needs to know whether the word is usable.
+  //
+  // ⛔ The digit view is read unconditionally: `__ly_long_view_as_i64` reads
+  // digit 0 whatever the magnitude, so the value is meaningless when `fits` is
+  // false and never wrong when it is true. Branching around it would cost a
+  // region for a load that cannot fault.
+  func.func @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "try_unbox.i64"} {
+    %meta, %digits = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    %value = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+    func.return %value, %fits : i64, i1
+  }
+
   func.func @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"} {
     %meta, %digits = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     // Reading a wider value through the i64 window would silently truncate;
