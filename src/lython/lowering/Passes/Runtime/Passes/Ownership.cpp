@@ -1250,6 +1250,60 @@ void collectHandlerEntryIds(mlir::Block *block,
 //
 // `handlerIds` empty means no successor takes an entry release, and nothing
 // moves -- which is the common case and keeps this off every other program's IR.
+// ⭐ THE SAME QUESTION ONE BLOCK FURTHER OUT. `delayPastUnwindingCallSites`
+// below walks `insertAfter`'s block, which is every guarded call site there is
+// only while the try path is straight-line code. Any control flow after the
+// last use splits the block, and the guarded calls in the blocks that follow
+// were then invisible to it:
+//
+//     with open(p) as handle:
+//         size = len(handle.read())
+//         if flag:                    # or `size + 1`, or `size // 2`
+//             size = size + 1
+//
+//     owned resource from @LyTextIO_Enter result 0 is released or transferred
+//     more than once on one CFG path
+//
+// The normal-path death landed before the `if`, and an unwind out of a call
+// inside it reached the handler's entry release of the same group -- a real
+// double free on that path, which the affine verifier refuses. Using the
+// handle again AFTER the split moves its last use past the split and the same
+// program compiles, which is the same fact read from the other side.
+//
+// ⛔ The answer is to DECLINE, not to delay further. Past a split there is no
+// single "last call site" to delay to -- a diamond has one per arm, and the
+// release belongs after the join -- and the liveness placement below already
+// models a merge. Declining hands the group to it.
+//
+// ⛔ And ANY guarded call, not one whose marker id names this handler. Try
+// scopes NEST: the call that unwinds into the `with`'s handler carries the id
+// of the INNER scope it sits in (11 and 15 in the shape above, where the
+// handler's own id is 3), because the unwind propagates outward when the inner
+// scope does not catch. Filtering by id was implemented first and left the
+// arithmetic spellings failing while the `if` spelling passed.
+bool guardedCallSiteReachableBeyondBlock(mlir::Block *block) {
+  llvm::SmallVector<mlir::Block *, 8> worklist(block->succ_begin(),
+                                               block->succ_end());
+  llvm::SmallPtrSet<mlir::Block *, 8> seen;
+  while (!worklist.empty()) {
+    mlir::Block *current = worklist.pop_back_val();
+    if (!seen.insert(current).second)
+      continue;
+    bool guarded = false;
+    // Nested regions too: an `scf.if` the arithmetic diamond left behind holds
+    // its own guarded calls, and an unwind out of one of them leaves the block
+    // exactly as a top-level call would.
+    current->walk([&](mlir::func::CallOp call) {
+      if (call.getCallee() == "LyEH_TryCallSiteMarker")
+        guarded = true;
+    });
+    if (guarded)
+      return true;
+    worklist.append(current->succ_begin(), current->succ_end());
+  }
+  return false;
+}
+
 mlir::Operation *
 delayPastUnwindingCallSites(mlir::Operation *insertAfter,
                             const llvm::SmallDenseSet<std::int64_t, 2> *handlerIds) {
@@ -1259,13 +1313,32 @@ delayPastUnwindingCallSites(mlir::Operation *insertAfter,
   for (mlir::Operation *op = insertAfter->getNextNode(); op;
        op = op->getNextNode()) {
     auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
-    if (!call || call.getCallee() != "LyEH_TryCallSiteMarker")
+    if (!call || call.getCallee() != "LyEH_TryCallSiteMarker") {
+      // ⛔ AND AN OP THAT CONTAINS ONE. The guarded call of an arithmetic
+      // fast/slow diamond sits inside an `scf.if` in this very block, so the
+      // top-level walk stepped straight over it and the death landed before a
+      // call whose unwind reaches the handler's entry release. Delaying past
+      // the whole region op is the same answer one nesting level out.
+      bool nestedGuarded = false;
+      for (mlir::Region &region : op->getRegions()) {
+        region.walk([&](mlir::func::CallOp nested) {
+          if (nested.getCallee() == "LyEH_TryCallSiteMarker")
+            nestedGuarded = true;
+        });
+        if (nestedGuarded)
+          break;
+      }
+      if (nestedGuarded)
+        last = op;
       continue;
-    if (handlerIds) {
-      std::optional<std::int64_t> id = own::exceptionMarkerId(call);
-      if (!id || !handlerIds->contains(*id))
-        continue;
     }
+    // ⛔ NO id FILTER. Try scopes NEST, so the call that unwinds into this
+    // handler carries the id of the INNER scope it sits in -- filtering by the
+    // handler's own id left `with ...: total = len(f.read()) + 1` releasing
+    // before a call whose unwind reached the handler's entry release. Delaying
+    // past a call site that cannot reach this handler only extends a live
+    // range, which is the direction this whole helper is allowed to move in.
+    (void)handlerIds;
     mlir::func::CallOp guarded = own::guardedCallAfterMarker(op);
     last = guarded ? guarded.getOperation() : op;
   }
@@ -1427,6 +1500,14 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
       collectHandlerEntryIds(successor, entryReleaseHandlerIds);
   const llvm::SmallDenseSet<std::int64_t, 2> *unwindIds =
       unwindDeathDelayEnabled() ? &entryReleaseHandlerIds : nullptr;
+
+  // A death this strategy would write can only be delayed within its own
+  // block; a guarded call site beyond it is one the delay cannot reach, so the
+  // group goes to the liveness placement instead.
+  if (unwindIds && !unwindIds->empty())
+    for (mlir::Block *successor : successors)
+      if (lastUser[successor] && guardedCallSiteReachableBeyondBlock(successor))
+        return false;
 
   for (mlir::Block *successor : successors) {
     mlir::OpBuilder builder(owner->getContext());

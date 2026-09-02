@@ -548,6 +548,10 @@ set(LYTHON_LEAK_GATE_CASES
     vararg_tuple_holds_its_arguments
     # An inlined __enter__/__exit__ pair around a body that allocates.
     with_statement_on_a_python_class
+    # The `as` value's normal-path death, moved past every call in the body
+    # whose unwind reaches the handler that releases it again. The verifier
+    # sees a death written too early; only this gate sees one written too late.
+    a_with_body_that_branches_after_its_last_use
     # The **kwargs dict retains its keys and its values.
     kwarg_dict_holds_its_arguments
     # A loop element released on the edges the early return does not take.
