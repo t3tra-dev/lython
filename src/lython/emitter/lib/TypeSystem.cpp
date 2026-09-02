@@ -243,6 +243,11 @@ struct GeneratorFunctionAnalysis {
   bool sawYieldFrom = false;
   bool hasReturnValue = false;
   llvm::SmallVector<mlir::Type, 4> yieldTypes;
+  // The node each yield type came from, so an EMPTY container yield can be
+  // dropped from the join the way an empty sibling is: `yield []` in one arm
+  // and `yield [1]` in the other joined to a union of two lists, and the
+  // frame lane for that is what refused the generator.
+  llvm::SmallVector<const parser::Node *, 4> yieldNodes;
   llvm::SmallVector<mlir::Type, 4> returnTypes;
   // Send types of `yield from` delegates: PEP 380 forwards send() into the
   // active delegate, so an unannotated outer generator's send channel is
@@ -433,14 +438,17 @@ void collectGeneratorFunctionAnalysis(
     const parser::Node *value = ast::node(*node, "value");
     if (!value) {
       analysis.yieldTypes.push_back(types.none());
+      analysis.yieldNodes.push_back(nullptr);
       return;
     }
     mlir::Type valueType =
         inferExprWithLocalCallables(types, value, localCallables,
                                     &analysis.failureReasons,
                                     &analysis.localSymbols);
-    if (valueType)
+    if (valueType) {
       analysis.yieldTypes.push_back(types.widenLiteral(valueType));
+      analysis.yieldNodes.push_back(value);
+    }
     return;
   }
   if (node->kind == "YieldFrom") {
@@ -450,6 +458,7 @@ void collectGeneratorFunctionAnalysis(
             types, ast::node(*node, "value"), localCallables,
             analysis.failureReasons, &analysis.localSymbols))
       analysis.yieldTypes.push_back(*element);
+      analysis.yieldNodes.push_back(nullptr);
     if (mlir::Type rawSource = inferExprWithLocalCallables(
             types, ast::node(*node, "value"), localCallables, nullptr,
             &analysis.localSymbols)) {
@@ -4540,7 +4549,12 @@ TypeSystem::functionSignature(const parser::Node &function,
     sig.generatorAnalysisFailures.append(generator.failureReasons.begin(),
                                          generator.failureReasons.end());
     sig.generatorYieldType =
-        generator.yieldTypes.empty() ? none() : join(generator.yieldTypes);
+        generator.yieldTypes.empty()
+            ? none()
+            : (generator.yieldNodes.size() == generator.yieldTypes.size()
+                   ? joinIgnoringEmptyLiterals(*this, generator.yieldTypes,
+                                               generator.yieldNodes)
+                   : join(generator.yieldTypes));
     // Without an annotation, the send channel is what the delegates accept:
     // PEP 380 forwards send() into the active `yield from` delegate.
     sig.generatorSendType = annotatedGeneratorSendType.value_or(
