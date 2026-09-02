@@ -22,13 +22,28 @@
 # already copies operand-free pure ops to their uses, for the `arith.constant
 # true` a `continue` leaves live) to ops whose operands are all clone ENTRY
 # ARGUMENTS. `py.bool(%arg0)` is exactly that shape, and rematerializing it
-# changed nothing -- so the i1 is not what the state machine declines on, and
-# the decline happens before or after the lane scan rather than in it.
+# changed nothing.
 #
-# ⭐ The message cannot say more yet either: `generatorDeclineReasons` is only
-# populated by the no-lane-contract arm, so the straight-line tier has nothing
-# to append. Whatever declines this shape does so silently, and finding it is
-# the first half of the repair.
+# ⭐ THE CAUSE IS THE PARAMETER'S SHAPE, not the branch. `builtins.bool`'s
+# manifest value shape is a BARE i1:
+#
+#     func.func private @LyBool_Shape() -> i1
+#         attributes {ly.runtime.contract = "builtins.bool", ly.runtime.shape}
+#
+# and `generatorLaneParts` requires every part to be a rank-1 MEMREF, because
+# a frame slot holds (pointer, size) word pairs. So a bool parameter has no
+# frame lane, `argumentsEligible` goes false in
+# `buildGeneratorResumeCloneSignatures`, and the state machine skips the
+# generator entirely -- WITHOUT recording a decline reason, which is why the
+# tier below has nothing to append to its own message. A str, float or list
+# parameter deciding the same branch compiles, and all three have memref
+# shapes.
+#
+# THE SHAPE OF THE REPAIR: a bool lane stored as one i64 word (0/1), widened
+# on store and truncated on load. The frame already has a non-memref lane kind
+# -- `lane.isInt`, an i64 plus an i1 valid flag -- so the mechanism exists; it
+# is consulted at 14 sites, which is the cost. Additive: a bool parameter has
+# no lane at all today, so nothing that works now would change.
 def g(flag: bool):
     if flag:
         yield 1
