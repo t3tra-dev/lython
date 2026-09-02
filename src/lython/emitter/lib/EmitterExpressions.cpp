@@ -3487,15 +3487,12 @@ mlir::Type ModuleEmitter::siblingExpectationFor(const parser::Node &literal,
                                                 bool forKey) {
   if (!element)
     return {};
-  bool elementIsEmptyLiteral =
-      (element->kind == "List" || element->kind == "Tuple" ||
-       element->kind == "Set" || element->kind == "Dict") &&
-      [&] {
-        const auto *elts = ast::nodeList(*element, "elts");
-        const auto *keys = ast::nodeList(*element, "keys");
-        return (!elts || elts->empty()) && (!keys || keys->empty());
-      }();
-  if (!elementIsEmptyLiteral)
+  // ⛔ Asked through the canonical predicate and not the node kinds, which is
+  // what stood here: `{"a": [1], "b": list()}` is the same dict as
+  // `{"a": [1], "b": []}` and it kept the erased element --
+  // "dict __getitem__ evidence contract 'list[object]' is not assignable to
+  // result 'list[int]'" the moment the empty bucket was appended to.
+  if (!isEmptyContainerExpression(element))
     return {};
   auto contract =
       mlir::dyn_cast_if_present<py::ContractType>(types.inferExpr(&literal));

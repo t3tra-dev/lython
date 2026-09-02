@@ -555,10 +555,86 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
           const auto *args = ast::nodeList(*call, "args");
           if (receiver && receiver->kind == "Name" &&
               llvm::StringRef(ast::nameSpelling(*receiver)) == name &&
-              method && args &&
-              args->size() == 1 && args->front() &&
-              (*method == "append" || *method == "add"))
-            noteExpr(element, args->front().get(), note);
+              method && args && args->front()) {
+            // ⭐ EVERY OPERATION THAT PUTS SOMETHING IN IT SEEDS IT. Two were
+            // recognised, and the rest of the ways Python fills a fresh
+            // container left it erased -- each with the same message about a
+            // `builtins.object` that no line of the program mentions:
+            //
+            //     xs = []; xs.extend([1]); xs[0] + 1
+            //     xs = []; xs.insert(0, 1)
+            //     s = set(); s.update([1])
+            //     d = {}; d.update({"a": 1})
+            //     d = {}; d.setdefault("a", 1)
+            //
+            // ⛔ An ITERABLE argument contributes its ELEMENT, not itself:
+            // `extend([1])` puts an int in, where `append([1])` puts a list
+            // in. That is why the two cannot share an arm.
+            auto noteIterableElements = [&](const parser::Node *iterable) {
+              if (!iterable || mentionsName(iterable, mentionsName))
+                return;
+              auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                  types.widenLiteral(types.inferExpr(iterable)));
+              if (!contract) {
+                disagreed = true;
+                return;
+              }
+              llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+              if (isMapping) {
+                if (arguments.size() != 2) {
+                  disagreed = true;
+                  return;
+                }
+                note(key, arguments[0]);
+                note(element, arguments[1]);
+                return;
+              }
+              if (arguments.size() != 1) {
+                disagreed = true;
+                return;
+              }
+              note(element, arguments.front());
+            };
+            if (args->size() == 1 &&
+                (*method == "append" || *method == "add"))
+              noteExpr(element, args->front().get(), note);
+            else if (args->size() == 1 &&
+                     (*method == "extend" || *method == "update"))
+              noteIterableElements(args->front().get());
+            else if (args->size() == 2 && *method == "insert" && !isMapping)
+              noteExpr(element, (*args)[1].get(), note);
+            else if (args->size() == 2 && *method == "setdefault" &&
+                     isMapping) {
+              noteExpr(key, args->front().get(), note);
+              noteExpr(element, (*args)[1].get(), note);
+            }
+          }
+        }
+      }
+    }
+    // ⭐ AND `xs += [1]` IS `xs.extend([1])`, which is how an accumulator that
+    // is built from slices rather than elements is written.
+    if (node.kind == "AugAssign") {
+      const parser::Node *target = ast::node(node, "target");
+      const parser::Node *op = ast::node(node, "op");
+      if (target && target->kind == "Name" &&
+          llvm::StringRef(ast::nameSpelling(*target)) == name && op &&
+          (op->kind == "Add" || op->kind == "BitOr")) {
+        const parser::Node *operand = ast::node(node, "value");
+        if (operand && !mentionsName(operand, mentionsName)) {
+          auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(types.inferExpr(operand)));
+          llvm::ArrayRef<mlir::Type> arguments =
+              contract ? contract.getArguments()
+                       : llvm::ArrayRef<mlir::Type>();
+          if (isMapping && arguments.size() == 2) {
+            note(key, arguments[0]);
+            note(element, arguments[1]);
+          } else if (!isMapping && arguments.size() == 1) {
+            note(element, arguments.front());
+          } else {
+            disagreed = true;
+          }
         }
       }
     }
@@ -715,10 +791,43 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
     }
   };
 
-  for (std::size_t index = currentSuiteIndex; index < currentSuite->size();
-       ++index)
-    if ((*currentSuite)[index])
-      visit(*(*currentSuite)[index], visit);
+  // ⭐ AND THE REST OF EVERY SUITE THIS ONE SITS INSIDE. The scan read the
+  // current suite only, so a container decided inside a REGION never saw the
+  // operations that seed it -- which are usually one suite out, because that
+  // is where the two branches meet again:
+  //
+  //     def f(c: bool) -> int:
+  //         if c:
+  //             xs = []
+  //         else:
+  //             xs = [2]
+  //         xs.append(1)          # the seed, in the enclosing suite
+  //         return xs[0] + 1
+  //     # static type !py.union<list[int], list[object]> ...
+  //
+  // The `try:` spelling of the same three lines failed the same way. This is
+  // the walk `nameMayBeReadAfterCurrentStatement` already makes for the same
+  // reason -- "after this statement" means the rest of this suite AND the rest
+  // of every suite it sits inside -- and it stops at the same floor, because
+  // the same name in the enclosing FUNCTION is a different binding.
+  //
+  // ⛔ Disagreement still decides: two seeds one suite apart that say
+  // different things leave the element erased, which is where it started.
+  auto scanRemainder = [&](const std::vector<parser::NodePtr> *suite,
+                           std::size_t from) {
+    if (!suite)
+      return;
+    for (std::size_t index = from; index < suite->size(); ++index)
+      if ((*suite)[index])
+        visit(*(*suite)[index], visit);
+  };
+  scanRemainder(currentSuite, currentSuiteIndex);
+  for (unsigned level = static_cast<unsigned>(suiteStack.size());
+       level > suiteStackFloor; --level) {
+    const auto &[suite, index] = suiteStack[level - 1];
+    if (suite != currentSuite)
+      scanRemainder(suite, index);
+  }
 
   // The provisional seed answers only when nothing else did: a store that does
   // not mention the name is better evidence, and two of those that disagree is

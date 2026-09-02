@@ -17,6 +17,8 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <cstddef>
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 namespace lython::emitter {
 
@@ -848,7 +850,31 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   if (valueNodes.empty())
     return {};
   llvm::SmallVector<mlir::Type, 4> inferred;
+  // ⭐ AN EMPTY CONTAINER SITE CONTRIBUTES NO ELEMENT TYPE, here as everywhere
+  // else. The slot took the join of every binding site, and `[]` joins as
+  // `list[object]` -- so the accumulator built inside a region got a slot
+  // nothing could be read out of:
+  //
+  //     def f() -> int:
+  //         for _ in range(1):
+  //             xs = []
+  //         xs.append(1)
+  //         return xs[0] + 1
+  //     # static type !py.contract<"builtins.object"> does not provide ...
+  //
+  // The `if` spelling of the same function has always worked, because a plain
+  // `if` does not take a slot at all -- only `for`, `while`, `try` and `with`
+  // reach this, which is why the shape looked like a loop defect.
+  const parser::Node *emptySite = nullptr;
+  for (const NameBindingSite &site : valueNodes)
+    if (site.element < 0 && isEmptyContainerExpression(site.value)) {
+      emptySite = site.value;
+      break;
+    }
+  llvm::SmallVector<mlir::Type, 4> inferredIncludingEmpty;
   for (const NameBindingSite &site : valueNodes) {
+    bool siteIsEmpty =
+        site.element < 0 && isEmptyContainerExpression(site.value);
     mlir::Type type = types.widenLiteral(types.inferExpr(site.value));
     if (!type)
       return {};
@@ -876,8 +902,42 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
       if (!type)
         return {};
     }
-    inferred.push_back(type);
+    inferredIncludingEmpty.push_back(type);
+    if (!siteIsEmpty)
+      inferred.push_back(type);
   }
+  // ⭐ AND WHEN EVERY SITE IS EMPTY, THE SEED SCAN ANSWERS. `xs = []` alone in
+  // a loop body has nothing to join with, and the operations that seed it are
+  // the appends -- the same question `emptyLiteralSeedType` already answers for
+  // the unconditional spelling. It is asked with the walk rewound one
+  // statement, because the seed usually sits INSIDE the region being entered
+  // and the scan otherwise starts just past it.
+  //
+  // ⛔ Only when nothing else decided: a real element type from another site
+  // is better evidence than a forward guess, and this is reached only when
+  // there is no other site.
+  if (inferred.empty() && emptySite) {
+    llvm::StringRef literalKind = emptySite->kind;
+    if (literalKind == "Call") {
+      llvm::StringRef callee = ast::nameSpelling(*ast::node(*emptySite, "func"));
+      literalKind = callee == "dict"    ? "Dict"
+                    : callee == "set"   ? "Set"
+                    : callee == "tuple" ? "Tuple"
+                                        : "List";
+    }
+    llvm::SaveAndRestore<std::size_t> rewound(
+        currentSuiteIndex, currentSuiteIndex ? currentSuiteIndex - 1 : 0);
+    if (mlir::Type seeded = emptyLiteralSeedType(name, literalKind))
+      inferred.push_back(seeded);
+  }
+  // ⛔ And when the scan finds nothing either, the erased join stands. A slot
+  // for `list[object]` is what this returned before the rule above existed,
+  // and a program that only PRINTS the empty container never decodes an
+  // element -- taking the slot away turned those into "unresolved name".
+  if (inferred.empty())
+    inferred = inferredIncludingEmpty;
+  if (inferred.empty())
+    return {};
   mlir::Type joined = types.join(inferred);
   // ⛔ ONLY A PLAIN CONTRACT GETS A SLOT. The slot is a synthesized class's
   // box-fronted field, so whatever goes in it has to be storable there: a
