@@ -1016,6 +1016,35 @@ TEST(EmitterTest, AnAttributeASourceClassDoesNotHaveIsRefusedAtEmit) {
   EXPECT_TRUE(inherited.ok());
 }
 
+TEST(EmitterTest, AUnionIsNotDisjointFromItsOwnMember) {
+  // `is` against a member of the value's own union is refused, not answered.
+  // The disjointness fold decided both `is` and `is not` from the whole type,
+  // and a union is assignable to no member of itself in either direction, so
+  // `classify(-1) is False` printed False where CPython prints True -- a wrong
+  // answer with no diagnostic anywhere.
+  for (const char *source :
+       {"def classify(n: int):\n    if n < 0:\n        return False\n    "
+        "return n * 2\nprint(classify(-1) is False)\n",
+        "def classify(n: int):\n    if n < 0:\n        return False\n    "
+        "return n * 2\nprint(classify(-1) is not False)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool refused = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      refused = refused || diagnostic.message.find("reference-typed operands") !=
+                               std::string::npos;
+    EXPECT_TRUE(refused) << source;
+  }
+
+  // Two types that really are disjoint still fold, and a shared member is what
+  // separates the two cases: a class instance is never a small int.
+  mlir::MLIRContext disjoint(testRegistry());
+  lython::emitter::EmitResult folded = emitSource(
+      "class P:\n    pass\np = P()\nprint(p is 5)\n", disjoint);
+  EXPECT_TRUE(folded.ok()) << folded.diagnostics.size();
+}
+
 TEST(EmitterTest, AFunctionValueSaysItHasNoRepr) {
   // Nothing resolves a `__repr__` for a callable, and the fall-through used
   // to try to resolve the NAME `repr` -- so all three spellings read

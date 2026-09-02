@@ -1470,12 +1470,44 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     // fallback -- and the argument specializer reaches this with `other` bound
     // to the caller's int, so the refusal fired on a branch whose answer is a
     // constant.
+    //
+    // ⭐ A UNION IS DISJOINT FROM T ONLY IF EVERY MEMBER IS. The test below
+    // asked assignability of the whole type, and `union<int, literal<False>>`
+    // is not assignable to `bool` in either direction even though one of its
+    // members IS a bool -- so the fold answered a question it had no business
+    // answering, silently:
+    //
+    //     def classify(n: int):
+    //         if n < 0:
+    //             return False
+    //         return n * 2
+    //     print(classify(-1) is False)   # printed False; CPython prints True
+    //
+    // Widening the members is part of the same rule: the literal `False` a
+    // `return` contributes is the member that has to be recognised as a bool.
+    // With both, a union that shares a member reaches the reference-identity
+    // path and its refusal, which is the answer the same program already got
+    // when the union was spelled in an annotation.
+    auto identityMembers = [&](mlir::Type type) {
+      llvm::SmallVector<mlir::Type, 4> members;
+      if (auto unionType =
+              mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(type)))
+        for (mlir::Type member : unionType.getMemberTypes())
+          members.push_back(types.widenLiteral(member));
+      else if (mlir::Type widened = types.widenLiteral(type))
+        members.push_back(widened);
+      return members;
+    };
     {
-      mlir::Type lhsDisjoint = types.widenLiteral(lhs.type);
-      mlir::Type rhsDisjoint = types.widenLiteral(rhs.type);
-      if (lhsDisjoint && rhsDisjoint &&
-          !py::isAssignableTo(lhsDisjoint, rhsDisjoint) &&
-          !py::isAssignableTo(rhsDisjoint, lhsDisjoint)) {
+      llvm::SmallVector<mlir::Type, 4> lhsMembers = identityMembers(lhs.type);
+      llvm::SmallVector<mlir::Type, 4> rhsMembers = identityMembers(rhs.type);
+      bool disjoint = !lhsMembers.empty() && !rhsMembers.empty();
+      for (mlir::Type lhsMember : lhsMembers)
+        for (mlir::Type rhsMember : rhsMembers)
+          if (py::isAssignableTo(lhsMember, rhsMember) ||
+              py::isAssignableTo(rhsMember, lhsMember))
+            disjoint = false;
+      if (disjoint) {
         bool truth = negatedIdentity;
         mlir::Type literalType = types.literal(truth ? "True" : "False");
         auto constant = py::BoolConstantOp::create(
