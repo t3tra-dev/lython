@@ -72,6 +72,29 @@ RuntimeBundleLowerer::markOwnedLocalObjectBundle(mlir::Operation *op,
 
   if (auto existing = ownedLocalObjectMarkers.find(logicalValue);
       existing != ownedLocalObjectMarkers.end()) {
+    // ⭐ NOTHING TO RE-ROOT WHEN THE GROUP IS UNCHANGED. The marker is
+    // re-minted at each field store because the store REPLACES lanes, and the
+    // token has to name the new ones. A field with no runtime lanes replaces
+    // nothing -- and re-minting moved the marker to the store, which is inside
+    // the loop when the store is:
+    //
+    //     class C:
+    //         def __init__(self) -> None:
+    //             for _ in range(1):
+    //                 self.v = None
+    //     c = C()
+    //     # owned resource ... reaches function exit without release
+    //
+    // The release placer needs a token that DOMINATES the exit, and one minted
+    // in a loop body does not. Keeping the marker the allocation already put
+    // there is the whole repair; every store that does change a lane still
+    // re-mints, because the operands then differ.
+    //
+    // ⛔ Operand identity, not "the field has no lanes": a store that writes
+    // back the same values it read (`self.xs = self.xs`) has the same
+    // question and the same answer, and asking the values is what covers both.
+    if (existing->second->getOperands() == bundle.objectValue.values)
+      return mlir::success();
     if (!existing->second->use_empty())
       return existing->second->emitError()
              << "owned local object marker unexpectedly has users";

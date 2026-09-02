@@ -2751,6 +2751,43 @@ void ModuleEmitter::collectClassFields(
       // different scope's, and the first type seen still wins
       // (`overwriteExisting=false`), so two branches that disagree take the
       // first and the other store is a type error where it is written.
+      // ⛔ A TUPLE target takes the element type APART: `for i, w in
+      // enumerate(xs)` binds two names from one tuple element, and binding the
+      // tuple to each of them would type both fields wrong rather than leave
+      // them erased.
+      auto bindLoopTarget = [&](const parser::Node *target,
+                                const parser::Node *iter) {
+        if (!target || !iter)
+          return;
+        mlir::Type element = types.iterationElementType(iter);
+        if (!element)
+          return;
+        if (target->kind == "Name") {
+          bindInitLocal(target, types.widenLiteral(element));
+          return;
+        }
+        if (target->kind != "Tuple" && target->kind != "List")
+          return;
+        const auto *parts = ast::nodeList(*target, "elts");
+        if (!parts)
+          return;
+        auto contract =
+            mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(element));
+        if (!contract)
+          return;
+        llvm::ArrayRef<mlir::Type> arguments = contract.getArguments();
+        if (contract.getContractName() == "builtins.tuple" &&
+            arguments.size() == parts->size()) {
+          for (auto [part, argument] : llvm::zip(*parts, arguments))
+            if (part && part->kind == "Name")
+              bindInitLocal(part.get(), types.widenLiteral(argument));
+          return;
+        }
+        if (arguments.size() == 1)
+          for (const parser::NodePtr &part : *parts)
+            if (part && part->kind == "Name")
+              bindInitLocal(part.get(), types.widenLiteral(arguments.front()));
+      };
       std::function<void(const std::vector<parser::NodePtr> *)> walkInitBody =
           [&](const std::vector<parser::NodePtr> *stmts) {
             if (!stmts)
@@ -2809,6 +2846,24 @@ void ModuleEmitter::collectClassFields(
               if (stmt->kind == "FunctionDef" ||
                   stmt->kind == "AsyncFunctionDef" || stmt->kind == "ClassDef")
                 continue;
+              // ⭐ AND THE LOOP TARGET IS IN SCOPE FOR THE BODY. Fields
+              // assigned inside a region became fields when this walk learned
+              // to enter one, and the commonest thing such an assignment
+              // mentions is the loop's own target -- which nothing had bound,
+              // so the field took the erased top:
+              //
+              //     class C:
+              //         def __init__(self) -> None:
+              //             for i in range(3):
+              //                 self.n = i
+              //     print(C().n + 1)
+              //     # static type builtins.object does not provide '__add__'
+              //
+              // Its type is the iterable's element type, which is known here;
+              // the seed scan binds it the same way for the same reason.
+              if (stmt->kind == "For" || stmt->kind == "AsyncFor")
+                bindLoopTarget(ast::node(*stmt, "target"),
+                               ast::node(*stmt, "iter"));
               for (llvm::StringRef region :
                    {"body", "orelse", "finalbody", "handlers"})
                 if (const auto *nested = ast::nodeList(*stmt, region))
