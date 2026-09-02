@@ -3239,15 +3239,24 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       if (std::optional<CallSolution> result =
               tryManifestMethod(*this, widenLiteral(operand), "__neg__", {}))
         return result->result;
+      if (mlir::Type unionResult =
+              unionOperatorResult(operand, "__neg__", {}))
+        return unionResult;
     }
     if (ast::isOperator(op, "UAdd"))
       if (std::optional<CallSolution> result =
               tryManifestMethod(*this, widenLiteral(operand), "__pos__", {}))
         return result->result;
+      if (mlir::Type unionResult =
+              unionOperatorResult(operand, "__pos__", {}))
+        return unionResult;
     if (ast::isOperator(op, "Invert"))
       if (std::optional<CallSolution> result =
               tryManifestMethod(*this, widenLiteral(operand), "__invert__", {}))
         return result->result;
+      if (mlir::Type unionResult =
+              unionOperatorResult(operand, "__invert__", {}))
+        return unionResult;
     return widenLiteral(operand);
   }
   if (node->kind == "BinOp") {
@@ -3363,6 +3372,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     if (std::optional<CallSolution> result =
             tryManifestMethod(*this, left, method, {right}))
       return result->result;
+    if (mlir::Type unionResult = unionOperatorResult(left, method, {right}))
+      return unionResult;
+    if (mlir::Type unionResult =
+            unionArgumentOperatorResult(left, method, right))
+      return unionResult;
     if (left == strType() && right == strType())
       return strType();
     if (ast::isOperator(op, "Div") &&
@@ -4182,6 +4196,105 @@ TypeSystem::fieldAssignmentRefinement(mlir::Type receiverType,
   const py::protocols::Table &table = py::protocols::Table::get(context);
   return table.refineContractByFieldAssignment(widenLiteral(receiverType),
                                                fieldName, valueType);
+}
+
+// ⭐ EVERY MEMBER OR NONE. `1 if c else 1.5` is a union, and CPython adds to it
+// without knowing which member is live because BOTH answer `__add__`. This
+// compiler refused the whole expression -- "static type !py.union<int, float>
+// does not provide manifest method '__add__'" -- for a program whose every
+// execution is well typed.
+//
+// The answer is the JOIN of what the members answer, which is what the tag
+// dispatch the emitter builds actually produces.
+//
+// ⛔ Every member, not a majority: a union with one member that cannot do it
+// has executions that would fail, and CPython fails those at RUN time. Refusing
+// the whole expression is this compiler's rule for that
+// (`never silently mis-execute`), and it is the answer `int | str` keeps.
+//
+// ⛔ And OPERATORS only. A general union method call would need the same
+// dispatch built at every call site that can reach one; the operator paths are
+// where the emitter has it.
+mlir::Type
+TypeSystem::unionOperatorResult(mlir::Type receiver, llvm::StringRef method,
+                                mlir::ArrayRef<mlir::Type> arguments) const {
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(widenLiteral(receiver));
+  if (!unionType)
+    return {};
+  llvm::SmallVector<mlir::Type, 4> results;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    mlir::Type receiverMember = widenLiteral(member);
+    llvm::SmallVector<mlir::Type, 2> memberArguments(arguments.begin(),
+                                                     arguments.end());
+    // ⭐ CPython's numeric tower reaches INTO the union. `int` has no
+    // `__add__` taking a float, so an `int | float` member pair declined here
+    // while the plain `1 + 2.0` beside it compiles -- that one is promoted at
+    // the OPERANDS before the dispatch, and the arm the emitter builds for
+    // this member promotes the same way.
+    if (memberArguments.size() == 1) {
+      mlir::Type argument = widenLiteral(memberArguments.front());
+      if (receiverMember == intType() && argument == floatType())
+        receiverMember = floatType();
+      else if (receiverMember == floatType() && argument == intType())
+        memberArguments[0] = floatType();
+    }
+    // ⭐ AND A UNION ON BOTH SIDES. `mk(-1) + mk(3)` is two of these values
+    // added together, and each member of the left has to ask the same question
+    // of the whole right -- which is the mirror rule, applied per member. The
+    // emitter's arms nest the same way: the left's tag chooses a member, and
+    // the recursive call meets the right's tag with a concrete receiver.
+    if (memberArguments.size() == 1 &&
+        mlir::isa_and_nonnull<py::UnionType>(
+            widenLiteral(memberArguments.front()))) {
+      mlir::Type nested = unionArgumentOperatorResult(
+          receiverMember, method, memberArguments.front());
+      if (!nested)
+        return {};
+      results.push_back(nested);
+      continue;
+    }
+    std::optional<CallSolution> solved =
+        tryManifestMethod(*this, receiverMember, method, memberArguments);
+    if (!solved || !solved->result)
+      return {};
+    results.push_back(widenLiteral(solved->result));
+  }
+  if (results.empty())
+    return {};
+  return join(results);
+}
+
+// ⭐ AND THE UNION ON THE RIGHT. `total += scaled(i)` is the accumulator every
+// running sum is written as, and the value being added is the union -- the
+// receiver is an ordinary float. The left-hand rule above does not see it, so
+// this asks the same question of the argument's members.
+mlir::Type TypeSystem::unionArgumentOperatorResult(mlir::Type receiver,
+                                                   llvm::StringRef method,
+                                                   mlir::Type argument) const {
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(widenLiteral(argument));
+  if (!unionType)
+    return {};
+  mlir::Type receiverType = widenLiteral(receiver);
+  llvm::SmallVector<mlir::Type, 4> results;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    mlir::Type memberType = widenLiteral(member);
+    mlir::Type armReceiver = receiverType;
+    // The same operand promotion the left-hand rule makes; see the note there.
+    if (armReceiver == intType() && memberType == floatType())
+      armReceiver = floatType();
+    else if (armReceiver == floatType() && memberType == intType())
+      memberType = floatType();
+    std::optional<CallSolution> solved =
+        tryManifestMethod(*this, armReceiver, method, {memberType});
+    if (!solved || !solved->result)
+      return {};
+    results.push_back(widenLiteral(solved->result));
+  }
+  if (results.empty())
+    return {};
+  return join(results);
 }
 
 mlir::Type TypeSystem::join(mlir::ArrayRef<mlir::Type> types) const {

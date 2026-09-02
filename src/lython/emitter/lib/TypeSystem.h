@@ -384,6 +384,16 @@ public:
                           mlir::ArrayRef<mlir::Type> positional,
                           mlir::ArrayRef<CallKeywordType> keywords) const;
   mlir::Type join(mlir::ArrayRef<mlir::Type> types) const;
+  // The result an OPERATOR has on a union receiver: the join of what each
+  // member answers, or null unless every member answers. The emitter builds
+  // the matching tag dispatch (`emitUnionOperator`); nothing else may use this
+  // without building one, or the two channels disagree.
+  mlir::Type unionOperatorResult(mlir::Type receiver, llvm::StringRef method,
+                                 mlir::ArrayRef<mlir::Type> arguments) const;
+  // The mirror image: a concrete receiver and a UNION argument.
+  mlir::Type unionArgumentOperatorResult(mlir::Type receiver,
+                                         llvm::StringRef method,
+                                         mlir::Type argument) const;
   // Same-shape callables collapse to one callable whose result is the join of
   // theirs, instead of a union nothing can call.
   mlir::Type commonCallableJoin(mlir::ArrayRef<mlir::Type> members) const;
