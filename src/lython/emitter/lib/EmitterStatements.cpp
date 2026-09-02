@@ -1528,6 +1528,23 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     emitTry(statement);
   } else if (statement.kind == "TryStar") {
     emitTryStar(statement);
+  } else if (statement.kind == "ClassDef") {
+    // ⭐ SAY WHICH STATEMENT AND WHY. A class declared inside a function or
+    // another class got the generic "unsupported statement kind 'ClassDef'"
+    // and then a second, misleading diagnostic at every use of the name
+    // ("unresolved name 'D'") -- which reads as a scoping bug rather than as
+    // the one limitation it is.
+    //
+    // ⛔ Not repaired here: a class is a module-level CONTRACT plus its
+    // methods as module-level functions, and hoisting one out of a function
+    // means deciding what a method that reads an enclosing local closes over.
+    // The nested `def` has an answer for that (its captures ride the function
+    // object); a nested class would need the same for every method at once.
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "a class defined inside a function or another class is not supported: "
+        "a class is a module-level contract here, so declare '" +
+            std::string(ast::nameSpelling(statement)) + "' at module scope"});
   } else {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, statement.range.start,

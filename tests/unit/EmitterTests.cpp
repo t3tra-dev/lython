@@ -1040,4 +1040,31 @@ TEST(EmitterTest, AFunctionValueSaysItHasNoRepr) {
       emitSource("print(repr(1), repr(\"a\"), repr([1]))\n", values);
   EXPECT_TRUE(ok.ok());
 }
+
+TEST(EmitterTest, ANestedClassNamesItsOwnLimit) {
+  // The generic "unsupported statement kind 'ClassDef'" plus a misleading
+  // "unresolved name" at every use read as a scoping bug rather than as the
+  // one limitation it is.
+  mlir::MLIRContext nested(testRegistry());
+  lython::emitter::EmitResult inFunction = emitSource(
+      "def run() -> None:\n    class D:\n        def __init__(self) -> None:\n"
+      "            self.v = 1\n    print(D().v)\nrun()\n",
+      nested);
+  EXPECT_FALSE(inFunction.ok());
+  bool saidClass = false;
+  for (const lython::parser::Diagnostic &diagnostic : inFunction.diagnostics)
+    saidClass = saidClass ||
+                diagnostic.message.find(
+                    "a class defined inside a function or another class") !=
+                    std::string::npos;
+  EXPECT_TRUE(saidClass);
+
+  // At module scope the same class compiles.
+  mlir::MLIRContext top(testRegistry());
+  lython::emitter::EmitResult atModule = emitSource(
+      "class D:\n    def __init__(self) -> None:\n        self.v = 1\n"
+      "def run() -> None:\n    print(D().v)\nrun()\n",
+      top);
+  EXPECT_TRUE(atModule.ok());
+}
 }
