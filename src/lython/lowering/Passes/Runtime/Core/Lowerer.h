@@ -419,6 +419,14 @@ private:
                                           const RuntimeBundle &object);
   mlir::LogicalResult
   lowerStaticCtypesFieldAttrGet(py::AttrGetOp op, const RuntimeBundle &object);
+  // The class-attribute constant channel, shared by the two spellings that
+  // reach it: `C.attr` through the class object and `c.attr` through an
+  // instance. `handled` says whether it materialized a value; false with
+  // success means the class declares no such attribute, or declares one this
+  // channel cannot re-materialize.
+  mlir::LogicalResult lowerStaticClassAttributeConstant(py::AttrGetOp op,
+                                                        py::ClassOp classOp,
+                                                        bool &handled);
   mlir::LogicalResult lowerStaticCtypesFieldAttrSet(py::AttrSetOp op,
                                                     const RuntimeBundle &object,
                                                     const RuntimeBundle *value);

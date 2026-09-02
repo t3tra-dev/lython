@@ -5,6 +5,7 @@
 #include "Runtime/ABI/BoxLayout.h"
 
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
@@ -1019,6 +1020,53 @@ mlir::LogicalResult RuntimeBundleLowerer::rebindMutatedContainer(
   return RuntimeBundleLowerer::writeBackFieldAlias(op, rebound);
 }
 
+mlir::LogicalResult RuntimeBundleLowerer::lowerStaticClassAttributeConstant(
+    py::AttrGetOp op, py::ClassOp classOp, bool &handled) {
+  handled = false;
+  std::optional<mlir::Attribute> staticValue =
+      py::type_object::staticAttributeValue(classOp, op.getName());
+  if (!staticValue)
+    return mlir::success();
+  auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(*staticValue);
+  if (!dict)
+    return op.emitError() << "static class attribute metadata for '"
+                          << op.getName() << "' is malformed";
+  auto kind = dict.getAs<mlir::StringAttr>("kind");
+  if (!kind)
+    return op.emitError() << "static class attribute '" << op.getName()
+                          << "' has no metadata kind";
+  llvm::StringRef defaultKind =
+      llvm::StringSwitch<llvm::StringRef>(kind.getValue())
+          .Case("constant.none", "none")
+          .Case("constant.bool", "bool")
+          .Case("constant.int", "int")
+          .Case("constant.float", "float")
+          .Case("constant.str", "str")
+          .Default(llvm::StringRef());
+  // ⛔ Not an error here. The class spelling reports the unsupported
+  // expression itself, and the INSTANCE spelling has a better sentence for it
+  // one line down -- this channel only says whether it answered.
+  if (defaultKind.empty())
+    return mlir::success();
+
+  llvm::SmallVector<mlir::NamedAttribute, 4> attrs;
+  attrs.push_back(
+      builder.getNamedAttr("kind", builder.getStringAttr(defaultKind)));
+  if (mlir::Attribute value = dict.get("value"))
+    attrs.push_back(builder.getNamedAttr("value", value));
+  mlir::DictionaryAttr defaultValue = builder.getDictionaryAttr(attrs);
+
+  builder.setInsertionPoint(op);
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::materializeDefaultValue(
+          op, op.getResult().getType(), defaultValue, result)))
+    return mlir::failure();
+  valueBundles[op.getResult()] = std::move(result);
+  erase.push_back(op);
+  handled = true;
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   const RuntimeBundle *object = RuntimeBundleLowerer::bundleFor(op.getObject());
   if (!object)
@@ -1037,49 +1085,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
     if (py::ClassOp classOp =
             RuntimeBundleLowerer::classForContract(object->instanceContract)) {
-      if (std::optional<mlir::Attribute> staticValue =
-              py::type_object::staticAttributeValue(classOp, op.getName())) {
-        auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(*staticValue);
-        if (!dict)
-          return op.emitError() << "static class attribute metadata for '"
-                                << op.getName() << "' is malformed";
-        auto kind = dict.getAs<mlir::StringAttr>("kind");
-        if (!kind)
-          return op.emitError() << "static class attribute '" << op.getName()
-                                << "' has no metadata kind";
-        llvm::StringRef spelling = kind.getValue();
-        llvm::StringRef defaultKind = spelling;
-        if (spelling == "constant.none")
-          defaultKind = "none";
-        else if (spelling == "constant.bool")
-          defaultKind = "bool";
-        else if (spelling == "constant.int")
-          defaultKind = "int";
-        else if (spelling == "constant.float")
-          defaultKind = "float";
-        else if (spelling == "constant.str")
-          defaultKind = "str";
-        else
-          return op.emitError()
-                 << "unsupported static class attribute expression for '"
-                 << op.getName() << "'";
-
-        llvm::SmallVector<mlir::NamedAttribute, 4> attrs;
-        attrs.push_back(
-            builder.getNamedAttr("kind", builder.getStringAttr(defaultKind)));
-        if (mlir::Attribute value = dict.get("value"))
-          attrs.push_back(builder.getNamedAttr("value", value));
-        mlir::DictionaryAttr defaultValue = builder.getDictionaryAttr(attrs);
-
-        builder.setInsertionPoint(op);
-        RuntimeBundle result;
-        if (mlir::failed(RuntimeBundleLowerer::materializeDefaultValue(
-                op, op.getResult().getType(), defaultValue, result)))
-          return mlir::failure();
-        valueBundles[op.getResult()] = std::move(result);
-        erase.push_back(op);
+      bool handled = false;
+      if (mlir::failed(RuntimeBundleLowerer::lowerStaticClassAttributeConstant(
+              op, classOp, handled)))
+        return mlir::failure();
+      if (handled)
         return mlir::success();
-      }
+      if (py::type_object::staticAttributeValue(classOp, op.getName()))
+        return op.emitError()
+               << "unsupported static class attribute expression for '"
+               << op.getName() << "'";
     }
     mlir::LogicalResult descriptorResult =
         RuntimeBundleLowerer::lowerStaticCtypesTypeFieldDescriptorGet(op,
@@ -1738,9 +1753,31 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
 
   if (!classOp)
     return op.emitError() << "attr.get object type has no class schema";
-  if (!fieldIndex)
+  if (!fieldIndex) {
+    // ⭐ AN INSTANCE READS ITS CLASS'S ATTRIBUTE, and only the CLASS spelling
+    // could. A main-module class attribute is slot-backed, so the emitter
+    // rewrites `c.attr` to the cell and never arrives here -- but an IMPORTED
+    // class has no cell (its module's body never runs to fill one) and keeps
+    // the constant channel, which had one caller:
+    //
+    //     # m.py: class A:  kind: str = "a"
+    //     import m
+    //     print(m.A.kind)     # "a"
+    //     print(m.A(1).kind)  # class m.A has no field 'kind'
+    //
+    // Two spellings of one question, and the second answered with the
+    // compiler's own sentence for a program CPython runs. Re-materializing is
+    // sound for exactly what this channel carries: the scalar constants, which
+    // no reader can tell apart from a shared one.
+    bool handled = false;
+    if (mlir::failed(RuntimeBundleLowerer::lowerStaticClassAttributeConstant(
+            op, classOp, handled)))
+      return mlir::failure();
+    if (handled)
+      return mlir::success();
     return op.emitError() << "class " << classOp.getSymName()
                           << " has no field '" << op.getName() << "'";
+  }
   if (*fieldIndex >= fieldTypes.size())
     return op.emitError() << "class field metadata is malformed for "
                           << classOp.getSymName();

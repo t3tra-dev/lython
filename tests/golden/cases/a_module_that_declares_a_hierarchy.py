@@ -3,6 +3,9 @@
 # alone declares two classes and prints nothing, which is what its empty
 # expectation says.
 class Shape:
+    kind: str = "shape"
+    sides: int = 4
+
     def __init__(self, size: int) -> None:
         self.size = size
 
