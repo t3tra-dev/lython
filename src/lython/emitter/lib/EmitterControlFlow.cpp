@@ -849,6 +849,89 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   }
   if (valueNodes.empty())
     return {};
+  // ⭐ AND THE OTHER NAMES THE REGION BINDS, because the slot has to be typed
+  // BEFORE the body runs and the value usually mentions one of them:
+  //
+  //     def f() -> int:
+  //         for _ in range(1):
+  //             a = 5
+  //             r = a + 1
+  //         return r
+  //     # unresolved name 'r'
+  //
+  // `r = 6` in the same position has always worked, and so has a value built
+  // from the loop TARGET -- that one is passed in as a hint. Every other name
+  // the body binds was simply not in scope, so the inference declined and the
+  // name got no slot at all. This is the rule the seed scan already states for
+  // the same reason ("a name the suite binds").
+  //
+  // ⛔ Not the name being decided: its type is the answer this is computing,
+  // and binding a guess for it would make `r = r + 1` agree with itself. And
+  // only names whose value infers to something concrete -- an unknown one is
+  // left unbound rather than bound to the erased top, which would decide the
+  // slot for a value nothing knows.
+  // The walk is rewound one statement for the whole inference: the region being
+  // entered is the statement just passed, and both the seeds in it and the one
+  // for `name` itself live INSIDE it.
+  llvm::SaveAndRestore<std::size_t> rewound(
+      currentSuiteIndex, currentSuiteIndex ? currentSuiteIndex - 1 : 0);
+  TypeSystem::Scope regionScope = types.pushScope();
+  {
+    // ⛔ An EMPTY container the region binds is seeded rather than bound at the
+    // erased element it carries. Binding `list[object]` is worse than binding
+    // nothing: `r = xs[0] + 1` then infers `object + 1`, declines, and the
+    // name being decided gets no slot -- so `xs = []` beside the append that
+    // fills it took the whole statement down with it.
+    auto seededEmptyType = [&](const parser::Node *value,
+                               llvm::StringRef bound) -> mlir::Type {
+      llvm::StringRef literalKind = value->kind;
+      if (literalKind == "Call") {
+        llvm::StringRef callee = ast::nameSpelling(*ast::node(*value, "func"));
+        literalKind = callee == "dict"    ? "Dict"
+                      : callee == "set"   ? "Set"
+                      : callee == "tuple" ? "Tuple"
+                                          : "List";
+      }
+      return emptyLiteralSeedType(bound, literalKind);
+    };
+    std::function<void(const parser::Node *)> bindRegionLocals =
+        [&](const parser::Node *node) {
+          if (!node || node->kind == "FunctionDef" ||
+              node->kind == "AsyncFunctionDef" || node->kind == "ClassDef")
+            return;
+          if (node->kind == "Assign") {
+            const parser::Node *value = ast::node(*node, "value");
+            const auto *targets = ast::nodeList(*node, "targets");
+            if (value && targets && targets->size() == 1 &&
+                targets->front() && targets->front()->kind == "Name") {
+              llvm::StringRef bound = ast::nameSpelling(*targets->front());
+              if (bound != name) {
+                mlir::Type type =
+                    isEmptyContainerExpression(value)
+                        ? seededEmptyType(value, bound)
+                        : types.widenLiteral(types.inferExpr(value));
+                if (type && type != types.object())
+                  types.bindLocalSymbol(bound, type);
+              }
+            }
+          }
+          for (const parser::Field &field : node->fields) {
+            if (const auto *child =
+                    std::get_if<parser::NodePtr>(&field.value)) {
+              bindRegionLocals(child->get());
+              continue;
+            }
+            if (const auto *children =
+                    std::get_if<std::vector<parser::NodePtr>>(&field.value))
+              for (const parser::NodePtr &child : *children)
+                bindRegionLocals(child.get());
+          }
+        };
+    for (const std::vector<parser::NodePtr> *body : bodies)
+      if (body)
+        for (const parser::NodePtr &statement : *body)
+          bindRegionLocals(statement.get());
+  }
   llvm::SmallVector<mlir::Type, 4> inferred;
   // ⭐ AN EMPTY CONTAINER SITE CONTRIBUTES NO ELEMENT TYPE, here as everywhere
   // else. The slot took the join of every binding site, and `[]` joins as
@@ -925,8 +1008,6 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
                     : callee == "tuple" ? "Tuple"
                                         : "List";
     }
-    llvm::SaveAndRestore<std::size_t> rewound(
-        currentSuiteIndex, currentSuiteIndex ? currentSuiteIndex - 1 : 0);
     if (mlir::Type seeded = emptyLiteralSeedType(name, literalKind))
       inferred.push_back(seeded);
   }
