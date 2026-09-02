@@ -22,6 +22,142 @@ bool isTopLevelClass(const parser::Node &statement) {
   return statement.kind == "ClassDef";
 }
 
+// ⭐ A STATEMENT IN AN IMPORTED MODULE THAT WOULD HAVE RUN AT IMPORT. The walk
+// below recognises DECLARATIONS -- defs, classes, imports and the constant
+// bindings `bindSourceModuleLocals` reads -- and everything else fell through
+// a bare `continue`, so a module-level `print(...)`, an `ITEMS.append(1)` or a
+// loop that fills a table simply did not happen:
+//
+//     # o.py
+//     print("side effect")
+//     # main
+//     import o        # printed nothing; CPython prints "side effect"
+//
+// A declaration is not a statement that runs, which is why the list is exactly
+// the declarations plus the two shapes with no effect at all: a docstring (a
+// bare string expression, which every ported stdlib module opens with) and
+// `pass`.
+//
+// ⛔ REFUSED rather than executed. Running an imported module's body needs a
+// module-init function and an import order to call it in, which is a mechanism
+// this compiler does not have; the rule for what it cannot do is to say so at
+// the earliest static boundary rather than answer as if the body were empty.
+bool isImportTimeDeclaration(const parser::Node &statement) {
+  llvm::StringRef kind(statement.kind);
+  if (kind == "FunctionDef" || kind == "AsyncFunctionDef" ||
+      kind == "ClassDef" || kind == "Import" || kind == "ImportFrom" ||
+      kind == "Assign" || kind == "AnnAssign" || kind == "Pass")
+    return true;
+  if (kind != "Expr")
+    return false;
+  const parser::Node *value = ast::node(statement, "value");
+  return value && value->kind == "Constant";
+}
+
+// The leaf spelling of a decorator, whatever shape it is written in. Kept
+// local rather than shared with EmitterClasses.cpp's richer version: the only
+// question here is whether the decorator is one of the markers that emit no
+// code, and a marker is always a bare name or a dotted one.
+llvm::StringRef importedDecoratorLeaf(const parser::Node &decorator) {
+  const parser::Node *node = &decorator;
+  if (node->kind == "Call")
+    if (const parser::Node *callee = ast::node(*node, "func"))
+      node = callee;
+  if (node->kind == "Name")
+    return ast::nameSpelling(*node);
+  if (node->kind == "Attribute")
+    if (std::optional<std::string_view> attr = ast::string(*node, "attr"))
+      return llvm::StringRef(attr->data(), attr->size());
+  return llvm::StringRef();
+}
+
+// ⭐ A DECORATOR ON AN IMPORTED DEF WAS DROPPED IN SILENCE, and this is the
+// one shape in the family that ANSWERS rather than refusing:
+//
+//     # m.py
+//     def twice(f): ...            # returns a wrapper that doubles
+//     @twice
+//     def scaled(n: int) -> int:
+//         return n + 1
+//     # main
+//     import m
+//     print(m.scaled(1))           # printed 2; CPython prints 4
+//
+// The same program in ONE file is right. `f = d(f)` is a module-level
+// rebinding evaluated at the def's position in module flow, and an imported
+// module has no flow to evaluate it in -- the emission walk called
+// `emitCallableFunction` for the body and neither `checkDecorators` nor
+// `applyFunctionDecorators` ran, so the decorator vanished and the
+// UNDECORATED function answered under the decorated name.
+//
+// ⛔ Except the markers that emit no code at all (`@overload`, `@override`,
+// `@final`, `@runtime_checkable`, `@native`): those constrain the checker, and
+// dropping them drops nothing.
+bool importedDecoratorEmitsNoCode(const parser::Node &decorator) {
+  llvm::StringRef leaf = importedDecoratorLeaf(decorator);
+  return leaf == "overload" || leaf == "override" || leaf == "final" ||
+         leaf == "runtime_checkable" || leaf == "native";
+}
+
+void refuseImportTimeStatements(TypeSystem &types,
+                                const std::vector<parser::NodePtr> &body,
+                                llvm::StringRef sourceName,
+                                std::vector<parser::Diagnostic> &diagnostics) {
+  for (const parser::NodePtr &statement : body) {
+    if (!statement)
+      continue;
+    // A module-level `if` is not itself a statement that runs when its test is
+    // decidable here: `staticModuleStatements` replaces it with the branch
+    // taken, and this walk asks the same question so the two agree about what
+    // the module contains. One it cannot decide is a branch nobody chooses,
+    // which is the silent drop again.
+    if (statement->kind == "If") {
+      const parser::Node *test = ast::node(*statement, "test");
+      std::optional<bool> truth =
+          test ? optionalStaticBranchTruth(*test, types, /*from=*/nullptr)
+               : std::nullopt;
+      if (!truth) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement->range.start,
+            "a module-level 'if' in an imported module needs a test this "
+            "compiler can decide: an imported module's body does not run, so "
+            "neither branch would be taken",
+            sourceName.str()});
+        continue;
+      }
+      if (const auto *branch =
+              ast::nodeList(*statement, *truth ? "body" : "orelse"))
+        refuseImportTimeStatements(types, *branch, sourceName, diagnostics);
+      continue;
+    }
+    if (isImportTimeDeclaration(*statement)) {
+      if (statement->kind == "FunctionDef" ||
+          statement->kind == "AsyncFunctionDef")
+        if (const auto *decorators =
+                ast::nodeList(*statement, "decorator_list"))
+          for (const parser::NodePtr &decorator : *decorators) {
+            if (!decorator || importedDecoratorEmitsNoCode(*decorator))
+              continue;
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, statement->range.start,
+                "a decorator on a function in an imported module is not "
+                "supported: an imported module's body does not run, so the "
+                "decorator would never be applied and the undecorated "
+                "function would answer under its name",
+                sourceName.str()});
+            break;
+          }
+      continue;
+    }
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement->range.start,
+        "a module-level statement in an imported module is not supported: an "
+        "imported module's body does not run, so this statement would be "
+        "dropped in silence",
+        sourceName.str()});
+  }
+}
+
 std::string sourceModuleFunctionSymbol(llvm::StringRef module,
                                        llvm::StringRef function) {
   return (llvm::Twine(module) + "." + function).str();
@@ -885,8 +1021,8 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode)
       continue;
-    const auto *body = ast::nodeList(*source.moduleNode, "body");
-    if (!body)
+    const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
+    if (!rawBody)
       continue;
     std::string savedSourceName = sourceName;
     std::string savedPackageName = activePackageName;
@@ -913,7 +1049,25 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       sourceName = std::move(savedSourceName);
       continue;
     }
-    for (const parser::NodePtr &statement : *body) {
+    // ⭐ THE SAME FLATTENING EVERY BINDER IN THIS FILE DOES. A module-level
+    // `if` whose test is statically decidable IS one branch's statements, and
+    // `bindSourceModuleLocals` reads the module that way -- but this EMISSION
+    // loop read the raw body, so a def inside such a branch had its name bound
+    // and its body never emitted:
+    //
+    //     # q.py: if sys.platform == "win32": def sep(): ... else: def sep(): ...
+    //     import q
+    //     print(q.sep())      # error: unresolved runtime binding 'q.sep'
+    //
+    // A lowering sentence for a program CPython runs, and the disagreement is
+    // between two walks of one module -- so the fix is to walk it once the
+    // same way, not to teach this loop a second recogniser for `If`.
+    const std::vector<parser::NodePtr> body =
+        staticModuleStatements(types, *rawBody);
+    // ⛔ Over the RAW body, because the flattener DROPS what it cannot decide
+    // and the refusal is precisely for what gets dropped.
+    refuseImportTimeStatements(types, *rawBody, sourceName, diagnostics);
+    for (const parser::NodePtr &statement : body) {
       if (!statement)
         continue;
       std::size_t diagnosticStart = diagnostics.size();

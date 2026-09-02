@@ -2,7 +2,11 @@
 #include "Emitter.h"
 #include "Parser.h"
 
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 
@@ -42,6 +46,117 @@ TEST(EmitterTest, EmitsSimpleModule) {
       emitSource("x = 1\nprint(x + 2)\n", context);
   EXPECT_TRUE(emitted.ok());
   EXPECT_TRUE(emitted.module);
+}
+
+// What: emit a two-module program. The helper goes on DISK rather than into a
+// second buffer because import resolution is a driver stage that reads the
+// importer's directory, and `emitMLIRFromSource` is the earliest entry point
+// that runs it -- so a diagnostic about an imported module can still be
+// asserted without paying for a lowering.
+struct ImportedModuleEmit {
+  bool succeeded = false;
+  std::string diagnostics;
+};
+
+ImportedModuleEmit emitWithImportedModule(llvm::StringRef helperName,
+                                          llvm::StringRef helperSource,
+                                          llvm::StringRef mainSource) {
+  ImportedModuleEmit result;
+  llvm::SmallString<128> dir;
+  if (llvm::sys::fs::createUniqueDirectory("lython-emit-import", dir)) {
+    result.diagnostics = "could not create a temporary import directory";
+    return result;
+  }
+  llvm::SmallString<128> helperPath(dir);
+  llvm::sys::path::append(helperPath, llvm::Twine(helperName) + ".py");
+  {
+    std::error_code error;
+    llvm::raw_fd_ostream out(helperPath, error);
+    if (error) {
+      result.diagnostics = "could not write the helper module";
+      return result;
+    }
+    out << helperSource;
+  }
+  llvm::SmallString<128> mainPath(dir);
+  llvm::sys::path::append(mainPath, "main.py");
+
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  llvm::raw_string_ostream diag(result.diagnostics);
+  lython::driver::DriverOptions options;
+  options.targetTriple = llvm::sys::getDefaultTargetTriple();
+  result.succeeded = mlir::succeeded(lython::driver::emitMLIRFromSource(
+      mainSource, mainPath, dir, options, context, module, diag));
+  llvm::sys::fs::remove(helperPath);
+  llvm::sys::fs::remove(dir);
+  return result;
+}
+
+// What: an imported module's body does not run, so a statement in it that WOULD
+// have run is refused instead of dropped.
+TEST(EmitterTest, RefusesAStatementInAnImportedModuleBody) {
+  ImportedModuleEmit emitted = emitWithImportedModule(
+      "sider", "ITEMS: \"list[int]\" = []\nITEMS.append(1)\n",
+      "import sider\nprint(sider.ITEMS)\n");
+  EXPECT_FALSE(emitted.succeeded);
+  EXPECT_NE(emitted.diagnostics.find(
+                "a module-level statement in an imported module is not "
+                "supported"),
+            std::string::npos)
+      << emitted.diagnostics;
+}
+
+// What: a decorator on a function in an imported module. It was dropped and the
+// undecorated function answered under the decorated name, so the refusal is
+// what keeps the wrong answer from happening.
+TEST(EmitterTest, RefusesADroppedDecoratorInAnImportedModule) {
+  ImportedModuleEmit emitted = emitWithImportedModule(
+      "wrapped",
+      "from typing import Callable\n\n"
+      "def twice(f: \"Callable[[int], int]\") -> \"Callable[[int], int]\":\n"
+      "    def inner(n: int) -> int:\n        return f(n) * 2\n"
+      "    return inner\n\n"
+      "@twice\ndef scaled(n: int) -> int:\n    return n + 1\n",
+      "import wrapped\nprint(wrapped.scaled(1))\n");
+  EXPECT_FALSE(emitted.succeeded);
+  EXPECT_NE(emitted.diagnostics.find(
+                "a decorator on a function in an imported module is not "
+                "supported"),
+            std::string::npos)
+      << emitted.diagnostics;
+}
+
+// What: the floor the two refusals above stand on -- an imported module of
+// plain declarations still emits, so what they refuse is what they name.
+TEST(EmitterTest, EmitsAnImportedModuleOfDeclarations) {
+  ImportedModuleEmit emitted = emitWithImportedModule(
+      "plain",
+      "\"a docstring\"\n\nCOUNT = 3\n\n"
+      "def only(n: int) -> int:\n    return n + COUNT\n\n"
+      "class Holder:\n    def __init__(self, v: int) -> None:\n"
+      "        self.v = v\n",
+      "import plain\nprint(plain.only(1), plain.Holder(2).v)\n");
+  EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
+}
+
+// What: the same refusal for the branch nobody can choose -- a module-level
+// `if` whose test this compiler cannot decide selects no branch at all.
+TEST(EmitterTest, RefusesAnUndecidableIfInAnImportedModuleBody) {
+  ImportedModuleEmit emitted = emitWithImportedModule(
+      "chooser",
+      "import sys\n\n"
+      "if len(sys.argv) > 1:\n"
+      "    def pick() -> int:\n        return 1\n"
+      "else:\n"
+      "    def pick() -> int:\n        return 2\n",
+      "import chooser\nprint(chooser.pick())\n");
+  EXPECT_FALSE(emitted.succeeded);
+  EXPECT_NE(emitted.diagnostics.find(
+                "a module-level 'if' in an imported module needs a test this "
+                "compiler can decide"),
+            std::string::npos)
+      << emitted.diagnostics;
 }
 
 TEST(EmitterTest, ReportsUnresolvedName) {
