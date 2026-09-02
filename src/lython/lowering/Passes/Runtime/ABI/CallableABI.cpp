@@ -1307,7 +1307,23 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             laid = false;
             break;
           }
-          if (memberOwnsALane(member))
+          // ⭐ A LANE IS OWNED ONLY IF IT IS A POINTER. `memberOwnsALane`
+          // asks the manifest whether the contract has a deallocator, and
+          // `builtins.bool` registers one -- but a bool member lowers to a
+          // bare i1, so the offset named an integer word and the ownership
+          // verifier refused the function it was put on:
+          //
+          //     def g(flag: bool):
+          //         return 1 if flag else False
+          //     # ly.ownership.owned_results result 1 must start an
+          //     # object-header-like result group
+          //
+          // ⛔ Not by naming bool: the condition the verifier enforces is
+          // about the PHYSICAL lane, so asking the lane directly also covers
+          // every future member whose contract has a deallocator it never
+          // reaches through a pointer.
+          if (memberOwnsALane(member) && !memberTypes->empty() &&
+              ownership::isObjectHeaderLikeType(memberTypes->front()))
             memberLanes.emplace_back(memberOffset, runtimeContractName(member));
           memberOffset += static_cast<std::int64_t>(memberTypes->size());
         }
