@@ -710,8 +710,12 @@ private:
   Value emitEmptyStrConstant(const parser::Node &anchor);
   Value emitStrLiteralPiece(const parser::Node &anchor, llvm::StringRef text);
   bool canStringifyType(mlir::Type type);
+  // The same question for the !r / !a direction, where the ladder is shorter:
+  // only __repr__ answers it.
+  bool canConvertType(mlir::Type type, int64_t conversion);
   Value emitUnionStringify(const parser::Node &anchor, Value value,
-                           py::UnionType unionType, unsigned index);
+                           py::UnionType unionType, unsigned index,
+                           int64_t conversion = 's');
   // str.format with a compile-time template: fields are matched against the
   // call arguments during emission (R4: literal templates are checked here).
   std::optional<Value> tryEmitStrFormatCall(const parser::Node &expr,

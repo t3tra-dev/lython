@@ -89,9 +89,25 @@ bool ModuleEmitter::canStringifyType(mlir::Type type) {
 // last member as the final else -- and each arm goes back through
 // `emitStringifyValue`, so a member that is itself a class, an exception or a
 // container renders the way it does anywhere else.
+bool ModuleEmitter::canConvertType(mlir::Type type, int64_t conversion) {
+  if (conversion == 's')
+    return canStringifyType(type);
+  mlir::Type widened = types.widenLiteral(type);
+  if (widened == types.none())
+    return true;
+  if (lookupClassMethod(widened, "__repr__"))
+    return true;
+  if (!types.inferMethodCallWithEvidence(widened, "__repr__", {}))
+    return false;
+  if (conversion != 'a')
+    return true;
+  return static_cast<bool>(types.inferMethodCallWithEvidence(
+      types.contract("builtins.str"), "__ascii__", {}));
+}
+
 Value ModuleEmitter::emitUnionStringify(const parser::Node &anchor, Value value,
                                         py::UnionType unionType,
-                                        unsigned index) {
+                                        unsigned index, int64_t conversion) {
   mlir::Type strType = types.contract("builtins.str");
   llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
   auto renderMember = [&](mlir::Type member) -> mlir::Value {
@@ -101,13 +117,16 @@ Value ModuleEmitter::emitUnionStringify(const parser::Node &anchor, Value value,
       return emitStrLiteralPiece(anchor, "None").value;
     auto unwrap =
         py::UnionUnwrapOp::create(builder, loc(anchor), member, value.value);
+    Value memberValue{unwrap.getResult(), member};
     std::optional<Value> text =
-        emitStringifyValue(anchor, Value{unwrap.getResult(), member});
+        conversion == 's'
+            ? emitStringifyValue(anchor, memberValue)
+            : emitConversionValue(anchor, memberValue, conversion);
     // Unreachable while `canStringifyType` gates every member, and cheaper to
     // answer than to prove: an empty string is a wrong ANSWER, so it may not
     // stand in. The caller checked; if the two ever disagree this is a crash
     // in a debug build rather than a silent blank.
-    assert(text && "union member passed canStringifyType but did not render");
+    assert(text && "union member passed canConvertType but did not render");
     // ⛔ A str member renders to ITSELF (the first arm of
     // `emitStringifyValue` is the identity), so what comes back is the union's
     // own payload rather than a freshly built string the way every other
@@ -125,7 +144,9 @@ Value ModuleEmitter::emitUnionStringify(const parser::Node &anchor, Value value,
       loc(anchor), test.getResult(), strType,
       [&] { return renderMember(members[index]); },
       [&] {
-        return emitUnionStringify(anchor, value, unionType, index + 1).value;
+        return emitUnionStringify(anchor, value, unionType, index + 1,
+                                  conversion)
+            .value;
       });
   return Value{rendered, strType};
 }
@@ -230,6 +251,34 @@ ModuleEmitter::emitConversionValue(const parser::Node &anchor, Value value,
   mlir::Type valueType = types.widenLiteral(value.type);
   if (valueType == types.none())
     return emitStrLiteralPiece(anchor, "None");
+  // ⭐ AND A UNION STILL RENDERS BY TAG HERE. The str direction has had this
+  // arm since `print(d.get("b"))` needed it; the repr direction never grew
+  // one, and every spelling that reaches it failed on a union -- `repr(u)`
+  // and `str(u)` disagreeing about the same value:
+  //
+  //     repr(d.get("b"))   # unresolved name 'repr'
+  //     f"{u!r}"           # f-string conversion is not statically resolvable
+  //     f"{u!a}"           # the same
+  //     "%r" % (u,)        # %-formatting conversion is not statically ...
+  //     ascii(u)           # ascii() is not supported for this argument type
+  //
+  // None of those is a question about the union: each member has a __repr__,
+  // and which one to ask is what the tag says. The member arms recurse through
+  // THIS function rather than the str one, so a str member comes back quoted.
+  //
+  // ⛔ Gated on `canConvertType` and not `canStringifyType`: a source class
+  // that declares only __str__ renders in the str direction and has nothing to
+  // answer here, and the branch chain cannot be half-emitted and undone.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(valueType)) {
+    llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+    if (members.empty())
+      return std::nullopt;
+    for (mlir::Type member : members)
+      if (!canConvertType(member, conversion))
+        return std::nullopt;
+    return emitUnionStringify(anchor, value, unionType, /*index=*/0,
+                              conversion);
+  }
   std::optional<Value> repr;
   if (dispatchIsUnresolvable(value, "__repr__", /*receiverNode=*/nullptr,
                              /*throughSuper=*/false)) {

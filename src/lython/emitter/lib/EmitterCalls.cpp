@@ -4850,6 +4850,17 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
                                   methodBindingBindsReceiver(*sourceMethod),
                                   *sourceMethod, {}, emptyKeywords);
     } else if (name == "repr") {
+      // A union has no contract of its own to resolve `__repr__` against, so
+      // the ladder below answered nothing and the fall-through then tried to
+      // resolve the NAME `repr` -- `repr(d.get("b"))` read "unresolved name
+      // 'repr'", a builtin the program never mentioned. `str()` has said the
+      // same thing about the same value since it grew its union arm; this is
+      // that arm on the repr side, and `emitConversionValue` is where it
+      // lives because !r and %r reach the union through the same door.
+      if (mlir::isa<py::UnionType>(argumentType))
+        if (std::optional<Value> rendered = emitConversionValue(
+                expr, emitExpr(args->front().get()), 'r'))
+          return *rendered;
       // Manifest-typed receiver (int/str/...): emit py.repr dispatch, the
       // same manifest path `str()` uses (avoid altering `print`'s existing
       // function-binding lowering, which this special case only optimizes).
