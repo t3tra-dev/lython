@@ -1,0 +1,4 @@
+['shape', 'square', 'rounded', 'sharp']
+['shape1', 'square2', 'rounded3', 'sharp4']
+[False, False, True, False]
+[False, True, False, True]

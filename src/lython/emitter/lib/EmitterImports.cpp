@@ -965,6 +965,80 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     const auto *declarations = ast::nodeList(*source.moduleNode, "body");
     if (!declarations)
       continue;
+    // ⭐ AND THE MODULE'S OWN IMPORT SPELLINGS, read from its AST. A base that
+    // lives in ANOTHER module was recorded wrong in all three spellings:
+    //
+    //     # base.py: class Root:  show() -> "R"
+    //     # mid.py:  import base
+    //     #          class Middle(base.Root):  show() -> "M"
+    //     xs: "list[base.Root]" = [base.Root(1), mid.Middle(2)]
+    //     print([x.show() for x in xs])
+    //     # printed ['R1', 'R2']; CPython prints ['R1', 'M2']
+    //
+    // A dotted base is an Attribute, which the walk below skipped outright,
+    // and `from base import Root` gives a bare Name that the walk qualified
+    // with the WRONG module -- `mid.Root`, a class nothing declares. Either
+    // way `mid.Middle` had no recorded base, so the override guard was told
+    // the hierarchy is flat and `isinstance(x, mid.Middle)` answered False for
+    // a Middle.
+    //
+    // ⛔ Read from the AST rather than from the type system: this pass runs
+    // before any module scope is pushed, precisely so that the answer does not
+    // depend on the order the modules are walked, and nothing else knows yet
+    // what `base` or `Root` mean inside this file.
+    llvm::StringMap<std::string> moduleAliases;
+    llvm::StringMap<std::string> importedClasses;
+    for (const parser::NodePtr &statement : *declarations) {
+      if (!statement)
+        continue;
+      const bool isFrom = statement->kind == "ImportFrom";
+      if (statement->kind != "Import" && !isFrom)
+        continue;
+      std::optional<std::string_view> fromModule =
+          isFrom ? ast::string(*statement, "module") : std::nullopt;
+      if (isFrom && !fromModule)
+        continue;
+      const auto *names = ast::nodeList(*statement, "names");
+      if (!names)
+        continue;
+      for (const parser::NodePtr &alias : *names) {
+        if (!alias)
+          continue;
+        std::optional<std::string_view> name = ast::string(*alias, "name");
+        if (!name || *name == "*")
+          continue;
+        std::optional<std::string_view> asname = ast::string(*alias, "asname");
+        std::string local(asname ? *asname : *name);
+        if (isFrom)
+          importedClasses[local] =
+              (llvm::Twine(*fromModule) + "." + llvm::StringRef(*name)).str();
+        else
+          moduleAliases[local] = std::string(*name);
+      }
+    }
+    auto qualifyBase = [&](const parser::Node &base) -> std::string {
+      if (base.kind == "Name") {
+        llvm::StringRef spelling = ast::nameSpelling(base);
+        auto imported = importedClasses.find(spelling);
+        if (imported != importedClasses.end())
+          return imported->second;
+        return sourceModuleClassSymbol(source.moduleName, spelling);
+      }
+      std::string dotted = ast::qualifiedName(&base);
+      if (dotted.empty())
+        return {};
+      auto [head, rest] = llvm::StringRef(dotted).split('.');
+      if (rest.empty())
+        return {};
+      if (auto alias = moduleAliases.find(head); alias != moduleAliases.end())
+        return (llvm::Twine(alias->second) + "." + rest).str();
+      // `from pkg import mod` binds a MODULE under a leaf name too, and a base
+      // written through it (`mod.X`) is the same question one level down.
+      if (auto nested = importedClasses.find(head);
+          nested != importedClasses.end())
+        return (llvm::Twine(nested->second) + "." + rest).str();
+      return {};
+    };
     for (const parser::NodePtr &statement : *declarations) {
       if (!statement || statement->kind != "ClassDef")
         continue;
@@ -975,10 +1049,13 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
           sourceModuleClassSymbol(source.moduleName, *name);
       auto &bases = declaredClassBases[qualified];
       if (const auto *baseNodes = ast::nodeList(*statement, "bases"))
-        for (const parser::NodePtr &base : *baseNodes)
-          if (base && base->kind == "Name")
-            bases.push_back(sourceModuleClassSymbol(
-                source.moduleName, ast::nameSpelling(*base)));
+        for (const parser::NodePtr &base : *baseNodes) {
+          if (!base)
+            continue;
+          std::string baseName = qualifyBase(*base);
+          if (!baseName.empty())
+            bases.push_back(std::move(baseName));
+        }
       // ⛔ AND THE TYPE SYSTEM'S COPY, which is a different map with the same
       // content: `declaredSubclassOfType` reads it, and that is what decides
       // whether the dispatcher's `isinstance(recv, Derived)` arm survives.
