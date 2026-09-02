@@ -401,13 +401,31 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     // both fails one layer further down anyway -- the module-global spelling
     // of this same program reaches "to expected ABI (memref<16xi64>, ...)"
     // through exactly that widening.
+    //
+    // ⭐ AND A UNION ARRIVING IN A LANE THAT IS NOT ONE, which `bothManifest`
+    // asks two CONTRACTS for and so never saw -- the commonest rebind there
+    // is:
+    //
+    //     cur = head              # the lane's type is Node
+    //     while ...:
+    //         cur = cur.nxt       # Node | None
+    //     print(cur is None)      # printed False; CPython prints True
+    //
+    // `coerceValue`'s unconditional upcast dropped the None arm into the Node
+    // lane and the value read back as a Node, so every walk of a linked
+    // structure answered as if the list never ended. The refusal is the same
+    // one and for the same reason: a lane has one type, and the zero-iteration
+    // path leaves the pre-loop binding in place.
     mlir::Type assignedType = types.widenLiteral(found->second.type);
     bool bothManifest =
         mlir::isa_and_nonnull<py::ContractType>(assignedType) &&
         mlir::isa_and_nonnull<py::ContractType>(local.type) &&
         !isSourceDefinedContract(assignedType) &&
         !isSourceDefinedContract(local.type);
-    if (bothManifest && assignedType != local.type &&
+    bool unionIntoScalarLane =
+        mlir::isa_and_nonnull<py::UnionType>(assignedType) &&
+        !mlir::isa_and_nonnull<py::UnionType>(local.type);
+    if ((bothManifest || unionIntoScalarLane) && assignedType != local.type &&
         !py::isAssignableTo(assignedType, local.type, module) &&
         !py::isAssignableTo(found->second.type, local.type, module)) {
       std::string carriedText;

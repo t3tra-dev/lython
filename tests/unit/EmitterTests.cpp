@@ -1176,6 +1176,42 @@ TEST(EmitterTest, RefusesAMatchWriteThatCannotReachAJump) {
   EXPECT_TRUE(named);
 }
 
+// What: an Optional assigned to a loop-carried local whose lane type is the
+// non-optional member. The None arm was dropped into that lane and the value
+// read back as the member, which is how every walk of a linked structure
+// answered as if the list never ended.
+TEST(EmitterTest, RefusesAUnionRebindOfALoopCarriedLocal) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult result = emitSource(
+      "class Node:\n"
+      "    def __init__(self, v: int) -> None:\n"
+      "        self.v = v\n"
+      "        self.nxt: \"Node | None\" = None\n"
+      "\n"
+      "\n"
+      "def f() -> int:\n"
+      "    head = Node(0)\n"
+      "    cur = head\n"
+      "    i = 0\n"
+      "    while i < 1:\n"
+      "        cur = cur.nxt\n"
+      "        i = i + 1\n"
+      "    if cur is None:\n"
+      "        return 1\n"
+      "    return 2\n"
+      "\n"
+      "\n"
+      "print(f())\n",
+      context);
+  EXPECT_FALSE(result.ok());
+  bool named = false;
+  for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+    named = named || diagnostic.message.find(
+                         "loop-carried local 'cur' is bound to") !=
+                         std::string::npos;
+  EXPECT_TRUE(named);
+}
+
 TEST(EmitterTest, AnAttributeAModuleDoesNotHaveIsRefusedAtEmit) {
   // Nothing resolved these, so they fell through to a dynamic attribute read
   // on the module object -- which no lowering can answer. The message came out
