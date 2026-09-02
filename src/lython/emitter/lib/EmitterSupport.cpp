@@ -446,8 +446,23 @@ bool declaredSubclassOfType(mlir::Type sub, mlir::Type super,
   auto superContract = mlir::dyn_cast_if_present<py::ContractType>(super);
   if (!subContract || !superContract)
     return false;
-  if (!isSourceDefinedContract(sub) || !isSourceDefinedContract(super))
-    return false;
+  // ⭐ THE DECLARED-BASES MAP IS THE TEST, not the name's shape.
+  // `isSourceDefinedContract` reads "has no dot", which is how a manifest
+  // contract is told from a program's class -- and an IMPORTED module's class
+  // is dotted too (`shapes.Base`), so every hierarchy question about one
+  // answered no:
+  //
+  //     # shapes.py: class Base: ... / class Derived(Base): ...
+  //     def show(b: "shapes.Base") -> str:
+  //         if isinstance(b, shapes.Derived):
+  //             return "D"
+  //         return "B"
+  //     print(show(shapes.Derived(2)))   # printed B; CPython prints D
+  //
+  // A silent wrong answer, and the same classes written in ONE file are right.
+  // The map holds exactly the classes this compiler DECLARED, which is what
+  // the heuristic was approximating: a manifest contract is never in it, so
+  // asking it directly is both narrower and correct.
   return types.declaredSubclassOf(subContract.getContractName(),
                                   superContract.getContractName());
 }

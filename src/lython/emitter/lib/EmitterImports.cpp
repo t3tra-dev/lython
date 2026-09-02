@@ -804,6 +804,84 @@ void ModuleEmitter::predeclareSourceModules() {
 }
 
 void ModuleEmitter::emitSourceModuleDeclarations() {
+  // ⭐ THE IMPORTED MODULES' HIERARCHIES, RECORDED BEFORE ANYTHING IS EMITTED.
+  // `collectTopLevelBindings` does this for the main module and the override
+  // guard reads it -- but it walks only the main module, so a base-typed
+  // reference to an IMPORTED class was told the hierarchy had no override and
+  // the base's body was inlined:
+  //
+  //     # shapes.py: class Base: show() -> "B"  /  class Derived(Base): show() -> "D"
+  //     xs: "list[shapes.Base]" = [shapes.Base(1), shapes.Derived(2)]
+  //     print([x.show() for x in xs])
+  //     # printed ['B1', 'B2']; CPython prints ['B1', 'D2']
+  //
+  // A silent wrong answer, and the same program written in ONE file is right.
+  // The names are the CONTRACTS (`shapes.Base`), which is what a receiver's
+  // type is spelled as by the time the guard asks.
+  //
+  // ⛔ Before the emission loop and not inside it: a module emitted later can
+  // subclass one emitted earlier, and the answer must not depend on the order
+  // the modules are walked -- which is the same reason the main module's pass
+  // runs up front.
+  for (const EmitOptions::SourceModule &source : options.sourceModules) {
+    if (!source.moduleNode || source.isStub)
+      continue;
+    const auto *declarations = ast::nodeList(*source.moduleNode, "body");
+    if (!declarations)
+      continue;
+    for (const parser::NodePtr &statement : *declarations) {
+      if (!statement || statement->kind != "ClassDef")
+        continue;
+      auto name = ast::string(*statement, "name");
+      if (!name)
+        continue;
+      std::string qualified =
+          sourceModuleClassSymbol(source.moduleName, *name);
+      auto &bases = declaredClassBases[qualified];
+      if (const auto *baseNodes = ast::nodeList(*statement, "bases"))
+        for (const parser::NodePtr &base : *baseNodes)
+          if (base && base->kind == "Name")
+            bases.push_back(sourceModuleClassSymbol(
+                source.moduleName, ast::nameSpelling(*base)));
+      // ⛔ AND THE TYPE SYSTEM'S COPY, which is a different map with the same
+      // content: `declaredSubclassOfType` reads it, and that is what decides
+      // whether the dispatcher's `isinstance(recv, Derived)` arm survives.
+      // With only the emitter's map filled, the guard built a dispatcher whose
+      // every arm then folded to AlwaysFalse -- the same wrong answer, now
+      // reached through a helper.
+      types.bindDeclaredBases(qualified, bases);
+      if (getenv("LYTHON_PROBE_BASES")) {
+        llvm::errs() << "[probe] class " << qualified << " bases:";
+        for (const std::string &b : bases)
+          llvm::errs() << " " << b;
+        llvm::errs() << "\n";
+      }
+      auto &methods = declaredClassMethods[qualified];
+      auto &attributes = declaredClassAttributes[qualified];
+      if (const auto *classBody = ast::nodeList(*statement, "body"))
+        for (const parser::NodePtr &member : *classBody) {
+          if (!member)
+            continue;
+          if (member->kind == "FunctionDef" ||
+              member->kind == "AsyncFunctionDef") {
+            if (auto methodName = ast::string(*member, "name"))
+              methods.insert(*methodName);
+            continue;
+          }
+          if (member->kind == "AnnAssign") {
+            if (const parser::Node *target = ast::node(*member, "target"))
+              if (target->kind == "Name")
+                attributes.insert(ast::nameSpelling(*target));
+            continue;
+          }
+          if (member->kind == "Assign")
+            if (const auto *targets = ast::nodeList(*member, "targets"))
+              for (const parser::NodePtr &target : *targets)
+                if (target && target->kind == "Name")
+                  attributes.insert(ast::nameSpelling(*target));
+        }
+    }
+  }
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode)
       continue;

@@ -484,7 +484,27 @@ bool ModuleEmitter::dispatchIsUnresolvable(Value receiver,
   // fires there; the standalone copy is the one place `self` carries the
   // defining class, and refusing it takes out a program whose every call site
   // is exact.
-  if (!superContexts.empty())
+  //
+  // ⛔ AND ONLY THERE. While a body is being INLINED, `self` is bound to the
+  // caller's value -- and a plain function's first parameter is an entry
+  // argument #0 too, so the test above could not tell the standalone copy from
+  // a base-typed parameter the body was inlined for:
+  //
+  //     class Shape:
+  //         def name(self) -> str: return "shape"
+  //         def describe(self) -> str: return self.name() + str(self.size)
+  //     class Local(Shape):
+  //         def name(self) -> str: return "local"
+  //     def describe(s: "Shape") -> str: return s.describe()
+  //     print(describe(Local(6)))   # printed shape6; CPython prints local6
+  //
+  // A silent wrong answer, and `Local(6).describe()` beside it is right --
+  // that receiver names its class, so the inlined copy resolves `name`
+  // exactly. The note above says the distinguishing fact is whether the
+  // receiver has a known dynamic class at this site; `methodsBeingInlined` is
+  // where that is recorded, because an inlining is precisely the case where
+  // `self` is somebody else's value.
+  if (!superContexts.empty() && methodsBeingInlined.empty())
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(receiver.value))
       if (argument.getArgNumber() == 0 && argument.getOwner() &&
           argument.getOwner()->isEntryBlock())
@@ -2395,7 +2415,38 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // Tasks and the program SEGFAULTED. Nothing else distinguishes the two: a
   // manifest class op carries no contract attribute of its own.
   state.addAttribute("ly.class.source", builder.getUnitAttr());
-  state.addAttribute("base_names", stringArray(builder, bases));
+  // ⭐ A BASE IN AN IMPORTED MODULE IS SPELLED BY ITS CONTRACT. `base_names`
+  // carried what the source WROTE -- a bare `Base` -- while the class op it
+  // names is `@sub.Base`, so importing any module that declares a subclass
+  // failed the dialect's own verifier before anything used it:
+  //
+  //     # sub.py: class Base: ...  /  class Derived(Base): pass
+  //     import sub
+  //     print("ok")
+  //     # 'py.class' op unknown base class 'Base'
+  //
+  // `mro_names` beside it was already canonical, which is what made the two
+  // disagree. The C3 merge computed the canonical name a few lines up; this
+  // uses the same answer.
+  //
+  // ⛔ Only for a base this emitter DECLARED under that canonical name. A
+  // manifest base keeps the spelling the verifier and the taxonomy look it up
+  // by (`isManifestDeclaredClass`, and the loop lowering's note about reaching
+  // a manifest base through `base_names`), and a main-module class is its own
+  // canonical name already.
+  llvm::SmallVector<std::string, 4> emittedBases;
+  emittedBases.reserve(bases.size());
+  for (auto [index, base] : llvm::enumerate(bases)) {
+    llvm::StringRef canonical = index < canonicalBases.size()
+                                    ? llvm::StringRef(canonicalBases[index])
+                                    : base;
+    if (canonical != base && canonical.contains('.') &&
+        classBaseNames.count(canonical))
+      emittedBases.push_back(canonical.str());
+    else
+      emittedBases.push_back(base.str());
+  }
+  state.addAttribute("base_names", stringArray(builder, emittedBases));
   state.addAttribute("field_names", stringArray(builder, fieldNames));
   state.addAttribute("field_types", typeArray(builder, fieldTypes));
   state.addAttribute("field_contract_types", typeArray(builder, fieldTypes));

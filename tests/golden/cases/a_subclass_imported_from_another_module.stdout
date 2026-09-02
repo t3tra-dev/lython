@@ -1,0 +1,5 @@
+shape1 square2
+circle3 square4
+['shape', 'square', 'circle', 'square']
+['shape1', 'square2', 'circle3', 'square4']
+['other', 'square', 'other', 'marked']

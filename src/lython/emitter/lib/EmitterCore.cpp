@@ -65,6 +65,21 @@ EmitResult ModuleEmitter::emit() {
   collectTopLevelBindings();
   predeclareSourceModules();
   predeclareTopLevel();
+  // ⭐ AND THE BASES THAT ARE NOT BARE NAMES. `collectTopLevelBindings` runs
+  // before the imports are bound -- it has to, because the spellings it reads
+  // decide which symbols the declarations are emitted under -- so a base
+  // written `shapes.Shape` could not be resolved there and was recorded as
+  // nothing at all. The override guard then saw a class with NO bases:
+  //
+  //     class Local(shapes.Shape):
+  //         def name(self) -> str: return "local"
+  //     print(describe(Local(6)))   # printed shape6; CPython prints local6
+  //
+  // A silent wrong answer -- `Shape.describe` calls `self.name()` and the
+  // guard, told the hierarchy had no override, inlined Shape's. Filled here,
+  // where the aliases resolve and still before anything is emitted, so the
+  // answer stays a property of the module rather than of the position asked.
+  resolveDottedTopLevelBases();
   // After class/import predeclaration (signatures may reference user classes
   // and imported names), before any body is typed or emitted.
   types.registerModule(moduleNode);
@@ -120,6 +135,38 @@ EmitResult ModuleEmitter::emit() {
   result.diagnostics = std::move(diagnostics);
   result.module = mlir::OwningOpRef<mlir::ModuleOp>(module);
   return result;
+}
+
+void ModuleEmitter::resolveDottedTopLevelBases() {
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "ClassDef")
+      continue;
+    auto name = ast::string(*statement, "name");
+    if (!name)
+      continue;
+    const auto *baseNodes = ast::nodeList(*statement, "bases");
+    if (!baseNodes)
+      continue;
+    auto &bases = declaredClassBases[*name];
+    bool changed = false;
+    for (const parser::NodePtr &base : *baseNodes) {
+      if (!base || base->kind == "Name")
+        continue; // already recorded by the spelling pass
+      std::string qualified = ast::qualifiedName(base.get());
+      if (qualified.empty())
+        continue;
+      std::string canonical = canonicalClassName(qualified);
+      if (canonical.empty() || llvm::is_contained(bases, canonical))
+        continue;
+      bases.push_back(canonical);
+      changed = true;
+    }
+    if (changed)
+      types.bindDeclaredBases(*name, bases);
+  }
 }
 
 void ModuleEmitter::collectTopLevelBindings() {
