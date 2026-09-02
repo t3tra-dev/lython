@@ -4514,8 +4514,24 @@ ModuleEmitter::tryEmitLenCall(const parser::Node &expr,
       }
     }
     Value input = emitExpr(argNode);
-    if (std::optional<Value> count = tryEmitClassDunder(expr, input, "__len__"))
-      return *count;
+  if (std::optional<Value> count = tryEmitClassDunder(expr, input, "__len__"))
+    return *count;
+  // ⭐ A UNION COUNTS BY TAG, like it adds by tag. `def f(x: "list[int] | str")`
+  // is an ordinary Python signature and `len(x)` in its body was refused for a
+  // question both members answer.
+  if (auto inputUnion =
+          mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(input.type)))
+    if (mlir::Type joined = types.unionOperatorResult(input.type, "__len__", {}))
+      return emitUnionMemberDispatch(
+          expr, input, inputUnion, joined, [&](Value member) {
+            CallInferenceResult memberInference =
+                types.inferMethodCallWithEvidence(member.type, "__len__", {});
+            auto memberOp = py::LenOp::create(
+                builder, loc(expr), joined,
+                mlir::FlatSymbolRefAttr::get(&context, "__len__"),
+                callProtocolFor(memberInference), member.value);
+            return Value{memberOp.getResult(), joined};
+          });
     CallInferenceResult inference =
         types.inferMethodCallWithEvidence(input.type, "__len__", {});
     if (!requireStaticEvidence(expr, inference))

@@ -3582,8 +3582,15 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
               widenLiteral(positional.front()), "__len__", {});
           if (inference)
             return inference.resultType;
+          if (mlir::Type unionResult =
+                  unionOperatorResult(positional.front(), "__len__", {}))
+            return unionResult;
           return fail(inference.failureReason);
         }
+        if (!positional.empty())
+          if (mlir::Type unionResult =
+                  unionOperatorResult(positional.front(), "__len__", {}))
+            return unionResult;
         if (!positional.empty())
           if (std::optional<CallSolution> result = tryManifestMethod(
                   *this, widenLiteral(positional.front()), "__len__", {}))

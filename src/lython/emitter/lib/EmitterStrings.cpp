@@ -105,6 +105,30 @@ bool ModuleEmitter::canConvertType(mlir::Type type, int64_t conversion) {
       types.contract("builtins.str"), "__ascii__", {}));
 }
 
+Value ModuleEmitter::emitUnionMemberDispatch(
+    const parser::Node &anchor, Value unionValue, py::UnionType unionType,
+    mlir::Type resultType, llvm::function_ref<Value(Value)> perMember) {
+  llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
+  std::function<mlir::Value(unsigned)> arm = [&](unsigned index) -> mlir::Value {
+    mlir::Type member = members[index];
+    auto emitArm = [&]() -> mlir::Value {
+      auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,
+                                              unionValue.value);
+      return coerceValue(perMember(Value{unwrap.getResult(), member}),
+                         resultType, anchor)
+          .value;
+    };
+    if (index + 1 >= members.size())
+      return emitArm();
+    auto test = py::UnionTestOp::create(builder, loc(anchor),
+                                        builder.getI1Type(), unionValue.value,
+                                        mlir::TypeAttr::get(member));
+    return emitValueDiamond(loc(anchor), test.getResult(), resultType, emitArm,
+                            [&] { return arm(index + 1); });
+  };
+  return Value{arm(0), resultType};
+}
+
 Value ModuleEmitter::emitUnionStringify(const parser::Node &anchor, Value value,
                                         py::UnionType unionType,
                                         unsigned index, int64_t conversion) {

@@ -58,3 +58,21 @@ print(1 + scaled(-1), 1 + scaled(3), 2 * flagged(-1))
 print(scaled(-1) + scaled(3), scaled(3) + scaled(-1))
 print(scaled(-1) + scaled(-1), scaled(3) + scaled(3))
 print(flagged(-1) + flagged(3), flagged(3) * flagged(3))
+
+
+# The same tag dispatch outside the operators: `len` asks each member too, and
+# a signature that accepts either is ordinary Python.
+def size(x: "list[int] | str") -> int:
+    return len(x)
+
+
+print(size([1, 2, 3]), size("ab"), size([]) + size(""))
+
+
+def measured(n: int):
+    if n < 0:
+        return "abc"
+    return [1, 2]
+
+
+print(len(measured(-1)), len(measured(1)), len(measured(-1)) + len(measured(1)))

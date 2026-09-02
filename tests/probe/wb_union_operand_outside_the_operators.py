@@ -10,8 +10,7 @@
 #   u < 5, u == v, 0 < u < 5 ......................... correct
 #   bool(u), str(u), repr(u), "{}".format(u) ......... correct
 #   max(u, 1) ........................................ correct
-#   len(u) ........................................... does not provide
-#                                                      manifest method '__len__'
+#   len(u) ........................................... correct (2026-09-02)
 #   u[0] ............................................. '__getitem__'
 #   [v for v in u] ................................... '__iter__'
 #   hash(u) .......................................... runtime method receiver
@@ -21,13 +20,13 @@
 #                                                      member only)
 #   abs(u), round(u), int(u), float(u), sum([u, u]) .. each its own refusal
 #
-# ⭐ WHY THE LINE IS WHERE IT IS: the dispatch is built in `emitBinarySpecial`
-# and `emitUnarySpecial` (Runtime-free, emitter-side), which is where the
-# operator paths converge. `len`, subscription, iteration and the numeric
-# builtins each have their own emitter with its own ladder, and a union arm in
-# one of them is a union arm in one of them -- the type channel must not answer
-# for a call whose emitter cannot build the tag test, or the two disagree and
-# the value is coerced to a member that may not be live.
+# ⭐ WHY THE LINE IS WHERE IT IS: `emitUnionMemberDispatch` turns the tag into
+# a branch chain, and each CALLER has to be taught to use it -- the operator
+# arms and `len` are, subscription, iteration and the numeric builtins are not.
+# Each of those has its own emitter with its own ladder, and the type channel
+# must not answer for a call whose emitter cannot build the tag test: the two
+# would then disagree, and the value would be coerced to a member that may not
+# be live.
 #
 # ⛔ `hash` and `in` are a different question again: both want ONE object
 # handle for the whole value, which a union does not have (see
@@ -39,4 +38,4 @@ def mk(n: int):
     return [1, 2]
 
 
-print(len(mk(-1)), len(mk(1)))
+print(mk(-1)[0], mk(1)[0])

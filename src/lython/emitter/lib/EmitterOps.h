@@ -32,74 +32,40 @@ Value ModuleEmitter::emitBinarySpecial(const parser::Node &anchor,
   if (auto lhsUnion =
           mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(lhs.type)))
     if (mlir::Type joined =
-            types.unionOperatorResult(lhs.type, method, {rhs.type})) {
-      llvm::ArrayRef<mlir::Type> members = lhsUnion.getMemberTypes();
-      std::function<mlir::Value(unsigned)> arm =
-          [&](unsigned index) -> mlir::Value {
-        mlir::Type member = members[index];
-        auto emitArm = [&]() -> mlir::Value {
-          auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,
-                                                  lhs.value);
-          Value armLhs{unwrap.getResult(), member};
-          Value armRhs = rhs;
-          // The operand promotion `emitBinary` makes for a mixed pair, made
-          // here for the member: this arm's receiver is the member, not the
-          // union the outer promotion looked at.
-          mlir::Type armRight = types.widenLiteral(rhs.type);
-          if (types.widenLiteral(member) == types.intType() &&
-              armRight == types.floatType())
-            armLhs = emitFloatFromInt(anchor, armLhs);
-          else if (types.widenLiteral(member) == types.floatType() &&
-                   armRight == types.intType())
-            armRhs = emitFloatFromInt(anchor, armRhs);
-          Value applied =
-              emitBinarySpecial<Op>(anchor, method, armLhs, armRhs, joined);
-          return coerceValue(applied, joined, anchor).value;
-        };
-        if (index + 1 >= members.size())
-          return emitArm();
-        auto test = py::UnionTestOp::create(builder, loc(anchor),
-                                            builder.getI1Type(), lhs.value,
-                                            mlir::TypeAttr::get(member));
-        return emitValueDiamond(loc(anchor), test.getResult(), joined, emitArm,
-                                [&] { return arm(index + 1); });
-      };
-      return Value{arm(0), joined};
-    }
+            types.unionOperatorResult(lhs.type, method, {rhs.type}))
+      return emitUnionMemberDispatch(
+          anchor, lhs, lhsUnion, joined, [&](Value armLhs) {
+            Value armRhs = rhs;
+            // The operand promotion `emitBinary` makes for a mixed pair, made
+            // here for the member: this arm's receiver is the member, not the
+            // union the outer promotion looked at.
+            mlir::Type armLeft = types.widenLiteral(armLhs.type);
+            mlir::Type armRight = types.widenLiteral(rhs.type);
+            if (armLeft == types.intType() && armRight == types.floatType())
+              armLhs = emitFloatFromInt(anchor, armLhs);
+            else if (armLeft == types.floatType() &&
+                     armRight == types.intType())
+              armRhs = emitFloatFromInt(anchor, armRhs);
+            return emitBinarySpecial<Op>(anchor, method, armLhs, armRhs,
+                                         joined);
+          });
   if (auto rhsUnion =
           mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(rhs.type)))
     if (mlir::Type joined =
-            types.unionArgumentOperatorResult(lhs.type, method, rhs.type)) {
-      llvm::ArrayRef<mlir::Type> members = rhsUnion.getMemberTypes();
-      std::function<mlir::Value(unsigned)> arm =
-          [&](unsigned index) -> mlir::Value {
-        mlir::Type member = members[index];
-        auto emitArm = [&]() -> mlir::Value {
-          auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,
-                                                  rhs.value);
-          Value armLhs = lhs;
-          Value armRhs{unwrap.getResult(), member};
-          mlir::Type armLeft = types.widenLiteral(lhs.type);
-          if (armLeft == types.intType() &&
-              types.widenLiteral(member) == types.floatType())
-            armLhs = emitFloatFromInt(anchor, armLhs);
-          else if (armLeft == types.floatType() &&
-                   types.widenLiteral(member) == types.intType())
-            armRhs = emitFloatFromInt(anchor, armRhs);
-          Value applied =
-              emitBinarySpecial<Op>(anchor, method, armLhs, armRhs, joined);
-          return coerceValue(applied, joined, anchor).value;
-        };
-        if (index + 1 >= members.size())
-          return emitArm();
-        auto test = py::UnionTestOp::create(builder, loc(anchor),
-                                            builder.getI1Type(), rhs.value,
-                                            mlir::TypeAttr::get(member));
-        return emitValueDiamond(loc(anchor), test.getResult(), joined, emitArm,
-                                [&] { return arm(index + 1); });
-      };
-      return Value{arm(0), joined};
-    }
+            types.unionArgumentOperatorResult(lhs.type, method, rhs.type))
+      return emitUnionMemberDispatch(
+          anchor, rhs, rhsUnion, joined, [&](Value armRhs) {
+            Value armLhs = lhs;
+            mlir::Type armLeft = types.widenLiteral(lhs.type);
+            mlir::Type armRight = types.widenLiteral(armRhs.type);
+            if (armLeft == types.intType() && armRight == types.floatType())
+              armLhs = emitFloatFromInt(anchor, armLhs);
+            else if (armLeft == types.floatType() &&
+                     armRight == types.intType())
+              armRhs = emitFloatFromInt(anchor, armRhs);
+            return emitBinarySpecial<Op>(anchor, method, armLhs, armRhs,
+                                         joined);
+          });
   // Source-class operator methods (including MRO-inherited and dataclass-
   // synthesized ones) inline like any other source method call -- through the
   // same gate `x.m()` goes through, since `a == b` on a base-typed `a` is the
@@ -141,28 +107,11 @@ Value ModuleEmitter::emitUnarySpecial(const parser::Node &anchor,
   // The same tag dispatch the binary form takes; see the note there.
   if (auto inputUnion = mlir::dyn_cast_if_present<py::UnionType>(
           types.widenLiteral(input.type)))
-    if (mlir::Type joined = types.unionOperatorResult(input.type, method, {})) {
-      llvm::ArrayRef<mlir::Type> members = inputUnion.getMemberTypes();
-      std::function<mlir::Value(unsigned)> arm =
-          [&](unsigned index) -> mlir::Value {
-        mlir::Type member = members[index];
-        auto emitArm = [&]() -> mlir::Value {
-          auto unwrap = py::UnionUnwrapOp::create(builder, loc(anchor), member,
-                                                  input.value);
-          Value applied = emitUnarySpecial<Op>(
-              anchor, method, Value{unwrap.getResult(), member}, joined);
-          return coerceValue(applied, joined, anchor).value;
-        };
-        if (index + 1 >= members.size())
-          return emitArm();
-        auto test = py::UnionTestOp::create(builder, loc(anchor),
-                                            builder.getI1Type(), input.value,
-                                            mlir::TypeAttr::get(member));
-        return emitValueDiamond(loc(anchor), test.getResult(), joined, emitArm,
-                                [&] { return arm(index + 1); });
-      };
-      return Value{arm(0), joined};
-    }
+    if (mlir::Type joined = types.unionOperatorResult(input.type, method, {}))
+      return emitUnionMemberDispatch(
+          anchor, input, inputUnion, joined, [&](Value member) {
+            return emitUnarySpecial<Op>(anchor, method, member, joined);
+          });
   CallInferenceResult inference =
       types.inferMethodCallWithEvidence(input.type, method, {});
   if (!requireStaticEvidence(anchor, inference))

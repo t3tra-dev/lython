@@ -713,6 +713,17 @@ private:
   // The same question for the !r / !a direction, where the ladder is shorter:
   // only __repr__ answers it.
   bool canConvertType(mlir::Type type, int64_t conversion);
+  // ⭐ THE ONE PLACE A UNION'S TAG IS TURNED INTO A BRANCH CHAIN. Three
+  // producers wrote this by hand -- the stringify chain, the operator arms and
+  // the len path -- and the shape is not tidiness: the inactive members' lanes
+  // hold zeroed placeholders, so the arms must be BRANCHES and not a select
+  // over eagerly-computed values, and a producer that forgot that would call a
+  // method on a header nobody wrote. `perMember` is handed the UNWRAPPED
+  // member value and returns this arm's answer; every answer is coerced to
+  // `resultType`, which the caller has already decided the members join at.
+  Value emitUnionMemberDispatch(const parser::Node &anchor, Value unionValue,
+                                py::UnionType unionType, mlir::Type resultType,
+                                llvm::function_ref<Value(Value)> perMember);
   Value emitUnionStringify(const parser::Node &anchor, Value value,
                            py::UnionType unionType, unsigned index,
                            int64_t conversion = 's');
