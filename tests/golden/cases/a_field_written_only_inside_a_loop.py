@@ -55,6 +55,32 @@ indexed = Indexed()
 print(indexed.at + 1, indexed.word.upper())
 
 
+# A field whose value is a CONTAINER built in the region: reading an element
+# back out of it is the decode, because the elements the literal produced live
+# in the region and the read does not.
+class Paired:
+    def __init__(self) -> None:
+        for _ in range(1):
+            self.pair = (1, "a")
+            self.table = {"k": 2}
+            self.items = [3, 4]
+
+
+paired = Paired()
+print(paired.pair[0] + 1, paired.pair[1], len(paired.pair))
+print(paired.table["k"] + 1, paired.items[0] + paired.items[1])
+
+
+# The same tuple built at the top level still folds: a read in the block that
+# built it keeps the evidence.
+class Direct:
+    def __init__(self) -> None:
+        self.pair = (5, "z")
+
+
+print(Direct().pair[0] + 1, Direct().pair[1])
+
+
 # The same field written from a self-read, which must keep re-rooting: the
 # lanes it stores are new ones.
 class Growing:

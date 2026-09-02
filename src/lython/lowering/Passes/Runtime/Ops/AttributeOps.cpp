@@ -1408,6 +1408,101 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   // it was written that way first and all four programs stayed red.
   bool unionRead = mlir::isa<py::UnionType>(op.getResult().getType());
   auto fieldBundle = object->fieldBundles.find(op.getName());
+  // ⭐ AND THE CACHED LANES HAVE TO REACH THE READ. The entry hands back the
+  // SSA values the STORE produced, which is the point of it -- but a store
+  // inside a region produces them there, and a constructor is inlined into its
+  // caller, so the read after the loop used values the loop body defined:
+  //
+  //     class C:
+  //         def __init__(self) -> None:
+  //             for _ in range(1):
+  //                 self.v = (1, "a")
+  //     c = C()
+  //     print(c.v[0])          # operand #0 does not dominate this use
+  //
+  // A single-lane field never showed it: its one value IS the object header,
+  // which the allocation defines before the region. A tuple keeps its elements
+  // as lanes of their own, and those are the store's.
+  //
+  // ⛔ The cheap filter first: when every lane is defined in the read's own
+  // block the walk has already passed them, and building a `DominanceInfo` per
+  // field read -- which is most reads in a method body -- would be paid on
+  // every program to answer a question only this shape asks.
+  auto valuesReachRead = [&](llvm::ArrayRef<mlir::Value> lanes) {
+    bool sameBlock = true;
+    for (mlir::Value lane : lanes) {
+      mlir::Operation *definition = lane.getDefiningOp();
+      if (!definition || definition->getBlock() != op->getBlock()) {
+        sameBlock = false;
+        break;
+      }
+    }
+    if (sameBlock)
+      return true;
+    auto function = op->getParentOfType<mlir::func::FuncOp>();
+    if (!function)
+      return false;
+    mlir::DominanceInfo dominance(function);
+    for (mlir::Value lane : lanes)
+      if (!dominance.properlyDominates(lane, op))
+        return false;
+    return true;
+  };
+  auto lanesReachRead = [&](const RuntimeBundle &bundle) {
+    llvm::SmallVector<mlir::Value, 8> lanes(bundle.objectValue.values.begin(),
+                                            bundle.objectValue.values.end());
+    if (bundle.boxedObject)
+      lanes.append(bundle.boxedObject->objectValue.values.begin(),
+                   bundle.boxedObject->objectValue.values.end());
+    return valuesReachRead(lanes);
+  };
+  // ⭐ A CONTAINER'S RECORDED ELEMENTS ARE SSA VALUES, not facts about the
+  // field -- the same thing the unboxed lane below is, and for the same
+  // reason. A tuple field records what the literal put in it, and a literal
+  // built inside a REGION produces those values there:
+  //
+  //     class C:
+  //         def __init__(self) -> None:
+  //             for _ in range(1):
+  //                 self.v = (1, "a")
+  //     c = C()
+  //     print(c.v[0])          # operand #0 does not dominate this use
+  //
+  // `print(c.v)` and `len(c.v)` in the same program work, because neither
+  // reads an ELEMENT out of the evidence -- and the LIST spelling works
+  // because `demoteCrossBlockContainerEvidence` already covers a container
+  // something can mutate. A tuple cannot be mutated, so nothing had asked.
+  //
+  // ⛔ Only when they do not reach: `(1, 2)[0]` folding to a constant is what
+  // the evidence is for, and every read in the block that built it keeps it.
+  auto dropUnreachableContainerEvidence = [&](RuntimeBundle &bundle) {
+    llvm::SmallVector<mlir::Value, 16> evidence;
+    for (const RuntimeValue &element : bundle.sequenceElements)
+      evidence.append(element.values.begin(), element.values.end());
+    for (const std::shared_ptr<RuntimeBundle> &element :
+         bundle.sequenceElementBundles)
+      if (element)
+        evidence.append(element->physicalValues().begin(),
+                        element->physicalValues().end());
+    for (const RuntimeValue &value : bundle.mappingValues)
+      evidence.append(value.values.begin(), value.values.end());
+    for (const std::shared_ptr<RuntimeBundle> &entry : bundle.mappingKeyBundles)
+      if (entry)
+        evidence.append(entry->physicalValues().begin(),
+                        entry->physicalValues().end());
+    for (const std::shared_ptr<RuntimeBundle> &entry :
+         bundle.mappingValueBundles)
+      if (entry)
+        evidence.append(entry->physicalValues().begin(),
+                        entry->physicalValues().end());
+    evidence.append(bundle.mappingPresent.begin(), bundle.mappingPresent.end());
+    if (!evidence.empty() && !valuesReachRead(evidence))
+      RuntimeBundleLowerer::clearContainerEvidence(bundle);
+  };
+  if (!boxedField && !unionRead &&
+      fieldBundle != object->fieldBundles.end() && fieldBundle->second &&
+      !lanesReachRead(*fieldBundle->second))
+    fieldBundle = object->fieldBundles.end();
   if (!boxedField && !unionRead &&
       fieldBundle != object->fieldBundles.end()) {
     if (!fieldBundle->second)
@@ -1899,6 +1994,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         read = *cached;
         read.objectValue.values.assign(values.begin(), values.end());
         read.primitiveI64.reset();
+        dropUnreachableContainerEvidence(read);
         read.setObjectLogicalOwnership(/*ownsObject=*/false);
       } else {
         read = RuntimeBundle::objectWithOwnership(
@@ -1922,6 +2018,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     // "operand #0 does not dominate this use". The box words ARE the value;
     // the speculation re-earns its lane where the value is produced.
     result.primitiveI64.reset();
+    dropUnreachableContainerEvidence(result);
     result.setObjectLogicalOwnership(/*ownsObject=*/false);
   } else {
     result = RuntimeBundle::objectWithOwnership(

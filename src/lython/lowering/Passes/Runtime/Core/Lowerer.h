@@ -679,6 +679,10 @@ private:
   // Named for the boundaries that are polymorphic over all of them and so can
   // name none of their shapes (`join`, `frozenset(iterable)`).
   static bool isSequenceLikeContractName(llvm::StringRef contract);
+  // The clearing itself, with no contract gate: a container whose recorded
+  // elements cannot REACH the reader has to lose them whether or not anything
+  // can mutate it.
+  static void clearContainerEvidence(RuntimeBundle &bundle);
   static void demoteMutableContainerEvidence(RuntimeBundle &bundle);
   void dropObjectFieldEvidence(RuntimeBundle &bundle);
   void demoteMutableContainerEvidenceFor(mlir::Value value);

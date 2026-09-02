@@ -186,11 +186,7 @@ bool RuntimeBundleLowerer::isSequenceLikeContractName(
 // runtime payload becomes the sole authority: evidence-backed lowerings keep
 // payload and length in sync at every step, so dropping the evidence is
 // always semantics-preserving (reads fall back to the runtime paths).
-void RuntimeBundleLowerer::demoteMutableContainerEvidence(
-    RuntimeBundle &bundle) {
-  if (bundle.kind != RuntimeBundle::Kind::Object ||
-      !isMutableContainerContractName(bundle.contractName()))
-    return;
+void RuntimeBundleLowerer::clearContainerEvidence(RuntimeBundle &bundle) {
   bundle.sequenceElements.clear();
   bundle.sequenceElementBundles.clear();
   bundle.sequenceIndices.clear();
@@ -203,6 +199,14 @@ void RuntimeBundleLowerer::demoteMutableContainerEvidence(
   bundle.mappingPresent.clear();
   bundle.mappingEvidenceBacked = false;
   bundle.mappingCapacity = 0;
+}
+
+void RuntimeBundleLowerer::demoteMutableContainerEvidence(
+    RuntimeBundle &bundle) {
+  if (bundle.kind != RuntimeBundle::Kind::Object ||
+      !isMutableContainerContractName(bundle.contractName()))
+    return;
+  RuntimeBundleLowerer::clearContainerEvidence(bundle);
 }
 
 // A class instance's fieldBundles are a CACHE of what this walk last stored
