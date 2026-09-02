@@ -10,3 +10,4 @@ import a_module_that_chooses_by_platform as paths
 print(paths.SEP)
 print(paths.joiner("a", "b"))
 print([paths.joiner(x, "z") for x in ["p", "q"]])
+print(paths.MISSING is None)

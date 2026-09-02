@@ -15,3 +15,9 @@ else:
 
     def joiner(a: str, b: str) -> str:
         return a + "/" + b
+
+
+# A module constant that is None. The literal channel an imported module's
+# constants ride carried str, int and bool and left this one out, so the
+# importer could not resolve the name at all.
+MISSING = None

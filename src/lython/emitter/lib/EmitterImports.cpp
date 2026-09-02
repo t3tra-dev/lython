@@ -602,6 +602,19 @@ sourceModuleLiteralConstant(TypeSystem &types,
     return types.literal(*flag ? "True" : "False");
   if (auto number = ast::integer(*constantNode, "value"))
     return types.literal(std::to_string(*number));
+  // ⭐ AND `None`, which the three arms above left out. An imported module's
+  // `NOTHING = None` did not resolve -- "module 'm' has no attribute
+  // 'NOTHING' that resolves statically" -- while `FLAG = True` beside it did,
+  // and the literal channel has carried the None spelling all along:
+  // `widenLiteral` maps it to the none type and `emitLiteralTypeConstant`
+  // materializes it.
+  //
+  // ⛔ A float still does not resolve, and this is not the place to make it:
+  // a "1.5" spelling would widen to INT, because every reader of a literal
+  // spelling that is not True/False/None/quoted takes it for one. Recorded in
+  // tests/probe/wb_a_container_constant_in_an_imported_module.py.
+  if (ast::isNoneField(*constantNode, "value"))
+    return types.literal("None");
   return std::nullopt;
 }
 
