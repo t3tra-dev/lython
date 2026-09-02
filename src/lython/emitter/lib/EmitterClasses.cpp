@@ -2666,6 +2666,60 @@ void ModuleEmitter::collectClassFields(
           return {};
         return types.inferExpr(value);
       };
+      // ⭐ AN EMPTY LITERAL TAKES THE ELEMENT TYPE THE NAME ALREADY HAS. The
+      // walk binds locals as it goes so a field can be typed from one, and it
+      // bound them from the region it found them in -- so the branch that
+      // supplies the default overwrote the parameter's type with an erased
+      // one, and the field then did not fit the value the emitter builds:
+      //
+      //     def __init__(self, xs: "list[int] | None" = None) -> None:
+      //         if xs is None:
+      //             xs = []            # bound list[object] over list[int]
+      //         self.xs = xs
+      //     # attribute value 'list[int]' is not assignable to field
+      //     # 'list[object]'
+      //
+      // The emitter's own join answers `list[int]` here (`return xs` from the
+      // same body compiles), so this is the walk disagreeing with what is
+      // built rather than a question with two answers. It is the same rule
+      // `setField` states one screen up, asked at the rebinding instead of at
+      // the field.
+      //
+      // ⛔ Only a SAME-CONTRACT member with no erased argument of its own: an
+      // `xs: "int | None"` that a branch rebinds to `[]` has nothing to take
+      // an element type from and keeps the erased one it had.
+      auto refineErasedRebinding = [&](llvm::StringRef name,
+                                       mlir::Type erased) -> mlir::Type {
+        auto erasedContract =
+            mlir::dyn_cast_if_present<py::ContractType>(erased);
+        if (!erasedContract || erasedContract.getArguments().empty())
+          return erased;
+        std::optional<mlir::Type> existing = types.lookupSymbol(name);
+        if (!existing || !*existing)
+          return erased;
+        llvm::SmallVector<mlir::Type, 4> candidates;
+        if (auto unionType = mlir::dyn_cast<py::UnionType>(*existing))
+          candidates.assign(unionType.getMemberTypes().begin(),
+                            unionType.getMemberTypes().end());
+        else
+          candidates.push_back(*existing);
+        for (mlir::Type candidate : candidates) {
+          auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+              types.widenLiteral(candidate));
+          if (!contract ||
+              contract.getContractName() !=
+                  erasedContract.getContractName() ||
+              contract.getArguments().size() !=
+                  erasedContract.getArguments().size())
+            continue;
+          if (llvm::any_of(contract.getArguments(), [](mlir::Type argument) {
+                return py::isPyObjectType(argument);
+              }))
+            continue;
+          return contract;
+        }
+        return erased;
+      };
       auto bindInitLocal = [&](const parser::Node *target, mlir::Type type) {
         if (!target || target->kind != "Name")
           return;
@@ -2744,8 +2798,13 @@ void ModuleEmitter::collectClassFields(
                   for (const parser::NodePtr &target : *targets) {
                     if (!target)
                       continue;
-                    bindInitLocal(&*target, valueType);
-                    collectTarget(*target, valueType, provisional);
+                    mlir::Type boundType =
+                        provisional && target->kind == "Name"
+                            ? refineErasedRebinding(
+                                  ast::nameSpelling(*target), valueType)
+                            : valueType;
+                    bindInitLocal(&*target, boundType);
+                    collectTarget(*target, boundType, provisional);
                   }
                 continue;
               }
