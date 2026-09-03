@@ -2579,6 +2579,59 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
             builder, loc(expr), type, builder.getStringAttr(simple));
         return Value{constant.getResult(), type};
       }
+  // ⭐ A FUNCTION'S `__name__` IS A COMPILE-TIME STRING TOO, and it had no arm
+  // at all: `f.__name__` type-checked and then died in the lowering as
+  // "attr.get object type has no class schema", which names nothing the reader
+  // wrote, while `C.__name__` one line above has been folded since it was
+  // written.
+  //
+  // ⛔ Only where the SPELLING is the def's own name -- a module function
+  // called by its name, or `C.m` naming a method of C. CPython's `__name__` is
+  // the name the `def` gave, so an alias (`g = f`) would answer "f" and this
+  // fold would answer "g"; that spelling is refused by name instead of folded
+  // wrong.
+  if (*attr == "__name__" &&
+      mlir::isa_and_nonnull<py::CallableType>(object.type)) {
+    const parser::Node *objectNode = ast::node(expr, "value");
+    llvm::StringRef defName;
+    if (objectNode && objectNode->kind == "Name") {
+      llvm::StringRef spelling = ast::nameSpelling(*objectNode);
+      if (moduleFunctionNames.count(spelling))
+        defName = spelling;
+    } else if (objectNode && objectNode->kind == "Attribute") {
+      if (auto member = ast::string(*objectNode, "attr"))
+        if (const parser::Node *owner = ast::node(*objectNode, "value"))
+          if (owner->kind == "Name" &&
+              types.lookupClass(ast::nameSpelling(*owner)) != mlir::Type())
+            defName = *member;
+    }
+    if (!defName.empty()) {
+      mlir::Type type = types.literal("\"" + defName.str() + "\"");
+      auto constant = py::StrConstantOp::create(
+          builder, loc(expr), type, builder.getStringAttr(defName));
+      return Value{constant.getResult(), type};
+    }
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "'__name__' of a function is folded at compile time and needs the name "
+        "the `def` gave; write it through that name (or through the class for "
+        "a method) rather than through a value that holds the function"});
+    return emitNone(expr);
+  }
+  // ⛔ AND EVERY OTHER ATTRIBUTE OF A FUNCTION VALUE IS REFUSED HERE, not in
+  // the lowering. `f.__defaults__`, `m.__self__` and the rest reached
+  // "attr.get object type has no class schema", which describes the compiler's
+  // position; a function is represented as its callable CONTRACT, which has no
+  // attribute surface at all, and saying so is the honest sentence.
+  if (mlir::isa_and_nonnull<py::CallableType>(object.type) &&
+      *attr != "__doc__") {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, expr.range.start,
+        "a function value has no attribute '" + std::string(*attr) +
+            "': it is represented by its callable contract, which carries no "
+            "attributes"});
+    return emitNone(expr);
+  }
   // ⛔ THE EXCEPTION CHAIN HAS NO VALUE SURFACE, and BaseException DECLARES the
   // four attributes that would read it -- so `e.__cause__` type-checked and
   // then failed in the lowering with "attr.get object type has no class

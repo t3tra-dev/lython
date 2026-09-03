@@ -3016,6 +3016,23 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         // them joined to `list[object]` ("a type-erased `object` value cannot be
         // stored in a runtime container slot"), because the join is computed from
         // the inferred element types, not from the emitted values.
+        // ⭐ A FUNCTION'S `__name__` IS A str TO THIS CHANNEL TOO. The emitter
+        // folds it to the def's name; without an arm here the read answered
+        // `object`, and a container of two of them joined to `list[object]` --
+        // "a type-erased `object` value cannot be stored in a runtime container
+        // slot" -- for values the emitter had already made strings.
+        if (*attr == "__name__") {
+          if (mlir::isa_and_nonnull<py::CallableType>(widenLiteral(objectType)))
+            return strType();
+          // `C.m.__name__`: the method read does not always come back as a
+          // callable through this channel, and the emitter folds it either way.
+          if (const parser::Node *owner = ast::node(*node, "value"))
+            if (owner->kind == "Attribute")
+              if (const parser::Node *root = ast::node(*owner, "value"))
+                if (root->kind == "Name" &&
+                    lookupClass(ast::nameSpelling(*root)) != mlir::Type())
+                  return strType();
+        }
         if (*attr == "__name__")
           if (auto typeObjectType = mlir::dyn_cast_if_present<py::TypeType>(
                   widenLiteral(objectType)))
