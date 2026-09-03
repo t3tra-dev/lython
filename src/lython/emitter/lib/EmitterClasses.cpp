@@ -2759,6 +2759,13 @@ void ModuleEmitter::collectClassFields(
       mlir::Type payload = existingIsNone ? fresh : existing;
       if (!mlir::isa_and_nonnull<py::ContractType>(payload))
         return mlir::Type();
+      // ⛔ `object` IS THE PRE-PASS SAYING IT DOES NOT KNOW, not a type to
+      // widen a field to. A store this walk cannot type -- a local it did not
+      // bind, a call it cannot resolve -- would otherwise turn a NoneType field
+      // into `object | None`, which is a field whose reads carry nothing and
+      // whose diagnostic names the wrong thing.
+      if (py::isPyObjectType(payload))
+        return mlir::Type();
       return types.join({payload, types.none()});
     };
     for (auto [index, existing] : llvm::enumerate(fieldNames)) {
@@ -2812,8 +2819,32 @@ void ModuleEmitter::collectClassFields(
     if (target.kind != "Attribute")
       return;
     const parser::Node *object = ast::node(target, "value");
-    if (!object || !ast::isName(*object, "self"))
+    if (!object)
       return;
+    // ⭐ AND THROUGH A LOCAL OF THIS CLASS, not only through `self`. A method
+    // that walks its own structure assigns through the node it is standing on:
+    //
+    //     def add(self, w: str) -> None:
+    //         node = self
+    //         ...
+    //         node.word = w        # the same field of the same class
+    //
+    // and reading only `self.<name>` left that field with whatever `__init__`
+    // said, which for `self.word = None` is NoneType.
+    //
+    // ⛔ Only when the local's inferred type IS this class: through anything
+    // else the target names another class's field, which this walk does not
+    // own and must not decide.
+    if (!ast::isName(*object, "self")) {
+      if (object->kind != "Name" || collectFieldsRefineOnly == false)
+        return;
+      auto className = ast::string(classDef, "name");
+      mlir::Type ownerType = types.widenLiteral(types.inferExpr(object));
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(ownerType);
+      if (!className || !contract ||
+          contract.getContractName() != llvm::StringRef(*className))
+        return;
+    }
     if (auto attr = ast::string(target, "attr")) {
       // `self.<prop> = ...` runs the property setter; it declares no field.
       if (propertyNames.contains(*attr))
@@ -2868,6 +2899,15 @@ void ModuleEmitter::collectClassFields(
       llvm::StringMap<mlir::Type> initArgTypes;
       collectInitArgTypes(method, initArgTypes);
       TypeSystem::Scope initScope = types.pushScope();
+      // ⭐ `self` IS THE CLASS, and this scope did not say so: it is the one
+      // parameter `collectInitArgTypes` skips (it has no annotation to read),
+      // so `other.nxt = self` -- how a linked structure links -- typed as
+      // nothing and the field kept whatever `__init__` gave it.
+      if (auto className = ast::string(classDef, "name"))
+        if (std::optional<mlir::Type> ownContract =
+                types.lookupClass(*className))
+          if (*ownContract)
+            types.bindLocalSymbol("self", *ownContract);
       // A name the pre-pass cannot type must SHADOW any outer binding of the
       // same name; resolving `self.f = x` to a module global that happens to
       // share the local's spelling would type the field off the wrong value.

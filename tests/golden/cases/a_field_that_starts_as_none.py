@@ -45,6 +45,23 @@ c.load("a", 3)
 print(c.show(), c.tags)
 
 
+# A method may also give the field its value through ANOTHER instance of the
+# same class -- the shape every linked structure is written in.
+class Cell:
+    def __init__(self, v: int) -> None:
+        self.v = v
+        self.nxt = None
+
+    def chain(self, other: "Cell") -> None:
+        other.nxt = self
+
+
+first = Cell(1)
+second = Cell(2)
+first.chain(second)
+print(second.nxt.v if second.nxt is not None else -1, first.nxt)
+
+
 # The other order too: a value first, cleared to None later.
 class Slot:
     def __init__(self) -> None:
