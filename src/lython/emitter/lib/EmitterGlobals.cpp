@@ -182,6 +182,33 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     moduleConstantBindings[name] = value;
   }
 
+  // ⭐ AND THE TYPE SYSTEM HAS TO KNOW THEM. A reference to one of these names
+  // re-emits the literal, so every USE site was right; but nothing bound the
+  // name, so any question asked ABOUT it away from a use site went unanswered:
+  //
+  //     WIDTH = 80
+  //     class C:
+  //         half = WIDTH // 2
+  //     print(C.half)      # unsupported static class attribute expression
+  //
+  // A class attribute is TYPED before any body is emitted, by `inferExpr`
+  // alone, and an attribute whose type is unknown falls off the slot channel
+  // onto the constant channel -- which has no arm for an expression and says
+  // so from the lowering. The annotated spelling `WIDTH: int = 80` already
+  // worked here, and CPython does not distinguish the two.
+  //
+  // ⛔ The LITERAL type, not the widened one: the binding has to describe what
+  // `emitConstant` will produce at the use site, and a widened `int` would
+  // make the two disagree wherever the literal's precision is what decides.
+  //
+  // ⛔ And only where nothing is bound already -- a name this pass reached is
+  // bound once by construction, but a builtin or an import may own the
+  // spelling, and this is a fallback for inference, not a rebinding.
+  for (const auto &entry : moduleConstantBindings)
+    if (!types.lookupSymbol(entry.getKey()))
+      if (mlir::Type literal = types.inferExpr(entry.second))
+        types.bindSymbol(entry.getKey(), literal);
+
   // ⭐ And a plain `NAME = <not a literal>` bound once gets a CELL, which is
   // the same argument one step on: re-emitting is only cheaper when there is
   // something to re-emit, and a container or an instance cannot be re-emitted
