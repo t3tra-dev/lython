@@ -44,6 +44,13 @@ NodePtr selfAttribute(llvm::StringRef receiver, llvm::StringRef attr,
 NodePtr subscript(NodePtr value, NodePtr slice, SourceRange range);
 NodePtr tuple(std::vector<NodePtr> elts, SourceRange range);
 NodePtr call(NodePtr func, std::vector<NodePtr> args, SourceRange range);
+// A `name=value` argument, and a call that carries some. The dispatcher's arms
+// forward a keyword AS a keyword, because CPython binds it by name in the body
+// that RUNS -- forwarding it by position would bind the subclass's parameter of
+// that position instead.
+NodePtr keyword(llvm::StringRef arg, NodePtr value, SourceRange range);
+NodePtr callWithKeywords(NodePtr func, std::vector<NodePtr> args,
+                         std::vector<NodePtr> keywords, SourceRange range);
 NodePtr methodCall(NodePtr receiver, llvm::StringRef method,
                    std::vector<NodePtr> args, SourceRange range);
 NodePtr lenCall(NodePtr value, SourceRange range);

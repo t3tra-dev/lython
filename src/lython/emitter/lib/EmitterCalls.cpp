@@ -2565,7 +2565,8 @@ parser::NodePtr sharedField(const parser::Node &node, llvm::StringRef field) {
 const ModuleEmitter::VirtualDispatchHelper *
 ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                                     llvm::StringRef methodName,
-                                    unsigned argumentCount, bool asProperty) {
+                                    unsigned argumentCount, bool asProperty,
+                                    llvm::ArrayRef<std::string> keywordNames) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!contract)
     return nullptr;
@@ -2594,15 +2595,18 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   // subclass was refused outright -- "'f' is overridden by a subclass of
   // 'Base'" -- for a method shape ordinary Python writes everywhere.
   //
+  // ⛔ A KEYWORD-ONLY PARAMETER IS NOT A REASON TO REFUSE EITHER, for the same
+  // reason: the arms restate only what the call passed, and a `*`-parameter is
+  // passed by name or not at all. The blanket `kwonlyargs` refusal that stood
+  // here rejected `x.f(3)` -- a call naming NOTHING keyword-only -- whenever
+  // the base merely declared one.
+  //
   // ⛔ The arms must not restate the default, only omit the parameter: each
   // arm calls `recv.f(p1..pN)` with exactly what the site passed, so the body
   // that RUNS fills the rest from its OWN default -- which is what CPython
   // does and what a dispatcher restating the base's default would get wrong
   // for a subclass that changed it. That is why the memo is keyed by the
   // argument count as well: one dispatcher per (class, method, arity).
-  if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs"))
-    if (!kwonly->empty())
-      return nullptr;
   parser::NodePtr returns = sharedField(*base->method, "returns");
   if (!returns)
     return nullptr;
@@ -2654,9 +2658,55 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   if (!selfSeen || parameterNames.size() != argumentCount)
     return nullptr;
 
+  // ⭐ A KEYWORD AT THE CALL SITE IS A PARAMETER OF THE DISPATCHER TOO. It used
+  // to bail the whole synthesis ("the dispatcher forwards positionals only, so
+  // a keyword would silently move to another parameter"), which refused
+  // `x.f(k=1)` on every overridden method. The keyword rides as an ordinary
+  // parameter here and is forwarded BY NAME in each arm, so the body that runs
+  // binds it the way CPython does.
+  //
+  // ⛔ Every keyword must name a parameter the base declares AFTER the
+  // positional prefix -- otherwise the call is already wrong -- and its
+  // annotation is the base's. A keyword the base does not declare, or one that
+  // repeats a positional, falls through to the refusal.
+  llvm::SmallVector<std::string, 2> keywordParameters;
+  for (const std::string &keywordName : keywordNames) {
+    if (llvm::is_contained(parameterNames, keywordName) ||
+        llvm::is_contained(keywordParameters, keywordName))
+      return nullptr;
+    parser::NodePtr annotation;
+    unsigned position = 0;
+    unsigned keywordPosition = 0;
+    bool keywordOnly = false;
+    for (llvm::StringRef field : {"posonlyargs", "args", "kwonlyargs"})
+      if (const auto *list = ast::nodeList(*arguments, field))
+        for (const parser::NodePtr &argument : *list) {
+          if (!argument)
+            return nullptr;
+          if (field != "kwonlyargs")
+            ++position;
+          if (position == 1 && field != "kwonlyargs")
+            continue; // the receiver
+          // A `/` parameter cannot be named at a call at all, so a keyword
+          // matching one is not this parameter -- CPython rejects the call.
+          if (field == "posonlyargs" ||
+              ast::nameSpelling(*argument) != keywordName)
+            continue;
+          annotation = sharedField(*argument, "annotation");
+          keywordPosition = position - 1;
+          keywordOnly = field == "kwonlyargs";
+        }
+    if (!annotation || (!keywordOnly && keywordPosition <= argumentCount))
+      return nullptr;
+    keywordParameters.push_back(keywordName);
+    params.push_back(synth::Param{keywordName, std::move(annotation)});
+  }
+
   std::string key = (receiverClass + "." + methodName + "/" +
                      llvm::Twine(argumentCount) + (asProperty ? "$get" : ""))
                         .str();
+  for (const std::string &keywordName : keywordParameters)
+    key += "," + keywordName;
   auto memo = virtualDispatchHelpers.find(key);
   if (memo == virtualDispatchHelpers.end()) {
     // Every class that declares the method and has the receiver's class among
@@ -2718,11 +2768,18 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     // that declares the property is tested before its own ancestors. That
     // ordering is Python's own resolution, so each arm binds the body an
     // instance of that class would have run.
+    auto keywordArguments = [&] {
+      std::vector<parser::NodePtr> out;
+      for (const std::string &name : keywordParameters)
+        out.push_back(synth::keyword(name, synth::name(name, range), range));
+      return out;
+    };
     auto read = [&](parser::NodePtr receiverNode) {
-      return asProperty ? synth::attribute(std::move(receiverNode), methodName,
-                                           range)
-                        : synth::methodCall(std::move(receiverNode), methodName,
-                                            forwarded(), range);
+      if (asProperty)
+        return synth::attribute(std::move(receiverNode), methodName, range);
+      return synth::callWithKeywords(
+          synth::attribute(std::move(receiverNode), methodName, range),
+          forwarded(), keywordArguments(), range);
     };
     std::vector<parser::NodePtr> body;
     for (const auto &candidate : candidates)
@@ -2742,9 +2799,10 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       for (parser::NodePtr &argument : forwarded())
         fallbackArguments.push_back(std::move(argument));
       body.push_back(synth::returnStmt(
-          synth::call(synth::attribute(synth::name(base->definingClass, range),
-                                       methodName, range),
-                      std::move(fallbackArguments), range),
+          synth::callWithKeywords(
+              synth::attribute(synth::name(base->definingClass, range),
+                               methodName, range),
+              std::move(fallbackArguments), keywordArguments(), range),
           range));
     }
 
@@ -2893,19 +2951,28 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
     const parser::Node &expr, const parser::Node &calleeNode,
     const parser::Node *receiverNode, Value receiver,
     llvm::StringRef methodName) {
-  // Keyword arguments at the CALL site: the dispatcher forwards positionals
-  // only, so a keyword would silently move to another parameter.
-  if (const auto *keywords = ast::nodeList(expr, "keywords"))
-    if (!keywords->empty())
-      return std::nullopt;
+  // A keyword at the CALL site becomes a parameter of the dispatcher, which
+  // forwards it by name. `**mapping` cannot: its names are not known here, so
+  // there is nothing to declare.
+  llvm::SmallVector<std::string, 2> keywordNames;
+  const auto *keywords = ast::nodeList(expr, "keywords");
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords) {
+      std::optional<std::string_view> name =
+          keyword ? ast::string(*keyword, "arg") : std::nullopt;
+      if (!name)
+        return std::nullopt;
+      keywordNames.push_back(std::string(*name));
+    }
   const auto *args = ast::nodeList(expr, "args");
   unsigned argumentCount = args ? static_cast<unsigned>(args->size()) : 0;
   if (args)
     for (const parser::NodePtr &argument : *args)
       if (argument && argument->kind == "Starred")
         return std::nullopt;
-  const VirtualDispatchHelper *helper =
-      virtualDispatcherFor(expr, receiver, methodName, argumentCount);
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      expr, receiver, methodName, argumentCount, /*asProperty=*/false,
+      keywordNames);
   if (!helper)
     return std::nullopt;
   // Emitted only now: a bail above must not have evaluated the arguments, or
@@ -2914,6 +2981,9 @@ std::optional<Value> ModuleEmitter::tryEmitVirtualDispatch(
   if (args)
     for (const parser::NodePtr &argument : *args)
       callArguments.push_back(emitExpr(argument.get()));
+  if (keywords)
+    for (const parser::NodePtr &keyword : *keywords)
+      callArguments.push_back(emitExpr(ast::node(*keyword, "value")));
   Value callee = emitBindingRef(expr, helper->symbol, helper->callable);
   return emitCallableDispatch(
       expr, callee,

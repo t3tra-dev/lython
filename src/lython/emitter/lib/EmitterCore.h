@@ -150,11 +150,10 @@ private:
   };
   // The dispatcher for one (receiver class, method), synthesized on first use.
   // Null when the shape is outside what the synthesis covers.
-  const VirtualDispatchHelper *virtualDispatcherFor(const parser::Node &anchor,
-                                                    Value receiver,
-                                                    llvm::StringRef methodName,
-                                                    unsigned argumentCount,
-                                                    bool asProperty = false);
+  const VirtualDispatchHelper *virtualDispatcherFor(
+      const parser::Node &anchor, Value receiver, llvm::StringRef methodName,
+      unsigned argumentCount, bool asProperty = false,
+      llvm::ArrayRef<std::string> keywordNames = {});
   // The forwarding body a bound METHOD OBJECT needs when the receiver's class
   // has an overriding subclass: `def m(self, ...): return __lyvdisp$N(self,
   // ...)`. Null when no dispatcher covers the shape, in which case the method

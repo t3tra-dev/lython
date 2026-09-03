@@ -75,6 +75,22 @@ NodePtr call(NodePtr func, std::vector<NodePtr> args, SourceRange range) {
   return node;
 }
 
+NodePtr keyword(llvm::StringRef arg, NodePtr value, SourceRange range) {
+  NodePtr node = parser::makeNode("keyword", range);
+  parser::addField(*node, "arg", std::string(arg));
+  parser::addField(*node, "value", std::move(value));
+  return node;
+}
+
+NodePtr callWithKeywords(NodePtr func, std::vector<NodePtr> args,
+                         std::vector<NodePtr> keywords, SourceRange range) {
+  NodePtr node = parser::makeNode("Call", range);
+  parser::addField(*node, "func", std::move(func));
+  parser::addField(*node, "args", std::move(args));
+  parser::addField(*node, "keywords", std::move(keywords));
+  return node;
+}
+
 NodePtr methodCall(NodePtr receiver, llvm::StringRef method,
                    std::vector<NodePtr> args, SourceRange range) {
   return call(attribute(std::move(receiver), method, range), std::move(args),
