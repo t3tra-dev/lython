@@ -4166,6 +4166,25 @@ ModuleEmitter::emitLiteralTypeConstant(const parser::Node &anchor,
         builder.getStringAttr(spelling.drop_front().drop_back()));
     return Value{op.getResult(), type};
   }
+  // A float spelling, which the int arm above deliberately does not claim.
+  // `widenLiteral` maps the same spellings to the float type; the two have to
+  // agree or the value and its static type would disagree at the use.
+  if (types.widenLiteral(type) == types.floatType()) {
+    double parsed = 0.0;
+    if (spelling == "inf" || spelling == "-inf" || spelling == "nan" ||
+        !spelling.getAsDouble(parsed)) {
+      if (spelling == "inf")
+        parsed = std::numeric_limits<double>::infinity();
+      else if (spelling == "-inf")
+        parsed = -std::numeric_limits<double>::infinity();
+      else if (spelling == "nan")
+        parsed = std::numeric_limits<double>::quiet_NaN();
+      auto op = py::FloatConstantOp::create(builder, loc(anchor),
+                                            types.floatType(),
+                                            builder.getF64FloatAttr(parsed));
+      return Value{op.getResult(), types.floatType()};
+    }
+  }
   return std::nullopt;
 }
 

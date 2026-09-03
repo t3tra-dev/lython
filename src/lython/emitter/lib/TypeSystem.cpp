@@ -4595,6 +4595,22 @@ TypeSystem::nearestCommonSourceBase(mlir::ArrayRef<mlir::Type> members) const {
   return {};
 }
 
+// The spellings `types.literal` may hold for a float: a decimal point, an
+// exponent, or one of the two non-finite names, with an optional sign.
+static bool isFloatLiteralSpelling(llvm::StringRef spelling) {
+  llvm::StringRef body = spelling;
+  body.consume_front("-");
+  body.consume_front("+");
+  if (body == "inf" || body == "nan")
+    return true;
+  if (body.empty() || body.front() == '"')
+    return false;
+  if (!body.contains('.') && !body.contains('e') && !body.contains('E'))
+    return false;
+  double parsed = 0.0;
+  return !spelling.getAsDouble(parsed);
+}
+
 mlir::Type TypeSystem::widenLiteral(mlir::Type type) const {
   auto literalType = mlir::dyn_cast_or_null<py::LiteralType>(type);
   if (!literalType)
@@ -4606,6 +4622,17 @@ mlir::Type TypeSystem::widenLiteral(mlir::Type type) const {
     return none();
   if (!spelling.empty() && spelling.front() == '"')
     return strType();
+  // ⭐ A FLOAT SPELLING IS A FLOAT. Everything unquoted that is not
+  // True/False/None used to widen to INT, which is why an imported module's
+  // `RATIO = 1.5` could not be a literal constant at all -- the import channel
+  // had to decline it rather than hand back a spelling every reader would take
+  // for an integer.
+  //
+  // ⛔ The mark, not `getAsDouble`: "3" parses as a double too, and an int
+  // literal must stay an int. A decimal point, an exponent, or the two
+  // non-finite spellings are what a float has and an int cannot.
+  if (isFloatLiteralSpelling(spelling))
+    return floatType();
   return intType();
 }
 

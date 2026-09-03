@@ -549,6 +549,21 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   return true;
 }
 
+// The literal type for a double, spelled so that `widenLiteral` reads it back
+// as a float: a decimal point is appended where `%.17g` produced none.
+static mlir::Type floatLiteralType(TypeSystem &types, double value) {
+  char buffer[40];
+  std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+  std::string spelling(buffer);
+  if (spelling.find('.') == std::string::npos &&
+      spelling.find('e') == std::string::npos &&
+      spelling.find('E') == std::string::npos &&
+      spelling.find("inf") == std::string::npos &&
+      spelling.find("nan") == std::string::npos)
+    spelling += ".0";
+  return types.literal(spelling);
+}
+
 // A top-level `NAME: T = <literal>` / `NAME = <literal>` assigned exactly once
 // in a source module is a static literal constant: its literal type fully
 // determines the value, so importers materialize it without module state.
@@ -596,8 +611,30 @@ sourceModuleLiteralConstant(TypeSystem &types,
     if (!constantNode)
       return std::nullopt;
   }
+  // ⭐ A NEGATIVE LITERAL IS A UnaryOp OVER ONE, not a Constant, so `LIMIT = -1`
+  // in an imported module did not resolve while `LIMIT = 1` beside it did --
+  // for an int as much as for a float. The sign is folded here; the spellings
+  // below already carry one.
+  bool negated = false;
+  while (constantNode->kind == "UnaryOp") {
+    const parser::Node *op = ast::node(*constantNode, "op");
+    bool minus = ast::isOperator(op, "USub");
+    if (!minus && !ast::isOperator(op, "UAdd"))
+      return std::nullopt;
+    negated = negated != minus;
+    constantNode = ast::node(*constantNode, "operand");
+    if (!constantNode)
+      return std::nullopt;
+  }
   if (constantNode->kind != "Constant")
     return std::nullopt;
+  if (negated) {
+    if (auto number = ast::integer(*constantNode, "value"))
+      return types.literal(std::to_string(-*number));
+    if (auto number = ast::floating(*constantNode, "value"))
+      return floatLiteralType(types, -*number);
+    return std::nullopt;
+  }
   if (auto text = ast::string(*constantNode, "value"))
     return types.literal("\"" + std::string(*text) + "\"");
   if (auto flag = ast::boolean(*constantNode, "value"))
@@ -611,12 +648,16 @@ sourceModuleLiteralConstant(TypeSystem &types,
   // `widenLiteral` maps it to the none type and `emitLiteralTypeConstant`
   // materializes it.
   //
-  // ⛔ A float still does not resolve, and this is not the place to make it:
-  // a "1.5" spelling would widen to INT, because every reader of a literal
-  // spelling that is not True/False/None/quoted takes it for one. Recorded in
-  // tests/probe/wb_a_container_constant_in_an_imported_module.py.
   if (ast::isNoneField(*constantNode, "value"))
     return types.literal("None");
+  // ⭐ AND A FLOAT, which the note here used to say was not this function's to
+  // make: "a 1.5 spelling would widen to INT, because every reader of a literal
+  // spelling that is not True/False/None/quoted takes it for one". That was
+  // true of `widenLiteral`, and it is the reader that has been taught the
+  // difference -- the spelling carries a decimal point, an exponent, or a
+  // non-finite name, and nothing else in the tree writes such a spelling.
+  if (auto number = ast::floating(*constantNode, "value"))
+    return floatLiteralType(types, *number);
   return std::nullopt;
 }
 

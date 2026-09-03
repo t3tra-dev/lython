@@ -1777,6 +1777,15 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                                              staticAttrNames.end());
   for (auto [attrName, attrValue, attrType] :
        llvm::zip_equal(staticAttrNames, staticAttrValues, staticAttrTypes)) {
+    // ⛔ A FLOAT LITERAL TYPE IS REGISTERED WIDENED. The constant channel
+    // materializes the read from the attribute's own type, and the lowering's
+    // default-value path knows the int/str/bool/None literal spellings but not
+    // a float one -- "default argument has no concrete runtime contract", for
+    // an imported `ratio = 1.5` whose int twin beside it worked. The metadata
+    // carries the value; the type only has to say what it is.
+    if (mlir::isa_and_nonnull<py::LiteralType>(attrType) &&
+        types.widenLiteral(attrType) == types.floatType())
+      attrType = types.floatType();
     registeredStaticAttrs[attrName] = attrType;
     registeredStaticValues[attrName] = attrValue;
     types.bindClassStaticAttr(contractName, attrName,
