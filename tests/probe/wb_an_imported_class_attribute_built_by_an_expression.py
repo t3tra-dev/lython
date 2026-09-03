@@ -28,6 +28,14 @@
 # was slotted. Any repair has to distinguish a user module from a lib one, or
 # fold the constant instead.
 #
+# ⛔ MEASURED AND DROPPED: recording the attribute from its INFERRED TYPE when
+# that type is a `!py.literal<...>`, on the theory that the inference had
+# already folded the expression. It fixed nothing -- `inferExpr(W // 4)`
+# answers `builtins.int`, not `literal<5>`, so the fold has no input. Folding
+# it would mean evaluating the binop over the operands' own constants and
+# resolving the "ref" to the module constant W, which is a constant evaluator
+# this channel does not have.
+#
 # Measured 2026-09-04. The dispatcher half of the same boundary IS fixed
 # (cases/a_class_attribute_a_subclass_redeclares_across_modules).
 import a_module_of_computed_attributes as m
