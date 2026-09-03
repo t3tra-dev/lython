@@ -900,7 +900,23 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
   llvm::SaveAndRestore<const parser::Node *> anchorless(
       anchorlessCall, anchorlessCallOf(statement));
   if (statement.kind == "Expr") {
-    emitExpr(ast::node(statement, "value"));
+    // ⭐ `...` AS A STATEMENT IS `pass`, which is what Python uses it for:
+    //
+    //     class Shape(Protocol):
+    //         def area(self) -> int: ...
+    //
+    // was "unsupported constant literal" -- the constant emitter has no arm
+    // for Ellipsis and the stub spelling is the one place a program writes
+    // one. That refusal took every Protocol declaration and every
+    // `@abstractmethod` stub with it.
+    //
+    // ⛔ Only as a STATEMENT. `x = ...` binds the Ellipsis OBJECT, which this
+    // compiler has no value for, and that keeps its refusal.
+    const parser::Node *value = ast::node(statement, "value");
+    if (value && value->kind == "Constant" &&
+        ast::isEllipsisField(*value, "value"))
+      return;
+    emitExpr(value);
   } else if (statement.kind == "Import") {
     bindImportStatement(statement, /*diagnoseUnsupported=*/true);
   } else if (statement.kind == "ImportFrom") {

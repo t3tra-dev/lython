@@ -139,6 +139,7 @@ public:
                          mlir::Type &currentReturnType,
                          std::string &currentFunctionPrefix,
                          mlir::Type &currentGeneratorSendType,
+                         mlir::Type &currentGeneratorYieldType,
                          llvm::StringMap<mlir::Type> &narrowedFromTypes,
                          const TypeSystem &types)
       : values(values), savedValues(values),
@@ -148,6 +149,8 @@ public:
         savedFunctionPrefix(currentFunctionPrefix),
         currentGeneratorSendType(currentGeneratorSendType),
         savedGeneratorSendType(currentGeneratorSendType),
+        currentGeneratorYieldType(currentGeneratorYieldType),
+        savedGeneratorYieldType(currentGeneratorYieldType),
         narrowedFromTypes(narrowedFromTypes),
         savedNarrowedFromTypes(narrowedFromTypes),
         typeScope(types.pushScope()) {
@@ -162,6 +165,7 @@ public:
     currentReturnType = savedReturnType;
     currentFunctionPrefix = savedFunctionPrefix;
     currentGeneratorSendType = savedGeneratorSendType;
+    currentGeneratorYieldType = savedGeneratorYieldType;
     narrowedFromTypes = savedNarrowedFromTypes;
   }
 
@@ -174,6 +178,8 @@ private:
   std::string savedFunctionPrefix;
   mlir::Type &currentGeneratorSendType;
   mlir::Type savedGeneratorSendType;
+  mlir::Type &currentGeneratorYieldType;
+  mlir::Type savedGeneratorYieldType;
   llvm::StringMap<mlir::Type> &narrowedFromTypes;
   llvm::StringMap<mlir::Type> savedNarrowedFromTypes;
   TypeSystem::Scope typeScope;

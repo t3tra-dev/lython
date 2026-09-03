@@ -4853,10 +4853,72 @@ TypeSystem::functionSignature(const parser::Node &function,
 
     if (returns && !py::isAssignableTo(sig.inferredGeneratorType,
                                        annotatedReturn)) {
-      sig.generatorAnnotationMismatch =
-          "generator function is annotated " + typeText(annotatedReturn) +
-          " but yields " + typeText(sig.generatorYieldType) + " (inferred " +
-          typeText(sig.inferredGeneratorType) + ")";
+      // ⭐ A YIELD INSIDE A GUARD YIELDS WHAT THE GUARD PROVED, and this walk
+      // cannot see guards: it types each `yield` expression on its own, so
+      //
+      //     def gen(xs: list[int | None]) -> Iterator[int]:
+      //         for v in xs:
+      //             if v is not None:
+      //                 yield v * 2
+      //
+      // came out as `int | None` and the annotation was reported as a
+      // mismatch, for a program whose every yield is an int. The annotation is
+      // the CONTRACT here, as it is everywhere else: when every inferred yield
+      // either satisfies it or is a union that CONTAINS it, the annotation is
+      // taken and each yield is checked at its own site, where the narrowing
+      // is available. A yield that really cannot produce the annotated type is
+      // then refused there, naming the yield instead of the function.
+      //
+      // ⛔ Only when the union CONTAINS it: a yield of an unrelated type is
+      // still the function-level mismatch, because no guard could make it
+      // right and the message that names the whole function is the better one.
+      std::optional<mlir::Type> annotatedYield;
+      if (const py::protocols::Table &table =
+              py::protocols::Table::get(context);
+          true)
+        for (llvm::StringRef protocolName :
+             {"Generator", "AsyncGenerator", "Iterator", "AsyncIterator",
+              "Iterable"})
+          if (!annotatedYield)
+            if (std::optional<std::vector<mlir::Type>> args =
+                    table.protocolArgumentsFor(annotatedReturn, protocolName))
+              if (!args->empty() && (*args)[0])
+                annotatedYield = (*args)[0];
+      bool everyYieldNarrows =
+          annotatedYield && *annotatedYield && !generator.yieldTypes.empty() &&
+          llvm::all_of(generator.yieldTypes, [&](mlir::Type yielded) {
+            mlir::Type widened = widenLiteral(yielded);
+            if (py::isAssignableTo(widened, *annotatedYield))
+              return true;
+            auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened);
+            return unionType && unionType.hasMember(*annotatedYield);
+          });
+      if (everyYieldNarrows) {
+        sig.generatorYieldType = *annotatedYield;
+        sig.generatorYieldTypeIsAnnotated = true;
+        sig.inferredGeneratorType =
+            function.kind == "AsyncFunctionDef"
+                ? protocol("AsyncGenerator",
+                           {sig.generatorYieldType, sig.generatorSendType})
+                : contract("types.GeneratorType",
+                           {sig.generatorYieldType, sig.generatorSendType,
+                            sig.generatorReturnType});
+      }
+      if (!everyYieldNarrows ||
+          !py::isAssignableTo(sig.inferredGeneratorType, annotatedReturn))
+        // ⛔ MEASURED AND DROPPED: taking the annotation whatever the walk
+        // inferred. It also accepts the shapes whose yield EXPRESSION needs
+        // the narrowing (`yield v.upper()` types as None because the lookup on
+        // the union fails), but it moved a genuinely wrong generator --
+        // `-> Iterator[str]` with `yield v` for an int v -- from this
+        // sentence to "Failed to run lowering pipeline", because the site
+        // coercion does not refuse int where str is declared. A worse
+        // diagnostic for a wrong program is not a trade worth the extra right
+        // ones; those need a narrowing-aware yield walk.
+        sig.generatorAnnotationMismatch =
+            "generator function is annotated " + typeText(annotatedReturn) +
+            " but yields " + typeText(sig.generatorYieldType) + " (inferred " +
+            typeText(sig.inferredGeneratorType) + ")";
     }
     sig.resultType = sig.generatorReturnType;
   } else if (function.kind == "Lambda") {

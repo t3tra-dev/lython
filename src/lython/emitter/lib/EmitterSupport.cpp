@@ -1105,6 +1105,15 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
 // side, not `int | None` -- and applying the second after the first replaces
 // rather than refines. `applyBranchNarrowing` makes that a safe no-op today, so
 // dropping the duplicate here says what is meant instead of relying on it.
+bool isEllipsisStubBody(const std::vector<parser::NodePtr> *body) {
+  if (!body || body->size() != 1 || !body->front() ||
+      body->front()->kind != "Expr")
+    return false;
+  const parser::Node *value = ast::node(*body->front(), "value");
+  return value && value->kind == "Constant" &&
+         ast::isEllipsisField(*value, "value");
+}
+
 llvm::SmallVector<BranchTypeNarrowing, 2>
 branchTypeNarrowings(const parser::Node &test, TypeSystem &types,
                      mlir::Operation *from) {

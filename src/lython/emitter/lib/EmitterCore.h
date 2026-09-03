@@ -1302,6 +1302,10 @@ private:
   void applyFunctionDecorators(const parser::Node &statement);
   mlir::Type currentReturnType;
   mlir::Type currentGeneratorSendType;
+  // The yield type the generator's ANNOTATION promises, when it has one. Each
+  // `yield` is checked against it at its own site, where the flow facts a guard
+  // proved are available and the whole-body walk's are not.
+  mlir::Type currentGeneratorYieldType;
   std::string currentFunctionPrefix;
   std::vector<parser::NodePtr> synthesizedDefaultProviders;
   // Non-constant defaults of MODULE-level defs (R6): evaluated once when

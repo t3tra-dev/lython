@@ -321,6 +321,20 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
   if (expr->kind == "Yield") {
     const parser::Node *valueNode = ast::node(*expr, "value");
     Value yielded = valueNode ? emitExpr(valueNode) : emitNone(*expr);
+    // ⭐ THE ANNOTATION IS CHECKED HERE, where the guard above the yield has
+    // already been spent. The whole-body walk that computes the yield type has
+    // no flow facts, so
+    //
+    //     def gen(xs: list[int | None]) -> Iterator[int]:
+    //         for v in xs:
+    //             if v is not None:
+    //                 yield v * 2
+    //
+    // was refused as "annotated Iterator[int] but yields int | None" for a
+    // program whose every yield is an int -- while the same guard around
+    // `out.append(v * 2)` in a plain function has always compiled.
+    if (currentGeneratorYieldType)
+      yielded = coerceValue(yielded, currentGeneratorYieldType, *expr);
     mlir::Type sentType =
         currentGeneratorSendType ? currentGeneratorSendType : types.none();
     auto op =

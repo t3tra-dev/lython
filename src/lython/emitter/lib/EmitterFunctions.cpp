@@ -463,10 +463,10 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     func->setAttr("closure_types", typeArray(builder, captureTypes));
   }
 
-  ScopedCallableEmission emissionScope(values, currentReturnType,
-                                       currentFunctionPrefix,
-                                       currentGeneratorSendType,
-                                       narrowedFromTypes, types);
+  ScopedCallableEmission emissionScope(
+      values, currentReturnType, currentFunctionPrefix,
+      currentGeneratorSendType, currentGeneratorYieldType, narrowedFromTypes,
+      types);
   // The forward look for a later read stops at this callable's own suites: a
   // name inside a nested function is a different binding, and the enclosing
   // function's remainder says nothing about it.
@@ -521,6 +521,11 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   currentGeneratorSendType =
       sig.isGeneratorFunction || sig.isAsyncGeneratorFunction
           ? sig.generatorSendType
+          : mlir::Type();
+  currentGeneratorYieldType =
+      (sig.isGeneratorFunction || sig.isAsyncGeneratorFunction) &&
+              sig.generatorYieldTypeIsAnnotated
+          ? sig.generatorYieldType
           : mlir::Type();
   currentFunctionPrefix = symbolName.str();
   llvm::SaveAndRestore<std::optional<NotImplementedFallback>> savedFallback(
@@ -708,7 +713,42 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                              currentReturnType, callable);
     mlir::func::ReturnOp::create(builder, loc(callable), body.value);
   } else {
-    emitStatements(ast::nodeList(callable, "body"));
+    // ⭐ A BODY THAT IS ONLY `...` IS A STUB, and a stub whose declared result
+    // cannot hold None has no value to fall through with:
+    //
+    //     class Shape(Protocol):
+    //         def area(self) -> int: ...
+    //     # this function can reach its end without returning, and its
+    //     # declared result builtins.int cannot hold the None a fallthrough
+    //     # returns
+    //
+    // which is the refusal `...` earns once it stops being an unsupported
+    // constant. CPython returns None from such a body; the annotation says it
+    // cannot, and the program that wrote the stub never means it to be called.
+    // So the body IS the raise a hand-written stub spells out, which is the
+    // form (`raise NotImplementedError`) this compiler has always accepted.
+    //
+    // ⛔ Only where None does not fit. `def f() -> None: ...` returns None in
+    // CPython and returns None here; raising there would be a deviation for a
+    // body whose answer IS representable.
+    const auto *bodyStatements = ast::nodeList(callable, "body");
+    bool stubBody = isEllipsisStubBody(bodyStatements);
+    if (stubBody && currentReturnType &&
+        !py::isAssignableTo(types.none(), currentReturnType, module)) {
+      parser::NodePtr stub = synth::raiseStmt(
+          synth::call(synth::name("NotImplementedError", callable.range),
+                      {synth::strConstant(
+                          std::string(ast::string(callable, "name")
+                                          .value_or("this function")) +
+                              " is a stub",
+                          callable.range)},
+                      callable.range),
+          callable.range);
+      emitStatement(*stub);
+      synthesizedIteratorDefs.push_back(std::move(stub));
+    } else {
+      emitStatements(bodyStatements);
+    }
   }
   if (!insertionBlockTerminated(builder)) {
     auto emitPrimitiveFallbackReturn = [&]() -> bool {

@@ -4192,7 +4192,24 @@ Value ModuleEmitter::emitInlineMethodBody(
   frame.endColumn = anchor.range.end.column;
   frame.noAnchor = anchorlessCall == &anchor;
   inlineFrames.push_back(std::move(frame));
-  emitStatements(body);
+  // The stub body the function path substitutes, substituted here too: an
+  // inlined `def area(self) -> int: ...` has no value to fall through with.
+  if (isEllipsisStubBody(body) && resultType != types.none()) {
+    parser::NodePtr stub = synth::raiseStmt(
+        synth::call(synth::name("NotImplementedError", anchor.range),
+                    {synth::strConstant(
+                        ast::string(*method.method, "name")
+                                .value_or("this function")
+                                .data() +
+                            std::string(" is a stub"),
+                        anchor.range)},
+                    anchor.range),
+        anchor.range);
+    emitStatement(*stub);
+    synthesizedIteratorDefs.push_back(std::move(stub));
+  } else {
+    emitStatements(body);
+  }
   inlineFrames.pop_back();
   methodsBeingInlined.pop_back();
   currentReturnType = enclosingReturnType;

@@ -124,6 +124,11 @@ const parser::Node *nameComparedWithNone(const parser::Node *left,
                                          const parser::Node *right);
 std::optional<NoneComparisonNarrowing>
 optionalNoneComparison(const parser::Node &test, TypeSystem &types);
+// A body that is only `...`: the stub spelling Python uses for a declaration
+// it does not mean to run (`def area(self) -> int: ...`). Both the function
+// path and the method-INLINING path have to recognise it, and asking twice is
+// what left the inlined one refusing what the other had just learned to accept.
+bool isEllipsisStubBody(const std::vector<parser::NodePtr> *body);
 // Every fact a test proves, one per NAME. A conjunction may prove things about
 // several names at once (`isinstance(a, X) and isinstance(b, Y)`), and a single
 // fact cannot carry them -- the body then narrowed only the first.

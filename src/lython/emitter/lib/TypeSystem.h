@@ -50,6 +50,11 @@ struct FunctionSignature {
   llvm::SmallVector<std::string, 4> generatorAnalysisFailures;
   mlir::Type inferredGeneratorType;
   mlir::Type generatorYieldType;
+  // True when `generatorYieldType` is the ANNOTATION's rather than the walk's.
+  // Only then is each yield checked against it at its site: for an unannotated
+  // generator the walk's answer IS the contract, and coercing to it would wrap
+  // a narrowed value back into the union the walk inferred.
+  bool generatorYieldTypeIsAnnotated = false;
   mlir::Type generatorSendType;
   mlir::Type generatorReturnType;
 };
