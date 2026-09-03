@@ -739,6 +739,59 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     return analysis;
   }
 
+  // ⭐ TWO CLASSES WITH NO EDGE BETWEEN THEM ARE NOT DISJOINT: a THIRD class
+  // may derive from both.
+  //
+  //     class A: pass
+  //     class M:
+  //         def only_m(self) -> int: return 5
+  //     class B(A, M): pass
+  //     a: A = B()
+  //     print(isinstance(a, M))    # printed False; CPython prints True
+  //
+  // Neither type is assignable to the other and neither declares the other as
+  // a base, which is what everything above reads as "cannot be" -- and a mixin
+  // is exactly the shape that makes it wrong, silently, in the direction that
+  // drops the branch a program wrote.
+  //
+  // ⛔ The ids the test names are the classes that derive from BOTH, not the
+  // target's subclasses: only those can reach this point, and naming the rest
+  // would be compares that cannot fire.
+  //
+  // ⛔ And the branch narrows only when there is exactly ONE such class. The
+  // narrowing hands the branch a VIEW with that class's layout, which is sound
+  // for the single candidate and a guess for a join of several -- so several
+  // answer the test and narrow nothing, which is a refusal inside the branch
+  // rather than a wrong layout.
+  if (mlir::isa<py::ContractType>(analysis.sourceType) &&
+      mlir::isa<py::ContractType>(analysis.targetType) && from) {
+    llvm::SmallVector<mlir::Type, 4> both;
+    // ⛔ `from` IS the module at top level, and `getParentOfType` looks only at
+    // ANCESTORS -- so the walk found no class at all and the arm answered as if
+    // the program had none.
+    mlir::ModuleOp enclosing = mlir::dyn_cast<mlir::ModuleOp>(from);
+    if (!enclosing)
+      enclosing = from->getParentOfType<mlir::ModuleOp>();
+    if (enclosing)
+      enclosing.walk([&](py::ClassOp classOp) {
+        std::optional<mlir::Type> classType =
+            types.lookupClass(classOp.getSymName());
+        if (!classType || llvm::is_contained(both, *classType))
+          return;
+        if (pythonSubclassOf(*classType, analysis.targetType, types, from) &&
+            pythonSubclassOf(*classType, analysis.sourceType, types, from))
+          both.push_back(*classType);
+      });
+    if (!both.empty()) {
+      analysis.kind = IsInstanceAnalysis::Kind::ClassTest;
+      analysis.targetType = both.front();
+      analysis.classTestTypes.assign(std::next(both.begin()), both.end());
+      if (both.size() == 1)
+        analysis.trueType = both.front();
+      return analysis;
+    }
+  }
+
   setAlwaysFalse();
   return analysis;
 }

@@ -539,6 +539,32 @@ bool ModuleEmitter::subclassShadowsAttribute(
 bool ModuleEmitter::subclassRedeclares(
     const llvm::StringMap<llvm::StringSet<>> &declarations,
     llvm::StringRef receiverClass, llvm::StringRef name) const {
+  for (const auto &entry : declaredClassBases)
+    if (candidateRedeclares(declarations, receiverClass, entry.getKey(), name))
+      return true;
+  return false;
+}
+
+// ⭐ A declaration the subclass reaches WITHOUT going through the receiver
+// class is an override, whether the subclass wrote it or inherited it from a
+// mixin. Testing only what the subclass declares itself missed
+// `class B(M, A): pass` -- B declares nothing, resolves `v` to M's, and the
+// base's body was inlined for it.
+//
+// The receiver's own ancestors are excluded because a declaration there is
+// what the receiver already resolves to, not a competitor. Conservative in a
+// diamond, which is the direction that refuses rather than the direction that
+// mis-executes.
+//
+// ⛔ NOT inlined back into the gate. `virtualDispatcherFor` scans for the same
+// candidates and used to ask only what each one DECLARES ITSELF, so
+// `class Both(Base, Mixin)` was refused by the gate (Mixin declares it) and
+// then found no candidate to dispatch to -- one question, two predicates, and
+// a valid program in the gap between them.
+bool ModuleEmitter::candidateRedeclares(
+    const llvm::StringMap<llvm::StringSet<>> &declarations,
+    llvm::StringRef receiverClass, llvm::StringRef candidate,
+    llvm::StringRef name) const {
   // Ancestors as WRITTEN, from the pre-pass rather than from the MRO map the
   // class emission fills: the answer must not depend on where in the file the
   // question is asked (`collectTopLevelBindings`).
@@ -554,38 +580,23 @@ bool ModuleEmitter::subclassRedeclares(
           worklist.push_back(base);
     }
   };
-
+  if (candidate == receiverClass)
+    return false;
+  llvm::StringSet<> candidateAncestors;
+  ancestors(candidate, candidateAncestors);
+  if (!candidateAncestors.contains(receiverClass))
+    return false;
   llvm::StringSet<> receiverAncestors;
   ancestors(receiverClass, receiverAncestors);
-
-  for (const auto &entry : declaredClassBases) {
-    llvm::StringRef candidate = entry.getKey();
-    if (candidate == receiverClass)
+  llvm::SmallVector<llvm::StringRef, 8> reachable{candidate};
+  for (const auto &ancestor : candidateAncestors)
+    reachable.push_back(ancestor.getKey());
+  for (llvm::StringRef cls : reachable) {
+    if (cls == receiverClass || receiverAncestors.contains(cls))
       continue;
-    llvm::StringSet<> candidateAncestors;
-    ancestors(candidate, candidateAncestors);
-    if (!candidateAncestors.contains(receiverClass))
-      continue;
-    // ⭐ A declaration the subclass reaches WITHOUT going through the receiver
-    // class is an override, whether the subclass wrote it or inherited it from
-    // a mixin. Testing only what the subclass declares itself missed
-    // `class B(M, A): pass` -- B declares nothing, resolves `v` to M's, and
-    // the base's body was inlined for it.
-    //
-    // The receiver's own ancestors are excluded because a declaration there is
-    // what the receiver already resolves to, not a competitor. Conservative in
-    // a diamond, which is the direction that refuses rather than the direction
-    // that mis-executes.
-    llvm::SmallVector<llvm::StringRef, 8> reachable{candidate};
-    for (const auto &ancestor : candidateAncestors)
-      reachable.push_back(ancestor.getKey());
-    for (llvm::StringRef cls : reachable) {
-      if (cls == receiverClass || receiverAncestors.contains(cls))
-        continue;
-      auto declared = declarations.find(cls);
-      if (declared != declarations.end() && declared->second.contains(name))
-        return true;
-    }
+    auto declared = declarations.find(cls);
+    if (declared != declarations.end() && declared->second.contains(name))
+      return true;
   }
   return false;
 }

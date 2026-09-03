@@ -2802,11 +2802,15 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       llvm::StringRef candidate = entry.getKey();
       if (candidate == receiverClass)
         continue;
+      // ⭐ THE SAME PREDICATE THE GATE USES. Asking only what the candidate
+      // DECLARES ITSELF left `class Both(Base, Mixin)` refused by the gate
+      // (Mixin declares it, so the dispatch is real) and unanswerable here (no
+      // candidate declares it), which is one question with two predicates and
+      // a valid program in the gap.
       const llvm::StringMap<llvm::StringSet<>> &declarations =
           asAttribute ? declaredClassAttributes : declaredClassMethods;
-      auto declares = declarations.find(candidate);
-      if (declares == declarations.end() ||
-          !declares->second.contains(methodName))
+      if (!candidateRedeclares(declarations, receiverClass, candidate,
+                               methodName))
         continue;
       unsigned depth = 0;
       llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};

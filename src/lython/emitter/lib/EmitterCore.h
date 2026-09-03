@@ -113,6 +113,13 @@ private:
                                llvm::StringRef methodName) const;
   // The same question about a class-level BINDING rather than a method
   // (EmitterClasses.cpp).
+  // Whether `candidate` reaches a declaration of `name` that the receiver
+  // class does not already resolve to. The gate below and the dispatcher's
+  // candidate scan ask this same question; asking it two ways is what left a
+  // program refused by one and unanswerable by the other.
+  bool candidateRedeclares(const llvm::StringMap<llvm::StringSet<>> &declarations,
+                           llvm::StringRef receiverClass,
+                           llvm::StringRef candidate, llvm::StringRef name) const;
   bool subclassShadowsAttribute(llvm::StringRef receiverClass,
                                 llvm::StringRef attributeName) const;
   bool subclassRedeclares(const llvm::StringMap<llvm::StringSet<>> &declarations,

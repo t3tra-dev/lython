@@ -63,7 +63,6 @@ errors/module_missing_attribute emit
 errors/object_constructor_rejected emit
 errors/object_default_not_implemented emit
 errors/override_behind_a_base_typed_receiver emit
-errors/override_inherited_from_a_mixin emit
 errors/param_annotation_required emit
 errors/parse_error parse
 errors/prim_factory_on_scalar emit
