@@ -1123,6 +1123,69 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
     }
   }
 
+  // ⭐ `isinstance(self.a, B)` PROVES SOMETHING ABOUT A FIELD, the same way
+  // `self.a is None` does, and it is the other half of the same gap: the
+  // analysis takes a NAME for its subject, so a field read reached it as
+  // nothing at all.
+  //
+  // ⛔ A FIELD OF A NAME and nothing deeper, for the reason the None arm gives:
+  // a longer path is more places for the value to change between the guard and
+  // the read, and the read side pays for each one.
+  if (test.kind == "Call")
+    if (const parser::Node *isinstanceCallee = ast::node(test, "func");
+        isinstanceCallee && isinstanceCallee->kind == "Name" &&
+        ast::nameSpelling(*isinstanceCallee) == "isinstance")
+      if (const auto *isinstanceKeywords = ast::nodeList(test, "keywords");
+          !isinstanceKeywords || isinstanceKeywords->empty())
+        if (const auto *isinstanceArgs = ast::nodeList(test, "args");
+            isinstanceArgs && isinstanceArgs->size() == 2 &&
+            isinstanceArgs->front() && (*isinstanceArgs)[1] &&
+            isinstanceArgs->front()->kind == "Attribute")
+          if (const parser::Node *owner =
+                  ast::node(*isinstanceArgs->front(), "value");
+              owner && owner->kind == "Name")
+            if (auto attr = ast::string(*isinstanceArgs->front(), "attr")) {
+              mlir::Type sourceType = types.widenLiteral(
+                  types.inferExpr(isinstanceArgs->front().get()));
+              std::optional<llvm::SmallVector<mlir::Type, 4>> targetTypes =
+                  isinstanceTargetTypes((*isinstanceArgs)[1].get(), types);
+              if (sourceType && targetTypes) {
+                IsInstanceAnalysis memberAnalysis =
+                    analyzeIsInstanceAny(sourceType, *targetTypes, types, from);
+                // ⛔ A UNION FIELD ONLY WHERE IT IS AN OPTIONAL, and this is
+                // measured rather than cautious. Narrowing an `int | str`
+                // field to `str` produces a value the ownership walk marks
+                // owned and the frame never acquired -- "owned_local_object
+                // marks a value this frame never acquired" -- which is a
+                // WORSE answer than the refusal it replaces. `T | None` is
+                // the shape the `is None` arm already narrows and the one
+                // this is measured clean on.
+                bool optionalUnion =
+                    memberAnalysis.kind == IsInstanceAnalysis::Kind::UnionTest &&
+                    memberAnalysis.trueType &&
+                    removeNoneFromType(sourceType, types) ==
+                        memberAnalysis.trueType;
+                bool testable =
+                    memberAnalysis.kind ==
+                        IsInstanceAnalysis::Kind::ClassTest ||
+                    optionalUnion;
+                if (testable && memberAnalysis.trueType) {
+                  BranchTypeNarrowing narrowing;
+                  narrowing.isMemberPath = true;
+                  narrowing.name = std::string(ast::nameSpelling(*owner)) +
+                                   "." + std::string(*attr);
+                  narrowing.trueType = memberAnalysis.trueType;
+                  // ⭐ The FALSE side matters for a union field and only for
+                  // one: `int | str` minus `str` is `int`, and without it the
+                  // else branch of `isinstance(self.payload, str)` still read
+                  // the union. Eliminating a class from a plain CONTRACT
+                  // leaves the contract, which is what the read already has,
+                  // and the analysis says so by answering null there.
+                  return narrowing;
+                }
+              }
+            }
+
   std::optional<IsInstanceBranchAnalysis> analyzed =
       optionalIsInstanceBranchAnalysis(test, types, from);
   if (!analyzed)

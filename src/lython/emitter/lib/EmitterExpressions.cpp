@@ -253,13 +253,31 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             raw = emitExpr(expr);
             suppressMemberNarrowing = false;
           }
-          if (auto unionType =
-                  mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
-              unionType && unionType.hasMember(found->second)) {
-            mlir::Type proved = found->second;
-            auto test = py::UnionTestOp::create(builder, loc(*expr),
-                                                builder.getI1Type(), raw.value,
-                                                mlir::TypeAttr::get(proved));
+          mlir::Type proved = found->second;
+          auto rawUnion =
+              mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
+          auto rawContract =
+              mlir::dyn_cast_if_present<py::ContractType>(raw.value.getType());
+          // A union member is tested by its tag; a subclass of the read's own
+          // contract by its runtime class id. Both are the same shape of proof
+          // and the same check.
+          bool testableUnion = rawUnion && rawUnion.hasMember(proved);
+          bool testableClass =
+              !rawUnion && rawContract &&
+              mlir::isa_and_nonnull<py::ContractType>(proved) &&
+              proved != raw.value.getType() &&
+              declaredSubclassOfType(proved, raw.value.getType(), types);
+          if (testableUnion || testableClass) {
+            mlir::Value bit =
+                testableUnion
+                    ? py::UnionTestOp::create(builder, loc(*expr),
+                                              builder.getI1Type(), raw.value,
+                                              mlir::TypeAttr::get(proved))
+                          .getResult()
+                    : py::ClassTestOp::create(builder, loc(*expr),
+                                              builder.getI1Type(), raw.value,
+                                              mlir::TypeAttr::get(proved))
+                          .getResult();
             mlir::Block *origin = builder.getInsertionBlock();
             mlir::Region *region = origin->getParent();
             mlir::Block *bad = builder.createBlock(
@@ -267,8 +285,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             mlir::Block *ok =
                 builder.createBlock(region, std::next(bad->getIterator()));
             builder.setInsertionPointToEnd(origin);
-            mlir::cf::CondBranchOp::create(builder, loc(*expr),
-                                           test.getResult(), ok,
+            mlir::cf::CondBranchOp::create(builder, loc(*expr), bit, ok,
                                            mlir::ValueRange{}, bad,
                                            mlir::ValueRange{});
             builder.setInsertionPointToStart(bad);
@@ -281,8 +298,11 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
                     synth::name("AttributeError", expr->range),
                     {synth::strConstant(
                         "attribute '" + std::string(*attr) +
-                            "' is None here, after a guard above proved it was "
-                            "not: it changed in between",
+                            (testableUnion
+                                 ? "' is None here, after a guard above proved "
+                                   "it was not: it changed in between"
+                                 : "' is not the class a guard above proved it "
+                                   "was: it changed in between"),
                         expr->range)},
                     expr->range),
                 expr->range);
@@ -291,9 +311,15 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             if (!insertionBlockTerminated(builder))
               mlir::cf::BranchOp::create(builder, loc(*expr), ok);
             builder.setInsertionPointToStart(ok);
-            auto unwrap = py::UnionUnwrapOp::create(builder, loc(*expr), proved,
-                                                    raw.value);
-            return Value{unwrap.getResult(), proved};
+            mlir::Value narrowedValue =
+                testableUnion
+                    ? py::UnionUnwrapOp::create(builder, loc(*expr), proved,
+                                                raw.value)
+                          .getResult()
+                    : py::ClassRefineOp::create(builder, loc(*expr), proved,
+                                                raw.value)
+                          .getResult();
+            return Value{narrowedValue, proved};
           }
           return raw;
         }

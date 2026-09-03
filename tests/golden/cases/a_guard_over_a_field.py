@@ -47,6 +47,43 @@ print(t.walk())
 print(t.depth())
 
 
+# The `isinstance` spelling of the same guard, over a field whose static type
+# is a base class: the read is checked against the CLASS the guard proved and
+# then refined, which is the same shape as the union test above.
+class Shape:
+    def area(self) -> int:
+        return 0
+
+
+class Square(Shape):
+    sides = 4
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def area(self) -> int:
+        return self.n * self.n
+
+
+class Holder:
+    def __init__(self, s: Shape) -> None:
+        self.s = s
+
+    def describe(self) -> str:
+        if isinstance(self.s, Square):
+            return "sq" + str(self.s.sides) + "/" + str(self.s.area())
+        return "shape" + str(self.s.area())
+
+    def sides(self) -> int:
+        if not isinstance(self.s, Square):
+            return -1
+        return self.s.sides
+
+
+print(Holder(Shape()).describe(), Holder(Square(3)).describe())
+print(Holder(Shape()).sides(), Holder(Square(3)).sides())
+
+
 class Box:
     def __init__(self) -> None:
         self.v = None
@@ -63,8 +100,14 @@ class Box:
     def sized(self) -> str:
         return str(len(self.v)) if self.v is not None else "-"
 
+    # An Optional field narrowed by isinstance rather than by `is None`.
+    def shouted(self) -> str:
+        if isinstance(self.v, str):
+            return self.v.title()
+        return "-"
+
 
 b = Box()
-print(b.shout(), b.sized())
+print(b.shout(), b.sized(), b.shouted())
 b.set("Ab")
-print(b.shout(), b.sized())
+print(b.shout(), b.sized(), b.shouted())
