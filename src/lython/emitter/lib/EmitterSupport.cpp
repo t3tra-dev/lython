@@ -1006,9 +1006,8 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
   // `object`, and the back edge then carried an `object` into a header expecting
   // the union -- "type mismatch for bb argument #0 of successor #0".
   //
-  // ⛔ ONE NAME, the first operand that proves anything. `BranchTypeNarrowing`
-  // carries a single name, and a conjunction may prove several; the rest are
-  // still applied operand-to-operand where they are read.
+  // ⛔ ONE NAME here, the first operand that proves anything; the caller that
+  // wants them all asks `branchTypeNarrowings`, which walks the same operands.
   if (test.kind == "BoolOp") {
     const parser::Node *op = ast::node(test, "op");
     const bool isAnd = op && op->kind == "And";
@@ -1087,6 +1086,69 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
   if (!narrowing.trueType && !narrowing.falseType)
     return std::nullopt;
   return narrowing;
+}
+
+// ⭐ A CONJUNCTION PROVES ONE THING PER OPERAND, and the body gets to keep all
+// of them:
+//
+//     if isinstance(x, B) and isinstance(y, B):
+//         return x.n + y.n      # 'n' is overridden by a subclass of 'A'
+//
+// `x` narrowed and `y` did not, because a single `BranchTypeNarrowing` carries
+// one name and the arm above returns the first operand that proves anything.
+// Inside the CONDITION the later operands are already narrowed (each proof is
+// applied to the operands after it), which is why `and x.only()` worked and
+// the body did not.
+//
+// ⛔ ONE FACT PER NAME, the first. Two facts about the SAME name would have to
+// be INTERSECTED -- `v is None or isinstance(v, str)` proves `int` on its false
+// side, not `int | None` -- and applying the second after the first replaces
+// rather than refines. `applyBranchNarrowing` makes that a safe no-op today, so
+// dropping the duplicate here says what is meant instead of relying on it.
+llvm::SmallVector<BranchTypeNarrowing, 2>
+branchTypeNarrowings(const parser::Node &test, TypeSystem &types,
+                     mlir::Operation *from) {
+  llvm::SmallVector<BranchTypeNarrowing, 2> facts;
+  auto add = [&](std::optional<BranchTypeNarrowing> fact) {
+    if (!fact)
+      return;
+    for (const BranchTypeNarrowing &seen : facts)
+      if (seen.name == fact->name)
+        return;
+    facts.push_back(std::move(*fact));
+  };
+  const parser::Node *op =
+      test.kind == "BoolOp" ? ast::node(test, "op") : nullptr;
+  const bool isAnd = op && op->kind == "And";
+  const bool isOr = op && op->kind == "Or";
+  if (!isAnd && !isOr) {
+    add(optionalBranchTypeNarrowing(test, types, from));
+    return facts;
+  }
+  const auto *operands = ast::nodeList(test, "values");
+  if (!operands)
+    return facts;
+  for (const parser::NodePtr &operand : *operands) {
+    if (!operand)
+      continue;
+    std::optional<BranchTypeNarrowing> inner =
+        optionalBranchTypeNarrowing(*operand, types, from);
+    if (!inner)
+      continue;
+    if (isAnd) {
+      inner->falseType = mlir::Type();
+      inner->falseSourceType = mlir::Type();
+      if (!inner->trueType)
+        continue;
+    } else {
+      inner->trueType = mlir::Type();
+      inner->trueSourceType = mlir::Type();
+      if (!inner->falseType)
+        continue;
+    }
+    add(std::move(inner));
+  }
+  return facts;
 }
 
 std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,

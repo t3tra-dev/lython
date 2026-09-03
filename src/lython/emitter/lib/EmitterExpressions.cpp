@@ -426,18 +426,17 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // `n if n is not None else 0` typed the kept arm `int | None` and the
     // join stayed a union -- the one spelling of the Optional idiom that has
     // no statement to hang the narrowing on.
-    std::optional<BranchTypeNarrowing> narrowing =
-        testNode ? optionalBranchTypeNarrowing(*testNode, types, module)
-                 : std::nullopt;
+    llvm::SmallVector<BranchTypeNarrowing, 2> narrowings =
+        testNode ? branchTypeNarrowings(*testNode, types, module)
+                 : llvm::SmallVector<BranchTypeNarrowing, 2>{};
     auto armType = [&](const parser::Node *arm, bool conditionIsTrue) {
-      if (!narrowing)
-        return types.widenLiteral(types.inferExpr(arm));
-      mlir::Type narrowed =
-          conditionIsTrue ? narrowing->trueType : narrowing->falseType;
-      if (!narrowed)
+      if (narrowings.empty())
         return types.widenLiteral(types.inferExpr(arm));
       auto scope = types.pushScope();
-      types.bindLocalSymbol(narrowing->name, narrowed);
+      for (const BranchTypeNarrowing &fact : narrowings)
+        if (mlir::Type narrowed =
+                conditionIsTrue ? fact.trueType : fact.falseType)
+          types.bindLocalSymbol(fact.name, narrowed);
       return types.widenLiteral(types.inferExpr(arm));
     };
     // ⭐ AN EMPTY LITERAL ARM CONTRIBUTES NO ELEMENT TYPE. `[]` has none of
@@ -490,29 +489,38 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // builder already is, and undone after it: the other arm and everything
     // after the expression must see the name as it was.
     auto emitArm = [&](const parser::Node *arm, bool conditionIsTrue) {
-      if (!narrowing)
+      if (narrowings.empty())
         return coerceValue(emitExpr(arm), resultType, *expr).value;
-      auto found = values.find(narrowing->name);
-      std::optional<Value> savedValue;
-      if (found != values.end())
-        savedValue = found->second;
-      std::optional<mlir::Type> savedSymbol =
-          types.lookupSymbol(narrowing->name);
-      auto savedNarrowedFrom = narrowedFromTypes.find(narrowing->name);
-      std::optional<mlir::Type> savedNarrowedFromType;
-      if (savedNarrowedFrom != narrowedFromTypes.end())
-        savedNarrowedFromType = savedNarrowedFrom->second;
-      applyBranchNarrowing(*expr, *narrowing, conditionIsTrue);
+      struct Saved {
+        std::string name;
+        std::optional<Value> value;
+        std::optional<mlir::Type> symbol;
+        std::optional<mlir::Type> narrowedFrom;
+      };
+      llvm::SmallVector<Saved, 2> saved;
+      for (const BranchTypeNarrowing &fact : narrowings) {
+        Saved entry{fact.name, std::nullopt, types.lookupSymbol(fact.name),
+                    std::nullopt};
+        if (auto found = values.find(fact.name); found != values.end())
+          entry.value = found->second;
+        if (auto found = narrowedFromTypes.find(fact.name);
+            found != narrowedFromTypes.end())
+          entry.narrowedFrom = found->second;
+        saved.push_back(std::move(entry));
+        applyBranchNarrowing(*expr, fact, conditionIsTrue);
+      }
       mlir::Value armValue =
           coerceValue(emitExpr(arm), resultType, *expr).value;
-      if (savedValue)
-        values[narrowing->name] = *savedValue;
-      if (savedSymbol)
-        types.bindSymbol(narrowing->name, *savedSymbol);
-      if (savedNarrowedFromType)
-        narrowedFromTypes[narrowing->name] = *savedNarrowedFromType;
-      else
-        narrowedFromTypes.erase(narrowing->name);
+      for (const Saved &entry : saved) {
+        if (entry.value)
+          values[entry.name] = *entry.value;
+        if (entry.symbol)
+          types.bindSymbol(entry.name, *entry.symbol);
+        if (entry.narrowedFrom)
+          narrowedFromTypes[entry.name] = *entry.narrowedFrom;
+        else
+          narrowedFromTypes.erase(entry.name);
+      }
       return armValue;
     };
     mlir::Value result = emitValueDiamond(

@@ -1611,9 +1611,9 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
     // narrows n for its own body, the same fact the if statement and the
     // conditional expression apply, through the same applyBranchNarrowing.
     if (test)
-      if (std::optional<BranchTypeNarrowing> narrowing =
-              optionalBranchTypeNarrowing(*test, types, module))
-        applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
+      for (const BranchTypeNarrowing &fact :
+           branchTypeNarrowings(*test, types, module))
+        applyBranchNarrowing(statement, fact, /*conditionIsTrue=*/true);
     // ⛔ What is still missing, measured: the OTHER half of the same
     // ownership hole. The acquisition above balances the per-iteration
     // release; nothing releases the LAST incarnation on the exit edge,

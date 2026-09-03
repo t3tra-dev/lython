@@ -137,8 +137,13 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
 
 void ModuleEmitter::emitIf(const parser::Node &statement) {
   const parser::Node *test = ast::node(statement, "test");
-  std::optional<BranchTypeNarrowing> narrowing =
-      test ? optionalBranchTypeNarrowing(*test, types, module) : std::nullopt;
+  llvm::SmallVector<BranchTypeNarrowing, 2> narrowings =
+      test ? branchTypeNarrowings(*test, types, module)
+           : llvm::SmallVector<BranchTypeNarrowing, 2>{};
+  auto applyNarrowings = [&](bool conditionIsTrue) {
+    for (const BranchTypeNarrowing &fact : narrowings)
+      applyBranchNarrowing(statement, fact, conditionIsTrue);
+  };
   llvm::StringMap<mlir::Type> savedNarrowedFrom = narrowedFromTypes;
   auto restoreNarrowedFrom = llvm::make_scope_exit(
       [&] { narrowedFromTypes = std::move(savedNarrowedFrom); });
@@ -150,8 +155,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     // does not scope): its bindings — assignments, imports, narrowing —
     // persist after the fold, so the platform-switch idiom can bind names
     // (`if os.name == "posix": from posix import *`).
-    if (narrowing)
-      applyBranchNarrowing(statement, *narrowing, *staticTruth);
+    applyNarrowings(*staticTruth);
     const auto *selected = *staticTruth ? ast::nodeList(statement, "body")
                                         : ast::nodeList(statement, "orelse");
     if (selected && !selected->empty())
@@ -229,8 +233,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   builder.setInsertionPointToStart(thenBlock);
   {
     ScopedEmitterScope scope(values, types);
-    if (narrowing)
-      applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
+    applyNarrowings(/*conditionIsTrue=*/true);
     emitStatements(ast::nodeList(statement, "body"));
     if (!insertionBlockTerminated(builder)) {
       thenExit = builder.getInsertionBlock();
@@ -252,8 +255,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     builder.setInsertionPointToStart(elseBlock);
     {
       ScopedEmitterScope scope(values, types);
-      if (narrowing)
-        applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/false);
+      applyNarrowings(/*conditionIsTrue=*/false);
       emitStatements(orelse);
       if (!insertionBlockTerminated(builder)) {
         elseExit = builder.getInsertionBlock();
@@ -367,12 +369,13 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     mlir::Type fallThroughType;
     if (!hasElse) {
       mlir::Type edgeType = types.widenLiteral(outer.type);
-      if (narrowing && narrowing->name == name && narrowing->falseType)
-        if (auto unionType = mlir::dyn_cast<py::UnionType>(outer.type))
-          if (unionType.hasMember(narrowing->falseType)) {
-            fallThroughType = narrowing->falseType;
-            edgeType = fallThroughType;
-          }
+      for (const BranchTypeNarrowing &fact : narrowings)
+        if (fact.name == name && fact.falseType)
+          if (auto unionType = mlir::dyn_cast<py::UnionType>(outer.type))
+            if (unionType.hasMember(fact.falseType)) {
+              fallThroughType = fact.falseType;
+              edgeType = fallThroughType;
+            }
       parts.push_back(edgeType);
     }
     bool valuesPresent = true;
@@ -484,10 +487,10 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
         Value{continuation->getArgument(argIndex), replacementTypes[slot]};
     types.bindSymbol(name, replacementTypes[slot]);
   }
-  if (narrowing && thenTerminates && !elseTerminates)
-    applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/false);
-  else if (narrowing && hasElse && elseTerminates && !thenTerminates)
-    applyBranchNarrowing(statement, *narrowing, /*conditionIsTrue=*/true);
+  if (thenTerminates && !elseTerminates)
+    applyNarrowings(/*conditionIsTrue=*/false);
+  else if (hasElse && elseTerminates && !thenTerminates)
+    applyNarrowings(/*conditionIsTrue=*/true);
 }
 
 namespace {

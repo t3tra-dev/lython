@@ -124,6 +124,12 @@ const parser::Node *nameComparedWithNone(const parser::Node *left,
                                          const parser::Node *right);
 std::optional<NoneComparisonNarrowing>
 optionalNoneComparison(const parser::Node &test, TypeSystem &types);
+// Every fact a test proves, one per NAME. A conjunction may prove things about
+// several names at once (`isinstance(a, X) and isinstance(b, Y)`), and a single
+// fact cannot carry them -- the body then narrowed only the first.
+llvm::SmallVector<BranchTypeNarrowing, 2>
+branchTypeNarrowings(const parser::Node &test, TypeSystem &types,
+                     mlir::Operation *from);
 std::optional<BranchTypeNarrowing>
 optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                             mlir::Operation *from);
