@@ -18,6 +18,27 @@
 #   10**30 as the generator's ARGUMENT ..... raises the same way, from the
 #                                            creation site's unbox
 #
+# ⛔ AND ONE SHAPE WHERE THE MESSAGE IS STILL ABOUT A SMALL INT (measured
+# 2026-09-03). An accumulator whose addend comes through a DISPATCHER whose
+# arms return different representations raises it for the int 1:
+#
+#     class Node:        def value(self) -> int: return 0
+#     class Leaf(Node):  def value(self) -> int: return self.v   # a FIELD
+#     def gen(ns):
+#         total = 0
+#         for n in ns:
+#             total = total + n.value()
+#             yield total
+#     [v for v in gen([Leaf(1), Leaf(2)])]
+#
+# Each ingredient alone is correct: the same accumulation in a plain function,
+# the same generator with a Leaf that returns a literal, `yield n.value()` with
+# no accumulator, and the same field read with no subclass. What the pair adds
+# is a value whose word is invalid on one arm -- a boxed int FIELD has none --
+# merging into a lane that is all the clone has. The box is dropped at that
+# merge, so there is nothing left to rebuild the word from, which is why the
+# repair for the container case does not reach it.
+#
 # and the same sum in a PLAIN function is correct for 10**30 too, so the limit
 # is the generator frame's and not the arithmetic's.
 #
