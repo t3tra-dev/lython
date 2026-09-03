@@ -1453,6 +1453,100 @@ void TypeSystem::seedBuiltins() {
 mlir::Type TypeSystem::object() const { return contract("builtins.object"); }
 mlir::Type TypeSystem::any() const { return contract("typing.Any"); }
 mlir::Type TypeSystem::none() const { return literal("None"); }
+
+mlir::Type
+TypeSystem::manifestMethodReceiverContract(mlir::Type typeObject,
+                                           llvm::StringRef methodName) const {
+  auto typeObjectType = mlir::dyn_cast_if_present<py::TypeType>(typeObject);
+  if (!typeObjectType)
+    return {};
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      typeObjectType.getInstanceType());
+  if (!contract || lookupClass(contract.getContractName()))
+    return {};
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  std::vector<py::protocols::ContractResolution> methods =
+      table.methodContractCandidatesWithEvidence(contract, methodName);
+  if (methods.empty())
+    return {};
+  // ⛔ THE FIRST PARAMETER HAS TO BE THE CLASS ITSELF, in EVERY overload. A
+  // manifest classmethod or staticmethod is reached through the class too --
+  // `int.from_bytes(b, "big")`, `dict.fromkeys(ks)` -- and shifting its first
+  // argument into a receiver would call something else entirely. Those already
+  // resolve as plain calls and must keep doing so. A method with overloads
+  // (`str.strip` declares two) is one method either way, so all of them have
+  // to agree before any of them is shifted.
+  for (const py::protocols::ContractResolution &candidate : methods) {
+    py::CallableType signature = candidate.method.signature;
+    if (!signature || signature.getPositionalTypes().empty() ||
+        signature.getPositionalTypes().front() != contract)
+      return {};
+  }
+  return contract;
+}
+
+std::optional<py::CallableType>
+TypeSystem::unboundManifestMethodCallable(mlir::Type typeObject,
+                                          llvm::StringRef methodName) const {
+  auto typeObjectType = mlir::dyn_cast_if_present<py::TypeType>(typeObject);
+  if (!typeObjectType)
+    return std::nullopt;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+      typeObjectType.getInstanceType());
+  if (!manifestMethodReceiverContract(typeObject, methodName))
+    return std::nullopt;
+  // A leaf `builtins.` contract with no arguments, because the forwarder writes
+  // its parameter and result as ANNOTATIONS and only such a type has a spelling
+  // to write. `list.copy` returns `list[T]`; it keeps the refusal.
+  auto spellable = [](mlir::Type type) {
+    auto leaf = mlir::dyn_cast_if_present<py::ContractType>(type);
+    if (!leaf || !leaf.getArguments().empty())
+      return false;
+    llvm::StringRef name = leaf.getContractName();
+    return name.consume_front("builtins.") && !name.contains('.');
+  };
+  if (!spellable(contract))
+    return std::nullopt;
+  const py::protocols::Table &table = py::protocols::Table::get(context);
+  std::vector<py::protocols::ContractResolution> methods =
+      table.methodContractCandidatesWithEvidence(contract, methodName);
+  // The overload a zero-argument call reaches is the SHORTEST one -- that is
+  // the resolution `__ly_recv.strip()` will get, so it is the one whose result
+  // this callable has to name.
+  py::CallableType signature;
+  for (const py::protocols::ContractResolution &candidate : methods) {
+    py::CallableType option = candidate.method.signature;
+    if (!option)
+      continue;
+    if (!signature || option.getPositionalTypes().size() <
+                          signature.getPositionalTypes().size())
+      signature = option;
+  }
+  if (!signature || signature.getPositionalTypes().empty() ||
+      signature.hasVararg() || signature.hasKwarg() ||
+      !signature.getKwOnlyTypes().empty() ||
+      signature.getResultTypes().size() != 1)
+    return std::nullopt;
+  // Every parameter past the receiver has to be optional: the forwarder calls
+  // the method with no arguments and lets the running body fill the rest, which
+  // is what `key=str.strip` means and all a `key=` can pass.
+  //
+  // ⛔ A signature with no parameter metadata at all -- most of them, and
+  // `str.lower` among them -- says every parameter is REQUIRED, so it passes
+  // only when the receiver is the whole list. Reading an absent `arg_defaults`
+  // as "all optional" would let a two-argument method through and the
+  // forwarder would then call it wrong.
+  llvm::ArrayRef<mlir::BoolAttr> defaults = signature.getPositionalDefaults();
+  llvm::ArrayRef<mlir::Type> positional = signature.getPositionalTypes();
+  for (unsigned index = 1; index < positional.size(); ++index)
+    if (index >= defaults.size() || !defaults[index].getValue())
+      return std::nullopt;
+  mlir::Type result = signature.getResultTypes().front();
+  if (!spellable(result))
+    return std::nullopt;
+  mlir::Type receiver = contract;
+  return py::CallableType::get(&context, {receiver}, {}, {}, {}, {result});
+}
 mlir::Type TypeSystem::boolType() const { return contract("builtins.bool"); }
 mlir::Type TypeSystem::intType() const { return contract("builtins.int"); }
 mlir::Type TypeSystem::strType() const { return contract("builtins.str"); }
@@ -2987,6 +3081,12 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (std::optional<CallSolution> method =
                 tryManifestMethod(*this, widenLiteral(objectType), *attr, {}))
           return method->result;
+        // ⭐ AN UNBOUND METHOD READ OFF A MANIFEST CLASS IS A CALLABLE. The
+        // emitter synthesizes a forwarder for it (`str.lower` as a `key=`), and
+        // this is the same question so the two cannot disagree.
+        if (std::optional<py::CallableType> unbound =
+                unboundManifestMethodCallable(widenLiteral(objectType), *attr))
+          return *unbound;
       }
       return object();
     }
@@ -3975,6 +4075,14 @@ CallInferenceResult TypeSystem::inferMethodCallWithEvidence(
         true,
         {}};
   }
+  // ⭐ `str.upper(s)` IS `s.upper()`. An unbound method called through its
+  // class is ordinary Python, and it is also what a `map(str.upper, xs)` fast
+  // path re-spells the callable as -- so both were refused with a sentence
+  // about the TYPE object not providing the method.
+  if (!positional.empty())
+    if (manifestMethodReceiverContract(receiverType, methodName))
+      return inferMethodCallWithEvidence(positional.front(), methodName,
+                                         positional.drop_front(), keywords);
   return unresolvedMethodCall(*this, receiverType, methodName);
 }
 

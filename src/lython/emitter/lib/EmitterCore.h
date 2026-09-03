@@ -918,6 +918,12 @@ private:
                                              llvm::StringRef binding);
   std::optional<Value> emitLiteralTypeConstant(const parser::Node &anchor,
                                                mlir::Type type);
+  // `str.lower` used as a value: the forwarder synthesized for it, memoized by
+  // "<contract>.<method>" so one program builds one.
+  std::optional<Value> tryEmitManifestMethodObject(const parser::Node &anchor,
+                                                   Value object,
+                                                   llvm::StringRef methodName);
+  llvm::StringMap<std::pair<std::string, mlir::Type>> manifestMethodObjects;
   Value emitFunctionObject(const parser::Node &anchor,
                            llvm::StringRef symbolName, mlir::Type type,
                            llvm::ArrayRef<Capture> captures);

@@ -2728,6 +2728,9 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       lookupClassMethod(object.type, *attr);
   if (methodBinding && !methodBinding->symbolName.empty())
     return emitMethodObject(expr, object, *methodBinding);
+  if (std::optional<Value> unbound =
+          tryEmitManifestMethodObject(expr, object, *attr))
+    return *unbound;
 
   // ⭐ AN ATTRIBUTE A SOURCE CLASS DOES NOT HAVE IS REFUSED HERE. Nothing
   // resolved it -- not a field, not a class attribute, not a method, not a
@@ -4083,6 +4086,99 @@ std::optional<Value> ModuleEmitter::emitStaticStringConstant(
   auto op = py::StrConstantOp::create(builder, loc(anchor), type,
                                       builder.getStringAttr(*value));
   return Value{op.getResult(), type};
+}
+
+// ⭐ AN UNBOUND METHOD TAKEN OFF A MANIFEST CLASS IS A CALLABLE, and there was
+// nothing to hand back for one:
+//
+//     sorted(names, key=str.lower)
+//     # static type !py.type<builtins.str> does not provide manifest method
+//     # 'lower'
+//     list(map(str.strip, lines))       # the same sentence
+//
+// while `key=lambda s: s.lower()` -- the same question in the other spelling --
+// worked, and so did `C.method` off a SOURCE class, which resolves to the plain
+// function the class emitted. A manifest class emits no function to resolve to,
+// so this synthesizes one: a module-level forwarder whose body is the call.
+//
+// ⛔ ONLY A METHOD A ZERO-ARGUMENT CALL SATISFIES, which is what a `key=` or a
+// `map()` passes it as. `str.strip` qualifies (its `chars` has a default and
+// the running body fills it); a method with a required second parameter does
+// not, because the forwarder would have to restate that parameter's type as an
+// ANNOTATION and the manifest gives types, not spellings.
+//
+// ⛔ And only where both spellings exist: an unparameterized `builtins.` leaf
+// for the receiver and for the result. `list.copy` returns `list[T]`, which
+// this synthesizer cannot write, so it keeps the refusal rather than guess.
+std::optional<Value>
+ModuleEmitter::tryEmitManifestMethodObject(const parser::Node &anchor,
+                                           Value object,
+                                           llvm::StringRef methodName) {
+  std::optional<py::CallableType> forwarder =
+      types.unboundManifestMethodCallable(object.type, methodName);
+  if (!forwarder)
+    return std::nullopt;
+  auto leafSpelling = [](mlir::Type type) {
+    return mlir::cast<py::ContractType>(type).getContractName().drop_front(
+        llvm::StringRef("builtins.").size());
+  };
+  std::string receiverSpelling =
+      leafSpelling(forwarder->getPositionalTypes().front()).str();
+  std::string resultSpelling =
+      leafSpelling(forwarder->getResultTypes().front()).str();
+  std::string key =
+      (mlir::cast<py::ContractType>(forwarder->getPositionalTypes().front())
+           .getContractName() +
+       "." + methodName)
+          .str();
+  auto memo = manifestMethodObjects.find(key);
+  if (memo == manifestMethodObjects.end()) {
+    parser::SourceRange range = anchor.range;
+    llvm::SmallVector<synth::Param, 1> params;
+    params.push_back(
+        synth::Param{"__ly_recv", synth::name(receiverSpelling, range)});
+    std::vector<parser::NodePtr> body;
+    body.push_back(synth::returnStmt(
+        synth::methodCall(synth::name("__ly_recv", range), methodName, {},
+                          range),
+        range));
+    std::string symbol =
+        "__lyumeth$" + std::to_string(++syntheticFunctionCounter);
+    parser::NodePtr def =
+        synth::functionDef(symbol, params, {}, std::move(body),
+                           synth::name(resultSpelling, range), {}, range);
+    synthesizedIteratorDefs.push_back(def);
+    FunctionSignature sig = types.functionSignature(*def);
+    manifestMethodObjects[key] = {symbol, sig.publicCallable};
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    {
+      // The forwarder is a FUNCTION, for the same reason the virtual dispatcher
+      // is: emitting it under an inliner's state would branch its `return` to
+      // the inliner's continuation block.
+      auto savedLoops = std::move(loopControlContexts);
+      loopControlContexts.clear();
+      auto savedInlineReturns = std::move(inlineReturnContexts);
+      inlineReturnContexts.clear();
+      auto savedSupers = std::move(superContexts);
+      superContexts.clear();
+      auto savedInlining = std::move(methodsBeingInlined);
+      methodsBeingInlined.clear();
+      auto savedInlineFrames = std::move(inlineFrames);
+      inlineFrames.clear();
+      auto restoreContexts = llvm::make_scope_exit([&] {
+        loopControlContexts = std::move(savedLoops);
+        inlineReturnContexts = std::move(savedInlineReturns);
+        superContexts = std::move(savedSupers);
+        methodsBeingInlined = std::move(savedInlining);
+        inlineFrames = std::move(savedInlineFrames);
+      });
+      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    }
+    memo = manifestMethodObjects.find(key);
+  }
+  if (!memo->second.second)
+    return std::nullopt;
+  return emitFunctionObject(anchor, memo->second.first, memo->second.second, {});
 }
 
 Value ModuleEmitter::emitFunctionObject(const parser::Node &anchor,

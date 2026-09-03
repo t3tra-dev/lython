@@ -209,6 +209,20 @@ public:
   mlir::Type object() const;
   mlir::Type any() const;
   mlir::Type none() const;
+  // The callable a manifest class's method has when it is read off the CLASS
+  // and used as a value (`str.lower`). Empty unless the forwarder the emitter
+  // synthesizes for it can be written -- see tryEmitManifestMethodObject, which
+  // asks this same question so the two answers cannot drift apart.
+  std::optional<py::CallableType>
+  unboundManifestMethodCallable(mlir::Type typeObject,
+                                llvm::StringRef methodName) const;
+  // The instance contract behind a type object whose manifest class declares
+  // `methodName` as an INSTANCE method -- the receiver an unbound call has to
+  // shift its first argument into. Null for a source class, for a staticmethod
+  // or classmethod (whose first parameter is not the class), and for a name the
+  // manifest does not resolve to exactly one method.
+  mlir::Type manifestMethodReceiverContract(mlir::Type typeObject,
+                                            llvm::StringRef methodName) const;
   mlir::Type boolType() const;
   mlir::Type intType() const;
   mlir::Type strType() const;

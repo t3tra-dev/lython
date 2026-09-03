@@ -1289,6 +1289,35 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             return emitCall(*rewritten);
           }
         }
+        // ⭐ `str.upper(s)` IS `s.upper()`, and the receiver is the first
+        // argument. Written by hand it is ordinary Python; reached through a
+        // `map(str.upper, xs)` whose fast path re-spells the callable as a
+        // call, it is how the idiom gets here at all. Both were refused with
+        // "!py.type<builtins.str> does not provide manifest method 'upper'",
+        // which is the compiler saying it looked on the class object.
+        if (types.manifestMethodReceiverContract(
+                types.widenLiteral(types.inferExpr(receiverNode)),
+                *methodName)) {
+          const auto *unboundArgs = ast::nodeList(expr, "args");
+          if (unboundArgs && !unboundArgs->empty() && unboundArgs->front() &&
+              unboundArgs->front()->kind != "Starred") {
+            std::vector<parser::NodePtr> rest(std::next(unboundArgs->begin()),
+                                              unboundArgs->end());
+            parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+            parser::addField(*rewritten, "func",
+                             synth::attribute(unboundArgs->front(), *methodName,
+                                              calleeNode->range));
+            parser::addField(*rewritten, "args", std::move(rest));
+            if (const parser::Field *keywords =
+                    parser::findField(expr, "keywords"))
+              rewritten->fields.push_back(*keywords);
+            else
+              parser::addField(*rewritten, "keywords",
+                               std::vector<parser::NodePtr>{});
+            synthesizedIteratorDefs.push_back(rewritten);
+            return emitCall(*rewritten);
+          }
+        }
         Value receiver = emitExpr(receiverNode);
         if (dispatchIsUnresolvable(receiver, *methodName, receiverNode,
                                    /*throughSuper=*/false)) {
