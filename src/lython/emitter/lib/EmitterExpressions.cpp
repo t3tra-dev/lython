@@ -2703,10 +2703,14 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       // through a binding instead of a call, so it goes through the same gate
       // -- including its exemptions for a constructed receiver and for `self`
       // inside a standalone method body.
-      if (subclassShadowsAttribute(contract.getContractName(), *attr) &&
-          refuseUnresolvableDispatch(expr, object, *attr,
-                                     ast::node(expr, "value")))
-        return emitNone(expr);
+      if (subclassShadowsAttribute(contract.getContractName(), *attr)) {
+        if (std::optional<Value> dispatched =
+                tryEmitVirtualAttributeRead(expr, object, *attr))
+          return *dispatched;
+        if (refuseUnresolvableDispatch(expr, object, *attr,
+                                       ast::node(expr, "value")))
+          return emitNone(expr);
+      }
       if (std::optional<std::pair<llvm::StringRef, mlir::Type>> slot =
               resolveClassAttrSlot(contract.getContractName(), *attr)) {
         std::string cellName =

@@ -552,6 +552,10 @@ set(LYTHON_LEAK_GATE_CASES
     # whose unwind reaches the handler that releases it again. The verifier
     # sees a death written too early; only this gate sees one written too late.
     a_with_body_that_branches_after_its_last_use
+    # A class attribute the receiver's runtime class decides: each arm reads
+    # through a narrowed receiver, and the value it hands back is a reference
+    # the caller now owns. Only a leak check says every arm books it once.
+    a_class_attribute_a_subclass_redeclares
     # A dict store whose key is computed: the demotion routes it to the runtime
     # insert, which retains the key and the value the evidence arm placed by
     # hand. Only a leak check says the two tiers book the same references.

@@ -2,8 +2,14 @@
 # started at the `a.v()` call site alone, so `len(a)`, `a == b`, `a + 1`,
 # `a[0]`, `if a:`, `repr(a)`, `with a:` and an overridden property all walked
 # past it -- eleven dunders measured silently wrong while `a.__len__()` on the
-# next line was refused. There is no dynamic dispatch to fall back to, so all
-# of them are refused where the hierarchy is visible.
+# next line was refused.
+#
+# What each of them does NOW is dispatch: the synthesized dispatcher tests the
+# runtime class and runs the body an instance of that class would have run, and
+# `a.kind` -- the class ATTRIBUTE spelling of the same question -- joined them.
+# So this file's remaining assertion is the one shape no dispatcher can be
+# built for: a name only the SUBCLASS declares, where there is no base body to
+# restate and no base binding to fall back to.
 class A:
     kind: int = 1
 

@@ -153,7 +153,12 @@ private:
   const VirtualDispatchHelper *virtualDispatcherFor(
       const parser::Node &anchor, Value receiver, llvm::StringRef methodName,
       unsigned argumentCount, bool asProperty = false,
-      llvm::ArrayRef<std::string> keywordNames = {});
+      llvm::ArrayRef<std::string> keywordNames = {}, bool asAttribute = false);
+  // `self.kind` where a subclass redeclares the class attribute `kind`: the
+  // same dispatcher, reading a class attribute instead of calling a method.
+  std::optional<Value> tryEmitVirtualAttributeRead(const parser::Node &anchor,
+                                                   Value receiver,
+                                                   llvm::StringRef attrName);
   // The forwarding body a bound METHOD OBJECT needs when the receiver's class
   // has an overriding subclass: `def m(self, ...): return __lyvdisp$N(self,
   // ...)`. Null when no dispatcher covers the shape, in which case the method
