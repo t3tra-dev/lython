@@ -2633,16 +2633,31 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   if (asAttribute) {
     if (argumentCount != 0 || !keywordNames.empty())
       return nullptr;
+    // ⭐ THE ATTRIBUTE'S TYPE, FROM EITHER CHANNEL. A main-module class keeps
+    // its attributes in cells and an IMPORTED one keeps them on the constant
+    // channel, and asking only the cells left every imported hierarchy
+    // refused -- `self.kind` inside an imported base method, which is where a
+    // library puts it.
     std::optional<std::pair<llvm::StringRef, mlir::Type>> slot =
         resolveClassAttrSlot(receiverClass, methodName);
-    if (!slot)
+    llvm::StringRef definingClass = receiverClass;
+    mlir::Type attributeType;
+    if (slot) {
+      definingClass = slot->first;
+      attributeType = slot->second;
+    } else if (std::optional<mlir::Type> constant =
+                   lookupClassStaticAttr(receiver.type, methodName)) {
+      attributeType = *constant;
+    }
+    if (!attributeType)
       return nullptr;
     // ⛔ Only a type the dispatcher can WRITE as its return annotation, which
     // is the same restriction every synthesized def here lives under. A
     // container-typed class attribute keeps the refusal rather than a guess.
     llvm::StringRef spelling;
     if (auto attrContract =
-            mlir::dyn_cast_if_present<py::ContractType>(slot->second))
+            mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(attributeType)))
       if (attrContract.getArguments().empty()) {
         spelling = attrContract.getContractName();
         if (spelling.consume_front("builtins.") && spelling.contains('.'))
@@ -2650,7 +2665,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       }
     if (spelling.empty())
       return nullptr;
-    fallbackClass = slot->first.str();
+    fallbackClass = definingClass.str();
     returns = synth::name(spelling, range);
   }
 
@@ -2874,14 +2889,23 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
           forwarded(), keywordArguments(), range);
     };
     std::vector<parser::NodePtr> body;
-    for (const auto &candidate : candidates)
+    for (const auto &candidate : candidates) {
+      // ⭐ AN ATTRIBUTE ARM READS THROUGH THE CLASS, not through the narrowed
+      // receiver. Inside the arm the runtime class IS this candidate (or a
+      // subclass that declares nothing of its own, whose Python answer is this
+      // candidate's binding), so `Candidate.attr` is the same value -- and it
+      // is available on BOTH channels, where a read through the receiver needs
+      // the cell only a main-module class has.
+      parser::NodePtr subject =
+          asAttribute ? synth::name(candidate.second, range)
+                      : synth::name("__ly_recv", range);
       body.push_back(synth::ifStmt(
           synth::call(synth::name("isinstance", range),
                       {synth::name("__ly_recv", range),
                        synth::name(candidate.second, range)},
                       range),
-          {synth::returnStmt(read(synth::name("__ly_recv", range)), range)}, {},
-          range));
+          {synth::returnStmt(read(std::move(subject)), range)}, {}, range));
+    }
     if (asAttribute) {
       body.push_back(synth::returnStmt(
           synth::attribute(synth::name(fallbackClass, range), methodName,
