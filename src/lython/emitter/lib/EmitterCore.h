@@ -300,10 +300,15 @@ private:
   // Set while `collectClassFields` walks a method other than `__init__`: those
   // may only REFINE a field the constructor declared, never add one.
   bool collectFieldsRefineOnly = false;
+  // `contractName` is the class's CANONICAL name -- `lib.R` for an imported
+  // class, where the ClassDef's own name is only `R`. The walk asks the type
+  // system about the class it is describing, and asking by the source spelling
+  // answered nothing for every imported one.
   void collectClassFields(const parser::Node &classDef,
                           llvm::SmallVectorImpl<std::string> &fieldNames,
                           llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
-                          bool includeAnnAssignDefaults = false);
+                          bool includeAnnAssignDefaults = false,
+                          llvm::StringRef contractName = {});
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values,

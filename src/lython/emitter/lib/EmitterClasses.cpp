@@ -140,6 +140,55 @@ mlir::Attribute sourceExprAttr(mlir::Builder &builder,
                                  "node", builder.getStringAttr(node->kind))});
 }
 
+// ⭐ A LITERAL TYPE IS A FOLDED VALUE, and the constant channel's currency is
+// exactly that. An IMPORTED class attribute is recorded from its AST shape, so
+// `capacity = model.LIMIT` becomes `kind = "ref"` and nothing materializes a
+// ref -- the attribute could not be read at all. Where the inference has
+// already folded the expression to a literal, the fold is what gets recorded.
+//
+// ⛔ A str only when the spelling round-trips: the literal's text is the source
+// spelling with quotes, and one containing a quote or a backslash of its own
+// cannot be unwrapped by looking at the ends.
+mlir::Attribute literalConstantAttr(mlir::Builder &builder, mlir::Type type) {
+  auto literal = mlir::dyn_cast_if_present<py::LiteralType>(type);
+  if (!literal)
+    return {};
+  llvm::StringRef spelling = literal.getSpelling();
+  auto dict = [&](llvm::StringRef kind,
+                  llvm::ArrayRef<mlir::NamedAttribute> extra = {}) {
+    llvm::SmallVector<mlir::NamedAttribute, 4> attrs;
+    attrs.push_back(builder.getNamedAttr("kind", builder.getStringAttr(kind)));
+    attrs.append(extra.begin(), extra.end());
+    return mlir::Attribute(builder.getDictionaryAttr(attrs));
+  };
+  if (spelling == "None")
+    return dict("constant.none");
+  if (spelling == "True" || spelling == "False")
+    return dict("constant.bool",
+                {builder.getNamedAttr(
+                    "value", builder.getBoolAttr(spelling == "True"))});
+  if (spelling.size() >= 2 && spelling.front() == '"' &&
+      spelling.back() == '"') {
+    llvm::StringRef text = spelling.drop_front().drop_back();
+    if (text.contains('"') || text.contains('\\'))
+      return {};
+    return dict("constant.str",
+                {builder.getNamedAttr("value", builder.getStringAttr(text))});
+  }
+  llvm::StringRef digits = spelling;
+  digits.consume_front("-");
+  if (!digits.empty() &&
+      llvm::all_of(digits, [](char c) { return c >= '0' && c <= '9'; }))
+    return dict("constant.int", {builder.getNamedAttr(
+                                    "value", builder.getStringAttr(spelling))});
+  double floating = 0.0;
+  if (!spelling.getAsDouble(floating))
+    return dict("constant.float",
+                {builder.getNamedAttr("value",
+                                      builder.getF64FloatAttr(floating))});
+  return {};
+}
+
 std::string sourceMethodSymbolName(llvm::StringRef className,
                                    llvm::StringRef methodName,
                                    const parser::Node &method) {
@@ -1396,7 +1445,7 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
   collectClassFields(classDef, fieldNames, fieldTypes,
-                     /*includeAnnAssignDefaults=*/isDataclass);
+                     /*includeAnnAssignDefaults=*/isDataclass, contractName);
 
   // Dataclass field defaults (AnnAssign initializers). dataclasses.field()
   // models default= and default_factory= only: the factory desugars to a
@@ -2621,7 +2670,10 @@ void ModuleEmitter::collectStaticClassAssignments(
       return;
     }
     names.push_back(std::string(name));
-    values.push_back(sourceExprAttr(attrBuilder, value));
+    mlir::Attribute recorded = literalConstantAttr(attrBuilder, valueType);
+    if (!recorded)
+      recorded = sourceExprAttr(attrBuilder, value);
+    values.push_back(recorded);
     if (typesOut)
       typesOut->push_back(valueType);
     if (valueType)
@@ -2695,7 +2747,15 @@ void ModuleEmitter::collectClassFields(
     const parser::Node &classDef,
     llvm::SmallVectorImpl<std::string> &fieldNames,
     llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
-    bool includeAnnAssignDefaults) {
+    bool includeAnnAssignDefaults, llvm::StringRef contractName) {
+  // The class as the TYPE SYSTEM knows it. An imported class is `lib.R` there
+  // and `R` in its own ClassDef, and every question this walk asks -- what
+  // `self` is, whether a target's owner is this class -- was asked by the
+  // source spelling and answered nothing for the imported ones.
+  std::string ownContractName =
+      contractName.empty()
+          ? std::string(ast::string(classDef, "name").value_or(""))
+          : contractName.str();
   // Field names whose only assignment so far was an EMPTY container literal,
   // which has no element type of its own: the next assignment replaces it.
   llvm::StringSet<> provisionalFields;
@@ -2861,11 +2921,10 @@ void ModuleEmitter::collectClassFields(
     if (!ast::isName(*object, "self")) {
       if (object->kind != "Name" || collectFieldsRefineOnly == false)
         return;
-      auto className = ast::string(classDef, "name");
       mlir::Type ownerType = types.widenLiteral(types.inferExpr(object));
       auto contract = mlir::dyn_cast_if_present<py::ContractType>(ownerType);
-      if (!className || !contract ||
-          contract.getContractName() != llvm::StringRef(*className))
+      if (ownContractName.empty() || !contract ||
+          contract.getContractName() != llvm::StringRef(ownContractName))
         return;
     }
     if (auto attr = ast::string(target, "attr")) {
@@ -2926,9 +2985,9 @@ void ModuleEmitter::collectClassFields(
       // parameter `collectInitArgTypes` skips (it has no annotation to read),
       // so `other.nxt = self` -- how a linked structure links -- typed as
       // nothing and the field kept whatever `__init__` gave it.
-      if (auto className = ast::string(classDef, "name"))
+      if (!ownContractName.empty())
         if (std::optional<mlir::Type> ownContract =
-                types.lookupClass(*className))
+                types.lookupClass(ownContractName))
           if (*ownContract)
             types.bindLocalSymbol("self", *ownContract);
       // A name the pre-pass cannot type must SHADOW any outer binding of the

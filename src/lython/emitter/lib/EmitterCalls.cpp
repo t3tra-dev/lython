@@ -2857,6 +2857,24 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       return lhs.second < rhs.second;
     });
 
+    // ⛔ EVERY ARM HAS TO BE ABLE TO READ THE ATTRIBUTE, and a candidate in a
+    // module emitted LATER cannot yet: `pets.Bird` is a known subclass to the
+    // declaration pre-pass while its own attributes are registered only when
+    // its module is emitted, and base.py is emitted first because pets.py
+    // imports it. Building the dispatcher anyway produced "'pets.Bird' object
+    // has no attribute 'sound'" -- a sentence that is false about the program
+    // and worse than the refusal it replaced.
+    if (asAttribute)
+      for (const auto &candidate : candidates) {
+        if (resolveClassAttrSlot(candidate.second, methodName))
+          continue;
+        std::optional<mlir::Type> candidateType =
+            types.lookupClass(candidate.second);
+        if (!candidateType ||
+            !lookupClassStaticAttr(*candidateType, methodName))
+          return nullptr;
+      }
+
     std::string symbol = "__lyvdisp$" + std::to_string(++syntheticFunctionCounter);
     virtualDispatchHelpers[key].symbol = symbol;
 
