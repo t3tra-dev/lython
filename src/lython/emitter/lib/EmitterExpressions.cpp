@@ -470,27 +470,49 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     mlir::Type resultType = types.join({bodyArmType, elseArmType});
     mlir::Value condition = emitBoolValue(emitExpr(testNode), *expr);
 
+    // ⭐ THE ARM SPENDS THE NARROWING THROUGH THE STATEMENT'S OWN MECHANISM.
+    // This lambda used to unwrap a UNION member by hand, which is one of the
+    // three things `applyBranchNarrowing` does -- so a CLASS proof was simply
+    // dropped:
+    //
+    //     class B(A):
+    //         def only(self) -> int: return 1
+    //     def f(x: A) -> int:
+    //         return x.only() if isinstance(x, B) else -1
+    //     # 'only' is overridden by a subclass of 'A', so this call cannot be
+    //     # resolved from the static type of the receiver
+    //
+    // while the `if` STATEMENT spelling of the same guard compiled and ran.
+    // The refine op, the sub-union case and the name-only narrowing all live
+    // in that one function; reaching it is the whole repair.
+    //
+    // ⛔ The narrowing is spent INSIDE the arm's block, which is where the
+    // builder already is, and undone after it: the other arm and everything
+    // after the expression must see the name as it was.
     auto emitArm = [&](const parser::Node *arm, bool conditionIsTrue) {
       if (!narrowing)
         return coerceValue(emitExpr(arm), resultType, *expr).value;
-      mlir::Type narrowed =
-          conditionIsTrue ? narrowing->trueType : narrowing->falseType;
       auto found = values.find(narrowing->name);
-      if (!narrowed || found == values.end() ||
-          !mlir::isa<py::UnionType>(found->second.value.getType()) ||
-          !mlir::cast<py::UnionType>(found->second.value.getType())
-               .hasMember(narrowed))
-        return coerceValue(emitExpr(arm), resultType, *expr).value;
-      Value saved = found->second;
-      std::optional<mlir::Type> savedSymbol = types.lookupSymbol(narrowing->name);
-      auto unwrap = py::UnionUnwrapOp::create(builder, loc(*expr), narrowed,
-                                              saved.value);
-      found->second = Value{unwrap.getResult(), narrowed};
-      types.bindSymbol(narrowing->name, narrowed);
-      mlir::Value armValue = coerceValue(emitExpr(arm), resultType, *expr).value;
-      values[narrowing->name] = saved;
+      std::optional<Value> savedValue;
+      if (found != values.end())
+        savedValue = found->second;
+      std::optional<mlir::Type> savedSymbol =
+          types.lookupSymbol(narrowing->name);
+      auto savedNarrowedFrom = narrowedFromTypes.find(narrowing->name);
+      std::optional<mlir::Type> savedNarrowedFromType;
+      if (savedNarrowedFrom != narrowedFromTypes.end())
+        savedNarrowedFromType = savedNarrowedFrom->second;
+      applyBranchNarrowing(*expr, *narrowing, conditionIsTrue);
+      mlir::Value armValue =
+          coerceValue(emitExpr(arm), resultType, *expr).value;
+      if (savedValue)
+        values[narrowing->name] = *savedValue;
       if (savedSymbol)
         types.bindSymbol(narrowing->name, *savedSymbol);
+      if (savedNarrowedFromType)
+        narrowedFromTypes[narrowing->name] = *savedNarrowedFromType;
+      else
+        narrowedFromTypes.erase(narrowing->name);
       return armValue;
     };
     mlir::Value result = emitValueDiamond(
