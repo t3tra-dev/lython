@@ -212,12 +212,14 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
     // own. The name is bound here, where the capture-only form binds it, and
     // the chain sees the inner pattern; the case's own scope keeps the binding
     // from outliving a case whose condition then fails.
+    llvm::SmallVector<std::string, 2> capturedNames;
     while (pattern->kind == "MatchAs" && ast::node(*pattern, "pattern")) {
       if (std::optional<std::string_view> name =
               ast::string(*pattern, "name")) {
         Value bound = capturedSubject();
         values[std::string(*name)] = bound;
         types.bindSymbol(*name, bound.type);
+        capturedNames.push_back(std::string(*name));
       }
       pattern = ast::node(*pattern, "pattern");
     }
@@ -685,6 +687,64 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         narrowed = Value{unwrap.getResult(), matchSubjectType};
       }
 
+      // ⭐ THE CASE'S BODY SEES THE CLASS THE PATTERN PROVED, and it did not:
+      //
+      //     match v:                 # v: int | str | None
+      //         case int():
+      //             return str(v + 1)
+      //     # union<int, str, None> does not provide manifest method '__add__'
+      //
+      //     match x:                 # x: A, B(A) declares `only`
+      //         case B() as b:
+      //             return b.only()  # 'only' is overridden by a subclass
+      //
+      // `narrowed` -- the unwrapped member, or the refined class -- was built
+      // and then spent only on the SUB-PATTERNS. The subject's own name and
+      // the `as` capture kept the type they had before the test, so the one
+      // spelling of narrowing that has no `if` to hang on had none. The `as`
+      // capture is bound before the chain reaches this pattern, which is why
+      // it needs rebinding rather than binding.
+      //
+      // ⛔ Not the subject name when the match promoted it to a CELL: a case
+      // body that assigns to it reads and writes through that cell, and
+      // rebinding the name to a refined view would take the write away from
+      // it. The captures are per-case and have no such second life.
+      llvm::SmallVector<std::pair<std::string, std::optional<Value>>, 3>
+          restoreAfterBody;
+      if (narrowed.type != subject.type) {
+        auto narrowName = [&](llvm::StringRef name) {
+          auto found = values.find(name);
+          restoreAfterBody.push_back(
+              {name.str(), found == values.end()
+                               ? std::nullopt
+                               : std::optional<Value>(found->second)});
+          values[name.str()] = narrowed;
+          types.bindSymbol(name, narrowed.type);
+        };
+        for (const std::string &name : capturedNames)
+          narrowName(name);
+        if (subjectNode->kind == "Name") {
+          llvm::StringRef subjectName = ast::nameSpelling(*subjectNode);
+          bool promoted = llvm::any_of(
+              promotedCells, [&](const std::pair<std::string, Value> &cell) {
+                return cell.first == subjectName;
+              });
+          if (!promoted && !llvm::is_contained(capturedNames, subjectName))
+            narrowName(subjectName);
+        }
+      }
+      auto restoreNarrowedNames = [&] {
+        for (auto &[name, saved] : restoreAfterBody) {
+          if (saved) {
+            values[name] = *saved;
+            types.bindSymbol(name, saved->type);
+          } else {
+            values.erase(name);
+          }
+        }
+        restoreAfterBody.clear();
+      };
+
       bool capturesSupported = true;
       std::optional<mlir::Value> valueCondition;
       for (auto &[attrName, sub] : attrPatterns) {
@@ -725,6 +785,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
                 : condition;
       }
       if (!capturesSupported) {
+        restoreNarrowedNames();
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "match class pattern sub-pattern must name a declared field"});
@@ -767,6 +828,7 @@ void ModuleEmitter::emitMatch(const parser::Node &statement) {
         builder.setInsertionPointToStart(guardBody);
       }
       emitStatements(body);
+      restoreNarrowedNames();
       if (!insertionBlockTerminated(builder))
         mlir::cf::BranchOp::create(builder, loc(statement), continuation);
       if (!nextCheck) {
