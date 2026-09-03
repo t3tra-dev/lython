@@ -737,6 +737,10 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
+  // The class body's own names are bound as each initializer is emitted (see
+  // the store below) and must not outlive it: `width` is an attribute of the
+  // class, not a module global.
+  ScopedEmitterScope classBodyScope(values, types);
   auto slots = classAttrSlots.find(*name);
   if (slots == classAttrSlots.end() || slots->second.empty())
     return;
@@ -842,6 +846,19 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
     std::string cellName = (llvm::Twine(*name) + "." + attrName).str();
     py::GlobalSetOp::create(builder, loc(*statement),
                             builder.getStringAttr(cellName), coerced.value);
+    // ⭐ THE CLASS BODY IS A SCOPE, and this is where its names live. CPython
+    // executes the body with each assignment visible to the ones after it:
+    //
+    //     class Layout:
+    //         width = 80
+    //         half = width // 2
+    //
+    // and without the binding `width` resolved to nothing, so the attribute
+    // fell off the slot channel onto the constant channel -- which has no arm
+    // for an expression and says so from the LOWERING. The scope guard the
+    // caller holds is what keeps these names out of the module below.
+    values[attrName] = coerced;
+    types.bindSymbol(attrName, coerced.type);
   }
 }
 
@@ -2586,6 +2603,10 @@ void ModuleEmitter::collectStaticClassAssignments(
     llvm::SmallVectorImpl<mlir::Attribute> &values,
     llvm::SmallVectorImpl<mlir::Type> *typesOut) {
   mlir::Builder attrBuilder(&context);
+  // The class body's names, in order, so a later attribute can be typed from an
+  // earlier one (`half = width // 2`). The scope is this walk's alone; the
+  // emitter binds the same names again, to VALUES, as it runs the initializers.
+  TypeSystem::Scope classBodyScope = types.pushScope();
   auto appendStaticAttr = [&](llvm::StringRef name, const parser::Node *value,
                               mlir::Type annotatedType = {}) {
     mlir::Type valueType = annotatedType;
@@ -2603,6 +2624,8 @@ void ModuleEmitter::collectStaticClassAssignments(
     values.push_back(sourceExprAttr(attrBuilder, value));
     if (typesOut)
       typesOut->push_back(valueType);
+    if (valueType)
+      types.bindLocalSymbol(name, valueType);
   };
   if (const auto *body = ast::nodeList(classDef, "body")) {
     for (const parser::NodePtr &statement : *body) {
