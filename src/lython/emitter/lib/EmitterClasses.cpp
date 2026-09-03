@@ -2176,8 +2176,20 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
           std::move(sig));
     }
     if (dataclassRepr && !userDefines("__repr__")) {
+      // ⭐ `__qualname__`, WHICH HAS NO MODULE IN IT. CPython's dataclass and
+      // NamedTuple reprs print the class's qualified NAME, not its module
+      // path, so an imported `Point(3, 4)` renders as `Point(x=3, y=4)` there
+      // and rendered as `data.Point(x=3, y=4)` here -- a silent wrong answer
+      // for every imported dataclass printed.
+      //
+      // ⛔ NOT the same as the default object repr beside it, which CPython
+      // spells `<data.Point object at 0x...>` WITH the module and which this
+      // compiler was taught to qualify for exactly that reason. The two reprs
+      // read different attributes and disagree on purpose.
       std::string className =
           py::contracts::displayClassNameForContract(contractName);
+      if (std::size_t dot = className.rfind('.'); dot != std::string::npos)
+        className = className.substr(dot + 1);
       parser::NodePtr expr;
       if (order.empty()) {
         expr = synth::strConstant(className + "()", range);
