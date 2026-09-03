@@ -2051,6 +2051,95 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                         std::string(contractName)};
     }
   }
+  // ⭐ AN INHERITED BODY THAT CALLS AN OVERRIDDEN METHOD NEEDS ITS OWN COPY.
+  // A class inherits its base's method by pointing at the BASE's symbol, and
+  // that symbol's body typed `self` as the base -- so a call inside it bound
+  // statically to the base's version:
+  //
+  //     class Shape:
+  //         def area(self) -> int: return 0
+  //         def __repr__(self) -> str: return "S(" + str(self.area()) + ")"
+  //     class Sq(Shape):
+  //         def area(self) -> int: return self.n * self.n
+  //     print([Sq(3)])        # printed [S(0)]; CPython prints [S(9)]
+  //
+  // A SILENT wrong answer, and `print(Sq(3))` beside it is right -- that path
+  // INLINES the body at the call site, where `self` is the receiver's own
+  // class. The container's repr reaches the body through its symbol instead,
+  // and a symbol has one `self` type forever.
+  //
+  // So a subclass that redeclares something an inherited body calls gets its
+  // own emission of that body, with `self` at ITS class. Everything the body
+  // resolves is then resolved against the class that will run it.
+  //
+  // ⛔ Only where it would ANSWER DIFFERENTLY -- the body has to name a member
+  // this class redeclares -- because every copy is code the program did not
+  // write, and the inherited symbol is correct for all the rest.
+  //
+  // ⛔ And not a body containing `super()`: the emission below pushes THIS
+  // class as the super context, while an inherited body means the DEFINING
+  // class's base. Those keep the inherited symbol and its old answer.
+  {
+    llvm::SmallVector<std::string, 4> ownMethodNames(methodNames.begin(),
+                                                     methodNames.end());
+    auto bodyNamesRedeclaredMember = [&](const parser::Node &method,
+                                         llvm::StringRef selfName) {
+      bool found = false;
+      bool sawSuper = false;
+      ast::walk(&method, [&](const parser::Node &current) {
+        if (current.kind == "Name" && ast::nameSpelling(current) == "super")
+          sawSuper = true;
+        if (current.kind != "Attribute")
+          return ast::Walk::Continue;
+        const parser::Node *owner = ast::node(current, "value");
+        if (!owner || owner->kind != "Name" ||
+            llvm::StringRef(ast::nameSpelling(*owner)) != selfName)
+          return ast::Walk::Continue;
+        if (auto member = ast::string(current, "attr"))
+          if (llvm::is_contained(ownMethodNames, llvm::StringRef(*member)))
+            found = true;
+        return ast::Walk::Continue;
+      });
+      return found && !sawSuper;
+    };
+    for (const std::string &ancestor :
+         llvm::ArrayRef<std::string>(mro).drop_front()) {
+      auto bindings = classMethodBindings.find(ancestor);
+      if (bindings == classMethodBindings.end())
+        continue;
+      for (const auto &entry : bindings->second) {
+        llvm::StringRef inheritedName = entry.getKey();
+        if (llvm::is_contained(methodNames, inheritedName))
+          continue;
+        const MethodBinding &inherited = entry.second;
+        if (inherited.kind != "instance" || !inherited.method ||
+            inherited.symbolName.empty() || inherited.async)
+          continue;
+        if (inherited.bodySignature.positionalNames.empty())
+          continue;
+        if (isExceptionBackedClass(contractName))
+          continue;
+        if (!bodyNamesRedeclaredMember(
+                *inherited.method, inherited.bodySignature.positionalNames.front()))
+          continue;
+        FunctionSignature specialized = inherited.bodySignature;
+        specialized.positionalTypes.front() = types.contract(contractName);
+        types.refreshCallable(specialized);
+        std::string symbolName = sourceMethodSymbolName(
+            contractName, inheritedName, *inherited.method);
+        methodNames.push_back(inheritedName.str());
+        methodKinds.push_back("instance");
+        methodContracts.push_back(specialized.publicCallable
+                                      ? specialized.publicCallable
+                                      : specialized.callable);
+        methodSymbols.push_back(symbolName);
+        pendingBodies.push_back(inherited.method);
+        pendingBodySigs.push_back(specialized);
+        pendingBodySymbols.push_back(symbolName);
+        pendingBodyKinds.push_back("instance");
+      }
+    }
+  }
   if (isDataclass) {
     // Synthesize __init__/__repr__/__eq__ from the MRO-merged field list
     // (CPython composes base dataclass fields the same way); an explicit
