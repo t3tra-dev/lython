@@ -2589,9 +2589,17 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     return nullptr;
   if (ast::node(*arguments, "vararg") || ast::node(*arguments, "kwarg"))
     return nullptr;
-  if (const auto *defaults = ast::nodeList(*arguments, "defaults"))
-    if (!defaults->empty())
-      return nullptr;
+  // ⭐ A DEFAULT IS NOT A REASON TO REFUSE, once the dispatcher restates only
+  // the parameters the CALL passed. `def f(self, a: int = 1)` overridden by a
+  // subclass was refused outright -- "'f' is overridden by a subclass of
+  // 'Base'" -- for a method shape ordinary Python writes everywhere.
+  //
+  // ⛔ The arms must not restate the default, only omit the parameter: each
+  // arm calls `recv.f(p1..pN)` with exactly what the site passed, so the body
+  // that RUNS fills the rest from its OWN default -- which is what CPython
+  // does and what a dispatcher restating the base's default would get wrong
+  // for a subclass that changed it. That is why the memo is keyed by the
+  // argument count as well: one dispatcher per (class, method, arity).
   if (const auto *kwonly = ast::nodeList(*arguments, "kwonlyargs"))
     if (!kwonly->empty())
       return nullptr;
@@ -2618,11 +2626,19 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   llvm::SmallVector<synth::Param, 4> params;
   params.push_back(synth::Param{"__ly_recv", synth::name(receiverClass, range)});
   bool selfSeen = false;
-  for (llvm::StringRef field : {"posonlyargs", "args"})
+  bool enough = false;
+  for (llvm::StringRef field : {"posonlyargs", "args"}) {
+    if (enough)
+      break;
     if (const auto *list = ast::nodeList(*arguments, field))
       for (const parser::NodePtr &argument : *list) {
         if (!argument)
           return nullptr;
+        // The rest come from the running body's own defaults.
+        if (selfSeen && parameterNames.size() == argumentCount) {
+          enough = true;
+          break;
+        }
         llvm::StringRef name = ast::nameSpelling(*argument);
         if (!selfSeen) {
           selfSeen = true;
@@ -2634,11 +2650,13 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
         parameterNames.push_back(name.str());
         params.push_back(synth::Param{name.str(), std::move(annotation)});
       }
-  if (!selfSeen)
+  }
+  if (!selfSeen || parameterNames.size() != argumentCount)
     return nullptr;
 
-  std::string key =
-      (receiverClass + "." + methodName + (asProperty ? "$get" : "")).str();
+  std::string key = (receiverClass + "." + methodName + "/" +
+                     llvm::Twine(argumentCount) + (asProperty ? "$get" : ""))
+                        .str();
   auto memo = virtualDispatchHelpers.find(key);
   if (memo == virtualDispatchHelpers.end()) {
     // Every class that declares the method and has the receiver's class among
