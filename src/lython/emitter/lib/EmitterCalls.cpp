@@ -2746,7 +2746,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     // reaches the dispatcher from a synthesized body, where the only spelling
     // available is a name. `$` cannot appear in a source identifier, so the
     // binding cannot shadow one.
-    types.bindSymbol(symbol, sig.publicCallable);
+    types.bindRootSymbol(symbol, sig.publicCallable);
     {
       // ⛔ The dispatcher is a FUNCTION, even when the call that needed it was
       // inside an inlined method body. Emitting it under the inliner's state

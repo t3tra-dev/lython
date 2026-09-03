@@ -43,3 +43,12 @@ print(with_argument(3))
 
 plain: Base = Base()
 print(plain.f(), (plain.f)())
+
+# Taken inside a LOOP and a COMPREHENSION, which is where the dispatcher's
+# symbol has to be visible from a scope that did not demand it.
+everyone: "list[Base]" = [Base(), Sub()]
+collected: "list[Callable[[], str]]" = []
+for one in everyone:
+    collected.append(one.f)
+print([fn() for fn in collected])
+print([one.f for one in everyone][1]())

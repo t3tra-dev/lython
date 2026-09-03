@@ -1785,6 +1785,11 @@ void TypeSystem::bindSymbol(llvm::StringRef name, mlir::Type type) {
   canonicalBindings.erase(name);
 }
 
+void TypeSystem::bindRootSymbol(llvm::StringRef name, mlir::Type type) {
+  symbols[name] = type ? type : object();
+  canonicalBindings.erase(name);
+}
+
 void TypeSystem::bindCanonicalSymbol(llvm::StringRef name,
                                      llvm::StringRef canonical,
                                      mlir::Type type) {

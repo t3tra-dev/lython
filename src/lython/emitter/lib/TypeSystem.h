@@ -253,6 +253,11 @@ public:
   // local cannot shadow a class annotation.
   void bindLocalTypeParameter(llvm::StringRef name, mlir::Type type) const;
   void bindSymbol(llvm::StringRef name, mlir::Type type);
+  // The MODULE's own symbol table, whatever scope is open. A synthesized
+  // module function is visible from every body, and binding it in whichever
+  // scope happened to demand it made the name unresolvable from the next one
+  // ("unresolved name '__lyvdisp$2'" from a method object taken inside a loop).
+  void bindRootSymbol(llvm::StringRef name, mlir::Type type);
   void bindCanonicalSymbol(llvm::StringRef name, llvm::StringRef canonical,
                            mlir::Type type);
   std::optional<mlir::Type> lookupSymbol(llvm::StringRef name) const;
