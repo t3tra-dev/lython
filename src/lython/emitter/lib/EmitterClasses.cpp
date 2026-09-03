@@ -2682,6 +2682,11 @@ void ModuleEmitter::collectClassFields(
     if (name.empty())
       return;
     if (!type) {
+      // A method other than `__init__` may only refine what the constructor
+      // declared, so an expression it cannot type there says nothing about a
+      // field and must not be reported as one.
+      if (collectFieldsRefineOnly)
+        return;
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, anchor.range.start,
           "class field '" + name.str() +
@@ -2729,6 +2734,33 @@ void ModuleEmitter::collectClassFields(
       }
       return improves;
     };
+    // ⭐ `None` AND A VALUE ARE ONE FIELD, AND IT IS OPTIONAL. `self.n = None`
+    // in `__init__` and `self.n = v` in a setter is how Python declares a slot
+    // that starts empty, and "the first assignment wins" made the field
+    // NoneType forever -- so the setter's store died in the lowering as
+    // "attribute value 'builtins.int' is not assignable to field
+    // '!py.literal<None>'", a sentence about the compiler for a program
+    // CPython runs. The ANNOTATED spelling (`self.n: int | None = None`) has
+    // always worked, and this makes the two agree.
+    //
+    // ⛔ The JOIN and not the later type: the slot really does hold None until
+    // the setter runs, so typing it `int` would make a read before that a
+    // silent wrong answer. `int | None` is what the annotation says and what
+    // the reader then has to narrow.
+    //
+    // ⛔ Only against the None LITERAL. Two unrelated concrete types are a
+    // program this compiler still refuses; widening those to a union here
+    // would hide a real mistake behind a value nothing can use.
+    auto optionalPair = [&](mlir::Type existing, mlir::Type fresh) {
+      bool existingIsNone = existing == types.none();
+      bool freshIsNone = fresh == types.none();
+      if (existingIsNone == freshIsNone)
+        return mlir::Type();
+      mlir::Type payload = existingIsNone ? fresh : existing;
+      if (!mlir::isa_and_nonnull<py::ContractType>(payload))
+        return mlir::Type();
+      return types.join({payload, types.none()});
+    };
     for (auto [index, existing] : llvm::enumerate(fieldNames)) {
       if (existing != name)
         continue;
@@ -2738,9 +2770,14 @@ void ModuleEmitter::collectClassFields(
         fieldTypes[index] = storedType;
         if (!provisional)
           provisionalFields.erase(name);
+        return;
       }
+      if (mlir::Type optional = optionalPair(fieldTypes[index], storedType))
+        fieldTypes[index] = optional;
       return;
     }
+    if (collectFieldsRefineOnly)
+      return;
     fieldNames.push_back(name.str());
     fieldTypes.push_back(storedType);
     if (provisional)
@@ -2798,9 +2835,28 @@ void ModuleEmitter::collectClassFields(
                /*overwriteExisting=*/true, *statement);
     }
 
-    for (const parser::NodePtr &method : *body) {
-      if (!method || ast::nameSpelling(*method) != "__init__")
-        continue;
+    // ⭐ AND THE OTHER METHODS, for the fields `__init__` DECLARED. A field
+    // seeded `self.n = None` and given its value by a setter is one slot
+    // whose type is `int | None`, and walking only `__init__` left it
+    // NoneType -- the setter's store then died in the lowering. The second
+    // pass adds NO names (a field this class never declares keeps its own
+    // diagnostic, "'C' object has no attribute 'n'") and refines only the
+    // None-seeded ones, which is exactly what `optionalPair` above allows.
+    llvm::SmallVector<const parser::Node *, 4> fieldMethods;
+    for (const parser::NodePtr &method : *body)
+      if (method && ast::nameSpelling(*method) == "__init__")
+        fieldMethods.push_back(method.get());
+    unsigned initMethodCount = fieldMethods.size();
+    for (const parser::NodePtr &method : *body)
+      if (method &&
+          (method->kind == "FunctionDef" || method->kind == "AsyncFunctionDef") &&
+          ast::nameSpelling(*method) != "__init__")
+        fieldMethods.push_back(method.get());
+    for (auto [methodIndex, methodPtr] : llvm::enumerate(fieldMethods)) {
+      const parser::Node *methodNode = methodPtr;
+      llvm::SaveAndRestore<bool> refineOnly(collectFieldsRefineOnly,
+                                            methodIndex >= initMethodCount);
+      const parser::Node &method = *methodNode;
       // Names in scope for a field's declared type: the parameters, plus
       // locals bound earlier in the body. Why not a private name->type map
       // consulted only where the initializer is a bare `Name`: an initializer
@@ -2810,7 +2866,7 @@ void ModuleEmitter::collectClassFields(
       // reads silently fail to carry wherever a known contract is required.
       // Binding the names into a real scope makes one path serve both.
       llvm::StringMap<mlir::Type> initArgTypes;
-      collectInitArgTypes(*method, initArgTypes);
+      collectInitArgTypes(method, initArgTypes);
       TypeSystem::Scope initScope = types.pushScope();
       // A name the pre-pass cannot type must SHADOW any outer binding of the
       // same name; resolving `self.f = x` to a module global that happens to
@@ -3032,7 +3088,7 @@ void ModuleEmitter::collectClassFields(
                   walkInitBody(nested);
             }
           };
-      walkInitBody(ast::nodeList(*method, "body"));
+      walkInitBody(ast::nodeList(method, "body"));
     }
   }
 }

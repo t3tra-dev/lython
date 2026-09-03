@@ -297,6 +297,9 @@ private:
   // the ARGUMENT types through __init__'s parameter types; null when they do
   // not determine every type parameter.
   mlir::Type inferredGenericClassInstantiation(const parser::Node &call);
+  // Set while `collectClassFields` walks a method other than `__init__`: those
+  // may only REFINE a field the constructor declared, never add one.
+  bool collectFieldsRefineOnly = false;
   void collectClassFields(const parser::Node &classDef,
                           llvm::SmallVectorImpl<std::string> &fieldNames,
                           llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
