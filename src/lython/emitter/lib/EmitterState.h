@@ -141,6 +141,7 @@ public:
                          mlir::Type &currentGeneratorSendType,
                          mlir::Type &currentGeneratorYieldType,
                          llvm::StringMap<mlir::Type> &narrowedFromTypes,
+                         llvm::StringMap<mlir::Type> &narrowedMemberTypes,
                          const TypeSystem &types)
       : values(values), savedValues(values),
         currentReturnType(currentReturnType),
@@ -153,8 +154,15 @@ public:
         savedGeneratorYieldType(currentGeneratorYieldType),
         narrowedFromTypes(narrowedFromTypes),
         savedNarrowedFromTypes(narrowedFromTypes),
+        narrowedMemberTypes(narrowedMemberTypes),
+        savedNarrowedMemberTypes(narrowedMemberTypes),
         typeScope(types.pushScope()) {
     narrowedFromTypes.clear();
+    // ⛔ A FIELD PATH IS A NAME PLUS A FIELD, and the name is scope-local: the
+    // caller's `self.left` says nothing about the callee's. Carrying the map
+    // in made a guard in one body check the same path in ANOTHER object's --
+    // and raise for a field that was fine.
+    narrowedMemberTypes.clear();
   }
 
   ScopedCallableEmission(const ScopedCallableEmission &) = delete;
@@ -167,6 +175,7 @@ public:
     currentGeneratorSendType = savedGeneratorSendType;
     currentGeneratorYieldType = savedGeneratorYieldType;
     narrowedFromTypes = savedNarrowedFromTypes;
+    narrowedMemberTypes = savedNarrowedMemberTypes;
   }
 
 private:
@@ -182,6 +191,8 @@ private:
   mlir::Type savedGeneratorYieldType;
   llvm::StringMap<mlir::Type> &narrowedFromTypes;
   llvm::StringMap<mlir::Type> savedNarrowedFromTypes;
+  llvm::StringMap<mlir::Type> &narrowedMemberTypes;
+  llvm::StringMap<mlir::Type> savedNarrowedMemberTypes;
   TypeSystem::Scope typeScope;
 };
 

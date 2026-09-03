@@ -466,7 +466,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   ScopedCallableEmission emissionScope(
       values, currentReturnType, currentFunctionPrefix,
       currentGeneratorSendType, currentGeneratorYieldType, narrowedFromTypes,
-      types);
+      narrowedMemberTypes, types);
   // The forward look for a later read stops at this callable's own suites: a
   // name inside a nested function is a different binding, and the enclosing
   // function's remainder says nothing about it.

@@ -1265,6 +1265,14 @@ private:
   // under `if xs is None:` wants the declared `list[int] | None`, not the
   // `None` the read side sees (EmitterControlFlow.cpp / the Assign rule).
   llvm::StringMap<mlir::Type> narrowedFromTypes;
+  // Field paths a guard has proved non-None, and the payload type proved. A
+  // read of one is CHECKED against the type at the read, never assumed: the
+  // field is re-read at every use and a call in between may have replaced it,
+  // and unwrapping a union whose tag has changed is a garbage pointer rather
+  // than a wrong answer. The entries live only inside the guarded region.
+  llvm::StringMap<mlir::Type> narrowedMemberTypes;
+  bool suppressMemberNarrowing = false;
+  void invalidateMemberNarrowings(const parser::Node &statement);
   // Names declared `global` in the function currently being emitted (writes
   // to them target the module global instead of a new local). Saved/restored
   // around each callable body.

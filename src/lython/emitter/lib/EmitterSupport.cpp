@@ -1040,6 +1040,62 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
     return std::nullopt;
   }
 
+  // ⭐ `self.left is None` PROVES SOMETHING TOO, and the machinery only knew
+  // names. That is the binary-search-tree idiom:
+  //
+  //     if self.left is None:
+  //         self.left = Tree(v)
+  //     else:
+  //         self.left.insert(v)   # union<Tree, None> has no 'insert'
+  //
+  // while `v = self.left; if v is not None:` -- the same program -- compiles.
+  //
+  // ⛔ The path is a FIELD OF A NAME and nothing deeper: `self.left` yes,
+  // `a.b.c` and `xs[0].f` no. A longer path is more places for the value to
+  // change between the guard and the read, and the read side pays for each one.
+  if (test.kind == "Compare")
+    if (const auto *comparators = ast::nodeList(test, "comparators");
+        comparators && comparators->size() == 1)
+      if (const auto *ops = ast::nodeList(test, "ops");
+          ops && ops->size() == 1) {
+        const parser::Node *op = ops->front().get();
+        bool trueBranchIsNone = ast::isOperator(op, "Is");
+        if (trueBranchIsNone || ast::isOperator(op, "IsNot")) {
+          const parser::Node *left = ast::node(test, "left");
+          const parser::Node *right = comparators->front().get();
+          const parser::Node *member = nullptr;
+          if (left && left->kind == "Attribute" && right &&
+              right->kind == "Constant" && ast::isNoneField(*right, "value"))
+            member = left;
+          else if (right && right->kind == "Attribute" && left &&
+                   left->kind == "Constant" &&
+                   ast::isNoneField(*left, "value"))
+            member = right;
+          if (member)
+            if (const parser::Node *owner = ast::node(*member, "value");
+                owner && owner->kind == "Name")
+              if (auto attr = ast::string(*member, "attr")) {
+                mlir::Type fieldType =
+                    types.widenLiteral(types.inferExpr(member));
+                mlir::Type payload =
+                    fieldType ? removeNoneFromType(fieldType, types)
+                              : mlir::Type{};
+                if (payload && payload != fieldType) {
+                  BranchTypeNarrowing narrowing;
+                  narrowing.isMemberPath = true;
+                  narrowing.name =
+                      std::string(ast::nameSpelling(*owner)) + "." +
+                      std::string(*attr);
+                  narrowing.trueType =
+                      trueBranchIsNone ? types.none() : payload;
+                  narrowing.falseType =
+                      trueBranchIsNone ? payload : types.none();
+                  return narrowing;
+                }
+              }
+        }
+      }
+
   if (std::optional<NoneComparisonNarrowing> none =
           optionalNoneComparison(test, types)) {
     BranchTypeNarrowing narrowing;

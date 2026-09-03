@@ -4234,6 +4234,12 @@ Value ModuleEmitter::emitInlineMethodBody(
   if (pushedSuperContext)
     superContexts.push_back(
         SuperContext{method.definingClass, sig.positionalNames.front()});
+  // The inlined body is another object's frame: its `self` is not the caller's,
+  // so a field path proved out here says nothing inside.
+  llvm::StringMap<mlir::Type> savedInlineMembers = narrowedMemberTypes;
+  narrowedMemberTypes.clear();
+  auto restoreInlineMembers = llvm::make_scope_exit(
+      [&] { narrowedMemberTypes = savedInlineMembers; });
   methodsBeingInlined.push_back(method.method);
   // The frame this body would have had if it were a function: everything it
   // emits is located inside `bad`, at a call written in whatever function the

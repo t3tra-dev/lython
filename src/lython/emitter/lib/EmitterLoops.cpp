@@ -15,6 +15,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -1610,6 +1611,9 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
     // The body sees what the condition proves: `while n is not None:`
     // narrows n for its own body, the same fact the if statement and the
     // conditional expression apply, through the same applyBranchNarrowing.
+    llvm::StringMap<mlir::Type> savedMembers = narrowedMemberTypes;
+    auto restoreMembers = llvm::make_scope_exit(
+        [&] { narrowedMemberTypes = savedMembers; });
     if (test)
       for (const BranchTypeNarrowing &fact :
            branchTypeNarrowings(*test, types, module))

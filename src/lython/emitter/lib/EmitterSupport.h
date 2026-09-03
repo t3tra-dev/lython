@@ -89,7 +89,11 @@ struct NoneComparisonNarrowing {
 };
 
 struct BranchTypeNarrowing {
+  // A local's name, or -- when `isMemberPath` -- the dotted path of a field
+  // read (`self.left`). The two are spent differently: a local is one value
+  // the branch holds, a field is re-read at every use.
   std::string name;
+  bool isMemberPath = false;
   mlir::Type trueType;
   mlir::Type falseType;
   mlir::Type trueSourceType;

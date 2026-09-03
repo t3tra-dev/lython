@@ -32,27 +32,18 @@
 # this one has that workaround, so the hint would be wrong more often than
 # right.
 #
-# ⭐ AND `is None` OVER A FIELD IS THE SAME GAP, which is what makes this the
-# top open item rather than a corner: it is the binary-search-tree idiom.
+# ⭐ THE `is None` HALF IS FIXED (cases/a_guard_over_a_field): a field path
+# proved non-None is recorded, and every READ of it is CHECKED against the
+# proof -- a union test, a branch to a raise, then the unwrap. That is what
+# makes it sound where a view would not be: the field is re-read at every use,
+# and a call between the guard and a later read may have stored None, which
+# unwrapped as `Tree` is a garbage pointer rather than a wrong answer.
 #
-#     class Tree:
-#         def __init__(self, v: int) -> None:
-#             self.left = None
-#         def insert(self, v: int) -> None:
-#             if self.left is None:
-#                 self.left = Tree(v)
-#             else:
-#                 self.left.insert(v)   # union<Tree, None> has no 'insert'
-#
-# ⛔ AND THE SOUND REPAIR IS A CHECKED UNWRAP, not a view. A union value is a
-# tag plus lanes; narrowing it means asserting the tag. For a LOCAL the value
-# is read once and the assertion holds for the rest of the branch. A field is
-# re-read at every use, and between the guard and a later read a call may have
-# stored None into it -- unwrapping that as `Tree` yields a garbage pointer,
-# which is a memory-safety failure and not a wrong answer. So the narrowing
-# would have to be a CHECKED unwrap that raises when the tag disagrees, which
-# is sound (CPython raises AttributeError there too) and costs a branch per
-# read. That is the mechanism; the current refusal is the honest placeholder.
+# THIS half -- `isinstance` over a field -- is the same mechanism with a class
+# test instead of a union test, and is not built. It needs one more thing the
+# None case does not: the payload of an Optional field is spelled by the field
+# type itself, while an isinstance target is a class the read has to be REFINED
+# to, and a refine is the layout view the checked unwrap exists to avoid.
 #
 # Measured 2026-09-03: the METHOD spelling (`self.a.only()`), the ATTRIBUTE
 # spelling (`self.a.n`) and the `is None` spelling are all refused; binding the

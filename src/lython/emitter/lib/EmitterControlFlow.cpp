@@ -25,9 +25,56 @@ namespace lython::emitter {
 // The one place a proved fact becomes a narrower SSA value. `if`, the
 // conditional expression and the `while` body all reach it: each of them
 // used to be its own copy, and the loop had none at all.
+void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
+  if (narrowedMemberTypes.empty())
+    return;
+  llvm::SmallVector<const parser::Node *, 4> targets;
+  auto addTargets = [&](llvm::StringRef field) {
+    if (const auto *list = ast::nodeList(statement, field))
+      for (const parser::NodePtr &target : *list)
+        targets.push_back(target.get());
+    else if (const parser::Node *single = ast::node(statement, field))
+      targets.push_back(single);
+  };
+  addTargets("targets");
+  addTargets("target");
+  for (const parser::Node *target : targets) {
+    if (!target)
+      continue;
+    if (target->kind == "Name") {
+      std::string prefix = std::string(ast::nameSpelling(*target)) + ".";
+      for (auto entry = narrowedMemberTypes.begin();
+           entry != narrowedMemberTypes.end();)
+        if (llvm::StringRef(entry->getKey()).starts_with(prefix))
+          narrowedMemberTypes.erase(entry++);
+        else
+          ++entry;
+      continue;
+    }
+    if (target->kind != "Attribute")
+      continue;
+    if (const parser::Node *owner = ast::node(*target, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(*target, "attr"))
+        narrowedMemberTypes.erase(std::string(ast::nameSpelling(*owner)) + "." +
+                                  std::string(*attr));
+  }
+}
+
 void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
                                          const BranchTypeNarrowing &fact,
                                          bool conditionIsTrue) {
+    // A field path is not a value this frame holds, so there is nothing here to
+    // unwrap: the fact is recorded and every READ of the path spends it, with a
+    // check of its own.
+    if (fact.isMemberPath) {
+      mlir::Type proved = conditionIsTrue ? fact.trueType : fact.falseType;
+      if (proved && proved != types.none())
+        narrowedMemberTypes[fact.name] = proved;
+      else
+        narrowedMemberTypes.erase(fact.name);
+      return;
+    }
     if (std::optional<mlir::Type> before = types.lookupSymbol(fact.name))
       narrowedFromTypes[fact.name] = *before;
     mlir::Type narrowed = conditionIsTrue ? fact.trueType : fact.falseType;
@@ -147,6 +194,15 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   llvm::StringMap<mlir::Type> savedNarrowedFrom = narrowedFromTypes;
   auto restoreNarrowedFrom = llvm::make_scope_exit(
       [&] { narrowedFromTypes = std::move(savedNarrowedFrom); });
+  // ⛔ A FIELD NARROWING IS BRANCH-LOCAL AND DOES NOT OUTLIVE THE STATEMENT.
+  // Each branch starts from what was proved outside, and nothing a branch
+  // proves is carried past the `if` -- past it the field is re-read with no
+  // guard in sight, and the entry would then check a fact no test established
+  // (which is how the first version of this raised inside the NEXT `if`'s own
+  // test).
+  llvm::StringMap<mlir::Type> savedMembers = narrowedMemberTypes;
+  auto restoreMembers = llvm::make_scope_exit(
+      [&] { narrowedMemberTypes = savedMembers; });
 
   std::optional<bool> staticTruth =
       test ? optionalStaticBranchTruth(*test, types, module) : std::nullopt;
@@ -233,6 +289,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   builder.setInsertionPointToStart(thenBlock);
   {
     ScopedEmitterScope scope(values, types);
+    narrowedMemberTypes = savedMembers;
     applyNarrowings(/*conditionIsTrue=*/true);
     emitStatements(ast::nodeList(statement, "body"));
     if (!insertionBlockTerminated(builder)) {
@@ -255,6 +312,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     builder.setInsertionPointToStart(elseBlock);
     {
       ScopedEmitterScope scope(values, types);
+      narrowedMemberTypes = savedMembers;
       applyNarrowings(/*conditionIsTrue=*/false);
       emitStatements(orelse);
       if (!insertionBlockTerminated(builder)) {
@@ -487,10 +545,25 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
         Value{continuation->getArgument(argIndex), replacementTypes[slot]};
     types.bindSymbol(name, replacementTypes[slot]);
   }
-  if (thenTerminates && !elseTerminates)
+  // ⭐ THE SURVIVING SIDE OUTLIVES THE STATEMENT, field facts included. This is
+  // the early-return spelling of the guard --
+  //
+  //     if self.v is None:
+  //         return "-"
+  //     return self.v.upper()
+  //
+  // -- and without carrying the fact into `savedMembers` the restore below
+  // would drop it at the `if`'s closing line, which is where the narrowing is
+  // needed.
+  if (thenTerminates && !elseTerminates) {
+    narrowedMemberTypes = savedMembers;
     applyNarrowings(/*conditionIsTrue=*/false);
-  else if (hasElse && elseTerminates && !thenTerminates)
+    savedMembers = narrowedMemberTypes;
+  } else if (hasElse && elseTerminates && !thenTerminates) {
+    narrowedMemberTypes = savedMembers;
     applyNarrowings(/*conditionIsTrue=*/true);
+    savedMembers = narrowedMemberTypes;
+  }
 }
 
 namespace {

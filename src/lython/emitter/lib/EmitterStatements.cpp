@@ -37,8 +37,16 @@ void ModuleEmitter::emitStatements(
       break;
     ++currentSuiteIndex;
     suiteStack.back().second = currentSuiteIndex;
-    if (statement && (!skipDeclarations || !isTopLevelDecl(*statement)))
+    if (statement && (!skipDeclarations || !isTopLevelDecl(*statement))) {
       emitStatement(*statement);
+      // ⛔ A FIELD FACT DIES WITH ITS ROOT. `cur = cur.nxt` rebinds the name the
+      // path is rooted at, so "cur.nxt is not None" is about an object the
+      // program no longer holds -- and the read below would then CHECK the new
+      // one against it and raise for a field nothing had proved. Erased after
+      // the statement, because the statement's own right side is read before
+      // its target is bound.
+      invalidateMemberNarrowings(*statement);
+    }
     else if (statement && skipDeclarations) {
       // The class contract was declared up front, but its attribute
       // initializers evaluate here -- at the class statement's position in

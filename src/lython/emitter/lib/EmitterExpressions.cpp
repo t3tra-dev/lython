@@ -233,6 +233,72 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     }
     return emitSubscript(*expr);
   }
+  if (expr->kind == "Attribute" && !suppressMemberNarrowing &&
+      !narrowedMemberTypes.empty()) {
+    // ⭐ A GUARD OVER A FIELD IS SPENT AT THE READ, and CHECKED there. The
+    // field is re-read at every use, so the tag the guard saw is evidence about
+    // the past; between the guard and this read a call may have stored None.
+    // The check is what makes the narrowing sound, and it costs one branch --
+    // and where it fails, CPython raises AttributeError on the same line.
+    if (const parser::Node *owner = ast::node(*expr, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(*expr, "attr")) {
+        std::string path = std::string(ast::nameSpelling(*owner)) + "." +
+                           std::string(*attr);
+        auto found = narrowedMemberTypes.find(path);
+        if (found != narrowedMemberTypes.end() && found->second) {
+          Value raw;
+          {
+            suppressMemberNarrowing = true;
+            raw = emitExpr(expr);
+            suppressMemberNarrowing = false;
+          }
+          if (auto unionType =
+                  mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
+              unionType && unionType.hasMember(found->second)) {
+            mlir::Type proved = found->second;
+            auto test = py::UnionTestOp::create(builder, loc(*expr),
+                                                builder.getI1Type(), raw.value,
+                                                mlir::TypeAttr::get(proved));
+            mlir::Block *origin = builder.getInsertionBlock();
+            mlir::Region *region = origin->getParent();
+            mlir::Block *bad = builder.createBlock(
+                region, std::next(origin->getIterator()));
+            mlir::Block *ok =
+                builder.createBlock(region, std::next(bad->getIterator()));
+            builder.setInsertionPointToEnd(origin);
+            mlir::cf::CondBranchOp::create(builder, loc(*expr),
+                                           test.getResult(), ok,
+                                           mlir::ValueRange{}, bad,
+                                           mlir::ValueRange{});
+            builder.setInsertionPointToStart(bad);
+            // The message describes what happened, not what CPython would
+            // have said next: a guard above proved this field, and by the time
+            // it was read something had replaced it. CPython reaches the same
+            // line with None in hand and raises on whatever it does with it.
+            parser::NodePtr raise = synth::raiseStmt(
+                synth::call(
+                    synth::name("AttributeError", expr->range),
+                    {synth::strConstant(
+                        "attribute '" + std::string(*attr) +
+                            "' is None here, after a guard above proved it was "
+                            "not: it changed in between",
+                        expr->range)},
+                    expr->range),
+                expr->range);
+            emitStatement(*raise);
+            synthesizedIteratorDefs.push_back(std::move(raise));
+            if (!insertionBlockTerminated(builder))
+              mlir::cf::BranchOp::create(builder, loc(*expr), ok);
+            builder.setInsertionPointToStart(ok);
+            auto unwrap = py::UnionUnwrapOp::create(builder, loc(*expr), proved,
+                                                    raw.value);
+            return Value{unwrap.getResult(), proved};
+          }
+          return raw;
+        }
+      }
+  }
   if (expr->kind == "Attribute") {
     std::string qualified = ast::qualifiedName(expr);
     if (!qualified.empty())
@@ -512,6 +578,9 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         std::optional<mlir::Type> narrowedFrom;
       };
       llvm::SmallVector<Saved, 2> saved;
+      llvm::StringMap<mlir::Type> savedMembers = narrowedMemberTypes;
+      auto restoreMembers = llvm::make_scope_exit(
+          [&] { narrowedMemberTypes = savedMembers; });
       for (const BranchTypeNarrowing &fact : narrowings) {
         Saved entry{fact.name, std::nullopt, types.lookupSymbol(fact.name),
                     std::nullopt};
