@@ -1218,6 +1218,24 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
       if (!statement || !isTopLevelClass(*statement))
         continue;
       std::size_t classDiagnosticStart = diagnostics.size();
+      // ⛔ AN ENUM CLASS IN AN IMPORTED MODULE IS REFUSED HERE, where the
+      // program can read the reason. `desugarEnumClasses` runs on the MAIN
+      // module only, so an imported one kept its `Enum` base and reached the
+      // dialect verifier as "'py.class' op unknown base class 'Enum'" -- the
+      // compiler's own sentence for a class CPython has no trouble with.
+      //
+      // ⛔ Not desugared here instead: a desugared member is an INSTANCE held
+      // as a class attribute, and an imported class attribute is carried by
+      // the literal channel, which has no form for one. The refusal is the
+      // honest half until that channel can hold an object.
+      if (enumBaseKind(*statement)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement->range.start,
+            "an Enum class in an imported module is not supported: its members "
+            "are instances, and an imported class attribute is carried as a "
+            "compile-time constant; define the enum in the main module"});
+        continue;
+      }
       if (std::optional<std::string_view> name =
               ast::string(*statement, "name")) {
         std::string classSymbol =
