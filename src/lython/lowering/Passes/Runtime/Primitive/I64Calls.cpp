@@ -381,8 +381,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
           ? logicalAnd(builder, loc, lhs.valid, sources[1]->primitiveI64->valid)
           : lhs.valid;
 
-  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(
-          op->getParentOfType<mlir::func::FuncOp>())) {
+  mlir::func::FuncOp enclosingClone = op->getParentOfType<mlir::func::FuncOp>();
+  // ⛔ A GENERATOR RESUME HAS NO BOXED TWIN TO FALL BACK TO. The parked
+  // decision below is only sound because the CALLER re-runs the boxed original
+  // when the clone says "I cannot say" -- and a resume's caller is the
+  // runtime's `next`, which has no such original:
+  //
+  //     def g(s: Shape) -> Iterator[int]:
+  //         if s.area() > 0:
+  //             yield 1
+  //         else:
+  //             yield 0
+  //     print(list(g(Sq(3))))     # printed [0]; CPython prints [1]
+  //
+  // `s.area()` reaches a dispatcher whose Sq arm returns a boxed int with no
+  // word, so the comparison's operands are not valid, the parked "cannot say"
+  // is AND-ed into the answer, and the resume BRANCHES on the false it
+  // produced. Nothing re-ran anything. So a comparison whose validity is not
+  // pinned takes the guarded path in a resume, and the word fast path stays
+  // for the case it was written for.
+  bool cloneCanFallBack =
+      enclosingClone && !enclosingClone->hasAttr("ly.generator.resume");
+  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(enclosingClone) &&
+      (cloneCanFallBack || !compare || isPinnedTrueFlag(operandsValid))) {
     if (unary || arithmetic) {
       mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
           unary ? RuntimeBundleLowerer::emitPrimitiveI64UnaryEvidence(
