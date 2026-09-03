@@ -552,6 +552,10 @@ set(LYTHON_LEAK_GATE_CASES
     # whose unwind reaches the handler that releases it again. The verifier
     # sees a death written too early; only this gate sees one written too late.
     a_with_body_that_branches_after_its_last_use
+    # A dict store whose key is computed: the demotion routes it to the runtime
+    # insert, which retains the key and the value the evidence arm placed by
+    # hand. Only a leak check says the two tiers book the same references.
+    a_dict_key_the_program_computes
     # The **kwargs dict retains its keys and its values.
     kwarg_dict_holds_its_arguments
     # A loop element released on the edges the early return does not take.

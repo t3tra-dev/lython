@@ -694,6 +694,10 @@ private:
   static void demoteMutableContainerEvidence(RuntimeBundle &bundle);
   void dropObjectFieldEvidence(RuntimeBundle &bundle);
   void demoteMutableContainerEvidenceFor(mlir::Value value);
+  bool demoteMappingEvidenceForDynamicKey(mlir::Value container,
+                                          const RuntimeBundle &containerBundle,
+                                          mlir::Value index,
+                                          const RuntimeBundle &indexBundle);
   void demoteMutableContainerArgumentEvidence(py::CallOp op);
   mlir::FailureOr<mlir::Value>
   rawSequenceIndexValue(mlir::Operation *op, mlir::Value indexValue,

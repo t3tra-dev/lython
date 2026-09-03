@@ -695,6 +695,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
   if (mlir::failed(collectObjectSources(
           op, inputs, "setitem operands need runtime bundles", sources)))
     return mlir::failure();
+  RuntimeBundleLowerer::demoteMappingEvidenceForDynamicKey(
+      op.getContainer(), *sources[0], op.getIndex(), *sources[1]);
   const RuntimeBundle &container = *sources[0];
   const RuntimeBundle &index = *sources[1];
   const RuntimeBundle &value = *sources[2];
@@ -1088,6 +1090,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerDelItem(py::DelItemOp op) {
   if (mlir::failed(collectObjectSources(
           op, inputs, "delitem operands need runtime bundles", sources)))
     return mlir::failure();
+  RuntimeBundleLowerer::demoteMappingEvidenceForDynamicKey(
+      op.getContainer(), *sources[0], op.getIndex(), *sources[1]);
   const RuntimeBundle &container = *sources[0];
   const RuntimeBundle &index = *sources[1];
   if (container.kind == RuntimeBundle::Kind::Object &&

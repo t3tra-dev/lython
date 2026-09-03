@@ -254,6 +254,47 @@ void RuntimeBundleLowerer::demoteMutableContainerEvidenceFor(
   dropObjectFieldEvidence(found->second);
 }
 
+// ⭐ AN EVIDENCE MAP CANNOT DESCRIBE A STORE WHOSE KEY IS UNKNOWN.
+//
+//     d = {"k": 1}
+//     d[str(1)] = 99      # runtime manifest has no builtins.dict.__setitem__
+//     del d[str(1)]       # ... has no builtins.dict.__delitem__
+//
+// The evidence arm of a dict store needs a STATIC key to place the entry, and
+// the runtime arm declines a dict that still carries evidence -- so a literal
+// dict written through a computed key fell out of both and died in the
+// manifest, which has no such method to offer. The same store one line later
+// already worked: a loop, a function boundary or an annotated global strips
+// the evidence first, which is why only the straight-line literal was hit.
+//
+// Dropping the evidence here is what the store MEANS. After it nothing static
+// knows which keys the dict holds, so every later read must go through the
+// payload -- and that is a demotion, never a widening, so it cannot make a
+// correct program wrong.
+//
+// ⛔ Not "materialize the key and look it up": the entry to update is chosen
+// at run time, and the evidence tier's whole premise is that this walk sees
+// every mutation. It cannot see this one.
+bool RuntimeBundleLowerer::demoteMappingEvidenceForDynamicKey(
+    mlir::Value container, const RuntimeBundle &containerBundle,
+    mlir::Value index, const RuntimeBundle &indexBundle) {
+  if (containerBundle.kind != RuntimeBundle::Kind::Object ||
+      containerBundle.contractName() != "builtins.dict")
+    return false;
+  if (!containerBundle.mappingEvidenceBacked &&
+      containerBundle.mappingKeys.empty())
+    return false;
+  if (indexBundle.kind != RuntimeBundle::Kind::Object)
+    return false;
+  if (RuntimeBundleLowerer::keywordNameFromValue(index) ||
+      indexBundle.literalText)
+    return false;
+  if (!RuntimeBundleLowerer::containerHasRuntimePayload(containerBundle))
+    return false;
+  demoteMutableContainerEvidenceFor(container);
+  return true;
+}
+
 void RuntimeBundleLowerer::demoteMutableContainerArgumentEvidence(
     py::CallOp op) {
   auto elementCanBeMutated = [&](mlir::Value element) {
