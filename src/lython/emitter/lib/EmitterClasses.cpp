@@ -1442,6 +1442,37 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   classBaseNames[contractName] = canonicalBases;
   classMros[contractName] = mro;
 
+  // ⭐ THE CLASS ATTRIBUTES ARE TYPED BEFORE THE FIELDS, because a field's
+  // initializer may read one:
+  //
+  //     class Config:
+  //         DEFAULTS = {"a": 1}
+  //         def __init__(self) -> None:
+  //             self.values = dict(Config.DEFAULTS)
+  //         def get(self, k: str) -> int:
+  //             return self.values[k]
+  //     # builtins.object does not provide manifest method '__getitem__'
+  //
+  // The field walk types `dict(Config.DEFAULTS)` with `inferExpr`, and with the
+  // attributes registered only further down, `Config.DEFAULTS` answered
+  // `object` -- so the FIELD became object and its reads carried nothing. The
+  // same line reading ANOTHER class's attribute compiled, which is what said
+  // the SELF reference was the defect.
+  //
+  // ⛔ Collected ONCE and carried. This walk emits diagnostics of its own
+  // ("requires a statically inferred type"), so calling it a second time
+  // further down would report each of them twice.
+  llvm::SmallVector<std::string, 8> staticAttrNames;
+  llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
+  llvm::SmallVector<mlir::Type, 8> staticAttrTypes;
+  collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues,
+                                &staticAttrTypes);
+  for (auto [attrName, attrType] :
+       llvm::zip_equal(staticAttrNames, staticAttrTypes))
+    if (attrType)
+      types.bindClassStaticAttr(contractName, attrName,
+                                types.widenLiteral(attrType));
+
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
   collectClassFields(classDef, fieldNames, fieldTypes,
@@ -1672,11 +1703,6 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // Class attributes register BEFORE any method body is emitted: method
   // bodies read them (Counter.count += 1) through the very lookups being
   // registered here.
-  llvm::SmallVector<std::string, 8> staticAttrNames;
-  llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
-  llvm::SmallVector<mlir::Type, 8> staticAttrTypes;
-  collectStaticClassAssignments(classDef, staticAttrNames, staticAttrValues,
-                                &staticAttrTypes);
   // Mutable class attributes: attributes of main-module classes whose
   // widened type has module-global cell storage become slot-backed (reads
   // and writes go through the cells; the initializer expression is no
