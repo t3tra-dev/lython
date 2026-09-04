@@ -1475,8 +1475,34 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
 
   llvm::SmallVector<std::string, 8> fieldNames;
   llvm::SmallVector<mlir::Type, 8> fieldTypes;
+  // ⭐ EACH FIELD IS VISIBLE TO THE ONES AFTER IT. A field's initializer may
+  // read an earlier field:
+  //
+  //     self.parts = list(parts)
+  //     self.frozen = tuple(self.parts)
+  //
+  // and `self.parts` resolves through the PROTOCOL TABLE, which learned this
+  // class's fields only after the whole walk -- so `frozen` typed as `object`
+  // and `"".join(self.frozen)` was "cannot adapt builtins.object". The same
+  // reason the note below gives for publishing before the method signatures,
+  // one step earlier.
+  auto publishFieldsSoFar = [&](llvm::ArrayRef<std::string> names,
+                                llvm::ArrayRef<mlir::Type> fieldTypesSoFar) {
+    py::protocols::ProtocolInfo partial;
+    for (const std::string &base : canonicalBases)
+      partial.bases.push_back(py::protocols::ProtocolBase{
+          py::contracts::manifestClassNameForContract(base), {}});
+    partial.bases.push_back(py::protocols::ProtocolBase{
+        py::contracts::manifestClassNameForContract("builtins.object"), {}});
+    for (auto [fieldName, fieldType] : llvm::zip_equal(names, fieldTypesSoFar))
+      if (fieldType)
+        partial.fields[fieldName] = fieldType;
+    py::protocols::Table::getMutable(context).registerClass(contractName,
+                                                            partial);
+  };
   collectClassFields(classDef, fieldNames, fieldTypes,
-                     /*includeAnnAssignDefaults=*/isDataclass, contractName);
+                     /*includeAnnAssignDefaults=*/isDataclass, contractName,
+                     publishFieldsSoFar);
 
   // Dataclass field defaults (AnnAssign initializers). dataclasses.field()
   // models default= and default_factory= only: the factory desugars to a
@@ -2883,7 +2909,10 @@ void ModuleEmitter::collectClassFields(
     const parser::Node &classDef,
     llvm::SmallVectorImpl<std::string> &fieldNames,
     llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
-    bool includeAnnAssignDefaults, llvm::StringRef contractName) {
+    bool includeAnnAssignDefaults, llvm::StringRef contractName,
+    llvm::function_ref<void(llvm::ArrayRef<std::string>,
+                            llvm::ArrayRef<mlir::Type>)>
+        publishSoFar) {
   // The class as the TYPE SYSTEM knows it. An imported class is `lib.R` there
   // and `R` in its own ClassDef, and every question this walk asks -- what
   // `self` is, whether a target's owner is this class -- was asked by the
@@ -3008,6 +3037,8 @@ void ModuleEmitter::collectClassFields(
     fieldTypes.push_back(storedType);
     if (provisional)
       provisionalFields.insert(name);
+    if (publishSoFar)
+      publishSoFar(fieldNames, fieldTypes);
   };
 
   auto collectInitArgTypes = [&](const parser::Node &method,

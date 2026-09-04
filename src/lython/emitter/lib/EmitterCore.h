@@ -304,11 +304,14 @@ private:
   // class, where the ClassDef's own name is only `R`. The walk asks the type
   // system about the class it is describing, and asking by the source spelling
   // answered nothing for every imported one.
-  void collectClassFields(const parser::Node &classDef,
-                          llvm::SmallVectorImpl<std::string> &fieldNames,
-                          llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
-                          bool includeAnnAssignDefaults = false,
-                          llvm::StringRef contractName = {});
+  void collectClassFields(
+      const parser::Node &classDef,
+      llvm::SmallVectorImpl<std::string> &fieldNames,
+      llvm::SmallVectorImpl<mlir::Type> &fieldTypes,
+      bool includeAnnAssignDefaults = false, llvm::StringRef contractName = {},
+      llvm::function_ref<void(llvm::ArrayRef<std::string>,
+                              llvm::ArrayRef<mlir::Type>)>
+          publishSoFar = nullptr);
   void collectStaticClassAssignments(
       const parser::Node &classDef, llvm::SmallVectorImpl<std::string> &names,
       llvm::SmallVectorImpl<mlir::Attribute> &values,

@@ -39,6 +39,29 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::emitSourceClassReprCall(
   return true;
 }
 
+namespace {
+
+// ⭐ KEEP THE TYPE ARGUMENTS THE OP'S OWN RESULT ALREADY CARRIES. The manifest
+// answers with a contract NAME, and rebuilding a type from a name drops the
+// parameters: `list(xs)` over a `list[str]` came out of the builtin as a bare
+// `builtins.list`, and storing that into a declared `list[str]` field was
+// "attribute value builtins.list is not assignable to field
+// builtins.list<str>". The manifest METHOD path already keeps them
+// (`bindRuntimeCallResult`); the builtin path rebuilt from the name.
+//
+// ⛔ Only when the names AGREE. Where the manifest's declared contract differs
+// from the op's -- the fallbacks above pick `symbol.resultContract` precisely
+// when the op says `object` -- the manifest's answer is the one to trust.
+mlir::Type builtinResultTypeFor(mlir::Value resultValue,
+                                llvm::StringRef resultContract) {
+  if (resultValue &&
+      runtimeContractName(resultValue.getType()) == resultContract)
+    return resultValue.getType();
+  return runtimeContractType(resultValue.getContext(), resultContract);
+}
+
+} // namespace
+
 mlir::LogicalResult RuntimeBundleLowerer::emitBoxedReprHookCall(
     mlir::Operation *op, const RuntimeBundle &object, RuntimeBundle &result) {
   mlir::FailureOr<mlir::Value> header =
@@ -193,9 +216,9 @@ RuntimeBundleLowerer::lowerBuiltinMethodCall(py::CallOp op,
                           << "' needs a concrete result contract";
 
   RuntimeBundle result;
-  if (mlir::failed(
-          bundleRuntimeResults(op, runtimeContractType(context, resultContract),
-                               emitted->call, result)))
+  if (mlir::failed(bundleRuntimeResults(
+          op, builtinResultTypeFor(op.getResult(0), resultContract),
+          emitted->call, result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
@@ -306,7 +329,8 @@ RuntimeBundleLowerer::lowerDirectBuiltinCall(py::CallOp op,
 
   RuntimeBundle result;
   if (mlir::failed(bundleRuntimeResults(
-          op, runtimeContractType(context, resultContract), call, result)))
+          op, builtinResultTypeFor(op.getResult(0), resultContract), call,
+          result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
