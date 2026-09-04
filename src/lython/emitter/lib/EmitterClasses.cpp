@@ -3167,10 +3167,69 @@ void ModuleEmitter::collectClassFields(
         else
           untypedLocals.insert(arg.getKey());
       }
+      // ⭐ A FIELD BUILT BY ONE OF THIS CLASS'S OWN METHODS. The methods are
+      // registered AFTER the fields -- a method's signature is inferred against
+      // them -- so `self.cache = self.compute()` typed as `object` and every
+      // read of the field then carried nothing. An ANNOTATED method needs
+      // nothing from the fields to say what it returns, so its annotation is
+      // read straight off the ClassDef here.
+      //
+      // ⛔ Annotated only. An unannotated method's result is inferred FROM the
+      // fields, which is the circle this deliberately does not enter.
+      //
+      // ⛔ A decorator other than staticmethod/classmethod means the name may
+      // not be the function the annotation belongs to.
+      auto annotatedSelfCallResult =
+          [&](const parser::Node *value) -> mlir::Type {
+        if (!value || value->kind != "Call")
+          return {};
+        const parser::Node *callee = ast::node(*value, "func");
+        if (!callee || callee->kind != "Attribute")
+          return {};
+        const parser::Node *owner = ast::node(*callee, "value");
+        if (!owner || !ast::isName(*owner, "self"))
+          return {};
+        auto called = ast::string(*callee, "attr");
+        if (!called)
+          return {};
+        const auto *classBody = ast::nodeList(classDef, "body");
+        if (!classBody)
+          return {};
+        for (const parser::NodePtr &member : *classBody) {
+          if (!member || member->kind != "FunctionDef")
+            continue;
+          if (ast::nameSpelling(*member) != *called)
+            continue;
+          if (const auto *decorators = ast::nodeList(*member, "decorator_list"))
+            for (const parser::NodePtr &decorator : *decorators) {
+              std::string spelling = ast::qualifiedName(decorator.get());
+              llvm::StringRef leaf = decoratorLeafName(spelling);
+              if (leaf != "staticmethod" && leaf != "classmethod")
+                return {};
+            }
+          if (const parser::Node *returns = ast::node(*member, "returns"))
+            return types.annotationType(returns);
+          return {};
+        }
+        // ⭐ AND A BASE'S METHOD, which is registered already: the base class
+        // was emitted before this one, so its binding carries the result its
+        // annotation promised. Without this a subclass whose field is built by
+        // an inherited factory typed that field `object`.
+        for (const std::string &ancestor : classMros[contractName])
+          if (ancestor != contractName)
+            if (auto bindings = classMethodBindings.find(ancestor);
+                bindings != classMethodBindings.end())
+              if (auto found = bindings->second.find(*called);
+                  found != bindings->second.end())
+                return found->second.bodySignature.resultType;
+        return {};
+      };
       auto valueTypeOf = [&](const parser::Node *value) -> mlir::Type {
         if (value && value->kind == "Name" &&
             untypedLocals.contains(ast::nameSpelling(*value)))
           return {};
+        if (mlir::Type annotated = annotatedSelfCallResult(value))
+          return annotated;
         return types.inferExpr(value);
       };
       // ⭐ AN EMPTY LITERAL TAKES THE ELEMENT TYPE THE NAME ALREADY HAS. The
