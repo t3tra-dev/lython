@@ -1049,6 +1049,15 @@ private:
   bool numericRepresentationMismatch(mlir::Type declared, mlir::Type assigned,
                                      mlir::Type &declaredLeaf,
                                      mlir::Type &assignedLeaf) const;
+  // The declared-cell name a container expression reads (a module global or a
+  // class attribute), or empty when it is not one.
+  std::string declaredCellNameFor(const parser::Node *container) const;
+  // Diagnostic text when a call writes into a declared cell's ELEMENT storage
+  // at a different numeric rung, or empty when it does not.
+  std::string cellElementRepresentationMismatch(
+      const parser::Node *containerNode, mlir::Type containerType,
+      const CallInferenceResult &inference,
+      llvm::ArrayRef<mlir::Type> argumentTypes) const;
   mlir::Value emitBoolValue(Value value, const parser::Node &anchor);
 
   template <typename Op>

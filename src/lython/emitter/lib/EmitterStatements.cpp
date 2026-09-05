@@ -2131,6 +2131,13 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
         container.type, "__setitem__", {index.type, value.type});
     if (!requireStaticEvidence(target, inference))
       return;
+    if (std::string mismatch = cellElementRepresentationMismatch(
+            containerNode, container.type, inference, {index.type, value.type});
+        !mismatch.empty()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, target.range.start, mismatch});
+      return;
+    }
     // Manifest-declared structural mutators may reallocate the container's
     // storage: the op carries an extra container-typed result that rebinds
     // the local (same channel as mutating bound-method calls).

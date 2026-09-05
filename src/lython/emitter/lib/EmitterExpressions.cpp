@@ -4453,6 +4453,100 @@ bool ModuleEmitter::isNumericPrimitiveContract(mlir::Type type) const {
 // names matching says nothing. Both cell channels -- the module global and the
 // class attribute -- asked the scalar question only, and the container spelling
 // of each printed the reinterpretation instead of being reported.
+// ⭐ A DECLARED CELL'S ELEMENT STORAGE IS THE CELL'S REPRESENTATION. A cell
+// holds ONE element type and its subscript read decodes with that type's lane
+// count, so an element written at a different numeric rung is read back as
+// something else entirely:
+//
+//     xs: list[int] = [1, 2]
+//     xs[0] = True
+//     print(xs, xs[0])       # printed [True, 2] 0; CPython prints [True, 2] True
+//
+// -- the container's repr decodes by TAG and is right, and the subscript
+// decodes by the declared element type and is not. `d["b"] = True` on a
+// `dict[str, int]` and `xs.append(True)` on a `list[int]` global say the same
+// thing, as does a class attribute's `P.v[0] = True`.
+//
+// ⛔ A LOCAL is not a cell and must not get this rule: the emitter refines the
+// name's element type at the store, so `xs: list[int] = [1, 2]; xs[0] = True`
+// inside a function reads True and is correct today. What makes a cell
+// different is that its declaration outlives the store.
+//
+// Returns the cell's name, or empty when the container is not one.
+std::string ModuleEmitter::declaredCellNameFor(
+    const parser::Node *container) const {
+  if (!container)
+    return {};
+  if (container->kind == "Name") {
+    llvm::StringRef name = ast::nameSpelling(*container);
+    return moduleGlobals.count(name) ? name.str() : std::string();
+  }
+  if (container->kind == "Attribute") {
+    const parser::Node *owner = ast::node(*container, "value");
+    auto attribute = ast::string(*container, "attr");
+    if (!owner || owner->kind != "Name" || !attribute)
+      return {};
+    llvm::StringRef ownerName = ast::nameSpelling(*owner);
+    if (!types.lookupClassStaticAttrType(ownerName, *attribute))
+      return {};
+    return (llvm::Twine(ownerName) + "." + *attribute).str();
+  }
+  return {};
+}
+
+std::string ModuleEmitter::cellElementRepresentationMismatch(
+    const parser::Node *containerNode, mlir::Type containerType,
+    const CallInferenceResult &inference,
+    llvm::ArrayRef<mlir::Type> argumentTypes) const {
+  std::string cell = declaredCellNameFor(containerNode);
+  if (cell.empty())
+    return {};
+  auto container = mlir::dyn_cast_if_present<py::ContractType>(containerType);
+  if (!container || container.getArguments().empty())
+    return {};
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      inference.evidence.callableContract);
+  if (!callable)
+    return {};
+  llvm::ArrayRef<mlir::Type> parameters = callable.getPositionalTypes();
+  // ⛔ Aligned from the END, because the receiver occupies parameter 0 of a
+  // manifest method's contract and does not of a bound one -- and which of the
+  // two this is depends on the call site, not on the method.
+  std::size_t offset = parameters.size() > argumentTypes.size()
+                           ? parameters.size() - argumentTypes.size()
+                           : 0;
+  for (auto [index, argument] : llvm::enumerate(argumentTypes)) {
+    if (index + offset >= parameters.size())
+      break;
+    // ⛔ THE LAST ARGUMENT ONLY, AND THE LAST TYPE ARGUMENT ONLY -- the VALUE
+    // written, never a key. A dict KEY of a lower rung is correct and must
+    // stay correct: CPython unifies `db[True]` with `db[1]` by hash and
+    // equality, and `dict[int, str]` does too (golden dict_generic_keys, which
+    // is what caught the broader rule).
+    if (index + 1 != argumentTypes.size())
+      continue;
+    mlir::Type parameter = parameters[index + offset];
+    // Only the container's LAST type argument names its element storage.
+    if (parameter != container.getArguments().back())
+      continue;
+    mlir::Type declaredLeaf, assignedLeaf;
+    if (!numericRepresentationMismatch(parameter, argument, declaredLeaf,
+                                       assignedLeaf))
+      continue;
+    auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
+      if (numeric == types.boolType())
+        return "bool";
+      return numeric == types.intType() ? "int" : "float";
+    };
+    return "'" + cell + "' holds a container of " + spell(declaredLeaf).str() +
+           " and this element assignment gives it " +
+           spell(assignedLeaf).str() +
+           "; the cell has one runtime representation and these two do not "
+           "share one, so write the value in the declared type";
+  }
+  return {};
+}
+
 bool ModuleEmitter::numericRepresentationMismatch(
     mlir::Type declared, mlir::Type assigned, mlir::Type &declaredLeaf,
     mlir::Type &assignedLeaf) const {

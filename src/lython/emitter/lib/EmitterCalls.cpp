@@ -1678,6 +1678,14 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             operands.keywordTypes);
         if (!requireStaticEvidence(expr, inference))
           return emitNone(expr);
+        if (std::string mismatch = cellElementRepresentationMismatch(
+                receiverNode, receiver.type, inference,
+                operands.positionalTypes);
+            !mismatch.empty()) {
+          diagnostics.push_back(parser::Diagnostic{
+              parser::Severity::Error, expr.range.start, mismatch});
+          return emitNone(expr);
+        }
         mlir::Type resultType =
             inference ? inference.resultType : types.inferExpr(&expr);
         // Manifest-declared structural mutators (`ly.typing.structural_mutators`)
