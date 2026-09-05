@@ -4094,6 +4094,29 @@ Value ModuleEmitter::emitInlineMethodBody(
   // class's contract name. Inside the cross-module isolation above, so an
   // imported generic keeps them too.
   bindClassTypeArguments(method.definingClass);
+  // ⭐ AN INLINED BODY IS STILL A FUNCTION BODY, and a nested `def` inside it
+  // needs the same promotion a free function's gets. `emitCallableFunction`
+  // computes `nonlocalBoxedNames` so that a local a nested function declares
+  // `nonlocal` becomes a shared cell; this path never did, so
+  //
+  //     class C:
+  //         def go(self) -> None:
+  //             total = 0
+  //             def bump(n: int) -> None:
+  //                 nonlocal total
+  //                 total += n
+  //             bump(2)
+  //
+  // was refused with "no binding for nonlocal 'total' found (the target must
+  // be assigned in an enclosing function before this definition)" -- a
+  // sentence whose own condition the program plainly satisfies. The identical
+  // code in a free function has always worked, and CAPTURE BY READ inside a
+  // method works too, which is what says the gap is the promotion and not the
+  // nesting.
+  llvm::StringSet<> savedInlineBoxedLocals = std::move(currentBoxedLocals);
+  currentBoxedLocals = nonlocalBoxedNames(*method.method);
+  llvm::scope_exit restoreInlineBoxedLocals(
+      [&] { currentBoxedLocals = std::move(savedInlineBoxedLocals); });
   // ⭐ THE BODY'S OWN LOCALS SHADOW THE USE SITE'S NAMES. An inlined body is
   // emitted in the caller's `values`, so a method local whose name also stands
   // at the use site inherited that binding: with `a = "hello"` at module scope,
