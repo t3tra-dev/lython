@@ -1050,10 +1050,36 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     return emitNone(expr);
   };
 
+  // ⭐ A NAME BOUND TO A TYPE OBJECT NAMES THE CLASS IT HOLDS, not the class of
+  // its own spelling. The note below says a VALUE binding that shares a class's
+  // spelling keeps reaching the constructor, and for an ordinary value that is
+  // right -- it is not callable as a class anyway. A `type[X]` value IS, and it
+  // may hold a DIFFERENT class:
+  //
+  //     def build(A: type[B], n: int) -> B:
+  //         return A(n)
+  //     print(build(B, 1).tag)     # 'B'; this built an A
+  //
+  // which is `type[X]` under any parameter name that a class in the module
+  // happens to share. Every other spelling of the shadowing works -- an int
+  // parameter, a local, a loop target -- because none of them reaches this
+  // branch.
+  auto boundTypeObject = [&](llvm::StringRef name) {
+    auto bound = values.find(name);
+    if (bound == values.end())
+      return false;
+    // A nested `def` binds a callable under its own name; a top-level one is
+    // already excluded by `moduleFunctionNames`, and this is the same rule one
+    // scope in.
+    return mlir::isa_and_nonnull<py::TypeType, py::CallableType>(
+        bound->second.type);
+  };
+
   // Same rule as the bare-Name constructor path below: a top-level `def int`
   // outranks the builtin class contract of that spelling. A bare Name has a
   // qualified spelling equal to itself, so this branch sees `int` first.
-  if (!calleeQualified.empty() && !moduleFunctionNames.count(calleeQualified))
+  if (!calleeQualified.empty() && !moduleFunctionNames.count(calleeQualified) &&
+      !boundTypeObject(calleeQualified))
     if (auto cls = types.lookupClass(calleeQualified)) {
       if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
@@ -1073,8 +1099,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     // that happens to share a class's spelling keeps reaching the constructor
     // as it does today, because only a `def` introduces a competing callable
     // under the same top-level name.
-    if (auto cls = moduleFunctionNames.count(name) ? std::optional<mlir::Type>()
-                                                   : types.lookupClass(name)) {
+    if (auto cls = (moduleFunctionNames.count(name) || boundTypeObject(name))
+                       ? std::optional<mlir::Type>()
+                       : types.lookupClass(name)) {
       if (std::optional<llvm::StringRef> symbol = contractName(*cls)) {
         if (std::optional<Value> v =
                 rejectStubSourceCall(expr, *symbol, /*instantiation=*/true))

@@ -4049,7 +4049,39 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       }
       if (name == "range")
         return contract("builtins.range");
-      if (auto cls = lookupClass(name)) {
+      // ⭐ A NAME BOUND TO A TYPE OBJECT NAMES THE CLASS IT HOLDS, not the
+      // class of its own spelling. `def build(A: type[B], n: int) -> B: return
+      // A(n)` inferred an `A`, because the parameter's binding lost to the
+      // class table -- which is `type[X]` under any parameter name a class in
+      // the module happens to share. The emitter's call path has the same rule.
+      //
+      // ⛔ Only when the two DISAGREE. A class's own spelling is bound to its
+      // own type object as well, and answering from here would skip
+      // `inferClassInstantiation` and with it every generic's solving.
+      bool shadowedByLocalCallable = false;
+      if (std::optional<mlir::Type> bound = lookupSymbol(name)) {
+        if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(*bound)) {
+          if (mlir::Type instance = typeObject.getInstanceType()) {
+            std::optional<mlir::Type> sameName = lookupClass(name);
+            if (!sameName || *sameName != instance)
+              return instance;
+          }
+        } else if (mlir::isa<py::CallableType>(*bound)) {
+          // ⭐ AND A CALLABLE BOUND UNDER A CLASS'S SPELLING SHADOWS IT TOO. A
+          // top-level `def` already outranks the class contract of its name
+          // (`moduleFunctionNames`); a NESTED one had no such guard, so
+          //
+          //     def go(n: int) -> int:
+          //         def Widget(v: int) -> int: return v * 10
+          //         return Widget(n)
+          //
+          // constructed the module's `Widget` class. The local binding is what
+          // Python resolves here, and this is the same rule one scope in.
+          shadowedByLocalCallable = static_cast<bool>(lookupClass(name));
+        }
+      }
+      if (auto cls = shadowedByLocalCallable ? std::optional<mlir::Type>()
+                                             : lookupClass(name)) {
         mlir::Type instance = inferClassInstantiation(*cls, positional, keywords);
         if (!strict || instance)
           return instance;
