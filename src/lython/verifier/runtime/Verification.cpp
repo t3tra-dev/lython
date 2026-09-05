@@ -67,11 +67,39 @@ mlir::LogicalResult verifyFunctionOwnershipShape(mlir::func::FuncOp function) {
   if (mlir::failed(contract))
     return mlir::failure();
 
-  for (unsigned index : contract->ownedResults.values) {
+  // ⭐ A `builtins.bool` GROUP IS A BIT, and naming it owned is a statement
+  // with nothing in it: no header to anchor, and `LyBool_DecRef` is a no-op
+  // over an immortal singleton the group does not carry. Returning a closure
+  // that captures a bool puts exactly that group in the result list --
+  //
+  //     def make() -> Callable[[int], int]:
+  //         flag = True
+  //         def pick(v: int) -> int: return v if flag else -v
+  //         return pick
+  //
+  // was "ly.ownership.owned_results result 1 must start an object-header-like
+  // result group", while the same closure over an int, a str or a float
+  // returns fine.
+  //
+  // ⛔ Why the entry stays in `owned_results` rather than not being recorded:
+  // measured. Dropping it clears the attribute entirely, and the caller's
+  // group collection then falls back to a scan that grouped the function
+  // handle with the lane and could place no cleanup for it -- "owned resource
+  // from @make result 0 is still owned when a call to 'LyLong_FromI64' may
+  // unwind". The declaration is what keeps result 0's own group separate; what
+  // it must not do is claim a header the bit does not have.
+  auto contractNameAt = [&](unsigned index) -> llvm::StringRef {
+    if (index < contract->ownedResultContracts.size())
+      return contract->ownedResultContracts[index];
+    return llvm::StringRef();
+  };
+  for (auto [position, index] : llvm::enumerate(contract->ownedResults.values)) {
     if (contract->borrowedResults.contains(index))
       return function.emitError()
              << "result " << index
              << " cannot be both owned_results and borrowed_results";
+    if (contractNameAt(static_cast<unsigned>(position)) == "builtins.bool")
+      continue;
     if (!own::isObjectHeaderLikeType(
             function.getFunctionType().getResult(index)))
       return function.emitError()
