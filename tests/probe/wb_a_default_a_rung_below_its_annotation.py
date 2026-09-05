@@ -1,29 +1,26 @@
-# probe: a parameter DEFAULT that stands a rung below its annotation
-# CLASSIFICATION @ 82993ec1: 3 loud, all from the LOWERING (a defect of layer)
+# FIXED 2026-09-05. The three shapes below now answer CPython's 1 / 1.5 / True,
+# and the golden is tests/golden/cases/a_default_a_rung_below_its_annotation.py.
+#
+# What it was: a parameter DEFAULT that stands a rung below its annotation.
 #   def go(v: float = 0) -> float: return v + 1.5 ; go()
 #     "runtime bundle value 0 for '!py.contract<"builtins.float">' has type
-#      'i64', but ABI expects 'memref<3xi64>'"
-#   def go(n: int = True) -> int: return n ; go()
-#     the same sentence with 'i1'
-#   def go(v: float = 1) -> float: return v ; go()
-#     the same sentence
-# CPython 3.14 expects: 1.5 / True / 1  (the default keeps its own type)
+#      'i64', but ABI expects 'memref<3xi64>'" -- from the LOWERING.
 #
-# ⭐ The ARGUMENT boundary of this exact question is closed by specialization
-# (wb_argument_boundary_numeric_tower.py): `f(3)` on `def f(x: float)` emits a
-# body per ground signature and answers CPython's 6, not 6.0. A call that OMITS
-# the parameter never reaches that decision, because the decision is made on the
-# emitted OPERAND types and an omitted argument has none -- so the declared
-# float ABI is used and the default, carried as `callable_default_values =
-# [{kind = "int", value = "1"}]`, is materialised as an i64 against it.
+# ⭐ WHAT LOCATED IT: the ARGUMENT boundary of the same question was already
+# closed by specialization (wb_argument_boundary_numeric_tower.py), so the two
+# spellings of one question disagreed. `recordMonomorphicFunction` listed a
+# positional default beside *args/**kwargs/keyword-only as a reason not to
+# register the function at all, and the mapping a default actually breaks is
+# only the one from OPERANDS: filling the omitted tail from the declared
+# parameters instead is exact for a call with no keywords and no `*`.
 #
-# ⛔ Converting the default to the declared rung is the repair this must NOT
-# take: `print(go())` would answer 0.0 where CPython answers 0, which is the
-# measurement that rejected converting at the argument boundary too.
+# ⛔ Converting the default to the declared rung stays rejected: `go()` would
+# answer 0.0 where CPython answers 0, the measurement that rejected converting
+# at the argument boundary too.
 #
-# The fix is the same mechanism one step over: an omitted parameter whose
-# default is a LITERAL of a lower rung should key the specialization at that
-# literal's type, exactly as passing it would.
+# ⛔ Literal defaults only. The rung has to be known without emitting the
+# expression, and a literal is the only default whose inferred type cannot
+# disagree with what emission would produce.
 
 
 def go(v: float = 1) -> float:

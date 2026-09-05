@@ -606,6 +606,11 @@ private:
                                  const EmitOptions::SourceModule *source);
   // A cheap AST + inference filter, run BEFORE anything is emitted, so the
   // ordinary path stays untouched for every call that cannot specialize.
+  // One AST node per declared positional parameter: the supplied arguments,
+  // then the literal defaults standing for the omitted trailing ones.
+  bool specializationArgumentNodes(
+      const parser::Node &expr, const GenericFunctionInfo &info,
+      llvm::SmallVectorImpl<const parser::Node *> &out) const;
   bool mayArgumentSpecialize(const parser::Node &expr,
                              const GenericFunctionInfo &info);
   // Emits the call. Takes the callee already emitted, and dispatches to the

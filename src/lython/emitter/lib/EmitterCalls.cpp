@@ -1858,19 +1858,74 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
 // which is monomorphization and not coercion. Returns nullopt when the call is
 // not that shape, leaving the ordinary dispatch to run (and, when the call is
 // simply wrong, to report it).
-bool ModuleEmitter::mayArgumentSpecialize(const parser::Node &expr,
-                                          const GenericFunctionInfo &info) {
+// ⭐ AND AN OMITTED PARAMETER STANDS FOR ITS DEFAULT. `def go(v: float = 0)`
+// called as `go()` never reached the decision below, because the decision is
+// made on the operands the call supplies and there are none -- so the declared
+// float ABI was used and the default, carried as an int attribute, was
+// materialised against it: "runtime bundle value 0 for
+// '!py.contract<"builtins.float">' has type 'i64', but ABI expects
+// 'memref<3xi64>'", from the lowering, over one of Python's commonest
+// spellings.
+//
+// ⛔ Literal defaults only. The rung has to be known without emitting the
+// expression, and a literal is the only default whose inferred type cannot
+// disagree with what emission would produce -- the disagreement the operand
+// rule below exists to avoid (`1.0 + 0.0j` infers float).
+//
+// ⛔ And NOT by converting the default to the declared rung: `print(go())`
+// would answer 0.0 where CPython answers 0, the same measurement that rejected
+// converting at the argument boundary.
+bool ModuleEmitter::specializationArgumentNodes(
+    const parser::Node &expr, const GenericFunctionInfo &info,
+    llvm::SmallVectorImpl<const parser::Node *> &out) const {
   const auto *keywords = ast::nodeList(expr, "keywords");
   if (keywords && !keywords->empty())
     return false;
   const auto *args = ast::nodeList(expr, "args");
   llvm::ArrayRef<mlir::Type> declared = info.signature.positionalTypes;
-  if (!args || args->size() != declared.size())
+  std::size_t supplied = args ? args->size() : 0;
+  if (supplied > declared.size())
     return false;
-  for (auto [index, arg] : llvm::enumerate(*args)) {
-    if (!arg || arg->kind == "Starred")
+  out.clear();
+  if (args)
+    for (const parser::NodePtr &arg : *args) {
+      if (!arg || arg->kind == "Starred")
+        return false;
+      out.push_back(arg.get());
+    }
+  if (supplied == declared.size())
+    return true;
+  if (!info.node)
+    return false;
+  const parser::Node *arguments = ast::node(*info.node, "args");
+  const auto *defaults =
+      arguments ? ast::nodeList(*arguments, "defaults") : nullptr;
+  if (!defaults || defaults->empty())
+    return false;
+  std::size_t firstDefault = declared.size() - defaults->size();
+  for (std::size_t index = supplied; index < declared.size(); ++index) {
+    if (index < firstDefault)
       return false;
-    mlir::Type supplied = types.widenLiteral(types.inferExpr(arg.get()));
+    const parser::Node *value = (*defaults)[index - firstDefault].get();
+    if (!value || value->kind != "Constant")
+      return false;
+    if (numericTowerRung(types, types.widenLiteral(types.inferExpr(value))) < 0)
+      return false;
+    out.push_back(value);
+  }
+  return true;
+}
+
+bool ModuleEmitter::mayArgumentSpecialize(const parser::Node &expr,
+                                          const GenericFunctionInfo &info) {
+  llvm::SmallVector<const parser::Node *, 4> nodes;
+  if (!specializationArgumentNodes(expr, info, nodes))
+    return false;
+  llvm::ArrayRef<mlir::Type> declared = info.signature.positionalTypes;
+  if (nodes.size() != declared.size())
+    return false;
+  for (auto [index, node] : llvm::enumerate(nodes)) {
+    mlir::Type supplied = types.widenLiteral(types.inferExpr(node));
     int suppliedRung = numericTowerRung(types, supplied);
     int declaredRung = numericTowerRung(types, declared[index]);
     if (suppliedRung >= 0 && declaredRung >= 0 && suppliedRung < declaredRung)
@@ -1901,11 +1956,24 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
   if (!operands.valid)
     return ordinary();
   llvm::ArrayRef<mlir::Type> declared = info.signature.positionalTypes;
-  if (operands.positionalTypes.size() != declared.size())
+  // The positions the call did not supply stand for their literal defaults,
+  // whose inferred type is exact.
+  llvm::SmallVector<mlir::Type, 4> suppliedTypes(
+      operands.positionalTypes.begin(), operands.positionalTypes.end());
+  if (suppliedTypes.size() < declared.size()) {
+    llvm::SmallVector<const parser::Node *, 4> nodes;
+    if (!specializationArgumentNodes(expr, info, nodes) ||
+        nodes.size() != declared.size())
+      return ordinary();
+    for (std::size_t index = suppliedTypes.size(); index < nodes.size();
+         ++index)
+      suppliedTypes.push_back(types.widenLiteral(types.inferExpr(nodes[index])));
+  }
+  if (suppliedTypes.size() != declared.size())
     return ordinary();
   llvm::SmallVector<mlir::Type, 4> actual;
   bool anyLowerRung = false;
-  for (auto [index, supplied] : llvm::enumerate(operands.positionalTypes)) {
+  for (auto [index, supplied] : llvm::enumerate(suppliedTypes)) {
     mlir::Type widened = types.widenLiteral(supplied);
     int suppliedRung = numericTowerRung(types, widened);
     int declaredRung = numericTowerRung(types, declared[index]);

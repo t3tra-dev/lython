@@ -124,14 +124,20 @@ void ModuleEmitter::recordMonomorphicFunction(
     const EmitOptions::SourceModule *source) {
   // Only a plain positional signature can be argument-specialized: the
   // mapping from a call's operands back to the parameters has to be exact,
-  // and defaults, *args, **kwargs and keyword-only parameters each make it
-  // not be. Recording the rest anyway would put the decision in the call
-  // site, which is where it would be got wrong once.
+  // and *args, **kwargs and keyword-only parameters each make it not be.
+  // Recording the rest anyway would put the decision in the call site, which
+  // is where it would be got wrong once.
+  //
+  // ⭐ A POSITIONAL DEFAULT DOES NOT. It used to be listed here beside the
+  // other three, and the mapping it breaks is only the one from OPERANDS --
+  // `specializationArgumentNodes` maps from the declared parameters instead,
+  // filling the omitted tail from the defaults, which is exact for a call with
+  // no keywords and no `*`. Excluding them left `def go(v: float = 0)` called
+  // as `go()` with the declared float ABI and an int default materialised
+  // against it, which the lowering reported as "runtime bundle value 0 for
+  // '!py.contract<"builtins.float">' has type 'i64'".
   if (sig.varargType || sig.kwargType || !sig.kwOnlyTypes.empty())
     return;
-  for (bool hasDefault : sig.positionalDefaults)
-    if (hasDefault)
-      return;
   if (sig.positionalTypes.empty())
     return;
   GenericFunctionInfo &info = monomorphicFunctions[key];
