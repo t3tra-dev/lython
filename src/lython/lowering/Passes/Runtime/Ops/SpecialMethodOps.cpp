@@ -351,8 +351,68 @@ bool RuntimeBundleLowerer::crossesStorageDefiningBlock(
     defBlock = defOp->getBlock();
   if (!defBlock)
     return false;
-  if (defBlock != op->getBlock())
-    return true;
+  // A block reachable from itself is a loop body: whatever the evidence says
+  // is a full trip stale on the second pass through.
+  auto reachesItself = [](mlir::Block *start) {
+    llvm::SmallPtrSet<mlir::Block *, 16> seen;
+    llvm::SmallVector<mlir::Block *, 16> worklist(start->succ_begin(),
+                                                  start->succ_end());
+    while (!worklist.empty()) {
+      mlir::Block *current = worklist.pop_back_val();
+      if (current == start)
+        return true;
+      if (!seen.insert(current).second)
+        continue;
+      worklist.append(current->succ_begin(), current->succ_end());
+    }
+    return false;
+  };
+  if (defBlock != op->getBlock()) {
+    // ⭐ A BLOCK THE LOWERING MADE IS NOT A BRANCH THE PROGRAM WROTE. The
+    // indirect dispatch splits the block it is in, so an argument computed by a
+    // call through a callable VALUE puts the mutation that consumes it in a
+    // continuation -- and comparing blocks called that a branch:
+    //
+    //     def run(self, f: Callable[[int], str]) -> list[str]:
+    //         self.done.append(f(1))
+    //
+    //     list.append on a field or borrowed list is not supported inside a
+    //     branch or loop body
+    //
+    // which names a condition this program does not have. The same append of a
+    // builtin, a free function's or a method's result compiles, because none of
+    // those splits the block.
+    //
+    // What the test is FOR is a mutation that does not run, or runs more than
+    // once, per definition of the storage: the evidence would then be wrong on
+    // a join or a trip. So ask that directly -- the definition dominates, the
+    // mutation post-dominates it, and neither sits in a cycle -- instead of
+    // asking whether the two are the same block.
+    //
+    // ⛔ Post-dominance is not optional. An `if` arm is dominated by the block
+    // that read the field too, and the append there happens on ONE path; the
+    // join after it would then read evidence describing a list the other path
+    // never grew.
+    mlir::Region *region = defBlock->getParent();
+    if (!region || region != op->getBlock()->getParent())
+      return true;
+    mlir::Operation *parentOp = region->getParentOp();
+    if (!parentOp)
+      return true;
+    mlir::DominanceInfo dominance(parentOp);
+    mlir::PostDominanceInfo postDominance(parentOp);
+    // ⛔ AND NEITHER BLOCK IN A CYCLE, which is measured rather than cautious.
+    // Dropping that condition -- on the argument that a same-block append in a
+    // loop already compiles -- takes `self.done.append(f(x))` inside a `for`
+    // from this message to "list iteration evidence candidate 0 contract ...",
+    // which is the evidence tier failing one layer down instead. It fixes no
+    // program, so the condition stays and the loop shape keeps the refusal that
+    // names it.
+    if (!dominance.dominates(defBlock, op->getBlock()) ||
+        !postDominance.postDominates(op->getBlock(), defBlock) ||
+        reachesItself(op->getBlock()) || reachesItself(defBlock))
+      return true;
+  }
   // ⭐ A FIELD READ IS A FRESH VALUE CARRYING INHERITED EVIDENCE. `b.table`
   // produces a new SSA value in the block that reads it, so the test above
   // called the evidence block-local -- but the mapping it carries was recorded
@@ -394,18 +454,7 @@ bool RuntimeBundleLowerer::crossesStorageDefiningBlock(
     ownerBlock = ownerOp->getBlock();
   if (!ownerBlock || ownerBlock == op->getBlock())
     return false;
-  llvm::SmallPtrSet<mlir::Block *, 16> seen;
-  llvm::SmallVector<mlir::Block *, 16> worklist(op->getBlock()->succ_begin(),
-                                                op->getBlock()->succ_end());
-  while (!worklist.empty()) {
-    mlir::Block *current = worklist.pop_back_val();
-    if (current == op->getBlock())
-      return true;
-    if (!seen.insert(current).second)
-      continue;
-    worklist.append(current->succ_begin(), current->succ_end());
-  }
-  return false;
+  return reachesItself(op->getBlock());
 }
 
 // Compile-time contents evidence describes a mutable container AS OF THE BLOCK
