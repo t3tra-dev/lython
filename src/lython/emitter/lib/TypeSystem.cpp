@@ -217,6 +217,24 @@ void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
   }
 }
 
+// Where a type stands in the numeric tower: bool below int below float below
+// complex, and -1 for anything that is not one of them (a union included).
+int numericTowerRung(const TypeSystem &types, mlir::Type type) {
+  if (!type)
+    return -1;
+  if (type == types.boolType())
+    return 0;
+  if (type == types.intType())
+    return 1;
+  if (type == types.floatType())
+    return 2;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (contract && contract.getArguments().empty() &&
+      contract.getContractName() == "builtins.complex")
+    return 3;
+  return -1;
+}
+
 mlir::Type inferredFunctionResult(const TypeSystem &types,
                                   const parser::Node &function,
                                   llvm::SmallVectorImpl<std::string>
@@ -4968,7 +4986,50 @@ TypeSystem::functionSignature(const parser::Node &function,
   } else if (function.kind == "Lambda") {
     sig.resultType = inferExpr(ast::node(function, "body"));
   } else if (returns && !monomorphize) {
-    sig.resultType = annotationType(returns);
+    mlir::Type annotated = annotationType(returns);
+    sig.resultType = annotated;
+    // ⭐ A NUMERIC RETURN ANNOTATION IS A CONSTRAINT A LOWER RUNG ALREADY
+    // SATISFIES, and taking it literally is what refused
+    //
+    //     def half(n: int) -> float: return n // 2
+    //     def positive(n: int) -> int: return n > 0
+    //
+    // with "type of return operand 0 ... doesn't match function result type"
+    // from the MLIR verifier -- a message about the compiler, over ordinary
+    // Python. CPython's `half(7)` is the int 3 and `positive(3)` is True, and
+    // every other boundary in this compiler already answers that way: a local
+    // (`x: float = 3` prints 3), a parameter and a parameter default (both by
+    // specialization). The return was the last one reading the annotation as
+    // the answer rather than as the constraint.
+    //
+    // ⛔ NOT by converting: `print(half(7))` would answer 3.0. The annotation
+    // does not convert in CPython either.
+    //
+    // ⛔ And only a LOWER rung of the same tower. A body whose arms return
+    // different rungs joins to a union, whose rung is -1, so it keeps the
+    // annotation and keeps its refusal -- the py ABI cannot return a union and
+    // collapsing it along the tower would print 0 for False.
+    //
+    // ⛔ NOT for a `complex` annotation, and this is a measurement, not a
+    // caution: `inferExpr` answers `builtins.float` for `1.0 + 0.0j`, so
+    // `def rotate(z: complex, n: int) -> complex` re-read at float emitted a
+    // body that returns a complex against a float ABI -- "cannot adapt
+    // builtins.complex return value to callable return ABI 0 of rotate"
+    // (golden scalar_loop_carried_mutate). It is the same inference the
+    // argument specializer refuses to trust, for the same reason and on the
+    // same program.
+    if (int declaredRung = numericTowerRung(*this, annotated);
+        declaredRung > 0 && declaredRung <= 2 &&
+        returnRungWalks.insert(&function).second) {
+      mlir::Type walked = inferredFunctionResult(*this, function,
+                                                 /*failureReasons=*/nullptr,
+                                                 &generator.localSymbols);
+      returnRungWalks.erase(&function);
+      mlir::Type widened = walked ? widenLiteral(walked) : mlir::Type();
+      if (int walkedRung = numericTowerRung(*this, widened);
+          walkedRung >= 0 && walkedRung < declaredRung)
+        sig.resultType = widened;
+    }
   } else if (ast::nameSpelling(function) == "__init__") {
     sig.resultType = none();
   } else {

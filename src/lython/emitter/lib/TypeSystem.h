@@ -477,6 +477,10 @@ private:
   // lambdas, and imported source modules run under caller-specific scope
   // contexts a node-keyed cache would conflate.
   llvm::DenseMap<const parser::Node *, FunctionSignature> signatureMemo;
+  // Functions whose numeric RETURN annotation is being re-read against their
+  // body right now. A cycle -- direct or mutual recursion -- takes the
+  // annotation and stops, which is what the annotation is for.
+  mutable llvm::DenseSet<const parser::Node *> returnRungWalks;
   // ⭐ A DECORATOR IS A CALL THE SOURCE DOES NOT SPELL. `@d def f` is
   // `f = d(f)`, and the parameter fixpoint below reads its constraints off
   // CALL NODES -- so `def d(fn)` with no annotation was refused under the
