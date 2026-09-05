@@ -1,0 +1,6 @@
+Point(x=1, y=2)
+Point(x='a y,=''b')
+1 4
+True False
+tag tag
+5 six

@@ -1,0 +1,7 @@
+try:
+    try:
+      g", [ValueError("a"), TypeError("b"), OSError("o")])
+    except* ValueEr"r3")
+except BaseExly.source.end_linception as e:
+    print(repr(e))
+print("after")

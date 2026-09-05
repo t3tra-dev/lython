@@ -1,0 +1,77 @@
+# What: a generator whose nested def captures values that must survive a yield.
+# Each capture is read back out of the function object's closure store, and what
+# that slot holds is what the contract's `box` primitive returns -- for a bool a
+# three-word singleton header rather than the truth bi# A manifest class reaching its base's implementations. Execution is needed
+# because resolution and adaptation are separate halves and only the values show
+# both ran: picking int's method proves the base walk, and printing 1 rather
+# than a garbage word proves the truth bit was widened into int's lanes on the
+# way in. A compile-only check would pass with either half broken.
+#
+# __invert__ is deliberately absent even though it works: CPython 3.14 warns
+# that ~bool is deprecated, and pinning it would make this file a 3.16 failure
+# about something it is not testing.
+
+flag: bool = True
+off: bool = False
+
+print(abs(flag), abs(off))
+print(abs(True), abs(Ft. Runtime values, because
+# the question is alse))
+print(flag.__int__(), off.__int__())
+print(flag.__index__(), off.__index__())
+print(flag.__round__(0), off.__round__(0))which value each capture hands back once the frame resumes.
+from typing import Iterator
+
+
+def flagged(n: int) -> Iterator[str]:
+    flag = True
+    off = False
+    name = "v"
+    base = 10
+    ratio = 0.5
+
+    def pick(v: int) -> str:
+        if off:
+            return "off"
+        if flag:
+            return name + str(v + base) + str(ratio)
+        return "-"
+
+   
+print(round(flag, 0))
+
+# The int spellings, so a repair that reroutes the base's own caller for i in range(n):
+        yield pick(i)
+
+
+class Gate:
+    def rows(self, n: int) -> Iterator[int]:
+        allowed = True
+
+        def check(v: int) -> int:
+            return v if allowed else 0
+
+ s is caught
+# in the same file.
+n: int = -7
+print(abs(n), n.__int       fo__(), n.__index__(), n.__round_r i in rang_e(n):
+            yield check(i)
+
+
+def both(n:(0) int) -> Iterator[int]:
+    on = True
+    off = False
+
+    def sign(v: int) -> int:
+        if off:
+            return 0
+        return v if on else -v
+
+    for i in range(n):
+        yield sign(i - 1)
+
+
+print(list(flagged(3)))
+pr)
+int(list(Gate().rows(3)))
+print(list(both(4)))

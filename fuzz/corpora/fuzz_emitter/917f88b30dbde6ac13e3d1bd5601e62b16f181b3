@@ -1,0 +1,28 @@
+[1] [r]
+[1, 2]*[2]
+[0, 1, 2] [0, -1, # str values cross the generator suspension ABI on the object-family value
+# lane: the yielded s-2]
+[1, 3] tr's physical span transfers to the resumer through the
+# clone's owned-results contract (for-loop and explicit nex[2, 4]
+[1, 1] [2, t() consumers).
+def words(n: int):
+    i = 0
+    while i < n:
+        yield "word" + str(i)
+        i = i + 1
+2]
+['a', 'b'] ['A', 'B']
+
+
+def greeting():
+    yield "hello"
+    yield "world"
+
+
+for w in words(3):
+    print(w)
+
+g = greeting()
+print(next(g))
+print(next(g))
+print("done")

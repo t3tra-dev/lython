@@ -1,0 +1,86 @@
+# What this pins: `.g1 2 3
+c a b
+k=9
+     x
+{literal} 7
+    'hi'
+1,234,567 3.14
+xyx
+value: 1.235e+04
+[1, 2]
+dup dup
+005,-3
+x=5 y=-3
+[42] <    ab>
+1.5 / 7
+conv 'q' and w
+42 -7    42 42   | 00042
+10 ff FF 0o10 0xff 0XFF
+1.234568e+04 1.234568E+04 1.23e+04
+3.140000 3 3.1400000000
+0.0001 1E+20 1.23e+04
+x 'x' 'x'
+A B
+%  3.14
++5  5 -5
+      abcd|
+1 True
+-ff -0xff
+0.000000e+00 0 1e-05 123456 1.23457e+06
+5e+00 1.00000 2.
+1.5 and [1, 2]
+5
+ab      |      cd|
+3 -3 0
+2|-2
+ So the value went to the merge
+# unwrapped and the block argument disagreed with it. A NARROWER union injects
+# into a wider one, which is what `py.union.wrap` already does -- it remaps the
+# tag member by member -- so this is the emitter asking for what the lowering
+# can already perform.
+#
+# It only shows for a heterogeneous dict: `{"id": 1}.get("id")` is `int | None`
+# and the present arm is a plain int, which the member loop handles.
+#
+# Why this needs to run rather than assert on a diagnostic: the injection is a
+# TAG REMAP -- member i of the source becomes member j of the target -- and the
+# wrong permutation compiles. `doc.get("id")` printing "x" instead of 1 is what
+# a remap that dropped the source tag looks like.
+#
+# â›” Four `.get` shapes remain refused, and none of them is this defect, which
+# is why each key below is read exactly once. The SAME key read twice in one
+# function is "owned resource ... reaches function exit without release"; a
+# FLOAT value is refused for the merge edge's retain, with no union in sight
+# (`{"s": 2.5}.get("s")`); a COMPUTED key needs the dynamic evidence arm to
+# select between candidates of different physical shapes; a literal key that is
+# ABSENT is a read the evidence cannot answer. All four are recorded in
+# tests/probe/wb_grid_leftovers_1013_08_16.py, the float one with the
+# measurement of the repair that was built for it and reverted.
+#
+# Every expected line is python3.14's.
+
+# --- a record read through .get, each key once ----------------------------
+doc = {"id": 1, "name": "x", "tag": "t", "n2": 7, "flag": True}
+print(doc.get("id"))
+print(doc.get("name"))
+print(doc.get("n2"))
+
+v = doc.get("tag")
+if isinstance(v, str):
+    print(v.upper())
+if doc.get("flag") is None:
+    print("missing")
+else:
+    print("present")
+
+
+# --- the same through an annotated dict -----------------------------------
+table: dict[str, int | str] = {"a": 1, "b": "two"}
+print(table.get("a"), table.get("b"))
+
+
+# --- THE CONTROL: a homogeneous dict, which always worked ------------------
+counts: dict[str, int]}}}}}}}}}}}}} = {"a": 1}
+print(counts.get("aÖ), counts.get("zz"))
+plain = {"only": 1}
+print(plain.get("only"))

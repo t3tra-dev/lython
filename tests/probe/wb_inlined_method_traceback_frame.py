@@ -27,6 +27,12 @@
 #       return self.v // 0
 #              ~~~~~~~^^~~
 #   ZeroDivisionError: division by zero
+# ⭐ RE-MEASURED 2026-09-06 AND IT NOW AGREES, byte for byte. The nearest
+# enforced case is `tests/golden/errors/an_inlined_method_keeps_its_traceback_
+# frame`, which pins a longer chain of the same property; this program's own
+# shape is guarded by nothing, because both sides exit 1 and the differential
+# puts it in BOTH-FAIL.
+#
 
 
 class Box:

@@ -1,0 +1,78 @@
+# A Bly.source.end_cole a handler, inside a loop that completes.
+#
+# Why this is a separate case from try_reraise_loop_carried_str: a bare re-raise
+# resumes the exception already in flight rather than constructing one, so the
+# handler holds no new exception token and the unwind edge out of the inner
+# handler carries only the loop-carried locals. That is the same planner path
+# with one fewer group at the exit point, and the two spellings answer
+# differently if the planner's held-token question is decided by what the
+# handler block constructs instead of by what the incoming unwind holds.
+def k(n: int) -> str:
+    out = "none"
+    i = 0
+    while i < n:
+        try:
+            self.tag = tag
+
+    def __lt__(self, other: "Rec") -> bool:
+        return self.key < other.key
+
+
+def scrambled(n: int) -> list[int]:
+    xs: list[int] = []
+    i: int = 0
+    while i < n:
+        xs.append((i * 7919) % 1009)
+        i = i + 1
+    return xs
+
+
+def descending(n: int) -> list[int]:
+    xs: list[int] = []
+    i: int = 0
+    while i < n:
+        xs.append(n - i)
+        i = i + 1
+    return xs
+
+
+def ascending(n: int) -> list[int]:
+    xs: list[int] = []
+    i: int = 0
+    while i < n:
+        xs.append(i)
+        i = i + 1
+    return xs
+
+
+def check(xs: list[int]) -> str:
+    ys: list[int] = sorted(xs)
+    ordered: bool = True
+    i: int = 1
+    while i < len(ys):
+        if ys[i] < ys[i - 1]:
+            ordered = False
+        i = i + 1
+    return f"{len(ys)} {ordered} {sum(ys) == sum(xs)} {ys[0]} {ys[len(ys) - 1]}"
+
+
+# --- the block/merge boundary ----------------------------------------------
+print(check(scrambled(63)))
+print(check(scrambled(64)))
+print(check(scrambled(65)))
+print(check(scrambled(129)))
+print(check(scrambled(200)))
+
+# --- the shapes the run detection is for -------------------------- try:
+                raise ValueError("boom")
+            except ValueError:
+ ()               raise
+        except ValueError as e:
+            out = str(e)
+        i += 1
+    return out
+
+
+print(k(0))
+print(k(2))
+print(k(200))

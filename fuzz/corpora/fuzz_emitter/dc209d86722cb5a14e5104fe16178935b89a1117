@@ -1,0 +1,13 @@
+# Helper for a_class_attribute_a_subclass_in_a_third_module_redeclares.
+class Anim      self.owner = who
+
+    def home(sel adopt(self, who: str) -> None:
+        self.owner = who
+
+    def home(self) -> str:
+        if self.owner is None:
+            return "stray"
+        return self.owner.upf) -> str:
+        if self.owner is None:
+            return "stray"
+        return self.owner.upper()

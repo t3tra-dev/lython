@@ -1,0 +1,111 @@
+# What this pins: an annotated module global of a container type is storage-
+# backed, so a function reads the module's current value and a muta     i += 1
+
+
+def at(i: int) -> int:
+    return GROWN[i]
+
+
+fill(50)
+print(len(GROWN), at(0), at(7), at(49), GROWN[25])
+GROWN.append(-1)
+print(len(GROWN), at(50))
+
+
+# --- dict insert from a function, past its initial capacity ---------------
+COUNTS: dict[int, str] = {}
+
+
+def put(k: int) -> None:
+    COUNTS[k] = str(k * 3)
+
+
+def get(k: int) -> str:
+    return COUNTS[k]
+
+
+j = 0
+while j < 60:
+    put(j)
+    j += 1
+print(len(COUNTS), get(0), get(59), COUNTS[30])
+
+
+# --- the mutators that carry a rebind result ------------------------------
+ORDER: list[int] = [3, 1, 2]
+
+
+def sort_it() -> None:
+    ORDER.sort()
+
+
+def insert_front(v: int) -> None:
+    ORDER.insert(0, v)
+
+
+def splice() -> None:
+    ORDER[1:3] = [99]
+
+
+sort_it()
+print(ORDER)
+insert_front(0)
+print(ORDER)
+splice()
+print(ORDER)
+
+SEEN: set[int] = {0}
+
+
+def collect(n: int) -> None:
+    i = 0
+    while i < n:
+        SEEN.add(i % 7)
+        i += 1
+
+
+collect(40)
+print(len(SEEN), 6 in SEEN, 7 in SEEN)
+
+
+# --- extend / pop, and a rebinding assignment through `global` -------------
+WORDS: list[str] = ["a"]
+
+
+def extend_it() -> None:
+    WORDS.extend(["b", "c"])
+
+
+def pop_it() -> str:
+    return WORDS.pop()
+
+
+extend_it()
+extend_it()
+print(WORDS, len(WORDS))
+print(pop_it(), WORDS)
+
+
+def replace() -> None:
+    global WORDS
+    WORDS = ["z"]
+
+
+replace()
+print(WORDS)
+
+
+# --- a container of containers --------------------------------------------
+NESTED: list[list[int]] = [[1], [2]]
+
+
+def push() -> None:
+    NESTED.append([3])
+
+
+def inner(i: int, j: int) -> int:
+    return NESTED[i][j]
+
+
+push()
+print(NESTED, inner(0, 0), inner(2, 0))

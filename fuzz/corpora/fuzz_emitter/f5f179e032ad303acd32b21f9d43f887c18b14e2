@@ -1,0 +1,23 @@
+list 2
+dict 1
+seq
+seq
+shape 3 3
+square 3 9
+other
+myerr
+zde
+exception
+str ABC 3
+str 日本語 3
+float 5.0
+Ѝnt
+bool
+int
+zde
+value
+myerr
+other
+True True False
+passed v
+True False False

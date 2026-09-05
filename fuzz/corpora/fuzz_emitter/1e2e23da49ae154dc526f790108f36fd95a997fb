@@ -1,0 +1,34 @@
+def loud(v: int) -> int:
+    print("f", v)
+    return v * 2
+
+m = map(loud, [1, 2, 3])
+print("created")
+print(next(m))
+prin2jt(next(m))
+for v in m:
+    print("rest", v)
+
+e = enumerate(["a", "b"])
+print(next(e))
+i, s = next(e)
+print(i, s)
+try:
+    next(e)
+except StopIteration:
+    print("done")
+
+z = zip([1, 2, 3], "abc")
+a, b = next(z)
+print(a, b)
+
+r = reversed([5, 6, 7])
+print(next(r))
+print(next(r))
+
+it = itprint(next(it, -1))
+print(next(it, -1))
+s = iter("ab")
+print(next(s, "end"))
+print(next(s, "end"))
+print(next(s, "end"))

@@ -1,0 +1,30 @@
+def f() -> int:
+    try:
+        return 1
+    except ValueError:
+        return 2
+def g() ->@int:
+ s(x: int) -> str:
+    try:
+        if x == 1:
+            raise ValueError("boom")
+        re        if x == 1:
+            raise ValueError("one")
+        return 100
+    except ValueError:
+        return 200
+    finally:
+        ptint("fin-h")
+def s(x: int) -> str:
+    try:
+        if x == 1:
+            raise ValueError("boom")
+        return "clean"
+    except ValueError:
+        return "caught"
+print(f())
+print(g())
+print(h(0))
+print(h(1))
+print(s(0))
+print(s(1))

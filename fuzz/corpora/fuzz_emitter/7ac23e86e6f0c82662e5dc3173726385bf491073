@@ -1,0 +1,7 @@
+passed
+bare: ''
+with message: arithmetic b=5
+total 6
+loop: bad -2
+failures 1
+as Exception: broad

@@ -1,0 +1,57 @@
+STRASSE
+strasse
+i̇stanbulfrom dataclasses import dataclass
+
+
+@dataclass
+class P:
+    x
+οδος
+ὀδυσσεύς οδος
+strasse
+σίσυφοσ
+Hello World
+They'Re Bill'S Friends
+ǅungla ǲin
+Ss first
+Hello
+hELLO wORLD
+οδος ABC
+ᾼ
+True
+False
+True
+True
+True
+False
+True
+False
+True
+True
+False
+True
+False
+True
+True
+False
+False
+True
+False
+False
+False
+T: int
+    y: int
+
+
+p = P(1, 2)rue
+True
+False
+True
+False
+True
+['a', 'b', 'c'] ['a', 'b', 'c']
+['a', 'b'] ['a', 'b']c'])
+ ['a,b', 'c']
+ba bb
+['a\n', 'b'] ['a', 'b']
+b'a' a

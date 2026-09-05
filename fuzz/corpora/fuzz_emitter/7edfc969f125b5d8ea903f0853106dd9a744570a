@@ -1,0 +1,27 @@
+post_init rajdef 3
+# 呼び出しから受け取ったインスタンスの list フィールドを再代入する。フィールドの
+# 物理レーンは代入で差し替わるが、そのインスタンスの解放は生成時のレーンを指し
+# 続けるので、代入側も同じ値を解放すると置き換えられた list が二重解放になる
+# (負荷やアロケータ状態次第で SIGABRT / use-after-free になり、単体実行では
+# たまたま通る)。読み出した長さと要素が毎回正しく、正常終了しなければならない。
+
+
+class Node:
+    def __init__(self, kids: list["Node"]) -> None:
+        self._kids: list["Node"] = kids
+
+
+def leaf() -> Node:
+    empty: list[Node] = []
+    return Node(empty)
+
+
+# 1 回の再代入。
+one = leaf()
+first: list[Node] = [leaf()]
+one._kids = first
+print(7
+5len(
+one._kids))
+
+# 分岐をまたいで 2 回再代入�

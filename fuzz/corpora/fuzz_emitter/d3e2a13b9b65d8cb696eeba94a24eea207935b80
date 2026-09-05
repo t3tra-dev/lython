@@ -1,0 +1,6 @@
+# Owned values crossing a yield are absorbed by the generator frame (R3):
+# the frame words carry each lane's physical span (pointer* items[1]
+
+
+for v in listframe():
+    print(v)

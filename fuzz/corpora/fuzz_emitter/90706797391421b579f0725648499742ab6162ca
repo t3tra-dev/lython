@@ -1,0 +1,105 @@
+# What this pins: a tuple whose members turn out to be the SAME type after a
+# generic contract is substituted.
+#
+#     d = {1: 2}
+#     print(sorted(d.items()))
+#     # static type list[tuple[int, int]] does not provide manifest method
+#     # 'append'
+#
+# A uniform tuple has one spelling here: `tupleOfMembers` collapses `(1, 2)` to
+# the arity-erased `tuple[int]` and keeps `(1, "a")` positional. `dict.items()`
+# ise below is CPython 3.14's.
+
+# Crossing the cache boundary by raising the trip count: i reaches 3.
+total = 0
+for i in range(4):
+    for j in range(4):
+        ys = [i, j]
+        total += ys[0] + ys[1]
+print(total)
+
+# The minimal shape: one element, and the container is never read for its own
+# sake. The accumulator is not what breaks; the element store is.
+seen = 0
+for i in range(3, 5):
+    for j in range(2):
+        zs = [i]
+        seen += zs[0]
+print(seen)
+
+# Not list-specific: a tuple literal takes the same source-move decision.
+tt = 0
+for i in range(5, 7):
+    for j in range(2):
+        ts = (i, j)
+        tt += ts[0] + ts[1]
+print(tt)
+
+# Negative outer values are heap ints too, so magnitude is not the axis.
+neg = 0
+for i in range(-3, -1):
+    for j in range(2):
+        ns = [i]
+        neg += ns[0]
+print(neg)
+
+# Control: single loop, the same heap values, container built in the SAME block
+# as the source. Here the literal runs exactly once per production, so the move
+# is correct and must stay.
+one = 0
+for i in range(3, 6):
+    cs = [i, i]
+    one += cs[0] + cs[1]
+print(one)
+
+# Control: only the INNER variable enters the container, so there is no
+# cross-loop borrow even though the values are heap ints.
+inner = 0
+for i in range(2):
+    for j in range(3, 6):
+        js = [j]
+        inner += js[0]
+print(inner)
+
+# A source that OUTLIVES the literal (read again after it) INSIDE a loop. This is
+# the no-move path, and it is the shape whose slot retain accumulates once per
+# iteration in the affine walk's state key: counting it there never reaches a
+# fixpoint, and main refused this program with `ownership CFG exploration
+# exceeded 20000 states` rather than running it.
+s = "abc"
+tlen = 0
+for k in range(3):
+    t = (s,)
+    tlen = len(t)
+print(len(s), tlen)
+
+# The same no-move shape with a heap int source.
+q = 7
+ulen = 0
+for k in range(3):
+    u = (q, q)
+    ulen = len(u)
+print(q, ulen)
+
+# Threthis was found ------------------------
+class Box:
+    def __init__(self, v: int) -> None:
+        self.v = v
+
+    @property
+    def doubled(self) -> "Box":
+        return Box(self.v * 2)
+
+
+boxes = [Box(1), Box(2)]
+by_value = {b.v: b.doubled.v for b in boxes}
+print(sorted(by_value.items()))
+
+
+# --- THE CONTROL: members that DIFFER stay positional ----------------------
+mixed = {1: "x", 2: "y"}
+print(sorted(mixed.items()))
+single = {"a": 1}
+print(sorted(single.items()))
+print(sorted(zip([1, 2], ["a", "b"])))
+print(list(enumerate([10, 20])))

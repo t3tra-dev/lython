@@ -1,0 +1,42 @@
+/x/y/z.txt
+dict[str, int]x/y
+('/', 'x', 'y', 'z.txt')
+True
+/x/y.txt/w
+/x/y/other.md
+/x/y/q.md
+/x/y/z.ed
+/x/y/z
+a/b/c
+a/b+c/d
+('a', 'b')
+.
+.
+PosixPath('/tmp/a')
+True False
+/x/y/z/w
+//a/b
+/a
+a/b/../c
+('/',)
+True
+ngz
+b.tar
+
+.cshrc
+True True
+5
+hello
+3
+b'bin'
+True True False False
+5
+['b.log', 'sub']
+['b.log']
+['a.txt']
+['b.log', 'sub']
+c.log
+True False
+False
+False
+False

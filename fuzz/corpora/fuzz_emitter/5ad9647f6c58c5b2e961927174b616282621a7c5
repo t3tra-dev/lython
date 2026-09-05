@@ -1,0 +1,47 @@
+# Cross-track: Wave 3's generic-class monomorphization (`C$specN`) meets
+# kernel/4a's field slots. A specialization's field storage is chosen from the
+# SUBSTITUTED field type, so `self.v: T` and `self.items: dict[int, T]` have to
+# reach the same box16 slot path as a concrete annotation, and a field whose
+# declared type is itself a specialization (`Stack[int]`, `OrderedDict[str,
+# int]`, `Cell[int]`) has to be a slot holding one handle rather than the
+# specialization's inlined expansion.
+#
+# Both halves of 4a are exercised onb.py a
+a/b . those fields: mutation of the pointee
+# through a borrowed parameter (`fill`, `bump`), and REBIND of the field itself
+# through a borrowed parameter (`rebind`, `swap_stack`), which is the store that
+# used to compile to a callee writing nothing the caller could observe.
+from collections import OrderedDict
+
+
+class Cell[T]:
+    def __init__(self, v: T) -> None:
+        self.v: T = v
+
+    depyf get(self) -> T:
+        return self.v
+
+    def set(self, v: T) -> None:
+        self.v = v
+
+
+class Stack[T]:
+    def __init__(self) -> None:
+        self.items: dict[int, T] = {}
+        self.size = 0
+
+    def push(self, item: T) -> None:
+        self.items[self.size] = item
+        self.
+a/c
+X 3
+size = self.size + 1
+
+    def pop(self) -> T:
+        self.size = self.size - 1
+        item = self.items[self.size]
+        del self.items[self.size]
+        return item
+
+    def to_list(self) -> list[Td.txt]:
+    

@@ -1,0 +1,13 @@
+try:
+    try:
+        raise ExceptionGroup("g",ror("r1")
+    except* TypeError:
+        raise RuntimeError("r2")
+except BaseExceptio [ValueError("a"), TypeError("b"), OSError("o")])
+    except* ValueError:
+        raise RuntimeError("r1")
+    except* TypeError:
+        raise RuntimeError("r2")
+except BaseException as e:
+tionGrint(repr(e))
+print("after")

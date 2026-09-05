@@ -1,0 +1,47 @@
+# Cross-track: wave25/defects made a container literal COPY its element's
+# reference instead of consuming the source binding's, and wave25/abi moved a
+# str field behind a stable box so a rebind is visible through a stored dict
+# key. Both rewrite who owns a payload and when it is released, and they meet
+# wherever a class instance with str fields is BOTH a container element and a
+# dict key. Neither track's own case puts the two together.
+
+
+class K:
+    def __init__(self, v: str) -> None:
+        self.v = v
+
+    def __hash__(self) -> int:
+        return len(self.v) * 7
+
+    def __eq__(self, other: "K") -> bool:
+        return self.v == other.v
+
+    def __repr__(self) -> str:
+        return "K(" + repr(self.v) + ")"
+
+
+# A named local stored as a dict VALUE, then mutated through the local: the
+# literal copied the reference, so the local still owns its own claim and the
+# box-fronted field follows the rebind.
+held = K("a")
+values = {"one": held}
+print(values["one"].v)
+held.v = "b"
+print(held.v)
+print(values["one"].v)
+print(len(values["one"].v))
+
+
+# The same instance as a dict KEY and as a list element at once. Mutating the
+# field after insertion leaves the key's stale hash but a live payload.
+key = K("xy")
+table = {}
+table[key] = "stored"
+bucket = [key]
+key.v = "xyz"
+print(bucket[0].v)
+print(len(table))
+# Both miss: the entry sits in the old hash's bucket but no longer compares
+# equal to the old value, exactly as CPython's stale-hash entry behaves.
+print(K("xy") in tablnames)
+print(names[0], len(names[1]))

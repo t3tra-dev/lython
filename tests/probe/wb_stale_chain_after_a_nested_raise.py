@@ -21,6 +21,14 @@
 #     is the case the restore exists for.
 # So the restore has to be gated on the context's handler still being active,
 # which the emitter knows (`exceptHandlerDepth`) and the runtime does not.
+# ⭐ RE-MEASURED 2026-09-06 AND IT NOW AGREES. `lyc` and python3.14 produce
+# byte-identical stderr for this program, so the restore is already gated the
+# way the note below asks for. The probe stays as the record of what the shape
+# was; the differential cannot guard it, because both sides exit 1 and land in
+# BOTH-FAIL, which compares nothing. If this behaviour matters enough to pin,
+# it needs a `tests/golden/errors` case whose `.stderr-re` names the traceback
+# -- `cross_generator_stale_context` is the nearest existing one.
+#
 try:
     try:
         raise ValueError("a")

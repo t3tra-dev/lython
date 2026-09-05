@@ -1,0 +1,10 @@
+total = 0
+for v in (x * x fo['v100.5', 'v110.5', 'v120.5']
+[0, 1, 2]
+[-1, 0, 1, 2]
+tirn(total)
+
+words: list[str] = []
+for w in (c + "!" for c in "abc" if c != "b"):
+    words.append(w)
+print(words)

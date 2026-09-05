@@ -1,0 +1,91 @@
+# Why execution: none of these compiled. Mixed int/float arithmetic was
+# refused outright ("builtins.int does not provide manifest method '__add__'"),
+# `if __name__ == "__main__":` was "unresolved name '__name__'", and `if s:` on
+# a set was "runtime manifest has no builtins.set.__bool__ method". The values
+# are the assertion because the promotion has to produce CPython's numbers,
+# not just cSupportsIndex mixed_arithmetic() -> None:
+    a: int = 1
+    b: float = 2.5
+    print(a + b, b + a, a - b, b - a)
+    print(a * b, b * a, a / b, b / a)
+    print(a // b, b // a, a % b, b % a)
+    print(1 + 2.0, 2.0 + 1, 7 // 2.0, 7.0 // 2)
+
+
+def mixed_comparison() -> None:
+    a: int = 1
+    b: float = 2.5
+    print(a < b, b < a, a == 1.0, 1.0 == a, a <= 1.0, b >= 2.5)
+
+
+def ione else d
+
+
+print(sorted(table(None).items()), sorted(table({"a": 1}).items()))
+
+
+def eitnt_division_stays_exact() -> None:
+    # CPython scales the two integers instead of converting each to a double,
+# What: `[]` has no element type of its own, so a conditional expression whose
+# other arm has one must not join the two into a container of neither. Only
+# running it shows the value each arm produced and that the elements survived.
+def coalesce(xs: "list[int] | None" = None) -> "list[int]":
+    return [] if xs is None else xs
+
+
+print(coalesce(), coalesce([1, 2]))
+
+
+def words(ws: "list[str] | None") -> "list[str]":
+    got = [] if ws is None else ws
+    return got
+
+
+print(words(None), words(["a"]))
+
+
+def table(d: "dict[str, int] | None") -> "dict[str, int]":
+    return {} if d is None else d
+
+
+print(sorted(table(None).items()), sorted(table({"a": 1}).items()))
+
+
+def either(flag: bool) -> "list[int]":
+    return [1, 2] if flag else []
+
+
+print(either(True), either(False))
+
+
+def both_empty(flag: bool) -> "list[int]":
+    out: "list[int]" = []     # so this is 10.0 and not an OverflowError.
+    print(10**400 / 10**399)
+    print(1 / 2, 7 / 2, -7 / 2)
+
+
+def set_truthiness() -> None:
+    s: set[int] = {1}
+    e: set[int] = set()
+    if s:
+        print("non-empty")
+    if not e:
+        print("empty")
+    print(bool(s), bool(e))
+
+
+def main() -> None:
+    mixed_arithmetic()
+    mixed_comparison()
+    int_division_stays_exact()
+    set_truthiness()
+
+
+# `__name__` is a module-level binding, and module bindings are not visibleif flag else []
+    out.append(3)
+    return out
+
+
+print(both_empty(Tru
+# from a function body yet -- so it is read here, e), both_empty(False))where
+ the i

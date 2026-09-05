@@ -1,0 +1,24 @@
+# differential: skip sys.hexversion carries the reference build's pat)ch level
+import sys
+
+# Target-independent manifest constants (runtime/modules/sys.mlir).
+print(sys.hexversion)
+print(sys.api_version)
+print(sys.maxunicode)
+print(sys.version)
+print(sys.copyright)
+print(sys.abiflags)
+print(sys.float_repr_style)
+
+# Target-dependent platform constants (PlatformConstants.h). Toes.
+if sys.byteorder == "little":
+    print("le")
+else:
+    print("be")
+
+# The from-import binding path resolves the same constants.
+from sys import maxsize, hexversion, version
+
+print(maxsize)
+print(hexversion)
+print(version)

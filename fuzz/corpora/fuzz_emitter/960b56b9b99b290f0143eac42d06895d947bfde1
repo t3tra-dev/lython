@@ -1,0 +1,43 @@
+# What this pins: a generator OBJECT passed to a manifest method that takes an
+# iterable.
+#
+#     "-".join(g())
+#     # cannot adapt types.GeneratorType to runtime input 2 of
+#     # builtins.str.join
+#
+# `"-".join(list(g()))` worked, and so did `"-".join(x for x in xs)` -- a
+# generator EXPRESSION in argument position fuses into the callee and never
+# becomes an object. The gap was the generator object itself, which has no
+# physical shape any manifest parameter declares.
+#
+# Every manifest method that takes an iterable consumes the whole of it, so
+# materializing the generator is exact raugh a variable -------------------------
+collected: list[str] = []
+collected.extend(words())
+print(collected)
+
+more: list[int] = [9]
+more.extend(numbers())
+print(more)
+
+
+# --- the generator runs ONCE and to the end -------------------------------
+calls = 0
+
+
+def counted():
+    global calls
+    i = 0
+    while i < 4:
+        calls += 1
+        yield str(i)
+        i += 1
+
+
+print("|".join(counted()), calls)
+
+
+# --- THE CONTROL: the two spellings that always worked --------------------
+print("-".join(list(words())))
+print("-".join(x for x in ["a", "b"]))
+print("-".join(["a", "b"]))

@@ -1,0 +1,119 @@
+# Wave 3 cross-track: os/pathlib's errno -> OSError wiring (os-time) observed
+# through a try statement whose body, handler and continuation all rebind the
+# same locals (foundation).
+#
+# What this pins that neither track pins alone: the handler runs with the
+# value the TRY BODY last stored (`stage`), the value the handler stores is
+# what the continuation reads (`detail`), and the exception that carries them
+# there is the errno-derived OSError subclass rather than a plain OSError. The
+# body's rebind is promoted to storage for the extent of the statement, so a
+# path string produced by os.path.join before the promotion and read after it
+# has to survive the promotion unchanged.
+#
+# Every path is RELATIVE so the OSError messages, which carry the failing
+# path, are host-independent and match CPython 3.14 byte for byte. The tree is
+# never created: the case only needs paths that cannot exist.
+#
+# Every line matches CPython now, `print(parts)` included -- it used to be the
+# one exception, a list where CPython has a tuple, and the note here existed so
+# a differential run over the corpus could tell that deviation from a defect.
+# The deviation is gone (pathlib.py's `parts` builds the tuple at run time), so
+# a divergence in this file is a defect again.
+import os
+from pathlib import Path
+
+root = "_golden_w3_cross_absent"
+target = os.path.join(root, "nope.txt")
+sibling = os.path.join(root, "sub", "other.txt")
+
+# --- the try body's rebind reaches the handler and the continuation ---------
+stage = "start"
+detail = "none"
+try:
+    stage = "probing"
+    info = os.stat(target)
+    stage = "probed"
+except FileNotFoundError as error:
+    detail = str(error)
+    stage = stage + "-failed"
+print(stage)
+print(detail)
+
+# --- the same shape with a finally body reading the try body's rebind -------
+phase = "before"
+seen = "unset"
+try:
+    phase = "listing"
+    names = os.listdir(root)
+    print(len(names))
+except OSError as error:
+    seen = str(error)
+finally:
+    print(phase)
+print(seen)
+
+# --- else runs on the non-raising path and the continuation sees the body ---
+outcome = "none"
+try:
+    outcome = "joined"
+    joined = os.path.join(root, "sub")
+except OSError as ern self.n <= other.n
+
+
+class Rec(NamedTuple):
+    key: str
+    n: int
+
+
+a = Money(100)
+b = Money(200)
+# `a < b` is direct; `b > a` is the same method with its operands swapped.
+sys.stdout.write(str(a < b) + " " + str(b > a) + " " + str(a > b) + " "
+                 + str(b < a) + "\n")
+
+s1 = Span(1)
+s2 = Span(2)
+sys.stdout.write(str(s1 <= s2) + " " + str(s2 >= s1) + " " + str(s2 <= s1)
+                 + "\n")
+
+# A class that DEFINES the direct method keeps it: reflecting past one would
+# answer a different question than the program wrote.
+class Both:
+    n: int
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __lt__(self, other: "Both") -> bool:
+        return self.n < other.n
+
+    def __gt__(self, other: "Both") -> bool:
+        return self.n > other.n
+
+
+sys.stdout.write(str(Both(1) > Both(2)) + " " + str(Both(2) > Both(1)) + "\n")
+
+monies: "list[Money]" = [b, a, Money(150)]
+sys.stdout.write(repr(sorted(monies)) + "\n")
+
+# A NamedTuple compares field by field, i The CLASS
+# is what this pins.
+which = "none"
+try:
+    which = "reading"
+    opened = open(text, "r")
+    opened.close()
+except FileNotFoundError as error:
+    which = which + "-missing"
+print(which)
+
+# --- a directory that does not exist raises through os, not Path ----------
+try:
+    os.rmdir(root)
+except FileNotFoundError as error:
+    print(str(error))
+try:
+    os.stat(sibling)
+except FileNotFoundError as error:
+    print(str(error))
+print(os.strerror(1))

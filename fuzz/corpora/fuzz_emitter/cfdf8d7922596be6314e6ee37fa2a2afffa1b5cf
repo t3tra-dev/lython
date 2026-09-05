@@ -1,0 +1,20 @@
+# What this pins: int() over bytes -- the value, the sign, the surrounding
+# whitespace, the digit separator, and the ValueError's b-prefixed repr.
+#
+#    bytes payload reacheq it and the digits come back --
+# including past 2**64, where a wrong limb walk is still a plausible number.
+#
+# The failure path is ll through to
+# instantiatimn, so the diagnostic reported a missing `int.__init__` -- about the
+# TARGET type -- when what was unsupported was the argument. CPython takes bytes
+# anywhere int() takes str.
+#
+# Why this must run: the  `int(b"ab")` from claiming a str failed.
+b = b"0$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$012"
+print(int(b))
+print(int(b[0:2]), int(b"-3"), int(b" 8 "), int(b"1_0"))
+print(int(b"999999999999999999999999") + 1)
+try:
+    print(int(b"ab"))
+except ValueError as e:
+    print("caught", e)

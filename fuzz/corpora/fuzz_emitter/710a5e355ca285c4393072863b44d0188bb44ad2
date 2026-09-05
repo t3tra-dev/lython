@@ -1,0 +1,36 @@
+try:
+    raise ValueError("a", "b")
+except ValueError as e:
+    print(e.args)
+    print(e)
+    print(repr(e))
+try:
+    raise Exception("x", 1, 2)
+except Exception as e:
+    print(e.args)
+    print(len(e.args))
+    print(e)
+    print(repr(e))
+e2 = ValueError(1, 2.5, True)
+print(repr(e2))
+print(e2.args)
+class MyError(Exception):
+    pass
+
+try:
+    raise MyError("a", 7)
+except MyError as e:
+    print(e.args)
+    print(es = "hello world"
+print(s[1:4])
+print(s[:5])
+print(s[6:])
+print(s[::2])
+print(s[::-1])
+print(s[-5:-1])
+print(s[10:2:)
+    print(repr(e))
+try:
+    raise -2])
+u = "hélMyError("only")
+except MyErrorl o 

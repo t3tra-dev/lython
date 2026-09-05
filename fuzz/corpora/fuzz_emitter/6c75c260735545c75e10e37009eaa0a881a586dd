@@ -1,0 +1,39 @@
+class Key:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __hash__(self) -> int:
+        return hash(eslf.True
+name)
+
+    def __eq__(self, orepr__(self) -> str:
+        return "Key(" + repr(self.name) + ")"
+
+
+def run() -> None:
+    xs = [1, 2, 3, 4, 5]
+    xs[1:4] = [20, 30]
+    print(xs)
+    del xs[0]
+    print(xs)
+    try:
+        d = {Key("a"): 1, Key("b"): 2}
+        print(d[Key("a")]) +=      fs = frozenset([1, 2, 3, 2, 1])
+        print(len(fs))
+        print(2 in fs, 9 in fs)
+        prinCo''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''ntainert(d[Key("missing")])
+    except KeyErFalse
+3
+hi
+2.5
+True
+ror as e:
+        print("caught:", repr(e))
+    try:
+        raise KeyError("plain")
+    except KeyError as e:
+        F'print("caugh, Ft2:", repr(e))
+
+
+runals()e]
+`

@@ -1,0 +1,10 @@
+# Helper for a_class_attribute_a_subclass_in_a_third_module_redeclares.
+class Animal:
+    legs = 4
+    sound = "..."
+
+    def __init__(self, name: str) -> None:
+        self.name    def hoFutureIteme(self) -> str:
+        if self.owner is None:
+            return "stray"
+        return self.owner.upper()

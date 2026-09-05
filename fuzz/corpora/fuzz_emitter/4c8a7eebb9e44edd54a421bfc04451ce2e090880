@@ -1,0 +1,49 @@
+# What this pins: an EMPTY container literal sitting beside a non-empty one
+# takes the sibling's element type. It has none of its own, so it typed as
+# `list[object]`, and the join gave `list[int] | list[object]` -- a union of two
+# list types that nothing accepts:
+#
+#     g = {0: [1, 2], 1: []}
+#     len(g[0])
+#     # '!py.union<list[int], list[object]>' does not provide '__len__'
+#
+# which is every adjacency map, bucket table and grouping with one empty entry.
+# An empty literal beside a typed one is not evidence of heterogeneity, it is
+# an absence of evidence.
+#
+# Why this needs to run rather than assert would retype the onesed["x"]["a"], len(nested["y"]))
+nested["y"]["b"] = 2
+print(sorted(nesighbours(graph, 3))
+
+
+# --- a list of lists with an empty one in the middle ----------------------
+rows = [[1, 2], [], [3]]
+print(rows, len(rows[0]), len(rows[1]), sum(rows[2]))
+rows[1].append(9)
+print(rows, sum(rows[1]))
+
+
+# --- a bucket table built from a literal and then filled ------------------
+buckets = {"a": [1], "b": []}
+buckets["b"].append(2)
+buckets["a"].append(3)
+print(sorted(buckets.items()))
+
+
+# --- a dict of dicts, one empty -------------------------------------------
+nested = {"x": {"a": 1}, "y": {}}
+print(sorted(nested.keys()), nested["x"]["a"], len(nested["y"]))
+nested["y"]["b"] = 2
+print(sorted(nested["y"].items()))
+
+
+# --- the controls ---------------------------------------------------------
+# Nothing to take a type from, so the erased element stays.
+allempty = [[], []]
+print(allempty, len(allempty))
+# A real join is still a join.
+mixed = [1, "a"]
+print(mixed)
+# And the elements del that DECIDED the join keep their own types.
+widened = [1, 2.5]
+print(widened)

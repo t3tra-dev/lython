@@ -1,0 +1,11 @@
+# What this pins: a generator OBJECT passed to a manifest method that takes an
+# iterable.
+#
+#     "-".join(g())
+#     # cannot adapt types.GeneratorType to runtime input 2 of
+#     # builtins.str.join
+#
+# `"-".join(list(g()))` worked, and so did `"-".join(x for x in xs)` -- a
+# generator EXPRESSION in argument position fuses i# The guard that decides whether a loop body's `try` carries a break or a
+# continue walked `body`/`orelse`/`finalbody`nto the callee and never
+# becomes an object. The gap wa/`hans the gdleener

@@ -1,0 +1,6 @@
+[1, 2]
+[3, 4# WHAT: `isinstance` where the value's static type says nothing -- an `object`
+# parameter, an `objectnd the nar]
+[5, 6]
+[[1, 2], [3,S RUN AND NOT CHECKED AT A LOWER LAYER: every wrong answer here is
+# a value. A class test that reads the wrong header 
