@@ -3627,8 +3627,14 @@ mlir::LogicalResult verifyGeneratorResumeFrames(mlir::ModuleOp module) {
             }
             ranges.push_back(
                 {begin.getInt(), begin.getInt() + size.getInt()});
+            // ⛔ `builtins.bool` beside `types.NoneType`, and for the same
+            // reason: the lane is a bare `i1`, so there is no header for an
+            // ownership contract to anchor and no release for one to
+            // discharge. Requiring the anchor refused every generator that
+            // yields a bool once the state machine could carry one.
             if (anchors && size.getInt() > 0 &&
                 laneContract.getValue() != "types.NoneType" &&
+                laneContract.getValue() != "builtins.bool" &&
                 !anchors->contains(static_cast<unsigned>(begin.getInt()))) {
               function.emitError()
                   << "generator lane at " << attrName << " offset "

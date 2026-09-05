@@ -266,6 +266,14 @@ RuntimeBundleLowerer::computeGeneratorResumeLane(mlir::Operation *op,
     return op->emitError()
            << "generator suspension lane has no concrete runtime contract: "
            << type;
+  if (contract == "builtins.bool") {
+    // The same one-bit lane the argument path builds; see `laneEligibleContract`.
+    lane.contract = contract;
+    lane.isBool = true;
+    lane.physicalCount = 1;
+    lane.physicalTypes.assign({mlir::IntegerType::get(context, 1)});
+    return lane;
+  }
   std::optional<llvm::SmallVector<mlir::Type, 4>> parts =
       RuntimeBundleLowerer::generatorLaneParts(op, type);
   if (!parts)
@@ -494,6 +502,8 @@ unsigned RuntimeBundleLowerer::generatorLaneFrameWords(
     const GeneratorResumeLane &lane) const {
   if (lane.isControl() || lane.isNone)
     return lane.isControl() ? 2 : 0;
+  if (lane.isBool)
+    return 1; // the bit, widened into one word
   return (lane.isInt ? 2 : 0) + 2 * lane.physicalCount;
 }
 
@@ -671,12 +681,14 @@ RuntimeBundleLowerer::getOrCreateGeneratorClaimFunction(
   auto function = mlir::func::FuncOp::create(
       builder, loc, name, builder.getFunctionType(types, types));
   function.setPrivate();
-  function->setAttr(ownership::kOwnedResultsAttr,
-                    mlir::DenseI64ArrayAttr::get(
-                        context, llvm::ArrayRef<std::int64_t>{0}));
-  function->setAttr(
-      ownership::kOwnedResultContractsAttr,
-      builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
+  if (!lane.isBool) {
+    function->setAttr(ownership::kOwnedResultsAttr,
+                      mlir::DenseI64ArrayAttr::get(
+                          context, llvm::ArrayRef<std::int64_t>{0}));
+    function->setAttr(
+        ownership::kOwnedResultContractsAttr,
+        builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
+  }
   mlir::Block *entry = function.addEntryBlock();
   builder.setInsertionPointToStart(entry);
   // ⭐ THE INT LANE'S WORD IS REBUILT FROM ITS BOX WHEN THE WORD IS INVALID.
@@ -887,12 +899,14 @@ RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(
       builder.getFunctionType({generatorStorageType(builder), i64},
                               laneTypes));
   function.setPrivate();
-  function->setAttr(ownership::kOwnedResultsAttr,
-                    mlir::DenseI64ArrayAttr::get(
-                        context, llvm::ArrayRef<std::int64_t>{0}));
-  function->setAttr(
-      ownership::kOwnedResultContractsAttr,
-      builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
+  if (!lane.isBool) {
+    function->setAttr(ownership::kOwnedResultsAttr,
+                      mlir::DenseI64ArrayAttr::get(
+                          context, llvm::ArrayRef<std::int64_t>{0}));
+    function->setAttr(
+        ownership::kOwnedResultContractsAttr,
+        builder.getArrayAttr({builder.getStringAttr(lane.contract)}));
+  }
 
   mlir::Block *entry = function.addEntryBlock();
   builder.setInsertionPointToStart(entry);
@@ -1241,12 +1255,29 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     // lane, which has no suspension ABI yet.
     bool eligible = true;
     std::string valueContract;
-    auto laneEligibleContract = [&](mlir::Type type) -> std::string {
+    // ⭐ A YIELDED BOOL RIDES ITS OWN BIT, the way a bool ARGUMENT already
+    // does. `builtins.bool`'s manifest value shape is a bare `i1`
+    // (LyBool_Shape) and `generatorLaneParts` requires rank-1 memrefs, so
+    // every generator that yields one was ineligible here and the tier below
+    // refused it for a limit it was never there for: `def go(): yield True`
+    // said "source generator next lowering currently supports only
+    // straight-line pure int yield bodies", and the same generator yielding an
+    // int, a str, a float or a tuple compiles.
+    //
+    // ⛔ The VALUE lane only. A bool LIVE ACROSS a yield still has no frame
+    // lane -- a frame slot holds (pointer, size) per part and a bit is
+    // neither -- so `lives` below asks the same question with `allowBool`
+    // false and keeps its recorded decline reason.
+    auto laneEligibleContract = [&](mlir::Type type,
+                                    bool allowBool) -> std::string {
       if (isIntContract(type))
         return "builtins.int";
       std::string contract = runtimeContractName(type);
-      if (contract.empty() ||
-          !RuntimeBundleLowerer::generatorLaneParts(clone.getOperation(), type))
+      if (contract.empty())
+        return std::string();
+      if (allowBool && contract == "builtins.bool")
+        return contract;
+      if (!RuntimeBundleLowerer::generatorLaneParts(clone.getOperation(), type))
         return std::string();
       return contract;
     };
@@ -1254,7 +1285,9 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     clone.walk([&](mlir::Operation *op) {
       if (auto yield = mlir::dyn_cast<py::YieldValueOp>(op)) {
         yields.push_back(yield);
-        std::string contract = laneEligibleContract(yield.getValue().getType());
+        std::string contract =
+            laneEligibleContract(yield.getValue().getType(),
+                                 /*allowBool=*/true);
         if (contract.empty())
           eligible = false;
         else if (valueContract.empty())
@@ -1366,7 +1399,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
             liveAfterYield(yield, liveIns, exceptionEdges, &cloneEntry);
         llvm::StringMap<unsigned> counts;
         for (mlir::Value live : lives) {
-          std::string contract = laneEligibleContract(live.getType());
+          std::string contract =
+              laneEligibleContract(live.getType(), /*allowBool=*/false);
           if (contract.empty()) {
             // ⭐ SAY WHICH VALUE, because the tier below cannot. It refuses
             // for its own reason -- "yields whose runtime value is a single
@@ -2210,7 +2244,10 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   function.setPrivate();
   // The yielded value crosses the driver as an owned object span (the clone
   // transferred it through its own owned-results contract).
-  if (!info.valueLane.isControl() && !info.valueLane.isNone) {
+  // ⛔ A bool lane is a bit: no header to own, and `LyBool_DecRef` is a no-op
+  // over an immortal singleton the lane does not even carry.
+  if (!info.valueLane.isControl() && !info.valueLane.isNone &&
+      !info.valueLane.isBool) {
     function->setAttr(ownership::kOwnedResultsAttr,
                       mlir::DenseI64ArrayAttr::get(
                           context, llvm::ArrayRef<std::int64_t>{1}));

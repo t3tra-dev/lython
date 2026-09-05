@@ -1681,3 +1681,23 @@ TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
       "print(Bag(5).total())\n");
   EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
 }
+
+// A bool LIVE ACROSS a yield still has no frame lane, and the tier that
+// refuses it must say so: its own sentence is about int yield bodies, which is
+// never why a generator arrived there. The yielded value's lane is separate and
+// compiles (tests/golden/cases/a_generator_that_yields_a_bool.py).
+TEST(DriverTest, ABoolLiveAcrossAYieldNamesTheRealLimit) {
+  CompileResult refused = compileSource(
+      "from typing import Iterator\n"
+      "def go() -> Iterator[bool]:\n"
+      "    flag = True\n"
+      "    for _ in range(3):\n"
+      "        yield flag\n"
+      "        flag = not flag\n"
+      "print(list(go()))\n");
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_NE(refused.diagnostics.find("is live across a yield and has no "
+                                     "generator frame lane"),
+            std::string::npos)
+      << refused.diagnostics;
+}

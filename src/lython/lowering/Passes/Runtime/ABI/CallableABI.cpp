@@ -1105,7 +1105,11 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
           llvm::SmallVector<mlir::Type, 6> laneTypes =
               RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
           std::int64_t begin = static_cast<std::int64_t>(resultTypes.size());
-          if (!lane.isNone) {
+          // ⛔ A bool lane is a bit, not a header: the same rule the dead
+          // value follows. Marking it owned earns a release no deallocator
+          // could discharge -- `LyBool_DecRef` is a no-op over an immortal
+          // singleton, and the lane does not even hold that.
+          if (!lane.isNone && !lane.isBool) {
             generatorOwnedOffsets.push_back(begin);
             generatorOwnedContracts.push_back(
                 builder.getStringAttr(lane.contract));

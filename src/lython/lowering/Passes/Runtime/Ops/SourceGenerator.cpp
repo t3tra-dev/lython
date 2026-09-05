@@ -559,9 +559,23 @@ RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
                   py::NoneOp, py::AddOp, py::SubOp, py::MulOp,
                   mlir::func::ReturnOp>(bodyOp))
       continue;
-    return bodyOp.emitError()
-           << "source generator next lowering currently supports only "
-              "straight-line pure int yield bodies";
+    // ⭐ SAY WHY THE PROGRAM IS HERE, the same way the single-lane refusal
+    // above does. This tier's own limit is almost never the reason a generator
+    // reached it: `def go() -> Iterator[bool]: flag = True; yield flag; flag =
+    // not flag` reads as a complaint about int yield bodies, when what
+    // happened is that the state machine declined a bool live across the
+    // suspension. Without this line the reader goes after the yield instead of
+    // after that value.
+    mlir::InFlightDiagnostic bodyDiagnostic =
+        bodyOp.emitError()
+        << "source generator next lowering currently supports only "
+           "straight-line pure int yield bodies";
+    if (auto declined = generatorDeclineReasons.find(target.getSymName());
+        declined != generatorDeclineReasons.end())
+      bodyDiagnostic << "; the state machine that does support it declined "
+                        "this generator because "
+                     << declined->second;
+    return bodyDiagnostic;
   }
 
   auto collectStraightLineIntYieldValues = [&](mlir::func::FuncOp yieldTarget,

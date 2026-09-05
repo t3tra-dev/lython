@@ -216,7 +216,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnOwnedValueSurvivesTwoRebindingIfChains"
     "DriverTest.ABorrowedParameterRebindsAcrossALoop"
     "DriverTest.ARefusedGeneratorNamesWhatSentItDown"
-    "DriverTest.ARecursiveGeneratorMethodNamesTheRealLimit")
+    "DriverTest.ARecursiveGeneratorMethodNamesTheRealLimit"
+    "DriverTest.ABoolLiveAcrossAYieldNamesTheRealLimit")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")
