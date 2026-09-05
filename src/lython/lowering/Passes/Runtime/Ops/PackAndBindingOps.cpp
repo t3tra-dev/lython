@@ -533,6 +533,10 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::materializeClosureStore(
   // `memref<5xi64>` the refcount phases had to release, and the program
   // aborted on the release it could not place.
   for (auto [index, capture] : llvm::enumerate(captures)) {
+    // A capture with no runtime values has nothing to write; its slot stays
+    // zeroed and the read side asks the contract for lanes it does not have.
+    if (capture.values.empty())
+      continue;
     RuntimeBundle one = RuntimeBundle::object(capture.contract, capture.values);
     mlir::FailureOr<RuntimeBundle> normalized =
         RuntimeBundleLowerer::normalizeBoxSource(op, one);
@@ -584,6 +588,31 @@ mlir::LogicalResult RuntimeBundleLowerer::appendClosureValues(
   for (auto [index, capture] : llvm::enumerate(op.getCaptures())) {
     const RuntimeBundle *captureBundle =
         RuntimeBundleLowerer::bundleFor(capture);
+    // ⭐ A `type[X]` CAPTURE CARRIES NO RUNTIME VALUE, the same way a `type[X]`
+    // ARGUMENT occupies no ABI input: which class it is, is in the type, and
+    // the callee's own parameter type rebuilds it. Its bundle is a
+    // `TypeObject`, so the object-bundle test refused
+    //
+    //     def go() -> None:
+    //         cls = A
+    //         def build(n: int) -> A:
+    //             return cls(n)
+    //
+    // with "closure capture 0 must be a lowered Python object bundle" -- while
+    // the same class passed as an ARGUMENT, held in a FIELD or taken as a
+    // DEFAULT all work.
+    //
+    // ⛔ The slot is still allocated and still counted: dropping it would shift
+    // every later capture's `closure_slot` index, and the two sides of that
+    // index are in different files. It stays zeroed, and the read asks the
+    // contract for its lanes, which for a `type[X]` are none.
+    if (captureBundle && captureBundle->kind == RuntimeBundle::Kind::TypeObject &&
+        index < closureTypes.size() &&
+        mlir::isa<py::TypeType>(closureTypes[index])) {
+      bundle.closureValues.push_back(
+          RuntimeValue::object(closureTypes[index], mlir::ValueRange{}));
+      continue;
+    }
     if (!captureBundle || captureBundle->kind != RuntimeBundle::Kind::Object)
       return op.emitError() << "closure capture " << index
                             << " must be a lowered Python object bundle";
