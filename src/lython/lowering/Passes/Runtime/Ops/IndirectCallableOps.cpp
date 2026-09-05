@@ -450,6 +450,49 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   mlir::Block *defaultBlock =
       builder.createBlock(region, continuation->getIterator());
 
+  // ⭐ THE DISPATCH'S BLOCKS ARE STILL INSIDE THE TRY. `createRuntimeCall`
+  // emits the call-site marker when `currentTryHandlerId()` answers, and that
+  // answer is keyed on the INSERTION BLOCK -- so every call this dispatch puts
+  // in a block it just created was emitted unguarded, and the exception walked
+  // straight out of the `try` that was written around it:
+  //
+  //     def go(op: Callable[[int], int], v: int) -> int:
+  //         try:
+  //             return op(v)
+  //         except ValueError:
+  //             return -1
+  //     print(go(f.run, 3), go(f.run, -1))   # ValueError escapes
+  //
+  // Silent, and it takes TWO call sites: with one candidate target the fast
+  // path emits the call in the ORIGINAL block, which still carries the id, so
+  // every smaller spelling of the same program catches. A free function is the
+  // same shape and was fine for the same reason -- the two sites share one
+  // target.
+  //
+  // ⛔ The CONTINUATION inherits it too, and not only the arms: the rest of the
+  // try body lives there, so a second guarded call after this one would lose
+  // its marker the same way.
+  {
+    std::optional<std::int64_t> guardingHandlerId;
+    for (mlir::Block *block = entry; block;) {
+      auto found = tryHandlerIds.find(block);
+      if (found != tryHandlerIds.end()) {
+        guardingHandlerId = found->second;
+        break;
+      }
+      mlir::Operation *parent = block->getParentOp();
+      block = parent ? parent->getBlock() : nullptr;
+    }
+    if (guardingHandlerId) {
+      tryHandlerIds.try_emplace(continuation, *guardingHandlerId);
+      for (mlir::Block *block : targetBlocks)
+        tryHandlerIds.try_emplace(block, *guardingHandlerId);
+      for (mlir::Block *block : testBlocks)
+        tryHandlerIds.try_emplace(block, *guardingHandlerId);
+      tryHandlerIds.try_emplace(defaultBlock, *guardingHandlerId);
+    }
+  }
+
   for (auto [index, target] : llvm::enumerate(targets)) {
     llvm::StringRef targetName = target.getSymName();
     builder.setInsertionPointToStart(targetBlocks[index]);
