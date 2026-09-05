@@ -1336,7 +1336,25 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
     }
   }
 
-  if (!values.empty() && storage == DeadObjectStorage::OwningHeap) {
+  // ⭐ A LANE WITH NO HEADER OWNS NOTHING, so it gets no token. The dead value
+  // for `builtins.bool` is an `i1` constant -- `initializeObjectHeader` below
+  // sees a non-memref and returns, quietly, while the marker was minted
+  // regardless. The affine verifier is the one that noticed:
+  // "owned_local_object marks a value this frame never acquired", for a bool
+  // returned through any callable the dispatch cannot name statically:
+  //
+  //     fs: list[Callable[[int], bool]] = [b]
+  //     print(fs[0](0))
+  //
+  // The same list of int- or str-returning functions compiles, because their
+  // dead value IS a header the frame allocated.
+  //
+  // ⛔ Why NOT box the bool to give it one: `LyBool_Box` hands back an
+  // immortal singleton and `LyBool_DecRef` is a no-op, so the token would name
+  // a reference no release can discharge -- the marker's absence says the same
+  // thing without the allocation.
+  if (!values.empty() && storage == DeadObjectStorage::OwningHeap &&
+      own::isObjectHeaderLikeType(values.front().getType())) {
     initializeObjectHeader(builder, op->getLoc(), values.front(),
                            /*refcount=*/1, /*classId=*/0);
     // ⭐ AND SAY SO. The header is written HERE, not at the `memref.alloc`
