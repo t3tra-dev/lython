@@ -33,6 +33,22 @@
 # argument at the throwing point, which is a question the cleanup placement
 # does not ask today and cannot answer from what it holds
 # (`getOrCreateCleanupHandler`, Runtime/Passes/Ownership.cpp).
+#
+# ⭐ RE-MEASURED 2026-09-05, and the `with` row above needed a fix of its own to
+# get here: the yield-type walk did not bind a `with ... as X` target, so
+# `with Ctx() as base: yield base` was refused EARLIER, with "annotated
+# Iterator[int] but yields builtins.object" -- a sentence about an annotation
+# that was correct. It now reaches this limit like the others.
+#
+# ⛔ A `with` with NO target reaches a THIRD limit rather than this one:
+# `with Ctx(): yield 1` says "generator resume continuation live closure
+# violated". Same area, different placement.
+#
+# ⛔ And a sibling shape that does NOT need a try at all is recorded separately
+# in wb_a_short_circuit_guard_around_a_yield.py: a short-circuit `and`/`or`
+# guarding a yield loses a list local's unwind release, where the same condition
+# written as nested `if`s compiles. Both are the refcount phase failing on an
+# exceptional edge inside a generator, and both work outside one.
 def g(xs: "list[int]"):
     for x in xs:
         try:
