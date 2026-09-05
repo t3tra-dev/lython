@@ -225,6 +225,9 @@ private:
   // subscript or a `|` union, or a name standing for one). Their assignment is
   // not emitted, so a later alias that spells one must not be either.
   llvm::StringSet<> valuelessTypeAliases;
+  // Module-level names bound ONCE to a bare builtin spelling (`Text = str`).
+  // A call through one is that builtin's call, which is keyed on the spelling.
+  llvm::StringMap<std::string> builtinValueAliases;
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,

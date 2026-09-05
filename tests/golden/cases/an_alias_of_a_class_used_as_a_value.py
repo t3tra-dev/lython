@@ -23,6 +23,9 @@ class MyError(Exception):
 W = Widget
 E = MyError
 Err = ValueError
+Text = str
+Num = int
+Flag = bool
 
 
 def direct(n: int) -> str:
@@ -63,8 +66,16 @@ def annotated(w: W) -> int:
     return w.n
 
 
+# A BUILTIN spelling is intercepted by name before the class-instantiation
+# path -- `str(x)` is `__str__` dispatch, not construction -- so an alias of one
+# has to reach that interception rather than the class binding.
+def converted(n: int) -> str:
+    return Text(n) + "/" + Text(Num("7") + 1) + "/" + Text(Flag(n))
+
+
 print(direct(1))
 print(captured(2))
 print(factory()(3).label())
 print(raised(-1), raised(1))
 print(annotated(Widget(4)))
+print(converted(0), converted(5))

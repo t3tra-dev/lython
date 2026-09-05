@@ -3,6 +3,7 @@
 #include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
+#include "ClosureAnalysis.h"
 #include "PyProtocols.h"
 
 #include "llvm/Support/SaveAndRestore.h"
@@ -1382,6 +1383,8 @@ void ModuleEmitter::predeclareTopLevel() {
         types.bindSymbol(name, primitive->first);
       }
     }
+    // An alias is only an alias while the module does not rebind it.
+    llvm::StringSet<> boundOnce = singleAssignmentNames(moduleNode);
     // ⭐ A SECOND PASS FOR TYPE ALIASES, because an alias may name a class the
     // first pass has not reached yet -- `W = Widget` above `class Widget` is
     // legal Python only in an annotation, and that is exactly what an alias is
@@ -1425,10 +1428,23 @@ void ModuleEmitter::predeclareTopLevel() {
       // both the emitter's call path and the inference -- so the parameter wins
       // where it should. cases/type_object_representation is the case that
       // caught it and the one that pins it now.
-      if (value && value->kind == "Name")
-        if (std::optional<mlir::Type> aliased =
-                types.lookupClass(ast::nameSpelling(*value)))
-          types.bindClass(ast::nameSpelling(*targets->front()), *aliased);
+      if (value && value->kind == "Name") {
+        llvm::StringRef aliasedName = ast::nameSpelling(*value);
+        llvm::StringRef aliasName = ast::nameSpelling(*targets->front());
+        if (std::optional<mlir::Type> aliased = types.lookupClass(aliasedName))
+          types.bindClass(aliasName, *aliased);
+        // ⛔ AND THE SPELLING TOO, because the class binding is not enough for
+        // every class. `str`, `int` and `bool` are intercepted by name BEFORE
+        // the class-instantiation path -- `str(x)` is `__str__` dispatch, not
+        // construction -- so an alias of one reached that path and said
+        // "builtins.str has manifest method '__init__' but no signature that
+        // accepts ...". A source class and an exception class have no such
+        // interception and are served by the class binding above; recording
+        // both costs nothing and lets whichever path claims the call first be
+        // right.
+        if (boundOnce.contains(aliasName))
+          builtinValueAliases[aliasName] = aliasedName.str();
+      }
     }
   }
 }

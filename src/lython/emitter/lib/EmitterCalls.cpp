@@ -2177,9 +2177,25 @@ ModuleEmitter::literalStringArgument(const parser::Node *node) {
 // winner depend on the argument count. Nineteen sites spelled this out.
 bool ModuleEmitter::callsUnshadowedBuiltin(const parser::Node *calleeNode,
                                            llvm::StringRef name) const {
-  return calleeNode && calleeNode->kind == "Name" &&
-         llvm::StringRef(ast::nameSpelling(*calleeNode)) == name &&
-         !programBindsName(name);
+  if (!calleeNode || calleeNode->kind != "Name")
+    return false;
+  llvm::StringRef spelling = ast::nameSpelling(*calleeNode);
+  // ⭐ A MODULE-LEVEL ALIAS OF A BUILTIN IS THAT BUILTIN'S CALL. Every builtin
+  // handled here is keyed on the SPELLING, so `Text = str` then `Text(v)`
+  // reached none of them: it fell to the class-instantiation path and said
+  // "builtins.str has manifest method '__init__' but no signature that accepts
+  // ...", a sentence about str for a program that never named it. `str(v)` on
+  // the same line is the `__str__` dispatch it wanted.
+  //
+  // ⛔ Only a name the module binds ONCE, and only to a bare builtin spelling:
+  // a name it rebinds is a variable that happens to hold a class, and the call
+  // through it is whatever it holds at that point.
+  if (spelling != name) {
+    auto alias = builtinValueAliases.find(spelling);
+    if (alias == builtinValueAliases.end() || alias->second != name)
+      return false;
+  }
+  return !programBindsName(name);
 }
 
 std::optional<Value>
