@@ -226,8 +226,20 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
           mlir::arith::ConstantIndexOp::create(builder, loc, 5).getResult())
           .getResult();
   for (auto [index, closureType] : llvm::enumerate(closureTypes)) {
+    // ⭐ THE SLOT'S SHAPE, NOT THE VALUE'S. `materializeClosureStore` writes
+    // each capture through `normalizeBoxSource`, so what the slot holds is
+    // whatever the contract's `box` primitive returns -- and reading it back as
+    // the value's own lanes is the same question asked with the other
+    // spelling. `builtins.bool` is the one contract where the two differ (its
+    // value is an i1 and its box is a singleton header), and a generator that
+    // captured one was refused: "builtins.bool has no statically sized entity
+    // lane to rebuild a box from, got 'i1'".
+    //
+    // ⛔ Why NOT teach `lanesFromBoxEntity` to rebuild a scalar lane: the box
+    // slot does not hold the i1 at all, so there would be nothing to rebuild
+    // from. The pair below is the one a container element already uses.
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
-        RuntimeBundleLowerer::runtimeValueTypesFor(op, closureType,
+        RuntimeBundleLowerer::slotStorageShapesFor(op, closureType,
                                                    "closure capture ABI");
     if (mlir::failed(laneTypes))
       return mlir::failure();
@@ -258,8 +270,12 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
             runtimeContractName(closureType), op);
     if (mlir::failed(lanes))
       return mlir::failure();
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> unboxed =
+        RuntimeBundleLowerer::unboxSlotElementValues(op, closureType, *lanes);
+    if (mlir::failed(unboxed))
+      return mlir::failure();
     values.push_back(RuntimeValue::objectWithOwnership(
-        closureType, mlir::ValueRange{*lanes},
+        closureType, mlir::ValueRange{*unboxed},
         ownership::OwnershipKind::Borrow));
   }
   return values;
