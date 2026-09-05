@@ -2384,36 +2384,162 @@ bool releaseOwnedGroupByLiveness(
   }
   llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
       exceptionEdges = own::collectExceptionEdges(*region);
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (mlir::Block &block : llvm::reverse(*region)) {
-      char out = 0;
-      for (mlir::Block *successor : block.getSuccessors())
-        if (liveIn[successor]) {
-          out = 1;
-          break;
+
+  // ⭐ A HANDLER THAT DOES NOT MATCH HANDS THE EXCEPTION FURTHER OUT, and the
+  // handler it hands it to releases the same group on ITS OWN entry edge. Both
+  // entry edges are deaths in the ordinary CFG -- they hang off different
+  // anchors, so no path visits both -- and at runtime one unwind visits every
+  // handler in the chain:
+  //
+  //     with open(p) as handle:
+  //         try:
+  //             data = handle.read()
+  //         except ValueError:
+  //             data = ""
+  //
+  //     owned resource from @LyTextIO_Enter result 0 is released or
+  //     transferred more than once on one CFG path
+  //
+  // The repair is to keep the token LIVE through the chain and let it die at
+  // the end of it: the OUTERMOST entry becomes a use, every entry before it is
+  // then live-in and takes no release, and the arms that actually CATCH pick up
+  // their releases as ordinary death edges. Extending a live range is the
+  // direction this file is allowed to move in.
+  //
+  // ⛔ Why the OUTERMOST and not the inner entries: an entry that is live-in
+  // but not live-out takes its release before its TERMINATOR, and a handler's
+  // terminator is the kind test -- so the release would sit on the re-raising
+  // arm as well, which is the same double free one block later.
+  llvm::SmallPtrSet<mlir::Block *, 4> handlerEntries;
+  for (auto &entry : own::collectExceptionHandlerEntries(*region))
+    handlerEntries.insert(entry.second);
+  llvm::SmallPtrSet<mlir::Block *, 4> chainEndEntries;
+  auto augmentedSuccessors = [&](mlir::Block *block,
+                                 llvm::SmallVectorImpl<mlir::Block *> &out) {
+    out.assign(block->succ_begin(), block->succ_end());
+    if (auto found = exceptionEdges.find(block); found != exceptionEdges.end())
+      for (mlir::Block *handler : found->second)
+        if (!llvm::is_contained(out, handler))
+          out.push_back(handler);
+  };
+
+  // The liveness itself, recomputed once per chain end discovered. Handler
+  // chains are at most a few deep, and each round can only add entries, so the
+  // bound is a guard against a malformed CFG rather than a real iteration
+  // count.
+  for (unsigned round = 0;; ++round) {
+    for (mlir::Block &block : *region) {
+      liveIn[&block] = 0;
+      liveOut[&block] = 0;
+    }
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (mlir::Block &block : llvm::reverse(*region)) {
+        char out = 0;
+        for (mlir::Block *successor : block.getSuccessors())
+          if (liveIn[successor]) {
+            out = 1;
+            break;
+          }
+        if (!out)
+          if (auto found = exceptionEdges.find(&block);
+              found != exceptionEdges.end())
+            for (mlir::Block *successor : found->second)
+              if (liveIn[successor]) {
+                out = 1;
+                break;
+              }
+        char in = (&block == defBlock)
+                      ? 0
+                      : ((lastUse.count(&block) ||
+                          chainEndEntries.count(&block) || out)
+                             ? 1
+                             : 0);
+        if (out != liveOut[&block]) {
+          liveOut[&block] = out;
+          changed = true;
         }
-      if (!out)
-        if (auto found = exceptionEdges.find(&block);
-            found != exceptionEdges.end())
-          for (mlir::Block *successor : found->second)
-            if (liveIn[successor]) {
-              out = 1;
-              break;
-            }
-      char in = (&block == defBlock)
-                    ? 0
-                    : ((lastUse.count(&block) || out) ? 1 : 0);
-      if (out != liveOut[&block]) {
-        liveOut[&block] = out;
-        changed = true;
-      }
-      if (in != liveIn[&block]) {
-        liveIn[&block] = in;
-        changed = true;
+        if (in != liveIn[&block]) {
+          liveIn[&block] = in;
+          changed = true;
+        }
       }
     }
+    if (handlerEntries.empty() || round >= 8)
+      break;
+
+    // The handler entries this placement would release on, before any of the
+    // guards below narrow the set -- an over-approximation is what is wanted
+    // here, since a chain that turns out not to release is only a live range
+    // held one block longer.
+    llvm::SmallPtrSet<mlir::Block *, 4> entryDeaths;
+    for (mlir::Block &blockRef : *region) {
+      if (blockRef.empty())
+        continue;
+      if (!(&blockRef == defBlock || liveIn[&blockRef] ||
+            lastUse.count(&blockRef)))
+        continue;
+      mlir::Operation *terminator = blockRef.getTerminator();
+      for (unsigned index = 0, end = terminator->getNumSuccessors();
+           index < end; ++index) {
+        mlir::Block *successor = terminator->getSuccessor(index);
+        if (!liveIn[successor] && handlerEntries.count(successor))
+          entryDeaths.insert(successor);
+      }
+    }
+    // Which of them the exception can leave and which it cannot: the ones it
+    // cannot are where the token has to die.
+    bool grew = false;
+    for (mlir::Block *entry : entryDeaths) {
+      bool reachedFromAnother = false;
+      bool reachesAnother = false;
+      llvm::SmallVector<mlir::Block *, 8> succs;
+      for (mlir::Block *start : entryDeaths) {
+        if (start == entry)
+          continue;
+        llvm::SmallPtrSet<mlir::Block *, 16> seen;
+        llvm::SmallVector<mlir::Block *, 16> worklist;
+        augmentedSuccessors(start, succs);
+        worklist.append(succs.begin(), succs.end());
+        while (!worklist.empty()) {
+          mlir::Block *current = worklist.pop_back_val();
+          // A path back through the defining block re-arms the token, so what
+          // it reaches belongs to the next incarnation.
+          if (current == defBlock || !seen.insert(current).second)
+            continue;
+          if (current == entry) {
+            reachedFromAnother = true;
+            break;
+          }
+          augmentedSuccessors(current, succs);
+          worklist.append(succs.begin(), succs.end());
+        }
+        if (reachedFromAnother)
+          break;
+      }
+      if (!reachedFromAnother)
+        continue;
+      llvm::SmallPtrSet<mlir::Block *, 16> seen;
+      llvm::SmallVector<mlir::Block *, 16> worklist;
+      augmentedSuccessors(entry, succs);
+      worklist.append(succs.begin(), succs.end());
+      while (!worklist.empty() && !reachesAnother) {
+        mlir::Block *current = worklist.pop_back_val();
+        if (current == defBlock || !seen.insert(current).second)
+          continue;
+        if (entryDeaths.count(current)) {
+          reachesAnother = true;
+          break;
+        }
+        augmentedSuccessors(current, succs);
+        worklist.append(succs.begin(), succs.end());
+      }
+      if (!reachesAnother && chainEndEntries.insert(entry).second)
+        grew = true;
+    }
+    if (!grew)
+      break;
   }
 
   auto blockIsLive = [&](mlir::Block *block) {
