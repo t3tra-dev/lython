@@ -1382,6 +1382,35 @@ void ModuleEmitter::predeclareTopLevel() {
         types.bindSymbol(name, primitive->first);
       }
     }
+    // ⭐ A SECOND PASS FOR TYPE ALIASES, because an alias may name a class the
+    // first pass has not reached yet -- `W = Widget` above `class Widget` is
+    // legal Python only in an annotation, and that is exactly what an alias is
+    // for. Aliases themselves are bound in SOURCE order, so `A = str; B = A`
+    // resolves through the first.
+    for (const parser::NodePtr &statement : *body) {
+      if (!statement)
+        continue;
+      // PEP 695: `type Name = str`.
+      if (statement->kind == "TypeAlias") {
+        const parser::Node *target = ast::node(*statement, "name");
+        const parser::Node *value = ast::node(*statement, "value");
+        if (target && target->kind == "Name" && types.namesAType(value))
+          types.bindAnnotationTypeAlias(ast::nameSpelling(*target),
+                                        types.annotationType(value));
+        continue;
+      }
+      if (statement->kind != "Assign")
+        continue;
+      const auto *targets = ast::nodeList(*statement, "targets");
+      if (!targets || targets->size() != 1 || !targets->front() ||
+          targets->front()->kind != "Name")
+        continue;
+      const parser::Node *value = ast::node(*statement, "value");
+      if (!types.namesAType(value))
+        continue;
+      types.bindAnnotationTypeAlias(ast::nameSpelling(*targets->front()),
+                                    types.annotationType(value));
+    }
   }
 }
 

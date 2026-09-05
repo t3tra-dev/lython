@@ -221,6 +221,10 @@ private:
   // assignment path only makes a cell at a name's FIRST binding, so without
   // this the reader has nothing to capture and the name is dropped.
   void emitForwardBoundCells(const parser::Node &callable);
+  // Module-level names bound to a type expression with no runtime value (a
+  // subscript or a `|` union, or a name standing for one). Their assignment is
+  // not emitted, so a later alias that spells one must not be either.
+  llvm::StringSet<> valuelessTypeAliases;
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,

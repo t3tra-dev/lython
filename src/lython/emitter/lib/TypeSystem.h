@@ -372,6 +372,15 @@ public:
   // and a body that reads `c.n` on a source class inferred `object` there.
   void forgetSignature(const parser::Node *function);
   mlir::Type annotationType(const parser::Node *node) const;
+  // True when the expression NAMES A TYPE rather than a value: a builtin
+  // spelling, a declared class, a protocol or contract name, an alias already
+  // bound, or a subscript or `|` union of those. This is what tells
+  // `Name = str` (a type alias) from `Name = "str"` (a string).
+  bool namesAType(const parser::Node *node) const;
+  // Bind a module-level type alias. Unlike `bindAnnotationAlias`, which maps a
+  // name to another SPELLING (what an import rename needs), this carries the
+  // resolved type, so `Row = list[int]` works as well as `Name = str`.
+  void bindAnnotationTypeAlias(llvm::StringRef name, mlir::Type type);
   // Diagnostics recorded while resolving annotations (string forward
   // references whose text is not a simple name). Drained once by the
   // emitter when it assembles its result.
@@ -518,6 +527,7 @@ private:
   llvm::StringMap<mlir::Type> classStaticMethodTypes;
   llvm::StringMap<std::string> canonicalBindings;
   llvm::StringMap<std::string> annotationAliases;
+  llvm::StringMap<mlir::Type> annotationTypeAliases;
   mutable llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> scopes;
   mutable llvm::SmallVector<llvm::StringMap<std::string>, 8>
       scopedCanonicalBindings;

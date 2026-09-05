@@ -2012,6 +2012,47 @@ void TypeSystem::bindAnnotationAlias(llvm::StringRef name,
   annotationAliases[name] = target.str();
 }
 
+void TypeSystem::bindAnnotationTypeAlias(llvm::StringRef name,
+                                         mlir::Type type) {
+  if (type)
+    annotationTypeAliases[name] = type;
+}
+
+// ⭐ WHAT MAKES AN ASSIGNMENT A TYPE ALIAS. Only the shapes an annotation can
+// be: a spelling this function can already resolve, a subscript of one, or a
+// `|` of those. `Name = "str"` and `LIMIT = 10` are values and answer false,
+// so nothing about them reaches annotation resolution.
+bool TypeSystem::namesAType(const parser::Node *node) const {
+  if (!node)
+    return false;
+  if (node->kind == "Name") {
+    std::string resolved = resolveAnnotationName(ast::nameSpelling(*node));
+    llvm::StringRef name(resolved);
+    if (annotationTypeAliases.count(name))
+      return true;
+    for (llvm::StringRef builtin :
+         {"int", "str", "bool", "float", "complex", "bytes", "bytearray",
+          "object", "Any", "None", "list", "dict", "set", "frozenset", "tuple",
+          "range", "type"})
+      if (annotationNameIs(name, builtin))
+        return true;
+    // The typing spellings an import brings in -- `Optional`, `Callable`,
+    // `Sequence` and the rest -- are a type expression under any alias too.
+    if (isImportedAnnotationName(name))
+      return true;
+    return static_cast<bool>(lookupClass(name));
+  }
+  if (node->kind == "Subscript")
+    return namesAType(ast::node(*node, "value"));
+  if (node->kind == "BinOp") {
+    const parser::Node *op = ast::node(*node, "op");
+    return op && op->kind == "BitOr" &&
+           namesAType(ast::node(*node, "left")) &&
+           namesAType(ast::node(*node, "right"));
+  }
+  return false;
+}
+
 std::string TypeSystem::resolveAnnotationName(llvm::StringRef name) const {
   auto found = annotationAliases.find(name);
   if (found != annotationAliases.end())
@@ -2492,6 +2533,23 @@ mlir::Type TypeSystem::annotationTypeForName(llvm::StringRef rawName) const {
     if (found != it->end())
       return found->second;
   }
+  // ⭐ A MODULE-LEVEL TYPE ALIAS. Without it the fallback at the end of this
+  // function invented a contract out of the spelling: `Name = str` gave
+  // `!py.contract<"builtins.Name">`, which no manifest declares, and the
+  // program was refused for a method that contract does not have -- "static
+  // type !py.contract<"builtins.Name"> does not provide manifest method
+  // '__add__'" for `def go(v: Name) -> Name: return v + "!"`. Every spelling
+  // did it: a generic alias (`Row = list[int]`), an alias for a declared class,
+  // an alias inside a container annotation, and PEP 695's `type Name = str`.
+  //
+  // ⛔ A fabricated contract is the worst of the three possible answers -- it
+  // is neither the type nor a refusal that names the alias -- and it is what
+  // the fallback still gives a name that is not an alias at all. That fallback
+  // is deliberate (a manifest contract may be spelled bare), so this map is
+  // what separates the two.
+  if (auto alias = annotationTypeAliases.find(name);
+      alias != annotationTypeAliases.end())
+    return alias->second;
   if (auto symbol = lookupSymbol(name)) {
     if (mlir::isa<py::TypeVarType, py::ParamSpecType, py::TypeVarTupleType>(
             *symbol))

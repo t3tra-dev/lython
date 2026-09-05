@@ -931,6 +931,37 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     bindImportStatement(statement, /*diagnoseUnsupported=*/true);
   } else if (statement.kind == "Assign") {
     const parser::Node *rhs = ast::node(statement, "value");
+    // ⭐ A GENERIC TYPE ALIAS HAS NO VALUE TO EVALUATE. `Row = list[int]` at
+    // module scope is a declaration `predeclareTopLevel` has already read;
+    // CPython builds a `types.GenericAlias` object here, which this compiler
+    // does not model, so emitting the subscript refused the program at the
+    // ALIAS -- "unresolved name 'list'" -- for an annotation that now resolves.
+    //
+    // ⛔ Only a SUBSCRIPT, and only at module scope: `Name = str` and
+    // `W = Widget` name values this compiler does have, and they keep being
+    // assigned so the name still works as one. A program that uses `Row` as a
+    // value gets "unresolved name 'Row'", which is a refusal that names the
+    // right thing rather than the inside of the annotation.
+    if (atModuleScope && rhs) {
+      const auto *aliasTargets = ast::nodeList(statement, "targets");
+      const parser::Node *aliasTarget =
+          aliasTargets && aliasTargets->size() == 1 ? aliasTargets->front().get()
+                                                    : nullptr;
+      if (aliasTarget && aliasTarget->kind == "Name") {
+        // A subscript or a `|` union is a type expression with no runtime value
+        // here; a name that stands for one inherits that -- `Chain = Maybe`
+        // after `Maybe = Optional[int]` was "unresolved name 'Maybe'".
+        bool valueless =
+            (rhs->kind == "Subscript" || rhs->kind == "BinOp") &&
+            types.namesAType(rhs);
+        if (!valueless && rhs->kind == "Name")
+          valueless = valuelessTypeAliases.contains(ast::nameSpelling(*rhs));
+        if (valueless) {
+          valuelessTypeAliases.insert(ast::nameSpelling(*aliasTarget));
+          return;
+        }
+      }
+    }
     // ⭐ `a, b = b, a + b` BUILDS NO TUPLE. Both sides are written out here, so
     // the general path's "materialize the right, then index it once per
     // target" makes an object whose whole life is the statement -- and in a
@@ -1664,6 +1695,14 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         {}, statement.range);
     emitStatement(*guard);
   } else if (statement.kind == "Pass") {
+    return;
+  } else if (statement.kind == "TypeAlias") {
+    // ⭐ `type Name = str` IS A DECLARATION, and this compiler has already read
+    // it: `predeclareTopLevel` binds the alias for annotation resolution before
+    // any body is typed. CPython builds a `TypeAliasType` object here, which is
+    // a value only reflection can see; emitting nothing is what a statically
+    // resolved alias means, and refusing the statement made the PEP 695
+    // spelling the one alias form that did not work.
     return;
   } else if (statement.kind == "Match") {
     emitMatch(statement);
