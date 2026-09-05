@@ -14,14 +14,17 @@ This runs the loop over a whole corpus and sorts the outcomes into buckets:
     WRONG      both ran to completion, stdout differs      <-- the bad one
     GAP        CPython ran it, lyc refused it
     EXTRA      lyc ran it, CPython refused it
-    BOTH-FAIL  neither accepted it (refusal parity)
+    BOTH-FAIL  neither accepted it, and both said the same thing
+    BOTH-FAIL-DIFF  neither accepted it and they disagree about what happened
     TIMEOUT    one of them did not finish
 
 WRONG is what the project's "never silently mis-execute" rule exists to make
 impossible, so a WRONG is a bug report on its own. GAP is the work queue: it
 is where unimplemented surface shows up, and it is expected to be non-empty.
 BOTH-FAIL is not automatically fine either -- two refusals can disagree about
-WHY -- but this tool does not compare diagnostics, only whether they refuse.
+WHY -- so the output is compared there too and a disagreement is its own
+bucket. It used to stop at "both refused", and two probes in the corpus were
+green in the tree while their own headers still described a defect.
 
     python3 tests/probe/tools/differential.py ./build/bin/lyc tests/probe
 
@@ -54,7 +57,8 @@ from pathlib import Path
 
 # The buckets, worst first: report order, and the order that decides which
 # transition counts as a regression (a move DOWN this list is an improvement).
-BUCKETS = ["WRONG", "WRONG-DECLARED", "TIMEOUT", "EXTRA", "GAP", "BOTH-FAIL",
+BUCKETS = ["WRONG", "WRONG-DECLARED", "TIMEOUT", "EXTRA", "GAP", "BOTH-FAIL-DIFF",
+           "BOTH-FAIL",
            "AGREE", "SKIP"]
 IMPROVEMENT_RANK = {name: index for index, name in enumerate(BUCKETS)}
 
@@ -133,6 +137,14 @@ def classify(lyc: Path, interpreter: str, source: Path, workdir: Path,
     reference_code, reference_out = reference
     subject_code, subject_out = subject
     if reference_code != 0 and subject_code != 0:
+        # Two refusals are not automatically parity: they can disagree about
+        # WHICH exception, or lyc can refuse at compile time where CPython dies
+        # at run time. Comparing the output is what tells those apart, and
+        # without it a probe recorded here goes green in the tree and stays red
+        # in its own header (two did, found 2026-09-06).
+        if reference_out != subject_out:
+            return Outcome(source.name, "BOTH-FAIL-DIFF",
+                           first_difference(reference_out, subject_out))
         return Outcome(source.name, "BOTH-FAIL", f"rc {reference_code}/{subject_code}")
     if reference_code != 0:
         return Outcome(source.name, "EXTRA", f"CPython rc {reference_code}")
