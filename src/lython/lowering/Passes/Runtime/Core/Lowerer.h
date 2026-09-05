@@ -1751,7 +1751,13 @@ private:
   // An evidence iterator is a compile-time token with a function-level cell,
   // so a block argument that forwards one has no bundle of its own: follow the
   // forwarding edges back to the value that does.
-  const RuntimeBundle *evidenceIteratorBundleFor(mlir::Value value) const;
+  // The bundle an iterator value's forwarding edges lead back to, selected by
+  // `carries` -- an evidence cell for a list/dict/set walk, a generator frame
+  // target for a source generator. A block argument's bundle is rebuilt from
+  // its TYPE and carries neither.
+  const RuntimeBundle *forwardedIteratorBundleFor(
+      mlir::Value value,
+      llvm::function_ref<bool(const RuntimeBundle &)> carries) const;
   mlir::Value materializeByteBuffer(mlir::Location loc, llvm::StringRef text);
   std::optional<std::int64_t> currentTryHandlerId() const;
   void emitTryCallSiteMarker(mlir::Location loc, std::int64_t id);

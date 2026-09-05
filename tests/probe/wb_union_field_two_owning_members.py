@@ -51,3 +51,19 @@ b = Box()
 print(b.v)
 b.v = "later"
 print(b.v)
+
+# RE-MEASURED 2026-09-05 with the narrowing gate LIFTED as an experiment (the
+# `optionalUnion` test in EmitterSupport.cpp, which restricts the member-path
+# isinstance narrowing to `T | None`). The gate is still justified and was put
+# back:
+#
+#   isinstance(self.f, str) on an `int | str` field -> the narrowing IS applied
+#     and reaches "ly.ownership.owned_local_object marks a value this frame
+#     never acquired" -- the dead-value problem above, one layer down.
+#   isinstance(self.f, int) on the same field ....... the narrowing is NOT
+#     applied at all: the read still sees the union and says "does not provide
+#     manifest method '__add__'".
+#
+# ⭐ So there are TWO blockers, not one, and the second is new information: the
+# int member does not narrow even with the gate open. Whatever declines it is
+# not the gate, and finding it is the cheaper half of this repair.

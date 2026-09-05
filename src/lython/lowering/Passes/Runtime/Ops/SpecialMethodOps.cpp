@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "mlir/IR/Dominance.h"
+
 #include "Runtime/ABI/CollectionPayload.h"
 #include "Runtime/ABI/BoxLayout.h"
 #include "Runtime/Evidence/Callable.h"
@@ -2200,8 +2202,9 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
   return mlir::success();
 }
 
-const RuntimeBundle *
-RuntimeBundleLowerer::evidenceIteratorBundleFor(mlir::Value value) const {
+const RuntimeBundle *RuntimeBundleLowerer::forwardedIteratorBundleFor(
+    mlir::Value value,
+    llvm::function_ref<bool(const RuntimeBundle &)> carries) const {
   llvm::SmallPtrSet<mlir::Value, 8> seen;
   llvm::SmallVector<mlir::Value, 8> worklist{value};
   while (!worklist.empty()) {
@@ -2209,7 +2212,7 @@ RuntimeBundleLowerer::evidenceIteratorBundleFor(mlir::Value value) const {
     if (!current || !seen.insert(current).second)
       continue;
     if (const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(current);
-        bundle && bundle->evidenceIteratorCell)
+        bundle && carries(*bundle))
       return bundle;
     auto argument = mlir::dyn_cast<mlir::BlockArgument>(current);
     if (!argument)
@@ -2259,7 +2262,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
   RuntimeBundle forwardedIterator;
   if (!iterator->evidenceIteratorCell)
     if (const RuntimeBundle *forwarded =
-            RuntimeBundleLowerer::evidenceIteratorBundleFor(op.getIterator())) {
+            RuntimeBundleLowerer::forwardedIteratorBundleFor(
+                op.getIterator(), [](const RuntimeBundle &bundle) {
+                  return static_cast<bool>(bundle.evidenceIteratorCell);
+                })) {
       forwardedIterator = *forwarded;
       iterator = &forwardedIterator;
     }
@@ -2269,22 +2275,58 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
     return RuntimeBundleLowerer::lowerListEvidenceNext(op, *iterator);
   }
   if (iterator->contractName() == "types.GeneratorType") {
+    // ⭐ AND THE SAME FORWARDING FOR A GENERATOR'S FRAME TARGET. The state
+    // machine threads a loop's iterator through the resume function's block
+    // arguments, and a block argument's bundle is rebuilt from its TYPE --
+    // which carries the contract and not the target. So a generator iterated
+    // INSIDE another generator was refused while the same two functions with
+    // the outer one not a generator worked.
+    if (iterator->generatorTarget.empty())
+      if (const RuntimeBundle *forwarded =
+              RuntimeBundleLowerer::forwardedIteratorBundleFor(
+                  op.getIterator(), [&](const RuntimeBundle &bundle) {
+                    if (bundle.generatorTarget.empty())
+                      return false;
+                    // ⛔ AND ONLY WHERE THE RESUME'S OPERANDS REACH THIS USE.
+                    // A generator's own frame values are defined once, at the
+                    // call that created it; when the state machine has split
+                    // the loop across resume functions they do not dominate
+                    // the `py.next` in the block that reads them, and adopting
+                    // the bundle anyway turns a sentence the reader can act on
+                    // into "operand #0 does not dominate this use". That shape
+                    // is the generator-frame work below, not this forwarding.
+                    mlir::DominanceInfo dominance;
+                    for (const RuntimeValue &source : bundle.generatorSources)
+                      for (mlir::Value value : source.values)
+                        if (value && !dominance.properlyDominates(
+                                         value, op.getOperation()))
+                          return false;
+                    return true;
+                  })) {
+        forwardedIterator = *forwarded;
+        iterator = &forwardedIterator;
+      }
     if (!iterator->generatorTarget.empty())
       return RuntimeBundleLowerer::lowerSourceGeneratorNext(op, *iterator);
-    // ⛔ A generator VALUE with no frame target: it crossed a function
-    // return, and the frame it resumes into is not part of what a return
-    // carries. Falling through to the manifest path reported "runtime
+    // ⛔ A generator VALUE with no frame target that the forwarding above
+    // could not reach either: the loop lives across a suspension, so the
+    // resume's own operands are defined in a block that does not dominate
+    // this read. Falling through to the manifest path reported "runtime
     // manifest has no types.GeneratorType.__next__ method" -- a sentence
-    // about the manifest for a program that did nothing to it, and the same
-    // generator iterates fine when it is bound to a local instead
-    // (`g = inner()` then `for v in g`). Named here rather than repaired:
-    // carrying the target through a return is the generator-frame work the
-    // resume lane note in GeneratorStateMachine.cpp describes.
+    // about the manifest for a program that did nothing to it. Named here
+    // rather than repaired: carrying the frame across a suspension is the
+    // generator-frame work the resume lane note in GeneratorStateMachine.cpp
+    // describes.
+    //
+    // ⛔ The advice has to be the advice that WORKS. `bind it to a local in
+    // the same function` was in this sentence and does not help inside a
+    // generator -- the local is the same value across the same suspension --
+    // and it is the shape a reader most naturally tries next.
     return op.emitError()
-           << "a generator returned out of a function cannot be resumed: the "
-              "frame it resumes into is not carried by the returned value. "
-              "Call the generator in the for statement, bind it to a local "
-              "in the same function, or return a list";
+           << "a generator returned out of a function cannot be resumed here: "
+              "the frame it resumes into is not reachable from this read. "
+              "Outside a generator, iterate it directly; inside one, "
+              "materialize it first (`for v in list(inner())`)";
   }
 
   llvm::SmallVector<const RuntimeBundle *, 1> sources{iterator};
