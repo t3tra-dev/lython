@@ -612,6 +612,46 @@ void collectGeneratorFunctionAnalysis(
     }
     return;
   }
+  if (node->kind == "With") {
+    // ⭐ AND A `with ... as X` TARGET, for the same reason the loop target is
+    // bound: the walk descends into the body, so a yield over the target has
+    // to know what the target is. Without it `X` was `object` and every
+    // generator holding a context manager was refused --
+    //
+    //     def go() -> Iterator[int]:
+    //         with Ctx() as base:
+    //             yield base
+    //
+    // "generator function is annotated Iterator[int] but yields
+    // builtins.object" -- while the same `with` around a yield of a LITERAL
+    // reaches the lowering, which is what says the target is the gap.
+    //
+    // ⛔ `With` and not `AsyncWith`: `__aenter__` answers with an awaitable
+    // and the target binds what awaiting it produces, which is a second
+    // question this walk has no answer for; binding the awaitable would be
+    // worse than binding nothing.
+    if (const auto *items = ast::nodeList(*node, "items"))
+      for (const parser::NodePtr &item : *items) {
+        if (!item)
+          continue;
+        const parser::Node *target = ast::node(*item, "optional_vars");
+        const parser::Node *contextExpr = ast::node(*item, "context_expr");
+        if (!target || !contextExpr)
+          continue;
+        mlir::Type contextType = inferExprWithLocalCallables(
+            types, contextExpr, localCallables, &analysis.failureReasons,
+            &analysis.localSymbols);
+        if (!contextType)
+          continue;
+        CallInferenceResult entered = types.inferMethodCallWithEvidence(
+            types.widenLiteral(contextType), "__enter__", {});
+        if (!entered)
+          continue;
+        bindGeneratorAnalysisTarget(types, target,
+                                    types.widenLiteral(entered.resultType),
+                                    nullptr, localCallables, analysis);
+      }
+  }
   if (node->kind == "For" || node->kind == "AsyncFor") {
     // Bind the loop target to the iteration element type before the generic
     // child walk reaches the body, so yields over the target infer correctly.

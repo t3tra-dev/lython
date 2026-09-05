@@ -1701,3 +1701,28 @@ TEST(DriverTest, ABoolLiveAcrossAYieldNamesTheRealLimit) {
             std::string::npos)
       << refused.diagnostics;
 }
+
+// A `with ... as X` target inside a generator is typed before the body walk
+// reaches the yields, the same way a loop target is. Without it the generator
+// was refused for its own correct annotation; the limit it really meets is the
+// unwind cleanup one (tests/probe/wb_a_try_inside_a_loop_inside_a_generator.py).
+TEST(DriverTest, AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation) {
+  CompileResult refused = compileSource(
+      "from typing import Iterator\n"
+      "class Ctx:\n"
+      "    def __enter__(self) -> int:\n"
+      "        return 5\n"
+      "    def __exit__(self, a: object, b: object, c: object) -> bool:\n"
+      "        return False\n"
+      "def go() -> Iterator[int]:\n"
+      "    with Ctx() as base:\n"
+      "        yield base\n"
+      "print(list(go()))\n");
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_EQ(refused.diagnostics.find("but yields"), std::string::npos)
+      << refused.diagnostics;
+  EXPECT_NE(refused.diagnostics.find("unwind cleanup cannot target a handler "
+                                     "entry with block arguments"),
+            std::string::npos)
+      << refused.diagnostics;
+}
