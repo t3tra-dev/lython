@@ -643,8 +643,17 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
     // A `type[X]` argument occupies no ABI input: which class it is, is in
     // its type, so the callee reconstructs it from its own parameter type.
     // Skipped BEFORE the bound check, or a trailing one reads as an overflow.
+    //
+    // ⭐ AND `None` FOR THE SAME REASON, which the trailing case is exactly how
+    // it showed up: a nested def capturing a local bound to `None` puts a
+    // zero-lane logical input LAST, and the bound check read it as the
+    // overflow the note above already describes -- "too many positional args
+    // for function target go$show$1$3_4", a sentence about a call the program
+    // does not have. The same capture of an `int | None` parameter works,
+    // because a union has lanes.
     if (sourceIndex < logicalInputTypes.size() &&
-        mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]))
+        (mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]) ||
+         py::isPyNoneType(logicalInputTypes[sourceIndex])))
       continue;
     if (inputIndex >= functionType.getNumInputs())
       return op.emitError()
@@ -1087,8 +1096,10 @@ mlir::LogicalResult RuntimeBundleLowerer::emitSourceFunctionTargetCallResult(
   unsigned inputIndex = 0;
   builder.setInsertionPoint(op);
   for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
+    // The same two zero-lane logical inputs the direct call skips.
     if (sourceIndex < logicalInputTypes.size() &&
-        mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]))
+        (mlir::isa<py::TypeType>(logicalInputTypes[sourceIndex]) ||
+         py::isPyNoneType(logicalInputTypes[sourceIndex])))
       continue;
     if (inputIndex >= functionType.getNumInputs())
       return op->emitError()

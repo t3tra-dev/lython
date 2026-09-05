@@ -1425,14 +1425,23 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
         }
-        ownedResultOffsets.push_back(
-            static_cast<std::int64_t>(resultTypes.size()));
-        ownedResultContracts.push_back(
-            builder.getStringAttr(laneContractName));
+        std::size_t laneBegin = resultTypes.size();
         if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
                 function, capture.laneContract, resultTypes))) {
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
+        }
+        // ⭐ A LANE WITH NO RESULTS OWNS NOTHING AND HAS NO OFFSET. The offset
+        // was recorded before the types were known, so a capture that expands
+        // to nothing named a result index past the end: returning a closure
+        // over a local bound to `None` was refused with
+        // "ly.ownership.owned_results index 1 is out of range [0, 1)".
+        // Capturing the same `None` without returning the closure works, and
+        // so does returning one over an int or a str.
+        if (resultTypes.size() > laneBegin) {
+          ownedResultOffsets.push_back(static_cast<std::int64_t>(laneBegin));
+          ownedResultContracts.push_back(
+              builder.getStringAttr(laneContractName));
         }
       }
     }
