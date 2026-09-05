@@ -4446,6 +4446,48 @@ bool ModuleEmitter::isNumericPrimitiveContract(mlir::Type type) const {
                   type == types.floatType());
 }
 
+// ⭐ THE NUMERIC TOWER DISAGREEING WITH A DECLARED CELL, AT ANY DEPTH. int,
+// float and bool share no representation, so a cell declared as one and
+// written with another reinterprets the value's lanes; a container's ELEMENT
+// type is its storage, so the same is true one level in and the outer contract
+// names matching says nothing. Both cell channels -- the module global and the
+// class attribute -- asked the scalar question only, and the container spelling
+// of each printed the reinterpretation instead of being reported.
+bool ModuleEmitter::numericRepresentationMismatch(
+    mlir::Type declared, mlir::Type assigned, mlir::Type &declaredLeaf,
+    mlir::Type &assignedLeaf) const {
+  if (!declared || !assigned)
+    return false;
+  mlir::Type widenedDeclared = types.widenLiteral(declared);
+  mlir::Type widenedAssigned = types.widenLiteral(assigned);
+  if (widenedDeclared != widenedAssigned &&
+      isNumericPrimitiveContract(widenedDeclared) &&
+      isNumericPrimitiveContract(widenedAssigned)) {
+    declaredLeaf = widenedDeclared;
+    assignedLeaf = widenedAssigned;
+    return true;
+  }
+  auto declaredContract =
+      mlir::dyn_cast_if_present<py::ContractType>(widenedDeclared);
+  auto assignedContract =
+      mlir::dyn_cast_if_present<py::ContractType>(widenedAssigned);
+  // ⛔ Same name only. `list[Derived]` against `list[Base]` is a real retyping
+  // over one representation, and a differently-named contract pair is not this
+  // question at all.
+  if (!declaredContract || !assignedContract ||
+      declaredContract.getContractName() != assignedContract.getContractName())
+    return false;
+  llvm::ArrayRef<mlir::Type> declaredArgs = declaredContract.getArguments();
+  llvm::ArrayRef<mlir::Type> assignedArgs = assignedContract.getArguments();
+  if (declaredArgs.empty() || declaredArgs.size() != assignedArgs.size())
+    return false;
+  for (auto [declaredArg, assignedArg] : llvm::zip(declaredArgs, assignedArgs))
+    if (numericRepresentationMismatch(declaredArg, assignedArg, declaredLeaf,
+                                      assignedLeaf))
+      return true;
+  return false;
+}
+
 Value ModuleEmitter::coerceValue(Value value, mlir::Type targetType,
                                  const parser::Node &anchor) {
   if (!targetType || value.type == targetType)

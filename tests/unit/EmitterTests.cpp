@@ -1395,3 +1395,41 @@ TEST(EmitterTest, ANestedClassNamesItsOwnLimit) {
   EXPECT_TRUE(atModule.ok());
 }
 }
+
+TEST(EmitterTest, AModuleGlobalContainerNamesItsElementRepresentation) {
+  // A module global's cell reaches its elements: `xs: list[int] = [True]`
+  // printed 0 and `ys: list[float] = [1]` printed 5e-324, because the store
+  // went through at the value's own element type and the read came back at the
+  // declaration's. Only the scalar shape was reported.
+  const char *shapes[] = {
+      "xs: list[int] = [True]\nprint(xs[0])\n",
+      "ys: list[float] = [1]\nprint(ys[0])\n",
+      "t: tuple[int, int] = (True, 2)\nprint(t[0])\n",
+      "d: dict[str, int] = {\"a\": True}\nprint(d[\"a\"])\n",
+      // The class attribute is the same cell with the same rule, and its
+      // container spelling printed the reinterpretation too.
+      "class P:\n    v: list[float] = [1]\nprint(P.v[0])\n",
+      "class Q:\n    v: dict[str, int] = {\"a\": True}\nprint(Q.v[\"a\"])\n",
+  };
+  for (const char *shape : shapes) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(shape, context);
+    EXPECT_FALSE(result.ok()) << shape;
+    bool named = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      named = named || diagnostic.message.find("a container of") !=
+                           std::string::npos;
+    EXPECT_TRUE(named) << shape;
+  }
+
+  // Inside a function the same four compile: a local carries the type its
+  // value has, so there is no cell to disagree with.
+  mlir::MLIRContext local(testRegistry());
+  lython::emitter::EmitResult inFunction = emitSource(
+      "def run() -> None:\n    xs: list[int] = [True]\n"
+      "    ys: list[float] = [1]\n    t: tuple[int, int] = (True, 2)\n"
+      "    d: dict[str, int] = {\"a\": True}\n"
+      "    print(xs[0], ys[0], t[0], d[\"a\"])\nrun()\n",
+      local);
+  EXPECT_TRUE(inFunction.ok());
+}

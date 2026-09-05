@@ -1039,6 +1039,11 @@ private:
   // bool, int and float: the three contracts that carry a VALUE rather than an
   // object handle, and so the three between which a retyping is a lie.
   bool isNumericPrimitiveContract(mlir::Type type) const;
+  // Deepest numeric-tower disagreement between a declared cell type and the
+  // type being stored into it, container element types included.
+  bool numericRepresentationMismatch(mlir::Type declared, mlir::Type assigned,
+                                     mlir::Type &declaredLeaf,
+                                     mlir::Type &assignedLeaf) const;
   mlir::Value emitBoolValue(Value value, const parser::Node &anchor);
 
   template <typename Op>

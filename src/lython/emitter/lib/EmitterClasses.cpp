@@ -872,21 +872,27 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
     // rule, and without the check the store of an int into a float cell was
     // dropped further down -- leaving the cell unassigned and the failure to
     // the reader at RUNTIME, naming an internal cell name.
-    if (mlir::Type declared = types.widenLiteral(slot->second),
-        supplied = types.widenLiteral(initial.type);
-        declared && supplied && declared != supplied &&
-        isNumericPrimitiveContract(declared) &&
-        isNumericPrimitiveContract(supplied)) {
+    //
+    // ⭐ AND AT ANY DEPTH, since a container's element type is its storage:
+    // `v: list[float] = [1]` printed 5e-324 and `v: list[int] = [True]`
+    // printed 0, both silently, because the outer contract names match and the
+    // scalar test stopped there.
+    mlir::Type declared, supplied;
+    if (numericRepresentationMismatch(slot->second, initial.type, declared,
+                                      supplied)) {
       auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
         if (numeric == types.boolType())
           return "bool";
         return numeric == types.intType() ? "int" : "float";
       };
+      bool insideContainer = declared != types.widenLiteral(slot->second);
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, statement->range.start,
           "class attribute '" + std::string(*name) + "." + attrName.str() +
-              "' holds " + spell(declared).str() +
-              " and this initializer gives it " + spell(supplied).str() +
+              "' holds " + (insideContainer ? "a container of " : "") +
+              spell(declared).str() + " and this initializer gives it " +
+              (insideContainer ? "a container of " : "") +
+              spell(supplied).str() +
               "; the attribute's cell has one runtime representation and these "
               "two do not share one, so write the value in the declared type"});
       continue;

@@ -1895,19 +1895,39 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       // int's lanes were reinterpreted as a double and `x: float = 3`
       // printed 5e-324. It reported "assignment value group has 3 values,
       // expected 1" before that, which named the count and not the cause.
-      if (mlir::Type widened = types.widenLiteral(value.type);
-          widened != type && isNumericPrimitiveContract(widened) &&
-          isNumericPrimitiveContract(type)) {
+      //
+      // ⭐ AND THE SAME MISMATCH ONE LEVEL IN. A container's ELEMENT type is
+      // its storage, so the cell's declaration reaches every element:
+      //
+      //     xs: list[int] = [True]      # printed 0;      CPython prints True
+      //     ys: list[float] = [1]       # printed 5e-324; CPython prints 1
+      //     t: tuple[int, int] = (True, 2)
+      //     d: dict[str, int] = {"a": True}
+      //
+      // all stored a container of one element type into a cell read back at
+      // another and printed the reinterpretation. Only the scalar shape was
+      // reported, because the outer contract names match and the walk stopped
+      // there.
+      //
+      // ⛔ Inside a FUNCTION every one of these is correct and must stay
+      // correct: a local has no declared cell, so the name simply carries the
+      // type the value has. The cell is what makes this a question.
+      mlir::Type declaredLeaf, assignedLeaf;
+      if (numericRepresentationMismatch(type, value.type, declaredLeaf,
+                                        assignedLeaf)) {
         auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
           if (numeric == types.boolType())
             return "bool";
           return numeric == types.intType() ? "int" : "float";
         };
+        bool insideContainer = declaredLeaf != types.widenLiteral(type);
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, target.range.start,
             "module global '" + name.str() + "' holds " +
-                spell(type).str() + " and this assignment gives it " +
-                spell(widened).str() +
+                (insideContainer ? "a container of " : "") +
+                spell(declaredLeaf).str() + " and this assignment gives it " +
+                (insideContainer ? "a container of " : "") +
+                spell(assignedLeaf).str() +
                 "; a module global has one runtime representation and these "
                 "two do not share one, so write the value in the declared "
                 "type"});
