@@ -1410,16 +1410,25 @@ void ModuleEmitter::predeclareTopLevel() {
         continue;
       types.bindAnnotationTypeAlias(ast::nameSpelling(*targets->front()),
                                     types.annotationType(value));
-      // ⛔ MEASURED AND DROPPED: also binding a Name alias of a declared class
-      // as a CLASS, so `W = Widget` then `cls = W` inside a function works the
-      // way `cls = Widget` does (it is "unresolved name 'W'" today, because a
-      // module global holding a class has no storage). `bindClass` at this
-      // point is unscoped, so the alias then beat a PARAMETER of the same
-      // spelling: `t = A` at module scope made `def build_b(t: type[B]) -> B:
-      // return t(n)` construct an A, which cases/type_object_representation
-      // caught as "annotated to return B but this return gives A". The alias
-      // has to be scoped like a class binding is inside a function before this
-      // can be tried again.
+      // ⭐ AN ALIAS OF A CLASS IS ALSO THE CLASS AS A VALUE. `W = Widget` then
+      // `cls = W` inside a function was "unresolved name 'W'", while
+      // `cls = Widget` on the same line works: a class NAME is predeclared and
+      // emits its type object, and a module global holding a class is a plain
+      // global this compiler gives no storage to. The same is what
+      // `Err = ValueError` needs for `raise Err(...)` and `except Err`.
+      //
+      // ⛔ This was tried once and dropped: `bindClass` here is UNSCOPED, so
+      // the alias beat a PARAMETER of the same spelling and `t = A` at module
+      // scope made `def build_b(t: type[B]) -> B: return t(n)` construct an A.
+      // What made it safe is the shadowing rule that came after -- a name bound
+      // to a type object or a callable now outranks a class of its spelling in
+      // both the emitter's call path and the inference -- so the parameter wins
+      // where it should. cases/type_object_representation is the case that
+      // caught it and the one that pins it now.
+      if (value && value->kind == "Name")
+        if (std::optional<mlir::Type> aliased =
+                types.lookupClass(ast::nameSpelling(*value)))
+          types.bindClass(ast::nameSpelling(*targets->front()), *aliased);
     }
   }
 }
