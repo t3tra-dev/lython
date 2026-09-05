@@ -435,8 +435,22 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     logicalInputs.push_back(sig.varargType);
   if (sig.kwargType)
     logicalInputs.push_back(sig.kwargType);
+  // ⭐ A CAPTURE'S DECLARED TYPE IS WIDENED, because the value that arrives is.
+  // `flag = True` binds `literal<True>` and its runtime bundle is
+  // `builtins.bool`, so a nested def capturing it was refused in the lowering:
+  // "closure capture 0 has type '!py.contract<"builtins.bool">', expected
+  // '!py.literal<True>'". The same capture of an int, a str or a float works,
+  // and so does a bool assigned TWICE -- the rebinding is what widened it --
+  // which is what says the literal is the accident here.
+  //
+  // ⛔ Widening every literal rather than the bool: a literal IS assignable to
+  // its own contract, so the three kinds that work keep working, and one rule
+  // is what stops the next kind from having its own accident.
+  auto captureType = [&](const Capture &capture) {
+    return types.widenLiteral(capture.value.type);
+  };
   for (const Capture &capture : captures)
-    logicalInputs.push_back(capture.value.type);
+    logicalInputs.push_back(captureType(capture));
 
   auto funcType =
       builder.getFunctionType(logicalInputs, mlir::TypeRange{sig.resultType});
@@ -465,7 +479,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     llvm::SmallVector<mlir::Type, 4> captureTypes;
     for (const Capture &capture : captures) {
       captureNames.push_back(capture.name);
-      captureTypes.push_back(capture.value.type);
+      captureTypes.push_back(captureType(capture));
     }
     func->setAttr("closure_names", stringArray(builder, captureNames));
     func->setAttr("closure_types", typeArray(builder, captureTypes));
