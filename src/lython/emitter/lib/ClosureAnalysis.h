@@ -26,6 +26,12 @@ llvm::StringSet<> functionLocalNames(const parser::Node &callable);
 // must be promoted to shared cells (R6).
 llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable);
 
+// Locals of `callable` whose FIRST binding in its own statement list comes
+// after the first nested function or lambda that reads them. Such a name has
+// no value at the def site, so it needs a cell that the later binding fills --
+// which is what CPython's frame gives every closed-over name.
+llvm::StringSet<> namesBoundAfterNestedReader(const parser::Node &callable);
+
 // Names bound exactly once directly in `scope`'s own statement list, counting
 // a loop target as more than once. Used at module scope to tell a constant
 // apart from a name the module rebinds.

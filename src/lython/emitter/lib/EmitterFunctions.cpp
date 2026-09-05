@@ -683,6 +683,40 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
     values[boxed.getKey()] = cell;
     types.bindSymbol(boxed.getKey(), cellContentType(cell.type));
   }
+  // ⭐ AND AN EMPTY CELL FOR A NAME THE BODY BINDS ONLY LATER. The assignment
+  // path makes a cell on a name's FIRST binding, so a nested def that READS
+  // the name before that binding had nothing to capture and the name was
+  // dropped from the capture walk -- "emit error: unresolved name 'is_odd'"
+  // for the mutually recursive pair, which the same two defs at module scope
+  // or in a class body have always resolved:
+  //
+  //     def go(n: int) -> bool:
+  //         def is_even(k: int) -> bool:
+  //             return True if k == 0 else is_odd(k - 1)
+  //         def is_odd(k: int) -> bool:
+  //             return False if k == 0 else is_even(k - 1)
+  //         return is_even(n)
+  //
+  // ⛔ Why NOT resolve the sibling to its SYMBOL instead, the way a def's own
+  // name resolves inside its body: the pair is circular, so the binding
+  // reference for one needs the other's captures and neither can be built
+  // first. A cell is what CPython's frame has here, and `tracksBinding` keeps
+  // a read before the binding an error rather than a garbage value -- an
+  // `UnboundLocalError` where CPython says `NameError` ("cannot access free
+  // variable ... in enclosing scope"), which is its base class and catches the
+  // same, but not the same name.
+  //
+  // ⛔ AND THE MUTUAL PAIR LEAKS, because it is a reference CYCLE: the cell
+  // holds one function object, whose closure store holds the other, whose
+  // store holds the cell. Measured at 889 B per call for a pair that captures
+  // a 512-byte string, against 240 B for the same pair capturing nothing. That
+  // is this runtime's refcount model and not this fix -- two objects pointing
+  // at each other leak 1284 B per iteration, and `xs.append(xs)` leaks 861,
+  // both of which CPython collects with a cycle GC this compiler does not
+  // have. Refusing the program is not the smaller cost: it compiled to
+  // "unresolved name" and nothing ran at all.
+  if (!isLambda)
+    emitForwardBoundCells(callable);
   if (preboundTypeObjectName && preboundTypeObject) {
     mlir::Type classType = types.typeObject(preboundTypeObject);
     auto typeObject = py::TypeObjectOp::create(builder, loc(callable),
@@ -898,6 +932,27 @@ void ModuleEmitter::evaluateNestedDefaults(
     for (auto [index, value] : llvm::enumerate(*kwDefaults))
       evaluateNestedDefault(value,
                             positionalCount + static_cast<unsigned>(index));
+}
+
+void ModuleEmitter::emitForwardBoundCells(const parser::Node &callable) {
+  const auto *body = ast::nodeList(callable, "body");
+  if (!body)
+    return;
+  for (const auto &forward : namesBoundAfterNestedReader(callable)) {
+    llvm::StringRef name = forward.getKey();
+    if (values.count(name))
+      continue;
+    mlir::Type content = inferConditionalLocalType({body}, name);
+    // The storability rule the conditional slots end with: a slot for an
+    // erased type accepts every write and refuses every read.
+    if (!content || py::isPyObjectType(content))
+      continue;
+    auto unbound = py::UnboundOp::create(builder, loc(callable), content);
+    values[name] =
+        emitCellAlloc(callable, Value{unbound.getResult(), content},
+                      /*tracksBinding=*/true);
+    types.bindSymbol(name, content);
+  }
 }
 
 Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {

@@ -216,6 +216,11 @@ private:
   // Emitted at the class statement's position in module flow, beside the
   // attribute initializers, for the same reason.
   void emitInitSubclassHook(const parser::Node &classDef);
+  // A cell, empty and binding-tracked, for every local of `callable` whose
+  // first binding comes after the nested def or lambda that reads it. The
+  // assignment path only makes a cell at a name's FIRST binding, so without
+  // this the reader has nothing to capture and the name is dropped.
+  void emitForwardBoundCells(const parser::Node &callable);
   Value emitNestedFunctionDecl(const parser::Node &function);
   mlir::ArrayAttr emitCallableDefaultValues(const parser::Node &function,
                                             const FunctionSignature &sig,

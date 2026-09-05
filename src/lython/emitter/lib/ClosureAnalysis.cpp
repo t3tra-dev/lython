@@ -399,7 +399,55 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable) {
     if (locals.contains(entry.getKey()) &&
         assignments.lookup(entry.getKey()) > 1)
       boxed.insert(entry.getKey());
+
+  // ⭐ AND A NAME BOUND ONLY AFTER THE DEF THAT READS IT, which the
+  // more-than-once rule above cannot see: one binding means the cell and the
+  // copy hold the same thing forever only when that binding comes FIRST.
+  // Mutually recursive nested functions are the shape this refused --
+  // `is_even` reads `is_odd`, whose def has not run yet -- and they were
+  // "emit error: unresolved name 'is_odd'". The same pair written at module
+  // scope or in a class body has always worked.
+  for (const auto &entry : namesBoundAfterNestedReader(callable))
+    boxed.insert(entry.getKey());
   return boxed;
+}
+
+llvm::StringSet<> namesBoundAfterNestedReader(const parser::Node &callable) {
+  llvm::StringSet<> forward;
+  const auto *body = ast::nodeList(callable, "body");
+  if (!body)
+    return forward;
+  llvm::StringSet<> locals;
+  collectFunctionLocalNames(callable, locals);
+  llvm::StringSet<> parameters;
+  collectParameterNames(ast::node(callable, "args"), parameters);
+
+  llvm::StringMap<unsigned> firstRead;
+  llvm::StringMap<unsigned> firstBinding;
+  for (auto [index, statement] : llvm::enumerate(*body)) {
+    llvm::SmallVector<const parser::Node *, 4> readers;
+    collectDirectNestedFunctions(statement.get(), readers);
+    collectDirectNestedLambdas(statement.get(), readers);
+    for (const parser::Node *reader : readers)
+      for (const std::string &capture : lexicalCaptureNames(*reader))
+        firstRead.try_emplace(capture, static_cast<unsigned>(index));
+    llvm::StringSet<> bound;
+    collectLocalNames(statement.get(), bound);
+    for (const auto &entry : bound)
+      firstBinding.try_emplace(entry.getKey(), static_cast<unsigned>(index));
+  }
+
+  for (const auto &entry : firstRead) {
+    llvm::StringRef name = entry.getKey();
+    if (parameters.contains(name) || !locals.contains(name))
+      continue;
+    auto binding = firstBinding.find(name);
+    if (binding == firstBinding.end())
+      continue;
+    if (binding->second > entry.getValue())
+      forward.insert(name);
+  }
+  return forward;
 }
 
 llvm::StringSet<> singleAssignmentNames(const parser::Node &scope) {

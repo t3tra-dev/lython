@@ -4647,6 +4647,10 @@ Value ModuleEmitter::emitInlineMethodBody(
     emitStatement(*stub);
     synthesizedIteratorDefs.push_back(std::move(stub));
   } else {
+    // ⛔ Here and not beside the `currentBoxedLocals` promotion above: the
+    // cells are ops, and the parameter binding between the two is what puts
+    // the builder inside the region they belong to.
+    emitForwardBoundCells(*method.method);
     emitStatements(body);
   }
   inlineFrames.pop_back();
