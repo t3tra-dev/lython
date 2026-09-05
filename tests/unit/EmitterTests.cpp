@@ -1593,3 +1593,54 @@ TEST(EmitterTest, AMultiValueLiteralAnnotationIsTheJoinOfItsMembers) {
       single);
   EXPECT_TRUE(one.ok()) << diagnosticText(one);
 }
+
+// A return whose type does not match the annotation is refused HERE, where both
+// types have names. It used to reach the lowering and surface as "callable
+// return ABI expected 2 physical values, but lowering produced 1" -- and inside
+// a `try`, where the return leaves through a join, as "cannot adapt runtime
+// bundle builtins.int ... to expected ABI".
+TEST(EmitterTest, AReturnThatDoesNotMatchItsAnnotationIsNamed) {
+  auto refusedNaming = [](lython::emitter::EmitResult &emitted) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      if (diagnostic.message.find("annotated to return") != std::string::npos &&
+          diagnostic.message.find("but this return gives") != std::string::npos)
+        return true;
+    return false;
+  };
+
+  mlir::MLIRContext plain(testRegistry());
+  lython::emitter::EmitResult direct = emitSource(
+      "def run() -> str:\n    return 1\n\n\nprint(run())\n", plain);
+  EXPECT_FALSE(direct.ok());
+  EXPECT_TRUE(refusedNaming(direct));
+
+  // The same return inside a `try` leaves through a join rather than a
+  // `func.return`, which is why the check sits before the paths diverge.
+  mlir::MLIRContext guarded(testRegistry());
+  lython::emitter::EmitResult inTry = emitSource(
+      "def run() -> str:\n"
+      "    try:\n"
+      "        return 1\n"
+      "    except ValueError:\n"
+      "        return \"caught\"\n\n\n"
+      "print(run())\n",
+      guarded);
+  EXPECT_FALSE(inTry.ok());
+  EXPECT_TRUE(refusedNaming(inTry));
+
+  // The three allowances the declared-PARAMETER check makes are kept: the
+  // numeric tower, a subclass reaching a base, and a bare generic contract.
+  mlir::MLIRContext admitted(testRegistry());
+  lython::emitter::EmitResult tower = emitSource(
+      "def run(x: int) -> float:\n    return x\n\n\nprint(run(3))\n", admitted);
+  EXPECT_TRUE(tower.ok());
+
+  mlir::MLIRContext subclass(testRegistry());
+  lython::emitter::EmitResult base = emitSource(
+      "class B:\n"
+      "    def __init__(self) -> None:\n        self.n: int = 1\n"
+      "class D(B):\n    pass\n"
+      "def make() -> B:\n    return D()\n\n\nprint(make().n)\n",
+      subclass);
+  EXPECT_TRUE(base.ok()) << base.diagnostics.size();
+}

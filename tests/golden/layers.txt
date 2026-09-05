@@ -54,7 +54,7 @@ errors/generic_class_no_class_object emit
 errors/generic_class_pack_parameter emit
 errors/generic_class_ungrounded emit
 errors/global_declaration_without_storage emit
-errors/int_element_in_a_float_container lower
+errors/int_element_in_a_float_container emit
 errors/int_truthiness emit
 errors/is_value_type emit
 errors/len_takes_no_keyword_arguments emit

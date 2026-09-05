@@ -1,1 +1,1 @@
-type of return operand 0 .*builtins\.int.* doesn.t match function result type .*builtins\.float
+function is annotated to return .*builtins\.list.*builtins\.float.* but this return gives .*builtins\.list.*builtins\.int

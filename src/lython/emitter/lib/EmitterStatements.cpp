@@ -1592,6 +1592,112 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     Value value = returnValue
                       ? emitExprExpected(returnValue, currentReturnType)
                       : emitExpr(returnValue);
+    // ⭐ THE RETURN IS CHECKED HERE, where both types have names and BEFORE the
+    // paths diverge. A value the coercion cannot retype used to travel to the
+    // lowering and surface as "callable return ABI expected 2 physical values,
+    // but lowering produced 1" -- a sentence about physical values, for
+    // `def run() -> str: return 1`. Inside a `try` it read further still:
+    // "cannot adapt runtime bundle builtins.int with physical values
+    // (memref<2xi64>) to expected ABI (memref<2xi64>, memref<?xi8>)", because
+    // that return leaves through a join rather than a `func.return`.
+    //
+    // ⛔ The INFERRED type of the expression, not the emitted value's: an
+    // expected-type emission stamps the expectation on the value, so asking
+    // the value what it is answers with what was asked for.
+    //
+    // ⛔ And `object` contributes nothing, which is the same rule the field
+    // walk uses: it is the inference saying it does not know, and refusing on
+    // it would reject programs whose returns are fine.
+    if (returnValue && currentReturnType) {
+      mlir::Type returnedType =
+          types.widenLiteral(types.inferExpr(returnValue));
+      // The three allowances the DECLARED PARAMETER check makes, for the same
+      // reasons and spelled the same way (EmitterClasses.cpp): the numeric
+      // tower, which `isAssignableTo` answers false for; a subclass reaching a
+      // base; and a BARE generic contract accepting an instantiation of itself.
+      auto numericRung = [&](mlir::Type type) {
+        if (type == types.boolType())
+          return 0;
+        if (type == types.intType())
+          return 1;
+        if (type == types.floatType())
+          return 2;
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+        if (contract && contract.getArguments().empty() &&
+            contract.getContractName() == "builtins.complex")
+          return 3;
+        return -1;
+      };
+      auto accepted = [&](mlir::Type returned, mlir::Type declared) {
+        if (py::isAssignableTo(returned, declared, module))
+          return true;
+        int returnedRung = numericRung(returned);
+        int declaredRung = numericRung(declared);
+        if (returnedRung >= 0 && declaredRung >= 0 &&
+            returnedRung <= declaredRung)
+          return true;
+        auto declaredContract =
+            mlir::dyn_cast_if_present<py::ContractType>(declared);
+        auto returnedContract =
+            mlir::dyn_cast_if_present<py::ContractType>(returned);
+        if (!declaredContract || !returnedContract)
+          return false;
+        if (llvm::is_contained(classMro(returnedContract.getContractName()),
+                               declaredContract.getContractName()))
+          return true;
+        return declaredContract.getArguments().empty() &&
+               !returnedContract.getArguments().empty() &&
+               declaredContract.getContractName() ==
+                   returnedContract.getContractName();
+      };
+      // ⛔ `object` ANYWHERE IN THE RETURNED TYPE is the inference saying it
+      // does not know, not a type to refuse on -- the same rule the class-field
+      // walk uses. An empty or heterogeneous list literal infers
+      // `list[object]`, and `os.listdir` in the embedded stdlib returns one
+      // where `list[str]` is declared; refusing that takes the whole stdlib
+      // with it.
+      std::function<bool(mlir::Type)> mentionsObject = [&](mlir::Type type) {
+        if (!type)
+          return false;
+        if (py::isPyObjectType(type))
+          return true;
+        auto contract = mlir::dyn_cast<py::ContractType>(type);
+        if (!contract)
+          return false;
+        for (mlir::Type argument : contract.getArguments())
+          if (mentionsObject(argument))
+            return true;
+        return false;
+      };
+      // ⛔ BOTH SIDES ORDINARY NAMED CONTRACTS, and every exclusion is
+      // measured. `inferExpr` is not the emitter's own value tracking, so it
+      // answers for shapes this check cannot judge:
+      //   - a UNION on either side: the inference does not carry the branch
+      //     narrowing, so a guarded `return self.value` on an `int | None`
+      //     field infers the union (wb_an_optional_field_guarded_by_a_check),
+      //     and a member returned where a union is declared reads as a
+      //     mismatch (a_return_that_is_a_number_or_a_flag).
+      //   - a LITERAL declared: a generator's inferred return annotation is one
+      //     (generator_return_value).
+      //   - a synthesized `__ly_slot$N`: the storage a conditional binding gets
+      //     (a_name_bound_on_one_path_survives_it, try_rebind_storage_boundary).
+      // What is left is the shape the message is worth having for: two named
+      // contracts that simply are not the same type.
+      auto ordinaryContract = [](mlir::Type type) {
+        auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+        return contract && !contract.getContractName().starts_with("__ly");
+      };
+      if (returnedType && !mentionsObject(returnedType) &&
+          ordinaryContract(returnedType) &&
+          ordinaryContract(currentReturnType) &&
+          !accepted(returnedType, currentReturnType)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, statement.range.start,
+            "function is annotated to return " + typeText(currentReturnType) +
+                " but this return gives " + typeText(returnedType)});
+        return;
+      }
+    }
     if (!inlineReturnContexts.empty()) {
       InlineReturnContext &ctx = inlineReturnContexts.back();
       if (ctx.carryResult) {

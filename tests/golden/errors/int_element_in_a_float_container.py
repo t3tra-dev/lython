@@ -23,6 +23,12 @@
 # float-declared container -- which is the representation question recorded in
 # tests/probe/wb_grid_leftovers_2026_08_16.py, not something this refusal decides.
 #
+# ⛔ The sentence changed on 2026-09-05 and the refusal did not. It used to be
+# the MLIR verifier's ("type of return operand 0 ... doesn't match function
+# result type"), which reaches the reader only after the emitter has let the
+# return through; the emitter now checks the return against its annotation and
+# says so at the `return`, in source terms.
+#
 # ⛔ Two channels still mis-execute and neither is this one: a module-global
 # container (`xs: list[float] = [1]` at module scope) goes through the static
 # attribute initializer, and a tuple literal builds `tuple[float, float]` directly
