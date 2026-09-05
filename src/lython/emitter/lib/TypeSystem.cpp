@@ -536,6 +536,27 @@ void collectGeneratorFunctionAnalysis(
     const parser::Node *target = ast::node(*node, "target");
     if (target && target->kind == "Name") {
       mlir::Type type = types.annotationType(ast::node(*node, "annotation"));
+      // ⭐ A NUMERIC ANNOTATION DOES NOT RETYPE THE VALUE, and this walk has to
+      // say what the EMITTER does rather than what the declaration asks for.
+      // `coerceValue` declines to retype between int, float and bool -- they
+      // share no representation -- so `v: float = 1` binds the int, and a walk
+      // that recorded `float` here made the function disagree with its own
+      // body: `def outer() -> float: v: float = 1; return v` was refused with
+      // "type of return operand 0 ('!py.literal<1>') doesn't match function
+      // result type".
+      //
+      // ⛔ Not for a `complex` annotation: `inferExpr` answers
+      // `builtins.float` for `1.0 + 0.0j`, so re-reading one would bind float
+      // over a complex value. Same measurement as the return walk's.
+      if (value)
+        if (int declaredRung = numericTowerRung(types, type);
+            declaredRung > 0 && declaredRung <= 2) {
+          mlir::Type supplied =
+              types.widenLiteral(lenientWalkInfer(types, value, analysis));
+          if (int suppliedRung = numericTowerRung(types, supplied);
+              suppliedRung >= 0 && suppliedRung < declaredRung)
+            type = supplied;
+        }
       if (!type && value)
         type = lenientWalkInfer(types, value, analysis);
       if (type)
