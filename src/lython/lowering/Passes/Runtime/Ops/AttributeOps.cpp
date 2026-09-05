@@ -2318,16 +2318,44 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
     auto built = mlir::scf::IfOp::create(
         builder, loc, matches[index],
         [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
+          // ⭐ THE SLOT'S SHAPE, NOT THE MEMBER'S. What the box holds is
+          // whatever the contract's `box` primitive returns, which for
+          // `builtins.bool` is a three-word singleton header and not the truth
+          // bit -- so reading it back as the member's own lanes said
+          // "builtins.bool has no statically sized entity lane to rebuild a box
+          // from, got 'i1'". The store side normalizes through the same
+          // primitive, and this is that step in the other direction; it is also
+          // the pair a boxed container element and a closure capture use.
+          mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> slotShapes =
+              RuntimeBundleLowerer::slotStorageShapesFor(op, member,
+                                                         "union member ABI");
+          if (mlir::failed(slotShapes)) {
+            armFailed = true;
+            mlir::scf::YieldOp::create(nested, nestedLoc, mlir::ValueRange{});
+            return;
+          }
           mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
               RuntimeBundleLowerer::lanesFromBoxEntity(
-                  nested, nestedLoc, entityWord, *laneTypes, contractName, op);
+                  nested, nestedLoc, entityWord, *slotShapes, contractName, op);
           if (mlir::failed(lanes)) {
             armFailed = true;
             mlir::scf::YieldOp::create(nested, nestedLoc, mlir::ValueRange{});
             return;
           }
-          mlir::scf::YieldOp::create(nested, nestedLoc,
-                                     mlir::ValueRange{*lanes});
+          // The unbox writes through the lowerer's own builder, so it is
+          // pointed into this region rather than handed a second one -- the
+          // same device the dead materializer below uses.
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToEnd(nested.getInsertionBlock());
+          mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> unboxed =
+              RuntimeBundleLowerer::unboxSlotElementValues(op, member, *lanes);
+          if (mlir::failed(unboxed)) {
+            armFailed = true;
+            mlir::scf::YieldOp::create(builder, nestedLoc, mlir::ValueRange{});
+            return;
+          }
+          mlir::scf::YieldOp::create(builder, nestedLoc,
+                                     mlir::ValueRange{*unboxed});
         },
         [&](mlir::OpBuilder &nested, mlir::Location nestedLoc) {
           // The dead materializer writes through the lowerer's own builder, so

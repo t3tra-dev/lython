@@ -1687,7 +1687,13 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
         auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
         return contract && !contract.getContractName().starts_with("__ly");
       };
+      // ⛔ And `object` in the DECLARED type too, which is a regression this
+      // check introduced before the exclusion existed: `def f() -> list[object]:
+      // return [1, "a"]` compiled and then did not. An `object` element accepts
+      // anything, so a declaration that names one is not a claim this check can
+      // refuse against.
       if (returnedType && !mentionsObject(returnedType) &&
+          !mentionsObject(currentReturnType) &&
           ordinaryContract(returnedType) &&
           ordinaryContract(currentReturnType) &&
           !accepted(returnedType, currentReturnType)) {

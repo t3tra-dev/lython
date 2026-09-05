@@ -535,8 +535,21 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
               op, member, lanes, memberBundle,
               concrete->objectValue.ownership)))
         return mlir::failure();
+      // ⭐ A BOOL MEMBER HAS NO HEADER TO HAND OVER, and the slot needs one.
+      // `builtins.bool` is the one contract whose whole value is an `i1`, so
+      // `objectPayloadHandleWords` asked it for a header and got the truth bit:
+      // "builtins.bool runtime object header has invalid type 'i1'", for
+      // `[classify(-1)]` where `classify` returns `int | bool`. RETURNING the
+      // same union works, and so does a plain `[True, False]` -- the literal
+      // path already normalizes through the contract's `box` primitive, and
+      // this is the same step for a member the union splices inline.
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<RuntimeBundle> normalizedMember =
+          RuntimeBundleLowerer::normalizeBoxSource(op, memberBundle);
+      if (mlir::failed(normalizedMember))
+        return mlir::failure();
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> memberWords =
-          RuntimeBundleLowerer::objectPayloadHandleWords(op, memberBundle,
+          RuntimeBundleLowerer::objectPayloadHandleWords(op, *normalizedMember,
                                                           ownsPayload);
       if (mlir::failed(memberWords))
         return mlir::failure();
