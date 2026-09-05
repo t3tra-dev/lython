@@ -1483,3 +1483,36 @@ TEST(EmitterTest, ACellsElementStorageNamesItsRepresentation) {
     EXPECT_TRUE(emitSource(local, context).ok()) << local;
   }
 }
+
+TEST(EmitterTest, AMethodThatExistsIsNotReportedAsMissing) {
+  // `list[float]` provides `append`; what it does not have is an overload
+  // taking an int. Both cases said "does not provide manifest method", and a
+  // reader given that sentence looks for a missing method that is not there.
+  mlir::MLIRContext wrongArguments(testRegistry());
+  lython::emitter::EmitResult mismatched = emitSource(
+      "xs: list[float] = [1.0]\nxs.append(1)\nprint(xs)\n", wrongArguments);
+  EXPECT_FALSE(mismatched.ok());
+  bool namedTheArguments = false;
+  for (const lython::parser::Diagnostic &diagnostic : mismatched.diagnostics)
+    namedTheArguments =
+        namedTheArguments ||
+        (diagnostic.message.find("has manifest method 'append'") !=
+             std::string::npos &&
+         diagnostic.message.find("no signature that accepts") !=
+             std::string::npos);
+  EXPECT_TRUE(namedTheArguments);
+
+  // A method the receiver really does not have keeps the other sentence.
+  mlir::MLIRContext noSuchMethod(testRegistry());
+  lython::emitter::EmitResult missing =
+      emitSource("xs: list[int] = [1]\nprint(xs.no_such_method())\n",
+                 noSuchMethod);
+  EXPECT_FALSE(missing.ok());
+  bool namedTheMethod = false;
+  for (const lython::parser::Diagnostic &diagnostic : missing.diagnostics)
+    namedTheMethod = namedTheMethod ||
+                     diagnostic.message.find("does not provide manifest "
+                                             "method 'no_such_method'") !=
+                         std::string::npos;
+  EXPECT_TRUE(namedTheMethod);
+}

@@ -86,15 +86,49 @@ std::string literalSpelling(const parser::Node &constant) {
   return "object";
 }
 
+// ⭐ "DOES NOT PROVIDE" AND "DOES NOT ACCEPT THESE" ARE DIFFERENT SENTENCES,
+// and the first was said for both:
+//
+//     xs: list[float] = [1.0]
+//     xs.append(1)
+//     # static type list[float] does not provide manifest method 'append'
+//
+// `list[float]` provides `append`; what it does not have is an overload taking
+// an int. A reader given the first sentence looks for a missing method, which
+// is not there to find. The protocol table already enumerates candidates BY
+// NAME, so the two cases are one lookup apart.
 CallInferenceResult unresolvedMethodCall(const TypeSystem &types,
                                          mlir::Type receiverType,
-                                         llvm::StringRef methodName) {
+                                         llvm::StringRef methodName,
+                                         mlir::ArrayRef<mlir::Type> positional,
+                                         mlir::ArrayRef<CallKeywordType>
+                                             keywords) {
+  std::string subject =
+      "static type " + typeText(types.widenLiteral(receiverType));
+  if (!types.declaresManifestMethod(receiverType, methodName))
+    return CallInferenceResult{
+        {},
+        {},
+        false,
+        subject + " does not provide manifest method '" + methodName.str() +
+            "'"};
+  std::string arguments;
+  for (mlir::Type argument : positional) {
+    if (!arguments.empty())
+      arguments += ", ";
+    arguments += typeText(types.widenLiteral(argument));
+  }
+  for (const CallKeywordType &keyword : keywords) {
+    if (!arguments.empty())
+      arguments += ", ";
+    arguments += keyword.name + "=" + typeText(types.widenLiteral(keyword.type));
+  }
   return CallInferenceResult{
       {},
       {},
       false,
-      ("static type " + typeText(types.widenLiteral(receiverType)) +
-       " does not provide manifest method '" + methodName.str() + "'")};
+      subject + " has manifest method '" + methodName.str() +
+          "' but no signature that accepts (" + arguments + ")"};
 }
 
 CallInferenceResult unresolvedCallable(mlir::Type calleeType,
@@ -4139,7 +4173,19 @@ CallInferenceResult TypeSystem::inferMethodCallWithEvidence(
     if (manifestMethodReceiverContract(receiverType, methodName))
       return inferMethodCallWithEvidence(positional.front(), methodName,
                                          positional.drop_front(), keywords);
-  return unresolvedMethodCall(*this, receiverType, methodName);
+  return unresolvedMethodCall(*this, receiverType, methodName, positional,
+                              keywords);
+}
+
+bool TypeSystem::declaresManifestMethod(mlir::Type receiverType,
+                                        llvm::StringRef methodName) const {
+  const py::protocols::Table &table = py::protocols::Table::get(getContext());
+  for (const py::protocols::ContractResolution &candidate :
+       table.methodContractCandidatesWithEvidence(receiverType, methodName)) {
+    (void)candidate;
+    return true;
+  }
+  return false;
 }
 
 bool TypeSystem::isStructuralMutatorMethod(mlir::Type receiverType,

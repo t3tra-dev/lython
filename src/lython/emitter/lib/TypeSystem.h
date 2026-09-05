@@ -393,6 +393,11 @@ public:
   // Manifest fact (`ly.typing.structural_mutators`): the method structurally
   // mutates the receiver, so its call rebinds the receiver local through an
   // extra receiver-typed call result.
+  // Does the receiver declare a manifest method of this NAME at all, whatever
+  // its signature? "does not provide" and "does not accept these arguments"
+  // are different sentences and the reader acts on them differently.
+  bool declaresManifestMethod(mlir::Type receiverType,
+                              llvm::StringRef methodName) const;
   bool isStructuralMutatorMethod(mlir::Type receiverType,
                                  llvm::StringRef methodName) const;
   // Ordered `__match_args__` attribute names for positional class patterns on
