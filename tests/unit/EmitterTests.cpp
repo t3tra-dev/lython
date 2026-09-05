@@ -1548,3 +1548,48 @@ TEST(EmitterTest, AnImportedModulesOwnBindingIsNotAnUnresolvedName) {
       "import counted\nprint(counted.get())\n");
   EXPECT_TRUE(scalar.succeeded) << scalar.diagnostics;
 }
+
+// `Literal[a, b]` is the JOIN of its members. The tuple slice fell to a
+// fallback that built `!py.literal<object>` -- a literal whose spelling is the
+// word "object" -- and every call and every operation on the annotated name was
+// then refused with a sentence about the Callable contract. Emit-level: once
+// the annotation names a type the program can use, nothing about the running
+// values is new.
+TEST(EmitterTest, AMultiValueLiteralAnnotationIsTheJoinOfItsMembers) {
+  auto diagnosticText = [](const lython::emitter::EmitResult &emitted) {
+    std::string text;
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      text += diagnostic.message + "\n";
+    return text;
+  };
+  mlir::MLIRContext strings(testRegistry());
+  lython::emitter::EmitResult twoStrings = emitSource(
+      "from typing import Literal\n\n\n"
+      "def go(mode: Literal[\"a\", \"b\"]) -> int:\n"
+      "    return 1 if mode == \"a\" else 2\n\n\n"
+      "print(go(\"a\"), go(\"b\"))\n",
+      strings);
+  EXPECT_TRUE(twoStrings.ok()) << diagnosticText(twoStrings);
+
+  // The members are widened before the join, so an int Literal supports int
+  // arithmetic rather than answering as a union of two literals.
+  mlir::MLIRContext ints(testRegistry());
+  lython::emitter::EmitResult twoInts = emitSource(
+      "from typing import Literal\n\n\n"
+      "def go(n: Literal[1, 2]) -> int:\n"
+      "    return n * 10\n\n\n"
+      "print(go(1), go(2))\n",
+      ints);
+  EXPECT_TRUE(twoInts.ok()) << diagnosticText(twoInts);
+
+  // A one-member Literal keeps its exact literal type, which is what made the
+  // tuple slice the gap rather than the annotation.
+  mlir::MLIRContext single(testRegistry());
+  lython::emitter::EmitResult one = emitSource(
+      "from typing import Literal\n\n\n"
+      "def go(mode: Literal[\"a\"]) -> str:\n"
+      "    return mode\n\n\n"
+      "print(go(\"a\"))\n",
+      single);
+  EXPECT_TRUE(one.ok()) << diagnosticText(one);
+}

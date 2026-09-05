@@ -2851,10 +2851,37 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       return py::CallableType::get(&context, positional, {}, vararg, kwarg,
                                    {result});
     }
-    if (annotationNameIs(baseName, "Literal"))
-      return literal(slice && slice->kind == "Constant"
-                         ? literalSpelling(*slice)
-                         : "object");
+    if (annotationNameIs(baseName, "Literal")) {
+      if (slice && slice->kind == "Constant")
+        return literal(literalSpelling(*slice));
+      // ⭐ `Literal[a, b]` IS THE JOIN OF ITS MEMBERS, and the fallback below
+      // made it `!py.literal<object>` -- a literal whose spelling is the word
+      // "object", which no operation and no call accepts:
+      //
+      //     def go(mode: Literal["a", "b"]) -> int: ...
+      //     go("a")   # is not callable: call arguments do not match the
+      //               # Callable contract
+      //
+      // A one-member `Literal["a"]` has always worked, which is what says the
+      // tuple slice is the gap and not the annotation.
+      //
+      // ⛔ The members are WIDENED before the join, so `Literal[1, 2]` is
+      // `int` rather than a union of two int literals: a union would have to
+      // answer `__mul__` to be usable, and every value the annotation admits
+      // is an int. A mixed `Literal[1, "a"]` still joins to `int | str`, which
+      // is what it means.
+      if (slice && slice->kind == "Tuple")
+        if (const auto *elts = ast::nodeList(*slice, "elts")) {
+          llvm::SmallVector<mlir::Type, 4> members;
+          for (const parser::NodePtr &elt : *elts)
+            members.push_back(elt && elt->kind == "Constant"
+                                  ? widenLiteral(literal(literalSpelling(*elt)))
+                                  : object());
+          if (!members.empty())
+            return join(members);
+        }
+      return object();
+    }
     llvm::SmallVector<mlir::Type, 4> arguments;
     if (slice && slice->kind == "Tuple") {
       if (const auto *elts = ast::nodeList(*slice, "elts"))
