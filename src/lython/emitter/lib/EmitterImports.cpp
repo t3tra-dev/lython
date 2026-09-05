@@ -1410,6 +1410,16 @@ void ModuleEmitter::predeclareTopLevel() {
         continue;
       types.bindAnnotationTypeAlias(ast::nameSpelling(*targets->front()),
                                     types.annotationType(value));
+      // ⛔ MEASURED AND DROPPED: also binding a Name alias of a declared class
+      // as a CLASS, so `W = Widget` then `cls = W` inside a function works the
+      // way `cls = Widget` does (it is "unresolved name 'W'" today, because a
+      // module global holding a class has no storage). `bindClass` at this
+      // point is unscoped, so the alias then beat a PARAMETER of the same
+      // spelling: `t = A` at module scope made `def build_b(t: type[B]) -> B:
+      // return t(n)` construct an A, which cases/type_object_representation
+      // caught as "annotated to return B but this return gives A". The alias
+      // has to be scoped like a class binding is inside a function before this
+      // can be tried again.
     }
   }
 }
