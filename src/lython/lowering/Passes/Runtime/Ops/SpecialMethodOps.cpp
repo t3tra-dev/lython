@@ -349,8 +349,63 @@ bool RuntimeBundleLowerer::crossesStorageDefiningBlock(
     defBlock = argument.getOwner();
   else if (mlir::Operation *defOp = anchor.getDefiningOp())
     defBlock = defOp->getBlock();
-  // Same block: appended evidence dominates every later same-function use.
-  return defBlock && defBlock != op->getBlock();
+  if (!defBlock)
+    return false;
+  if (defBlock != op->getBlock())
+    return true;
+  // ⭐ A FIELD READ IS A FRESH VALUE CARRYING INHERITED EVIDENCE. `b.table`
+  // produces a new SSA value in the block that reads it, so the test above
+  // called the evidence block-local -- but the mapping it carries was recorded
+  // where the FIELD was built. Inside a loop that evidence is a full iteration
+  // stale, and the replace it drives releases the value stored at
+  // CONSTRUCTION on every trip:
+  //
+  //     class Bag:
+  //         def __init__(self) -> None:
+  //             self.table: dict[str, int] = {"a": 1}
+  //     b = Bag()
+  //     for i in range(2):
+  //         b.table["c"] = i
+  //     print(sorted(b.table.items()))     # SEGV; CPython prints [('a', 1), ('c', 1)]
+  //
+  // The same store with the field bound to a local first, or written twice
+  // without a loop, is correct -- which is what says the staleness is the trip
+  // and not the field.
+  //
+  // ⛔ Only in a CYCLE. A field read in straight-line code has evidence that
+  // is exactly as good as the field's, and demoting it there would cost the
+  // evidence tier on every program that reads a field container once.
+  //
+  // ⛔ And only MAPPING evidence, which is measured: demoting a list field's
+  // sequence evidence in a loop takes `b.items.append(i)` from correct to
+  // "list.append on a field or borrowed list is not supported inside a branch
+  // or loop body" -- the mutation path there needs an owned handle from an
+  // evidence element, which is the unbuilt change the repr exemption above
+  // also names. A dict's replace is the shape that goes wrong, and it is the
+  // mapping evidence that drives it.
+  if (bundle.mappingKeys.empty())
+    return false;
+  if (!bundle.fieldAliasOwner)
+    return false;
+  mlir::Block *ownerBlock = nullptr;
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(bundle.fieldAliasOwner))
+    ownerBlock = argument.getOwner();
+  else if (mlir::Operation *ownerOp = bundle.fieldAliasOwner.getDefiningOp())
+    ownerBlock = ownerOp->getBlock();
+  if (!ownerBlock || ownerBlock == op->getBlock())
+    return false;
+  llvm::SmallPtrSet<mlir::Block *, 16> seen;
+  llvm::SmallVector<mlir::Block *, 16> worklist(op->getBlock()->succ_begin(),
+                                                op->getBlock()->succ_end());
+  while (!worklist.empty()) {
+    mlir::Block *current = worklist.pop_back_val();
+    if (current == op->getBlock())
+      return true;
+    if (!seen.insert(current).second)
+      continue;
+    worklist.append(current->succ_begin(), current->succ_end());
+  }
+  return false;
 }
 
 // Compile-time contents evidence describes a mutable container AS OF THE BLOCK
