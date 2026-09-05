@@ -267,6 +267,8 @@ void ModuleEmitter::emitInDefiningModuleScope(
       source.sourceName.empty() ? source.moduleName : source.sourceName);
   llvm::SaveAndRestore<std::string> savedPackageName(activePackageName,
                                                      source.packageName);
+  llvm::SaveAndRestore<const parser::Node *> savedSourceModuleNode(
+      activeSourceModuleNode, source.moduleNode);
   auto savedLoops = std::move(loopControlContexts);
   loopControlContexts.clear();
   auto savedInlineReturns = std::move(inlineReturnContexts);

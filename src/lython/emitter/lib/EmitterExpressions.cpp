@@ -152,9 +152,11 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             types.lookupCanonicalBinding(name))
       binding = *canonical;
     if (!symbolType) {
-      diagnostics.push_back(
-          parser::Diagnostic{parser::Severity::Error, expr->range.start,
-                             "unresolved name '" + std::string(name) + "'"});
+      std::string reason = importedModuleBindingReason(name);
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr->range.start,
+          reason.empty() ? "unresolved name '" + std::string(name) + "'"
+                         : reason});
       return emitNone(*expr);
     }
     if (std::optional<Value> constant =

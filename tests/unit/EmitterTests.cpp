@@ -1516,3 +1516,35 @@ TEST(EmitterTest, AMethodThatExistsIsNotReportedAsMissing) {
                          std::string::npos;
   EXPECT_TRUE(namedTheMethod);
 }
+
+TEST(EmitterTest, AnImportedModulesOwnBindingIsNotAnUnresolvedName) {
+  // A container constant in an imported module cannot be read from a function
+  // in that module -- an imported module has no executed body, so its
+  // constants travel as literals and a list has no literal spelling. The
+  // sentence was "unresolved name 'ITEMS'", pointing at a line where the name
+  // is plainly in scope, which sends the reader looking for a typo.
+  ImportedModuleEmit container = emitWithImportedModule(
+      "tabled",
+      "ITEMS: \"list[int]\" = [1, 2, 3]\n\n\ndef total() -> int:\n"
+      "    return len(ITEMS)\n",
+      "import tabled\nprint(tabled.total())\n");
+  EXPECT_FALSE(container.succeeded);
+  EXPECT_NE(container.diagnostics.find("imported module has no executed body"),
+            std::string::npos)
+      << container.diagnostics;
+
+  // A name the module really does not bind keeps the other sentence.
+  ImportedModuleEmit typo = emitWithImportedModule(
+      "typoed", "def go() -> int:\n    return NOPE\n",
+      "import typoed\nprint(typoed.go())\n");
+  EXPECT_FALSE(typo.succeeded);
+  EXPECT_NE(typo.diagnostics.find("unresolved name 'NOPE'"), std::string::npos)
+      << typo.diagnostics;
+
+  // And a SCALAR constant read the same way still works, which is what makes
+  // the container case a limitation of the channel rather than of the scope.
+  ImportedModuleEmit scalar = emitWithImportedModule(
+      "counted", "COUNT: int = 5\n\n\ndef get() -> int:\n    return COUNT\n",
+      "import counted\nprint(counted.get())\n");
+  EXPECT_TRUE(scalar.succeeded) << scalar.diagnostics;
+}

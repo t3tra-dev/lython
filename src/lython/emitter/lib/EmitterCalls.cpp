@@ -1730,9 +1730,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                            emitExpr(calleeNode));
     }
     if (!types.lookupSymbol(name) && !types.lookupClass(name)) {
+      std::string reason = importedModuleBindingReason(name);
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, calleeNode->range.start,
-          "unresolved name '" + name.str() + "'"});
+          reason.empty() ? "unresolved name '" + name.str() + "'" : reason});
       return emitNone(expr);
     }
   }

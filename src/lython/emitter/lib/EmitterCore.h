@@ -629,6 +629,14 @@ private:
   // file.
   void emitInDefiningModuleScope(const EmitOptions::SourceModule &source,
                                  llvm::function_ref<void()> body);
+  // The imported module whose body is being emitted, or null in the main
+  // module. Only a diagnostic reads it: a name that does not resolve THERE
+  // has a different cause than one that does not resolve here.
+  const parser::Node *activeSourceModuleNode = nullptr;
+  // "unresolved name" is the wrong sentence when the imported module DOES
+  // bind the name at its top level and the binding is one this compiler
+  // cannot carry across the import. Returns the honest sentence, or empty.
+  std::string importedModuleBindingReason(llvm::StringRef name) const;
   // Generic lookup for a callee spelling: the local registration first, then
   // the canonical import binding (imported generics register under their
   // canonical "<module>.<name>" symbol).

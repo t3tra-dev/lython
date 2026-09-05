@@ -661,6 +661,51 @@ sourceModuleLiteralConstant(TypeSystem &types,
   return std::nullopt;
 }
 
+// ⭐ AN IMPORTED MODULE'S CONSTANT TRAVELS AS A LITERAL, and a container has
+// no literal spelling. A module that merely DEFINES one still imports; a
+// function in it that READS one did not, and the sentence it got was
+// "unresolved name 'ITEMS'" pointing at a line where the name is plainly in
+// scope:
+//
+//     # lib.py
+//     ITEMS: list[int] = [1, 2, 3]
+//     def total() -> int:
+//         return len(ITEMS)      # unresolved name 'ITEMS'
+//
+// An imported module has no executed body (a module-level STATEMENT in one is
+// refused outright), so there is no cell for the name to read; the same three
+// lines in the MAIN module compile, because there the annotated assignment IS
+// a cell.
+std::string
+ModuleEmitter::importedModuleBindingReason(llvm::StringRef name) const {
+  if (!activeSourceModuleNode)
+    return {};
+  const auto *body = ast::nodeList(*activeSourceModuleNode, "body");
+  if (!body)
+    return {};
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement)
+      continue;
+    const parser::Node *target = nullptr;
+    if (statement->kind == "AnnAssign") {
+      target = ast::node(*statement, "target");
+    } else if (statement->kind == "Assign") {
+      if (const auto *targets = ast::nodeList(*statement, "targets"))
+        if (targets->size() == 1)
+          target = targets->front().get();
+    }
+    if (!target || target->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*target)) != name)
+      continue;
+    return "'" + name.str() +
+           "' is assigned at the top level of this imported module, but an "
+           "imported module has no executed body: its constants travel as "
+           "literals and this value has no literal spelling. Return it from a "
+           "function, or define it in the importing module";
+  }
+  return {};
+}
+
 bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
                                          llvm::StringRef exportedName,
                                          llvm::StringRef localName,
@@ -1162,6 +1207,8 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     sourceName =
         source.sourceName.empty() ? source.moduleName : source.sourceName;
     activePackageName = source.packageName;
+    llvm::SaveAndRestore<const parser::Node *> savedSourceModuleNode(
+        activeSourceModuleNode, source.moduleNode);
     // The pair `emitInDefiningModuleScope` already uses for a specialization
     // emitted in its own module. This walk pushed a scope but left the
     // importer's below it, which is a scope that shadows rather than one that
