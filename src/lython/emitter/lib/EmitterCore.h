@@ -272,7 +272,8 @@ private:
   // CPython calls a base's `__init_subclass__` when a subclass is DEFINED.
   // Emitted at the class statement's position in module flow, beside the
   // attribute initializers, for the same reason.
-  void emitInitSubclassHook(const parser::Node &classDef);
+  void emitInitSubclassHook(const parser::Node &classDef,
+                            llvm::StringRef contractName = {});
   // A cell, empty and binding-tracked, for every local of `callable` whose
   // first binding comes after the nested def or lambda that reads it. The
   // assignment path only makes a cell at a name's FIRST binding, so without

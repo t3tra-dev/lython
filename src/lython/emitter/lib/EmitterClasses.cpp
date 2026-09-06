@@ -763,10 +763,20 @@ ModuleEmitter::resolveClassAttrSlot(llvm::StringRef className,
 // object inside the copy. Measured in
 // tests/probe/wb_init_subclass_through_a_middle_class.py: the class in the
 // middle printed only its own hook, never its parent's.
-void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
+void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef,
+                                         llvm::StringRef contractName) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
+  // ⭐ AN IMPORTED CLASS'S HOOK RUNS TOO, and it did not: this is emitted at
+  // the class statement's position in MODULE flow, and an imported module's
+  // body does not run -- so a library whose base declares
+  // `__init_subclass__` registered nothing at all, silently, which is the one
+  // thing that pattern exists to do. The contract is the QUALIFIED one there;
+  // the SPELLING stays the module's own, which is what the synthesized call
+  // resolves through inside its defining scope.
+  mlir::Type ownContract =
+      contractName.empty() ? types.contract(*name) : types.contract(contractName);
   // ⭐ THE CLASS HEADER'S KEYWORDS ARE THE HOOK'S ARGUMENTS, and they were
   // dropped on the floor: `class Sub(Base, tag="s")` compiled, ran, and
   // printed nothing where CPython prints what the hook prints -- and with a
@@ -811,17 +821,20 @@ void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
   };
 
   std::optional<MethodBinding> hook =
-      lookupClassMethod(types.contract(*name), "__init_subclass__");
+      lookupClassMethod(ownContract, "__init_subclass__");
   if (!hook || !hook->method) {
     if (!classKeywords.empty())
       refuseKeywords("does not declare (no hook takes them)");
     return;
   }
-  bool declaresItsOwn = hook->definingClass == *name;
+  std::string ownName =
+      contractName.empty() ? std::string(*name) : contractName.str();
+  bool declaresItsOwn = hook->definingClass == ownName;
   if (declaresItsOwn) {
     // The class declares its own, so the hook that runs for it is the nearest
     // one ABOVE it. `startAfter` is what super() positions itself with.
-    std::string canonical = canonicalClassName(*name);
+    std::string canonical =
+        contractName.empty() ? canonicalClassName(*name) : ownName;
     hook = resolveMroMethod(canonical, "__init_subclass__", canonical);
     if (!hook || !hook->method) {
       if (!classKeywords.empty())
@@ -881,7 +894,7 @@ void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
         (llvm::Twine(hook->symbolName) + "$initsubclass$" + *name).str();
     emitCallableFunction(*hook->method, symbolName, bound, {},
                          /*isLambda=*/false, /*positionalNodeOffset=*/1,
-                         types.contract(*name));
+                         ownContract);
     // ⛔ Not left to the binding `emitCallableFunction` makes: that one is
     // inside the copy's own emission scope and is gone by the time the call is
     // emitted. The spelling carries `$`, so no source name can collide.

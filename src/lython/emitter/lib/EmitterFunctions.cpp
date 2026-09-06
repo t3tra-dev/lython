@@ -269,6 +269,9 @@ void ModuleEmitter::emitImportedClassAttrInitializers() {
       continue;
     emitInDefiningModuleScope(*entry.source, [&] {
       emitClassAttrInitializers(*entry.classDef, entry.contractName);
+      // CPython runs the hook right after the class body it belongs to, and
+      // the queue is in declaration order, so this is that position.
+      emitInitSubclassHook(*entry.classDef, entry.contractName);
     });
   }
 }
