@@ -1402,16 +1402,25 @@ void ModuleEmitter::predeclareTopLevel() {
                                         types.annotationType(value));
         continue;
       }
-      if (statement->kind != "Assign")
-        continue;
-      const auto *targets = ast::nodeList(*statement, "targets");
-      if (!targets || targets->size() != 1 || !targets->front() ||
-          targets->front()->kind != "Name")
+      // ⭐ AND AN ANNOTATED ONE. `CLS = Widget` binds the alias and
+      // `CLS: type[Widget] = Widget` did not, so writing the annotation that
+      // says what the name IS broke the program: "unresolved name 'CLS'" at
+      // every read inside a function, where the unannotated line works. The
+      // annotation agrees with the walk rather than replacing it.
+      const parser::Node *aliasTarget = nullptr;
+      if (statement->kind == "AnnAssign") {
+        aliasTarget = ast::node(*statement, "target");
+      } else if (statement->kind == "Assign") {
+        const auto *targets = ast::nodeList(*statement, "targets");
+        if (targets && targets->size() == 1)
+          aliasTarget = targets->front().get();
+      }
+      if (!aliasTarget || aliasTarget->kind != "Name")
         continue;
       const parser::Node *value = ast::node(*statement, "value");
       if (!types.namesAType(value))
         continue;
-      types.bindAnnotationTypeAlias(ast::nameSpelling(*targets->front()),
+      types.bindAnnotationTypeAlias(ast::nameSpelling(*aliasTarget),
                                     types.annotationType(value));
       // ⭐ AN ALIAS OF A CLASS IS ALSO THE CLASS AS A VALUE. `W = Widget` then
       // `cls = W` inside a function was "unresolved name 'W'", while
@@ -1430,7 +1439,7 @@ void ModuleEmitter::predeclareTopLevel() {
       // caught it and the one that pins it now.
       if (value && value->kind == "Name") {
         llvm::StringRef aliasedName = ast::nameSpelling(*value);
-        llvm::StringRef aliasName = ast::nameSpelling(*targets->front());
+        llvm::StringRef aliasName = ast::nameSpelling(*aliasTarget);
         if (std::optional<mlir::Type> aliased = types.lookupClass(aliasedName))
           types.bindClass(aliasName, *aliased);
         // ⛔ AND THE SPELLING TOO, because the class binding is not enough for

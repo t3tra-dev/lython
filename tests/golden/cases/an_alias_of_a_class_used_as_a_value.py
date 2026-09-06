@@ -26,6 +26,9 @@ Err = ValueError
 Text = str
 Num = int
 Flag = bool
+# The ANNOTATED spelling of the same binding: writing what the name is must not
+# take the binding away.
+CLS: type[Widget] = Widget
 
 
 def direct(n: int) -> str:
@@ -69,6 +72,10 @@ def annotated(w: W) -> int:
 # A BUILTIN spelling is intercepted by name before the class-instantiation
 # path -- `str(x)` is `__str__` dispatch, not construction -- so an alias of one
 # has to reach that interception rather than the class binding.
+def annotated_global(n: int) -> int:
+    return CLS(n).n
+
+
 def converted(n: int) -> str:
     return Text(n) + "/" + Text(Num("7") + 1) + "/" + Text(Flag(n))
 
@@ -79,3 +86,4 @@ print(factory()(3).label())
 print(raised(-1), raised(1))
 print(annotated(Widget(4)))
 print(converted(0), converted(5))
+print(annotated_global(6))
