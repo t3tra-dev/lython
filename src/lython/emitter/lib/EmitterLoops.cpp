@@ -421,8 +421,8 @@ llvm::SmallVector<mlir::Value, 4> ModuleEmitter::carriedLoopEdgeOperands(
     bool bothManifest =
         mlir::isa_and_nonnull<py::ContractType>(assignedType) &&
         mlir::isa_and_nonnull<py::ContractType>(local.type) &&
-        !isSourceDefinedContract(assignedType) &&
-        !isSourceDefinedContract(local.type);
+        !isSourceClassContract(assignedType) &&
+        !isSourceClassContract(local.type);
     bool unionIntoScalarLane =
         mlir::isa_and_nonnull<py::UnionType>(assignedType) &&
         !mlir::isa_and_nonnull<py::UnionType>(local.type);

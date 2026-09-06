@@ -91,6 +91,15 @@ private:
   // aliases through the class binding; manifest classes resolve to their
   // builtins.* contract). Falls back to the raw spelling.
   std::string canonicalClassName(llvm::StringRef spelling) const;
+  // A contract this compiler DECLARED -- written in this module or imported
+  // from another -- as opposed to a manifest one.
+  //
+  // ⭐ NOT the name-shape test (`isSourceDefinedContract`, "the name has no
+  // dot"). An imported class's contract name is `mod.Base`, which looks
+  // exactly like `builtins.int` to that test, so every question asked with it
+  // answered "manifest" for a program's own class the moment it crossed a
+  // file. Ask the map of what was declared, which is filled for both.
+  bool isSourceClassContract(mlir::Type type) const;
   // The second half of `collectTopLevelBindings`, run once the imports are
   // bound: neither a base spelled `module.Class` nor one spelled with the bare
   // name a `from module import Class` bound can be canonicalized before that.

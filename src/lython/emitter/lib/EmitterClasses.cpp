@@ -401,6 +401,18 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
   }
 }
 
+bool ModuleEmitter::isSourceClassContract(mlir::Type type) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract)
+    return false;
+  llvm::StringRef name = contract.getContractName();
+  if (name.starts_with("$"))
+    return false;
+  // A main-module class is bare; an imported one is `mod.Base` and is in the
+  // same declaration map, which a manifest contract never is.
+  return !name.contains('.') || declaredClassMethods.count(name) != 0;
+}
+
 std::string ModuleEmitter::canonicalClassName(llvm::StringRef spelling) const {
   if (std::optional<mlir::Type> bound = types.lookupClass(spelling))
     if (auto contract = mlir::dyn_cast<py::ContractType>(*bound))

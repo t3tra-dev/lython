@@ -1340,7 +1340,7 @@ ModuleEmitter::tryEmitIterableMembership(const parser::Node &expr) {
     return std::nullopt;
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(
       types.widenLiteral(types.inferExpr(container.get())));
-  if (!contract || !isSourceDefinedContract(contract))
+  if (!contract || !isSourceClassContract(contract))
     return std::nullopt;
   if (lookupClassMethod(contract, "__contains__"))
     return std::nullopt;
@@ -2029,7 +2029,7 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   // DOES define the direct method keeps it, because reflecting past a defined
   // method would answer a different question than the program wrote.
   auto reflects = [&](llvm::StringRef direct, llvm::StringRef mirror) {
-    return isSourceDefinedContract(types.widenLiteral(lhs.type)) &&
+    return isSourceClassContract(types.widenLiteral(lhs.type)) &&
            !lookupClassMethod(lhs.type, direct) &&
            lookupClassMethod(rhs.type, mirror);
   };
@@ -2192,7 +2192,7 @@ ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
   // asks the right operand, which is what this does. A SOURCE class on the
   // left keeps its own answer whenever it has one.
   if (leftInferenceSucceeded &&
-      isSourceDefinedContract(types.widenLiteral(lhs.type)))
+      isSourceClassContract(types.widenLiteral(lhs.type)))
     return std::nullopt;
   static constexpr llvm::StringLiteral kReflectable[] = {
       llvm::StringLiteral("__add__"),      llvm::StringLiteral("__sub__"),
@@ -2224,7 +2224,7 @@ ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
   }
   auto rightContract =
       mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(rhs.type));
-  if (!rightContract || !isSourceDefinedContract(rightContract))
+  if (!rightContract || !isSourceClassContract(rightContract))
     return std::nullopt;
   if (!lookupClassMethod(rightContract, reflected))
     return std::nullopt;
@@ -2303,7 +2303,7 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
     if (builtinSequence)
       if (auto indexContract = mlir::dyn_cast_if_present<py::ContractType>(
               types.widenLiteral(index.type));
-          indexContract && isSourceDefinedContract(indexContract) &&
+          indexContract && isSourceClassContract(indexContract) &&
           lookupClassMethod(indexContract, "__index__"))
         if (std::optional<Value> converted =
                 tryEmitClassDunder(expr, index, "__index__", {}))

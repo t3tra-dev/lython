@@ -1118,12 +1118,28 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
           moduleAliases[local] = std::string(*name);
       }
     }
+    // The classes this module declares itself, so a base that is neither one
+    // of them nor an import can be recognised as MANIFEST.
+    llvm::StringSet<> ownClassNames;
+    for (const parser::NodePtr &statement : *declarations)
+      if (statement && statement->kind == "ClassDef")
+        if (auto declared = ast::string(*statement, "name"))
+          ownClassNames.insert(*declared);
     auto qualifyBase = [&](const parser::Node &base) -> std::string {
       if (base.kind == "Name") {
         llvm::StringRef spelling = ast::nameSpelling(base);
         auto imported = importedClasses.find(spelling);
         if (imported != importedClasses.end())
           return imported->second;
+        // ⭐ A MANIFEST BASE IS NOT THIS MODULE'S CLASS. Qualifying every bare
+        // name with the module recorded `class MyErr(Exception)` as deriving
+        // from `lib_err.Exception`, a class nothing declares -- so every
+        // hierarchy question about an imported exception walked into a dead
+        // end and `isinstance(e, MyErr)` on an `Exception`-typed value folded
+        // to False, compiling the handler away. The same class written in ONE
+        // file was right, because there the base is recorded as written.
+        if (!ownClassNames.contains(spelling))
+          return spelling.str();
         return sourceModuleClassSymbol(source.moduleName, spelling);
       }
       std::string dotted = ast::qualifiedName(&base);

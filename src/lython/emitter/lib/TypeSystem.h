@@ -291,6 +291,12 @@ public:
   void bindDeclaredBases(llvm::StringRef name,
                          llvm::ArrayRef<std::string> bases);
   bool declaredSubclassOf(llvm::StringRef sub, llvm::StringRef super) const;
+  // Whether this compiler DECLARED the class at all -- written here or
+  // imported. The name-shape test ("has no dot") calls an imported class
+  // manifest, which is a wrong answer for every hierarchy question about one.
+  bool isDeclaredClass(llvm::StringRef name) const {
+    return declaredBases.count(name) != 0;
+  }
   // The nearest SOURCE class every member derives from, or null when there is
   // none -- what a join of source classes returns instead of a union of them.
   mlir::Type nearestCommonSourceBase(mlir::ArrayRef<mlir::Type> members) const;

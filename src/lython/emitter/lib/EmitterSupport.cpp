@@ -467,9 +467,20 @@ bool declaredSubclassOfType(mlir::Type sub, mlir::Type super,
                                   superContract.getContractName());
 }
 
+static bool sourceClassUnderManifestBase(mlir::Type sub, mlir::Type super,
+                                         TypeSystem &types);
+
 bool pythonSubclassOf(mlir::Type sub, mlir::Type super, TypeSystem &types,
                       mlir::Operation *from) {
   if (declaredSubclassOfType(sub, super, types))
+    return true;
+  // ⭐ AND THE SAME QUESTION `isinstance` ALREADY ASKS. `issubclass(MyErr,
+  // Exception)` for an IMPORTED `class MyErr(Exception)` answered False while
+  // `isinstance(e, MyErr)` beside it answered correctly -- one hierarchy, two
+  // predicates, and only one of them knew that a declared class can sit under
+  // a manifest base. The local twin was right through assignability, which is
+  // what hid it.
+  if (sourceClassUnderManifestBase(sub, super, types))
     return true;
   if (isAssignableWithStaticEvidence(sub, super, from))
     return true;
@@ -507,7 +518,24 @@ static bool sourceClassUnderManifestBase(mlir::Type sub, mlir::Type super,
   auto superContract = mlir::dyn_cast_if_present<py::ContractType>(super);
   if (!subContract || !superContract)
     return false;
-  if (!isSourceDefinedContract(sub) || isSourceDefinedContract(super))
+  // ⭐ THE DECLARATION MAP FOR THE SUBCLASS, the name shape for the base. An
+  // IMPORTED exception class is `mod.MyErr`, which the name-shape test calls
+  // manifest, so `isinstance(e, mod.MyErr)` on an `Exception`-typed value
+  // folded to False and the handler was compiled away -- silently, for the
+  // shape every user-defined exception is tested by, and correct in ONE file:
+  //
+  //     # lib_err.py: class MyErr(Exception): pass
+  //     def classify(e: Exception) -> str:
+  //         if isinstance(e, MyErr): return "mine"
+  //         return "other"
+  //     print(classify(MyErr("x")))     # printed other; CPython prints mine
+  //
+  // ⛔ The BASE still uses the name shape, because that is the question here:
+  // whether the target of the test is a manifest class, and a declared one is
+  // answered by `declaredSubclassOfType` above instead.
+  if (!types.isDeclaredClass(subContract.getContractName()) ||
+      types.isDeclaredClass(superContract.getContractName()) ||
+      isSourceDefinedContract(super))
     return false;
   llvm::StringRef superName = superContract.getContractName();
   llvm::StringRef superLeaf = superName.rsplit('.').second;

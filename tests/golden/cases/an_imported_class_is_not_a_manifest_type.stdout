@@ -1,0 +1,7 @@
+in True False
+reflected < True False
+eq both ways False False
+radd 105
+index 20
+isinstance mine other
+issubclass True False
