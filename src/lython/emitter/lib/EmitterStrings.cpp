@@ -350,8 +350,21 @@ Value ModuleEmitter::emitFormatValue(const parser::Node &anchor, Value value,
                                      bool specKnownEmpty) {
   mlir::Type strType = types.contract("builtins.str");
   mlir::Type valueType = types.widenLiteral(value.type);
-  if (refuseUnresolvableDispatch(anchor, value, "__format__"))
-    return emitNone(anchor);
+  // ⭐ ASK THE DISPATCHER BEFORE REFUSING, the way `__repr__` above does. This
+  // site went straight to the refusal, so `format(x, "")` and `f"{x}"` on a
+  // base-typed receiver were rejected for a hierarchy whose `repr(x)` one line
+  // over dispatched -- one question, two spellings, and only one of them had
+  // been taught the answer.
+  if (dispatchIsUnresolvable(value, "__format__", /*receiverNode=*/nullptr,
+                             /*throughSuper=*/false)) {
+    Value specValue = spec ? coerceValue(*spec, strType, anchor)
+                           : emitEmptyStrConstant(anchor);
+    if (std::optional<Value> dispatched = tryEmitVirtualDispatchWithValues(
+            anchor, value, "__format__", {specValue}))
+      return *dispatched;
+    if (refuseUnresolvableDispatch(anchor, value, "__format__"))
+      return emitNone(anchor);
+  }
   // The presence check precedes the gate so that the empty format spec is
   // materialized only on the path that consumes it.
   if (lookupClassMethod(valueType, "__format__")) {

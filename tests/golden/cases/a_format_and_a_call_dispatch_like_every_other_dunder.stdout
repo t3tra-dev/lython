@@ -1,0 +1,6 @@
+format ['tag[>4]', 'LOUD[>4]']
+empty spec ['tag[]', 'LOUD[]']
+f-string ['tag[<3]', 'LOUD[<3]']
+plain f-string ['tag[]', 'LOUD[]']
+call [2, 20]
+call with a keyword [3, 30]

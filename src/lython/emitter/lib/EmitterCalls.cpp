@@ -1832,6 +1832,21 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             types.widenLiteral(types.inferExpr(calleeNode))))
       if (lookupClassMethod(calleeContract, "__call__")) {
         Value receiver = emitExpr(calleeNode);
+        // ⭐ `x(...)` OVER AN OVERRIDDEN `__call__` IS A DISPATCH TOO. This
+        // site went to the refusal through `resolveClassDunder`, so a
+        // base-typed callable object was rejected while every other dunder on
+        // the same hierarchy dispatched.
+        //
+        // ⛔ Through the AST entry point rather than the values one, because
+        // this call node carries the arguments: that path reads the keywords
+        // as well (`x(n=4)` is an ordinary spelling of a call) and asks the
+        // dispatcher BEFORE emitting anything, which is what stops
+        // `tryEmitClassDunderCall` below from evaluating each argument twice.
+        if (dispatchIsUnresolvable(receiver, "__call__", calleeNode,
+                                   /*throughSuper=*/false))
+          if (std::optional<Value> dispatched = tryEmitVirtualDispatch(
+                  expr, *calleeNode, calleeNode, receiver, "__call__"))
+            return *dispatched;
         if (std::optional<Value> called =
                 tryEmitClassDunderCall(expr, receiver, "__call__"))
           return *called;
