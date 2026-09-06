@@ -173,6 +173,13 @@ private:
   const parser::Node *virtualMethodObjectDef(const parser::Node &anchor,
                                              Value receiver,
                                              const MethodBinding &binding);
+  // The same, for a `@staticmethod` read off a base-typed instance. A static
+  // binding has no receiver to bind, so the wrapper INTRODUCES one and the
+  // result is an ordinary instance-kind binding over it -- which is what makes
+  // `m = x.s` carry the receiver the dispatcher tests.
+  std::optional<MethodBinding>
+  virtualStaticMethodObjectBinding(const parser::Node &anchor, Value receiver,
+                                   const MethodBinding &binding);
   // The same dispatch for a `@property` READ through a base-typed receiver.
   std::optional<Value> tryEmitVirtualPropertyRead(const parser::Node &anchor,
                                                   Value receiver,

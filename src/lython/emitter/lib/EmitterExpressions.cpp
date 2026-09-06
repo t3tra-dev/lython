@@ -2403,6 +2403,33 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
   bool bindReceiver = methodBindingBindsReceiver(methodBinding);
   if (methodBinding.kind == "instance" && mlir::isa<py::TypeType>(object.type))
     bindReceiver = false;
+  // ⭐ A STATIC OR CLASS METHOD READ OFF A BASE-TYPED INSTANCE IS A DISPATCH,
+  // and the read walked past the gate that the CALL spelling one line over
+  // stops at:
+  //
+  //     a: Base = Sub()
+  //     print(a.s())       # refused before, dispatched now
+  //     m = a.s; print(m())  # printed the BASE's answer, silently
+  //
+  // The static half has an answer -- the forwarder below carries the receiver
+  // into the same arms -- and the class half does not, so it takes the gate's
+  // refusal. `cls` has to be the RUNTIME class and the arms enumerate only
+  // classes that redeclare the method, so a dispatcher would bind an ancestor
+  // for a subclass that merely inherits it.
+  if (methodBinding.method && mlir::isa<py::ContractType>(object.type))
+    if (std::optional<std::string_view> readName =
+            ast::string(*methodBinding.method, "name");
+        readName && (methodBinding.kind == "static" ||
+                     methodBinding.kind == "class" ||
+                     methodBinding.kind == "classmethod") &&
+        dispatchIsUnresolvable(object, *readName, /*receiverNode=*/nullptr,
+                               /*throughSuper=*/false)) {
+      if (std::optional<MethodBinding> dispatching =
+              virtualStaticMethodObjectBinding(anchor, object, methodBinding))
+        return emitMethodObject(anchor, object, *dispatching);
+      refuseUnresolvableDispatch(anchor, object, *readName);
+      return emitNone(anchor);
+    }
   if (!bindReceiver)
     return emitFunctionObject(anchor, methodBinding.symbolName,
                               methodBinding.signature.publicCallable, {});

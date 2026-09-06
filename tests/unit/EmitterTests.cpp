@@ -1644,3 +1644,54 @@ TEST(EmitterTest, AReturnThatDoesNotMatchItsAnnotationIsNamed) {
       subclass);
   EXPECT_TRUE(base.ok()) << base.diagnostics.size();
 }
+
+// What: a `@classmethod` an override sits behind is refused in BOTH spellings.
+// The call `a.tag()` always was; reading it first (`m = a.tag`) walked past the
+// same gate and answered the base's body, so one question had two answers.
+// A staticmethod beside it dispatches through both spellings, which is what
+// says the refusal here is about `cls` and not about the receiver being an
+// instance.
+TEST(EmitterTest, AClassmethodBehindAnOverrideIsRefusedThroughEitherSpelling) {
+  auto refusedNaming = [](lython::emitter::EmitResult &emitted,
+                          const char *member) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      if (diagnostic.message.find(std::string("'") + member +
+                                  "' is overridden by a subclass") !=
+          std::string::npos)
+        return true;
+    return false;
+  };
+  const char *hierarchy =
+      "class Base:\n"
+      "    @classmethod\n"
+      "    def tag(cls) -> str:\n        return \"base\"\n"
+      "class Sub(Base):\n"
+      "    @classmethod\n"
+      "    def tag(cls) -> str:\n        return \"sub\"\n"
+      "a: Base = Sub()\n";
+
+  mlir::MLIRContext called(testRegistry());
+  lython::emitter::EmitResult direct =
+      emitSource(std::string(hierarchy) + "print(a.tag())\n", called);
+  EXPECT_FALSE(direct.ok());
+  EXPECT_TRUE(refusedNaming(direct, "tag"));
+
+  mlir::MLIRContext read(testRegistry());
+  lython::emitter::EmitResult asValue =
+      emitSource(std::string(hierarchy) + "m = a.tag\nprint(m())\n", read);
+  EXPECT_FALSE(asValue.ok());
+  EXPECT_TRUE(refusedNaming(asValue, "tag"));
+
+  mlir::MLIRContext staticly(testRegistry());
+  lython::emitter::EmitResult dispatched = emitSource(
+      "class Base:\n"
+      "    @staticmethod\n"
+      "    def tag() -> str:\n        return \"base\"\n"
+      "class Sub(Base):\n"
+      "    @staticmethod\n"
+      "    def tag() -> str:\n        return \"sub\"\n"
+      "a: Base = Sub()\n"
+      "m = a.tag\nprint(a.tag(), m())\n",
+      staticly);
+  EXPECT_TRUE(dispatched.ok()) << dispatched.diagnostics.size();
+}

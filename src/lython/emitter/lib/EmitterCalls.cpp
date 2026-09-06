@@ -2761,6 +2761,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   parser::NodePtr returns;
   parser::SourceRange range = expr.range;
   std::optional<MethodBinding> base;
+  bool staticKind = false;
   const parser::Node *arguments = nullptr;
   if (asAttribute) {
     if (argumentCount != 0 || !keywordNames.empty())
@@ -2807,8 +2808,31 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   base = lookupClassMethod(receiver.type, methodName);
   if (!base || !base->method || base->definingClass.empty())
     return nullptr;
-  if (base->kind != (asProperty ? "property" : "instance") || base->async ||
-      base->bodySignature.isGeneratorFunction ||
+  // ⭐ A `@staticmethod` DISPATCHES THROUGH THE SAME ARMS, and it was the one
+  // callable kind the synthesis refused outright:
+  //
+  //     class Base:
+  //         @staticmethod
+  //         def s() -> str: return "B"
+  //     class Sub(Base): ... overrides s ...
+  //     b: Base = Sub()
+  //     b.s()   # 's' is overridden by a subclass of 'Base', so this call ...
+  //
+  // The base's own note says a dispatcher may not GUESS a signature, and a
+  // staticmethod's is the one it does NOT have to: there is no receiver to
+  // restate, so the arms call `Candidate.s(args)` through the CLASS -- exactly
+  // what the attribute arms already do -- and the answer is the body the
+  // runtime class's MRO picks.
+  //
+  // ⛔ NOT the classmethod, which looks like the same gap and is not. `cls`
+  // must be the RUNTIME class, and the arms enumerate only classes that
+  // REDECLARE the method: a subclass that inherits it lands in its parent's
+  // arm, so `cls.__name__` would answer the parent -- a silent wrong value
+  // where the refusal is not. Covering it means enumerating every subclass,
+  // which is a different candidate set.
+  staticKind = !asProperty && base->kind == "static";
+  if ((base->kind != (asProperty ? "property" : "instance") && !staticKind) ||
+      base->async || base->bodySignature.isGeneratorFunction ||
       base->bodySignature.isAsyncGeneratorFunction)
     return nullptr;
   if (types.lookupClass(base->definingClass) == mlir::Type())
@@ -2861,7 +2885,9 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   llvm::SmallVector<std::string, 2> keywordParameters;
   params.push_back(synth::Param{"__ly_recv", synth::name(receiverClass, range)});
   if (!asAttribute) {
-  bool selfSeen = false;
+  // A staticmethod declares no receiver, so there is no first parameter to
+  // skip -- `__ly_recv` above is the dispatcher's own, not the method's.
+  bool selfSeen = staticKind;
   bool enough = false;
   for (llvm::StringRef field : {"posonlyargs", "args"}) {
     if (enough)
@@ -2916,7 +2942,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
             return nullptr;
           if (field != "kwonlyargs")
             ++position;
-          if (position == 1 && field != "kwonlyargs")
+          if (!staticKind && position == 1 && field != "kwonlyargs")
             continue; // the receiver
           // A `/` parameter cannot be named at a call at all, so a keyword
           // matching one is not this parameter -- CPython rejects the call.
@@ -2924,7 +2950,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
               ast::nameSpelling(*argument) != keywordName)
             continue;
           annotation = sharedField(*argument, "annotation");
-          keywordPosition = position - 1;
+          keywordPosition = position - (staticKind ? 0 : 1);
           keywordOnly = field == "kwonlyargs";
         }
     if (!annotation || (!keywordOnly && keywordPosition <= argumentCount))
@@ -3047,8 +3073,8 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // is available on BOTH channels, where a read through the receiver needs
       // the cell only a main-module class has.
       parser::NodePtr subject =
-          asAttribute ? synth::name(candidate.second, range)
-                      : synth::name("__ly_recv", range);
+          asAttribute || staticKind ? synth::name(candidate.second, range)
+                                    : synth::name("__ly_recv", range);
       body.push_back(synth::ifStmt(
           synth::call(synth::name("isinstance", range),
                       {synth::name("__ly_recv", range),
@@ -3064,6 +3090,9 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     } else if (asProperty) {
       body.push_back(
           synth::returnStmt(read(synth::name("__ly_recv", range)), range));
+    } else if (staticKind) {
+      body.push_back(
+          synth::returnStmt(read(synth::name(fallbackClass, range)), range));
     } else {
       std::vector<parser::NodePtr> fallbackArguments;
       fallbackArguments.push_back(synth::name("__ly_recv", range));
@@ -3215,6 +3244,94 @@ ModuleEmitter::virtualMethodObjectDef(const parser::Node &anchor, Value receiver
       std::move(body), std::move(returns), {}, range);
   synthesizedIteratorDefs.push_back(def);
   return def.get();
+}
+
+// ⭐ THE VALUE SPELLING OF THE SAME QUESTION. `x.s()` dispatches through the
+// arms above, and `m = x.s; m()` did not: a static binding has no receiver, so
+// `emitMethodObject` handed back the base's own function object and the call
+// answered the base's body -- silently, and with the call spelling one line
+// over answering correctly.
+//
+// The wrapper INTRODUCES a receiver parameter the static method never had, so
+// the result is an ordinary instance-kind binding: `emitMethodObject` binds
+// `__ly_recv` as the capture and the dispatcher tests it. The signature is
+// computed from the synthesized def rather than adapted from the static one --
+// there is no first parameter to erase from a signature that has none.
+//
+// ⛔ No defaults are carried, and that is deliberate rather than an omission:
+// each arm's body fills its own, so a wrapper restating the BASE's default
+// would answer the base's value for a subclass that changed it. Without them
+// a short call is an arity refusal, which is the honest half of the pair.
+std::optional<MethodBinding> ModuleEmitter::virtualStaticMethodObjectBinding(
+    const parser::Node &anchor, Value receiver, const MethodBinding &binding) {
+  if (binding.kind != "static" || !binding.method)
+    return std::nullopt;
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
+  if (!contract)
+    return std::nullopt;
+  std::optional<std::string_view> methodName =
+      ast::string(*binding.method, "name");
+  if (!methodName)
+    return std::nullopt;
+  const parser::Node *arguments = ast::node(*binding.method, "args");
+  if (!arguments)
+    return std::nullopt;
+  parser::NodePtr returns = sharedField(*binding.method, "returns");
+  if (!returns)
+    return std::nullopt;
+
+  parser::SourceRange range = anchor.range;
+  llvm::SmallVector<synth::Param, 4> params;
+  llvm::SmallVector<std::string, 4> forwardedNames;
+  params.push_back(
+      synth::Param{"__ly_recv", synth::name(contract.getContractName(), range)});
+  for (llvm::StringRef field : {"posonlyargs", "args"})
+    if (const auto *list = ast::nodeList(*arguments, field))
+      for (const parser::NodePtr &argument : *list) {
+        if (!argument)
+          return std::nullopt;
+        parser::NodePtr annotation = sharedField(*argument, "annotation");
+        if (!annotation)
+          return std::nullopt;
+        forwardedNames.push_back(
+            std::string(llvm::StringRef(ast::nameSpelling(*argument))));
+        params.push_back(
+            synth::Param{forwardedNames.back(), std::move(annotation)});
+      }
+
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      anchor, receiver, *methodName,
+      static_cast<unsigned>(forwardedNames.size()));
+  if (!helper)
+    return std::nullopt;
+
+  std::vector<parser::NodePtr> callArguments;
+  callArguments.push_back(synth::name("__ly_recv", range));
+  for (const std::string &name : forwardedNames)
+    callArguments.push_back(synth::name(name, range));
+  std::vector<parser::NodePtr> body;
+  body.push_back(synth::returnStmt(
+      synth::call(synth::name(helper->symbol, range), std::move(callArguments),
+                  range),
+      range));
+  std::string symbol =
+      "__lyvsbound$" + std::to_string(++syntheticFunctionCounter);
+  parser::NodePtr def =
+      synth::functionDef(symbol, params, {}, std::move(body),
+                         std::move(returns), {}, range);
+  synthesizedIteratorDefs.push_back(def);
+
+  MethodBinding bound;
+  bound.method = def.get();
+  bound.kind = "instance";
+  bound.symbolName = symbol;
+  bound.bodySignature = types.functionSignature(*def);
+  bound.signature = bound.bodySignature;
+  // ⛔ Left empty on purpose: `emitMethodObject` pushes a super() context for a
+  // binding that names its defining class, and this body is a forwarder with
+  // no class behind it.
+  bound.definingClass.clear();
+  return bound;
 }
 
 // The AST call site: `x.m(a, b)` with a base-typed `x`.
