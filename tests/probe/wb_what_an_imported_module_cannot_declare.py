@@ -15,7 +15,12 @@
 #     int / str / bool module constant
 #
 #   ONE FILE IS RIGHT, ACROSS THE BOUNDARY IS NOT -- the boundary is the cause
-#     Enum subclass ......... 'py.class' op unknown base class 'Enum'
+#     Enum subclass ......... CORRECT as of 2026-09-06 (`desugarEnumClasses`
+#                             now runs on every imported module before the main
+#                             one, and an imported class attribute is real
+#                             storage, which is what a member needs to BE an
+#                             instance; golden cases/an_enum_declared_in_an
+#                             _imported_module)
 #     module-level lambda ... module 'm' has no attribute 'DOUBLE' in this
 #                             runtime (annotated `Callable`, so the one-file
 #                             spelling of it compiles and answers 2)

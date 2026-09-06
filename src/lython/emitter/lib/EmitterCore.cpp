@@ -47,6 +47,16 @@ EmitResult ModuleEmitter::emit() {
   module.setName(moduleName);
   // Enum desugaring rewrites the parsed tree, so it must run before anything
   // reads the module's shape (static module attributes below already do).
+  //
+  // ⭐ AND ON EVERY IMPORTED MODULE, FIRST. It used to run on the main module
+  // alone, so `class Color(Enum)` in a library reached the dialect verifier as
+  // "'py.class' op unknown base class 'Enum'" -- the compiler's own sentence
+  // for a class CPython has no trouble with, and the same class in the main
+  // module works. Imported modules go first so the main module's use rewrite
+  // sees their members as well as its own.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      desugarEnumClasses(*source.moduleNode);
   desugarEnumClasses(moduleNode);
   llvm::SmallVector<std::string, 8> staticAttrNames;
   llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
