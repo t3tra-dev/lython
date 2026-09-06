@@ -1122,6 +1122,23 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   if (inferred.empty())
     return {};
   mlir::Type joined = types.join(inferred);
+  // ⛔ AND NOT AN OPTIONAL EITHER, measured 2026-09-06. The try statement's own
+  // carry-out rule takes one (`T | None` is stored as ONE box whose empty
+  // entity word IS the None), so this looked like the same relaxation the
+  // callable above turned out to be -- and it is not: letting an optional
+  // through here CRASHES the compiler on
+  //
+  //     w: Optional[int] = 3
+  //     match flag:
+  //         case 1: v = w
+  //         case _: v = w
+  //     return 0 if v is None else v
+  //
+  // where the refusal it replaces is a clean "unresolved name 'v'". The two
+  // rules reach different storage: the try's cell is written and read on the
+  // statement's own edges, and this slot is read by whatever follows the
+  // region. Recorded in tests/probe/wb_an_optional_first_bound_inside_a_region.py.
+  //
   // ⛔ ONLY A PLAIN CONTRACT GETS A SLOT. The slot is a synthesized class's
   // box-fronted field, so whatever goes in it has to be storable there: a
   // union keeps every member's lanes and is refused at the box, and a `type[X]`
@@ -1156,6 +1173,7 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   // answered.
   if (mlir::isa_and_nonnull<py::CallableType>(joined))
     return joined;
+
   if (!mlir::isa_and_nonnull<py::ContractType>(joined) ||
       py::isPyObjectType(joined))
     return {};
