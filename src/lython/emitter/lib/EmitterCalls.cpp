@@ -2728,7 +2728,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
                                     llvm::StringRef methodName,
                                     unsigned argumentCount, bool asProperty,
                                     llvm::ArrayRef<std::string> keywordNames,
-                                    bool asAttribute) {
+                                    bool asAttribute, bool asSetter) {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(receiver.type);
   if (!contract)
     return nullptr;
@@ -2805,7 +2805,17 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   // The body the STATIC type resolves to: its signature is the one the
   // dispatcher restates, and its declaring class is how the fallback names it.
   if (!asAttribute) {
-  base = lookupClassMethod(receiver.type, methodName);
+  // ⭐ A `@property` WRITE IS A DISPATCH TOO, and the assignment path had no
+  // gate at all: `x.v = 5` inlined the setter the STATIC class resolves to, so
+  // a base-typed receiver ran the BASE's setter while `x.v` one line over
+  // dispatched. [5, 50] where CPython prints [5, 60], silently. The BINDING is
+  // the only thing that differs -- the arms, the fallback and the suppression
+  // are the property READ's, because inside an arm the narrowed receiver
+  // resolves its own setter exactly the way it resolves its own getter.
+  base = asSetter
+             ? lookupClassMethod(receiver.type,
+                                 (llvm::Twine(methodName) + ".setter").str())
+             : lookupClassMethod(receiver.type, methodName);
   if (!base || !base->method || base->definingClass.empty())
     return nullptr;
   // ⭐ A `@staticmethod` DISPATCHES THROUGH THE SAME ARMS, and it was the one
@@ -2830,9 +2840,12 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   // arm, so `cls.__name__` would answer the parent -- a silent wrong value
   // where the refusal is not. Covering it means enumerating every subclass,
   // which is a different candidate set.
-  staticKind = !asProperty && base->kind == "static";
-  if ((base->kind != (asProperty ? "property" : "instance") && !staticKind) ||
-      base->async || base->bodySignature.isGeneratorFunction ||
+  staticKind = !asProperty && !asSetter && base->kind == "static";
+  llvm::StringRef wantedKind = asSetter     ? "property_setter"
+                               : asProperty ? "property"
+                                            : "instance";
+  if ((base->kind != wantedKind && !staticKind) || base->async ||
+      base->bodySignature.isGeneratorFunction ||
       base->bodySignature.isAsyncGeneratorFunction)
     return nullptr;
   if (types.lookupClass(base->definingClass) == mlir::Type())
@@ -2962,7 +2975,8 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
 
   std::string key =
       (receiverClass + "." + methodName + "/" + llvm::Twine(argumentCount) +
-       (asProperty ? "$get" : "") + (asAttribute ? "$attr" : ""))
+       (asProperty ? "$get" : "") + (asAttribute ? "$attr" : "") +
+       (asSetter ? "$set" : ""))
           .str();
   for (const std::string &keywordName : keywordParameters)
     key += "," + keywordName;
@@ -3064,6 +3078,13 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
           synth::attribute(std::move(receiverNode), methodName, range),
           forwarded(), keywordArguments(), range);
     };
+    // The setter's one parameter, restated BY NAME so the arm binds it the way
+    // the body that runs declares it.
+    auto write = [&](parser::NodePtr receiverNode) {
+      return synth::assign(
+          synth::attribute(std::move(receiverNode), methodName, range),
+          synth::name(parameterNames.front(), range), range);
+    };
     std::vector<parser::NodePtr> body;
     for (const auto &candidate : candidates) {
       // ⭐ AN ATTRIBUTE ARM READS THROUGH THE CLASS, not through the narrowed
@@ -3075,18 +3096,44 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       parser::NodePtr subject =
           asAttribute || staticKind ? synth::name(candidate.second, range)
                                     : synth::name("__ly_recv", range);
+      // ⛔ A candidate that redeclares the GETTER and no setter has no setter
+      // at all -- redeclaring the property replaces the whole descriptor -- so
+      // its arm RAISES the AttributeError CPython raises, rather than falling
+      // through to an inherited setter Python cannot reach through it.
+      std::vector<parser::NodePtr> armBody;
+      if (asSetter && !classPropertyHasSetter(candidate.second, methodName))
+        armBody.push_back(synth::raiseCall(
+            "AttributeError",
+            "property '" + std::string(methodName) + "' of '" +
+                py::contracts::displayClassNameForContract(candidate.second) +
+                "' object has no setter",
+            range));
+      else if (asSetter) {
+        armBody.push_back(write(std::move(subject)));
+        // ⛔ The arm has to RETURN. A read arm ends in one because it produces
+        // a value; a write arm is a statement, so without this control fell
+        // through to the fallback and the base's setter overwrote what the
+        // subclass's had just stored -- the same wrong answer, now reached
+        // through a correct arm.
+        armBody.push_back(
+            synth::returnStmt(synth::noneConstant(range), range));
+      }
+      else
+        armBody.push_back(synth::returnStmt(read(std::move(subject)), range));
       body.push_back(synth::ifStmt(
           synth::call(synth::name("isinstance", range),
                       {synth::name("__ly_recv", range),
                        synth::name(candidate.second, range)},
                       range),
-          {synth::returnStmt(read(std::move(subject)), range)}, {}, range));
+          std::move(armBody), {}, range));
     }
     if (asAttribute) {
       body.push_back(synth::returnStmt(
           synth::attribute(synth::name(fallbackClass, range), methodName,
                            range),
           range));
+    } else if (asSetter) {
+      body.push_back(write(synth::name("__ly_recv", range)));
     } else if (asProperty) {
       body.push_back(
           synth::returnStmt(read(synth::name("__ly_recv", range)), range));
@@ -3142,10 +3189,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // from that; the inline stack belongs to the body being interrupted.
       auto savedInlineFrames = std::move(inlineFrames);
       inlineFrames.clear();
-      if (readsWithoutCall)
+      bool suppressGate = readsWithoutCall || asSetter;
+      if (suppressGate)
         ++virtualPropertyBodyDepth;
-      llvm::scope_exit restoreSuppression([&, readsWithoutCall] {
-        if (readsWithoutCall)
+      llvm::scope_exit restoreSuppression([&, suppressGate] {
+        if (suppressGate)
           --virtualPropertyBodyDepth;
       });
       llvm::scope_exit restoreContexts([&] {
@@ -3399,6 +3447,39 @@ ModuleEmitter::tryEmitVirtualAttributeRead(const parser::Node &anchor,
   return emitCallableDispatch(
       anchor, callee,
       emitCallOperands(anchor, {receiver}, /*includeAstArguments=*/false));
+}
+
+bool ModuleEmitter::classPropertyHasSetter(
+    llvm::StringRef className, llvm::StringRef propertyName) const {
+  std::optional<MethodBinding> getter =
+      resolveMroMethod(className, propertyName);
+  if (!getter || getter->kind != "property")
+    return false;
+  std::optional<MethodBinding> setter = resolveMroMethod(
+      className, (llvm::Twine(propertyName) + ".setter").str());
+  // The two have to come from the SAME class body: a subclass that redeclares
+  // the getter builds a new property object, and an inherited setter belongs
+  // to the one it replaced.
+  return setter && setter->kind == "property_setter" &&
+         setter->definingClass == getter->definingClass;
+}
+
+bool ModuleEmitter::tryEmitVirtualPropertyWrite(const parser::Node &anchor,
+                                                Value receiver,
+                                                llvm::StringRef propertyName,
+                                                Value value) {
+  const VirtualDispatchHelper *helper = virtualDispatcherFor(
+      anchor, receiver, propertyName, /*argumentCount=*/1,
+      /*asProperty=*/false, /*keywordNames=*/{}, /*asAttribute=*/false,
+      /*asSetter=*/true);
+  if (!helper)
+    return false;
+  Value callee = emitBindingRef(anchor, helper->symbol, helper->callable);
+  emitCallableDispatch(
+      anchor, callee,
+      emitCallOperands(anchor, {receiver, value},
+                       /*includeAstArguments=*/false));
+  return true;
 }
 
 std::optional<Value>

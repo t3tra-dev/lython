@@ -161,7 +161,8 @@ private:
   const VirtualDispatchHelper *virtualDispatcherFor(
       const parser::Node &anchor, Value receiver, llvm::StringRef methodName,
       unsigned argumentCount, bool asProperty = false,
-      llvm::ArrayRef<std::string> keywordNames = {}, bool asAttribute = false);
+      llvm::ArrayRef<std::string> keywordNames = {}, bool asAttribute = false,
+      bool asSetter = false);
   // `self.kind` where a subclass redeclares the class attribute `kind`: the
   // same dispatcher, reading a class attribute instead of calling a method.
   std::optional<Value> tryEmitVirtualAttributeRead(const parser::Node &anchor,
@@ -185,6 +186,16 @@ private:
   std::optional<Value> tryEmitVirtualPropertyRead(const parser::Node &anchor,
                                                   Value receiver,
                                                   llvm::StringRef propertyName);
+  // And the WRITE. `x.v = n` inlines the setter the receiver's STATIC class
+  // resolves to, which is the base's body for a base-typed receiver -- the
+  // same wrong answer the read had, reached through the assignment path.
+  bool tryEmitVirtualPropertyWrite(const parser::Node &anchor, Value receiver,
+                                   llvm::StringRef propertyName, Value value);
+  // Whether `className`'s `propertyName` is a property that still HAS a
+  // setter: a subclass redeclaring the getter replaces the whole descriptor,
+  // so an inherited setter is not reachable through it.
+  bool classPropertyHasSetter(llvm::StringRef className,
+                              llvm::StringRef propertyName) const;
   // Non-zero while a property dispatcher's body is being emitted, where the
   // unresolvable-dispatch gate is the question the dispatcher answers.
   unsigned virtualPropertyBodyDepth = 0;

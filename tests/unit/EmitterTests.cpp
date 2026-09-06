@@ -1751,3 +1751,48 @@ TEST(EmitterTest, AClassHeaderKeywordWithNoHookToTakeItIsRefused) {
                  defaulted);
   EXPECT_TRUE(ok.ok()) << ok.diagnostics.size();
 }
+
+// What: redeclaring a `@property` in a subclass replaces the whole descriptor,
+// so the base's setter is not reachable through it -- CPython raises
+// AttributeError and this inlined the base's setter, storing where Python
+// stores nothing. The same hierarchy WITH a setter in the subclass compiles,
+// which is what says the refusal is about the missing setter and not about the
+// redeclaration.
+TEST(EmitterTest, APropertyRedeclaredWithoutASetterRefusesTheWrite) {
+  auto refusedSaying = [](lython::emitter::EmitResult &emitted) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      if (diagnostic.message.find("has no setter") != std::string::npos)
+        return true;
+    return false;
+  };
+  const char *base =
+      "class Base:\n"
+      "    def __init__(self) -> None:\n        self._v = 0\n"
+      "    @property\n"
+      "    def v(self) -> int:\n        return self._v\n"
+      "    @v.setter\n"
+      "    def v(self, n: int) -> None:\n        self._v = n\n";
+
+  mlir::MLIRContext replaced(testRegistry());
+  lython::emitter::EmitResult noSetter =
+      emitSource(std::string(base) +
+                     "class Sub(Base):\n"
+                     "    @property\n"
+                     "    def v(self) -> int:\n        return self._v * 10\n"
+                     "s = Sub()\ns.v = 5\nprint(s.v)\n",
+                 replaced);
+  EXPECT_FALSE(noSetter.ok());
+  EXPECT_TRUE(refusedSaying(noSetter));
+
+  mlir::MLIRContext kept(testRegistry());
+  lython::emitter::EmitResult withSetter =
+      emitSource(std::string(base) +
+                     "class Sub(Base):\n"
+                     "    @property\n"
+                     "    def v(self) -> int:\n        return self._v * 10\n"
+                     "    @v.setter\n"
+                     "    def v(self, n: int) -> None:\n        self._v = n + 1\n"
+                     "s = Sub()\ns.v = 5\nprint(s.v)\n",
+                 kept);
+  EXPECT_TRUE(withSetter.ok()) << withSetter.diagnostics.size();
+}

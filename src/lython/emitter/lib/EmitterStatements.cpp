@@ -2146,6 +2146,34 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       if (std::optional<MethodBinding> setter = lookupClassMethod(
               object.type, (llvm::Twine(*attr) + ".setter").str())) {
         if (setter->kind == "property_setter") {
+          // ⭐ THE WRITE IS A DISPATCH, exactly as the read is. Inlining the
+          // setter the STATIC class resolves to ran the BASE's body for a
+          // base-typed receiver -- [5, 50] where CPython prints [5, 60] -- and
+          // `x.v` on the next line dispatched, so one property had two rules.
+          if (dispatchIsUnresolvable(object, *attr, /*receiverNode=*/nullptr,
+                                     /*throughSuper=*/false)) {
+            if (tryEmitVirtualPropertyWrite(target, object, *attr, value))
+              return;
+            if (refuseUnresolvableDispatch(target, object, *attr))
+              return;
+          }
+          // ⛔ AND AN EXACT RECEIVER STILL HAS TO HAVE A SETTER TO REACH.
+          // Redeclaring the getter in a subclass replaces the whole descriptor,
+          // so the base's setter is not reachable through it -- CPython raises
+          // AttributeError and this inlined the base's body.
+          if (auto contract =
+                  mlir::dyn_cast_if_present<py::ContractType>(object.type);
+              contract &&
+              !classPropertyHasSetter(contract.getContractName(), *attr)) {
+            diagnostics.push_back(parser::Diagnostic{
+                parser::Severity::Error, target.range.start,
+                "property '" + std::string(*attr) + "' of '" +
+                    py::contracts::displayClassNameForContract(
+                        contract.getContractName()) +
+                    "' has no setter: the class redeclares the property and "
+                    "declares no setter, which replaces the base's"});
+            return;
+          }
           emitInlineMethodBody(target, object, /*bindDescriptorReceiver=*/true,
                                *setter, {value}, {});
           return;
