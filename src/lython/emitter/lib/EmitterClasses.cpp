@@ -1918,6 +1918,16 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     for (auto [attrName, attrType] :
          llvm::zip_equal(staticAttrNames, staticAttrTypes)) {
       mlir::Type widened = types.widenLiteral(attrType);
+      // ⛔ NOT A CALLABLE, and the reason is measured rather than assumed.
+      // Adding it here moves nothing: `C.V(1)` for
+      // `V: Callable[[int], int] = lambda n: n + 1` in a class body is still
+      // "static type !py.type<...> does not provide manifest method 'V'",
+      // at module scope as much as inside a method, so the attribute is not
+      // reaching this walk at all -- the class-body collection is where to
+      // look, not the storability rule. It is also CPython's unbound-method
+      // corner (`C().V(1)` passes the instance, which is what @staticmethod
+      // exists to opt out of), so the read is a shape question before it is a
+      // storage one.
       bool storable =
           widened == types.intType() || widened == types.strType() ||
           widened == types.floatType() || widened == types.boolType();
