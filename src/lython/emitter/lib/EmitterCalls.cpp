@@ -1111,6 +1111,13 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     // that happens to share a class's spelling keeps reaching the constructor
     // as it does today, because only a `def` introduces a competing callable
     // under the same top-level name.
+    // ⛔ AN IMPORTED def UNDER A CLASS SPELLING IS NOT COVERED, and adding it
+    // here was measured to change nothing: `from helpers import str` never
+    // reaches this gate, because a builtin spelling is bound as a CLASS in the
+    // type system and the canonical binding an import leaves is not consulted
+    // on this path at all. Recorded in
+    // tests/probe/wb_a_builtin_shadowed_by_an_import.py with the three
+    // spellings that still miss.
     if (auto cls = (moduleFunctionNames.count(name) || boundTypeObject(name))
                        ? std::optional<mlir::Type>()
                        : types.lookupClass(name)) {

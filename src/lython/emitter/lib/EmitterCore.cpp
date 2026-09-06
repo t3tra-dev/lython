@@ -277,9 +277,25 @@ void ModuleEmitter::collectTopLevelBindings() {
   }
 }
 
+// ⭐ AN IMPORT BINDS THE NAME TOO, and this asked only about the three things
+// the module writes itself. `from helpers import range` -- or `len`, `str`,
+// `sum`, `max`, `min`, `repr`, `int` -- left every builtin fast path visible,
+// so the BUILTIN ran and the imported function was never called:
+//
+//     # helpers.py: def range(n): return [n, n + 1]
+//     from helpers import range
+//     for v in range(7): print(v)     # counted 0..6; CPython prints 7, 8
+//
+// Eight builtins measured wrong the same way, all silently, and the one-file
+// spelling of every one of them was already right -- which is what says the
+// import binding is the gap and not the shadowing rule.
+//
+// A canonical binding is what an import leaves behind (`bindCanonicalSymbol`),
+// and nothing else in a main module makes one.
 bool ModuleEmitter::programBindsName(llvm::StringRef name) const {
   return values.find(name) != values.end() || moduleFunctionNames.count(name) ||
-         moduleClassNames.count(name);
+         moduleClassNames.count(name) ||
+         types.lookupCanonicalBinding(name).has_value();
 }
 
 llvm::StringRef
