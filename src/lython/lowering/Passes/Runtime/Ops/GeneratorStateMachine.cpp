@@ -1169,8 +1169,34 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     llvm::SmallVector<GeneratorResumeLane, 4> argumentLanes;
     bool argumentsEligible = true;
     for (mlir::Type positional : callable.getPositionalTypes()) {
+      // ⭐ A ZERO-WIDTH ARGUMENT LANE for the two types whose runtime value is
+      // EMPTY. `type[X]` decides which class it is from its own type and
+      // `None` carries nothing at all, so neither has words for the frame to
+      // store -- and treating "no contract to key a lane on" as ineligible
+      // sent every such generator to the int-only tier below:
+      //
+      //     def rows(cls: type[Widget], n: int) -> Iterator[int]:
+      //         for i in range(n):
+      //             yield cls(i).n
+      //
+      // The same parameter on a plain FUNCTION works, and so does the same
+      // class as a LOCAL inside the generator, which is what says the
+      // ARGUMENT lane is the gap.
+      //
+      // ⛔ Spelled as a None lane because that is exactly what it is to the
+      // frame: `generatorArgumentFrameWords` gives it zero words and the ABI
+      // skips its owned marking. The clone keeps the parameter's own type; a
+      // lane describes the ABI expansion, not the value.
+      if (mlir::isa<py::TypeType>(positional) || isNoneLike(positional)) {
+        GeneratorResumeLane zeroWidth;
+        zeroWidth.contract = "types.NoneType";
+        zeroWidth.isNone = true;
+        zeroWidth.physicalCount = 0;
+        argumentLanes.push_back(zeroWidth);
+        continue;
+      }
       std::string contract = runtimeContractName(positional);
-      if (contract.empty() || contract == "types.NoneType") {
+      if (contract.empty()) {
         argumentsEligible = false;
         break;
       }

@@ -230,6 +230,25 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
   result.generatorSources.reserve(sources.size());
   result.generatorSourceBundles.reserve(sources.size());
   for (const RuntimeBundle *source : sources) {
+    // ⭐ A `type[X]` FRAME SOURCE CARRIES NOTHING, the same way a `type[X]`
+    // argument occupies no ABI input and a `type[X]` capture fills no closure
+    // slot: which class it is, is in the type. Its bundle is a `TypeObject`,
+    // so the object-bundle test refused
+    //
+    //     def rows(cls: type[Widget], n: int) -> Iterator[int]:
+    //         for i in range(n):
+    //             yield cls(i).n
+    //
+    // with "generator frame source ... must be a lowered Python object
+    // bundle", while the same parameter on a plain FUNCTION and the same class
+    // as a LOCAL inside the generator both work.
+    if (source && source->kind == RuntimeBundle::Kind::TypeObject) {
+      result.generatorSources.push_back(
+          RuntimeValue::object(source->contract, mlir::ValueRange{}));
+      result.generatorSourceBundles.push_back(
+          std::make_shared<RuntimeBundle>(*source));
+      continue;
+    }
     if (!source || source->kind != RuntimeBundle::Kind::Object)
       return op->emitError()
              << "generator frame source for " << targetName
@@ -276,7 +295,11 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
       const GeneratorResumeLane *lane = index < info.argumentLanes.size()
                                             ? &info.argumentLanes[index]
                                             : nullptr;
-      if (lane && !lane->isInt && !lane->isControl()) {
+      // ⛔ A zero-width lane has nothing to persist and nothing to retain: it
+      // is what `type[X]` and `None` arguments get, and `retainAggregateSlot`
+      // refused the first of them outright ("aggregate slot retain requires an
+      // object bundle", for a `TypeObject`).
+      if (lane && !lane->isInt && !lane->isControl() && !lane->isNone) {
         if (!source || source->physicalValues().size() != lane->physicalCount)
           return op->emitError()
                  << "generator argument " << index << " (" << lane->contract

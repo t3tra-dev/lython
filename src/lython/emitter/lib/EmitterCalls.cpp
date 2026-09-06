@@ -1071,8 +1071,20 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     // A nested `def` binds a callable under its own name; a top-level one is
     // already excluded by `moduleFunctionNames`, and this is the same rule one
     // scope in.
-    return mlir::isa_and_nonnull<py::TypeType, py::CallableType>(
-        bound->second.type);
+    if (mlir::isa_and_nonnull<py::CallableType>(bound->second.type))
+      return true;
+    auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(bound->second.type);
+    if (!typeObject)
+      return false;
+    // ⛔ ONLY WHEN THE TWO DISAGREE, which the inference already required and
+    // this did not: `def build(Widget: type[Widget], n: int)` binds a type
+    // object holding the very class its name spells, and steering that away
+    // from the constructor sent it to "calling a type object held in a value
+    // is not supported" -- a program that worked before the shadowing rule
+    // existed. What the rule is for is the case where the value holds a
+    // DIFFERENT class.
+    std::optional<mlir::Type> sameName = types.lookupClass(name);
+    return !sameName || *sameName != typeObject.getInstanceType();
   };
 
   // Same rule as the bare-Name constructor path below: a top-level `def int`
