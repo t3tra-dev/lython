@@ -53,6 +53,14 @@
 #                             type is resolved: an erased `[]` has no storage
 #                             the readers can agree on and keeps the refusal.
 #
+#     an UNANNOTATED parameter ... refused, and the reason is not that the
+#         pre-pass is skipped on the import path: the pass constrains a
+#         parameter from CALL SITES in module-level statement position, and an
+#         imported module has none -- its body does not run. The constraint
+#         lives in the IMPORTER, so the repair is a cross-module fixpoint, not
+#         a call to the existing one. Three of the four split-corpus diffs left
+#         on 2026-09-06 are this one shape.
+#
 #   BOTH FAIL -- the boundary is NOT the cause, and neither is a finding here
 #     nested class (`m.Outer.Inner()`) .... !py.type<...> does not provide a
 #                                           manifest __call__ (also in one file)
