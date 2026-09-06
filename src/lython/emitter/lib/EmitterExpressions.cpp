@@ -123,6 +123,20 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       markBoxedModuleGlobal(op);
       return {op.getResult(), type};
     }
+    // The same cell under its canonical name: an imported module's container
+    // constant is spelled bare inside its OWN bodies and by whatever name a
+    // `from lib import NAMES` bound it to here.
+    if (std::optional<std::string> canonical =
+            types.lookupCanonicalBinding(name)) {
+      if (std::string global = importedModuleGlobalFor(*canonical);
+          !global.empty()) {
+        mlir::Type stored = moduleGlobals.lookup(global);
+        auto op = py::GlobalGetOp::create(builder, loc(*expr), stored,
+                                          builder.getStringAttr(global));
+        markBoxedModuleGlobal(op);
+        return {op.getResult(), stored};
+      }
+    }
     if (auto literal = moduleConstantBindings.find(name);
         literal != moduleConstantBindings.end())
       return emitConstant(*literal->second);
@@ -363,6 +377,17 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         if (std::optional<Value> literal =
                 emitLiteralTypeConstant(*expr, *symbol))
           return *literal;
+        // ⭐ AN IMPORTED MODULE'S CONTAINER CONSTANT IS A CELL, not a value
+        // to materialize: `lib.NAMES` resolves to the global `lib.NAMES`, the
+        // same storage the main module's own container global lives in.
+        if (std::string global = importedModuleGlobalFor(binding);
+            !global.empty()) {
+          mlir::Type stored = moduleGlobals.lookup(global);
+          auto op = py::GlobalGetOp::create(builder, loc(*expr), stored,
+                                            builder.getStringAttr(global));
+          markBoxedModuleGlobal(op);
+          return {op.getResult(), stored};
+        }
         if (genericFunctions.count(binding)) {
           // Same rule as the Name case: a bare qualified reference to an
           // imported generic has no instantiation to materialize.

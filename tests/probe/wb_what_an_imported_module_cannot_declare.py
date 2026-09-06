@@ -23,9 +23,17 @@
 #                             _imported_module)
 #     module-level lambda ... module 'm' has no attribute 'DOUBLE' in this
 #                             runtime (annotated `Callable`, so the one-file
-#                             spelling of it compiles and answers 2)
-#     float / None / container constant ...
-#                             [[wb_a_container_constant_in_an_imported_module]]
+#                             spelling of it compiles and answers 2) -- the
+#                             ONLY one left on this list
+#     float / None constant ..CORRECT as of 2026-09-04 (the literal channel
+#                             gained a float arm and a None arm)
+#     container constant .... CORRECT as of 2026-09-06 (a container gets the
+#                             module global CELL the main module's own gets,
+#                             filled at the start of `__main__` in import
+#                             order; golden cases/an_imported_container
+#                             _constant_is_one_storage). Only when the element
+#                             type is resolved: an erased `[]` has no storage
+#                             the readers can agree on and keeps the refusal.
 #
 #   BOTH FAIL -- the boundary is NOT the cause, and neither is a finding here
 #     nested class (`m.Outer.Inner()`) .... !py.type<...> does not provide a

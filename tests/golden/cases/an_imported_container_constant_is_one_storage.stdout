@@ -1,0 +1,5 @@
+read ['a', 'b'] {'k': 1} (1, 2) 3
+annotated ['x'] []
+from its own body 2 a
+appended there 3 ['a', 'b', 'c']
+appended here 4 ['a', 'b', 'c', 'd']

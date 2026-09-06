@@ -545,6 +545,12 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
             sourceModuleLiteralConstant(types, *body, name)) {
       std::string local = (llvm::Twine(localName) + "." + name).str();
       types.bindSymbol(local, *literal);
+      continue;
+    }
+    std::string globalName = (llvm::Twine(module) + "." + name).str();
+    if (moduleGlobals.count(globalName)) {
+      std::string local = (llvm::Twine(localName) + "." + name).str();
+      types.bindCanonicalSymbol(local, globalName, moduleGlobals[globalName]);
     }
   }
   return true;
@@ -699,10 +705,10 @@ ModuleEmitter::importedModuleBindingReason(llvm::StringRef name) const {
         llvm::StringRef(ast::nameSpelling(*target)) != name)
       continue;
     return "'" + name.str() +
-           "' is assigned at the top level of this imported module, but an "
-           "imported module has no executed body: its constants travel as "
-           "literals and this value has no literal spelling. Return it from a "
-           "function, or define it in the importing module";
+           "' is assigned at the top level of this imported module, but its "
+           "type is not one a module global can hold: a scalar travels as a "
+           "literal and a container gets a cell only when its element type is "
+           "resolved. Annotate it, or define it in the importing module";
   }
   return {};
 }
@@ -747,6 +753,12 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
   if (std::optional<mlir::Type> literal =
           sourceModuleLiteralConstant(types, *body, exportedName)) {
     types.bindSymbol(localName, *literal);
+    return true;
+  }
+  if (std::string globalName =
+          (llvm::Twine(module) + "." + exportedName).str();
+      moduleGlobals.count(globalName)) {
+    types.bindCanonicalSymbol(localName, globalName, moduleGlobals[globalName]);
     return true;
   }
   if (aliasDepth < kMaxAliasDepth)
@@ -952,6 +964,104 @@ bool ModuleEmitter::bindNativeModuleStar(llvm::StringRef module,
   return ok || diagnoseUnsupported;
 }
 
+namespace {
+// A container type a module global can hold: the same set `collectModuleGlobals`
+// slots for the main module, with every argument resolved so the cell has one
+// runtime representation.
+bool isStorableContainerType(mlir::Type type) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract)
+    return false;
+  llvm::StringRef name = contract.getContractName();
+  if (name != "builtins.list" && name != "builtins.dict" &&
+      name != "builtins.set" && name != "builtins.tuple" &&
+      name != "builtins.frozenset")
+    return false;
+  if (contract.getArguments().empty())
+    return false;
+  for (mlir::Type argument : contract.getArguments()) {
+    if (mlir::isa<py::UnionType>(argument))
+      return false;
+    auto element = mlir::dyn_cast_if_present<py::ContractType>(argument);
+    if (!element || element.getContractName() == "builtins.object")
+      return false;
+  }
+  return true;
+}
+} // namespace
+
+// ⭐ THE CONSTANTS AN IMPORTED MODULE CANNOT SPELL AS A LITERAL. Everything
+// scalar rides the literal channel -- its TYPE carries the value, so the
+// importer materializes it with no module state at all -- and a container has
+// no such spelling, so `NAMES = ["a"]` resolved from nowhere:
+//
+//     # lib.py
+//     NAMES = ["a", "b"]
+//     def count() -> int: return len(NAMES)   # unresolved name 'NAMES'
+//     # main.py
+//     import lib
+//     print(lib.NAMES)   # module 'lib' has no attribute 'NAMES' ...
+//
+// and the same three lines in the MAIN module compile, because there the
+// assignment IS a module global cell. This gives it the same cell, named
+// `mod.NAME`, filled at the start of `__main__` in import order -- the place
+// an imported module's class bodies already run.
+//
+// ⛔ Only a CONSTANT whose type is fully resolved. An erased element (`[]`) or
+// an `object` top has no storage the readers can agree on, which is the rule
+// `collectModuleGlobals` lives under for the main module; those keep the
+// refusal rather than a cell nothing can read.
+void ModuleEmitter::collectImportedModuleGlobals() {
+  for (const EmitOptions::SourceModule &source : options.sourceModules) {
+    if (!source.moduleNode || source.isStub)
+      continue;
+    const auto *rawBody = ast::nodeList(*source.moduleNode, "body");
+    if (!rawBody)
+      continue;
+    const std::vector<parser::NodePtr> body =
+        staticModuleStatements(types, *rawBody);
+    for (const parser::NodePtr &statement : body) {
+      if (!statement ||
+          (statement->kind != "AnnAssign" && statement->kind != "Assign"))
+        continue;
+      const parser::Node *target =
+          statement->kind == "AnnAssign"
+              ? ast::node(*statement, "target")
+              : (ast::nodeList(*statement, "targets") &&
+                         ast::nodeList(*statement, "targets")->size() == 1
+                     ? ast::nodeList(*statement, "targets")->front().get()
+                     : nullptr);
+      const parser::Node *value = ast::node(*statement, "value");
+      if (!target || target->kind != "Name" || !value)
+        continue;
+      llvm::StringRef name = ast::nameSpelling(*target);
+      if (sourceModuleLiteralConstant(types, body, name))
+        continue; // the literal channel already carries it
+      mlir::Type declared;
+      if (statement->kind == "AnnAssign")
+        declared = types.annotationType(ast::node(*statement, "annotation"));
+      if (!declared)
+        declared = types.widenLiteral(types.inferExpr(value));
+      if (!isStorableContainerType(declared))
+        continue;
+      std::string globalName =
+          (llvm::Twine(source.moduleName) + "." + name).str();
+      if (moduleGlobals.count(globalName))
+        continue;
+      moduleGlobals[globalName] = declared;
+      importedModuleGlobalInits.push_back(
+          PendingModuleGlobalInit{value, globalName, &source});
+    }
+  }
+}
+
+std::string
+ModuleEmitter::importedModuleGlobalFor(llvm::StringRef binding) const {
+  if (binding.empty() || !binding.contains('.'))
+    return {};
+  return moduleGlobals.count(binding) ? binding.str() : std::string();
+}
+
 void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
                                            const parser::Node &sourceModule,
                                            bool isStub) {
@@ -997,6 +1107,14 @@ void ModuleEmitter::bindSourceModuleLocals(llvm::StringRef moduleName,
     if (std::optional<mlir::Type> literal =
             sourceModuleLiteralConstant(types, *body, name)) {
       types.bindSymbol(name, *literal);
+      continue;
+    }
+    // Its own bodies read it too, and for an imported module there is no
+    // executed module body to bind it at run time -- the cell is what stands
+    // in for one.
+    std::string globalName = (llvm::Twine(moduleName) + "." + name).str();
+    if (moduleGlobals.count(globalName)) {
+      types.bindCanonicalSymbol(name, globalName, moduleGlobals[globalName]);
       continue;
     }
     if (moduleAliasTarget(*body, name))

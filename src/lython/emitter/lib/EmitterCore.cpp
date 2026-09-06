@@ -58,6 +58,10 @@ EmitResult ModuleEmitter::emit() {
     if (source.moduleNode && !source.isStub)
       desugarEnumClasses(*source.moduleNode);
   desugarEnumClasses(moduleNode);
+  // Before any binder reads an imported module's top level: a container
+  // constant there is a module GLOBAL, and the binders below hand out its
+  // canonical name.
+  collectImportedModuleGlobals();
   llvm::SmallVector<std::string, 8> staticAttrNames;
   llvm::SmallVector<mlir::Attribute, 8> staticAttrValues;
   collectStaticModuleAssignments(moduleNode, staticAttrNames, staticAttrValues);
@@ -135,6 +139,9 @@ EmitResult ModuleEmitter::emit() {
   // Before the main module's first statement, because that is where CPython
   // runs an imported module's class bodies: `import lib` executes lib before
   // the importer continues.
+  // Module-level constants first: a class attribute initializer may read one,
+  // and CPython runs the module body top to bottom.
+  emitImportedModuleGlobalInitializers();
   emitImportedClassAttrInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;

@@ -1518,20 +1518,29 @@ TEST(EmitterTest, AMethodThatExistsIsNotReportedAsMissing) {
 }
 
 TEST(EmitterTest, AnImportedModulesOwnBindingIsNotAnUnresolvedName) {
-  // A container constant in an imported module cannot be read from a function
-  // in that module -- an imported module has no executed body, so its
-  // constants travel as literals and a list has no literal spelling. The
-  // sentence was "unresolved name 'ITEMS'", pointing at a line where the name
-  // is plainly in scope, which sends the reader looking for a typo.
+  // A container constant in an imported module IS storage now: it gets the
+  // module global cell the main module's own container constant gets, filled
+  // at the start of `__main__`. Read from a function in its own module, which
+  // is the half that used to say "unresolved name 'ITEMS'" at a line where
+  // the name is plainly in scope.
   ImportedModuleEmit container = emitWithImportedModule(
       "tabled",
       "ITEMS: \"list[int]\" = [1, 2, 3]\n\n\ndef total() -> int:\n"
       "    return len(ITEMS)\n",
       "import tabled\nprint(tabled.total())\n");
-  EXPECT_FALSE(container.succeeded);
-  EXPECT_NE(container.diagnostics.find("imported module has no executed body"),
+  EXPECT_TRUE(container.succeeded) << container.diagnostics;
+
+  // ⛔ And only when the element type is RESOLVED: an erased `[]` has no
+  // storage the readers can agree on, and that refusal names the assignment
+  // rather than sending the reader looking for a typo.
+  ImportedModuleEmit erased = emitWithImportedModule(
+      "erased", "ITEMS = []\n\n\ndef total() -> int:\n    return len(ITEMS)\n",
+      "import erased\nprint(erased.total())\n");
+  EXPECT_FALSE(erased.succeeded);
+  EXPECT_NE(erased.diagnostics.find("is assigned at the top level of this "
+                                    "imported module"),
             std::string::npos)
-      << container.diagnostics;
+      << erased.diagnostics;
 
   // A name the module really does not bind keeps the other sentence.
   ImportedModuleEmit typo = emitWithImportedModule(

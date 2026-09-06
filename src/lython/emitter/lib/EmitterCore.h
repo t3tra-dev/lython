@@ -252,6 +252,23 @@ private:
   };
   llvm::SmallVector<PendingClassAttrInit, 4> importedClassAttrInits;
   void emitImportedClassAttrInitializers();
+  // ⭐ AND THE SAME QUESTION ONE LEVEL UP: a module-level CONTAINER constant
+  // in an imported module. A constant travels as a literal TYPE, and a
+  // container has no literal spelling, so `NAMES = ["a"]` did not resolve from
+  // the importer ("module 'm' has no attribute 'NAMES'") nor from a function
+  // in its own module ("unresolved name 'NAMES'"). A module global is what the
+  // main module gives one; these are the same storage, initialized at the
+  // start of `__main__` in import order.
+  struct PendingModuleGlobalInit {
+    const parser::Node *value = nullptr;
+    std::string globalName;
+    const EmitOptions::SourceModule *source = nullptr;
+  };
+  llvm::SmallVector<PendingModuleGlobalInit, 4> importedModuleGlobalInits;
+  void collectImportedModuleGlobals();
+  void emitImportedModuleGlobalInitializers();
+  // The `mod.NAME` global an imported module's constant lives in, or empty.
+  std::string importedModuleGlobalFor(llvm::StringRef binding) const;
   // CPython calls a base's `__init_subclass__` when a subclass is DEFINED.
   // Emitted at the class statement's position in module flow, beside the
   // attribute initializers, for the same reason.
@@ -1337,6 +1354,15 @@ private:
       emitter.moduleGlobals.clear();
       emitter.moduleConstantBindings.clear();
       emitter.primitiveConstants.clear();
+      // ⛔ EXCEPT AN IMPORTED MODULE'S OWN GLOBALS, which are exactly what a
+      // body being emitted here reads. Their keys are QUALIFIED (`lib.NAMES`)
+      // and a main-module global's is bare, so they cannot shadow one -- and
+      // hiding them left `return len(NAMES)` inside lib.py unresolved while
+      // `lib.NAMES` from the importer resolved, which is one storage with two
+      // answers.
+      for (const auto &entry : globals)
+        if (entry.getKey().contains('.'))
+          emitter.moduleGlobals[entry.getKey()] = entry.getValue();
     }
     ImporterModuleScope(const ImporterModuleScope &) = delete;
     ImporterModuleScope &operator=(const ImporterModuleScope &) = delete;

@@ -273,6 +273,27 @@ void ModuleEmitter::emitImportedClassAttrInitializers() {
   }
 }
 
+void ModuleEmitter::emitImportedModuleGlobalInitializers() {
+  llvm::SmallVector<PendingModuleGlobalInit, 4> pending =
+      std::move(importedModuleGlobalInits);
+  importedModuleGlobalInits.clear();
+  for (const PendingModuleGlobalInit &entry : pending) {
+    if (!entry.value || !entry.source)
+      continue;
+    mlir::Type stored = moduleGlobals.lookup(entry.globalName);
+    if (!stored)
+      continue;
+    emitInDefiningModuleScope(*entry.source, [&] {
+      Value initial = emitExprExpected(entry.value, stored);
+      Value coerced = coerceValue(initial, stored, *entry.value);
+      auto op = py::GlobalSetOp::create(builder, loc(*entry.value),
+                                        builder.getStringAttr(entry.globalName),
+                                        coerced.value);
+      markBoxedModuleGlobal(op);
+    });
+  }
+}
+
 void ModuleEmitter::emitInDefiningModuleScope(
     const EmitOptions::SourceModule &source, llvm::function_ref<void()> body) {
   llvm::SaveAndRestore<std::string> savedSourceName(
