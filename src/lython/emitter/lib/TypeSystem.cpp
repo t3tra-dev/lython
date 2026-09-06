@@ -3892,6 +3892,28 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                          reducerArgs->front()->kind != "Starred";
       if ((reducer == "any" || reducer == "all") && oneArgument)
         return boolType();
+      // ⭐ `divmod` OVER FLOATS IS TYPED WHERE THE EMITTER FOLDS IT. The
+      // manifest's divmod is `[int, int] -> tuple[int, int]`, and the emitter
+      // rewrites the float form into `(a // b, a % b)` -- so the CALL runs and
+      // this walk answered nothing, which the callers widen to `object`:
+      //
+      //     print(str(divmod(7.5, 2.5)))
+      //     # cannot pass concrete object builtins.tuple as builtins.object
+      //     # runtime input 0 of builtins.object.__str__
+      //
+      // while `t = divmod(7.5, 2.5)` then `str(t)` compiles, and the int form
+      // compiles inline. One question, two spellings: this is the emitter's
+      // own rule, which its note states as "divmod(x, y) and (x // y, x % y)
+      // are the same quotient and the same remainder".
+      if (reducer == "divmod" && reducerArgs && reducerArgs->size() == 2 &&
+          reducerArgs->front() && (*reducerArgs)[1] &&
+          reducerArgs->front()->kind != "Starred" &&
+          (*reducerArgs)[1]->kind != "Starred") {
+        mlir::Type leftOperand = widenLiteral(recurse(reducerArgs->front().get()));
+        mlir::Type rightOperand = widenLiteral(recurse((*reducerArgs)[1].get()));
+        if (leftOperand == floatType() || rightOperand == floatType())
+          return contract("builtins.tuple", {floatType(), floatType()});
+      }
       if ((reducer == "sum" || reducer == "max" || reducer == "min") &&
           oneArgument)
         if (mlir::Type element =

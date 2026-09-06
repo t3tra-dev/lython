@@ -1,0 +1,5 @@
+inline (3.0, 0.0)
+module scope (3.0, 0.0)
+unpacked 3.0 1.5
+mixed (3.0, 1.5)
+ints still (2, 1)
