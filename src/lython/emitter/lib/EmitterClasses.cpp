@@ -725,30 +725,64 @@ ModuleEmitter::resolveClassAttrSlot(llvm::StringRef className,
 // (`Sub.__init_subclass__()`): looking an inherited classmethod up through the
 // subclass binds `cls` to it, which is the argument CPython passes.
 //
-// ⛔ NOT when the class declares its own, and that shape is still missing its
-// parent's hook. CPython runs the PARENT's for the new class, never the
-// class's own on itself, and the spelling above would run the class's own.
-// Reaching the parent's with `cls` bound to the NEW class is what `super()`
-// does inside a method body and there is no expression for it out here:
-// `Base.__init_subclass__()` binds `cls` to Base, which is a wrong answer
-// rather than a missing one. Measured in
-// tests/probe/wb_init_subclass_through_a_middle_class.py.
+// ⛔ NOT through the attribute spelling when the class declares its own: that
+// finds the class's own method, which CPython never runs on itself, and
+// `Base.__init_subclass__()` binds `cls` to Base, a wrong answer rather than a
+// missing one. What reaches the ANCESTOR's body with `cls` bound to the NEW
+// class is a specialization -- the same `preboundTypeObject` the bound-method
+// wrapper uses, which drops `cls` from the signature and materializes the type
+// object inside the copy. Measured in
+// tests/probe/wb_init_subclass_through_a_middle_class.py: the class in the
+// middle printed only its own hook, never its parent's.
 void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
   std::optional<MethodBinding> hook =
       lookupClassMethod(types.contract(*name), "__init_subclass__");
-  if (!hook || !hook->method || hook->definingClass == *name)
+  if (!hook || !hook->method)
     return;
+  bool declaresItsOwn = hook->definingClass == *name;
+  if (declaresItsOwn) {
+    // The class declares its own, so the hook that runs for it is the nearest
+    // one ABOVE it. `startAfter` is what super() positions itself with.
+    std::string canonical = canonicalClassName(*name);
+    hook = resolveMroMethod(canonical, "__init_subclass__", canonical);
+    if (!hook || !hook->method)
+      return;
+  }
   // The hook takes no arguments beyond `cls`; anything else is a shape this
   // does not model, and calling it would pass the wrong count.
   if (hook->bodySignature.positionalNames.size() != 1)
     return;
+  parser::NodePtr callee;
+  if (!declaresItsOwn) {
+    callee = synth::attribute(synth::name(*name, classDef.range),
+                              "__init_subclass__", classDef.range);
+  } else {
+    // The lookup through the subclass would find the class's own body, so
+    // emit a copy of the ancestor's with `cls` prebound to this class.
+    FunctionSignature bound = hook->bodySignature;
+    bound.positionalTypes.erase(bound.positionalTypes.begin());
+    bound.positionalNames.erase(bound.positionalNames.begin());
+    if (!bound.positionalDefaults.empty())
+      bound.positionalDefaults.erase(bound.positionalDefaults.begin());
+    if (bound.positionalOnlyCount > 0)
+      --bound.positionalOnlyCount;
+    types.refreshCallable(bound);
+    std::string symbolName =
+        (llvm::Twine(hook->symbolName) + "$initsubclass$" + *name).str();
+    emitCallableFunction(*hook->method, symbolName, bound, {},
+                         /*isLambda=*/false, /*positionalNodeOffset=*/1,
+                         types.contract(*name));
+    // ⛔ Not left to the binding `emitCallableFunction` makes: that one is
+    // inside the copy's own emission scope and is gone by the time the call is
+    // emitted. The spelling carries `$`, so no source name can collide.
+    types.bindSymbol(symbolName, bound.callable);
+    callee = synth::name(symbolName, classDef.range);
+  }
   parser::NodePtr call = synth::call(
-      synth::attribute(synth::name(*name, classDef.range),
-                       "__init_subclass__", classDef.range),
-      std::vector<parser::NodePtr>{}, classDef.range);
+      std::move(callee), std::vector<parser::NodePtr>{}, classDef.range);
   emitStatement(*synth::exprStmt(std::move(call), classDef.range));
 }
 
