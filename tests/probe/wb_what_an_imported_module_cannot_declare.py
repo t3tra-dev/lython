@@ -11,10 +11,22 @@
 #   CORRECT ACROSS THE BOUNDARY
 #     def / default argument / generator def
 #     @property / @staticmethod / @classmethod / @dataclass
+#     `__init_subclass__` (CORRECT as of 2026-09-06: the hook runs where the
+#         imported class bodies do, at the start of `__main__` in import order;
+#         golden cases/an_imported_hook_runs_when_its_module_is_read)
+#     a module CONSTANT whose value is an expression (2026-09-06)
+#     a module constant REBOUND in a loop by the importer (2026-09-06 -- it
+#         used to compile and not terminate)
 #     Exception subclass, class attribute read through an instance
 #     int / str / bool module constant
 #
 #   ONE FILE IS RIGHT, ACROSS THE BOUNDARY IS NOT -- the boundary is the cause
+#     a plain @decorator on a def ... refused, and the MECHANISM now exists:
+#         an imported module's initializers run at the start of `__main__`, and
+#         `f = d(f)` is one. What blocks it is ORDER -- the decorated type is
+#         `inferExpr` over `d(f)`, which cannot answer until the module's own
+#         defs are declared, one pass after the importer's binders hand out the
+#         name. Recorded at the refusal itself.
 #     Enum subclass ......... CORRECT as of 2026-09-06 (`desugarEnumClasses`
 #                             now runs on every imported module before the main
 #                             one, and an imported class attribute is real

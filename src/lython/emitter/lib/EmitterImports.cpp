@@ -143,6 +143,16 @@ void refuseImportTimeStatements(TypeSystem &types,
               continue;
             diagnostics.push_back(parser::Diagnostic{
                 parser::Severity::Error, statement->range.start,
+                // ⛔ THE MECHANISM NOW EXISTS AND THIS STILL REFUSES, which
+                // is a scope decision rather than a missing one: an imported
+                // module's class bodies and module-global initializers run at
+                // the start of `__main__` in import order (2026-09-06), and a
+                // decorator application is exactly such an initializer --
+                // `f = d(f)` into the cell the name reads. What it needs
+                // before it can be queued is the DECORATED type, and that is
+                // `inferExpr` over `d(f)`, which cannot answer until the
+                // module's own defs are declared -- one pass later than where
+                // the importer's binders hand out the name.
                 "a decorator on a function in an imported module is not "
                 "supported: an imported module's body does not run, so the "
                 "decorator would never be applied and the undecorated "
