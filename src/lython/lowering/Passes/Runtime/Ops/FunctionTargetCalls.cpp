@@ -990,6 +990,17 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
                      << " references logical argument " << index
                      << ", but call has only " << sources.size()
                      << " logical sources";
+            // ⭐ A `type[X]` CAPTURE CARRIES NOTHING -- the fourth place that
+            // pairs a logical capture with a physical one, after the closure
+            // store, the call's ABI inputs and the generator's frame sources.
+            // Returning a closure over a `type[X]` PARAMETER was "returned
+            // callable capture source must be an object bundle", while the same
+            // closure over a `type[X]` LOCAL returns fine.
+            if (sources[index]->kind == RuntimeBundle::Kind::TypeObject) {
+              alternative.closureValues.push_back(RuntimeValue::object(
+                  sources[index]->contract, mlir::ValueRange{}));
+              continue;
+            }
             if (sources[index]->kind != RuntimeBundle::Kind::Object)
               return op->emitError() << "returned callable capture source "
                                         "must be an object bundle";

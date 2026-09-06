@@ -10,7 +10,7 @@
 # with a SUBCLASS is a separate refusal ("whose class is subclassed in this
 # program, so which class it names is not decided by its type"), and it is not
 # what this case is about.
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 class Widget:
@@ -47,8 +47,30 @@ class Factory:
             yield cls(i).label()
 
 
+# The same class held in a FIELD: `self.cls(i)` is a constructor, not a method
+# named `cls`, and only the yield walk asks the inference that question.
+class Held:
+    def __init__(self, cls: type[Widget]) -> None:
+        self.cls: type[Widget] = cls
+
+    def rows(self, n: int) -> Iterator[str]:
+        for i in range(n):
+            yield self.cls(i).label()
+
+
+# A closure over a `type[X]` PARAMETER, returned out of the function that
+# built it: its capture rides out as a lane that carries nothing.
+def factory(cls: type[Widget]) -> Callable[[int], str]:
+    def build(v: int) -> str:
+        return cls(v).label()
+
+    return build
+
+
 print(list(rows(Widget, 3)))
 print(list(flags(Widget, 4)))
 print(list(missing(None, 2)))
 print(list(shadowed(Widget, 2)))
 print(list(Factory().rows(Widget, 2)))
+print(list(Held(Widget).rows(2)))
+print(factory(Widget)(9))

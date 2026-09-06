@@ -4204,6 +4204,26 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
               widenLiteral(receiver), *methodName, positional, keywords);
           if (inference)
             return inference.resultType;
+          // ⭐ AN ATTRIBUTE HOLDING A TYPE OBJECT IS A CONSTRUCTOR, not a
+          // method. `self.cls(i)` where `self.cls: type[Widget]` looked for a
+          // METHOD named `cls`, found none and answered `object` -- which only
+          // the generator yield walk depends on, so
+          //
+          //     def rows(self, n: int) -> Iterator[int]:
+          //         for i in range(n):
+          //             yield self.cls(i).n
+          //
+          // was refused for its own correct annotation. Binding `self.cls` to
+          // a local first works, and so does the same expression in a plain
+          // method, which is what says the inference is the gap.
+          //
+          // ⛔ Asked only after the method lookup has FAILED: it re-infers the
+          // attribute expression, and doing that ahead of every method call
+          // would pay for a question almost none of them ask.
+          if (auto attributeType = mlir::dyn_cast_if_present<py::TypeType>(
+                  widenLiteral(recurse(callee))))
+            if (mlir::Type instance = attributeType.getInstanceType())
+              return inferClassInstantiation(instance, positional, keywords);
           return strict ? fail(inference.failureReason) : object();
         }
       }
