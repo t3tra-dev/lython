@@ -1104,6 +1104,17 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   // "collection payload element ... has no physical object handle". A join
   // that reached the erased top is excluded for the opposite reason: the slot
   // would accept every write and refuse every read.
+  //
+  // ⛔ AND `None`, which reads like a missing arm and is the same wall
+  // measured (2026-09-06): letting it through turns "unresolved name 'v'" into
+  // "field 'v' of '!py.literal<None>' has no instance body word" out of the
+  // LOWERING, for `v = None` first bound inside a for/while/try/with and read
+  // after. A None expands to NO physical values, so the slot's field has no
+  // word -- what it needs is the written FLAG alone, which the field layout
+  // has no shape for. The `if` spelling works because a plain `if` joins
+  // through block arguments and never takes a slot at all; an int in the same
+  // position works because it has a word. Recorded in
+  // tests/probe/wb_a_none_first_bound_inside_a_region.py.
   if (!mlir::isa_and_nonnull<py::ContractType>(joined) ||
       py::isPyObjectType(joined))
     return {};
