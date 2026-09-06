@@ -979,20 +979,34 @@ bool isStorableContainerType(mlir::Type type) {
   if (!contract)
     return false;
   llvm::StringRef name = contract.getContractName();
-  if (name != "builtins.list" && name != "builtins.dict" &&
-      name != "builtins.set" && name != "builtins.tuple" &&
-      name != "builtins.frozenset")
-    return false;
-  if (contract.getArguments().empty())
-    return false;
-  for (mlir::Type argument : contract.getArguments()) {
-    if (mlir::isa<py::UnionType>(argument))
+  if (name == "builtins.list" || name == "builtins.dict" ||
+      name == "builtins.set" || name == "builtins.tuple" ||
+      name == "builtins.frozenset") {
+    if (contract.getArguments().empty())
       return false;
-    auto element = mlir::dyn_cast_if_present<py::ContractType>(argument);
-    if (!element || element.getContractName() == "builtins.object")
-      return false;
+    for (mlir::Type argument : contract.getArguments()) {
+      if (mlir::isa<py::UnionType>(argument))
+        return false;
+      auto element = mlir::dyn_cast_if_present<py::ContractType>(argument);
+      if (!element || element.getContractName() == "builtins.object")
+        return false;
+    }
+    return true;
   }
-  return true;
+  // ⭐ AND A SCALAR WHOSE VALUE IS AN EXPRESSION. The literal channel carries
+  // `LIMIT = 3600` because its TYPE is the value; `LIMIT = 60 * 60` has no
+  // literal spelling, so it resolved from nowhere -- "module 'lib' has no
+  // attribute 'RATIO' that resolves statically" for `RATIO = 1.0 / 4.0`, and
+  // the same three lines in the MAIN module compile. The caller reaches this
+  // only after the literal channel has declined, so nothing that used to fold
+  // starts taking a cell.
+  //
+  // ⛔ NOT the erased top, and not a bare generic: a cell whose contract has
+  // no arguments to describe it accepts every write and refuses every read,
+  // which is the rule `collectModuleGlobals` lives under for the main module.
+  if (name == "builtins.object")
+    return false;
+  return contract.getArguments().empty();
 }
 } // namespace
 
