@@ -1701,6 +1701,21 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     // Reference identity between header-carrying contracts (user-class
     // instances, containers) is an address comparison; dispatching the
     // fall-through __eq__/__ne__ here would silently turn `is` into `==`.
+    // ⛔ A CALLABLE IS NOT ONE OF THEM, and the reason is NOT the spelling.
+    // A `py.callable` static type looks like the four storability gates that
+    // wrongly excluded a function object -- but here the exclusion is right,
+    // and letting it through is a SILENT WRONG ANSWER rather than a missing
+    // one (measured 2026-09-06):
+    //
+    //     v: Callable[[int], int] = double
+    //     w: Callable[[int], int] = double
+    //     print(v is w)      # prints False; CPython prints True
+    //
+    // because a function VALUE is materialized at each reference here -- two
+    // reads of one `def` build two objects -- so their addresses differ and
+    // identity has no stable meaning. That is the same rule the int/str arm
+    // above states, for a different reason. Making it true needs one function
+    // object per def, cached at the binding.
     mlir::Type lhsWidened = types.widenLiteral(lhs.type);
     mlir::Type rhsWidened = types.widenLiteral(rhs.type);
     if (mlir::isa<py::ContractType>(lhsWidened) &&
