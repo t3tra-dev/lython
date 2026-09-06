@@ -1311,7 +1311,10 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
           llvm::SaveAndRestore<bool> emitNow(deferClassMethodBodies, false);
           drainGenericClassSpecializations(classSymbol);
         } else {
-          emitClassContract(*statement, classSymbol);
+          // `&source` is what says its attribute initializers will be run:
+          // an imported module's body does not, so they are queued for the
+          // start of `__main__`, in import order.
+          emitClassContract(*statement, classSymbol, &source);
         }
       }
       for (std::size_t index = classDiagnosticStart; index < diagnostics.size();

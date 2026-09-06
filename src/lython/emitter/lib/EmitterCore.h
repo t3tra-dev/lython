@@ -239,7 +239,19 @@ private:
                        llvm::StringRef attrName) const;
   // Evaluates the class body's attribute initializers into their global
   // slots; runs at the ClassDef statement position in module flow.
-  void emitClassAttrInitializers(const parser::Node &classDef);
+  void emitClassAttrInitializers(const parser::Node &classDef,
+                                 llvm::StringRef contractName = {});
+  // ⭐ AN IMPORTED CLASS'S ATTRIBUTE INITIALIZERS HAVE NO POSITION IN MODULE
+  // FLOW, because an imported module's body does not run -- so they are queued
+  // as its classes are declared and emitted at the start of `__main__`, in
+  // import order, which is where CPython runs them.
+  struct PendingClassAttrInit {
+    const parser::Node *classDef = nullptr;
+    std::string contractName;
+    const EmitOptions::SourceModule *source = nullptr;
+  };
+  llvm::SmallVector<PendingClassAttrInit, 4> importedClassAttrInits;
+  void emitImportedClassAttrInitializers();
   // CPython calls a base's `__init_subclass__` when a subclass is DEFINED.
   // Emitted at the class statement's position in module flow, beside the
   // attribute initializers, for the same reason.
@@ -261,8 +273,13 @@ private:
                                             const FunctionSignature &sig,
                                             llvm::StringRef symbolName);
   Value emitLambda(const parser::Node &expr, py::CallableType expected = {});
+  // `source` names the imported module a class was declared in, and is what
+  // says its attribute initializers will be RUN (queued for the start of
+  // `__main__`). A generic specialization also carries a symbolName and has no
+  // such position, so it keeps the constant channel.
   void emitClassContract(const parser::Node &classDef,
-                         llvm::StringRef symbolName = {});
+                         llvm::StringRef symbolName = {},
+                         const EmitOptions::SourceModule *source = nullptr);
   // Monomorphization of `class C[T]`, the class-side counterpart of
   // GenericFunctionInfo: the generic class itself is never emitted (a py
   // class contract has no runtime slot for a type parameter, and its field

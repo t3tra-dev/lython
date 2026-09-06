@@ -719,11 +719,28 @@ ModuleEmitter::resolveClassAttrSlot(llvm::StringRef className,
   }
   for (const std::string &cls : mro) {
     auto slots = classAttrSlots.find(cls);
-    if (slots == classAttrSlots.end())
-      continue;
-    auto slot = slots->second.find(attrName);
-    if (slot != slots->second.end())
-      return std::make_pair(slots->first(), slot->second);
+    if (slots != classAttrSlots.end()) {
+      auto slot = slots->second.find(attrName);
+      if (slot != slots->second.end())
+        return std::make_pair(slots->first(), slot->second);
+    }
+    // ⛔ STOP AT THE FIRST CLASS IN THE MRO THAT DECLARES IT, slot or no slot.
+    // Only a main-module class gets slots -- an imported one keeps its
+    // attributes on the constant channel -- so walking past it handed back a
+    // LATER class's storage:
+    //
+    //     # lib.py: class A: tag = "a"
+    //     class M:            tag = "m"
+    //     class BaseFirst(A, M): pass
+    //     print(BaseFirst().tag)   # printed m; Python reads A's, "a"
+    //
+    // Silently, and correct with A written in the same file. A main-module
+    // class whose own attribute is not storable (a container) is the same
+    // question: its value is what Python reads, not its base's slot.
+    auto declared = declaredClassAttributes.find(cls);
+    if (declared != declaredClassAttributes.end() &&
+        declared->second.contains(attrName))
+      return std::nullopt;
   }
   return std::nullopt;
 }
@@ -916,15 +933,18 @@ void ModuleEmitter::emitDeferredMethodBodies() {
   deferredMethodBodies.clear();
 }
 
-void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
+void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef,
+                                              llvm::StringRef contractName) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
+  std::string slotKey =
+      contractName.empty() ? std::string(*name) : contractName.str();
   // The class body's own names are bound as each initializer is emitted (see
   // the store below) and must not outlive it: `width` is an attribute of the
   // class, not a module global.
   ScopedEmitterScope classBodyScope(values, types);
-  auto slots = classAttrSlots.find(*name);
+  auto slots = classAttrSlots.find(slotKey);
   if (slots == classAttrSlots.end() || slots->second.empty())
     return;
   const auto *body = ast::nodeList(classDef, "body");
@@ -1032,7 +1052,10 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef) {
       continue;
     }
     Value coerced = coerceValue(initial, slot->second, *statement);
-    std::string cellName = (llvm::Twine(*name) + "." + attrName).str();
+    // The DEFINING class's contract name, not the source spelling: an
+    // imported class's cell is `mod.Registry.items` on every reader's side,
+    // and a store under the bare name left the cell the readers use unwritten.
+    std::string cellName = (llvm::Twine(slotKey) + "." + attrName).str();
     py::GlobalSetOp::create(builder, loc(*statement),
                             builder.getStringAttr(cellName), coerced.value);
     // ⭐ THE CLASS BODY IS A SCOPE, and this is where its names live. CPython
@@ -1420,7 +1443,8 @@ void ModuleEmitter::drainGenericClassSpecializations(llvm::StringRef onlyBase) {
 }
 
 void ModuleEmitter::emitClassContract(const parser::Node &classDef,
-                                      llvm::StringRef symbolName) {
+                                      llvm::StringRef symbolName,
+                                      const EmitOptions::SourceModule *source) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
@@ -1875,7 +1899,20 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
   // longer restricted to constants). Container-typed attributes stay on the
   // constant channel: their storage cells would go stale against
   // reallocation, the same reason collectModuleGlobals excludes them.
-  if (symbolName.empty()) {
+  // ⭐ AN IMPORTED CLASS GETS SLOTS TOO. The gate used to be "main-module
+  // only", so an imported class's attributes stayed on the constant channel --
+  // which re-materializes a value per read and has no arm for a container or
+  // for a WRITE. `class Registry: seen: list[str] = []` in a library was
+  // "unsupported static class attribute expression for 'seen'" out of the
+  // LOWERING, and `Counter.count += 1` the same, both for shapes that work
+  // written in one file. A cell is what CPython's class dict is: one storage,
+  // shared, mutable.
+  //
+  // ⛔ A slot only where the INITIALIZER will run. A generic specialization
+  // carries a symbolName too and has no position in module flow at all, so it
+  // keeps the constant channel -- giving it a cell nothing writes left
+  // `Tagged$spec0.label` "referenced before assignment" at run time.
+  if (symbolName.empty() || source) {
     llvm::StringMap<mlir::Type> &slots = classAttrSlots[contractName];
     slots.clear();
     for (auto [attrName, attrType] :
@@ -1941,6 +1978,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       if (storable)
         slots[attrName] = widened;
     }
+    if (source)
+      importedClassAttrInits.push_back(
+          PendingClassAttrInit{&classDef, classSymbol, source});
   }
   // Inherit base class attributes MRO-forward (own declarations win): a
   // subclass reads its bases' class attributes through its own type object.

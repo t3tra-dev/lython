@@ -122,6 +122,10 @@ EmitResult ModuleEmitter::emit() {
   };
   bindModuleDunder("__name__", "__main__");
   bindModuleDunder("__file__", sourceName);
+  // Before the main module's first statement, because that is where CPython
+  // runs an imported module's class bodies: `import lib` executes lib before
+  // the importer continues.
+  emitImportedClassAttrInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;
   if (!insertionBlockTerminated(builder))

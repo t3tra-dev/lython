@@ -260,6 +260,19 @@ ModuleEmitter::ensureGenericSpecialization(const parser::Node &anchor,
   return std::make_pair(symbol, specialized.publicCallable);
 }
 
+void ModuleEmitter::emitImportedClassAttrInitializers() {
+  llvm::SmallVector<PendingClassAttrInit, 4> pending =
+      std::move(importedClassAttrInits);
+  importedClassAttrInits.clear();
+  for (const PendingClassAttrInit &entry : pending) {
+    if (!entry.classDef || !entry.source)
+      continue;
+    emitInDefiningModuleScope(*entry.source, [&] {
+      emitClassAttrInitializers(*entry.classDef, entry.contractName);
+    });
+  }
+}
+
 void ModuleEmitter::emitInDefiningModuleScope(
     const EmitOptions::SourceModule &source, llvm::function_ref<void()> body) {
   llvm::SaveAndRestore<std::string> savedSourceName(

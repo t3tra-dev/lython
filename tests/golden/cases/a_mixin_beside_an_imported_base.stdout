@@ -1,0 +1,3 @@
+attribute ['shape', 'loud', 'shape']
+method ['shape', 'loud', 'shape']
+through the base ['shape1', 'loud2', 'shape3']
