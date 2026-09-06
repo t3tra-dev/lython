@@ -1,0 +1,5 @@
+outer local abc
+nested xxx
+loop target bb
+local alias 4
+while zz

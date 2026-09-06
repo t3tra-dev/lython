@@ -1115,6 +1115,21 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   // through block arguments and never takes a slot at all; an int in the same
   // position works because it has a word. Recorded in
   // tests/probe/wb_a_none_first_bound_inside_a_region.py.
+  // ⭐ AND A CALLABLE, which the `def` branch at the top of this function has
+  // been returning all along -- it hands back `sig.publicCallable` and never
+  // reaches this gate. So a slot for a function object demonstrably works, and
+  // only the spellings that come through the VALUE path were refused:
+  //
+  //     w: Callable[[int], int] = lambda n: n + 1
+  //     for _ in range(1):
+  //         v = w
+  //     return v(1)        # unresolved name 'v'
+  //
+  // while `def v(...)` in the same position, and a lambda LITERAL in the same
+  // position, both compile. One question, three spellings, one of them
+  // answered.
+  if (mlir::isa_and_nonnull<py::CallableType>(joined))
+    return joined;
   if (!mlir::isa_and_nonnull<py::ContractType>(joined) ||
       py::isPyObjectType(joined))
     return {};

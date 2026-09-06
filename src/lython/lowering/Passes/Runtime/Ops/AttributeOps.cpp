@@ -987,6 +987,47 @@ bool RuntimeBundleLowerer::storedSourceOutlivesStore(mlir::Operation *op,
   // move a token it can see the whole life of.
   if (mlir::isa<mlir::BlockArgument>(source))
     return true;
+  // ⭐ AND A STORE THAT RUNS MORE THAN ONCE PER DEFINITION. The dominance walk
+  // below asks whether anyone ELSE needs the value; for
+  //
+  //     w = "abc"
+  //     for _ in range(1):
+  //         h.x = w
+  //
+  // nobody does, so the store took the token -- and the next trip ran the same
+  // store with the same one: "released or transferred more than once on one
+  // CFG path", for a program that stores a local into a field in a loop. The
+  // store's own REPETITION is what outlives it: one definition, N moves.
+  //
+  // ⛔ Only when the definition does not repeat WITH it. A value produced
+  // inside the loop body is fresh on every trip and has exactly one store to
+  // move into -- `h.x = s` over the loop target is that shape, and it compiled
+  // all along.
+  //
+  // ⛔ AND THE TEST IS "REACHES ITSELF WITHOUT PASSING THE DEFINITION", not
+  // "same cycle". A definition in an OUTER loop and a store in an INNER one
+  // sit in the same strongly-connected component, and the store still repeats
+  // three times per definition -- which is the shape the leak probe for this
+  // very fix is written as.
+  auto repeatsWithoutRedefining = [](mlir::Block *start, mlir::Block *avoid) {
+    llvm::SmallPtrSet<mlir::Block *, 16> seen;
+    llvm::SmallVector<mlir::Block *, 16> worklist(start->succ_begin(),
+                                                  start->succ_end());
+    while (!worklist.empty()) {
+      mlir::Block *current = worklist.pop_back_val();
+      if (current == start)
+        return true;
+      if (current == avoid || !seen.insert(current).second)
+        continue;
+      worklist.append(current->succ_begin(), current->succ_end());
+    }
+    return false;
+  };
+  mlir::Block *storeBlock = op->getBlock();
+  mlir::Block *sourceBlock = source.getParentBlock();
+  if (storeBlock && sourceBlock &&
+      repeatsWithoutRedefining(storeBlock, sourceBlock))
+    return true;
   mlir::Operation *function = op->getParentOfType<mlir::func::FuncOp>();
   if (!function)
     return false;
