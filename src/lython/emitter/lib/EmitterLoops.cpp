@@ -206,8 +206,59 @@ llvm::SmallVector<CarriedLoopLocal, 4> ModuleEmitter::collectCarriedLoopLocals(
     if (excludedNames && excludedNames->contains(assigned.getKey()))
       continue;
     auto found = values.find(assigned.getKey());
-    if (found == values.end() || !found->second.value)
-      continue;
+    // ⭐ A NAME THE MODULE ONLY KNOWS AS A CONSTANT IS STILL A BINDING TO
+    // CARRY. An imported scalar (`from lib import i` where lib says `i = 0`)
+    // rides the literal channel -- its TYPE is the value -- so it has no
+    // `values` entry, and the scan read "not bound before the loop" and
+    // carried nothing:
+    //
+    //     from lib import i
+    //     while True:
+    //         i += 1
+    //         if i >= 5: break
+    //
+    // re-materialized the literal 0 on every trip, so the test never became
+    // true and the program HUNG. `i = i + 1` outside a loop works, and the
+    // same three lines with `i = 0` written here work, which is what says the
+    // missing entry is the gap. Materializing it is what the first READ of the
+    // name would have done anyway, one statement earlier.
+    if (found == values.end() || !found->second.value) {
+      // ⛔ AT MODULE SCOPE ONLY. A method body is emitted INLINE, so a module
+      // constant is in scope inside it -- and a method's own local of the same
+      // spelling is a DIFFERENT binding. Materializing there made
+      // `text = "hello"` at module scope collide with a method's int `text`:
+      // "loop-carried local 'text' is bound to builtins.str before the loop
+      // and to builtins.int inside it", for a golden that exists to pin that
+      // the two stay apart. The shape this repairs is a module-level rebind,
+      // and inside a function one needs `global` anyway.
+      // ⛔ NOT THE LOOP TARGET, and not inside an INLINED body. A method is
+      // emitted inline at its call site, so at module scope a module constant
+      // is in scope inside it -- and `for text in xs:` in a method whose
+      // module has `text = "hello"` is a DIFFERENT binding. Materializing
+      // there made the two collide: "loop-carried local 'text' is bound to
+      // builtins.str before the loop and to builtins.int inside it", for a
+      // golden that exists to pin that they stay apart. A loop TARGET is a
+      // fresh binding per trip and never a carried constant, which is the
+      // same reason the scan filters it by not finding it in `values`.
+      const parser::Node *loopTarget = ast::node(statement, "target");
+      bool isLoopTarget =
+          loopTarget && loopTarget->kind == "Name" &&
+          llvm::StringRef(ast::nameSpelling(*loopTarget)) == assigned.getKey();
+      std::optional<mlir::Type> bound = types.lookupSymbol(assigned.getKey());
+      if (!atModuleScope || isLoopTarget || !methodsBeingInlined.empty() ||
+          !bound || !mlir::isa<py::LiteralType>(*bound) ||
+          moduleFunctionNames.count(assigned.getKey()) ||
+          moduleClassNames.count(assigned.getKey()))
+        continue;
+      parser::NodePtr read =
+          synth::name(assigned.getKey(), statement.range);
+      Value materialized = emitExpr(read.get());
+      synthesizedIteratorDefs.push_back(std::move(read));
+      if (!materialized.value)
+        continue;
+      values[assigned.getKey()] = materialized;
+      found = values.find(assigned.getKey());
+    }
     // ⛔ A CELL IS NOT CARRIED. The binding is the cell OBJECT and the body
     // writes through it, so there is nothing to thread -- and threading it
     // rebound the name's static type to the cell's own contract, which made
