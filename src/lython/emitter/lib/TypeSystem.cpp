@@ -3919,6 +3919,24 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (mlir::Type element =
                 iterationElementType(reducerArgs->front().get()))
           return element;
+      // ⭐ `sorted(x, reverse=True)` HAS `sorted(x)`'s TYPE. The keyword form
+      // is a SUGAR rewrite in the emitter, so this walk had nothing for it and
+      // its callers widen to `object`:
+      //
+      //     print(str(sorted(xs, reverse=True)))
+      //     # cannot pass concrete object builtins.list as builtins.object
+      //     # runtime input 0 of builtins.object.__str__
+      //
+      // while `t = sorted(xs, reverse=True)` then `str(t)` compiled, and the
+      // keyword-LESS form compiled inline through the manifest contract. Same
+      // shape as `divmod` over floats above: the emitter folds something the
+      // walk does not know about, and it shows only where a caller asks for
+      // the type. `key=` does not change the answer either -- the result holds
+      // the argument's elements, whatever the key ordered them by.
+      if (reducer == "sorted" && oneArgument)
+        if (mlir::Type element =
+                iterationElementType(reducerArgs->front().get()))
+          return contract("builtins.list", {widenLiteral(element)});
       // The lazy-iterator builtins are the same story one step further:
       // the emitter synthesizes a generator function for each of them, so
       // the type exists only once that function is emitted. A walk that ran

@@ -1,4 +1,9 @@
-# What: `divmod` over floats used INLINE, without binding the pair first. The
+# What: a builtin the EMITTER FOLDS, used INLINE rather than through a name.
+# That is the shape: the fold makes the call run, and the inference walk knows
+# nothing about it, so its callers widen the result to `object` -- which shows
+# up only where a caller ASKS for the type, and never where the value is bound.
+#
+# `divmod` over floats used inline, without binding the pair first. The
 # manifest's divmod is `[int, int] -> tuple[int, int]` and the emitter rewrites
 # the float form into `(a // b, a % b)` -- so the call ran and the inference
 # walk answered nothing, which its callers widen to `object`:
@@ -32,3 +37,15 @@ print("module scope", str(divmod(7.5, 2.5)))
 print("unpacked", unpacked(7.5, 2.0))
 print("mixed", mixed(7.5, 2))
 print("ints still", str(divmod(7, 3)))
+
+# ⭐ The same shape one builtin over: `sorted(x, reverse=True)` is a SUGAR
+# rewrite in the emitter, so the walk had nothing for it and `str()` of it
+# inline was the same message about `builtins.list`. `key=` does not change
+# the answer -- the result holds the argument's elements, whatever the key
+# ordered them by.
+values: list[int] = [3, 1, 2]
+words: list[str] = ["bb", "a", "ccc"]
+
+print("sorted reverse", str(sorted(values, reverse=True)))
+print("sorted key", str(sorted(words, key=len)))
+print("sorted plain", str(sorted(values)))
