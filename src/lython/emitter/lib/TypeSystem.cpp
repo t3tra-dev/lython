@@ -464,6 +464,102 @@ void bindGeneratorAnalysisTarget(const TypeSystem &types,
                                   nullptr, localCallables, analysis);
 }
 
+// ⭐ A GUARD IS A FACT THE YIELD INSIDE IT DEPENDS ON, and this walk had none.
+// Every yield is typed by a pass with no flow facts, so
+//
+//     def tags(xs: list[A]) -> Iterator[str]:
+//         for x in xs:
+//             if isinstance(x, B):
+//                 yield x.tag()
+//
+// inferred None -- `tag` is not on `A` -- and the generator was refused as
+// "annotated Iterator[str] but yields literal<None>", a sentence about the
+// annotation for a program whose annotation is right. `yield v * 2` over an
+// `int | None` was the shape that worked, and only because `__mul__` still
+// infers SOMETHING for the walk to recognise; an attribute or method lookup
+// fails outright.
+//
+// ⛔ NOT the whole narrowing analysis the emitter has -- this walk runs before
+// any of it exists. Two guards, both syntactic: `isinstance(NAME, Class)` and
+// `NAME is not None`, each binding the narrowed type for the BODY only. That
+// is what the two recorded shapes need, and a guard it does not recognise
+// leaves the walk exactly as it was.
+//
+// ⛔ And not the `else` arm: the negative of `is not None` is None, which is
+// the type the walk already infers, and the negative of `isinstance` is not a
+// type at all.
+void applyGeneratorGuardNarrowing(
+    const TypeSystem &types, const parser::Node *test,
+    const llvm::StringMap<mlir::Type> &localCallables,
+    GeneratorFunctionAnalysis &analysis,
+    llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow) {
+  if (!test)
+    return;
+  if (test->kind == "BoolOp" && ast::isOperator(ast::node(*test, "op"), "And")) {
+    if (const auto *values = ast::nodeList(*test, "values"))
+      for (const parser::NodePtr &value : *values)
+        applyGeneratorGuardNarrowing(types, value.get(), localCallables,
+                                     analysis, narrow);
+    return;
+  }
+  if (test->kind == "Call") {
+    const parser::Node *callee = ast::node(*test, "func");
+    const auto *args = ast::nodeList(*test, "args");
+    if (!callee || callee->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*callee)) != "isinstance" || !args ||
+        args->size() != 2 || !args->front() || !(*args)[1])
+      return;
+    const parser::Node *subject = args->front().get();
+    if (subject->kind != "Name")
+      return;
+    std::string spelling = ast::qualifiedName((*args)[1].get());
+    if (spelling.empty())
+      return;
+    if (std::optional<mlir::Type> narrowed = types.lookupClass(spelling))
+      narrow(ast::nameSpelling(*subject), *narrowed);
+    return;
+  }
+  if (test->kind != "Compare")
+    return;
+  const parser::Node *left = ast::node(*test, "left");
+  const auto *ops = ast::nodeList(*test, "ops");
+  const auto *comparators = ast::nodeList(*test, "comparators");
+  if (!left || left->kind != "Name" || !ops || ops->size() != 1 ||
+      !comparators || comparators->size() != 1 || !comparators->front() ||
+      !ast::isOperator(ops->front().get(), "IsNot") ||
+      !ast::isNoneField(*comparators->front(), "value"))
+    return;
+  llvm::StringRef name = ast::nameSpelling(*left);
+  mlir::Type current = analysis.localSymbols.lookup(name);
+  if (!current)
+    if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
+      current = *bound;
+  auto unionType =
+      mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(current));
+  if (!unionType)
+    return;
+  llvm::SmallVector<mlir::Type, 4> payloads;
+  bool sawNone = false;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    member = types.widenLiteral(member);
+    if (auto literal = mlir::dyn_cast_if_present<py::LiteralType>(member);
+        literal && literal.getSpelling() == "None") {
+      sawNone = true;
+      continue;
+    }
+    if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(member);
+        contract && contract.getContractName() == "types.NoneType") {
+      sawNone = true;
+      continue;
+    }
+    payloads.push_back(member);
+  }
+  if (!sawNone || payloads.empty())
+    return;
+  if (mlir::Type narrowed = types.join(payloads))
+    narrow(name, narrowed);
+}
+
 void collectGeneratorFunctionAnalysis(
     const TypeSystem &types, const parser::Node *node,
     const llvm::StringMap<mlir::Type> &localCallables,
@@ -651,6 +747,41 @@ void collectGeneratorFunctionAnalysis(
                                     types.widenLiteral(entered.resultType),
                                     nullptr, localCallables, analysis);
       }
+  }
+  if (node->kind == "If") {
+    // The test is walked for its own yields, then its narrowings stand for the
+    // BODY only -- restored before the `else` arm, which the guard says
+    // nothing about.
+    collectGeneratorFunctionAnalysis(types, ast::node(*node, "test"),
+                                     localCallables, generatorSendHint,
+                                     analysis);
+    llvm::SmallVector<std::pair<std::string, std::optional<mlir::Type>>, 2>
+        saved;
+    applyGeneratorGuardNarrowing(
+        types, ast::node(*node, "test"), localCallables, analysis,
+        [&](llvm::StringRef name, mlir::Type narrowed) {
+          auto existing = analysis.localSymbols.find(name);
+          saved.emplace_back(name.str(),
+                             existing == analysis.localSymbols.end()
+                                 ? std::optional<mlir::Type>()
+                                 : std::optional<mlir::Type>(existing->second));
+          analysis.localSymbols[name] = narrowed;
+        });
+    if (const auto *body = ast::nodeList(*node, "body"))
+      for (const parser::NodePtr &statement : *body)
+        collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
+                                         generatorSendHint, analysis);
+    for (auto &entry : llvm::reverse(saved)) {
+      if (entry.second)
+        analysis.localSymbols[entry.first] = *entry.second;
+      else
+        analysis.localSymbols.erase(entry.first);
+    }
+    if (const auto *orelse = ast::nodeList(*node, "orelse"))
+      for (const parser::NodePtr &statement : *orelse)
+        collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
+                                         generatorSendHint, analysis);
+    return;
   }
   if (node->kind == "For" || node->kind == "AsyncFor") {
     // Bind the loop target to the iteration element type before the generic

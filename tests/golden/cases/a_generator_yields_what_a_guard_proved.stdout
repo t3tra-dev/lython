@@ -1,0 +1,4 @@
+isinstance ['named']
+is not None ['A', 'B']
+chained ['A', 'B']
+both arms ['A', 'none']

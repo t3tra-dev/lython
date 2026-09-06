@@ -1805,3 +1805,42 @@ TEST(EmitterTest, APropertyRedeclaredWithoutASetterRefusesTheWrite) {
                  kept);
   EXPECT_TRUE(withSetter.ok()) << withSetter.diagnostics.size();
 }
+
+// What: a generator whose ANNOTATION is genuinely wrong still gets the clean
+// emit diagnostic. The guard narrowing that made `yield v.upper()` type under
+// `if v is not None` must not become "take the annotation": that was measured
+// and dropped once, because it moves `-> Iterator[str]` with `yield v` for an
+// int `v` from this sentence to "Failed to run lowering pipeline".
+TEST(EmitterTest, AGeneratorAnnotationThatIsWrongIsStillNamed) {
+  auto refusedNaming = [](lython::emitter::EmitResult &emitted) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      if (diagnostic.message.find("but yields") != std::string::npos)
+        return true;
+    return false;
+  };
+
+  mlir::MLIRContext wrong(testRegistry());
+  lython::emitter::EmitResult mismatched = emitSource(
+      "from typing import Iterator\n"
+      "def bad(xs: \"list[int | None]\") -> Iterator[str]:\n"
+      "    for v in xs:\n"
+      "        if v is not None:\n"
+      "            yield v\n"
+      "print(list(bad([1, None])))\n",
+      wrong);
+  EXPECT_FALSE(mismatched.ok());
+  EXPECT_TRUE(refusedNaming(mismatched));
+
+  // The same shape with the annotation the guard proves compiles, which is
+  // what says the refusal is about the mismatch and not about the guard.
+  mlir::MLIRContext right(testRegistry());
+  lython::emitter::EmitResult narrowed = emitSource(
+      "from typing import Iterator\n"
+      "def good(xs: \"list[int | None]\") -> Iterator[int]:\n"
+      "    for v in xs:\n"
+      "        if v is not None:\n"
+      "            yield v + 1\n"
+      "print(list(good([1, None])))\n",
+      right);
+  EXPECT_TRUE(narrowed.ok()) << narrowed.diagnostics.size();
+}
