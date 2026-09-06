@@ -21,10 +21,16 @@
 #                             storage, which is what a member needs to BE an
 #                             instance; golden cases/an_enum_declared_in_an
 #                             _imported_module)
-#     module-level lambda ... module 'm' has no attribute 'DOUBLE' in this
-#                             runtime (annotated `Callable`, so the one-file
-#                             spelling of it compiles and answers 2) -- the
-#                             ONLY one left on this list
+#     module-level lambda ... CORRECT as of 2026-09-06, and it was never a
+#                             boundary defect: the one-file spelling READ FROM
+#                             A FUNCTION was "unresolved name 'DOUBLE'" too.
+#                             A `Callable` annotation was not a contract, so
+#                             the name stayed value-bound and invisible inside
+#                             a body; a callable is a function OBJECT and gets
+#                             a cell (golden cases/a_callable_global_is_read
+#                             _from_a_function). ⭐ THIS LIST HAD IT IN THE
+#                             WRONG SECTION -- the one-file rewrite it names as
+#                             the discriminator was done only at module scope.
 #     float / None constant ..CORRECT as of 2026-09-04 (the literal channel
 #                             gained a float arm and a None arm)
 #     container constant .... CORRECT as of 2026-09-06 (a container gets the

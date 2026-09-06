@@ -965,10 +965,16 @@ bool ModuleEmitter::bindNativeModuleStar(llvm::StringRef module,
 }
 
 namespace {
-// A container type a module global can hold: the same set `collectModuleGlobals`
-// slots for the main module, with every argument resolved so the cell has one
+// A type a module global can hold: the same set `collectModuleGlobals` slots
+// for the main module, with every argument resolved so the cell has one
 // runtime representation.
 bool isStorableContainerType(mlir::Type type) {
+  // A CALLABLE is a function OBJECT, which is what makes a module-level lambda
+  // in a library reachable at all: `DOUBLE: Callable[[int], int] = lambda ...`
+  // had no symbol to bind and no literal spelling, so it resolved from nowhere
+  // on either side of the boundary.
+  if (mlir::isa<py::CallableType>(type))
+    return true;
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
   if (!contract)
     return false;

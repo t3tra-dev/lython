@@ -1250,6 +1250,19 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
       // Qualified references to imported generics (module.fn(...)) resolve
       // through the canonical binding to the same registration the bare
       // import-name path uses.
+      // ⭐ AN IMPORTED MODULE'S CALLABLE CONSTANT IS A CELL, and a CALL
+      // through it took the binding-ref route: `lib.DOUBLE(2)` for a
+      // module-level lambda was "unresolved runtime binding 'lib.DOUBLE'"
+      // while the read `lib.DOUBLE` one line over resolved.
+      if (std::string global = importedModuleGlobalFor(binding);
+          !global.empty()) {
+        mlir::Type stored = moduleGlobals.lookup(global);
+        auto op = py::GlobalGetOp::create(builder, loc(*calleeNode), stored,
+                                          builder.getStringAttr(global));
+        markBoxedModuleGlobal(op);
+        return emitCallableDispatch(expr, Value{op.getResult(), stored},
+                                    emitCallOperands(expr));
+      }
       auto generic = genericFunctions.find(binding);
       if (generic != genericFunctions.end())
         return emitGenericCall(expr, *calleeNode, generic->second);

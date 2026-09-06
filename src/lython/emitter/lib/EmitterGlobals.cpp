@@ -108,7 +108,8 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     // as the ADDRESS spelling -- its cell is the machine word, which is what a
     // signal handler may read and what an `int` global deliberately no longer
     // is (see lowerGlobalGet).
-    bool storageBacked = mlir::isa<py::ContractType>(annotated);
+    bool storageBacked = mlir::isa<py::ContractType>(annotated) ||
+                         mlir::isa<py::CallableType>(annotated);
     // ⛔ EXCEPT a container whose ELEMENT type is a union. A cell hands back
     // the handle and nothing else, and a union-typed element read needs the
     // per-element evidence the literal recorded -- the runtime read declines a
