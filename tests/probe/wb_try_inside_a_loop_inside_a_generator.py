@@ -44,6 +44,25 @@
 # `with Ctx(): yield 1` says "generator resume continuation live closure
 # violated". Same area, different placement.
 #
+# ⛔ TWO OPERAND RULES TRIED AND DROPPED, 2026-09-06. The cleanup block CAN be
+# given the handler's block arguments (`getOrCreateCleanupHandler` takes them,
+# memoised alongside the group set so two sites cannot share one arm while
+# passing different values) -- the question is only WHICH values, and both
+# answers produce IR that LLVM rejects with "Instruction does not dominate all
+# uses" on the handler's phi:
+#
+#   - the operands the handler's normal predecessor passes, required to
+#     dominate the ANCHOR: a value computed in the try BODY has not run on
+#     every path that reaches the landing pad the final EH phase makes.
+#   - the same, required to dominate the HANDLER BLOCK: still rejected, and
+#     the phi it breaks names the ORIGINAL predecessor's incoming value --
+#     which says the split itself (`head->splitBlock(anchorBefore)`) moves a
+#     definition out from under a use, not just the new edge.
+#
+# So the next attempt has to reason about the CFG the EH phase produces, not
+# the one the cleanup placement sees. Neither rule is a matter of picking a
+# better dominance query.
+#
 # ⛔ And a sibling shape that does NOT need a try at all is recorded separately
 # in wb_a_short_circuit_guard_around_a_yield.py: a short-circuit `and`/`or`
 # guarding a yield loses a list local's unwind release, where the same condition
