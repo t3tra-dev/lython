@@ -3,6 +3,7 @@
 #include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
+#include "AstSynth.h"
 #include "ClosureAnalysis.h"
 #include "PyProtocols.h"
 
@@ -137,9 +138,18 @@ void refuseImportTimeStatements(TypeSystem &types,
       if (statement->kind == "FunctionDef" ||
           statement->kind == "AsyncFunctionDef")
         if (const auto *decorators =
-                ast::nodeList(*statement, "decorator_list"))
+                ast::nodeList(*statement, "decorator_list")) {
+          bool everyDecoratorIsALocalDef = true;
+          for (const parser::NodePtr &decorator : *decorators)
+            if (!decorator || decorator->kind != "Name")
+              everyDecoratorIsALocalDef = false;
           for (const parser::NodePtr &decorator : *decorators) {
             if (!decorator || importedDecoratorEmitsNoCode(*decorator))
+              continue;
+            // ⭐ A plain NAME decorator is `f = d(f)`, which the module-global
+            // initializer queue now runs at the start of `__main__`. Only the
+            // spellings that are not one keep the refusal.
+            if (everyDecoratorIsALocalDef)
               continue;
             diagnostics.push_back(parser::Diagnostic{
                 parser::Severity::Error, statement->range.start,
@@ -160,6 +170,7 @@ void refuseImportTimeStatements(TypeSystem &types,
                 sourceName.str()});
             break;
           }
+        }
       continue;
     }
     diagnostics.push_back(parser::Diagnostic{
@@ -431,11 +442,18 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
     std::optional<std::string_view> name = ast::string(*statement, "name");
     if (!name)
       continue;
-    FunctionSignature sig = sourceModuleFunctionSignature(
-        types, module, *body, *statement, source->isStub);
     std::string local =
         (llvm::Twine(localName) + "." + llvm::StringRef(*name)).str();
     std::string canonical = sourceModuleFunctionSymbol(module, *name);
+    // A DECORATED def is the wrapper, not the symbol: the cell holds what the
+    // decorator returned, and binding the plain symbol here would answer the
+    // undecorated body under the name.
+    if (moduleGlobals.count(canonical)) {
+      types.bindCanonicalSymbol(local, canonical, moduleGlobals[canonical]);
+      continue;
+    }
+    FunctionSignature sig = sourceModuleFunctionSignature(
+        types, module, *body, *statement, source->isStub);
     types.bindCanonicalSymbol(local, canonical, sig.publicCallable);
     continue;
   }
@@ -744,9 +762,13 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     std::optional<std::string_view> name = ast::string(*statement, "name");
     if (!name || llvm::StringRef(*name) != exportedName)
       continue;
+    std::string canonical = sourceModuleFunctionSymbol(module, exportedName);
+    if (moduleGlobals.count(canonical)) {
+      types.bindCanonicalSymbol(localName, canonical, moduleGlobals[canonical]);
+      return true;
+    }
     FunctionSignature sig = sourceModuleFunctionSignature(
         types, module, *body, *statement, source->isStub);
-    std::string canonical = sourceModuleFunctionSymbol(module, exportedName);
     types.bindCanonicalSymbol(localName, canonical, sig.publicCallable);
     return true;
   }
@@ -1081,6 +1103,66 @@ void ModuleEmitter::collectImportedModuleGlobals() {
       moduleGlobals[globalName] = declared;
       importedModuleGlobalInits.push_back(
           PendingModuleGlobalInit{value, globalName, &source});
+    }
+    // ⭐ A DECORATED def IS A MODULE GLOBAL TOO -- `f = d(f)` is exactly the
+    // initializer this queue exists for. It was refused outright ("an imported
+    // module's body does not run, so the decorator would never be applied"),
+    // which was true until the queue existed.
+    //
+    // ⛔ The decorated TYPE is folded from the SIGNATURES, not inferred from
+    // the call: a signature is computable with nothing bound, and inferring
+    // `d(f)` would need the module's own scope, which is one pass later than
+    // where the importer's binders hand out the name.
+    llvm::StringSet<> moduleDefs;
+    for (const parser::NodePtr &statement : body)
+      if (statement && isTopLevelFunction(*statement))
+        if (auto defName = ast::string(*statement, "name"))
+          moduleDefs.insert(*defName);
+    for (const parser::NodePtr &statement : body) {
+      if (!statement || !isTopLevelFunction(*statement))
+        continue;
+      const auto *decorators = ast::nodeList(*statement, "decorator_list");
+      auto defName = ast::string(*statement, "name");
+      if (!decorators || decorators->empty() || !defName)
+        continue;
+      bool plain = true;
+      for (const parser::NodePtr &decorator : *decorators)
+        if (!decorator || decorator->kind != "Name" ||
+            !moduleDefs.contains(ast::nameSpelling(*decorator)))
+          plain = false;
+      if (!plain)
+        continue;
+      mlir::Type applied = types.functionSignature(*statement).publicCallable;
+      parser::NodePtr expression =
+          synth::name(*defName, statement->range);
+      for (const parser::NodePtr &decorator : llvm::reverse(*decorators)) {
+        llvm::StringRef spelling = ast::nameSpelling(*decorator);
+        const parser::Node *decoratorDef = nullptr;
+        for (const parser::NodePtr &candidate : body)
+          if (candidate && isTopLevelFunction(*candidate))
+            if (auto candidateName = ast::string(*candidate, "name");
+                candidateName && llvm::StringRef(*candidateName) == spelling)
+              decoratorDef = candidate.get();
+        if (!decoratorDef) {
+          applied = mlir::Type();
+          break;
+        }
+        applied = types.functionSignature(*decoratorDef).resultType;
+        std::vector<parser::NodePtr> arguments;
+        arguments.push_back(expression);
+        expression = synth::call(synth::name(spelling, statement->range),
+                                 std::move(arguments), statement->range);
+      }
+      if (!mlir::isa_and_nonnull<py::CallableType>(applied))
+        continue;
+      std::string globalName =
+          (llvm::Twine(source.moduleName) + "." + *defName).str();
+      if (moduleGlobals.count(globalName))
+        continue;
+      moduleGlobals[globalName] = applied;
+      importedModuleGlobalInits.push_back(PendingModuleGlobalInit{
+          expression.get(), globalName, &source, std::string(*defName)});
+      synthesizedIteratorDefs.push_back(std::move(expression));
     }
   }
 }

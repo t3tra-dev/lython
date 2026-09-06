@@ -287,6 +287,8 @@ void ModuleEmitter::emitImportedModuleGlobalInitializers() {
     if (!stored)
       continue;
     emitInDefiningModuleScope(*entry.source, [&] {
+      llvm::SaveAndRestore<std::string> decorating(decoratorSubjectName,
+                                                   entry.decoratorSubject);
       Value initial = emitExprExpected(entry.value, stored);
       Value coerced = coerceValue(initial, stored, *entry.value);
       auto op = py::GlobalSetOp::create(builder, loc(*entry.value),

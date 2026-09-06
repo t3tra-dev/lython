@@ -263,6 +263,10 @@ private:
     const parser::Node *value = nullptr;
     std::string globalName;
     const EmitOptions::SourceModule *source = nullptr;
+    // The def a DECORATOR application is about, if any. While the decoration
+    // runs, that name must read the emitted SYMBOL and not the cell it is
+    // about to fill -- the same rule the main module's decorator pass keeps.
+    std::string decoratorSubject;
   };
   llvm::SmallVector<PendingModuleGlobalInit, 4> importedModuleGlobalInits;
   void collectImportedModuleGlobals();

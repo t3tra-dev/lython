@@ -136,7 +136,8 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // constant is spelled bare inside its OWN bodies and by whatever name a
     // `from lib import NAMES` bound it to here.
     if (std::optional<std::string> canonical =
-            types.lookupCanonicalBinding(name)) {
+            types.lookupCanonicalBinding(name);
+        canonical && name != decoratorSubjectName) {
       if (std::string global = importedModuleGlobalFor(*canonical);
           !global.empty()) {
         mlir::Type stored = moduleGlobals.lookup(global);

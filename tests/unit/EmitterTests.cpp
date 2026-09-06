@@ -111,7 +111,10 @@ TEST(EmitterTest, RefusesAStatementInAnImportedModuleBody) {
 // undecorated function answered under the decorated name, so the refusal is
 // what keeps the wrong answer from happening.
 TEST(EmitterTest, RefusesADroppedDecoratorInAnImportedModule) {
-  ImportedModuleEmit emitted = emitWithImportedModule(
+  // A plain NAME decorator naming a def in the same module is `f = d(f)`,
+  // which the module-global initializer queue runs at the start of `__main__`
+  // -- so it compiles now, and the golden pins what it answers.
+  ImportedModuleEmit applied = emitWithImportedModule(
       "wrapped",
       "from typing import Callable\n\n"
       "def twice(f: \"Callable[[int], int]\") -> \"Callable[[int], int]\":\n"
@@ -119,12 +122,31 @@ TEST(EmitterTest, RefusesADroppedDecoratorInAnImportedModule) {
       "    return inner\n\n"
       "@twice\ndef scaled(n: int) -> int:\n    return n + 1\n",
       "import wrapped\nprint(wrapped.scaled(1))\n");
-  EXPECT_FALSE(emitted.succeeded);
-  EXPECT_NE(emitted.diagnostics.find(
+  EXPECT_TRUE(applied.succeeded) << applied.diagnostics;
+
+  // ⛔ A decorator that is not a plain NAME is still refused: the application
+  // is folded from the decorator's own signature, and a FACTORY (`@d(arg)`)
+  // is one more call whose intermediate value has none to fold. The sentence
+  // is what it always was.
+  ImportedModuleEmit factory = emitWithImportedModule(
+      "borrowed",
+      "from typing import Callable\n\n"
+      "def scale(k: int) -> \"Callable[[Callable[[int], int]], "
+      "Callable[[int], int]]\":\n"
+      "    def deco(f: \"Callable[[int], int]\") -> "
+      "\"Callable[[int], int]\":\n"
+      "        def inner(n: int) -> int:\n            return f(n) * k\n"
+      "        return inner\n"
+      "    return deco\n\n"
+      "@scale(2)\ndef scaled(n: int) -> int:\n    return n + 1\n",
+      "import borrowed\nprint(borrowed.scaled(1))\n");
+  ImportedModuleEmit &foreign = factory;
+  EXPECT_FALSE(foreign.succeeded);
+  EXPECT_NE(foreign.diagnostics.find(
                 "a decorator on a function in an imported module is not "
                 "supported"),
             std::string::npos)
-      << emitted.diagnostics;
+      << foreign.diagnostics;
 }
 
 // What: the floor the two refusals above stand on -- an imported module of
