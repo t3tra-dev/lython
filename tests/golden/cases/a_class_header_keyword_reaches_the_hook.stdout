@@ -1,0 +1,5 @@
+registry Tagged t 2
+registry Bare none 0
+strict Middle on
+middle Leaf deep
+done

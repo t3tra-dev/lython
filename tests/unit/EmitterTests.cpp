@@ -1695,3 +1695,59 @@ TEST(EmitterTest, AClassmethodBehindAnOverrideIsRefusedThroughEitherSpelling) {
       staticly);
   EXPECT_TRUE(dispatched.ok()) << dispatched.diagnostics.size();
 }
+
+// What: the two class-header keyword shapes that have no answer are refused
+// rather than dropped. Both compiled and ran before: `metaclass=` named a type
+// that never ran, and a keyword no `__init_subclass__` declares is a TypeError
+// in CPython and printed nothing here.
+TEST(EmitterTest, AClassHeaderKeywordWithNoHookToTakeItIsRefused) {
+  auto refusedSaying = [](lython::emitter::EmitResult &emitted,
+                          const char *fragment) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      if (diagnostic.message.find(fragment) != std::string::npos)
+        return true;
+    return false;
+  };
+
+  mlir::MLIRContext meta(testRegistry());
+  lython::emitter::EmitResult withMetaclass =
+      emitSource("class Meta(type):\n    pass\n"
+                 "class Base(metaclass=Meta):\n    pass\n"
+                 "print(\"ok\")\n",
+                 meta);
+  EXPECT_FALSE(withMetaclass.ok());
+  EXPECT_TRUE(refusedSaying(withMetaclass, "'metaclass=' is not supported"));
+
+  mlir::MLIRContext undeclared(testRegistry());
+  lython::emitter::EmitResult noHook =
+      emitSource("class Base:\n    pass\n"
+                 "class Sub(Base, tag=\"s\"):\n    pass\n"
+                 "print(\"ok\")\n",
+                 undeclared);
+  EXPECT_FALSE(noHook.ok());
+  EXPECT_TRUE(refusedSaying(noHook, "does not declare"));
+
+  // A parameter the hook requires and the header does not pass is the other
+  // half of CPython's TypeError, and it is the one a default makes legal --
+  // so the same hierarchy with a default compiles.
+  mlir::MLIRContext missing(testRegistry());
+  lython::emitter::EmitResult short_ =
+      emitSource("class Base:\n"
+                 "    @classmethod\n"
+                 "    def __init_subclass__(cls, tag: str) -> None:\n"
+                 "        print(tag)\n"
+                 "class Sub(Base):\n    pass\n",
+                 missing);
+  EXPECT_FALSE(short_.ok());
+  EXPECT_TRUE(refusedSaying(short_, "the header does not pass"));
+
+  mlir::MLIRContext defaulted(testRegistry());
+  lython::emitter::EmitResult ok =
+      emitSource("class Base:\n"
+                 "    @classmethod\n"
+                 "    def __init_subclass__(cls, tag: str = \"d\") -> None:\n"
+                 "        print(tag)\n"
+                 "class Sub(Base):\n    pass\n",
+                 defaulted);
+  EXPECT_TRUE(ok.ok()) << ok.diagnostics.size();
+}

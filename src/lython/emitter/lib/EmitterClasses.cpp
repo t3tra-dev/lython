@@ -738,23 +738,101 @@ void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
   auto name = ast::string(classDef, "name");
   if (!name)
     return;
+  // ⭐ THE CLASS HEADER'S KEYWORDS ARE THE HOOK'S ARGUMENTS, and they were
+  // dropped on the floor: `class Sub(Base, tag="s")` compiled, ran, and
+  // printed nothing where CPython prints what the hook prints -- and with a
+  // hook that takes no keywords at all it compiled where CPython raises
+  // TypeError. Both silent.
+  //
+  // ⛔ `metaclass=` is NOT one of them and is refused rather than passed on:
+  // it selects the type that BUILDS the class, which this compiler does not
+  // model, so accepting it silently would run none of what it names.
+  std::vector<const parser::Node *> classKeywords;
+  bool refusedKeyword = false;
+  if (const auto *keywords = ast::nodeList(classDef, "keywords"))
+    for (const parser::NodePtr &keyword : *keywords) {
+      if (!keyword)
+        continue;
+      auto keywordName = ast::string(*keyword, "arg");
+      if (!keywordName) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, keyword->range.start,
+            "'**' in a class header is not supported: the keywords a class "
+            "passes to __init_subclass__ have to be named here"});
+        refusedKeyword = true;
+        continue;
+      }
+      if (*keywordName == "metaclass") {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, keyword->range.start,
+            "'metaclass=' is not supported: a class is built by this compiler, "
+            "so a metaclass would not run"});
+        refusedKeyword = true;
+        continue;
+      }
+      classKeywords.push_back(keyword.get());
+    }
+  if (refusedKeyword)
+    return;
+  auto refuseKeywords = [&](llvm::StringRef reason) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, classDef.range.start,
+        "class '" + std::string(*name) +
+            "' passes keywords that its __init_subclass__ " + reason.str()});
+  };
+
   std::optional<MethodBinding> hook =
       lookupClassMethod(types.contract(*name), "__init_subclass__");
-  if (!hook || !hook->method)
+  if (!hook || !hook->method) {
+    if (!classKeywords.empty())
+      refuseKeywords("does not declare (no hook takes them)");
     return;
+  }
   bool declaresItsOwn = hook->definingClass == *name;
   if (declaresItsOwn) {
     // The class declares its own, so the hook that runs for it is the nearest
     // one ABOVE it. `startAfter` is what super() positions itself with.
     std::string canonical = canonicalClassName(*name);
     hook = resolveMroMethod(canonical, "__init_subclass__", canonical);
-    if (!hook || !hook->method)
+    if (!hook || !hook->method) {
+      if (!classKeywords.empty())
+        refuseKeywords("does not declare (no hook takes them)");
       return;
+    }
   }
-  // The hook takes no arguments beyond `cls`; anything else is a shape this
-  // does not model, and calling it would pass the wrong count.
-  if (hook->bodySignature.positionalNames.size() != 1)
-    return;
+  const FunctionSignature &hookSig = hook->bodySignature;
+  if (hookSig.positionalNames.empty())
+    return; // no `cls`: not a shape this models
+  // Every class keyword has to name a parameter past `cls`, and every such
+  // parameter the header does not name has to have a default -- the same two
+  // conditions CPython's own call raises TypeError for.
+  llvm::StringSet<> supplied;
+  for (const parser::Node *keyword : classKeywords)
+    supplied.insert(*ast::string(*keyword, "arg"));
+  for (const parser::Node *keyword : classKeywords) {
+    llvm::StringRef spelling = *ast::string(*keyword, "arg");
+    bool declared = llvm::is_contained(hookSig.kwOnlyNames, spelling);
+    for (std::size_t index = 1; index < hookSig.positionalNames.size(); ++index)
+      declared = declared || hookSig.positionalNames[index] == spelling;
+    if (!declared) {
+      refuseKeywords("does not declare");
+      return;
+    }
+  }
+  for (std::size_t index = 1; index < hookSig.positionalNames.size(); ++index)
+    if (!supplied.contains(hookSig.positionalNames[index]) &&
+        (index >= hookSig.positionalDefaults.size() ||
+         !hookSig.positionalDefaults[index])) {
+      refuseKeywords("requires and the header does not pass");
+      return;
+    }
+  for (auto [index, kwOnly] : llvm::enumerate(hookSig.kwOnlyNames))
+    if (!supplied.contains(kwOnly) &&
+        (index >= hookSig.kwOnlyDefaults.size() ||
+         !hookSig.kwOnlyDefaults[index])) {
+      refuseKeywords("requires and the header does not pass");
+      return;
+    }
   parser::NodePtr callee;
   if (!declaresItsOwn) {
     callee = synth::attribute(synth::name(*name, classDef.range),
@@ -781,8 +859,18 @@ void ModuleEmitter::emitInitSubclassHook(const parser::Node &classDef) {
     types.bindSymbol(symbolName, bound.callable);
     callee = synth::name(symbolName, classDef.range);
   }
-  parser::NodePtr call = synth::call(
-      std::move(callee), std::vector<parser::NodePtr>{}, classDef.range);
+  std::vector<parser::NodePtr> keywordArguments;
+  for (const parser::Node *keyword : classKeywords) {
+    const parser::Field *value = parser::findField(*keyword, "value");
+    if (!value || !std::holds_alternative<parser::NodePtr>(value->value))
+      return;
+    keywordArguments.push_back(synth::keyword(
+        *ast::string(*keyword, "arg"),
+        std::get<parser::NodePtr>(value->value), keyword->range));
+  }
+  parser::NodePtr call = synth::callWithKeywords(
+      std::move(callee), std::vector<parser::NodePtr>{},
+      std::move(keywordArguments), classDef.range);
   emitStatement(*synth::exprStmt(std::move(call), classDef.range));
 }
 
