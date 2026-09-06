@@ -92,8 +92,9 @@ private:
   // builtins.* contract). Falls back to the raw spelling.
   std::string canonicalClassName(llvm::StringRef spelling) const;
   // The second half of `collectTopLevelBindings`, run once the imports are
-  // bound: a base spelled `module.Class` cannot be canonicalized before that.
-  void resolveDottedTopLevelBases();
+  // bound: neither a base spelled `module.Class` nor one spelled with the bare
+  // name a `from module import Class` bound can be canonicalized before that.
+  void resolveTopLevelBaseSpellings();
   // The class's C3 linearization (contract names, self first). Computed and
   // cached by emitClassContract; empty for unknown classes.
   llvm::ArrayRef<std::string> classMro(llvm::StringRef className) const;

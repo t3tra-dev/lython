@@ -79,7 +79,7 @@ EmitResult ModuleEmitter::emit() {
   // guard, told the hierarchy had no override, inlined Shape's. Filled here,
   // where the aliases resolve and still before anything is emitted, so the
   // answer stays a property of the module rather than of the position asked.
-  resolveDottedTopLevelBases();
+  resolveTopLevelBaseSpellings();
   // After class/import predeclaration (signatures may reference user classes
   // and imported names), before any body is typed or emitted.
   types.registerModule(moduleNode);
@@ -137,7 +137,7 @@ EmitResult ModuleEmitter::emit() {
   return result;
 }
 
-void ModuleEmitter::resolveDottedTopLevelBases() {
+void ModuleEmitter::resolveTopLevelBaseSpellings() {
   const auto *body = ast::nodeList(moduleNode, "body");
   if (!body)
     return;
@@ -152,9 +152,24 @@ void ModuleEmitter::resolveDottedTopLevelBases() {
       continue;
     auto &bases = declaredClassBases[*name];
     bool changed = false;
+    // ⭐ AND A BARE NAME THAT IS AN IMPORT, which the dotted repair below left
+    // behind: the spelling pass records what the source wrote, so
+    // `from shapes import Shape` records "Shape" while the receiver's contract
+    // is "shapes.Shape" -- the same hierarchy, invisible to every question
+    // keyed on the contract name. `class Square(shapes.Shape)` printed
+    // [0, 4] and `from shapes import Shape` / `class Square(Shape)` printed
+    // [0, 0] for the same program, with no diagnostic on either.
+    for (std::string &recorded : bases) {
+      std::string canonical = canonicalClassName(recorded);
+      if (canonical.empty() || canonical == recorded ||
+          llvm::is_contained(bases, canonical))
+        continue;
+      recorded = canonical;
+      changed = true;
+    }
     for (const parser::NodePtr &base : *baseNodes) {
       if (!base || base->kind == "Name")
-        continue; // already recorded by the spelling pass
+        continue; // canonicalized in place above
       std::string qualified = ast::qualifiedName(base.get());
       if (qualified.empty())
         continue;

@@ -1,0 +1,7 @@
+call ['shape', 'local']
+through the base ['shape2', 'local6']
+dunder [1, 7]
+property [0, 9]
+attribute ['shape', 'local']
+static [0, 4]
+as a value ['shape', 'local']
