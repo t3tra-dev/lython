@@ -1,0 +1,6 @@
+direct None
+through a local None
+through an optional 3 None
+inside containers [None, None] (None, 1) {'a': None}
+the others still Box(2) 's' 3 True 1.5
+conversions agree None None None

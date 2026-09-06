@@ -5663,7 +5663,16 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
       // same thing about the same value since it grew its union arm; this is
       // that arm on the repr side, and `emitConversionValue` is where it
       // lives because !r and %r reach the union through the same door.
-      if (mlir::isa<py::UnionType>(argumentType))
+      //
+      // ⭐ AND `None`, for the same reason and through the same door. A None
+      // resolves a manifest `__repr__` here, so the ladder emitted a py.repr
+      // on a value that expands to NO physical values -- "types.NoneType
+      // runtime object has no physical header value", out of the LOWERING, for
+      // `print(repr(None))`. `f"{v!r}"` renders it, `str(v)` renders it and
+      // `print(v)` renders it, all three through `emitConversionValue`; this
+      // was the one door that had its own copy.
+      if (mlir::isa<py::UnionType>(argumentType) ||
+          isNoneTypeLike(argumentType))
         if (std::optional<Value> rendered = emitConversionValue(
                 expr, emitExpr(args->front().get()), 'r'))
           return *rendered;
