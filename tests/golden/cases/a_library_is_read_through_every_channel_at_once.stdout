@@ -1,0 +1,8 @@
+hook ['Square:sq']
+attribute ['shape', 'square']
+method ['shape', 'square']
+static [0, 4]
+property [5, 60]
+guarded ['square']
+enum RED 2
+constants ['lib'] 6
