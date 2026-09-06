@@ -812,6 +812,14 @@ private:
   // f-string machinery: JoinedStr folds stringified pieces with str.__add__;
   // FormattedValue applies !r/!s/!a and dispatches __format__ statically.
   Value emitJoinedStr(const parser::Node &expr);
+  // ⭐ A GUARD IS SPENT AT THE READ, and CHECKED there. Shared by the two
+  // storages that are RE-READ rather than held: a field and a CELL. The tag
+  // the guard saw is evidence about the past, so the read tests it, raises
+  // where it fails, and refines where it holds. `subject` names what the
+  // sentence is about; `subjectIsField` picks between the two spellings.
+  Value emitCheckedNarrowedRead(const parser::Node &anchor, Value raw,
+                                mlir::Type proved, llvm::StringRef subject,
+                                bool subjectIsField);
   Value emitFormattedValue(const parser::Node &expr);
   // str(value) semantics on an already-emitted value (str kept, source-class
   // __str__ inlined, manifest __str__, then __repr__) — print's stringify

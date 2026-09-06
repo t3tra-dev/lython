@@ -109,7 +109,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         // at the read, which is the only place the answer matters.
         if (cellTracksBinding(found->second.type))
           emitUnboundLocalGuard(*expr, found->second, name);
-        return emitCellLoad(*expr, found->second);
+        Value loaded = emitCellLoad(*expr, found->second);
+        // The guard above the read is spent HERE, with a check, for the same
+        // reason a field's is: the cell is re-read at every use and something
+        // may have written it in between.
+        if (!suppressMemberNarrowing && !narrowedMemberTypes.empty())
+          if (auto narrowed = narrowedMemberTypes.find(name);
+              narrowed != narrowedMemberTypes.end() && narrowed->second)
+            return emitCheckedNarrowedRead(*expr, loaded, narrowed->second,
+                                           name, /*subjectIsField=*/false);
+        return loaded;
       }
       return found->second;
     }
@@ -269,75 +278,8 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             raw = emitExpr(expr);
             suppressMemberNarrowing = false;
           }
-          mlir::Type proved = found->second;
-          auto rawUnion =
-              mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
-          auto rawContract =
-              mlir::dyn_cast_if_present<py::ContractType>(raw.value.getType());
-          // A union member is tested by its tag; a subclass of the read's own
-          // contract by its runtime class id. Both are the same shape of proof
-          // and the same check.
-          bool testableUnion = rawUnion && rawUnion.hasMember(proved);
-          bool testableClass =
-              !rawUnion && rawContract &&
-              mlir::isa_and_nonnull<py::ContractType>(proved) &&
-              proved != raw.value.getType() &&
-              declaredSubclassOfType(proved, raw.value.getType(), types);
-          if (testableUnion || testableClass) {
-            mlir::Value bit =
-                testableUnion
-                    ? py::UnionTestOp::create(builder, loc(*expr),
-                                              builder.getI1Type(), raw.value,
-                                              mlir::TypeAttr::get(proved))
-                          .getResult()
-                    : py::ClassTestOp::create(builder, loc(*expr),
-                                              builder.getI1Type(), raw.value,
-                                              mlir::TypeAttr::get(proved))
-                          .getResult();
-            mlir::Block *origin = builder.getInsertionBlock();
-            mlir::Region *region = origin->getParent();
-            mlir::Block *bad = builder.createBlock(
-                region, std::next(origin->getIterator()));
-            mlir::Block *ok =
-                builder.createBlock(region, std::next(bad->getIterator()));
-            builder.setInsertionPointToEnd(origin);
-            mlir::cf::CondBranchOp::create(builder, loc(*expr), bit, ok,
-                                           mlir::ValueRange{}, bad,
-                                           mlir::ValueRange{});
-            builder.setInsertionPointToStart(bad);
-            // The message describes what happened, not what CPython would
-            // have said next: a guard above proved this field, and by the time
-            // it was read something had replaced it. CPython reaches the same
-            // line with None in hand and raises on whatever it does with it.
-            parser::NodePtr raise = synth::raiseStmt(
-                synth::call(
-                    synth::name("AttributeError", expr->range),
-                    {synth::strConstant(
-                        "attribute '" + std::string(*attr) +
-                            (testableUnion
-                                 ? "' is None here, after a guard above proved "
-                                   "it was not: it changed in between"
-                                 : "' is not the class a guard above proved it "
-                                   "was: it changed in between"),
-                        expr->range)},
-                    expr->range),
-                expr->range);
-            emitStatement(*raise);
-            synthesizedIteratorDefs.push_back(std::move(raise));
-            if (!insertionBlockTerminated(builder))
-              mlir::cf::BranchOp::create(builder, loc(*expr), ok);
-            builder.setInsertionPointToStart(ok);
-            mlir::Value narrowedValue =
-                testableUnion
-                    ? py::UnionUnwrapOp::create(builder, loc(*expr), proved,
-                                                raw.value)
-                          .getResult()
-                    : py::ClassRefineOp::create(builder, loc(*expr), proved,
-                                                raw.value)
-                          .getResult();
-            return Value{narrowedValue, proved};
-          }
-          return raw;
+          return emitCheckedNarrowedRead(*expr, raw, found->second, *attr,
+                                         /*subjectIsField=*/true);
         }
       }
   }
@@ -2254,6 +2196,74 @@ ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
   if (!lookupClassMethod(rightContract, reflected))
     return std::nullopt;
   return tryEmitClassDunder(anchor, rhs, reflected, {lhs});
+}
+
+// The check half of a guard spent at a READ, shared by the two storages that
+// are RE-READ rather than held: a field and a CELL. A union member is tested by
+// its tag; a subclass of the read's own contract by its runtime class id. Both
+// are the same shape of proof and the same check.
+//
+// ⛔ The message describes what HAPPENED, not what CPython would have said
+// next: a guard above proved this, and by the time it was read something had
+// replaced it. CPython reaches the same line with None in hand and raises on
+// whatever it does with it.
+Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
+                                             Value raw, mlir::Type proved,
+                                             llvm::StringRef subject,
+                                             bool subjectIsField) {
+  if (!proved)
+    return raw;
+  auto rawUnion = mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
+  auto rawContract =
+      mlir::dyn_cast_if_present<py::ContractType>(raw.value.getType());
+  bool testableUnion = rawUnion && rawUnion.hasMember(proved);
+  bool testableClass =
+      !rawUnion && rawContract &&
+      mlir::isa_and_nonnull<py::ContractType>(proved) &&
+      proved != raw.value.getType() &&
+      declaredSubclassOfType(proved, raw.value.getType(), types);
+  if (!testableUnion && !testableClass)
+    return raw;
+  mlir::Value bit =
+      testableUnion
+          ? py::UnionTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                    raw.value, mlir::TypeAttr::get(proved))
+                .getResult()
+          : py::ClassTestOp::create(builder, loc(anchor), builder.getI1Type(),
+                                    raw.value, mlir::TypeAttr::get(proved))
+                .getResult();
+  mlir::Block *origin = builder.getInsertionBlock();
+  mlir::Region *region = origin->getParent();
+  mlir::Block *bad =
+      builder.createBlock(region, std::next(origin->getIterator()));
+  mlir::Block *ok = builder.createBlock(region, std::next(bad->getIterator()));
+  builder.setInsertionPointToEnd(origin);
+  mlir::cf::CondBranchOp::create(builder, loc(anchor), bit, ok,
+                                 mlir::ValueRange{}, bad, mlir::ValueRange{});
+  builder.setInsertionPointToStart(bad);
+  std::string what = subjectIsField ? "attribute '" : "captured local '";
+  what += std::string(subject);
+  what += testableUnion ? "' is None here, after a guard above proved it was "
+                          "not: it changed in between"
+                        : "' is not the class a guard above proved it was: it "
+                          "changed in between";
+  parser::NodePtr raise = synth::raiseStmt(
+      synth::call(synth::name(subjectIsField ? "AttributeError" : "NameError",
+                              anchor.range),
+                  {synth::strConstant(what, anchor.range)}, anchor.range),
+      anchor.range);
+  emitStatement(*raise);
+  synthesizedIteratorDefs.push_back(std::move(raise));
+  if (!insertionBlockTerminated(builder))
+    mlir::cf::BranchOp::create(builder, loc(anchor), ok);
+  builder.setInsertionPointToStart(ok);
+  mlir::Value narrowedValue =
+      testableUnion
+          ? py::UnionUnwrapOp::create(builder, loc(anchor), proved, raw.value)
+                .getResult()
+          : py::ClassRefineOp::create(builder, loc(anchor), proved, raw.value)
+                .getResult();
+  return Value{narrowedValue, proved};
 }
 
 Value ModuleEmitter::emitSubscript(const parser::Node &expr) {

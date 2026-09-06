@@ -75,6 +75,32 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
         narrowedMemberTypes.erase(fact.name);
       return;
     }
+    // ⭐ A CELL-BACKED NAME IS RE-READ, exactly like a field, so its proof is
+    // spent at the read and not by unwrapping a value this frame holds. The
+    // unwrap below asks `values[name].value`, which for a captured-and-rebound
+    // local is the CELL OBJECT and never a union -- so the narrowing silently
+    // did nothing and the read handed the whole union on:
+    //
+    //     def make() -> int:
+    //         v: Optional[int] = 3
+    //         def inner() -> int:
+    //             if v is None: return 0
+    //             return v          # cannot adapt union<int, None> return
+    //         v = 4
+    //         return inner()
+    //
+    // while `w = v` inside `inner` compiles and prints CPython's answer. The
+    // key is the bare name, which no field path can collide with: a member
+    // path always carries a dot.
+    if (auto cellBound = values.find(fact.name);
+        cellBound != values.end() && isCellContract(cellBound->second.type)) {
+      mlir::Type proved = conditionIsTrue ? fact.trueType : fact.falseType;
+      if (proved && proved != types.none())
+        narrowedMemberTypes[fact.name] = proved;
+      else
+        narrowedMemberTypes.erase(fact.name);
+      return;
+    }
     if (std::optional<mlir::Type> before = types.lookupSymbol(fact.name))
       narrowedFromTypes[fact.name] = *before;
     mlir::Type narrowed = conditionIsTrue ? fact.trueType : fact.falseType;
