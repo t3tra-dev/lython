@@ -1929,7 +1929,13 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
                       attrContractName == "builtins.set" ||
                       attrContractName == "builtins.tuple" ||
                       attrContractName == "builtins.frozenset" ||
-                      !attrContractName.contains('.'));
+                      // ⛔ The declaration map, not the name's shape: an
+                      // IMPORTED class is `mod.Kind`, so a class attribute
+                      // typed by one got no slot and the read reached the
+                      // constant channel, which has no arm for an instance --
+                      // "Failed to run lowering pipeline", where the same
+                      // class written in one file is read fine.
+                      isSourceClassContract(attrContract));
         }
       }
       if (storable)
