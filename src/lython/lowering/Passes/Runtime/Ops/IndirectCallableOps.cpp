@@ -264,6 +264,30 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
                                                  box_abi::kEntityWord)
                 .getResult())
             .getResult();
+    // ⭐ A UNION CAPTURE IS ONE BOX, and its lanes are rebuilt from the box the
+    // way a container element's are. `slotStorageShapesFor` answers a union
+    // with the VALUE's own lanes -- a union has no contract name to find a
+    // `box` primitive under -- so lane 0 was the i64 TAG and the rebuild said
+    // " has no statically sized entity lane to rebuild a box from, got 'i64'"
+    // for a closure that captures an `Optional[int]`.
+    if (auto captureUnion = mlir::dyn_cast<py::UnionType>(closureType)) {
+      mlir::Value classWord =
+          mlir::memref::LoadOp::create(
+              builder, loc, slot,
+              mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult())
+              .getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+          RuntimeBundleLowerer::unionValuesFromBoxWords(op, captureUnion,
+                                                        classWord, entityWord);
+      if (mlir::failed(unionValues))
+        return mlir::failure();
+      values.push_back(RuntimeValue::objectWithOwnership(
+          closureType,
+          mlir::ValueRange{llvm::ArrayRef<mlir::Value>(unionValues->begin(),
+                                                        unionValues->end())},
+          ownership::OwnershipKind::Borrow));
+      continue;
+    }
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
         RuntimeBundleLowerer::lanesFromBoxEntity(
             builder, loc, entityWord, *laneTypes,
