@@ -803,7 +803,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorSpanStoreFunction(
   // remaining parts are interior views of the same entity. The retaining form
   // marks the header without the transfer, so the caller's token stays the
   // caller's and release placement keeps covering it.
-  if (lane.physicalCount > 0) {
+  // ⛔ NOT FOR A BOOL LANE, whose one part is a bare i1: there is no header to
+  // anchor a transfer at, and marking one is "transfer_args argument 6 must be
+  // an object-header-like memref". The load side already guards its owned
+  // result the same way -- a bool carries no ownership at all.
+  if (lane.physicalCount > 0 && !lane.isBool) {
     if (transferring)
       function->setAttr(ownership::kTransferArgsAttr,
                         builder.getI64ArrayAttr({2}));
@@ -939,6 +943,24 @@ RuntimeBundleLowerer::getOrCreateGeneratorFrameLoadFunction(
   }
   llvm::SmallVector<mlir::Value, 6> results;
   for (unsigned part = 0; part < lane.physicalCount; ++part) {
+    // ⭐ THE MATCHING ARM FOR A BARE i1, which the STORE side has had all
+    // along ("A BARE i1 PART TAKES ONE WORD, not the (pointer, size) pair").
+    // Only this half was missing, so a bool live across a yield reached
+    // `cast<MemRefType>` on an i1 and the compiler ASSERTED -- which is why
+    // the frame-lane gate asked `laneEligibleContract` with `allowBool` false
+    // and recorded a reason that had stopped being true: the frame WORD
+    // accounting already gives a bool lane one word.
+    if (laneTypes[part].isInteger(1)) {
+      mlir::Value bitWord =
+          mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(word))
+              .getResult();
+      results.push_back(mlir::arith::CmpIOp::create(
+                            builder, loc, mlir::arith::CmpIPredicate::ne,
+                            bitWord, zero)
+                            .getResult());
+      word += 1;
+      continue;
+    }
     mlir::Value pointerWord =
         mlir::memref::LoadOp::create(builder, loc, storage, wordIndex(word))
             .getResult();
@@ -1290,10 +1312,19 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     // straight-line pure int yield bodies", and the same generator yielding an
     // int, a str, a float or a tuple compiles.
     //
-    // ⛔ The VALUE lane only. A bool LIVE ACROSS a yield still has no frame
-    // lane -- a frame slot holds (pointer, size) per part and a bit is
-    // neither -- so `lives` below asks the same question with `allowBool`
-    // false and keeps its recorded decline reason.
+    // ⭐ AND THE FRAME LANE, since 2026-09-06. The note here said a bool live
+    // across a yield had none because "a frame slot holds (pointer, size) per
+    // part and a bit is neither" -- and that had stopped being true on the
+    // STORE side, which takes one word for a bare i1. Only the LOAD half was
+    // missing, so the gate below asked with `allowBool` false and a plain
+    //
+    //     def walk():
+    //         flag: bool = True
+    //         yield 0
+    //         yield 1 if flag else 0
+    //
+    // was refused for a reason about the frame layout rather than about the
+    // half that was not written.
     auto laneEligibleContract = [&](mlir::Type type,
                                     bool allowBool) -> std::string {
       if (isIntContract(type))
@@ -1426,7 +1457,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         llvm::StringMap<unsigned> counts;
         for (mlir::Value live : lives) {
           std::string contract =
-              laneEligibleContract(live.getType(), /*allowBool=*/false);
+              laneEligibleContract(live.getType(), /*allowBool=*/true);
           if (contract.empty()) {
             // ⭐ SAY WHICH VALUE, because the tier below cannot. It refuses
             // for its own reason -- "yields whose runtime value is a single

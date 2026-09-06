@@ -1004,7 +1004,13 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
                 RuntimeBundleLowerer::generatorLanePhysicalTypes(lane);
             // The transfer is anchored at the lane's header (group offset);
             // the remaining parts are the entity's interior views.
-            if (lane.physicalCount > 0)
+            //
+            // ⛔ EXCEPT a BOOL lane, whose one part is a bare i1: there is no
+            // header to anchor at, and marking one is "transfer_args argument
+            // N must be an object-header-like memref". A bool carries no
+            // ownership -- its DecRef is a no-op -- so there is nothing to
+            // transfer either.
+            if (lane.physicalCount > 0 && !lane.isBool)
               generatorTransferArgs.push_back(begin);
             generatorResumeArgLanes.push_back(builder.getDictionaryAttr({
                 builder.getNamedAttr("contract",

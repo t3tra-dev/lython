@@ -1687,13 +1687,29 @@ TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
 // never why a generator arrived there. The yielded value's lane is separate and
 // compiles (tests/golden/cases/a_generator_that_yields_a_bool.py).
 TEST(DriverTest, ABoolLiveAcrossAYieldNamesTheRealLimit) {
-  CompileResult refused = compileSource(
+  // A bool live across a yield has a frame lane now: the frame WORD accounting
+  // always gave it one and the STORE side always took one word for a bare i1;
+  // only the LOAD half was missing, so the gate asked with `allowBool` false
+  // and this compiled to a refusal about the frame layout.
+  CompileResult flag = compileSource(
       "from typing import Iterator\n"
       "def go() -> Iterator[bool]:\n"
       "    flag = True\n"
       "    for _ in range(3):\n"
       "        yield flag\n"
       "        flag = not flag\n"
+      "print(list(go()))\n");
+  EXPECT_TRUE(flag.succeeded) << flag.diagnostics;
+
+  // The limit the message names is real for a UNION, which has no lane at all:
+  // the sentence has to keep naming the VALUE, because the tier below refuses
+  // for a reason that is never why the program came down to it.
+  CompileResult refused = compileSource(
+      "from typing import Iterator, Optional\n"
+      "def go() -> Iterator[int]:\n"
+      "    v: Optional[int] = 3\n"
+      "    yield 0\n"
+      "    yield 0 if v is None else v\n"
       "print(list(go()))\n");
   EXPECT_FALSE(refused.succeeded);
   EXPECT_NE(refused.diagnostics.find("is live across a yield and has no "

@@ -1,0 +1,4 @@
+alternating [True, False, True, False]
+loop flag [1, 2, 3, 100] [0, 0]
+parameters [0, 1] [0, 2]
+beside an int [0, 5]
