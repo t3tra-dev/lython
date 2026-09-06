@@ -649,7 +649,15 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
                mlir::isa_and_nonnull<py::ContractType>(
                    unionType.getOptionalPayloadType());
       };
+      // ⭐ AND A CALLABLE, which is a function OBJECT and fits the same cell.
+      // The rule read "a contract-typed slot" and a `Callable[[int], int]`
+      // local reassigned inside a try was refused outright -- while the same
+      // local reassigned inside a `for`, a `with` or a `match` takes that very
+      // cell. Third reader of one stale enumeration: the module globals and
+      // the region slot rule each excluded a callable for the same unstated
+      // reason ([[lython-module-storage]]).
       if (!mlir::isa_and_nonnull<py::ContractType>(content) &&
+          !mlir::isa_and_nonnull<py::CallableType>(content) &&
           !optionalContent(content)) {
         std::string typeText;
         {
