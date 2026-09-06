@@ -2767,11 +2767,32 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (*attr == "__name__" &&
       mlir::isa_and_nonnull<py::CallableType>(object.type)) {
     const parser::Node *objectNode = ast::node(expr, "value");
+    // ⛔ The canonical symbol is a TEMPORARY, so the leaf has to be copied
+    // rather than referenced: a StringRef into an `optional<string>` that dies
+    // at the end of its `if` folded seven NUL bytes for "compute" -- the right
+    // length and no content, printed with no diagnostic.
+    std::string importedDefName;
     llvm::StringRef defName;
     if (objectNode && objectNode->kind == "Name") {
       llvm::StringRef spelling = ast::nameSpelling(*objectNode);
       if (moduleFunctionNames.count(spelling))
         defName = spelling;
+      // ⭐ AN IMPORTED FUNCTION KNOWS ITS DEF'S NAME TOO, and it is the LEAF of
+      // the canonical symbol the import bound (`lib.compute` -> "compute").
+      // `from lib import compute` was refused by the sentence below while
+      // `lib.compute.__name__` one line over folded, which is one question
+      // with two spellings -- and the canonical leaf is stricter than the
+      // note's own worry, not looser: an `as` alias answers the DEF's name
+      // here, which is what CPython answers, where a local `g = f` could not.
+      if (defName.empty())
+        if (std::optional<std::string> canonical =
+                types.lookupCanonicalBinding(spelling)) {
+          llvm::StringRef symbol(*canonical);
+          if (auto dot = symbol.rfind('.'); dot != llvm::StringRef::npos) {
+            importedDefName = symbol.drop_front(dot + 1).str();
+            defName = importedDefName;
+          }
+        }
     } else if (objectNode && objectNode->kind == "Attribute") {
       if (auto member = ast::string(*objectNode, "attr"))
         if (const parser::Node *owner = ast::node(*objectNode, "value"))
