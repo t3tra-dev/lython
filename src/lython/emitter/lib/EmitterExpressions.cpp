@@ -382,7 +382,18 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     return emitAwait(*expr);
   if (expr->kind == "Yield") {
     const parser::Node *valueNode = ast::node(*expr, "value");
-    Value yielded = valueNode ? emitExpr(valueNode) : emitNone(*expr);
+    // ⭐ THE DECLARED YIELD TYPE IS THE EXPECTATION, which a LAMBDA needs and
+    // nothing else here changes. An unannotated lambda has no type of its own
+    // ("lambda requires a Callable annotation because its type contains
+    // unresolved Unknown"), and `yield lambda n: n + 1` under
+    // `-> Iterator[Callable[[int], int]]` had nothing to read it against --
+    // while `v: Callable[[int], int] = lambda n: n + 1` one line over is the
+    // same expectation and compiles.
+    Value yielded;
+    if (valueNode && valueNode->kind == "Lambda" && currentGeneratorYieldType)
+      yielded = emitExprExpected(valueNode, currentGeneratorYieldType);
+    else
+      yielded = valueNode ? emitExpr(valueNode) : emitNone(*expr);
     // ⭐ THE ANNOTATION IS CHECKED HERE, where the guard above the yield has
     // already been spent. The whole-body walk that computes the yield type has
     // no flow facts, so

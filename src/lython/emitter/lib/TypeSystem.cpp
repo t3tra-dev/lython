@@ -5321,15 +5321,33 @@ TypeSystem::functionSignature(const parser::Node &function,
                     table.protocolArgumentsFor(annotatedReturn, protocolName))
               if (!args->empty() && (*args)[0])
                 annotatedYield = (*args)[0];
+      // ⭐ AND A YIELDED LAMBDA TAKES THE ANNOTATION, the way an assigned one
+      // does. An unannotated lambda has no type of its own -- its parameters
+      // read as `object` -- so `yield lambda n: n + 1` under
+      // `-> Iterator[Callable[[int], int]]` was the function-level mismatch,
+      // while `v: Callable[[int], int] = lambda n: n + 1` one line over is
+      // exactly the same expectation and compiles. The lambda is checked at
+      // its own site against that expectation, so this cannot accept a
+      // generator the site would refuse.
+      auto yieldNarrows = [&](std::size_t index, mlir::Type yielded) {
+        mlir::Type widened = widenLiteral(yielded);
+        if (py::isAssignableTo(widened, *annotatedYield))
+          return true;
+        if (index < generator.yieldNodes.size() && generator.yieldNodes[index] &&
+            generator.yieldNodes[index]->kind == "Lambda" &&
+            mlir::isa<py::CallableType>(*annotatedYield))
+          return true;
+        auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened);
+        return unionType && unionType.hasMember(*annotatedYield);
+      };
       bool everyYieldNarrows =
-          annotatedYield && *annotatedYield && !generator.yieldTypes.empty() &&
-          llvm::all_of(generator.yieldTypes, [&](mlir::Type yielded) {
-            mlir::Type widened = widenLiteral(yielded);
-            if (py::isAssignableTo(widened, *annotatedYield))
-              return true;
-            auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened);
-            return unionType && unionType.hasMember(*annotatedYield);
-          });
+          annotatedYield && *annotatedYield && !generator.yieldTypes.empty();
+      if (everyYieldNarrows)
+        for (auto [index, yielded] : llvm::enumerate(generator.yieldTypes))
+          if (!yieldNarrows(index, yielded)) {
+            everyYieldNarrows = false;
+            break;
+          }
       if (everyYieldNarrows) {
         sig.generatorYieldType = *annotatedYield;
         sig.generatorYieldTypeIsAnnotated = true;
