@@ -26,10 +26,23 @@
 // function is ordinary Python.
 //
 // ⛔ Why the residue is spelled as "not a contract" rather than enumerated:
-// the enumeration is what went stale. A union stays value-bound so isinstance
-// narrowing keeps working on the module flow, and the rest have no runtime
-// value group to put in a cell; both are properties of the annotation, and
-// neither is a list of names.
+// the enumeration is what went stale -- twice. The container exclusion above
+// was the first; a CALLABLE was the second (2026-09-06), and it was worse than
+// a missing feature because ANNOTATING took a working program away:
+// `DOUBLE = double` resolved through the alias binding and
+// `DOUBLE: Callable[[int], int] = double` did not. A function object has a
+// value group like anything else.
+//
+// ⛔ A UNION IS STILL NOT ONE, and the reason is now MEASURED rather than
+// argued. Adding `isa<UnionType>` here turns the refusal into a LOWERING
+// failure -- "cannot adapt runtime bundle with physical values (i64,
+// memref<2xi64>) to expected ABI (memref<2xi64>)" -- so the store side reduces
+// the union to one lane where the value has a tag and a payload. The cell
+// machinery itself is ready (`moduleObjectGlobalCell` documents a `_v<i>` word
+// "for scalar physical values such as a union tag"); what is not is the ABI
+// the global's own type is adapted to. That is where the next attempt starts,
+// and until then value binding also keeps isinstance narrowing working on the
+// module flow. The rest have no runtime value group at all.
 //
 // Why NOT in EmitterClasses.cpp, where this lived: nothing here is about a
 // class. It shared the file only because `collectStaticModuleAssignments`
@@ -173,8 +186,13 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
         targets->front()->kind != "Name")
       continue;
     const parser::Node *value = ast::node(*statement, "value");
-    if (!value || value->kind != "Constant" ||
-        ast::isNoneField(*value, "value"))
+    // ⭐ `None` IS ONE OF THEM. It was excluded here with no stated reason,
+    // so `V = None` read from a function was "unresolved name 'V'" while
+    // `V = 3` beside it worked -- one channel with an arm missing, which is
+    // the same shape the imported-module literal channel had for None. The
+    // re-emission this channel does is `py.none`, which costs nothing and
+    // cannot go stale: a name bound once to None is None everywhere.
+    if (!value || value->kind != "Constant")
       continue;
     llvm::StringRef name = ast::nameSpelling(*targets->front());
     if (!boundOnce.contains(name) || moduleGlobals.count(name) ||
