@@ -318,6 +318,9 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   // current block after the body, which may differ from the branch entry when
   // the body has its own control flow) and capture the merge values in scope.
   mlir::Block *thenExit = nullptr, *elseExit = nullptr;
+  // The field facts each arm reaches the join with. Merged below: a fact both
+  // arms agree on describes every path past the statement.
+  llvm::StringMap<mlir::Type> thenMembers, elseMembers;
   llvm::SmallVector<Value, 4> thenValues, elseValues;
   llvm::SmallVector<Value, 2> thenMutationValues, elseMutationValues;
   builder.setInsertionPointToStart(thenBlock);
@@ -328,6 +331,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     emitStatements(ast::nodeList(statement, "body"));
     if (!insertionBlockTerminated(builder)) {
       thenExit = builder.getInsertionBlock();
+      thenMembers = narrowedMemberTypes;
       for (const std::string &name : mergeCandidates) {
         auto found = values.find(name);
         thenValues.push_back(found != values.end() ? found->second : Value{});
@@ -351,6 +355,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
       emitStatements(orelse);
       if (!insertionBlockTerminated(builder)) {
         elseExit = builder.getInsertionBlock();
+        elseMembers = narrowedMemberTypes;
         for (const std::string &name : mergeCandidates) {
           auto found = values.find(name);
           elseValues.push_back(found != values.end() ? found->second : Value{});
@@ -597,6 +602,55 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
     narrowedMemberTypes = savedMembers;
     applyNarrowings(/*conditionIsTrue=*/true);
     savedMembers = narrowedMemberTypes;
+  } else if (!thenTerminates && !elseTerminates) {
+    // ⭐ AND A FACT BOTH ARMS AGREE ON, which is the lazy-cache idiom:
+    //
+    //     if self.cached is None:
+    //         self.cached = [1, 2, 3]
+    //     return self.cached
+    //
+    // The body proves `list` by STORING one and the fall-through proves it by
+    // the guard's negative, so every path past the statement has the same
+    // answer -- and dropping both left the read to hand back the union, which
+    // the return then refused.
+    //
+    // ⛔ AGREEMENT AND NOT A JOIN. `if x is None: ...` with no store leaves
+    // None on one side and the payload on the other; joining those rebuilds
+    // the declared union, and a fact equal to the declaration is not a fact.
+    // Requiring the two sides to be EQUAL says the same thing without asking
+    // the type system for a join it would then have to undo -- and it is what
+    // keeps a proof out of the code after an `if` that established nothing,
+    // which is the failure the branch-local rule was written for.
+    if (!hasElse) {
+      // ⛔ The MEMBER half only, spelled out rather than through
+      // `applyNarrowings`: that one also unwraps the VALUE of a narrowed NAME
+      // and rebinds it, and doing that here -- at the continuation, on the
+      // false side -- rebound `v` to the None member after
+      //
+      //     v = pick_int(True)
+      //     if v is not None:
+      //         print(v + 1)
+      //     print(v)
+      //
+      // so the last line printed None where CPython prints 7. A silent wrong
+      // answer, and the only thing wanted here is what the arms proved about
+      // FIELDS.
+      elseMembers = savedMembers;
+      for (const BranchTypeNarrowing &fact : narrowings) {
+        if (!fact.isMemberPath)
+          continue;
+        if (fact.falseType && fact.falseType != types.none())
+          elseMembers[fact.name] = fact.falseType;
+        else
+          elseMembers.erase(fact.name);
+      }
+    }
+    llvm::StringMap<mlir::Type> agreed;
+    for (const auto &entry : thenMembers)
+      if (auto other = elseMembers.find(entry.getKey());
+          other != elseMembers.end() && other->second == entry.second)
+        agreed[entry.getKey()] = entry.second;
+    savedMembers = std::move(agreed);
   }
 }
 

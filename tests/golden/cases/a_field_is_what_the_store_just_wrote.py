@@ -17,12 +17,17 @@
 # `None` proves nothing worth keeping, and `self.f = other_union` proves the
 # union it already had.
 #
-# ⛔ Still refused, and it is the MERGE and not the store: reading the field
-# after an `if` that assigned it in one arm. Both arms prove the same thing
-# there -- the body by this store and the fall-through by the guard's negative
-# -- but a branch's proof does not outlive the statement, for the reason
-# emitIf records. `x_lazy_else` below is the spelling that works: return inside
-# the arm.
+# ⭐ AND THE MERGE, which is the lazy-cache idiom's usual spelling: reading the
+# field AFTER an `if` that assigned it in one arm. Both arms prove the same
+# thing -- the body by the store, the fall-through by the guard's negative --
+# so every path past the statement has the same answer, and a fact both arms
+# AGREE on now outlives it.
+#
+# ⛔ Agreement and not a join. `if x is None: ...` with no store leaves None on
+# one side and the payload on the other; joining those rebuilds the declared
+# union, and a fact equal to the declaration is not a fact. Requiring the two
+# sides to be EQUAL is what keeps a proof out of the code after an `if` that
+# established nothing -- the failure the branch-local rule was written for.
 class Box:
     def __init__(self) -> None:
         self.f: "int | None" = None
@@ -51,6 +56,23 @@ class Box:
             return self.xs
         return self.xs
 
+    def lazy_merged(self) -> list[int]:
+        if self.xs is None:
+            self.xs = [4, 5, 6]
+        return self.xs
+
+    def lazy_scalar(self) -> int:
+        if self.f is None:
+            self.f = 12
+        return self.f
+
+    def proves_nothing(self) -> str:
+        # Neither arm agrees with the other, so nothing survives the statement
+        # and the read below is the whole union again.
+        if self.tag is None:
+            pass
+        return "unset" if self.tag is None else self.tag
+
     def overwritten(self) -> int:
         self.f = 1
         self.f = 2
@@ -74,6 +96,9 @@ def main() -> None:
     print(box.set_and_join(), box.overwritten(), box.cleared())
     fresh = Box()
     print(fresh.lazy(), fresh.lazy())
+    merged = Box()
+    print(merged.lazy_merged(), merged.lazy_merged(), merged.lazy_scalar())
+    print(merged.proves_nothing())
     print(through_a_local_name())
 
 
