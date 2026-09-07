@@ -1319,6 +1319,7 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
   // exactly what a dead value is, so the tag names one of those when the union
   // has one. `NoneType` is that member for every `Optional`.
   if (auto unionType = mlir::dyn_cast<py::UnionType>(contract)) {
+    std::optional<std::int64_t> emptyMember;
     for (auto [memberIndex, member] :
          llvm::enumerate(unionType.getMemberTypes())) {
       mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
@@ -1327,13 +1328,32 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
         return mlir::failure();
       if (!memberTypes->empty())
         continue;
-      if (!values.empty() && mlir::isa<mlir::IntegerType>(values.front().getType()))
-        values.front() = mlir::arith::ConstantIntOp::create(
-                             builder, op->getLoc(),
-                             static_cast<std::int64_t>(memberIndex), 64)
-                             .getResult();
+      emptyMember = static_cast<std::int64_t>(memberIndex);
       break;
     }
+    // ⭐ AND WHEN THERE IS NO SUCH MEMBER, NAME NONE OF THEM. `int | str` has
+    // no arm that owns nothing, so the tag stayed at 0 and said "the int is
+    // live" over a header the frame had zeroed rather than allocated:
+    //
+    //     class Box:
+    //         def __init__(self, v: "int | str") -> None:
+    //             self.v: "int | str" = v
+    //     Box(1)              # Ly_DecRef observed non-positive refcount
+    //
+    // A tag naming no member releases and retains nothing, which is what a
+    // dead value owns. `forEachActiveUnionMember` reads a CONSTANT tag and
+    // emits only the arm it names, so an out-of-range constant emits no arm
+    // at all -- the unconditional every-member walk it falls back to is for a
+    // tag that is not known here.
+    //
+    // ⛔ NOT the immortal static placeholder on every lane instead, which is
+    // the other way to make the walk harmless: it keeps the retain/release
+    // pair on a value that owns nothing, and the pair is what the affine
+    // verifier then has to be taught to see through.
+    if (!values.empty() && mlir::isa<mlir::IntegerType>(values.front().getType()))
+      values.front() = mlir::arith::ConstantIntOp::create(
+                           builder, op->getLoc(), emptyMember.value_or(-1), 64)
+                           .getResult();
   }
 
   // ⭐ A LANE WITH NO HEADER OWNS NOTHING, so it gets no token. The dead value
