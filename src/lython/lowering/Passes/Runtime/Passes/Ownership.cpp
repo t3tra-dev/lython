@@ -550,6 +550,32 @@ mlir::LogicalResult insertBorrowedConsumeRetains(
   return result;
 }
 
+// ⛔ IS THE RETURNED VALUE A MARKER THAT ALREADY MINTED ITS OWN TOKEN? A value
+// the frame only borrows becomes returnable by being retained, and a container
+// element read does exactly that: the retain roots an owned-local marker
+// (`own::ownedLocalMarkerIsRetainRooted`), so the return transfers the token
+// the mint made. Retaining a second time left the mint with no release at all
+// and handed the caller two tokens for one object --
+//
+//     def f(v: int) -> int:
+//         xs: list[int] = []
+//         xs.append(v)
+//         return xs[0]
+//
+// which the affine verifier refused as "borrowed entry argument 0 of @f is
+// returned with 2 retained ownership tokens". So did `t = (v, 2); return t[0]`
+// and every ternary stored into a list and read back. The FIELD spelling
+// (`b.xs.append(v); return b.xs[0]`) always worked because its element comes
+// from the field's storage rather than from an entry argument, so it never
+// reached this walk.
+bool returnsItsOwnMintedToken(llvm::ArrayRef<mlir::Value> group,
+                              own::AliasAnalysis &aliases) {
+  if (group.empty())
+    return false;
+  mlir::Operation *producer = group.front().getDefiningOp();
+  return producer && own::ownedLocalMarkerIsRetainRooted(producer, aliases);
+}
+
 mlir::LogicalResult insertBorrowedReturnRetains(
     mlir::ModuleOp module, mlir::func::FuncOp retain,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators,
@@ -601,8 +627,9 @@ mlir::LogicalResult insertBorrowedReturnRetains(
               static_cast<unsigned>(deallocator->inputTypes.size()));
           if (group.empty())
             continue;
-          if (own::valueGroupEqualsEntryArgumentGroup(function, group) ||
-              valueGroupDerivedFromEntryArguments(function, group, aliases)) {
+          if ((own::valueGroupEqualsEntryArgumentGroup(function, group) ||
+               valueGroupDerivedFromEntryArguments(function, group, aliases)) &&
+              !returnsItsOwnMintedToken(group, aliases)) {
             if (mlir::failed(insertRetain(retain, returnOp.getOperation(),
                                           group.front()))) {
               result = mlir::failure();
@@ -632,8 +659,9 @@ mlir::LogicalResult insertBorrowedReturnRetains(
         llvm::SmallVector<mlir::Value, 4> group = own::valueSlice(
             returnOp.getOperands(), offset,
             static_cast<unsigned>(deallocator->inputTypes.size()));
-        if (own::valueGroupEqualsEntryArgumentGroup(function, group) ||
-            valueGroupDerivedFromEntryArguments(function, group, aliases)) {
+        if ((own::valueGroupEqualsEntryArgumentGroup(function, group) ||
+             valueGroupDerivedFromEntryArguments(function, group, aliases)) &&
+            !returnsItsOwnMintedToken(group, aliases)) {
           if (mlir::failed(insertRetain(retain, returnOp.getOperation(), group.front()))) {
             result = mlir::failure();
             return;
