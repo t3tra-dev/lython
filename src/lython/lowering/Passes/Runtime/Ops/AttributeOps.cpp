@@ -243,13 +243,28 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
       std::string payloadName = runtimeShapeContractName(payload);
       if (payloadName.empty() || payloadName == "types.NoneType")
         return false;
-      return RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(payload);
+      if (RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(payload))
+        return true;
+      // ⭐ OR IT HAS A BOX PRIMITIVE, which is `builtins.bool` and only it.
+      // The bool's own value is an `i1` and has no address, but its BOXED form
+      // is an immortal singleton that does, so the slot holds one of those and
+      // the read unboxes it. The general-union read is what does that (the
+      // optional fast path rebuilds the payload's own lanes from the entity,
+      // which for a bool is the truth bit and not a header), so a `bool |
+      // None` field takes the same road as `int | str`.
+      return manifest.primitive(payloadName, "box").has_value();
     }
     // ⭐ AND SO IS EVERY OTHER UNION WHOSE MEMBERS EACH FIT A BOX. The slot
     // holds ONE payload handle and that handle's class word says which member
     // it is -- the reading a `list[int | str]` element has always had
     // (`unionValuesFromBoxWords`) -- so the tag needs no storage of its own and
     // the members need no shared width.
+    //
+    // ⛔ WHAT DOES NOT FIT IS A MEMBER WITH NO CONTRACT OF ITS OWN, which is
+    // `type[X]`: its value is EMPTY (which class it names is in the type), so
+    // there is nothing to box and no class word that could name it back. A
+    // union holding one keeps every member's lanes, and the class holding that
+    // union keeps them too.
     //
     // Keeping them inline instead put the tag and every member's lanes into the
     // INSTANCE's own value group, and that one decision was four defects: an
@@ -263,6 +278,10 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
     // ⛔ AT MOST ONE MEMBER MAY BE LANE-LESS, and it is the empty box.
     // `unionValuesFromBoxWords` reads the first such member as the tag no
     // identified class claims; a second one would be indistinguishable from it.
+    //
+    // `builtins.bool` IS one of the ones that fit, through its `box`
+    // primitive: its own value is an `i1` with no address, and its boxed form
+    // is an immortal singleton that has one.
     unsigned laneLess = 0;
     for (mlir::Type member : unionType.getMemberTypes()) {
       std::string memberName = runtimeShapeContractName(member);
@@ -272,7 +291,8 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
         ++laneLess;
         continue;
       }
-      if (!RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(member))
+      if (!RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(member) &&
+          !manifest.primitive(memberName, "box"))
         return false;
     }
     return laneLess <= 1;
@@ -580,7 +600,9 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
   // whichever arm the value carries decides between filling the box and
   // emptying it.
   if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(value.contract))
-    if (unionType.isOptional())
+    if (unionType.isOptional() &&
+        RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(
+            unionType.getOptionalPayloadType()))
       return RuntimeBundleLowerer::storeOptionalBoxedField(op, body, boxWord,
                                                            value, unionType,
                                                            slotName);
@@ -1978,7 +2000,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     // tag where the payload's lane belonged.
     auto optionalField =
         mlir::dyn_cast_if_present<py::UnionType>(loadedContract);
-    if (optionalField && !optionalField.isOptional())
+    if (optionalField &&
+        (!optionalField.isOptional() ||
+         !RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(
+             optionalField.getOptionalPayloadType())))
       optionalField = nullptr;
     if (optionalField) {
       mlir::Type payloadType = optionalField.getOptionalPayloadType();
@@ -2089,6 +2114,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       }
     } else if (auto unionField =
                    mlir::dyn_cast_if_present<py::UnionType>(loadedContract)) {
+      (void)0;
       // ⭐ A UNION OF TWO REAL MEMBERS READS BACK THE WAY A CONTAINER ELEMENT
       // DOES: the box's CLASS word names the live member, each member's lanes
       // are rebuilt from the entity under that test, and the inactive ones get
@@ -2524,10 +2550,25 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
       if (mlir::failed(dead) || dead->values.empty())
         return mlir::failure();
       builder.setInsertionPoint(op);
+      mlir::Value deadHandle = dead->values.front();
+      // ⛔ A MEMBER WITH A `box` PRIMITIVE HAS NO ADDRESS OF ITS OWN. `bool`'s
+      // dead value is an `i1` constant, and the inactive arm needs something
+      // the slot's shape can be built AT -- so it stands in as its own boxed
+      // form, which is an immortal singleton and safe to read on either arm.
+      if (std::optional<RuntimeSymbol> boxed =
+              manifest.primitive(contractName, "box")) {
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            loc, *boxed, dead->values);
+        if (call.getNumResults() == 0)
+          return op->emitError()
+                 << "runtime box primitive for " << contractName
+                 << " returns nothing to stand in for an inactive union member";
+        deadHandle = call.getResult(0);
+      }
       mlir::Value deadAddress = mlir::arith::IndexCastOp::create(
           builder, loc, builder.getI64Type(),
           mlir::memref::ExtractAlignedPointerAsIndexOp::create(
-              builder, loc, dead->values.front()));
+              builder, loc, deadHandle));
       mlir::Value entity = mlir::arith::SelectOp::create(
           builder, loc, matches[index], entityWord, deadAddress);
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =

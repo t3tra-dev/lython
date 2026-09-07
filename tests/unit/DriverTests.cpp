@@ -1505,10 +1505,10 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
 TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
   CompileResult result = compileSource("class Node:\n"
                                        "    v: int\n"
-                                       "    nxt: \"Node | bool\"\n"
+                                       "    nxt: \"Node | type[Node]\"\n"
                                        "    def __init__(self, v: int) -> None:\n"
                                        "        self.v = v\n"
-                                       "        self.nxt = False\n"
+                                       "        self.nxt = Node\n"
                                        "\n"
                                        "print(Node(1).v)\n");
   EXPECT_FALSE(result.succeeded);
@@ -1520,7 +1520,8 @@ TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
 
 // And a union of two OBJECTS no longer does. Each member fits a box, so the
 // field is one payload handle whose class word names the member -- which is
-// what `Node | Leaf` needs to terminate, and what a `bool` member cannot have.
+// what `Node | Leaf` needs to terminate, and what a `type[X]` member, whose
+// value is empty, cannot have.
 TEST(DriverTest, AUnionOfTwoObjectsReachesItsOwnClass) {
   CompileResult result = compileSource("class Leaf:\n"
                                        "    n: int\n"

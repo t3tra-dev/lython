@@ -66,7 +66,7 @@ namespace py::lowering::box_abi {
 // three lanes took `class P: x, y, z: float` out of every container. Fields
 // live in the instance BODY now and a class is one lane however many it has;
 // what `objectPayloadHandleWords` still refuses is a class holding a union
-// with a `bool` member, the one contract with no address to be a handle.
+// with a `type[X]` member, the one member with no value to box.
 inline constexpr std::int64_t kWordsPerBox = 5;
 // Word 2 is the ENTITY: the address of the object's first physical value, and
 // the only one a box keeps. Everything else a contract expands to is reached

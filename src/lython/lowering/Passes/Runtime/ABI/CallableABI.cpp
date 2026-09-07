@@ -237,20 +237,19 @@ RuntimeBundleLowerer::runtimeValueTypesFor(mlir::Operation *op, mlir::Type type,
   // worst answer a compiler can give, so the cycle is reported where it is
   // entered.
   //
-  // ⛔ WHAT STILL ARRIVES HERE IS A MEMBER WITH NO ENTITY. `T | None`, `Node |
-  // Leaf` and every other union of boxable members are stored as one payload
-  // handle whose class word names the live member, so they terminate.
-  // `builtins.bool` is the one contract whose whole value is an `i1` -- there
-  // is no address a box's entity word could hold -- so a union with a bool
-  // member keeps its members' lanes, and a class reached through one of those
-  // is reached through its own layout.
+  // ⛔ WHAT STILL ARRIVES HERE IS A MEMBER WITH NO CONTRACT. `T | None`, `Node
+  // | Leaf`, `int | bool` and every other union of boxable members are stored
+  // as one payload handle whose class word names the live member, so they
+  // terminate. `type[X]` is the one that cannot: its value is EMPTY, so there
+  // is nothing to box and no class word to name it back, and a class reached
+  // through a union holding one is reached through its own layout.
   if (!expandingContracts.insert(type).second)
     return op->emitError()
            << "class layout for " << type
            << " contains itself through a union-typed field that is stored "
               "inline, so it has no finite layout; a union whose members can "
-              "each be boxed -- which is every member but `bool` -- is stored "
-              "as one reference and terminates";
+              "each be boxed -- which is every member but a `type[X]` -- is "
+              "stored as one reference and terminates";
   auto expanding = llvm::make_scope_exit([&] { expandingContracts.erase(type); });
   if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
     llvm::SmallVector<mlir::Type, 8> types{mlir::IntegerType::get(context, 64)};

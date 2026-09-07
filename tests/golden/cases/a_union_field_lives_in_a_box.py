@@ -120,8 +120,48 @@ def total(n: Node) -> int:
     return n.v + got.n
 
 
+# A `bool` MEMBER. The bool's own value is an `i1` with no address, so it kept
+# every member's lanes with it -- and the two spellings below are the two
+# probes that recorded it: a guard, a second read, and a receiver the frame
+# owns. Its BOXED form is an immortal singleton that does have an address, so
+# the slot holds one of those and the read unboxes it.
+class Flag:
+    def __init__(self, v: "bool | None") -> None:
+        self.v: "bool | None" = v
+
+    def show(self) -> str:
+        if self.v is None:
+            return "n"
+        return "t" if self.v else "f"
+
+
+class Mixed:
+    def __init__(self, v: "int | bool") -> None:
+        self.v: "int | bool" = v
+
+    def show(self) -> str:
+        seen = self.v
+        if isinstance(seen, bool):
+            return "b" + ("T" if seen else "F")
+        return "i" + str(seen + 1)
+
+
+def bool_members() -> None:
+    print(Flag(True).show(), Flag(None).show(), Flag(False).show())
+    for value in [True, None, False]:
+        print(Flag(value).show())
+    print(Mixed(4).show(), Mixed(True).show())
+    flags = [Flag(True), Flag(None)]
+    print(len(flags), flags[0].show(), flags[1].show())
+    one = Mixed(1)
+    if len("x") == 1:
+        one.v = True
+    print(one.show())
+
+
 def main() -> None:
     containers()
+    bool_members()
     stores_in_regions()
     print(stored_twice(4, "hi"))
     print(total(chain(3)))

@@ -586,12 +586,13 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   // `__repr__` that plainly exists into a runtime abort. Reject at the box, the
   // earliest point where the width is known.
   //
-  // A UNION WITH A `bool` MEMBER is what reaches this now. A class instance is
-  // one lane however many fields it has -- they live in its body, and a union
-  // field is one payload handle whose class word names the member it holds --
-  // unless one of that union's members has no address to be the handle.
-  // `builtins.bool` is the only such contract, so `int | bool` keeps its
-  // members' lanes and the class that holds one expands with them.
+  // A UNION WITH A `type[X]` MEMBER is what reaches this now. A class instance
+  // is one lane however many fields it has -- they live in its body, and a
+  // union field is one payload handle whose class word names the member it
+  // holds -- unless one of that union's members has no contract to be that
+  // handle. `type[X]` is the one: its value is EMPTY, so there is nothing to
+  // box and no class word that would name it back, and `int | type[U]` keeps
+  // its members' lanes with the class that holds it.
   //
   // ⛔ READING a union element out of a container works and WRITING one does
   // not, and the asymmetry is in the direction, not an oversight. A read has
@@ -609,9 +610,9 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
            << concrete->physicalValues().size()
            << " physical values and nothing can rebuild them from one address; "
               "it cannot be stored in a container slot or boxed field yet "
-              "(a union with a `bool` member keeps every member's lanes -- a "
-              "bool has no address a box could hold -- and a field holding "
-              "one keeps them in its class)";
+              "(a union with a `type[X]` member keeps every member's lanes "
+              "-- a type object has no value to box -- and a field holding one "
+              "keeps them in its class)";
 
   mlir::FailureOr<mlir::Value> header =
       RuntimeBundleLowerer::objectPhysicalHeader(op, concrete->objectValue);
