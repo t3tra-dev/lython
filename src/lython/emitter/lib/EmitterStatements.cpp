@@ -2236,6 +2236,22 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
           }
         }
       }
+      // ⛔ COERCED TO THE FIELD'S DECLARED TYPE, which the store used not to
+      // do. The value is normally emitted with the field as its expectation,
+      // but a value that arrives already typed -- a literal under a member
+      // NARROWING, say -- skipped that and was written raw:
+      //
+      //     s.best: "int | None" = None
+      //     if s.best is not None:
+      //         s.best = 3        # py.attr.set ... = !py.literal<3>
+      //
+      // put an int where the field's lanes are a union, and the program
+      // SEGFAULTED -- with the guard false, so the store never even ran. The
+      // `else` spelling and the same write with the field already set were
+      // both correct, which is what kept this hidden.
+      if (std::optional<mlir::Type> fieldType =
+              lookupClassField(object.type, *attr))
+        value = coerceValue(value, *fieldType, target);
       auto op = py::AttrSetOp::create(builder, loc(target), object.value, *attr,
                                       value.value);
       if (lookupClassField(object.type, *attr))
