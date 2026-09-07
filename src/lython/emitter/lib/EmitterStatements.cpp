@@ -2249,11 +2249,40 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       // SEGFAULTED -- with the guard false, so the store never even ran. The
       // `else` spelling and the same write with the field already set were
       // both correct, which is what kept this hidden.
-      if (std::optional<mlir::Type> fieldType =
-              lookupClassField(object.type, *attr))
-        value = coerceValue(value, *fieldType, target);
+      std::optional<mlir::Type> storedFieldType =
+          lookupClassField(object.type, *attr);
+      mlir::Type storedValueType = types.widenLiteral(value.type);
+      if (storedFieldType)
+        value = coerceValue(value, *storedFieldType, target);
       auto op = py::AttrSetOp::create(builder, loc(target), object.value, *attr,
                                       value.value);
+      // ⭐ THE STORE PROVES WHAT IT WROTE. A `int | None` field assigned an int
+      // is an int on every path below, and reading it back was refused for the
+      // whole union:
+      //
+      //     self.f = 5
+      //     return self.f + 1     # union<int, None> does not provide __add__
+      //
+      // -- and the lazy-cache idiom (`if self.cached is None: self.cached =
+      // [...]` then `return self.cached`) with it. This is the same kind of
+      // fact a guard proves, so it is spent the same way: at the READ, with a
+      // check, which is what covers anything that changes the field in
+      // between.
+      //
+      // ⛔ The owner must be a NAME and the fact a strict MEMBER of the
+      // declared union -- the same two limits every other member path has.
+      if (storedFieldType && storedValueType)
+        if (auto declared =
+                mlir::dyn_cast<py::UnionType>(types.widenLiteral(*storedFieldType)))
+          if (declared.hasMember(storedValueType) &&
+              storedValueType != mlir::Type(declared) &&
+              storedValueType != types.none())
+            if (const parser::Node *owner = ast::node(target, "value");
+                owner && owner->kind == "Name")
+              memberNarrowingsFromStores[std::string(
+                                             ast::nameSpelling(*owner)) +
+                                         "." + std::string(*attr)] =
+                  storedValueType;
       if (lookupClassField(object.type, *attr))
         op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
       if (auto contract =

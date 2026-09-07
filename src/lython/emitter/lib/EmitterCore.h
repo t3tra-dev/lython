@@ -1407,6 +1407,13 @@ private:
   llvm::StringMap<mlir::Type> narrowedMemberTypes;
   bool suppressMemberNarrowing = false;
   void invalidateMemberNarrowings(const parser::Node &statement);
+  // ⭐ WHAT A STORE PROVES. `self.f = 5` on a `int | None` field proves the
+  // field is an int on every path below it, which is the same kind of fact a
+  // guard proves and is spent the same way -- at the READ, with a check. The
+  // store cannot write it into `narrowedMemberTypes` directly because
+  // `invalidateMemberNarrowings` runs after the statement and would erase it,
+  // so it lands here and that walk installs it.
+  llvm::StringMap<mlir::Type> memberNarrowingsFromStores;
   // Names declared `global` in the function currently being emitted (writes
   // to them target the module global instead of a new local). Saved/restored
   // around each callable body.

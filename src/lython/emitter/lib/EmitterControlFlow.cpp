@@ -26,7 +26,15 @@ namespace lython::emitter {
 // conditional expression and the `while` body all reach it: each of them
 // used to be its own copy, and the loop had none at all.
 void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
-  if (narrowedMemberTypes.empty())
+  // The store's own proof survives the erase below: it is about the value the
+  // statement just wrote, not about anything the statement invalidated.
+  llvm::StringMap<mlir::Type> proved = std::move(memberNarrowingsFromStores);
+  memberNarrowingsFromStores.clear();
+  auto installProved = llvm::make_scope_exit([&] {
+    for (const auto &entry : proved)
+      narrowedMemberTypes[entry.getKey()] = entry.second;
+  });
+  if (narrowedMemberTypes.empty() && proved.empty())
     return;
   llvm::SmallVector<const parser::Node *, 4> targets;
   auto addTargets = [&](llvm::StringRef field) {
