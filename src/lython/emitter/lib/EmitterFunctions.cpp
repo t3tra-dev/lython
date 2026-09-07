@@ -767,43 +767,26 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   // so whichever body goes first has to name a symbol that does not exist yet.
   // Declaring then defining is the same split the sibling-subclass dispatch
   // needed, for the same reason.
-  llvm::StringMap<ClosedSibling> enclosingSiblings =
-      std::move(closedSiblingGroup);
-  closedSiblingGroup.clear();
+  SiblingGroupState enclosingSiblings = std::move(closedSiblingGroup);
+  closedSiblingGroup = SiblingGroupState{};
   auto restoreSiblings = llvm::make_scope_exit(
       [&] { closedSiblingGroup = std::move(enclosingSiblings); });
-  if (!isLambda)
-    if (auto memberName = ast::string(callable, "name");
-        memberName && enclosingSiblings.count(*memberName))
-      for (const auto &entry : enclosingSiblings) {
-        if (entry.getKey() == llvm::StringRef(*memberName) || !entry.second.node)
-          continue;
-        FunctionSignature siblingSig =
-            types.functionSignature(*entry.second.node);
-        mlir::Type siblingType = siblingSig.isGeneratorFunction ||
-                                         siblingSig.isAsyncGeneratorFunction
-                                     ? siblingSig.publicCallable
-                                     : siblingSig.callable;
-        if (!siblingType)
-          continue;
-        values[entry.getKey()] =
-            emitBindingRef(callable, entry.second.symbol, siblingType, {});
-        types.bindSymbol(entry.getKey(), siblingType);
-      }
   if (!isLambda) {
-    llvm::StringSet<> members = closedMutualNestedDefs(callable);
-    if (!members.empty())
-      if (const auto *groupBody = ast::nodeList(callable, "body"))
+    MutualNestedDefGroup group = mutualNestedDefGroup(callable);
+    if (!group.members.empty())
+      if (const auto *groupBody = ast::nodeList(callable, "body")) {
+        closedSiblingGroup.captures = std::move(group.captures);
         for (const parser::NodePtr &statement : *groupBody) {
           if (!statement || statement->kind != "FunctionDef")
             continue;
           auto memberName = ast::string(*statement, "name");
-          if (!memberName || !members.contains(*memberName))
+          if (!memberName || !group.members.contains(*memberName))
             continue;
-          closedSiblingGroup[*memberName] = ClosedSibling{
+          closedSiblingGroup.members[*memberName] = ClosedSibling{
               nestedFunctionSymbolName(*memberName, *statement),
               statement.get()};
         }
+      }
   }
   if (!isLambda)
     emitForwardBoundCells(callable);
@@ -853,6 +836,28 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
             emitBindingRef(callable, symbolName, selfType, selfCaptures);
         types.bindSymbol(selfSpelling, selfType);
       }
+      // ⭐ AND EVERY SIBLING OF THE GROUP, by the same construction. This
+      // member's capture arguments ARE the group's list, in the group's order,
+      // so they are exactly what a sibling's binding reference needs -- which
+      // is the whole reason the list is uniform. Nothing holds a function
+      // object, so nothing closes the cycle.
+      if (enclosingSiblings.members.count(selfSpelling))
+        for (const auto &entry : enclosingSiblings.members) {
+          if (entry.getKey() == selfSpelling || !entry.second.node)
+            continue;
+          FunctionSignature siblingSig =
+              types.functionSignature(*entry.second.node);
+          mlir::Type siblingType = siblingSig.isGeneratorFunction ||
+                                           siblingSig.isAsyncGeneratorFunction
+                                       ? siblingSig.publicCallable
+                                       : siblingSig.callable;
+          if (!siblingType)
+            continue;
+          values[entry.getKey()] =
+              emitBindingRef(callable, entry.second.symbol, siblingType,
+                             selfCaptures);
+          types.bindSymbol(entry.getKey(), siblingType);
+        }
     }
   if (isLambda) {
     Value body = coerceValue(emitExpr(ast::node(callable, "body")),
@@ -1034,7 +1039,7 @@ void ModuleEmitter::emitForwardBoundCells(const parser::Node &callable) {
       continue;
     // A member of the closed group needs no cell: its siblings name it by
     // symbol, which is what keeps it out of their closure stores.
-    if (closedSiblingGroup.count(name))
+    if (closedSiblingGroup.members.count(name))
       continue;
     mlir::Type content = inferConditionalLocalType({body}, name);
     // The storability rule the conditional slots end with: a slot for an
@@ -1068,17 +1073,27 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
   checkDecorators(function, DecoratorRole::Function);
 
   llvm::SmallVector<Capture, 4> captures;
-  for (const std::string &captureName : lexicalCaptureNames(function)) {
-    // ⛔ A SIBLING OF A CLOSED GROUP IS NOT A CAPTURE. Its name is bound by
-    // symbol inside every member's body, so capturing it here would put the
-    // function object back in the closure store -- which is the cycle this
-    // group exists to avoid. The name is in `values` by now for whichever
-    // sibling's def statement has already run.
-    if (closedSiblingGroup.count(captureName))
-      continue;
-    auto found = values.find(captureName);
-    if (found != values.end())
-      captures.push_back(Capture{captureName, found->second});
+  auto memberOfGroup = closedSiblingGroup.members.find(*name);
+  const bool isGroupMember = memberOfGroup != closedSiblingGroup.members.end() &&
+                             memberOfGroup->second.node == &function;
+  if (isGroupMember) {
+    // ⛔ THE GROUP'S LIST, not this def's own captures. A member names its
+    // siblings by symbol and has to pass their captures, and the only list it
+    // can be sure of is the one it carries itself -- so every member carries
+    // the same one, whether it reads those names or not. A sibling is never in
+    // it: capturing one would put the function object back in the closure
+    // store, which is the cycle the group exists to avoid.
+    for (const std::string &captureName : closedSiblingGroup.captures) {
+      auto found = values.find(captureName);
+      if (found != values.end())
+        captures.push_back(Capture{captureName, found->second});
+    }
+  } else {
+    for (const std::string &captureName : lexicalCaptureNames(function)) {
+      auto found = values.find(captureName);
+      if (found != values.end())
+        captures.push_back(Capture{captureName, found->second});
+    }
   }
 
   FunctionSignature sig = types.functionSignature(function);
@@ -1087,11 +1102,9 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
 
   // A group member's symbol was assigned before any member's body was
   // emitted, so a sibling reading it already named THIS symbol.
-  auto assigned = closedSiblingGroup.find(*name);
-  std::string symbolName =
-      assigned != closedSiblingGroup.end() && assigned->second.node == &function
-          ? assigned->second.symbol
-          : nestedFunctionSymbolName(*name, function);
+  std::string symbolName = isGroupMember
+                               ? memberOfGroup->second.symbol
+                               : nestedFunctionSymbolName(*name, function);
   if (diagnoseUnsupportedGeneratorFunction(diagnostics, function, sig))
     return emitNone(function);
   emitCallableFunction(function, symbolName, sig, captures, /*isLambda=*/false);

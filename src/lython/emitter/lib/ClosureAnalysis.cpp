@@ -450,9 +450,40 @@ llvm::StringSet<> namesBoundAfterNestedReader(const parser::Node &callable) {
   return forward;
 }
 
-llvm::StringSet<> closedMutualNestedDefs(const parser::Node &callable) {
+// Does this def's OWN body yield? Nested defs are skipped: a generator inside a
+// plain def does not make the def a generator.
+bool bodyYields(const parser::Node &node) {
+  if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+      node.kind == "Lambda" || node.kind == "ClassDef")
+    return false;
+  if (node.kind == "Yield" || node.kind == "YieldFrom")
+    return true;
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && bodyYields(**child))
+        return true;
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &child : *children)
+        if (child && bodyYields(*child))
+          return true;
+  }
+  return false;
+}
+
+bool defIsAGenerator(const parser::Node &def) {
+  if (const auto *body = ast::nodeList(def, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement && bodyYields(*statement))
+        return true;
+  return false;
+}
+
+MutualNestedDefGroup mutualNestedDefGroup(const parser::Node &callable) {
+  MutualNestedDefGroup group;
   const auto *body = ast::nodeList(callable, "body");
-  llvm::StringSet<> group;
   if (!body)
     return group;
   // Only the defs the body declares DIRECTLY: a def nested one level deeper is
@@ -461,6 +492,14 @@ llvm::StringSet<> closedMutualNestedDefs(const parser::Node &callable) {
   llvm::StringMap<const parser::Node *> siblings;
   for (const parser::NodePtr &statement : *body) {
     if (!statement || statement->kind != "FunctionDef")
+      continue;
+    // ⛔ NOT A GENERATOR. Its frame is a state machine with its own capture
+    // seeding, and putting one in the group swapped a readable refusal ("a
+    // generator cannot carry a value of contract 'builtins.function' across a
+    // suspension yet") for an internal one about clone entry seeding. A
+    // generator that names a member still captures it as a value, which closes
+    // no cycle: the member it captures holds no function object of its own.
+    if (defIsAGenerator(*statement))
       continue;
     if (auto name = ast::string(*statement, "name"))
       siblings.try_emplace(*name, statement.get());
@@ -471,30 +510,27 @@ llvm::StringSet<> closedMutualNestedDefs(const parser::Node &callable) {
   collectFunctionLocalNames(callable, enclosingNames);
   // ⛔ Against the ENCLOSING scope's names and not against "anything the walk
   // reports": a member may read a module global or a builtin freely -- those
-  // resolve by symbol and are not captures. What disqualifies the group is a
+  // resolve by symbol and are not captures. What the group has to carry is a
   // name the enclosing FRAME owns.
-  auto capturesOutside = [&](const parser::Node &def) {
-    for (const std::string &capture : lexicalCaptureNames(def)) {
-      llvm::StringRef name(capture);
-      if (siblings.count(name))
-        continue;
-      if (enclosingNames.contains(name))
-        return true;
-    }
-    return false;
-  };
+  llvm::StringSet<> external;
   bool referencesASibling = false;
-  for (const auto &entry : siblings) {
-    if (capturesOutside(*entry.second))
-      return llvm::StringSet<>();
-    for (const std::string &capture : lexicalCaptureNames(*entry.second))
-      if (siblings.count(llvm::StringRef(capture)))
+  for (const auto &entry : siblings)
+    for (const std::string &capture : lexicalCaptureNames(*entry.second)) {
+      llvm::StringRef name(capture);
+      if (siblings.count(name)) {
         referencesASibling = true;
-  }
+        continue;
+      }
+      if (enclosingNames.contains(name))
+        external.insert(name);
+    }
   if (!referencesASibling)
     return group;
   for (const auto &entry : siblings)
-    group.insert(entry.getKey());
+    group.members.insert(entry.getKey());
+  for (const auto &entry : external)
+    group.captures.push_back(entry.getKey().str());
+  llvm::sort(group.captures);
   return group;
 }
 

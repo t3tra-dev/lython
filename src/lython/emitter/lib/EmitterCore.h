@@ -1486,7 +1486,7 @@ private:
                               llvm::SmallVectorImpl<Capture> &captures);
   unsigned syntheticFunctionCounter = 0;
   // The closed mutually-recursive nested-def group of the body being emitted
-  // (`closedMutualNestedDefs`), keyed by source name: the symbol assigned to
+  // (`mutualNestedDefGroup`), keyed by source name: the symbol assigned to
   // each member BEFORE any of their bodies is emitted, so a member can reach
   // its siblings the way it already reaches itself -- by symbol, with no
   // captures and therefore no reference cycle. Empty for every other body.
@@ -1494,7 +1494,11 @@ private:
     std::string symbol;
     const parser::Node *node = nullptr;
   };
-  llvm::StringMap<ClosedSibling> closedSiblingGroup;
+  struct SiblingGroupState {
+    llvm::StringMap<ClosedSibling> members;
+    llvm::SmallVector<std::string, 4> captures;
+  };
+  SiblingGroupState closedSiblingGroup;
   std::string nestedFunctionSymbolName(llvm::StringRef name,
                                        const parser::Node &function);
   unsigned listCompCounter = 0;

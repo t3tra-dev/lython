@@ -17,10 +17,15 @@
 # emitted, because the pair is circular and whichever body goes first would
 # otherwise name a symbol that does not exist.
 #
-# ⛔ A member that captures something ELSE keeps its cell and its cycle, and is
-# NOT here for that reason -- a golden that leaks would put a known leaker in a
-# corpus the leak sweep reads as clean. It lives in
-# tests/probe/wb_a_mutual_pair_that_captures_its_frame.py with the measurement.
+# ⭐ A member that also reads the ENCLOSING frame is the same mechanism with a
+# non-empty list: every member carries the group's captures, whether it reads
+# them or not, because a member naming a sibling has to pass the sibling's
+# captures and the only list it can be sure of is its own. `with_a_capture` and
+# `counted_down` are here for that.
+#
+# ⛔ A GENERATOR member is excluded from the group: its frame is a state
+# machine with its own capture seeding, and putting one in swapped a readable
+# refusal for an internal one about clone entry seeding.
 class Walk:
     def run(self, n: int) -> int:
         def down(k: int) -> int:
@@ -74,6 +79,31 @@ def beside_a_free_one(n: int) -> int:
     return a(n) + unrelated(n)
 
 
+def with_a_capture(n: int, base: int) -> int:
+    def a(k: int) -> int:
+        return base if k == 0 else b(k - 1)
+
+    def b(k: int) -> int:
+        return a(k - 1) + 1
+
+    return a(n)
+
+
+def counted_down(n: int, step: int) -> int:
+    seen = 0
+
+    def down(k: int) -> int:
+        nonlocal seen
+        seen += 1
+        return 0 if k <= 0 else up(k - step)
+
+    def up(k: int) -> int:
+        return down(k) + 1
+
+    total = down(n)
+    return total * 100 + seen
+
+
 def text(n: int) -> str:
     def a(k: int) -> str:
         return "" if k == 0 else b(k - 1) + "a"
@@ -86,11 +116,13 @@ def text(n: int) -> str:
 
 def main() -> None:
     print(parity(6), parity(7), Walk().run(4))
-    print(three_of_them(3), beside_a_free_one(3))
+    print(three_of_them(3), beside_a_free_one(3), with_a_capture(4, 10))
+    print(counted_down(6, 2), counted_down(3, 1))
     print(text(2))
     total = 0
     for i in range(200):
         total += 1 if parity(i) == "even" else 0
+        total += with_a_capture(2, i) % 3
     print(total)
 
 

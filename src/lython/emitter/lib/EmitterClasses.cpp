@@ -4859,24 +4859,25 @@ Value ModuleEmitter::emitInlineMethodBody(
     // emitCallableFunction, so a mutually recursive pair declared in one kept
     // its cell -- and its reference cycle -- while the same pair in a free
     // function stopped leaking. The two call sites have to agree.
-    llvm::StringMap<ClosedSibling> enclosingSiblings =
-        std::move(closedSiblingGroup);
-    closedSiblingGroup.clear();
+    SiblingGroupState enclosingSiblings = std::move(closedSiblingGroup);
+    closedSiblingGroup = SiblingGroupState{};
     auto restoreSiblings = llvm::make_scope_exit(
         [&] { closedSiblingGroup = std::move(enclosingSiblings); });
-    llvm::StringSet<> members = closedMutualNestedDefs(*method.method);
-    if (!members.empty())
-      if (const auto *groupBody = ast::nodeList(*method.method, "body"))
+    MutualNestedDefGroup group = mutualNestedDefGroup(*method.method);
+    if (!group.members.empty())
+      if (const auto *groupBody = ast::nodeList(*method.method, "body")) {
+        closedSiblingGroup.captures = std::move(group.captures);
         for (const parser::NodePtr &statement : *groupBody) {
           if (!statement || statement->kind != "FunctionDef")
             continue;
           auto memberName = ast::string(*statement, "name");
-          if (!memberName || !members.contains(*memberName))
+          if (!memberName || !group.members.contains(*memberName))
             continue;
-          closedSiblingGroup[*memberName] = ClosedSibling{
+          closedSiblingGroup.members[*memberName] = ClosedSibling{
               nestedFunctionSymbolName(*memberName, *statement),
               statement.get()};
         }
+      }
     emitForwardBoundCells(*method.method);
     emitStatements(body);
   }
