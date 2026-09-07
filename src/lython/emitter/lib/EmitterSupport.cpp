@@ -1191,11 +1191,24 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                 // ⛔ A UNION FIELD ONLY WHERE IT IS AN OPTIONAL, and this is
                 // measured rather than cautious. Narrowing an `int | str`
                 // field to `str` produces a value the ownership walk marks
-                // owned and the frame never acquired -- "owned_local_object
-                // marks a value this frame never acquired" -- which is a
-                // WORSE answer than the refusal it replaces. `T | None` is
-                // the shape the `is None` arm already narrows and the one
-                // this is measured clean on.
+                // owned and the frame never acquired, which is a WORSE answer
+                // than the refusal it replaces. `T | None` is the shape the
+                // `is None` arm already narrows and the one this is measured
+                // clean on.
+                //
+                // ⛔ RE-MEASURED 2026-09-07, after the borrowed-return retain
+                // fix (which is about exactly that phrase, "a value this frame
+                // never acquired"). Dropping the gate no longer produces that
+                // sentence -- it produces two worse ones. Of the eight
+                // programs in the `int | str` field matrix, three now DOUBLE
+                // FREE at run time ("Ly_DecRef observed non-positive
+                // refcount": `len(self.v)` inside the guard, `print(self.v)`,
+                // and the free-function spelling `if isinstance(b.v, str)`),
+                // and four are refused with "owned resource ... reaches
+                // function exit without release". A crash is further from
+                // "never silently mis-execute" than the refusal is, so the
+                // gate stays until the element token has an owner
+                // (rfc/memory-safety-proof.md, Aggregates).
                 bool optionalUnion =
                     memberAnalysis.kind == IsInstanceAnalysis::Kind::UnionTest &&
                     memberAnalysis.trueType &&
