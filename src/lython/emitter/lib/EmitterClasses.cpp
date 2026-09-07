@@ -379,12 +379,15 @@ void ModuleEmitter::checkDecorators(const parser::Node &node,
       // Only the SYNTAX was refused, so `@logged` was rejected while
       // `double = logged(double)` beside it compiled.
       //
-      // ⛔ Only a bare NAME. A decorator FACTORY (`@deco(arg)`) is
-      // `f = deco(arg)(f)`, one more call whose intermediate value is a
-      // function the compiler would have to see through; it keeps the refusal
-      // rather than getting a silent partial answer.
+      // ⭐ AND A DECORATOR FACTORY, `@deco(arg)`, which is `f = deco(arg)(f)`.
+      // The refusal here said the intermediate value is "a function the
+      // compiler would have to see through" -- and the hand-written spelling,
+      // `shown = tagged("v")(show)`, has compiled all along. What was missing
+      // was the desugaring in `declareModuleGlobals`, not the seeing.
       recognized = leaf == "native" || isTypingMarker(leaf) ||
-                   (decorator->kind == "Name" && moduleFunctionNames.count(leaf));
+                   ((decorator->kind == "Name" ||
+                     decorator->kind == "Call") &&
+                    moduleFunctionNames.count(leaf));
       break;
     case DecoratorRole::Class:
       recognized = leaf == "dataclass" || isTypingMarker(leaf);
@@ -4021,17 +4024,32 @@ void ModuleEmitter::applyFunctionDecorators(const parser::Node &statement) {
   // function -- `@times_ten @plus_one def triple` answered 60 for 70.
   bool innermost = true;
   for (const parser::NodePtr &decorator : llvm::reverse(*decorators)) {
-    if (!decorator || decorator->kind != "Name")
+    if (!decorator)
       continue;
-    llvm::StringRef spelling = ast::nameSpelling(*decorator);
-    if (!moduleFunctionNames.count(spelling))
+    // ⭐ AND `@deco(arg)` IS `f = deco(arg)(f)`. The factory's own call is the
+    // callee of the application, evaluated here rather than named: it is the
+    // hand-written `f = deco(arg)(f)` this compiler already runs, one AST
+    // shape away.
+    parser::NodePtr callee;
+    if (decorator->kind == "Name") {
+      llvm::StringRef spelling = ast::nameSpelling(*decorator);
+      if (!moduleFunctionNames.count(spelling))
+        continue;
+      callee = synth::name(spelling, statement.range);
+    } else if (decorator->kind == "Call") {
+      const parser::Node *factory = ast::node(*decorator, "func");
+      if (!factory || factory->kind != "Name" ||
+          !moduleFunctionNames.count(ast::nameSpelling(*factory)))
+        continue;
+      callee = decorator;
+    } else {
       continue;
+    }
     std::vector<parser::NodePtr> arguments;
     arguments.push_back(synth::name(*name, statement.range));
     parser::NodePtr applied = synth::assign(
         synth::name(*name, statement.range),
-        synth::call(synth::name(spelling, statement.range),
-                    std::move(arguments), statement.range),
+        synth::call(std::move(callee), std::move(arguments), statement.range),
         statement.range);
     {
       llvm::SaveAndRestore<std::string> subject(

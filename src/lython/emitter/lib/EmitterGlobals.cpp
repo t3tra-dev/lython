@@ -87,14 +87,28 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     parser::NodePtr applied = synth::name(*decorated, statement->range);
     bool rebinding = false;
     for (const parser::NodePtr &decorator : llvm::reverse(*decorators)) {
-      if (!decorator || decorator->kind != "Name" ||
-          !moduleFunctionNames.count(ast::nameSpelling(*decorator)))
+      if (!decorator)
+        continue;
+      // ⭐ AND A DECORATOR FACTORY, `@deco(arg)`, which is `f = deco(arg)(f)`.
+      // The refusal said the intermediate value is "a function the compiler
+      // would have to see through", and the hand-written spelling --
+      // `shown = tagged("v")(show)` -- has compiled all along, so what was
+      // missing was this desugaring and not the seeing.
+      parser::NodePtr callee;
+      if (decorator->kind == "Name" &&
+          moduleFunctionNames.count(ast::nameSpelling(*decorator)))
+        callee = synth::name(ast::nameSpelling(*decorator), statement->range);
+      else if (decorator->kind == "Call")
+        if (const parser::Node *factory = ast::node(*decorator, "func");
+            factory && factory->kind == "Name" &&
+            moduleFunctionNames.count(ast::nameSpelling(*factory)))
+          callee = decorator;
+      if (!callee)
         continue;
       std::vector<parser::NodePtr> arguments;
       arguments.push_back(applied);
-      applied = synth::call(
-          synth::name(ast::nameSpelling(*decorator), statement->range),
-          std::move(arguments), statement->range);
+      applied = synth::call(std::move(callee), std::move(arguments),
+                            statement->range);
       rebinding = true;
     }
     if (!rebinding)

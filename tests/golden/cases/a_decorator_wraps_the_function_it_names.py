@@ -7,9 +7,12 @@
 # plausible number; the stacked case pins the ORDER, which is the other thing
 # a lost capture gets wrong.
 #
-# ⛔ A decorator FACTORY (`@deco(arg)`) is still refused: it is one more call
-# whose intermediate value is a function, and a partial answer there would be
-# a wrong wrapper rather than a diagnostic.
+# ⭐ AND A DECORATOR FACTORY, `@deco(arg)`, which is `f = deco(arg)(f)`. The
+# refusal that stood here said the intermediate value is "a function the
+# compiler would have to see through" -- while `shown = tag("v")(show)`, the
+# hand-written spelling of the same three calls, compiled beside it. What was
+# missing was the desugaring, and the factory's own call is simply the callee
+# of the application.
 #
 # ⛔ THE DECORATED NAME IS A MODULE CELL, because that is what CPython makes
 # it: every later reference -- a recursion inside the function's own body,
@@ -82,3 +85,57 @@ def outer() -> int:
 
 print(outer())
 print([double(v) for v in [1, 2]])
+
+
+from typing import Callable
+
+
+def tag(t: str) -> "Callable[[Callable[[int], str]], Callable[[int], str]]":
+    def deco(fn: "Callable[[int], str]") -> "Callable[[int], str]":
+        def wrapper(n: int) -> str:
+            return t + fn(n)
+
+        return wrapper
+
+    return deco
+
+
+def scaled(k: int) -> "Callable[[Callable[[int], int]], Callable[[int], int]]":
+    def deco(fn: "Callable[[int], int]") -> "Callable[[int], int]":
+        def wrapper(n: int) -> int:
+            return fn(n) * k
+
+        return wrapper
+
+    return deco
+
+
+def bump(fn: "Callable[[int], int]") -> "Callable[[int], int]":
+    def wrapper(n: int) -> int:
+        return fn(n) + 1
+
+    return wrapper
+
+
+@tag("a")
+@tag("b")
+def label(n: int) -> str:
+    return str(n)
+
+
+# A factory under a plain decorator: the order is what a lost capture gets
+# wrong, and `bump` sees the SCALED function.
+@bump
+@scaled(3)
+def go(n: int) -> int:
+    return n
+
+
+@scaled(2)
+def fact(n: int) -> int:
+    if n <= 1:
+        return 1
+    return n * fact(n - 1)
+
+
+print(label(1), go(2), fact(4))
