@@ -22,6 +22,89 @@
 
 namespace lython::emitter {
 
+namespace {
+
+// What does anything this body RUNS assign to `<name>.<attr>`? Not a nested
+// def, lambda or class -- those do not run here.
+//
+// `values` collects the assigned expressions; `opaque` says one of them is not
+// an expression this scope can type. The caller asks because a callee that
+// writes the member the guard already proved changes nothing about the proof:
+// `bump(c)` with `x.v = 3` leaves `c.v` an int, and erasing the fact there
+// costs `c.v + 1` its narrowing for nothing.
+struct AttributeAssignments {
+  bool assigns = false;
+  bool opaque = false;
+  llvm::SmallVector<const parser::Node *, 2> values;
+};
+
+void collectAttributeAssignments(const parser::Node &node, llvm::StringRef name,
+                                 llvm::StringRef attr,
+                                 AttributeAssignments &found) {
+  if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+      node.kind == "Lambda" || node.kind == "ClassDef")
+    return;
+  auto namesTheField = [&](const parser::Node *target) {
+    if (!target || target->kind != "Attribute")
+      return false;
+    auto spelled = ast::string(*target, "attr");
+    if (!spelled || llvm::StringRef(*spelled) != attr)
+      return false;
+    const parser::Node *owner = ast::node(*target, "value");
+    return owner && owner->kind == "Name" &&
+           llvm::StringRef(ast::nameSpelling(*owner)) == name;
+  };
+  auto record = [&](const parser::Node &statement) {
+    found.assigns = true;
+    const parser::Node *value = ast::node(statement, "value");
+    if (!value)
+      found.opaque = true;
+    else
+      found.values.push_back(value);
+  };
+  if (const auto *list = ast::nodeList(node, "targets"))
+    for (const parser::NodePtr &target : *list)
+      if (namesTheField(target.get()))
+        record(node);
+  if (const parser::Node *single = ast::node(node, "target"))
+    if (namesTheField(single)) {
+      // An augmented assignment reads and writes; what it leaves is a function
+      // of what was there, which this walk does not have.
+      if (node.kind == "AugAssign") {
+        found.assigns = true;
+        found.opaque = true;
+      } else {
+        record(node);
+      }
+    }
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectAttributeAssignments(**child, name, attr, found);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectAttributeAssignments(*child, name, attr, found);
+  }
+}
+
+// The name the callee's parameter at `index` binds, or empty.
+llvm::StringRef parameterNameAt(const parser::Node &def, unsigned index) {
+  const parser::Node *args = ast::node(def, "args");
+  if (!args)
+    return {};
+  const auto *positional = ast::nodeList(*args, "args");
+  if (!positional || index >= positional->size() || !(*positional)[index])
+    return {};
+  auto spelled = ast::string(*(*positional)[index], "arg");
+  return spelled ? llvm::StringRef(*spelled) : llvm::StringRef();
+}
+
+} // namespace
+
 // The one place a proved fact becomes a narrower SSA value. `if`, the
 // conditional expression and the `while` body all reach it: each of them
 // used to be its own copy, and the loop had none at all.
@@ -37,6 +120,7 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
   if (narrowedMemberTypes.empty() && proved.empty())
     return;
   llvm::SmallVector<const parser::Node *, 4> targets;
+  llvm::SmallVector<const parser::Node *, 4> calls;
   // ⛔ INSIDE the statement, not only at its top. A compound statement runs its
   // own body, and an assignment in there changes the same field:
   //
@@ -62,6 +146,26 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
         targets.push_back(target.get());
     if (const parser::Node *single = ast::node(node, "target"))
       targets.push_back(single);
+    // ⭐ AND A CALL THAT WAS HANDED THE OBJECT ITSELF. `touch(c)` and
+    // `c.clear()` can both rebind `c.f`, so a proof about it does not survive
+    // them:
+    //
+    //     if c.f is not None:
+    //         touch(c)          # sets c.f = None
+    //         print(c.f)        # CPython prints None
+    //
+    // raised "attribute 'f' is None here, after a guard above proved it was
+    // not". The raise is sound -- the read is checked, which is what makes the
+    // proof safe to carry at all -- but the program CPython runs is not one
+    // that has to fail.
+    //
+    // ⛔ A BARE NAME AND NOTHING DEEPER, on both sides. `touch(c.left)` and
+    // `self.left.insert(v)` hand over the object the PATH names, and a method
+    // on that object can rebind ITS fields, not the field that names it -- so
+    // erasing `self.*` there would refuse `self.left.insert(v)` followed by
+    // any other read of `self.left`, which is how every tree walk is written.
+    if (node.kind == "Call")
+      calls.push_back(&node);
     for (const parser::Field &field : node.fields) {
       if (field.name == "targets" || field.name == "target")
         continue;
@@ -78,6 +182,39 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
     }
   };
   collectTargets(statement, collectTargets);
+  // ⭐ AND A CALL THAT WAS HANDED THE OBJECT ITSELF. `touch(c)` and `c.clear()`
+  // can both rebind `c.f`, so a proof about it does not survive one:
+  //
+  //     if c.f is not None:
+  //         touch(c)          # sets c.f = None
+  //         print(c.f)        # CPython prints None
+  //
+  // raised "attribute 'f' is None here, after a guard above proved it was
+  // not". The raise is sound -- the read is checked, which is what makes the
+  // proof safe to carry at all -- but the program CPython runs is not one that
+  // has to fail.
+  //
+  // ⛔ ONLY WHAT THE CALLEE IS SEEN TO ASSIGN, not every call that touches the
+  // object. Erasing on any call was measured first and costs more than it
+  // buys: `log(c); print(c.f + 1)` -- a call that assigns nothing -- then reads
+  // the union and is REFUSED, and that shape is far commoner than the mutator.
+  // An unresolved callee keeps the proof, and the checked read is what makes
+  // that safe.
+  for (const parser::Node *call : calls) {
+    llvm::SmallVector<std::string, 4> dead;
+    for (const auto &entry : narrowedMemberTypes) {
+      llvm::StringRef path = entry.getKey();
+      auto dot = path.find('.');
+      if (dot == llvm::StringRef::npos)
+        continue;
+      if (callAssignsMemberPath(*call, path.take_front(dot),
+                                path.drop_front(dot + 1), /*depth=*/3,
+                                /*allowMethods=*/true, entry.second))
+        dead.push_back(path.str());
+    }
+    for (const std::string &path : dead)
+      narrowedMemberTypes.erase(path);
+  }
   for (const parser::Node *target : targets) {
     if (!target)
       continue;
@@ -99,6 +236,154 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
         narrowedMemberTypes.erase(std::string(ast::nameSpelling(*owner)) + "." +
                                   std::string(*attr));
   }
+}
+
+const parser::Node *ModuleEmitter::moduleFunctionDef(llvm::StringRef name) {
+  if (!moduleFunctionDefsBuilt) {
+    moduleFunctionDefsBuilt = true;
+    if (const auto *body = ast::nodeList(moduleNode, "body"))
+      for (const parser::NodePtr &statement : *body)
+        if (statement && (statement->kind == "FunctionDef" ||
+                          statement->kind == "AsyncFunctionDef"))
+          if (auto spelled = ast::string(*statement, "name"))
+            moduleFunctionDefs[llvm::StringRef(*spelled)] = statement.get();
+  }
+  auto found = moduleFunctionDefs.find(name);
+  return found == moduleFunctionDefs.end() ? nullptr : found->second;
+}
+
+bool ModuleEmitter::defAssignsThroughParam(const parser::Node &def,
+                                           llvm::StringRef param,
+                                           llvm::StringRef attr,
+                                           unsigned depth, mlir::Type proved) {
+  const auto *body = ast::nodeList(def, "body");
+  if (!body)
+    return false;
+  AttributeAssignments found;
+  for (const parser::NodePtr &statement : *body)
+    if (statement)
+      collectAttributeAssignments(*statement, param, attr, found);
+  if (found.assigns) {
+    // ⭐ WHAT IT WRITES, NOT THAT IT WRITES. A callee that stores the member
+    // the guard proved leaves the proof true, and it is the common shape: a
+    // setter takes an `int | None` field to an int. Only a write this scope
+    // cannot type, or one of a different member, costs the fact.
+    //
+    // ⛔ The value is typed in the CALLER's scope, so only an expression whose
+    // type does not depend on one answers -- a literal. Anything else is
+    // opaque, which erases, which is what the fact meant before this walk
+    // existed.
+    if (found.opaque || !proved)
+      return true;
+    for (const parser::Node *value : found.values) {
+      if (!value || value->kind != "Constant")
+        return true;
+      mlir::Type written = types.widenLiteral(types.inferExpr(value));
+      if (!written || written != proved)
+        return true;
+    }
+  }
+  if (depth == 0)
+    return false;
+  // ⛔ ONE HOP, AND ONLY THROUGH A NAMED FUNCTION. A method call inside the
+  // callee would have to be resolved against a receiver type this scope's
+  // symbol table does not describe -- `types` is the CALLER's -- and a wrong
+  // class there answers about the wrong body.
+  bool forwards = false;
+  auto walk = [&](const parser::Node &node, auto &&recurse) -> void {
+    if (forwards || node.kind == "FunctionDef" ||
+        node.kind == "AsyncFunctionDef" || node.kind == "Lambda" ||
+        node.kind == "ClassDef")
+      return;
+    if (node.kind == "Call" &&
+        callAssignsMemberPath(node, param, attr, depth - 1,
+                              /*allowMethods=*/false, proved)) {
+      forwards = true;
+      return;
+    }
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, recurse);
+    }
+  };
+  for (const parser::NodePtr &statement : *body)
+    if (statement)
+      walk(*statement, walk);
+  return forwards;
+}
+
+bool ModuleEmitter::callAssignsMemberPath(const parser::Node &call,
+                                          llvm::StringRef root,
+                                          llvm::StringRef attr, unsigned depth,
+                                          bool allowMethods, mlir::Type proved) {
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee)
+    return false;
+  if (callee->kind == "Attribute") {
+    if (!allowMethods)
+      return false;
+    const parser::Node *receiver = ast::node(*callee, "value");
+    if (!receiver || receiver->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*receiver)) != root)
+      return false;
+    auto method = ast::string(*callee, "attr");
+    if (!method)
+      return false;
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(receiver)));
+    if (!contract)
+      return false;
+    std::optional<MethodBinding> binding =
+        resolveMroMethod(contract.getContractName(), llvm::StringRef(*method),
+                         "");
+    if (!binding || !binding->method)
+      return false;
+    llvm::StringRef self = parameterNameAt(*binding->method, 0);
+    if (self.empty())
+      return false;
+    return defAssignsThroughParam(*binding->method, self, attr, depth,
+                                  proved);
+  }
+  if (callee->kind != "Name")
+    return false;
+  const parser::Node *def =
+      moduleFunctionDef(llvm::StringRef(ast::nameSpelling(*callee)));
+  if (!def)
+    return false;
+  const auto *args = ast::nodeList(call, "args");
+  if (args)
+    for (auto [index, arg] : llvm::enumerate(*args)) {
+      if (!arg || arg->kind != "Name" ||
+          llvm::StringRef(ast::nameSpelling(*arg)) != root)
+        continue;
+      llvm::StringRef param =
+          parameterNameAt(*def, static_cast<unsigned>(index));
+      if (!param.empty() &&
+          defAssignsThroughParam(*def, param, attr, depth, proved))
+        return true;
+    }
+  if (const auto *keywords = ast::nodeList(call, "keywords"))
+    for (const parser::NodePtr &keyword : *keywords) {
+      if (!keyword)
+        continue;
+      const parser::Node *value = ast::node(*keyword, "value");
+      auto name = ast::string(*keyword, "arg");
+      if (!value || value->kind != "Name" || !name ||
+          llvm::StringRef(ast::nameSpelling(*value)) != root)
+        continue;
+      if (defAssignsThroughParam(*def, llvm::StringRef(*name), attr, depth,
+                                 proved))
+        return true;
+    }
+  return false;
 }
 
 void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,

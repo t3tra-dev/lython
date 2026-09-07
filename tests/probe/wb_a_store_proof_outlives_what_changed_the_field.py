@@ -1,39 +1,35 @@
-# WHAT: a store proves what it wrote, and that proof is spent at the READ with
-# a check -- so a program that CHANGES the field in between raises where CPython
-# just answers. Same deviation the guard form has had
-# (wb_a_field_read_after_a_call_that_changed_it), reached from an assignment
-# instead of a test, and the message says "a guard or an assignment" for that
-# reason.
+# WHAT IS LEFT: a store proves what it wrote, and that proof is spent at the
+# READ with a check -- so a program that changes the field through ANOTHER NAME
+# for the same object raises where CPython just answers.
 #
-# MEASURED 2026-09-07. The two shapes that reach it, and the ones that do not:
+#   a = Box(); b = a
+#   a.f = 5
+#   b.f = None
+#   print(a.f is None)      # CPython True; here AttributeError
 #
-#   self.f = 5; self.clear(); self.f is None ......... raises (this file)
+# MEASURED 2026-09-08. The shapes that reach it and the ones that no longer do:
+#
 #   a.f = 5; b.f = None; a.f is None   (b is a) ...... raises (this file)
-#   c.f = 5; for ...: c.f = None; c.f is None ....... CORRECT -- the walk that
-#                                                     erases a fact now looks
-#                                                     INSIDE a compound
-#                                                     statement, which fixed
-#                                                     the guard form too
-#   self.f = 5; self.note("x"); self.f + 1 .......... correct (the call does
-#                                                     not change the field)
-#   guard, then a call, then a read ................. correct
+#   self.f = 5; self.clear(); self.f is None ......... CORRECT since the walk
+#                                                      that erases a fact asks
+#                                                      what the CALLEE assigns
+#   c.f = 5; for ...: c.f = None; c.f is None ....... correct
+#   self.f = 5; self.note("x"); self.f + 1 .......... correct -- the callee
+#                                                      assigns nothing
+#   guard, then a mutating call, then a read ........ correct
 #
-# ⛔ Erasing the fact at any CALL naming the root was measured and rejected: it
-# would refuse `if self.v is not None: self.note("a"); return self.v.upper()`,
-# which compiles and runs today. The deviation is the project's chosen answer
-# for a proof about the past -- loud, never a wrong value -- and this is the
-# same answer one statement earlier.
+# ⭐ WHY THE ALIAS IS THE HARD ONE. Every fact is keyed on a dotted PATH, and
+# `b.f` is a different path from `a.f` however the two names came to share an
+# object. Closing it needs an alias relation between local names, which nothing
+# in the emitter has -- and the deviation is loud (a raise, never a wrong
+# value), which is the project's chosen answer for a proof about the past.
 class Box:
     def __init__(self) -> None:
         self.f: "int | None" = None
 
-    def clear(self) -> None:
-        self.f = None
 
-    def set_then_clear(self) -> str:
-        self.f = 5
-        self.clear()
-        return "none" if self.f is None else "value"
-
-
-print(Box().set_then_clear())
+a = Box()
+b = a
+a.f = 5
+b.f = None
+print(a.f is None)

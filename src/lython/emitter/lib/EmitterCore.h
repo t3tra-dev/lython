@@ -1407,6 +1407,20 @@ private:
   llvm::StringMap<mlir::Type> narrowedMemberTypes;
   bool suppressMemberNarrowing = false;
   void invalidateMemberNarrowings(const parser::Node &statement);
+  // Can this call assign `<root>.<attr>`? Only what the callee's own body --
+  // and, one hop on, a function it hands the same value to -- is SEEN to
+  // assign counts. A callee this cannot resolve answers no, which leaves the
+  // proof standing and the read CHECKED: the sound answer either way, and the
+  // one that does not refuse a program because the compiler lost the callee.
+  bool callAssignsMemberPath(const parser::Node &call, llvm::StringRef root,
+                             llvm::StringRef attr, unsigned depth,
+                             bool allowMethods, mlir::Type proved);
+  bool defAssignsThroughParam(const parser::Node &def, llvm::StringRef param,
+                              llvm::StringRef attr, unsigned depth,
+                              mlir::Type proved);
+  const parser::Node *moduleFunctionDef(llvm::StringRef name);
+  llvm::StringMap<const parser::Node *> moduleFunctionDefs;
+  bool moduleFunctionDefsBuilt = false;
   // ⭐ WHAT A STORE PROVES. `self.f = 5` on a `int | None` field proves the
   // field is an int on every path below it, which is the same kind of fact a
   // guard proves and is spent the same way -- at the READ, with a check. The
