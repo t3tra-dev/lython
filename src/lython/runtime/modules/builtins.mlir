@@ -28,10 +28,14 @@
 //     withholds splits from the right, which the left-to-right walk cannot
 //     produce. The cap rides the whitespace overload as a bare int, so
 //     `split(1)` -- a TypeError in CPython, which reads the int as the
-//     separator -- is accepted here. str/bytes `.join` accepts
-//     list/tuple operands (no arbitrary-iterable protocol dispatch yet).
+//     separator -- is accepted here.
 //   - str.translate / str.maketrans are absent until the hash-based dict
 //     rework lands (they need int-keyed runtime dicts).
+//   - The set operations that CPython spells over any iterable
+//     (`update`, `union`, `difference_update`, ...) declare `set` operands
+//     here, so `s.update(["b"])` and `s.union("bc")` are refused by name
+//     ("has manifest method 'update' but no signature that accepts
+//     (builtins.list)"); `s.update(set(xs))` is the spelling that works.
 //   - bytes.decode accepts only utf-8/strict and validates the arguments
 //     eagerly (CPython's codec lookup is lazy); unknown encodings raise
 //     LookupError up front.

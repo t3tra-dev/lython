@@ -6,6 +6,12 @@
 # iterators failed one phase later, in the lowering, for the same reason:
 # a manifest method cannot take a synthesized generator.
 #
+# A `str` argument is the same rewrite and was the one iterable that did not
+# get it: `set`, `frozenset`, a generator, `map`, `filter` and a dict view all
+# materialize, but a str named the RECEIVER's own contract, which the rewrite
+# reads as a peer container (`s.update(other_set)`), so `"-".join(s)` reached
+# the ABI as "cannot adapt builtins.str to runtime input 2".
+#
 # The lazy spellings all belong to NAME callees (the reducers fuse a
 # generator expression into an accumulator loop, the container constructors
 # into their build loop, a for-loop iterable into nested loops), and those
@@ -19,6 +25,13 @@ def main() -> None:
     print(" ".join(map(str, xs)))
     print(" ".join(reversed(words)))
     print(",".join(filter(lambda w: w > "ab", words)))
+    print("-".join("abc"))
+    text = "xyz"
+    print("".join(text), ",".join(text))
+    print("-".join(text[1:]))
+    letters: list[str] = ["p", "q"]
+    letters.extend("rs")
+    print(letters)
     grown = [0]
     grown.extend(v * 2 for v in xs)
     grown.extend(reversed(xs))

@@ -1647,6 +1647,16 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                   // is the shape the runtime does implement directly
                   // (`s.update(other_set)`, `xs.extend(other_list)`).
                   // Materializing those would take a working call and break it.
+                  //
+                  // ⛔ That exception is keyed on the contract NAME, which says
+                  // "peer container" for every contract but one: `str` is the
+                  // only one that iterates to ITSELF, so `"-".join(s)` read as
+                  // a peer and skipped the materialization that `set`,
+                  // `frozenset`, a generator, `map`, `filter` and a dict view
+                  // all get -- and reached the ABI as "cannot adapt builtins.str
+                  // to runtime input 2 of builtins.str.join". A self-iterating
+                  // argument is a sequence OF the receiver's contract, not one
+                  // of it, so the exception does not apply to it.
                   bool wantsList = false;
                   if (!generator && index < declaredTypes.size() &&
                       actual.getContractName() != "builtins.list")
@@ -1655,10 +1665,14 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                       auto receiverContract =
                           mlir::dyn_cast_if_present<py::ContractType>(
                               types.widenLiteral(receiver.type));
+                      mlir::Type element =
+                          types.iterationElementType(argument.get());
+                      bool selfIterating =
+                          element == mlir::Type(actual) ||
+                          types.widenLiteral(element) == mlir::Type(actual);
                       wantsList =
-                          declared.getProtocolName() == "Iterable" &&
-                          types.iterationElementType(argument.get()) &&
-                          (!receiverContract ||
+                          declared.getProtocolName() == "Iterable" && element &&
+                          (!receiverContract || selfIterating ||
                            receiverContract.getContractName() !=
                                actual.getContractName());
                     }
