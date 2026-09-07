@@ -1727,6 +1727,43 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
       values[local.name] = Value{postTestValues[index], local.type};
       types.bindSymbol(local.name, local.type);
     }
+    // ⭐ THE EXIT EDGE CARRIES THE TEST'S NEGATIVE FACT, exactly as an `if`'s
+    // fall-through does: the loop leaves when the test is FALSE, so after
+    //
+    //     while isinstance(v, int):
+    //         v = "done"
+    //
+    // `v` is a str, and `return v` from a `-> str` function was refused for
+    // handing back the whole union ("cannot adapt !py.union<...> return value
+    // to callable return ABI 0"). The `if` spelling of the same narrowing has
+    // always worked, which is what made this look like a union defect rather
+    // than a loop one.
+    //
+    // ⛔ Only when the after-block's ONE predecessor is that edge. A `break`
+    // leaves with the test still true and an `else` puts a block in between,
+    // and `afterForwardsCarried` is exactly "one of those is present" -- both
+    // still refuse the spelling above, which is a refusal and not a wrong
+    // answer.
+    //
+    // ⛔ MEMBER-PATH facts are NOT applied here, for the reason `emitIf`
+    // restores `narrowedMemberTypes` around its branches: past the statement
+    // the field is re-read with no guard in sight, and a proof left standing
+    // there makes the next read check a fact no test established.
+    //
+    // ⛔ AND NOT A NARROWING TO `None`, which is the negative of
+    // `while cur is not None`. It is TRUE -- the name is None after that loop
+    // -- but the code after it is still written as `m.v if m is not None else
+    // -1`, and a name typed `literal<None>` has no schema for the `.v` in the
+    // arm that cannot run ("attr.get object type has no class schema",
+    // golden.cases.the_walked_name_is_still_there_after_the_loop). The union
+    // is what lets the dead arm keep type-checking, which is the same reason
+    // `applyBranchNarrowing` drops a None proof for a member path.
+    if (test)
+      for (const BranchTypeNarrowing &fact :
+           branchTypeNarrowings(*test, types, module))
+        if (!fact.isMemberPath && fact.falseType &&
+            fact.falseType != types.none())
+          applyBranchNarrowing(statement, fact, /*conditionIsTrue=*/false);
   }
 }
 
