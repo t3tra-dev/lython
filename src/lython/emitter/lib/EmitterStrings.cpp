@@ -413,6 +413,8 @@ Value ModuleEmitter::emitFormattedValue(const parser::Node &expr) {
         "malformed f-string interpolation"});
     return emitNone(expr);
   }
+  if (rendersAClass(*valueNode))
+    return *refuseClassRendering(expr, "an f-string");
   int64_t conversion = ast::integer(expr, "conversion").value_or(-1);
   const parser::Node *specNode = ast::node(expr, "format_spec");
 

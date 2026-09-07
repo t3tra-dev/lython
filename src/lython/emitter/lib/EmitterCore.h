@@ -774,6 +774,9 @@ private:
                                       const parser::Node *calleeNode);
   Value emitFloatFromInt(const parser::Node &anchor, Value argument);
   Value emitIntFromBool(const parser::Node &anchor, Value argument);
+  bool rendersAClass(const parser::Node &argument);
+  std::optional<Value> refuseClassRendering(const parser::Node &expr,
+                                            llvm::StringRef spelling);
   std::optional<Value> tryEmitStrCall(const parser::Node &expr,
                                       const parser::Node *calleeNode);
   std::optional<Value>

@@ -1076,6 +1076,31 @@ TEST(EmitterTest, TheReadsThatUsedToFailInTheLowering) {
   EXPECT_TRUE(saidClass);
 }
 
+TEST(EmitterTest, EveryWayToRenderAClassSaysTheSameThing) {
+  // A type object has no runtime value here, and the four spellings that ask
+  // for its text used to answer with four different sentences: print() said
+  // so, str() said "unresolved name 'repr'" (the callee, for a problem in the
+  // argument), str(type(x)) reached the lowering as "runtime method receiver
+  // has no concrete contract", and an f-string said a static type with no
+  // spelling in it does not provide '__format__'.
+  for (const char *source : {"print(int)\n", "print(type([1]))\n",
+                             "print(str(int))\n", "print(repr(int))\n",
+                             "xs = [1]\nprint(str(type(xs)))\n",
+                             "print(f\"{int}\")\n",
+                             "xs = [1]\nprint(f\"{type(xs)}\")\n",
+                             "class A:\n    pass\n\n\nprint(str(A))\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult result = emitSource(source, context);
+    EXPECT_FALSE(result.ok()) << source;
+    bool saidClass = false;
+    for (const lython::parser::Diagnostic &diagnostic : result.diagnostics)
+      saidClass = saidClass ||
+                  diagnostic.message.find("cannot render a class") !=
+                      std::string::npos;
+    EXPECT_TRUE(saidClass) << source;
+  }
+}
+
 TEST(EmitterTest, AModuleLevelLambdaCannotFreezeAReboundName) {
   // A module name bound more than once gets no cell, so a lambda that reads
   // it would carry the value it had when the lambda was built. The def

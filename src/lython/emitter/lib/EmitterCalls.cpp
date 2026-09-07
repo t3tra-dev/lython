@@ -4056,6 +4056,38 @@ ModuleEmitter::tryEmitPowCall(const parser::Node &expr,
   return emitBinary(*rewritten);
 }
 
+// ⛔ The two SPELLINGS and not only the inferred type: `type(x)` is folded by
+// the emitter and the inference walk does not model the fold, so it answers
+// `object` for the very expression this is about.
+bool ModuleEmitter::rendersAClass(const parser::Node &argument) {
+  if (mlir::isa_and_nonnull<py::TypeType>(
+          types.widenLiteral(types.inferExpr(&argument))))
+    return true;
+  if (argument.kind == "Call")
+    return callsUnshadowedBuiltin(ast::node(argument, "func"), "type");
+  return argument.kind == "Attribute" &&
+         ast::string(argument, "attr") == "__class__";
+}
+
+// ⛔ ONE MESSAGE FOR THE FOUR SPELLINGS of the same question. `print(int)` said
+// this; `str(int)` rerouted to the repr path and said "unresolved name 'repr'",
+// naming the CALLEE for a problem in the argument; `str(type(xs))` reached the
+// lowering as "runtime method receiver has no concrete contract"; and
+// `f"{type(xs)}"` said a static type with no spelling in it does not provide
+// '__format__'. The refusal is the same one in every case, so it is written
+// once and says which spelling asked.
+std::optional<Value>
+ModuleEmitter::refuseClassRendering(const parser::Node &expr,
+                                    llvm::StringRef spelling) {
+  diagnostics.push_back(parser::Diagnostic{
+      parser::Severity::Error, expr.range.start,
+      spelling.str() +
+          " cannot render a class: a type object is compile-time "
+          "evidence here and has no runtime value, so write "
+          "`type(x).__name__` for the name"});
+  return emitNone(expr);
+}
+
 std::optional<Value>
 ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
                               const parser::Node *calleeNode) {
@@ -4065,6 +4097,9 @@ ModuleEmitter::tryEmitStrCall(const parser::Node &expr,
     return std::nullopt;
   const auto *strArgs = ast::nodeList(expr, "args");
   const auto *strKeywords = ast::nodeList(expr, "keywords");
+  if (strArgs && strArgs->size() == 1 && strArgs->front() &&
+      strArgs->front()->kind != "Starred" && rendersAClass(*strArgs->front()))
+    return refuseClassRendering(expr, "str()");
   auto strClass = types.lookupClass("str");
   std::optional<llvm::StringRef> strSymbol =
       strClass ? contractName(*strClass) : std::nullopt;
@@ -4328,26 +4363,11 @@ ModuleEmitter::tryEmitPrintCall(const parser::Node &expr,
   // ⛔ The two SPELLINGS and not only the inferred type: `type(x)` is folded by
   // the emitter and the inference walk does not model the fold, so it answers
   // `object` for the very expression this is about.
-  auto rendersAClass = [&](const parser::Node &argument) {
-    if (mlir::isa_and_nonnull<py::TypeType>(
-            types.widenLiteral(types.inferExpr(&argument))))
-      return true;
-    if (argument.kind == "Call")
-      return callsUnshadowedBuiltin(ast::node(argument, "func"), "type");
-    return argument.kind == "Attribute" &&
-           ast::string(argument, "attr") == "__class__";
-  };
   if (printArgs)
     for (const parser::NodePtr &argument : *printArgs)
       if (argument && argument->kind != "Starred" &&
-          rendersAClass(*argument)) {
-        diagnostics.push_back(parser::Diagnostic{
-            parser::Severity::Error, expr.range.start,
-            "print() cannot render a class: a type object is compile-time "
-            "evidence here and has no runtime value, so write "
-            "`type(x).__name__` for the name"});
-        return emitNone(expr);
-      }
+          rendersAClass(*argument))
+        return refuseClassRendering(expr, "print()");
   bool singleUnionArgument =
       printArgs && printArgs->size() == 1 && printArgs->front() &&
       printArgs->front()->kind != "Starred" &&
@@ -5593,6 +5613,9 @@ ModuleEmitter::tryEmitReprCall(const parser::Node &expr,
   bool hasKeywords = keywords && !keywords->empty();
   if (builtinVisible && args && args->size() == 1 && !hasKeywords &&
       (name == "repr" || name == "print")) {
+    if (args->front() && args->front()->kind != "Starred" &&
+        rendersAClass(*args->front()))
+      return *refuseClassRendering(expr, name.str() + "()");
     // Widen literals to their contract (`repr(5)` sees `builtins.int`, not
     // `literal<5>`) so the manifest `__repr__` resolves.
     //
