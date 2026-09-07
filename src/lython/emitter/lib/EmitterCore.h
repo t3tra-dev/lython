@@ -1485,6 +1485,18 @@ private:
                               const FunctionSignature &signature,
                               llvm::SmallVectorImpl<Capture> &captures);
   unsigned syntheticFunctionCounter = 0;
+  // The closed mutually-recursive nested-def group of the body being emitted
+  // (`closedMutualNestedDefs`), keyed by source name: the symbol assigned to
+  // each member BEFORE any of their bodies is emitted, so a member can reach
+  // its siblings the way it already reaches itself -- by symbol, with no
+  // captures and therefore no reference cycle. Empty for every other body.
+  struct ClosedSibling {
+    std::string symbol;
+    const parser::Node *node = nullptr;
+  };
+  llvm::StringMap<ClosedSibling> closedSiblingGroup;
+  std::string nestedFunctionSymbolName(llvm::StringRef name,
+                                       const parser::Node &function);
   unsigned listCompCounter = 0;
   // Cell classes are synthesized once per (widened) content type.
   llvm::DenseMap<mlir::Type, mlir::Type> cellClassContracts;

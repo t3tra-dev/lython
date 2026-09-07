@@ -450,6 +450,54 @@ llvm::StringSet<> namesBoundAfterNestedReader(const parser::Node &callable) {
   return forward;
 }
 
+llvm::StringSet<> closedMutualNestedDefs(const parser::Node &callable) {
+  const auto *body = ast::nodeList(callable, "body");
+  llvm::StringSet<> group;
+  if (!body)
+    return group;
+  // Only the defs the body declares DIRECTLY: a def nested one level deeper is
+  // reached through its own enclosing def, whose captures this walk already
+  // sees.
+  llvm::StringMap<const parser::Node *> siblings;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "FunctionDef")
+      continue;
+    if (auto name = ast::string(*statement, "name"))
+      siblings.try_emplace(*name, statement.get());
+  }
+  if (siblings.size() < 2)
+    return group;
+  llvm::StringSet<> enclosingNames;
+  collectFunctionLocalNames(callable, enclosingNames);
+  // ⛔ Against the ENCLOSING scope's names and not against "anything the walk
+  // reports": a member may read a module global or a builtin freely -- those
+  // resolve by symbol and are not captures. What disqualifies the group is a
+  // name the enclosing FRAME owns.
+  auto capturesOutside = [&](const parser::Node &def) {
+    for (const std::string &capture : lexicalCaptureNames(def)) {
+      llvm::StringRef name(capture);
+      if (siblings.count(name))
+        continue;
+      if (enclosingNames.contains(name))
+        return true;
+    }
+    return false;
+  };
+  bool referencesASibling = false;
+  for (const auto &entry : siblings) {
+    if (capturesOutside(*entry.second))
+      return llvm::StringSet<>();
+    for (const std::string &capture : lexicalCaptureNames(*entry.second))
+      if (siblings.count(llvm::StringRef(capture)))
+        referencesASibling = true;
+  }
+  if (!referencesASibling)
+    return group;
+  for (const auto &entry : siblings)
+    group.insert(entry.getKey());
+  return group;
+}
+
 llvm::StringSet<> singleAssignmentNames(const parser::Node &scope) {
   llvm::StringMap<unsigned> counts;
   countNameAssignments(ast::nodeList(scope, "body"), counts);

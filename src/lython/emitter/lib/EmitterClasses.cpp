@@ -4853,6 +4853,30 @@ Value ModuleEmitter::emitInlineMethodBody(
     // ⛔ Here and not beside the `currentBoxedLocals` promotion above: the
     // cells are ops, and the parameter binding between the two is what puts
     // the builder inside the region they belong to.
+    //
+    // ⛔ AND THE CLOSED SIBLING GROUP TOO, for the same reason the cells are
+    // here: a method reached by INLINING does not go through
+    // emitCallableFunction, so a mutually recursive pair declared in one kept
+    // its cell -- and its reference cycle -- while the same pair in a free
+    // function stopped leaking. The two call sites have to agree.
+    llvm::StringMap<ClosedSibling> enclosingSiblings =
+        std::move(closedSiblingGroup);
+    closedSiblingGroup.clear();
+    auto restoreSiblings = llvm::make_scope_exit(
+        [&] { closedSiblingGroup = std::move(enclosingSiblings); });
+    llvm::StringSet<> members = closedMutualNestedDefs(*method.method);
+    if (!members.empty())
+      if (const auto *groupBody = ast::nodeList(*method.method, "body"))
+        for (const parser::NodePtr &statement : *groupBody) {
+          if (!statement || statement->kind != "FunctionDef")
+            continue;
+          auto memberName = ast::string(*statement, "name");
+          if (!memberName || !members.contains(*memberName))
+            continue;
+          closedSiblingGroup[*memberName] = ClosedSibling{
+              nestedFunctionSymbolName(*memberName, *statement),
+              statement.get()};
+        }
     emitForwardBoundCells(*method.method);
     emitStatements(body);
   }

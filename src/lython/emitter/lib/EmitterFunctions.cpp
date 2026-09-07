@@ -754,6 +754,57 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
   // both of which CPython collects with a cycle GC this compiler does not
   // have. Refusing the program is not the smaller cost: it compiled to
   // "unresolved name" and nothing ran at all.
+  // ⭐ A CLOSED MUTUAL GROUP IS REACHED BY SYMBOL, not through a cell. Members
+  // of `closedMutualNestedDefs` capture nothing outside the group, so each one
+  // can be named the way a nested def already names ITSELF -- a binding
+  // reference with no closure arguments. That is what breaks the cycle the
+  // cell otherwise makes (cell -> function object -> closure store -> cell),
+  // which this runtime cannot collect and which leaked 400 B per call of the
+  // enclosing function.
+  //
+  // ⛔ The symbols are assigned for the WHOLE group before any member's body
+  // is emitted, which is the only ordering that works: the pair is circular,
+  // so whichever body goes first has to name a symbol that does not exist yet.
+  // Declaring then defining is the same split the sibling-subclass dispatch
+  // needed, for the same reason.
+  llvm::StringMap<ClosedSibling> enclosingSiblings =
+      std::move(closedSiblingGroup);
+  closedSiblingGroup.clear();
+  auto restoreSiblings = llvm::make_scope_exit(
+      [&] { closedSiblingGroup = std::move(enclosingSiblings); });
+  if (!isLambda)
+    if (auto memberName = ast::string(callable, "name");
+        memberName && enclosingSiblings.count(*memberName))
+      for (const auto &entry : enclosingSiblings) {
+        if (entry.getKey() == llvm::StringRef(*memberName) || !entry.second.node)
+          continue;
+        FunctionSignature siblingSig =
+            types.functionSignature(*entry.second.node);
+        mlir::Type siblingType = siblingSig.isGeneratorFunction ||
+                                         siblingSig.isAsyncGeneratorFunction
+                                     ? siblingSig.publicCallable
+                                     : siblingSig.callable;
+        if (!siblingType)
+          continue;
+        values[entry.getKey()] =
+            emitBindingRef(callable, entry.second.symbol, siblingType, {});
+        types.bindSymbol(entry.getKey(), siblingType);
+      }
+  if (!isLambda) {
+    llvm::StringSet<> members = closedMutualNestedDefs(callable);
+    if (!members.empty())
+      if (const auto *groupBody = ast::nodeList(callable, "body"))
+        for (const parser::NodePtr &statement : *groupBody) {
+          if (!statement || statement->kind != "FunctionDef")
+            continue;
+          auto memberName = ast::string(*statement, "name");
+          if (!memberName || !members.contains(*memberName))
+            continue;
+          closedSiblingGroup[*memberName] = ClosedSibling{
+              nestedFunctionSymbolName(*memberName, *statement),
+              statement.get()};
+        }
+  }
   if (!isLambda)
     emitForwardBoundCells(callable);
   if (preboundTypeObjectName && preboundTypeObject) {
@@ -981,6 +1032,10 @@ void ModuleEmitter::emitForwardBoundCells(const parser::Node &callable) {
     llvm::StringRef name = forward.getKey();
     if (values.count(name))
       continue;
+    // A member of the closed group needs no cell: its siblings name it by
+    // symbol, which is what keeps it out of their closure stores.
+    if (closedSiblingGroup.count(name))
+      continue;
     mlir::Type content = inferConditionalLocalType({body}, name);
     // The storability rule the conditional slots end with: a slot for an
     // erased type accepts every write and refuses every read.
@@ -994,6 +1049,18 @@ void ModuleEmitter::emitForwardBoundCells(const parser::Node &callable) {
   }
 }
 
+std::string
+ModuleEmitter::nestedFunctionSymbolName(llvm::StringRef name,
+                                        const parser::Node &function) {
+  return (llvm::Twine(currentFunctionPrefix.empty() ? "__main__"
+                                                    : currentFunctionPrefix) +
+          "$" + sanitizedSymbolPart(name) + "$" +
+          llvm::Twine(++syntheticFunctionCounter) + "$" +
+          llvm::Twine(function.range.start.line) + "_" +
+          llvm::Twine(function.range.start.column))
+      .str();
+}
+
 Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
   auto name = ast::string(function, "name");
   if (!name)
@@ -1002,6 +1069,13 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
 
   llvm::SmallVector<Capture, 4> captures;
   for (const std::string &captureName : lexicalCaptureNames(function)) {
+    // ⛔ A SIBLING OF A CLOSED GROUP IS NOT A CAPTURE. Its name is bound by
+    // symbol inside every member's body, so capturing it here would put the
+    // function object back in the closure store -- which is the cycle this
+    // group exists to avoid. The name is in `values` by now for whichever
+    // sibling's def statement has already run.
+    if (closedSiblingGroup.count(captureName))
+      continue;
     auto found = values.find(captureName);
     if (found != values.end())
       captures.push_back(Capture{captureName, found->second});
@@ -1011,14 +1085,13 @@ Value ModuleEmitter::emitNestedFunctionDecl(const parser::Node &function) {
 
   evaluateNestedDefaults(function, sig, captures);
 
+  // A group member's symbol was assigned before any member's body was
+  // emitted, so a sibling reading it already named THIS symbol.
+  auto assigned = closedSiblingGroup.find(*name);
   std::string symbolName =
-      (llvm::Twine(currentFunctionPrefix.empty() ? "__main__"
-                                                 : currentFunctionPrefix) +
-       "$" + sanitizedSymbolPart(*name) + "$" +
-       llvm::Twine(++syntheticFunctionCounter) + "$" +
-       llvm::Twine(function.range.start.line) + "_" +
-       llvm::Twine(function.range.start.column))
-          .str();
+      assigned != closedSiblingGroup.end() && assigned->second.node == &function
+          ? assigned->second.symbol
+          : nestedFunctionSymbolName(*name, function);
   if (diagnoseUnsupportedGeneratorFunction(diagnostics, function, sig))
     return emitNone(function);
   emitCallableFunction(function, symbolName, sig, captures, /*isLambda=*/false);

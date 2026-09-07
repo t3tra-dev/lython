@@ -32,6 +32,18 @@ llvm::StringSet<> nonlocalBoxedNames(const parser::Node &callable);
 // which is what CPython's frame gives every closed-over name.
 llvm::StringSet<> namesBoundAfterNestedReader(const parser::Node &callable);
 
+// The direct nested defs of `callable` that reference EACH OTHER and capture
+// nothing else -- no parameter and no other local of the enclosing scope. Such
+// a group needs no closure at all: each member can be reached by SYMBOL, the
+// way a nested def already reaches itself. Returns the members' names, empty
+// when at least one of them captures something outside the group.
+//
+// The point is the reference CYCLE: the enclosing frame's cell holds one
+// function object, whose closure store holds the other, whose store holds the
+// cell, and this runtime has no cycle collector (measured: 400 B per call of
+// the enclosing function, unbounded in a loop).
+llvm::StringSet<> closedMutualNestedDefs(const parser::Node &callable);
+
 // Names bound exactly once directly in `scope`'s own statement list, counting
 // a loop target as more than once. Used at module scope to tell a constant
 // apart from a name the module rebinds.
