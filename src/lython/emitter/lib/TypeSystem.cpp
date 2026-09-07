@@ -488,18 +488,20 @@ void bindGeneratorAnalysisTarget(const TypeSystem &types,
 // ⛔ And not the `else` arm: the negative of `is not None` is None, which is
 // the type the walk already infers, and the negative of `isinstance` is not a
 // type at all.
-void applyGeneratorGuardNarrowing(
+// ⛔ A SYMBOL LOOKUP, not the generator analysis it was written against: the
+// COMPREHENSION FILTER asks the same question about its own `bound` map, and
+// giving the two callers two narrowing walks is how the same fact starts being
+// answered two ways.
+void applyGuardNarrowing(
     const TypeSystem &types, const parser::Node *test,
-    const llvm::StringMap<mlir::Type> &localCallables,
-    GeneratorFunctionAnalysis &analysis,
+    llvm::function_ref<mlir::Type(llvm::StringRef)> currentType,
     llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow) {
   if (!test)
     return;
   if (test->kind == "BoolOp" && ast::isOperator(ast::node(*test, "op"), "And")) {
     if (const auto *values = ast::nodeList(*test, "values"))
       for (const parser::NodePtr &value : *values)
-        applyGeneratorGuardNarrowing(types, value.get(), localCallables,
-                                     analysis, narrow);
+        applyGuardNarrowing(types, value.get(), currentType, narrow);
     return;
   }
   if (test->kind == "Call") {
@@ -530,7 +532,7 @@ void applyGeneratorGuardNarrowing(
       !ast::isNoneField(*comparators->front(), "value"))
     return;
   llvm::StringRef name = ast::nameSpelling(*left);
-  mlir::Type current = analysis.localSymbols.lookup(name);
+  mlir::Type current = currentType(name);
   if (!current)
     if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
       current = *bound;
@@ -558,6 +560,17 @@ void applyGeneratorGuardNarrowing(
     return;
   if (mlir::Type narrowed = types.join(payloads))
     narrow(name, narrowed);
+}
+
+void applyGeneratorGuardNarrowing(
+    const TypeSystem &types, const parser::Node *test,
+    const llvm::StringMap<mlir::Type> &localCallables,
+    GeneratorFunctionAnalysis &analysis,
+    llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow) {
+  applyGuardNarrowing(
+      types, test,
+      [&](llvm::StringRef name) { return analysis.localSymbols.lookup(name); },
+      narrow);
 }
 
 void collectGeneratorFunctionAnalysis(
@@ -3271,6 +3284,21 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       mlir::Type element = iterationElementType(ast::node(*generator, "iter"));
       if (!bindTarget(ast::node(*generator, "target"), element, bindTarget))
         return object();
+      // ⭐ THE FILTER NARROWS THE TARGET, and only the walk did not know it.
+      // The emitter applies the same fact inside the body, so
+      // `[v for v in xs if isinstance(v, str)]` BUILDS a list of str and then
+      // the walk called it `list[int | str]` -- "function is annotated to
+      // return list[str]" for a comprehension that returns exactly that. The
+      // spellings whose element is an EXPRESSION (`len(v)`, `str(v)`) hid it,
+      // because their type does not depend on the narrowing.
+      if (const auto *filters = ast::nodeList(*generator, "ifs"))
+        for (const parser::NodePtr &filter : *filters)
+          applyGuardNarrowing(
+              *this, filter.get(),
+              [&](llvm::StringRef name) { return bound.lookup(name); },
+              [&](llvm::StringRef name, mlir::Type narrowed) {
+                bound[name] = narrowed;
+              });
       for (const auto &entry : bound)
         bindLocalSymbol(entry.getKey(), entry.getValue());
     }
