@@ -3704,16 +3704,65 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         }
       }
     }
+    // ⭐ AND EVERY GUARD FORM THE None COMPARISON ABOVE DOES NOT COVER, on the
+    // TRUE side, through the walk the comprehension filter already asks.
+    // `[v if isinstance(v, str) else str(v) for v in xs]` is a list of str and
+    // this answered `list[int | str]`, so a `-> list[str]` function returning
+    // it was refused -- the reader the note above said had not been measured.
+    //
+    // ⛔ Into a copy of the CONTEXT's local symbols and not onto the scope,
+    // which is what the None path does: `ctx->localSymbols` wins over the
+    // scope in the Name arm, so a comprehension target bound there would have
+    // shadowed the narrowing and this would have changed nothing.
+    //
+    // ⛔ The TRUE side only. Eliminating a class on the false side leaves what
+    // the arm already has, and nothing has been measured to need it.
+    llvm::SmallVector<std::pair<std::string, mlir::Type>, 2> provedOnTrue;
+    if (narrowedName.empty() && testNode)
+      applyGuardNarrowing(
+          *this, testNode,
+          [&](llvm::StringRef spelling) -> mlir::Type {
+            if (ctx && ctx->localSymbols) {
+              auto found = ctx->localSymbols->find(spelling);
+              if (found != ctx->localSymbols->end())
+                return found->second;
+            }
+            return mlir::Type();
+          },
+          [&](llvm::StringRef spelling, mlir::Type narrowed) {
+            provedOnTrue.emplace_back(spelling.str(), narrowed);
+          });
     auto armType = [&](const parser::Node *arm,
                        bool conditionIsTrue) -> mlir::Type {
-      if (narrowedName.empty())
+      llvm::SmallVector<std::pair<llvm::StringRef, mlir::Type>, 2> armFacts;
+      if (!narrowedName.empty())
+        armFacts.emplace_back(narrowedName, conditionIsTrue == trueBranchIsNone
+                                                ? none()
+                                                : narrowedPayload);
+      else if (conditionIsTrue)
+        for (const auto &entry : provedOnTrue)
+          armFacts.emplace_back(entry.first, entry.second);
+      if (armFacts.empty())
         return widenLiteral(lenientRecurse(arm));
-      mlir::Type narrowed = conditionIsTrue == trueBranchIsNone
-                                ? none()
-                                : narrowedPayload;
+      // ⛔ Into a copy of the CONTEXT's local symbols and not only onto the
+      // scope, which is all the None path used to do: `ctx->localSymbols` wins
+      // over the scope in the Name arm, so a COMPREHENSION target bound there
+      // shadowed the narrowing and it changed nothing --
+      // `[v if v is not None else 0 for v in xs]` typed as `list[int | None]`
+      // and a `-> list[int]` function returning it was refused. The scope
+      // binding stays for readers that reach `lookupSymbol`.
+      llvm::StringMap<mlir::Type> armLocals;
+      if (ctx && ctx->localSymbols)
+        armLocals = *ctx->localSymbols;
       auto scope = pushScope();
-      bindLocalSymbol(narrowedName, narrowed);
-      return widenLiteral(lenientRecurse(arm));
+      for (const auto &fact : armFacts) {
+        armLocals[fact.first] = fact.second;
+        bindLocalSymbol(fact.first, fact.second);
+      }
+      static const llvm::StringMap<mlir::Type> kNoCallables;
+      ExprInferenceContext narrowedCtx{kNoCallables, nullptr, &armLocals,
+                                       /*strict=*/false};
+      return widenLiteral(inferExprImpl(arm, &narrowedCtx));
     };
     llvm::SmallVector<mlir::Type, 2> collected{
         armType(bodyNode, /*conditionIsTrue=*/true),
