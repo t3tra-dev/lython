@@ -23,8 +23,22 @@
 # never even ran. The `else` spelling and the same write with the field already
 # set were both correct, which is what kept it hidden.
 #
-# Why this must run: every line below is a value, and both defects were silent
-# (one a crash, one a lowering message about a binding nobody wrote).
+# ⭐ AND A FACT DIES WHEN A NESTED STATEMENT ASSIGNS THE FIELD. The walk that
+# erases one looked only at the statement's own targets, so
+#
+#     if c.f is not None:
+#         for i in range(2):
+#             if i == 1:
+#                 c.f = None
+#         print(c.f is None)
+#
+# still carried the proof into the read and raised, for a program CPython
+# answers True. It looks inside a compound statement now -- but not into a
+# nested def, lambda or class, which do not run there.
+#
+# Why this must run: every line below is a value, and the defects were silent
+# (a crash, a lowering message about a binding nobody wrote, and a raise where
+# CPython answers).
 
 
 class Tree:
@@ -193,3 +207,40 @@ def main() -> None:
 
 
 main()
+
+
+
+class Slot2:
+    def __init__(self, v: "int | None") -> None:
+        self.f = v
+
+
+def cleared_in_a_loop() -> str:
+    c = Slot2(5)
+    if c.f is not None:
+        for i in range(2):
+            if i == 1:
+                c.f = None
+        return "none" if c.f is None else "value"
+    return "-"
+
+
+def cleared_in_a_nested_if() -> str:
+    c = Slot2(5)
+    c.f = 7
+    if c.f is not None:
+        c.f = None
+    return "none" if c.f is None else "value"
+
+
+def survives_an_unrelated_loop() -> int:
+    c = Slot2(5)
+    if c.f is not None:
+        total = 0
+        for i in range(3):
+            total += i
+        return c.f + total
+    return -1
+
+
+print(cleared_in_a_loop(), cleared_in_a_nested_if(), survives_an_unrelated_loop())

@@ -37,15 +37,47 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
   if (narrowedMemberTypes.empty() && proved.empty())
     return;
   llvm::SmallVector<const parser::Node *, 4> targets;
-  auto addTargets = [&](llvm::StringRef field) {
-    if (const auto *list = ast::nodeList(statement, field))
+  // ⛔ INSIDE the statement, not only at its top. A compound statement runs its
+  // own body, and an assignment in there changes the same field:
+  //
+  //     c.f = 5
+  //     for i in range(2):
+  //         if i == 1:
+  //             c.f = None
+  //     print(c.f is None)
+  //
+  // erased nothing, so the read below still carried the proof and raised
+  // "attribute 'f' is None here, after a guard above proved it was not" for a
+  // program CPython answers `True`. The same hole swallowed a GUARD's proof
+  // over the same loop, so this is not about where the fact came from.
+  //
+  // ⛔ Not into a nested def, lambda or class: those do not run here, and what
+  // their bodies assign is their own business.
+  auto collectTargets = [&](const parser::Node &node, auto &&recurse) -> void {
+    if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+        node.kind == "Lambda" || node.kind == "ClassDef")
+      return;
+    if (const auto *list = ast::nodeList(node, "targets"))
       for (const parser::NodePtr &target : *list)
         targets.push_back(target.get());
-    else if (const parser::Node *single = ast::node(statement, field))
+    if (const parser::Node *single = ast::node(node, "target"))
       targets.push_back(single);
+    for (const parser::Field &field : node.fields) {
+      if (field.name == "targets" || field.name == "target")
+        continue;
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, recurse);
+    }
   };
-  addTargets("targets");
-  addTargets("target");
+  collectTargets(statement, collectTargets);
   for (const parser::Node *target : targets) {
     if (!target)
       continue;
@@ -652,6 +684,20 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
         agreed[entry.getKey()] = entry.second;
     savedMembers = std::move(agreed);
   }
+  // ⛔ AND THE STATEMENT'S OWN FACTS SURVIVE ITS OWN INVALIDATION. The walk
+  // that erases a fact looks inside a compound statement now, so the `if` that
+  // ESTABLISHES one by assigning the field --
+  //
+  //     if self.hot is None:
+  //         self.hot = {}
+  //     found = self.hot.get(k)
+  //
+  // -- would have had it erased a line later by the assignment that made it.
+  // The same channel a store uses carries them past that walk; a fact an inner
+  // statement really did invalidate never reaches here, because the arm's own
+  // invalidation ran inside the arm.
+  for (const auto &entry : savedMembers)
+    memberNarrowingsFromStores[entry.getKey()] = entry.second;
 }
 
 namespace {

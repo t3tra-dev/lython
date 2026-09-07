@@ -2355,10 +2355,14 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   builder.setInsertionPointToStart(bad);
   std::string what = subjectIsField ? "attribute '" : "captured local '";
   what += std::string(subject);
-  what += testableUnion ? "' is None here, after a guard above proved it was "
-                          "not: it changed in between"
-                        : "' is not the class a guard above proved it was: it "
-                          "changed in between";
+  // ⛔ "a guard OR AN ASSIGNMENT": a store proves what it wrote, the same way a
+  // test proves what it tested, and the reader of this sentence was sent
+  // looking for a guard that was never written.
+  what += testableUnion
+              ? "' is None here, after a guard or an assignment above proved "
+                "it was not: it changed in between"
+              : "' is not the class a guard or an assignment above proved it "
+                "was: it changed in between";
   parser::NodePtr raise = synth::raiseStmt(
       synth::call(synth::name(subjectIsField ? "AttributeError" : "NameError",
                               anchor.range),
