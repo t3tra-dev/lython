@@ -8,5 +8,19 @@ False 1
 eval b
 eval c
 True 2
+eval left
+True 1
+eval left
+eval middle
+eval right
+True 3
+eval left
+eval middle
+False 2
+eval a
+eval b
+eval c
+eval d
+True 4
 True False False
 True True True True

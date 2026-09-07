@@ -1,7 +1,7 @@
 # Why execution: the assertion is what does NOT print. A chained comparison
 # stops at the first false link -- `1 > 2 > s()` never calls `s` -- and every
-# operand is evaluated exactly ONCE, so the middle of `1 < m() < 10` is one
-# call, not two. The pairs used to be emitted eagerly, so the trailing
+# operand is evaluated exactly ONCE, the LEFT one included, so the middle of
+# `1 < m() < 10` is one call and the left of `l() < 2 < 3` is one call. The pairs used to be emitted eagerly, so the trailing
 # operands ran; rewriting to `a op b and b op c` would have duplicated the
 # middle instead, which is why it had not been done.
 
@@ -48,6 +48,17 @@ def the_ordinary_range_check() -> None:
     print(lo <= 50 <= hi, lo <= 99 <= hi, lo <= 47 <= hi)
 
 
+def the_left_operand_runs_once() -> None:
+    reset()
+    print(side(1, "left") < 2 < 3, calls)
+    reset()
+    print(side(1, "left") < side(2, "middle") < side(3, "right"), calls)
+    reset()
+    print(side(3, "left") < side(2, "middle") < side(1, "right"), calls)
+    reset()
+    print(side(1, "a") < side(2, "b") < side(3, "c") < side(4, "d"), calls)
+
+
 def mixed_operators() -> None:
     print(1 == 1 < 2, 3 > 2 == 2, 1 != 2 != 3, 1 < 2 > 1)
 
@@ -57,6 +68,7 @@ def main() -> None:
     evaluates_the_middle_once()
     stops_at_the_second_link()
     four_operands_all_true()
+    the_left_operand_runs_once()
     the_ordinary_range_check()
     mixed_operators()
 

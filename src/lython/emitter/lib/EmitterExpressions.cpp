@@ -1360,7 +1360,6 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
     return *view;
   if (std::optional<Value> membership = tryEmitIterableMembership(expr))
     return *membership;
-  Value lhs = emitExpr(ast::node(expr, "left"));
   const auto *comparators = ast::nodeList(expr, "comparators");
   const auto *ops = ast::nodeList(expr, "ops");
   if (!comparators || comparators->empty()) {
@@ -1441,6 +1440,11 @@ Value ModuleEmitter::emitCompare(const parser::Node &expr) {
     if (conjunction)
       return emitExpr(conjunction.get());
   }
+  // ⛔ NOT emitted before the branch above. It used to be, and the chain
+  // rewrite then emitted the same NODE a second time inside its first pair --
+  // `f(1) < f(2) < f(3)` called f FOUR times where CPython calls it three.
+  // The answer was still right, which is why nothing caught it.
+  Value lhs = emitExpr(ast::node(expr, "left"));
   Value result{};
   for (std::size_t index = 0; index < comparators->size(); ++index) {
     Value rhs = emitExpr((*comparators)[index].get());
