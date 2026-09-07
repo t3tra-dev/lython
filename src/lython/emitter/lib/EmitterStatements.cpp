@@ -1611,6 +1611,23 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     if (returnValue && currentReturnType) {
       mlir::Type returnedType =
           types.widenLiteral(types.inferExpr(returnValue));
+      // ⭐ A FIELD PATH ANSWERS WITH WHAT A GUARD PROVED. The inference does
+      // not carry the member narrowing -- that map is the emitter's -- so
+      // `return self.value` under `if self.value is not None:` infers the
+      // union, and this check has excluded unions outright for that reason.
+      // Asking the map first is what lets the union arm below say anything:
+      // with a proof standing, the returned type is the member; without one,
+      // the union really is what leaves.
+      if (returnValue->kind == "Attribute")
+        if (const parser::Node *owner = ast::node(*returnValue, "value");
+            owner && owner->kind == "Name")
+          if (auto attr = ast::string(*returnValue, "attr")) {
+            std::string path = std::string(ast::nameSpelling(*owner)) + "." +
+                               std::string(*attr);
+            auto proved = narrowedMemberTypes.find(path);
+            if (proved != narrowedMemberTypes.end() && proved->second)
+              returnedType = types.widenLiteral(proved->second);
+          }
       // The three allowances the DECLARED PARAMETER check makes, for the same
       // reasons and spelled the same way (EmitterClasses.cpp): the numeric
       // tower, which `isAssignableTo` answers false for; a subclass reaching a
@@ -1692,11 +1709,31 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       // return [1, "a"]` compiled and then did not. An `object` element accepts
       // anything, so a declaration that names one is not a claim this check can
       // refuse against.
+      // ⭐ AND A UNION THAT REALLY IS ONE. `def use(self) -> str: ...; return
+      // self.v` where a call between the guard and the read put a None back
+      // reached the LOWERING as "cannot adapt runtime bundle with physical
+      // values (i64, memref, memref) to expected ABI (memref, memref)" -- a
+      // sentence about lanes, for a return the author can see is wrong. Only
+      // where the DECLARED side is an ordinary contract: a member returned
+      // where a union is declared is not a mismatch, and that is the shape the
+      // union exclusion was written for.
+      //
+      // ⛔ AND ONLY WHERE THE RETURNED EXPRESSION IS THAT FIELD READ. Every
+      // other spelling can carry a narrowing the inference does not: `return
+      // v + 1` under `if v is None: return 0` infers `int | None` for a value
+      // that is an int, and four goldens say so. A field path is the one
+      // shape whose proof this walk holds, so it is the one it can judge.
+      bool unionMismatch =
+          returnValue->kind == "Attribute" &&
+          mlir::isa_and_nonnull<py::UnionType>(returnedType) &&
+          ordinaryContract(currentReturnType) &&
+          !mentionsObject(currentReturnType) &&
+          !py::isAssignableTo(returnedType, currentReturnType, module);
       if (returnedType && !mentionsObject(returnedType) &&
           !mentionsObject(currentReturnType) &&
-          ordinaryContract(returnedType) &&
-          ordinaryContract(currentReturnType) &&
-          !accepted(returnedType, currentReturnType)) {
+          (unionMismatch || (ordinaryContract(returnedType) &&
+                             ordinaryContract(currentReturnType) &&
+                             !accepted(returnedType, currentReturnType)))) {
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, statement.range.start,
             "function is annotated to return " + typeText(currentReturnType) +

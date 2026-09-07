@@ -1891,3 +1891,51 @@ TEST(EmitterTest, AGeneratorAnnotationThatIsWrongIsStillNamed) {
       right);
   EXPECT_TRUE(narrowed.ok()) << narrowed.diagnostics.size();
 }
+
+// A field read returned where a MEMBER of its union is declared. The guard
+// that proved the member does not survive a call that assigns the field, so
+// the return really does give the union -- and it reached the LOWERING as
+// "cannot adapt runtime bundle with physical values (i64, memref, memref) to
+// expected ABI (memref, memref)", a sentence about lanes for a return the
+// author can see is wrong.
+TEST(EmitterTest, AUnionFieldReturnedWhereAMemberIsDeclaredIsNamed) {
+  auto namesTheReturn = [](lython::emitter::EmitResult &emitted) {
+    for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
+      if (diagnostic.message.find("is annotated to return") !=
+          std::string::npos)
+        return true;
+    return false;
+  };
+
+  mlir::MLIRContext wrong(testRegistry());
+  lython::emitter::EmitResult mismatched = emitSource(
+      "class Box:\n"
+      "    def __init__(self) -> None:\n"
+      "        self.v: \"str | None\" = None\n"
+      "    def clear(self) -> None:\n"
+      "        self.v = None\n"
+      "    def use(self) -> str:\n"
+      "        if self.v is not None:\n"
+      "            self.clear()\n"
+      "            return self.v\n"
+      "        return \"-\"\n"
+      "print(Box().use())\n",
+      wrong);
+  EXPECT_FALSE(mismatched.ok());
+  EXPECT_TRUE(namesTheReturn(mismatched));
+
+  // The same read WITHOUT the call keeps the guard's proof and compiles, which
+  // is what says the refusal is about the union and not about the field.
+  mlir::MLIRContext right(testRegistry());
+  lython::emitter::EmitResult proved = emitSource(
+      "class Box:\n"
+      "    def __init__(self) -> None:\n"
+      "        self.v: \"str | None\" = None\n"
+      "    def use(self) -> str:\n"
+      "        if self.v is not None:\n"
+      "            return self.v\n"
+      "        return \"-\"\n"
+      "print(Box().use())\n",
+      right);
+  EXPECT_TRUE(proved.ok()) << proved.diagnostics.size();
+}
