@@ -3,3 +3,7 @@ shape circle r=2.0
 B(L(R(base)))
 L(base)
 R(base)
+app 400 negative
+value bad age
+wrapped 500 wrapped: inner
+silent True True

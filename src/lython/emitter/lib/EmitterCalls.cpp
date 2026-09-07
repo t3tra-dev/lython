@@ -1348,6 +1348,59 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             return emitCall(*rewritten);
           }
         }
+        // ⭐ `Exception.__init__(self, msg)` IS `super().__init__(msg)` when
+        // the class named is the base the receiver derives from. Both are how
+        // an exception subclass forwards its message, both appear in real
+        // code, and only the second was answered: the first went looking for
+        // `__init__` ON THE CLASS OBJECT and reported "type<Exception> has
+        // manifest method '__init__' but no signature that accepts (E, str)",
+        // which is the compiler saying it asked the wrong receiver.
+        //
+        // ⛔ The manifest bases only. A SOURCE base already works through the
+        // unbound spelling below (`A.__init__(self, v)` binds no receiver and
+        // passes it as the first argument); what has no method to bind is a
+        // taxonomy class, whose `__init__` is the runtime's.
+        if (*methodName == "__init__" && receiverNode) {
+          std::string named = ast::qualifiedName(receiverNode);
+          if (named.empty() && receiverNode->kind == "Name")
+            named = std::string(ast::nameSpelling(*receiverNode));
+          std::string baseContract = canonicalClassName(named);
+          const auto *initArgs = ast::nodeList(expr, "args");
+          bool taxonomyBase =
+              !baseContract.empty() &&
+              (py::exceptions::findByName(baseContract) ||
+               py::exceptions::findByName(
+                   py::contracts::manifestClassNameForContract(baseContract)));
+          if (taxonomyBase && !classMros.count(baseContract) &&
+              initArgs && !initArgs->empty() && initArgs->front() &&
+              initArgs->front()->kind != "Starred") {
+            Value self = emitExpr(initArgs->front().get());
+            auto selfContract =
+                mlir::dyn_cast_if_present<py::ContractType>(self.type);
+            if (selfContract &&
+                llvm::is_contained(classMro(selfContract.getContractName()),
+                                   baseContract)) {
+              parser::NodePtr forwarded =
+                  parser::makeNode("Call", expr.range);
+              parser::addField(*forwarded, "func", synth::name("__init__",
+                                                               expr.range));
+              parser::addField(
+                  *forwarded, "args",
+                  std::vector<parser::NodePtr>(std::next(initArgs->begin()),
+                                               initArgs->end()));
+              if (const parser::Field *keywords =
+                      parser::findField(expr, "keywords"))
+                forwarded->fields.push_back(*keywords);
+              else
+                parser::addField(*forwarded, "keywords",
+                                 std::vector<parser::NodePtr>{});
+              Value result = emitSuperExceptionInit(*forwarded, self,
+                                                    baseContract);
+              synthesizedIteratorDefs.push_back(std::move(forwarded));
+              return result;
+            }
+          }
+        }
         // ⭐ `str.upper(s)` IS `s.upper()`, and the receiver is the first
         // argument. Written by hand it is ordinary Python; reached through a
         // `map(str.upper, xs)` whose fast path re-spells the callable as a
