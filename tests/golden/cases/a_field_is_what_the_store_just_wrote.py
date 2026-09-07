@@ -28,6 +28,12 @@
 # union, and a fact equal to the declaration is not a fact. Requiring the two
 # sides to be EQUAL is what keeps a proof out of the code after an `if` that
 # established nothing -- the failure the branch-local rule was written for.
+# ⭐ AND THE DESUGARS SEE IT. `self.d.get(k)` with one argument is not a runtime
+# method at all -- it is a rewrite gated on the receiver being dict-typed -- and
+# the predicate that gate asks used the raw inference, which does not carry
+# these facts. So a proved dict field fell through to the manifest path and
+# died as "runtime manifest has no builtins.dict.get method", a sentence about
+# a method the program is right to call.
 class Box:
     def __init__(self) -> None:
         self.f: "int | None" = None
@@ -84,6 +90,30 @@ class Box:
         return "none" if self.f is None else "value"
 
 
+class Cache:
+    def __init__(self) -> None:
+        self.hot: "dict[str, int] | None" = None
+        self.cold: "dict[str, int] | None" = None
+
+    def get(self, k: str) -> "int | None":
+        if self.hot is None:
+            self.hot = {}
+        found = self.hot.get(k)
+        if found is not None:
+            return found
+        if self.cold is None:
+            self.cold = {"x": 9}
+        deep = self.cold.get(k)
+        if deep is not None:
+            self.hot[k] = deep
+        return deep
+
+    def size(self) -> int:
+        if self.hot is None:
+            self.hot = {}
+        return len(self.hot)
+
+
 def through_a_local_name() -> int:
     b = Box()
     b.f = 11
@@ -100,6 +130,8 @@ def main() -> None:
     print(merged.lazy_merged(), merged.lazy_merged(), merged.lazy_scalar())
     print(merged.proves_nothing())
     print(through_a_local_name())
+    cache = Cache()
+    print(cache.get("x"), cache.get("x"), cache.get("zz"), cache.size())
 
 
 main()

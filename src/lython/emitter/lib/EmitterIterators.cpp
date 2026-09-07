@@ -1162,8 +1162,26 @@ bool ModuleEmitter::exprHasContract(const parser::Node *expr,
                                     llvm::StringRef contractName) {
   if (!expr)
     return false;
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(
-      types.widenLiteral(types.inferExpr(expr)));
+  mlir::Type type = types.inferExpr(expr);
+  // ⭐ A PROVED FIELD PATH IS ITS PROVED TYPE HERE TOO. The inference walk does
+  // not carry `narrowedMemberTypes`, so a `dict[str, int] | None` field that a
+  // guard or a store has proved to be a dict still answered the UNION -- and
+  // every desugar gated on this predicate skipped it. `self.d.get(k)` then
+  // fell through to the manifest path, which has no `builtins.dict.get` at all
+  // (the one-argument form is a desugar, not a runtime method), and died as
+  // "runtime manifest has no builtins.dict.get method" -- a sentence about a
+  // method the program is right to call.
+  if (expr->kind == "Attribute" && !narrowedMemberTypes.empty())
+    if (const parser::Node *owner = ast::node(*expr, "value");
+        owner && owner->kind == "Name")
+      if (auto attr = ast::string(*expr, "attr"))
+        if (auto found = narrowedMemberTypes.find(
+                std::string(ast::nameSpelling(*owner)) + "." +
+                std::string(*attr));
+            found != narrowedMemberTypes.end())
+          type = found->second;
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(type));
   return contract && contract.getContractName() == contractName;
 }
 
