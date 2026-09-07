@@ -238,13 +238,44 @@ bool RuntimeBundleLowerer::classFieldStoredBoxed(
   // that header does not have cannot be a payload -- which is why the header is
   // sized for the deepest such read and not for a header.
   if (auto unionType = mlir::dyn_cast<py::UnionType>(fieldContract)) {
-    if (!unionType.isOptional())
-      return false;
-    mlir::Type payload = unionType.getOptionalPayloadType();
-    std::string payloadName = runtimeShapeContractName(payload);
-    if (payloadName.empty() || payloadName == "types.NoneType")
-      return false;
-    return RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(payload);
+    if (unionType.isOptional()) {
+      mlir::Type payload = unionType.getOptionalPayloadType();
+      std::string payloadName = runtimeShapeContractName(payload);
+      if (payloadName.empty() || payloadName == "types.NoneType")
+        return false;
+      return RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(payload);
+    }
+    // ⭐ AND SO IS EVERY OTHER UNION WHOSE MEMBERS EACH FIT A BOX. The slot
+    // holds ONE payload handle and that handle's class word says which member
+    // it is -- the reading a `list[int | str]` element has always had
+    // (`unionValuesFromBoxWords`) -- so the tag needs no storage of its own and
+    // the members need no shared width.
+    //
+    // Keeping them inline instead put the tag and every member's lanes into the
+    // INSTANCE's own value group, and that one decision was four defects: an
+    // object with such a field expands past one address and cannot go into a
+    // container, a store rebinds an SSA value so a store inside a branch does
+    // not reach the read after the merge ("operand #0 does not dominate this
+    // use"), the release of the field's previous contents aliases whatever
+    // value the last store spliced in, and a class reachable from its own
+    // union-typed field has no finite layout.
+    //
+    // ⛔ AT MOST ONE MEMBER MAY BE LANE-LESS, and it is the empty box.
+    // `unionValuesFromBoxWords` reads the first such member as the tag no
+    // identified class claims; a second one would be indistinguishable from it.
+    unsigned laneLess = 0;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      std::string memberName = runtimeShapeContractName(member);
+      if (memberName.empty())
+        return false;
+      if (memberName == "types.NoneType") {
+        ++laneLess;
+        continue;
+      }
+      if (!RuntimeBundleLowerer::optionalPayloadRebuildableFromBox(member))
+        return false;
+    }
+    return laneLess <= 1;
   }
   // runtimeShapeContractName returns by value; a StringRef binding would
   // dangle past this declaration statement.
@@ -757,10 +788,10 @@ RuntimeBundleLowerer::classFieldStorageValueTypes(
   // a class with three of them expanded to four and could not be stored in a
   // container at all.
   //
-  // ⛔ A union of two OBJECTS still takes its lanes. Its storage is a tag plus
-  // the live member's lanes, and the members do not share a width, so there is
-  // no single box to front it with. `T | None` is not one of these: see
-  // `classFieldStoredBoxed`.
+  // ⛔ A union with a member that has no ENTITY still takes its lanes -- which
+  // is `bool` and nothing else, because a box holds an address and
+  // `builtins.bool` is an `i1`. Every other union is one payload handle whose
+  // class word names the live member: see `classFieldStoredBoxed`.
   if (isPrimitiveFieldContract(fieldContract) ||
       classFieldStoredBoxed(fieldContract))
     return llvm::SmallVector<mlir::Type, 8>{};
@@ -2056,6 +2087,70 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                  << "optional field ABI: lane " << index
                  << " belongs to no member of " << optionalField;
       }
+    } else if (auto unionField =
+                   mlir::dyn_cast_if_present<py::UnionType>(loadedContract)) {
+      // ⭐ A UNION OF TWO REAL MEMBERS READS BACK THE WAY A CONTAINER ELEMENT
+      // DOES: the box's CLASS word names the live member, each member's lanes
+      // are rebuilt from the entity under that test, and the inactive ones get
+      // the immortal dead placeholder every producer of a union gives them.
+      // The optional arm above is the specialization whose tag is `entity != 0`
+      // and needs no class id at all.
+      builder.setInsertionPoint(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Value classIndex = mlir::arith::AddIOp::create(
+          builder, loc, boxWord,
+          mlir::arith::ConstantIndexOp::create(builder, loc, 1));
+      mlir::Value classWord =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, classIndex)
+              .getResult();
+      mlir::Value entityIndex = mlir::arith::AddIOp::create(
+          builder, loc, boxWord,
+          mlir::arith::ConstantIndexOp::create(builder, loc,
+                                               box_abi::kEntityWord));
+      mlir::Value entityWord =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
+              .getResult();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
+          RuntimeBundleLowerer::unionValuesFromBoxWords(op, unionField,
+                                                        classWord, entityWord,
+                                                        /*branchless=*/true);
+      if (mlir::failed(unionValues))
+        return mlir::failure();
+      // ⭐ AND ONE REFERENCE PER MEMBER, TAKEN HERE. `retainEvidenceElement`
+      // declines a union -- the tag is not a header -- so the tail's retain
+      // does nothing for this bundle and the value would carry the BOX's
+      // reference out of the function: `return b.v` from a `-> str` handed the
+      // caller a str the instance's deallocator then freed, and the caller's
+      // own release aborted in `Ly_DecRef`. The optional arm above retains its
+      // payload for the same reason; this is that step for N members, and the
+      // inactive ones step over an immortal header.
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> retainedUnion =
+          RuntimeBundleLowerer::retainUnionMemberValues(op, unionField,
+                                                        *unionValues);
+      if (mlir::failed(retainedUnion))
+        return mlir::failure();
+      values.assign(retainedUnion->begin(), retainedUnion->end());
+      // ⭐ AND THE TAG COMES FROM A SECOND READ OF THE BOX, taken after the
+      // reference is. The release planner puts the instance's own death after
+      // its last USE, and the box words are the only use a field read has:
+      // with the tag decided from the first read, the instance was deallocated
+      // between the lanes and the retain and `Ly_IncRef` ran on a freed header.
+      // Reading the words twice is free -- nothing between them can write the
+      // box -- and this is the same device the optional arm above uses.
+      builder.setInsertionPoint(op);
+      mlir::Value classWordAgain =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, classIndex)
+              .getResult();
+      mlir::Value entityWordAgain =
+          mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
+              .getResult();
+      mlir::FailureOr<mlir::Value> liveTag =
+          RuntimeBundleLowerer::unionTagFromBoxWords(op, unionField,
+                                                     classWordAgain,
+                                                     entityWordAgain);
+      if (mlir::failed(liveTag))
+        return mlir::failure();
+      values[0] = *liveTag;
     } else {
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> rebuilt =
           rebuildBoxedFieldLanes(laneTypes, slot->first, boxWord,
@@ -2309,15 +2404,12 @@ RuntimeBundleLowerer::retainUnionMemberValues(
   return retained;
 }
 
-mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
-RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
-                                              py::UnionType unionType,
-                                              mlir::Value classWord,
-                                              mlir::Value entityWord) {
+mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::unionTagFromBoxWords(
+    mlir::Operation *op, py::UnionType unionType, mlir::Value classWord,
+    mlir::Value entityWord, llvm::SmallVectorImpl<mlir::Value> *matchesOut) {
   mlir::Location loc = op->getLoc();
   mlir::Value exact =
       RuntimeBundleLowerer::exactClassIdFromWords(op, classWord, entityWord);
-  llvm::SmallVector<mlir::Value, 8> values;
   llvm::SmallVector<mlir::Value, 4> matches;
   mlir::func::FuncOp classIdMatches = getOrCreatePrivateFunction(
       module, builder, "LyEH_ClassIdMatches",
@@ -2378,7 +2470,25 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
                   .getResult(),
               tag)
               .getResult();
-  values.push_back(tag);
+  if (matchesOut)
+    matchesOut->assign(matches.begin(), matches.end());
+  return tag;
+}
+
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
+RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
+                                              py::UnionType unionType,
+                                              mlir::Value classWord,
+                                              mlir::Value entityWord,
+                                              bool branchless) {
+  mlir::Location loc = op->getLoc();
+  llvm::SmallVector<mlir::Value, 4> matches;
+  mlir::FailureOr<mlir::Value> tag = RuntimeBundleLowerer::unionTagFromBoxWords(
+      op, unionType, classWord, entityWord, &matches);
+  if (mlir::failed(tag))
+    return mlir::failure();
+  llvm::SmallVector<mlir::Value, 8> values;
+  values.push_back(*tag);
 
   for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
     mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> laneTypes =
@@ -2389,6 +2499,55 @@ RuntimeBundleLowerer::unionValuesFromBoxWords(mlir::Operation *op,
     if (laneTypes->empty())
       continue;
     std::string contractName = runtimeContractName(member);
+    if (branchless) {
+      // ⭐ THE INACTIVE ARM IS AN ADDRESS, NOT A BRANCH. Rebuilding a lane is
+      // arithmetic on the entity -- a memref built AT it -- so the arm can be
+      // one `select` over which address to build from, and the whole read stays
+      // a straight-line expression the release planner can see through. The
+      // stand-in is the immortal dead header, which is sized for the deepest
+      // `lane_words` read for exactly this reason.
+      //
+      // ⛔ Only where no member needs an `unbox` call, which is why
+      // `classFieldStoredBoxed` refuses a `bool` member: the call would run on
+      // the dead header of the arm that is not live. `builtins.bool` is the
+      // only contract that declares one.
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> slotShapes =
+          RuntimeBundleLowerer::slotStorageShapesFor(op, member,
+                                                     "union member ABI");
+      if (mlir::failed(slotShapes))
+        return mlir::failure();
+      mlir::FailureOr<RuntimeValue> dead =
+          RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+              op, member, "union inactive member ABI");
+      if (mlir::failed(dead) || dead->values.empty())
+        return mlir::failure();
+      builder.setInsertionPoint(op);
+      mlir::Value deadAddress = mlir::arith::IndexCastOp::create(
+          builder, loc, builder.getI64Type(),
+          mlir::memref::ExtractAlignedPointerAsIndexOp::create(
+              builder, loc, dead->values.front()));
+      mlir::Value entity = mlir::arith::SelectOp::create(
+          builder, loc, matches[index], entityWord, deadAddress);
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
+          RuntimeBundleLowerer::lanesFromBoxEntity(builder, loc, entity,
+                                                   *slotShapes, contractName,
+                                                   op);
+      if (mlir::failed(lanes))
+        return mlir::failure();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> unboxed =
+          RuntimeBundleLowerer::unboxSlotElementValues(op, member, *lanes);
+      if (mlir::failed(unboxed))
+        return mlir::failure();
+      if (unboxed->size() != laneTypes->size())
+        return op->emitError()
+               << "union member " << contractName << " needs "
+               << laneTypes->size() << " lanes and the branchless read produced "
+               << unboxed->size();
+      values.append(unboxed->begin(), unboxed->end());
+      continue;
+    }
     bool armFailed = false;
     auto built = mlir::scf::IfOp::create(
         builder, loc, matches[index],
@@ -2673,7 +2832,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     const bool receiverIsAMerge =
         receiver && !receiver.getOwner()->hasNoPredecessors() &&
         !llvm::hasSingleElement(receiver.getOwner()->getPredecessors());
-    if (receiverIsAMerge)
+    // ⛔ AND NEVER FOR A UNION FIELD, WHOSE CACHED CONTRACT IS THE ANSWER TO
+    // `isinstance`. For every other field the cache narrows a fact that cannot
+    // change -- an `int` field holds an int whatever the cache says -- and the
+    // box words are still the value. For a union the contract IS the tag, so a
+    // cache written before a loop's back edge decides a read the next trip
+    // reaches with the other member in the box:
+    //
+    //     b = Box("ab")               # Box.v: "int | str"
+    //     while ...:
+    //         if isinstance(b.v, str):
+    //             b.v = 7             # the cache says str at the read above
+    //
+    // printed "s" on both trips, for a program CPython flips. The read costs a
+    // class-word load and a compare without the cache, and is right whichever
+    // member is there.
+    auto unionField = mlir::dyn_cast<py::UnionType>(fieldTypes[*fieldIndex]);
+    if (receiverIsAMerge || (unionField && !unionField.isOptional()))
       updated.fieldBundles.erase(op.getName());
     else
       updated.fieldBundles[op.getName()] =
@@ -2684,10 +2859,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   }
 
   // Residual: a field with no single object contract to put behind a handle —
-  // a union (tag plus every member's lanes), a zero-lane contract, or an
-  // int/bool past the last header word. These keep the pre-4a lane splice, and
-  // with it the pre-4a defect: a store here is only visible where these lanes
-  // are. Union fields are the only shape that reaches it in practice.
+  // a union with a `bool` member (tag plus every member's lanes, because a
+  // bool has no address to box), a zero-lane contract, or an int/bool past the
+  // last header word. These keep the pre-4a lane splice, and with it the
+  // pre-4a defect: a store here is only visible where these lanes are.
   //
   // ⛔ WHICH IS A WRONG ANSWER WHEN THE RECEIVER CAME FROM A CALLER, so that
   // is refused here. The splice writes the receiver's own SSA expansion; a

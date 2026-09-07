@@ -333,6 +333,11 @@ def union_fields() -> None:
     print(a_union_field_under_a_chain(Payload("ab")))
     print(a_union_field_under_a_chain(Payload(3)))
     print(a_union_field_in_a_loop(Payload("ab")), a_union_field_in_a_loop(Payload(5)))
+    # The write under a proof, and the read that follows it in the same block.
+    p = Payload("ab")
+    if isinstance(p.v, str):
+        p.v = len(p.v)
+        print(p.v)
 
 
 union_fields()

@@ -1503,6 +1503,25 @@ TEST(DriverTest, AnOptionalFieldIsBoxedLikeThePayloadAlone) {
 // what keeps the expansion from recursing until the compiler dies with SIGILL
 // and no diagnostic, which is what it did.
 TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
+  CompileResult result = compileSource("class Node:\n"
+                                       "    v: int\n"
+                                       "    nxt: \"Node | bool\"\n"
+                                       "    def __init__(self, v: int) -> None:\n"
+                                       "        self.v = v\n"
+                                       "        self.nxt = False\n"
+                                       "\n"
+                                       "print(Node(1).v)\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("contains itself through a union-typed "
+                                    "field that is stored inline"),
+            std::string::npos)
+      << result.diagnostics;
+}
+
+// And a union of two OBJECTS no longer does. Each member fits a box, so the
+// field is one payload handle whose class word names the member -- which is
+// what `Node | Leaf` needs to terminate, and what a `bool` member cannot have.
+TEST(DriverTest, AUnionOfTwoObjectsReachesItsOwnClass) {
   CompileResult result = compileSource("class Leaf:\n"
                                        "    n: int\n"
                                        "    def __init__(self, n: int) -> None:\n"
@@ -1516,11 +1535,7 @@ TEST(DriverTest, AUnionOfTwoObjectsCannotReachItsOwnClass) {
                                        "        self.nxt = Leaf(0)\n"
                                        "\n"
                                        "print(Node(1).v)\n");
-  EXPECT_FALSE(result.succeeded);
-  EXPECT_NE(result.diagnostics.find("contains itself through a union-typed "
-                                    "field of two object types"),
-            std::string::npos)
-      << result.diagnostics;
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
 // An optional result carries its payload ONCE. `T | None` is a union with one

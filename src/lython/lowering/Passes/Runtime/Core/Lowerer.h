@@ -1345,9 +1345,26 @@ private:
                                     mlir::Value entityWord);
   // A union's physical values -- tag plus every member's lanes -- built from a
   // box that some container owns.
+  //
+  // `branchless` builds the same value with SELECTS over the entity address
+  // instead of an `scf.if` per member. A container element can take the
+  // branch; a FIELD read cannot -- the reference it takes is rooted by the
+  // retain immediately before the frame's token, and a lane defined inside a
+  // region is outside the release planner's reach ("Ly_IncRef observed
+  // non-positive refcount", the same reason the optional field read selects an
+  // address rather than branching).
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>
   unionValuesFromBoxWords(mlir::Operation *op, py::UnionType unionType,
-                          mlir::Value classWord, mlir::Value entityWord);
+                          mlir::Value classWord, mlir::Value entityWord,
+                          bool branchless = false);
+  // Which member a box holds: the tag, and the per-member predicate the lanes
+  // are selected with. Split out of the above because a FIELD read has to ask
+  // it TWICE -- once to pick the addresses and again after the retain, so the
+  // instance is still live where the reference is taken.
+  mlir::FailureOr<mlir::Value>
+  unionTagFromBoxWords(mlir::Operation *op, py::UnionType unionType,
+                       mlir::Value classWord, mlir::Value entityWord,
+                       llvm::SmallVectorImpl<mlir::Value> *matchesOut = nullptr);
   // One reference per member, for a union read whose container is released
   // before the binding dies. See the note at the definition.
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>>

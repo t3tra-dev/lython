@@ -202,6 +202,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnOptionalResultCarriesItsPayloadOnce"
     "DriverTest.AnOptionalFieldIsBoxedLikeThePayloadAlone"
     "DriverTest.AUnionOfTwoObjectsCannotReachItsOwnClass"
+    "DriverTest.AUnionOfTwoObjectsReachesItsOwnClass"
     "DriverTest.EveryLandingPadClauseIsAPythonClassOrCatchAll"
     "DriverTest.ShapesThatHandleMoreThanTheyNameStayCatchAll"
     "DriverTest.ABareExceptNamesBaseException"
