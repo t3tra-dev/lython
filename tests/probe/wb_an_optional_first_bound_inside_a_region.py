@@ -30,6 +30,28 @@
 # ⭐ SO THE SPELLING THAT LOOKS IDENTICAL IS NOT: `v` bound before the region
 # and reassigned inside it compiles, because then there is no slot at all.
 # That is also the workaround, and it is one line.
+# ⭐ RE-MEASURED 2026-09-08, after a union FIELD became one box. Two of the
+# three reasons above have moved:
+#
+#   letting a union through `inferConditionalLocalType` no longer crashes the
+#     compiler: `int | str` first bound inside a for/while/match COMPILES AND
+#     RUNS, and `int | None` gets as far as "Ly_IncRef observed non-positive
+#     refcount" at run time;
+#   routing the optional field through the GENERAL union path -- the class word
+#     as the tag rather than the empty entity -- makes those three run
+#     correctly too, and `ctest -L fast` stays green.
+#
+# ⛔ AND THE SLOT RELAXATION IS STILL REFUSED, for a reason that is not about
+# storage at all: with it, `golden.cases.stdlib_bisect`, `stdlib_functools`
+# and `generic_call_with_a_lambda` fail to EMIT -- a name those modules bind
+# inside a region gets an `int | None` slot where the dominance path had given
+# it the exact `int`, and `lo + 1` on a union is refused. The slot's TYPE is
+# the open question, not the slot's storage: it joins every binding in the
+# region, and a None-then-int sequence joins to a union the reader never sees.
+#
+# ⛔ Removing the optional fast path on its own FIXES NO PROGRAM (measured:
+# identical probe and golden differentials, 741/715 either way), so it is not
+# committed. It is the second half of this repair and belongs with the first.
 from typing import Optional
 
 
