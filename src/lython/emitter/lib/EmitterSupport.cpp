@@ -1007,6 +1007,14 @@ optionalNoneComparison(const parser::Node &test, TypeSystem &types) {
 std::optional<BranchTypeNarrowing>
 optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                             mlir::Operation *from) {
+  // ⭐ A WALRUS AROUND THE TEST IS STILL THE TEST. `if (found := isinstance(v,
+  // str)):` proves what `if isinstance(v, str):` proves -- the name it binds is
+  // the RESULT of the test, not its subject -- and the narrowing was dropped
+  // outright, so the body read the whole union ("cannot adapt !py.union<...>
+  // return value"). The `while` spelling lost it the same way.
+  if (test.kind == "NamedExpr")
+    if (const parser::Node *value = ast::node(test, "value"))
+      return optionalBranchTypeNarrowing(*value, types, from);
   if (test.kind == "UnaryOp") {
     const parser::Node *op = ast::node(test, "op");
     if (!ast::isOperator(op, "Not"))
