@@ -23,11 +23,15 @@
 # own fresh sub-generator.
 #
 # ⛔ A body that is anything else stays refused: `yield x * 2` is not delegation
-# and `py.yield.from` cannot carry it. So is `for x in list(src(n))` INSIDE a
-# generator -- the diagnostic suggests materializing, and that spelling has the
-# same nested-generator problem -- so the last section materializes in the CALLER
-# instead. Both are the nested-generator frame work the resume-target rule waits
-# on.
+# and `py.yield.from` cannot carry it. That is the nested-generator frame work
+# the resume-target rule waits on.
+#
+# ⭐ THE DIAGNOSTIC'S ADVICE WORKS, and the note here used to say it did not.
+# Re-measured 2026-09-07: `for x in list(src(n))` INSIDE a generator compiles
+# and runs, so does binding the list to a local first, and so does a
+# comprehension over it. The last three sections pin all three, because a note
+# claiming the suggested spelling is refused is worse than no note -- it sends
+# a reader looking for a workaround they already have.
 #
 # Every expected line is python3.14's.
 
@@ -54,11 +58,25 @@ def twice(n: int) -> Iterator[int]:
 
 
 def doubled(xs: list[int]) -> Iterator[int]:
-    # A body that is not delegation takes its source as a LIST: `for x in
-    # list(src(n))` inside a generator is refused too, so the materialization has
-    # to happen in the caller.
     for x in xs:
         yield x * 2
+
+
+def doubled_inline(n: int) -> Iterator[int]:
+    # The materialization the diagnostic suggests, INSIDE the generator.
+    for x in list(src(n)):
+        yield x * 2
+
+
+def doubled_via_local(n: int) -> Iterator[int]:
+    xs = list(src(n))
+    for x in xs:
+        yield x * 2
+
+
+def doubled_via_comprehension(n: int) -> Iterator[int]:
+    for x in [v * 2 for v in src(n)]:
+        yield x
 
 
 # --- the delegating loop, consumed whole -----------------------------------
@@ -71,5 +89,7 @@ for v in relay(4):
     total += v
 print(total, sum(relay(4)), max(relay(4)), len(list(relay(4))))
 
-# --- a body that is not delegation, through the workaround ---------------
+# --- a body that is not delegation, through each workaround ---------------
 print(list(doubled(list(relay(3)))))
+print(list(doubled_inline(3)), list(doubled_via_local(3)))
+print(list(doubled_via_comprehension(3)), list(doubled_inline(0)))

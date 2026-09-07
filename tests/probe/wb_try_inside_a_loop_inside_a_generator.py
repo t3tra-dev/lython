@@ -2,21 +2,28 @@
 #
 #   unwind cleanup cannot target a handler entry with block arguments
 #
-# MEASURED (2026-09-02, RelWithDebInfo, today's tree). The loop is what makes
-# the difference, not the try and not the generator:
+# RE-MEASURED (2026-09-07, RelWithDebInfo). ⭐ THE LOOP IS NOT THE LINE. It is
+# for a `try`; for a `with` there is no line at all -- every `with` inside a
+# generator is refused, including the flattest one there is:
 #
 #   try/finally at the generator's TOP level ....... correct
 #   try/except at the generator's top level ........ correct
+#   try around the whole loop ...................... correct
+#   a try in a loop in a plain FUNCTION ............ correct
+#   a `with` in a plain FUNCTION, loop and all ..... correct
 #   try/finally in a loop in a generator ........... the message above
 #   try/except in a loop in a generator ............ the message above
-#   try around the whole loop ...................... correct
-#   `with` in a loop in a generator ................ the message above
-#   a try in a loop in a plain FUNCTION ............ correct
 #   the try body without a yield in it ............. the message above
+#   `with X() as n:` then `yield n` ................ the message above
+#   `with X():` then `yield 1` ..................... the message above
+#   `with X() as n:` with NO yield inside it ....... the message above
+#   a `with` AFTER a yield ......................... the message above
+#   a `with` in a loop, or a loop in a `with` ...... the message above
 #
-# The last line is the useful one: the yield does not have to be inside the
-# try. Any `try` inside a generator's loop is refused, which is `for x in xs:`
-# with a `try:` in its body -- one of the most ordinary shapes Python has.
+# So the refused set is: any `try` inside a generator LOOP, and any `with`
+# inside a generator at all. `with open(p) as f: for line in f: yield line` is
+# the idiom this costs, and `for x in xs:` with a `try:` in its body is the
+# other -- two of the most ordinary shapes Python has.
 #
 # ⭐ WHERE IT COMES FROM: a generator's loop is flattened into a resume state
 # machine, so its blocks carry the frame's live lanes as BLOCK ARGUMENTS -- the
@@ -40,9 +47,10 @@
 # Iterator[int] but yields builtins.object" -- a sentence about an annotation
 # that was correct. It now reaches this limit like the others.
 #
-# ⛔ A `with` with NO target reaches a THIRD limit rather than this one:
-# `with Ctx(): yield 1` says "generator resume continuation live closure
-# violated". Same area, different placement.
+# ⛔ The note that a target-less `with` reaches a THIRD limit ("generator
+# resume continuation live closure violated") is STALE as of 2026-09-07: it
+# reaches this one. Nothing about the `with` spelling changes the answer any
+# more.
 #
 # ⛔ TWO OPERAND RULES TRIED AND DROPPED, 2026-09-06. The cleanup block CAN be
 # given the handler's block arguments (`getOrCreateCleanupHandler` takes them,
@@ -62,6 +70,16 @@
 # So the next attempt has to reason about the CFG the EH phase produces, not
 # the one the cleanup placement sees. Neither rule is a matter of picking a
 # better dominance query.
+#
+# ⭐ WHAT THE FAILING IR ACTUALLY LOOKS LIKE, read 2026-09-07 on the FLATTEST
+# case (`with G() as n: yield n`, no loop): the handler entry takes ONE
+# argument, `memref<5xi64>` -- the context manager object -- and the block that
+# branches to it passes its OWN block argument, not a definition. The same
+# object has a different SSA name in every block the flattening threaded it
+# through. So the missing input is a map from `handler argument index` to `the
+# name that value has AT THE ANCHOR`, which is a forward dataflow walk from the
+# anchor to the handler through the NORMAL edges -- not a dominance query at
+# all, and not something either dropped rule could have gotten right.
 #
 # ⛔ And a sibling shape that does NOT need a try at all is recorded separately
 # in wb_a_short_circuit_guard_around_a_yield.py: a short-circuit `and`/`or`
