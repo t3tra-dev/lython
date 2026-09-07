@@ -2358,11 +2358,28 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   // ⛔ "a guard OR AN ASSIGNMENT": a store proves what it wrote, the same way a
   // test proves what it tested, and the reader of this sentence was sent
   // looking for a guard that was never written.
-  what += testableUnion
-              ? "' is None here, after a guard or an assignment above proved "
-                "it was not: it changed in between"
-              : "' is not the class a guard or an assignment above proved it "
-                "was: it changed in between";
+  // ⭐ AND NAME WHAT IT IS NOT, once a union that is not an Optional can reach
+  // here. "is None here" was the whole story while `T | None` was the only
+  // shape a field guard narrowed; for `int | str` the reader was told the
+  // value is None when it is an int, which sends them looking for a `= None`
+  // that no line performs.
+  auto provedContract = mlir::dyn_cast_if_present<py::ContractType>(proved);
+  bool provedIsOptionalPayload =
+      rawUnion && rawUnion.isOptional() &&
+      rawUnion.getOptionalPayloadType() == proved;
+  if (!testableUnion)
+    what += "' is not the class a guard or an assignment above proved it "
+            "was: it changed in between";
+  else if (provedIsOptionalPayload || !provedContract)
+    what += "' is None here, after a guard or an assignment above proved "
+            "it was not: it changed in between";
+  else {
+    llvm::StringRef spelling = provedContract.getContractName();
+    spelling.consume_front("builtins.");
+    what += "' is not a '" + spelling.str() +
+            "' here, after a guard or an assignment above proved it was: it "
+            "changed in between";
+  }
   parser::NodePtr raise = synth::raiseStmt(
       synth::call(synth::name(subjectIsField ? "AttributeError" : "NameError",
                               anchor.range),

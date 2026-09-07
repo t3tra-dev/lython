@@ -244,3 +244,95 @@ def survives_an_unrelated_loop() -> int:
 
 
 print(cleared_in_a_loop(), cleared_in_a_nested_if(), survives_an_unrelated_loop())
+
+
+# ⭐ AND A UNION FIELD OF TWO REAL MEMBERS, which was gated off: narrowing an
+# `int | str` field to `str` used to reach the ownership verifier, and the
+# else arm of such a guard still read the whole union. Both were measured
+# against the dead value a field starts at, and that is what was actually
+# wrong; with it repaired the guard proves what it says on both sides.
+class Payload:
+    def __init__(self, v: "int | str") -> None:
+        self.v: "int | str" = v
+
+    def render(self) -> str:
+        if isinstance(self.v, str):
+            return self.v.upper()
+        return "num" + str(self.v + 1)
+
+
+def render_free(p: Payload) -> str:
+    if isinstance(p.v, str):
+        return "s:" + p.v + str(len(p.v))
+    return "i:" + str(p.v + 1)
+
+
+def render_else(p: Payload) -> str:
+    if isinstance(p.v, int):
+        return "i:" + str(p.v * 2)
+    else:
+        return "s:" + p.v
+
+
+class Three:
+    def __init__(self, v: "int | str | None") -> None:
+        self.v: "int | str | None" = v
+
+    def tell(self) -> str:
+        if isinstance(self.v, str):
+            return "s" + str(len(self.v))
+        elif isinstance(self.v, int):
+            return "i" + str(self.v + 1)
+        return "n"
+
+
+class Left:
+    def __init__(self) -> None:
+        self.k: int = 1
+
+
+class Right:
+    def __init__(self) -> None:
+        self.k: int = 2
+
+
+class Either:
+    def __init__(self, v: "Left | Right") -> None:
+        self.v: "Left | Right" = v
+
+    def tell(self) -> str:
+        if isinstance(self.v, Right):
+            return "R" + str(self.v.k)
+        return "L" + str(self.v.k)
+
+
+def a_union_field_under_a_chain(p: Payload) -> str:
+    if isinstance(p.v, str) and len(p.v) > 1:
+        return p.v + "!"
+    if not isinstance(p.v, str) or len(p.v) > 0:
+        return "other"
+    return "-"
+
+
+def a_union_field_in_a_loop(p: Payload) -> int:
+    total = 0
+    for _ in range(3):
+        if isinstance(p.v, str):
+            total += len(p.v)
+        else:
+            total += p.v
+    return total
+
+
+def union_fields() -> None:
+    print(Payload("ab").render(), Payload(4).render())
+    print(render_free(Payload("xy")), render_free(Payload(4)))
+    print(render_else(Payload("xy")), render_else(Payload(4)))
+    print(Three("abc").tell(), Three(6).tell(), Three(None).tell())
+    print(Either(Left()).tell(), Either(Right()).tell())
+    print(a_union_field_under_a_chain(Payload("ab")))
+    print(a_union_field_under_a_chain(Payload(3)))
+    print(a_union_field_in_a_loop(Payload("ab")), a_union_field_in_a_loop(Payload(5)))
+
+
+union_fields()

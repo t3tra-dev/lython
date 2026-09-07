@@ -1217,13 +1217,15 @@ optionalBranchTypeNarrowing(const parser::Node &test, TypeSystem &types,
                 bool testable =
                     memberAnalysis.kind ==
                         IsInstanceAnalysis::Kind::ClassTest ||
-                    optionalUnion;
+                    optionalUnion ||
+                    memberAnalysis.kind == IsInstanceAnalysis::Kind::UnionTest;
                 if (testable && memberAnalysis.trueType) {
                   BranchTypeNarrowing narrowing;
                   narrowing.isMemberPath = true;
                   narrowing.name = std::string(ast::nameSpelling(*owner)) +
                                    "." + std::string(*attr);
                   narrowing.trueType = memberAnalysis.trueType;
+                  narrowing.falseType = memberAnalysis.falseType;
                   // ⭐ The FALSE side matters for a union field and only for
                   // one: `int | str` minus `str` is `int`, and without it the
                   // else branch of `isinstance(self.payload, str)` still read
