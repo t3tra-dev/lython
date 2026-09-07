@@ -1276,11 +1276,45 @@ branchTypeNarrowings(const parser::Node &test, TypeSystem &types,
   auto add = [&](std::optional<BranchTypeNarrowing> fact) {
     if (!fact)
       return;
-    for (const BranchTypeNarrowing &seen : facts)
-      if (seen.name == fact->name)
+    for (BranchTypeNarrowing &seen : facts)
+      if (seen.name == fact->name) {
+        // ⭐ TWO FACTS ABOUT ONE NAME REFINE EACH OTHER. `if v is not None and
+        // isinstance(v, str)` proves both, and the first one kept the slot:
+        // `v` narrowed to `int | str` and the body still read the union, so
+        // `return v` from a `-> str` function was refused. An `and` evaluates
+        // left to right and each operand is proved under the ones before it,
+        // so the LATER fact is the refinement when its true type is
+        // assignable to the one standing.
+        //
+        // ⛔ Assignability and not "different": the operands of an `or` prove
+        // things on opposite sides, and two `and` operands can also disagree
+        // (`isinstance(v, str) and isinstance(v, int)` is a contradiction the
+        // walk must not turn into a proof). Keeping the first fact there is
+        // the conservative answer it already gave.
+        if (seen.trueType && fact->trueType && seen.trueType != fact->trueType &&
+            isAssignableWithStaticEvidence(fact->trueType, seen.trueType, from))
+          seen = std::move(*fact);
         return;
+      }
     facts.push_back(std::move(*fact));
   };
+  // ⭐ `not X` PROVES X's FACTS WITH THE SIDES SWAPPED, however many there are.
+  // The single-fact walk below handles `not isinstance(v, T)`, but `assert A
+  // and B` desugars to `if not (A and B): raise`, and asking the single-fact
+  // walk about the conjunction gave one fact for one name -- so the assert
+  // narrowed its first subject and left the second reading the union.
+  if (test.kind == "UnaryOp" &&
+      ast::isOperator(ast::node(test, "op"), "Not"))
+    if (const parser::Node *operand = ast::node(test, "operand")) {
+      llvm::SmallVector<BranchTypeNarrowing, 2> inner =
+          branchTypeNarrowings(*operand, types, from);
+      for (BranchTypeNarrowing &fact : inner) {
+        std::swap(fact.trueType, fact.falseType);
+        std::swap(fact.trueSourceType, fact.falseSourceType);
+        add(std::move(fact));
+      }
+      return facts;
+    }
   const parser::Node *op =
       test.kind == "BoolOp" ? ast::node(test, "op") : nullptr;
   const bool isAnd = op && op->kind == "And";
