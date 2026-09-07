@@ -41,6 +41,44 @@ def nested(rows: "list[list[int | str]]") -> list[str]:
     return [v for row in rows for v in row if isinstance(v, str)]
 
 
+# Through a LOCAL, which is where the emission has to know it. The direct
+# return above is decided by the expectation the caller pushes down; binding
+# the comprehension to a name first asks the emitter what it built, and it
+# answered list[int | str].
+def bound_first(items: "list[int | str]") -> list[str]:
+    out = [v for v in items if isinstance(v, str)]
+    return out
+
+
+def bound_then_grown(items: "list[int | str]") -> list[str]:
+    out = [v for v in items if isinstance(v, str)]
+    out.append("z")
+    return out
+
+
+def bound_none(items: "list[int | None]") -> int:
+    kept = [v for v in items if v is not None]
+    total = 0
+    for k in kept:
+        total += k
+    return total
+
+
+def bound_set(items: "list[int | str]") -> set[str]:
+    seen = {v for v in items if isinstance(v, str)}
+    return seen
+
+
+def bound_dict(items: "list[int | str]") -> dict[str, int]:
+    sizes = {v: len(v) for v in items if isinstance(v, str)}
+    return sizes
+
+
+def bound_nested(rows: "list[list[int | str]]") -> list[str]:
+    flat = [v for row in rows for v in row if isinstance(v, str)]
+    return flat
+
+
 def main() -> None:
     mixed: "list[int | str]" = [1, "a", 2, "bc"]
     print(only_text(mixed), "-".join(only_text(mixed)))
@@ -50,6 +88,9 @@ def main() -> None:
     print(both_facts([1, None, "x"]))
     print(measured(mixed), paired(mixed))
     print(nested([[1, "p"], ["q", 2]]))
+    print(bound_first(mixed), bound_then_grown(mixed))
+    print(bound_none([1, None, 5]), sorted(bound_set(mixed)), bound_dict(mixed))
+    print(bound_nested([[1, "p"], ["q", 2]]))
 
 
 main()

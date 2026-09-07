@@ -3528,6 +3528,24 @@ Value ModuleEmitter::emitComprehension(const parser::Node &expr,
                                 types.widenLiteral(itemInference.resultType));
         }
       }
+      // ⭐ AND WHAT THIS GENERATOR'S FILTERS PROVE, before the element
+      // expression is typed under them. `out = [v for v in xs if
+      // isinstance(v, str)]` built a `list[int | str]` -- the emitted
+      // container's element type is decided HERE, from the target as the
+      // iterable types it -- so a `-> list[str]` function returning the local
+      // was refused. The direct `return [...]` spelling worked, because there
+      // the expectation drives the emission and never asks this.
+      //
+      // ⛔ The NAME half only: a member path's proof is spent at the read and
+      // this walk has no read to spend it at.
+      for (const parser::NodePtr &filter : entry.filters) {
+        if (!filter)
+          continue;
+        for (const BranchTypeNarrowing &fact :
+             branchTypeNarrowings(*filter, types, module))
+          if (!fact.isMemberPath && fact.trueType)
+            types.bindLocalSymbol(fact.name, fact.trueType);
+      }
     }
     if (isDict) {
       keyType = types.widenLiteral(types.inferExpr(keyExpr.get()));
