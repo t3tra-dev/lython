@@ -195,18 +195,19 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::emitRuntimeException(
-    mlir::Operation *op, llvm::StringRef contract, llvm::StringRef message) {
+    mlir::Operation *op, llvm::StringRef contract, llvm::StringRef message,
+    bool pushTracebackFrame) {
   RuntimeBundle messageObject;
   if (mlir::failed(RuntimeBundleLowerer::materializeStringObject(
           op, message, messageObject)))
     return mlir::failure();
   return RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
-      op, contract, messageObject);
+      op, contract, messageObject, pushTracebackFrame);
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
     mlir::Operation *op, llvm::StringRef contract,
-    const RuntimeBundle &messageObject) {
+    const RuntimeBundle &messageObject, bool pushTracebackFrame) {
   mlir::Type exceptionType = runtimeContractType(context, contract);
   RuntimeBundle classObject = RuntimeBundle::typeObject(
       runtimeContractType(context, "builtins.type"), exceptionType);
@@ -261,7 +262,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
                            << ".raise primitive";
   llvm::SmallVector<const RuntimeBundle *, 1> raiseSources{&exception};
   llvm::SmallVector<mlir::Value, 8> raiseOperands;
-  if (mlir::failed(emitTracebackFrame(op)))
+  if (pushTracebackFrame && mlir::failed(emitTracebackFrame(op)))
     return mlir::failure();
   if (mlir::failed(buildRuntimeCallOperands(op, *raise, raiseSources,
                                             raiseOperands,

@@ -1420,13 +1420,20 @@ private:
                           bool allowUnusedSources);
   mlir::LogicalResult lowerNew(py::NewOp op);
   mlir::LogicalResult lowerInit(py::InitOp op);
+  // ⛔ `pushTracebackFrame=false` for a raise with NO PYTHON FRAME OF ITS OWN.
+  // The generator exhaustion protocol raises StopIteration after the body has
+  // returned, so CPython's traceback shows the caller's frame and nothing
+  // else -- see getOrCreateGeneratorAdvanceFunction, whose `op` is whichever
+  // resume site happened to materialize the clone.
   mlir::LogicalResult emitRuntimeException(mlir::Operation *op,
                                            llvm::StringRef contract,
-                                           llvm::StringRef message);
+                                           llvm::StringRef message,
+                                           bool pushTracebackFrame = true);
   mlir::LogicalResult
   emitRuntimeExceptionFromMessageObject(mlir::Operation *op,
                                         llvm::StringRef contract,
-                                        const RuntimeBundle &messageObject);
+                                        const RuntimeBundle &messageObject,
+                                        bool pushTracebackFrame = true);
   mlir::LogicalResult
   emitRaiseExceptionBundle(mlir::Operation *op, const RuntimeBundle &exception,
                            mlir::Operation *insertBefore = nullptr);

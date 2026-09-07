@@ -2723,8 +2723,16 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
             op, runtimeContractType(context, "builtins.str"),
             text.getResults(), message)))
       return mlir::failure();
+    // ⛔ NO FRAME FOR THIS RAISE. The body has already returned when the
+    // exhaustion StopIteration is raised, so CPython's traceback for
+    // `next(gen)` on a finished generator shows the CALLER's frame and
+    // nothing else -- and this function is built once, at whichever resume
+    // site materialized the clone, so the frame it pushed named that site
+    // forever. `next(a)` once and then `next(b)` to exhaustion reported a
+    // frame on A.
     if (mlir::failed(RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
-            op, "builtins.StopIteration", message)))
+            op, "builtins.StopIteration", message,
+            /*pushTracebackFrame=*/false)))
       return mlir::failure();
   }
   mlir::Block *deadBlock = builder.createBlock(&body);
@@ -2737,8 +2745,9 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   mlir::func::CallOp::create(
       builder, loc, getOrCreateDiscardCurrentException(module, builder),
       mlir::ValueRange{});
+  // No frame here either, for the reason the value-carrying arm above gives.
   if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
-          op, "builtins.StopIteration", "")))
+          op, "builtins.StopIteration", "", /*pushTracebackFrame=*/false)))
     return mlir::failure();
   mlir::Block *deadBlock2 = builder.createBlock(&body);
   builder.setInsertionPointToEnd(plainBlock);
