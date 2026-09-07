@@ -3,6 +3,28 @@
 # structure with it, was refused: "union<Tree, None> does not provide manifest
 # method 'insert'". `v = self.left; if v is not None:` -- the same program with
 # the read bound first -- has always compiled.
+#
+# ⭐ AND THE PROOF SPENT INSIDE A SHORT-CIRCUIT CHAIN, which is how a running
+# maximum is written:
+#
+#     if self.best is None or v > self.best:
+#
+# The chain bound the PATH as a local symbol, so `types.lookupSymbol("self.best")`
+# answered and the attribute read took the qualified-module-symbol road:
+# "unresolved runtime binding 'self.best'" out of the lowering. A path's proof
+# is spent at the READ with a check, and it is recorded per OPERAND -- recording
+# it for the whole chain made the read in the operand that PROVES it check a
+# fact that does not hold yet, and it raised.
+#
+# ⭐ AND A WRITE UNDER SUCH A PROOF. `if s.best is not None: s.best = 3` stored
+# `literal<3>` into a field whose lanes are a union -- the store did not coerce
+# to the DECLARED type, because the value had already been typed by the
+# narrowing -- and the program SEGFAULTED with the guard false, so the store
+# never even ran. The `else` spelling and the same write with the field already
+# set were both correct, which is what kept it hidden.
+#
+# Why this must run: every line below is a value, and both defects were silent
+# (one a crash, one a lowering message about a binding nobody wrote).
 
 
 class Tree:
@@ -111,3 +133,63 @@ b = Box()
 print(b.shout(), b.sized(), b.shouted())
 b.set("Ab")
 print(b.shout(), b.sized(), b.shouted())
+
+
+class Stats:
+    def __init__(self) -> None:
+        self.best: "int | None" = None
+        self.worst: "int | None" = None
+        self.tag: "str | None" = None
+
+    def add(self, v: int) -> None:
+        if self.best is None or v > self.best:
+            self.best = v
+        if self.worst is not None and v < self.worst:
+            self.worst = v
+        elif self.worst is None:
+            self.worst = v
+
+    def label(self, t: str) -> None:
+        if self.tag is None or t > self.tag:
+            self.tag = t
+
+
+def high_water(values: list[int]) -> "int | None":
+    best: "int | None" = None
+    for v in values:
+        if best is None or v > best:
+            best = v
+    return best
+
+
+class Slot:
+    def __init__(self) -> None:
+        self.v: "int | None" = None
+
+
+def written_under_a_guard() -> None:
+    s = Slot()
+    # The guard is FALSE, so the body never runs -- and the store inside it
+    # still has to be lowered against the declared union.
+    if s.v is not None:
+        s.v = 3
+    print(s.v is None)
+    s.v = 1
+    if s.v is not None:
+        s.v = 3
+    print(s.v)
+
+
+def main() -> None:
+    stats = Stats()
+    for v in [3, 7, 2, 7]:
+        stats.add(v)
+    stats.label("b")
+    stats.label("a")
+    stats.label("c")
+    print(stats.best, stats.worst, stats.tag)
+    print(high_water([]), high_water([4]), high_water([4, 9, 1]))
+    written_under_a_guard()
+
+
+main()

@@ -684,6 +684,11 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       // later operand may narrow the same name again, and shadowing in place
       // is what makes the last proof win.
       auto narrowingScope = types.pushScope();
+      // ⛔ AND THE MEMBER PROOFS, which do not live on the scope. They are
+      // restored the way the conditional expression restores its own.
+      llvm::StringMap<mlir::Type> savedNarrowedMembers = narrowedMemberTypes;
+      auto restoreNarrowedMembers = llvm::make_scope_exit(
+          [&] { narrowedMemberTypes = savedNarrowedMembers; });
       llvm::SmallVector<std::pair<std::string, Value>, 4> restoreValues;
       // ⛔ THE PROOFS ARE READ ONCE, BEFORE ANY OF THEM IS APPLIED. Asking
       // again during emission asks a `types` that already carries the answer:
@@ -715,7 +720,33 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
               isAnd ? narrowing->trueType : narrowing->falseType;
           if (narrowed) {
             narrowing->trueType = narrowed;
-            types.bindLocalSymbol(narrowing->name, narrowed);
+            // ⛔ A FIELD PATH IS NOT A SYMBOL. Binding `self.best` as a local
+            // made `types.lookupSymbol("self.best")` answer, and the ATTRIBUTE
+            // read then took the qualified-module-symbol road and emitted
+            // `py.binding.ref "self.best"` -- "unresolved runtime binding
+            // 'self.best'" out of the lowering, for
+            //
+            //     if self.best is None or v > self.best:
+            //
+            // which is how every running-maximum is written. The proof for a
+            // path is spent at the READ, with a check, like every other member
+            // narrowing.
+            // ⛔ A FIELD PATH IS NOT A SYMBOL, and its proof is not applied
+            // HERE. Binding `self.best` as a local made
+            // `types.lookupSymbol("self.best")` answer, and the ATTRIBUTE read
+            // then took the qualified-module-symbol road and emitted
+            // `py.binding.ref "self.best"` -- "unresolved runtime binding
+            // 'self.best'" out of the lowering, for
+            //
+            //     if self.best is None or v > self.best:
+            //
+            // which is how every running maximum is written. A path's proof is
+            // spent at the READ with a check, and this loop runs BEFORE any
+            // operand is emitted -- recording it here made the read in the
+            // operand that PROVES it check a fact that does not hold yet, and
+            // it raised. It goes on with the value half instead, per operand.
+            if (!narrowing->isMemberPath)
+              types.bindLocalSymbol(narrowing->name, narrowed);
           } else {
             narrowing.reset();
           }
@@ -733,10 +764,23 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       }
       // The VALUE half, emitted where the proof holds: an unwrap at the top of
       // the block that only runs when the earlier operands decided that way.
+      llvm::SmallVector<std::pair<std::string, std::optional<mlir::Type>>, 2>
+          restoreMembers;
       auto proveValue = [&](unsigned index) {
         if (index >= proven.size() || !proven[index])
           return;
         const BranchTypeNarrowing &narrowing = *proven[index];
+        // A path's proof is a fact the READ spends, so it is recorded for the
+        // operands after the one that proved it and undone with the values.
+        if (narrowing.isMemberPath) {
+          auto standing = narrowedMemberTypes.find(narrowing.name);
+          restoreMembers.push_back(
+              {narrowing.name, standing == narrowedMemberTypes.end()
+                                   ? std::optional<mlir::Type>()
+                                   : std::optional<mlir::Type>(standing->second)});
+          narrowedMemberTypes[narrowing.name] = narrowing.trueType;
+          return;
+        }
         auto found = values.find(narrowing.name);
         if (found == values.end())
           return;
@@ -771,6 +815,13 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         for (auto &saved : llvm::reverse(restoreValues))
           values[saved.first] = saved.second;
         restoreValues.clear();
+        for (auto &saved : llvm::reverse(restoreMembers)) {
+          if (saved.second)
+            narrowedMemberTypes[saved.first] = *saved.second;
+          else
+            narrowedMemberTypes.erase(saved.first);
+        }
+        restoreMembers.clear();
       };
       if (allBool) {
         mlir::Value accumulated =
