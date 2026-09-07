@@ -1317,6 +1317,21 @@ constexpr NameAliasImport kNameAliasImports[] = {
     // binding exists only so the import resolves.
     {"typing", "NamedTuple", "typing.NamedTuple", false},
     {"typing_extensions", "NamedTuple", "typing.NamedTuple", false},
+    // ⭐ `ABC` IS `object` HERE. An abstract base declares an interface and
+    // carries no state or behaviour of its own, and this compiler already
+    // dispatches an overridden method from a base-typed receiver -- which is
+    // the whole of what an ABC buys a running program. `@abstractmethod` was
+    // ALREADY recognized as a decorator; only the import that names it was
+    // refused, so `from abc import ABC, abstractmethod` -- the first two lines
+    // of every interface in Python -- stopped at "unsupported import
+    // 'abc.abstractmethod'".
+    //
+    // ⛔ NOT the instantiation check. CPython refuses `Shape()` when an
+    // abstract method is unimplemented; here `Shape` is an ordinary class and
+    // constructing it runs the stub. That is a deviation and it is the same
+    // one `@overload` and `@final` already carry: the marker constrains the
+    // CHECKER, and this compiler's checker is the type system.
+    {"abc", "abstractmethod", "abc.abstractmethod", false},
 };
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {
@@ -2663,6 +2678,22 @@ bool TypeSystem::bindImportedName(llvm::StringRef module,
       continue;
     bindCanonicalSymbol(localName, entry.canonicalName,
                         contract(entry.contract));
+    return true;
+  }
+
+  // ⭐ `ABC` IS `object` HERE, and it is bound as a CLASS because that is what
+  // it is used as: a base. An abstract base declares an interface and carries
+  // no state or behaviour of its own, and dispatching an overridden method
+  // from a base-typed receiver -- the whole of what an ABC buys a RUNNING
+  // program -- this compiler already does for any base.
+  //
+  // ⛔ NOT the instantiation check. CPython refuses `Shape()` while an
+  // abstract method is unimplemented; here `Shape` is an ordinary class and
+  // constructing it runs the stub body. That is a deviation, and it is the one
+  // `@overload` and `@final` already carry: the marker constrains a CHECKER,
+  // and this compiler's checker is its type system.
+  if (module == "abc" && exportedName == "ABC") {
+    bindClass(localName, contract("builtins.object"));
     return true;
   }
 

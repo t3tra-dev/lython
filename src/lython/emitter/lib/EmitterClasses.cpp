@@ -2991,11 +2991,22 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     llvm::StringRef canonical = index < canonicalBases.size()
                                     ? llvm::StringRef(canonicalBases[index])
                                     : base;
-    if (canonical != base && canonical.contains('.') &&
-        classBaseNames.count(canonical))
-      emittedBases.push_back(canonical.str());
-    else
+    if (canonical != base && canonical.contains('.')) {
+      if (classBaseNames.count(canonical)) {
+        emittedBases.push_back(canonical.str());
+      } else {
+        // ⭐ AND AN ALIAS OF A MANIFEST BASE RESOLVES TO THE SPELLING THE
+        // TAXONOMY KNOWS. `from abc import ABC` binds ABC to `builtins.object`,
+        // and keeping the source spelling handed the dialect a base it has
+        // never heard of: "'py.class' op unknown base class 'ABC'". Every
+        // other manifest base is written under its own name, where the raw
+        // spelling and this one agree.
+        emittedBases.push_back(
+            py::contracts::manifestClassNameForContract(canonical));
+      }
+    } else {
       emittedBases.push_back(base.str());
+    }
   }
   state.addAttribute("base_names", stringArray(builder, emittedBases));
   state.addAttribute("field_names", stringArray(builder, fieldNames));
