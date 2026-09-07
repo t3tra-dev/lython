@@ -495,15 +495,24 @@ void bindGeneratorAnalysisTarget(const TypeSystem &types,
 void applyGuardNarrowing(
     const TypeSystem &types, const parser::Node *test,
     llvm::function_ref<mlir::Type(llvm::StringRef)> currentType,
-    llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow) {
+    llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow,
+    bool onFalseSide = false) {
   if (!test)
     return;
   if (test->kind == "BoolOp" && ast::isOperator(ast::node(*test, "op"), "And")) {
+    // ⛔ An `and` proves nothing on its FALSE side: any one operand may be the
+    // one that failed.
+    if (onFalseSide)
+      return;
     if (const auto *values = ast::nodeList(*test, "values"))
       for (const parser::NodePtr &value : *values)
         applyGuardNarrowing(types, value.get(), currentType, narrow);
     return;
   }
+  // ⛔ And neither does an isinstance: eliminating one class from a plain
+  // contract leaves the contract, which is what the reader already has.
+  if (onFalseSide && test->kind == "Call")
+    return;
   if (test->kind == "Call") {
     const parser::Node *callee = ast::node(*test, "func");
     const auto *args = ast::nodeList(*test, "args");
@@ -526,16 +535,38 @@ void applyGuardNarrowing(
   const parser::Node *left = ast::node(*test, "left");
   const auto *ops = ast::nodeList(*test, "ops");
   const auto *comparators = ast::nodeList(*test, "comparators");
-  if (!left || left->kind != "Name" || !ops || ops->size() != 1 ||
-      !comparators || comparators->size() != 1 || !comparators->front() ||
-      !ast::isOperator(ops->front().get(), "IsNot") ||
+  // ⭐ A `name.attr` SUBJECT TOO, reported under its dotted path. `if
+  // self.rows is None: return` is the same proof about the same value as the
+  // parameter spelling, and a generator whose loop reads the field asked the
+  // union for an element type without it.
+  bool subjectIsAPath = left && left->kind == "Attribute" &&
+                        ast::node(*left, "value") &&
+                        ast::node(*left, "value")->kind == "Name";
+  if (!left || (left->kind != "Name" && !subjectIsAPath) || !ops ||
+      ops->size() != 1 || !comparators || comparators->size() != 1 ||
+      !comparators->front() ||
+      !ast::isOperator(ops->front().get(), onFalseSide ? "Is" : "IsNot") ||
       !ast::isNoneField(*comparators->front(), "value"))
     return;
-  llvm::StringRef name = ast::nameSpelling(*left);
+  std::string pathStorage;
+  if (subjectIsAPath)
+    pathStorage = ast::qualifiedName(left);
+  llvm::StringRef name = subjectIsAPath
+                             ? llvm::StringRef(pathStorage)
+                             : llvm::StringRef(ast::nameSpelling(*left));
+  if (subjectIsAPath && name.empty())
+    return;
   mlir::Type current = currentType(name);
-  if (!current)
+  if (!current && !subjectIsAPath)
     if (std::optional<mlir::Type> bound = types.lookupSymbol(name))
       current = *bound;
+  // ⛔ A PATH HAS NO SYMBOL. Its declared type comes from the class schema, so
+  // the walk asks the inference for the field itself -- without this the
+  // fallback answered null and the proof was dropped, which is why
+  // `if self.rows is None: return` narrowed nothing and the loop below it
+  // asked the union for an element type.
+  if (!current && subjectIsAPath)
+    current = types.inferExpr(left);
   auto unionType =
       mlir::dyn_cast_if_present<py::UnionType>(types.widenLiteral(current));
   if (!unionType)
@@ -566,11 +597,12 @@ void applyGeneratorGuardNarrowing(
     const TypeSystem &types, const parser::Node *test,
     const llvm::StringMap<mlir::Type> &localCallables,
     GeneratorFunctionAnalysis &analysis,
-    llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow) {
+    llvm::function_ref<void(llvm::StringRef, mlir::Type)> narrow,
+    bool onFalseSide = false) {
   applyGuardNarrowing(
       types, test,
       [&](llvm::StringRef name) { return analysis.localSymbols.lookup(name); },
-      narrow);
+      narrow, onFalseSide);
 }
 
 void collectGeneratorFunctionAnalysis(
@@ -790,6 +822,31 @@ void collectGeneratorFunctionAnalysis(
       else
         analysis.localSymbols.erase(entry.first);
     }
+    // ⭐ AND THE SURVIVING SIDE, which the emitter's own `if` has carried for a
+    // while and this walk had not. `if rows is None: return` leaves everything
+    // below it reading a proved value, and without the fact the LOOP over it
+    // asked the union for an element type and got `object`:
+    //
+    //     def walk(rows: "list[int] | None") -> Iterator[int]:
+    //         if rows is None:
+    //             return
+    //         for v in rows:
+    //             yield v * 2
+    //     # annotated Iterator[int] but yields builtins.object
+    //
+    // ⛔ Only when the body cannot fall through -- otherwise the code below
+    // the statement is reached on both sides and the guard proves nothing
+    // there.
+    if (const auto *body = ast::nodeList(*node, "body");
+        body && !body->empty() && body->back() &&
+        (body->back()->kind == "Return" || body->back()->kind == "Raise" ||
+         body->back()->kind == "Continue" || body->back()->kind == "Break"))
+      applyGeneratorGuardNarrowing(
+          types, ast::node(*node, "test"), localCallables, analysis,
+          [&](llvm::StringRef name, mlir::Type narrowed) {
+            analysis.localSymbols[name] = narrowed;
+          },
+          /*onFalseSide=*/true);
     if (const auto *orelse = ast::nodeList(*node, "orelse"))
       for (const parser::NodePtr &statement : *orelse)
         collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
@@ -3356,6 +3413,12 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
   }
   if (node->kind == "Attribute") {
     std::string qualified = ast::qualifiedName(node);
+    // A proved field path is carried in the same map as a local, under its
+    // dotted name -- a local name can never collide with one.
+    if (!qualified.empty() && ctx && ctx->localSymbols)
+      if (auto proved = ctx->localSymbols->find(qualified);
+          proved != ctx->localSymbols->end())
+        return proved->second;
     if (!qualified.empty()) {
       if (std::optional<mlir::Type> constant = staticStringLiteral(qualified))
         return *constant;

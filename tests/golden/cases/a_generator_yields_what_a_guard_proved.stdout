@@ -2,3 +2,7 @@ isinstance ['named']
 is not None ['A', 'B']
 chained ['A', 'B']
 both arms ['A', 'none']
+[] []
+[]
+[2, 4, 6] [2, 3, 4]
+[3, 6, 9] 12
