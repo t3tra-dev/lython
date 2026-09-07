@@ -1031,12 +1031,46 @@ bool RuntimeBundleLowerer::storedSourceOutlivesStore(mlir::Operation *op,
   mlir::Operation *function = op->getParentOfType<mlir::func::FuncOp>();
   if (!function)
     return false;
+  // ⭐ REACHABLE FROM THE STORE, not dominated by it. Dominance answers "this
+  // use always runs after the store", which a CONDITIONAL store never gets:
+  //
+  //     tail: "N | None" = None
+  //     for v in xs:
+  //         node = N(v)
+  //         if tail is not None:
+  //             tail.nxt = node      # the store is in the guarded arm
+  //         tail = node              # the join dominates nothing above it
+  //
+  // The join block that carries `node` on is not dominated by the store -- the
+  // else path skips it -- so this said "nobody else needs this", the store
+  // MOVED the frame's token into the slot, and the local was left holding a
+  // spent one: "Ly_DecRef observed non-positive refcount" from the second trip
+  // on, for the shape every linked list is built with.
+  //
+  // ⛔ Reachability is the conservative direction. It answers yes to some uses
+  // that cannot actually run after the store, and the cost of a wrong yes is a
+  // RETAIN where a move would have done -- the frame keeps its token and its
+  // own release discharges it. The cost of a wrong no is a double free.
+  llvm::SmallPtrSet<mlir::Block *, 16> reachable;
+  {
+    llvm::SmallVector<mlir::Block *, 16> worklist(op->getBlock()->succ_begin(),
+                                                  op->getBlock()->succ_end());
+    while (!worklist.empty()) {
+      mlir::Block *current = worklist.pop_back_val();
+      if (!reachable.insert(current).second)
+        continue;
+      worklist.append(current->succ_begin(), current->succ_end());
+    }
+  }
   mlir::DominanceInfo dominance(function);
   for (mlir::OpOperand &use : source.getUses()) {
     mlir::Operation *user = use.getOwner();
     if (user == op)
       continue;
     if (dominance.properlyDominates(op, user))
+      return true;
+    if (mlir::Block *userBlock = user->getBlock();
+        userBlock && reachable.contains(userBlock))
       return true;
   }
   return false;
@@ -2753,7 +2787,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
         source->kind == RuntimeBundle::Kind::Object &&
         source->objectValue.ownership == ownership::OwnershipKind::Own &&
         (!source->physicalValues().empty() ||
-         RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source));
+         RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) &&
+        // ⛔ AND ONLY IF THE SOURCE DIES HERE, which the boxed-field arm above
+        // has always asked and this one did not. A store MOVES the frame's
+        // token into the slot; when the same value is still bound afterwards
+        // the store has to RETAIN instead, or the local is left holding a
+        // token that has already been spent:
+        //
+        //     tail: "N | None" = None
+        //     for v in xs:
+        //         node = N(v)
+        //         if tail is not None:
+        //             tail.nxt = node      # nxt: "N | None" -- this arm
+        //         tail = node              # ... and node outlives the store
+        //
+        // crashed with "Ly_DecRef observed non-positive refcount" from the
+        // second iteration on -- building a linked list, which is as ordinary
+        // as this shape gets. A non-union field of the same class was correct,
+        // because its store asks.
+        !RuntimeBundleLowerer::storedSourceOutlivesStore(op, op.getValue());
   }
   // And the release names the object the STORE materialized, not the lazy
   // bundle it was handed: releasing through the latter would box a SECOND int
