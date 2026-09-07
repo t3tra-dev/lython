@@ -29,6 +29,34 @@
 
 namespace lython::emitter {
 
+// ⭐ TWO TYPE OBJECTS NAME ONE CLASS WHEN THEIR CONTRACTS DO, arguments aside.
+// `list[int]` and `list[str]` are the same runtime class -- CPython answers
+// True to `type([1]) is type(["a"])` -- because the parameters are the
+// emitter's evidence about the ELEMENTS, not a second class. Comparing the
+// instance types whole answered False to every one of those, silently, for
+// list, dict, set and tuple alike.
+//
+// ⛔ A MONOMORPHIZED SOURCE GENERIC IS THE SAME CASE, spelled in the contract
+// NAME instead of its arguments: `Box[int]` and `Box[str]` are `Box$spec0` and
+// `Box$spec1` here because each instantiation needs its own field layout, and
+// they are one class `Box` to the program -- which is already what
+// `type(bi).__name__` answers, so the identity fold disagreeing with the name
+// fold was the visible half. The suffix cannot collide with a class of its
+// own: `$` is not an identifier character.
+static bool typeObjectsNameOneClass(mlir::Type lhsInstance,
+                                    mlir::Type rhsInstance) {
+  auto lhs = mlir::dyn_cast_if_present<py::ContractType>(lhsInstance);
+  auto rhs = mlir::dyn_cast_if_present<py::ContractType>(rhsInstance);
+  if (!lhs || !rhs)
+    return lhsInstance == rhsInstance;
+  auto declaringClass = [](llvm::StringRef name) {
+    std::size_t spec = name.rfind("$spec");
+    return spec == llvm::StringRef::npos ? name : name.take_front(spec);
+  };
+  return declaringClass(lhs.getContractName()) ==
+         declaringClass(rhs.getContractName());
+}
+
 // origin -> then/else -> merge(block argument) with cf branches: the one
 // shape every two-armed value merge in the emitter uses (a conditional whose
 // arms may themselves open new blocks, so each arm branches from wherever
@@ -1539,7 +1567,8 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
   if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
     if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
       if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
-        bool same = lhsType.getInstanceType() == rhsType.getInstanceType();
+        bool same = typeObjectsNameOneClass(lhsType.getInstanceType(),
+                                           rhsType.getInstanceType());
         bool truth = ast::isOperator(op, "NotEq") ? !same : same;
         mlir::Type literalType = types.literal(truth ? "True" : "False");
         auto constant = py::BoolConstantOp::create(
@@ -1636,7 +1665,8 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
     // cannot depend on anything the program does at run time.
     if (auto lhsType = mlir::dyn_cast_if_present<py::TypeType>(lhs.type))
       if (auto rhsType = mlir::dyn_cast_if_present<py::TypeType>(rhs.type)) {
-        bool same = lhsType.getInstanceType() == rhsType.getInstanceType();
+        bool same = typeObjectsNameOneClass(lhsType.getInstanceType(),
+                                           rhsType.getInstanceType());
         bool truth = negatedIdentity ? !same : same;
         mlir::Type literalType = types.literal(truth ? "True" : "False");
         auto constant = py::BoolConstantOp::create(

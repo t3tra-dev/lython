@@ -32,6 +32,13 @@
 # `type(a) == type(b)` folds like the `is` spelling, because a class has exactly
 # one type object and a reader picks either.
 #
+# ⭐ THE ELEMENT TYPES ARE NOT PART OF THE CLASS. `list[int]` and `list[str]`
+# are one runtime class -- CPython answers True to `type([1]) is type(["a"])` --
+# and so is a monomorphized source generic, whose instantiations are separate
+# CONTRACTS here (`Box$spec0`, `Box$spec1`) only because each needs its own
+# field layout. Comparing the contracts whole answered False to every one of
+# those, silently, while `__name__` beside it answered `list` and `Box`.
+#
 # ⛔ Refused, and the refusal is the point: `type(o)` on a type-erased value, and
 # `type(v) is B` where the static class has a subclass -- the type OBJECT there
 # would have to be a runtime value, which is a different mechanism from the name.
@@ -91,6 +98,27 @@ maybe: int | None = None
 print(described(1), described("a"), described(2.5), type(maybe).__name__)
 print(x.__class__.__name__, x.__class__ is C, x.__class__ == C)
 print(type(1) == type(2), type(1) == type("a"), type(1) != type("a"))
+ints: list[int] = [1]
+texts: list[str] = ["a"]
+print(type(ints) is type(texts), type(ints) == type(texts), type(ints) is not type(texts))
+print(type({"a": 1}) == type({1: "a"}), type({1}) == type({"a"}), type((1,)) == type(("a",)))
+print(type(ints) == type({1}), type(ints) == type((1,)))
+
+
+class Holder[T]:
+    def __init__(self, v: T) -> None:
+        self.v: T = v
+
+
+class Other[T]:
+    def __init__(self, v: T) -> None:
+        self.v: T = v
+
+
+held = Holder(1)
+spelled = Holder("a")
+print(type(held) == type(spelled), type(held) is type(spelled))
+print(type(held) == type(Other(1)), type(held).__name__, type(spelled).__name__)
 
 
 class Shape:

@@ -6,6 +6,11 @@ int 1
 int str float NoneType
 C True True
 True False True
+True True False
+True True True
+False False
+True True
+False Holder Holder
 ['Circle', 'Square', 'Shape']
 a
 NotFound missing b
