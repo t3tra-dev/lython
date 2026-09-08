@@ -5035,7 +5035,15 @@ Value ModuleEmitter::emitInlineMethodBody(
     superContexts.pop_back();
   inlineReturnContexts.pop_back();
   if (!insertionBlockTerminated(builder)) {
-    if (resultType != types.none()) {
+    // ⛔ AND NOT WHERE NOTHING REACHES THE END. A body whose only exit is a
+    // return leaves an unreachable tail behind -- `while True:` with no break
+    // builds one, and it is how a recursive-descent parser's loops are
+    // written -- so reporting a fallthrough there refused a program CPython
+    // runs. The same syntactic question the function epilogue asks
+    // (`bodyCanComplete`) answers it here, and the tail gets the raise that
+    // path gets rather than a None the declared result cannot hold.
+    if (resultType != types.none() &&
+        bodyCanComplete(ast::nodeList(*method.method, "body"))) {
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, method.method->range.start,
           "inlined class method can fall through without returning a value"});

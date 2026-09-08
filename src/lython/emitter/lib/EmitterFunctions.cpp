@@ -369,10 +369,49 @@ namespace {
 //
 // ⛔ CONSERVATIVE IN ONE DIRECTION ONLY: anything not recognised is assumed to
 // complete, so the worst this can do is ask for a return that CPython would
-// have defaulted. A `while True:` with no break is not modelled -- reading the
-// loop for a break is a different analysis and it only ever ADDS unreachable
-// ends, never removes one.
-bool bodyCanComplete(const std::vector<parser::NodePtr> *body);
+// have defaulted.
+
+// Does a `break` in here leave the loop this body belongs to? A nested loop's
+// BODY owns its own breaks, so the walk stops there -- but its `else` does
+// not: a break in a nested loop's else targets the outer one.
+//
+// ⛔ Conservative toward "yes". A missed break makes the enclosing
+// `while True:` look inescapable, and the emitter then puts a raise at the
+// function's end -- which would fire on a program CPython returns None from.
+bool bodyBreaksOutOfItsLoop(const std::vector<parser::NodePtr> *body);
+
+bool statementBreaksOutOfItsLoop(const parser::Node &node) {
+  llvm::StringRef kind = node.kind;
+  if (kind == "Break")
+    return true;
+  if (kind == "FunctionDef" || kind == "AsyncFunctionDef" ||
+      kind == "Lambda" || kind == "ClassDef")
+    return false;
+  if (kind == "While" || kind == "For" || kind == "AsyncFor")
+    return bodyBreaksOutOfItsLoop(ast::nodeList(node, "orelse"));
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child && statementBreaksOutOfItsLoop(**child))
+        return true;
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &child : *children)
+        if (child && statementBreaksOutOfItsLoop(*child))
+          return true;
+  }
+  return false;
+}
+
+bool bodyBreaksOutOfItsLoop(const std::vector<parser::NodePtr> *body) {
+  if (!body)
+    return false;
+  for (const parser::NodePtr &statement : *body)
+    if (statement && statementBreaksOutOfItsLoop(*statement))
+      return true;
+  return false;
+}
 
 bool statementCanComplete(const parser::Node &statement) {
   llvm::StringRef kind = statement.kind;
@@ -388,6 +427,32 @@ bool statementCanComplete(const parser::Node &statement) {
   }
   if (kind == "With" || kind == "AsyncWith")
     return bodyCanComplete(ast::nodeList(statement, "body"));
+  // ⭐ `while True:` WITH NO BREAK CANNOT COMPLETE, and it is how a
+  // recursive-descent parser's loops are written:
+  //
+  //     def term(self) -> int:
+  //         value = self.factor()
+  //         while True:
+  //             if self.eat("*"):
+  //                 value = value * self.factor()
+  //             else:
+  //                 return value
+  //
+  // was refused with "this function can reach its end without returning",
+  // which it cannot: the only way out is the return.
+  //
+  // ⛔ An `else` on such a loop keeps the conservative answer. It is dead code
+  // in CPython too, and reading it as unreachable is the direction that puts a
+  // raise at a function's end.
+  if (kind == "While") {
+    const parser::Node *test = ast::node(statement, "test");
+    bool alwaysTrue = test && test->kind == "Constant" &&
+                      ast::boolean(*test, "value").value_or(false);
+    const auto *orelse = ast::nodeList(statement, "orelse");
+    if (!alwaysTrue || (orelse && !orelse->empty()))
+      return true;
+    return bodyBreaksOutOfItsLoop(ast::nodeList(statement, "body"));
+  }
   // ⛔ A `match` WITH AN IRREFUTABLE CASE IS EXHAUSTIVE, which is how a
   // dispatch-by-value function ends: `case _:` (or a bare capture) always
   // matches, so if no case body completes, neither does the statement.
@@ -443,6 +508,8 @@ bool statementCanComplete(const parser::Node &statement) {
   return true;
 }
 
+} // namespace
+
 bool bodyCanComplete(const std::vector<parser::NodePtr> *body) {
   if (!body)
     return true;
@@ -451,8 +518,6 @@ bool bodyCanComplete(const std::vector<parser::NodePtr> *body) {
       return false;
   return true;
 }
-
-} // namespace
 
 void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                                          llvm::StringRef symbolName,

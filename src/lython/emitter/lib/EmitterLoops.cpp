@@ -1648,9 +1648,24 @@ void ModuleEmitter::emitWhile(const parser::Node &statement) {
   if (afterForwardsCarried)
     headerArgs.append(postTestValues.begin(), postTestValues.end());
   mlir::Block *conditionFalseTarget = elseBlock ? elseBlock : afterBlock;
-  mlir::cf::CondBranchOp::create(builder, loc(statement), condition, bodyBlock,
-                                 mlir::ValueRange{}, conditionFalseTarget,
-                                 headerArgs);
+  // ⭐ `while True:` HAS NO FALSE EDGE, and the edge was the whole difference
+  // between what the program says and what the IR said. A constant-true header
+  // that still branches to the after-block makes that block reachable, so a
+  // method whose only exit is a `return` inside the loop was reported as
+  // falling through -- the shape every recursive-descent parser's `term()` and
+  // `expr()` are written in. With the edge gone the after-block has only the
+  // `break` edges it should have, and no break means no predecessors.
+  bool headerIsAlwaysTrue = false;
+  if (const parser::Node *headerTest = ast::node(statement, "test"))
+    headerIsAlwaysTrue = headerTest->kind == "Constant" &&
+                         ast::boolean(*headerTest, "value").value_or(false);
+  if (headerIsAlwaysTrue && !elseBlock) {
+    mlir::cf::BranchOp::create(builder, loc(statement), bodyBlock);
+  } else {
+    mlir::cf::CondBranchOp::create(builder, loc(statement), condition,
+                                   bodyBlock, mlir::ValueRange{},
+                                   conditionFalseTarget, headerArgs);
+  }
 
   builder.setInsertionPointToStart(bodyBlock);
   {

@@ -88,6 +88,13 @@ struct NoneComparisonNarrowing {
   mlir::Type payloadType;
 };
 
+// Can control reach the end of this body? Used by both fall-through checks:
+// the function epilogue (which fabricates a `return None`) and the inlined
+// method's (which has already built the IR). Conservative toward YES --
+// anything unrecognised completes -- because the cost of a wrong NO is a raise
+// at the end of a function CPython returns None from.
+bool bodyCanComplete(const std::vector<parser::NodePtr> *body);
+
 struct BranchTypeNarrowing {
   // A local's name, or -- when `isMemberPath` -- the dotted path of a field
   // read (`self.left`). The two are spent differently: a local is one value
