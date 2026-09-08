@@ -501,6 +501,24 @@ bool ModuleEmitter::refuseUnresolvableDispatch(const parser::Node &anchor,
   if (!dispatchIsUnresolvable(receiver, methodName, receiverNode, throughSuper))
     return false;
   auto contract = mlir::cast<py::ContractType>(receiver.type);
+  // ⛔ A CLASSMETHOD IS UNRESOLVABLE WITHOUT AN OVERRIDE, so it does not get
+  // the override sentence. `class Sub(Base): pass` redeclares nothing and
+  // still binds a different `cls`, and telling the author their method is
+  // overridden sends them looking for a subclass that does not exist.
+  if (!subclassOverridesMethod(contract.getContractName(), methodName) &&
+      !subclassShadowsAttribute(contract.getContractName(), methodName))
+    if (std::optional<MethodBinding> bound =
+            lookupClassMethod(receiver.type, methodName);
+        bound && (bound->kind == "class" || bound->kind == "classmethod")) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "'" + std::string(methodName) + "' is a classmethod and '" +
+              py::contracts::displayClassNameForContract(
+                  contract.getContractName()) +
+              "' has subclasses, so the `cls` its body reads cannot be "
+              "resolved from the static type of the receiver"});
+      return true;
+    }
   diagnostics.push_back(parser::Diagnostic{
       parser::Severity::Error, anchor.range.start,
       "'" + std::string(methodName) + "' is overridden by a subclass of '" +
@@ -586,7 +604,106 @@ bool ModuleEmitter::dispatchIsUnresolvable(Value receiver,
   // declares it is the whole evidence the dispatch is real; requiring the base
   // to declare it too made the gate blind to exactly the case where the
   // subclass introduces the method.
-  return redeclared;
+  if (redeclared)
+    return true;
+  // ⭐ AND A `@classmethod` WHEREVER A SUBCLASS EXISTS, redeclaration or not.
+  // `cls` binds the RUNTIME class, so
+  //
+  //     class Base:
+  //         @classmethod
+  //         def tag(cls) -> str: return cls.__name__
+  //     class Sub(Base): pass
+  //     xs: "list[Base]" = [Base(), Sub()]
+  //     print([x.tag() for x in xs])   # CPython ['Base', 'Sub']
+  //
+  // printed ['Base', 'Base']: the static resolution inlined Base's body with
+  // `cls` bound to Base, and nothing in the override test could see it because
+  // Sub declares nothing. A silent wrong value, which is what this gate exists
+  // to turn into a dispatch.
+  if (std::optional<MethodBinding> bound =
+          lookupClassMethod(receiver.type, methodName))
+    if (bound->kind == "class" || bound->kind == "classmethod")
+      // ⛔ AND ONLY WHERE THE BODY READS `cls`. Which class is bound is
+      // unobservable in a body that never mentions it, and refusing there
+      // costs programs the dispatcher cannot express anyway:
+      //
+      //     @classmethod
+      //     def go(cls, *args: int) -> int: return len(args)
+      //
+      // -- a vararg the arms have no way to restate -- ran correctly before
+      // this gate existed and would have become "'go' is overridden by a
+      // subclass of 'Base'" for a fact about `cls` its body does not use.
+      if (bound->method && methodBodyReadsFirstParameter(*bound->method))
+        return classHasDeclaredSubclass(contract.getContractName());
+  return false;
+}
+
+// Does the body mention the method's first parameter (`cls`, `self`)? Walked
+// whole, nested defs included: a closure that captures it reads it too.
+bool ModuleEmitter::methodBodyReadsFirstParameter(
+    const parser::Node &method) const {
+  const parser::Node *arguments = ast::node(method, "args");
+  if (!arguments)
+    return false;
+  llvm::StringRef parameter;
+  for (llvm::StringRef group : {"posonlyargs", "args"}) {
+    if (!parameter.empty())
+      break;
+    if (const auto *list = ast::nodeList(*arguments, group))
+      if (!list->empty() && list->front())
+        if (std::optional<std::string_view> spelled =
+                ast::string(*list->front(), "arg"))
+          parameter = llvm::StringRef(spelled->data(), spelled->size());
+  }
+  if (parameter.empty())
+    return false;
+  std::function<bool(const parser::Node &)> mentions =
+      [&](const parser::Node &node) -> bool {
+    if (node.kind == "Name" &&
+        llvm::StringRef(ast::nameSpelling(node)) == parameter)
+      return true;
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child && mentions(**child))
+          return true;
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child && mentions(*child))
+            return true;
+    }
+    return false;
+  };
+  if (const auto *body = ast::nodeList(method, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement && mentions(*statement))
+        return true;
+  return false;
+}
+
+bool ModuleEmitter::classHasDeclaredSubclass(
+    llvm::StringRef receiverClass) const {
+  for (const auto &entry : declaredClassBases) {
+    if (entry.getKey() == receiverClass)
+      continue;
+    llvm::SmallVector<llvm::StringRef, 8> worklist{entry.getKey()};
+    llvm::StringSet<> seen;
+    while (!worklist.empty()) {
+      llvm::StringRef current = worklist.pop_back_val();
+      auto bases = declaredClassBases.find(current);
+      if (bases == declaredClassBases.end())
+        continue;
+      for (const std::string &base : bases->second) {
+        if (base == receiverClass)
+          return true;
+        if (seen.insert(base).second)
+          worklist.push_back(llvm::StringRef(base));
+      }
+    }
+  }
+  return false;
 }
 
 bool ModuleEmitter::subclassOverridesMethod(llvm::StringRef receiverClass,

@@ -1,0 +1,5 @@
+['base:Base', 'sub:Sub', 'sub:Leaf', 'base:Quiet']
+['Base/2', 'Sub/2', 'Leaf/2', 'Quiet/2']
+['base', 'sub', 'sub', 'base']
+base:Base sub:Sub sub:Leaf base:Quiet
+[6, 6]

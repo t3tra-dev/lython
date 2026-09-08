@@ -119,6 +119,11 @@ private:
   // True when a subclass of `receiverClass` declares `methodName` itself, so
   // the static class is not enough to say which body a call runs
   // (EmitterClasses.cpp).
+  // Does any class in the program derive from this one? A classmethod's `cls`
+  // binds the RUNTIME class, so a subclass that redeclares NOTHING still has
+  // its own answer -- which is why the override test is not the question here.
+  bool classHasDeclaredSubclass(llvm::StringRef receiverClass) const;
+  bool methodBodyReadsFirstParameter(const parser::Node &method) const;
   bool subclassOverridesMethod(llvm::StringRef receiverClass,
                                llvm::StringRef methodName) const;
   // The same question about a class-level BINDING rather than a method

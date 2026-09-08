@@ -1701,13 +1701,14 @@ TEST(EmitterTest, AReturnThatDoesNotMatchItsAnnotationIsNamed) {
   EXPECT_TRUE(base.ok()) << base.diagnostics.size();
 }
 
-// What: a `@classmethod` an override sits behind is refused in BOTH spellings.
-// The call `a.tag()` always was; reading it first (`m = a.tag`) walked past the
-// same gate and answered the base's body, so one question had two answers.
-// A staticmethod beside it dispatches through both spellings, which is what
-// says the refusal here is about `cls` and not about the receiver being an
-// instance.
-TEST(EmitterTest, AClassmethodBehindAnOverrideIsRefusedThroughEitherSpelling) {
+// What: a `@classmethod` an override sits behind DISPATCHES when it is called,
+// and its value spelling (`m = a.tag`) is what is left. The call was refused
+// until the candidate set became every SUBCLASS rather than the redeclaring
+// slice of it -- `cls` binds the runtime class, so a subclass that redeclares
+// nothing still has its own answer. A staticmethod beside it dispatches
+// through both spellings, which is what says the residue is about carrying
+// `cls` into a value and not about the receiver being an instance.
+TEST(EmitterTest, AClassmethodBehindAnOverrideDispatchesWhenItIsCalled) {
   auto refusedNaming = [](lython::emitter::EmitResult &emitted,
                           const char *member) {
     for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
@@ -1729,8 +1730,7 @@ TEST(EmitterTest, AClassmethodBehindAnOverrideIsRefusedThroughEitherSpelling) {
   mlir::MLIRContext called(testRegistry());
   lython::emitter::EmitResult direct =
       emitSource(std::string(hierarchy) + "print(a.tag())\n", called);
-  EXPECT_FALSE(direct.ok());
-  EXPECT_TRUE(refusedNaming(direct, "tag"));
+  EXPECT_TRUE(direct.ok()) << direct.diagnostics.size();
 
   mlir::MLIRContext read(testRegistry());
   lython::emitter::EmitResult asValue =

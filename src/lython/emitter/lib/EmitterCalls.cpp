@@ -2933,6 +2933,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   parser::SourceRange range = expr.range;
   std::optional<MethodBinding> base;
   bool staticKind = false;
+  bool classKind = false;
   const parser::Node *arguments = nullptr;
   if (asAttribute) {
     if (argumentCount != 0 || !keywordNames.empty())
@@ -3012,10 +3013,24 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   // where the refusal is not. Covering it means enumerating every subclass,
   // which is a different candidate set.
   staticKind = !asProperty && !asSetter && base->kind == "static";
+  // ⭐ AND A `@classmethod` DISPATCHES THROUGH THE SAME ARMS, once the
+  // candidate set is the right one. The note above said `cls` must be the
+  // RUNTIME class and the arms enumerate only classes that REDECLARE the
+  // method, so an inheriting subclass would land in its parent's arm and
+  // `cls.__name__` would answer the parent -- a silent wrong value. Both
+  // halves are fixed below: the candidates are every SUBCLASS, and the arm
+  // calls through the candidate CLASS, which is what binds `cls` to it.
+  //
+  // ⛔ The cost is the whole subtree rather than the overriding slice of it,
+  // and that is the price of the answer: `class Leaf(Sub)` that redeclares
+  // nothing still needs its own arm, because `Sub.tag()` and `Leaf.tag()` run
+  // the same body and return different strings.
+  classKind = !asProperty && !asSetter && !asAttribute &&
+              (base->kind == "class" || base->kind == "classmethod");
   llvm::StringRef wantedKind = asSetter     ? "property_setter"
                                : asProperty ? "property"
                                             : "instance";
-  if ((base->kind != wantedKind && !staticKind) || base->async ||
+  if ((base->kind != wantedKind && !staticKind && !classKind) || base->async ||
       base->bodySignature.isGeneratorFunction ||
       base->bodySignature.isAsyncGeneratorFunction)
     return nullptr;
@@ -3071,6 +3086,8 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
   if (!asAttribute) {
   // A staticmethod declares no receiver, so there is no first parameter to
   // skip -- `__ly_recv` above is the dispatcher's own, not the method's.
+  // A classmethod's first parameter is `cls`, which the arm supplies by
+  // calling through the class -- the same skip a receiver gets.
   bool selfSeen = staticKind;
   bool enough = false;
   for (llvm::StringRef field : {"posonlyargs", "args"}) {
@@ -3167,8 +3184,11 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // a valid program in the gap.
       const llvm::StringMap<llvm::StringSet<>> &declarations =
           asAttribute ? declaredClassAttributes : declaredClassMethods;
-      if (!candidateRedeclares(declarations, receiverClass, candidate,
-                               methodName))
+      // ⛔ EVERY SUBCLASS FOR A CLASSMETHOD, not only the redeclaring ones:
+      // `cls` is the runtime class, so a subclass that declares nothing still
+      // has its own answer.
+      if (!classKind && !candidateRedeclares(declarations, receiverClass,
+                                             candidate, methodName))
         continue;
       unsigned depth = 0;
       llvm::SmallVector<llvm::StringRef, 8> worklist{candidate};
@@ -3265,8 +3285,9 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
       // is available on BOTH channels, where a read through the receiver needs
       // the cell only a main-module class has.
       parser::NodePtr subject =
-          asAttribute || staticKind ? synth::name(candidate.second, range)
-                                    : synth::name("__ly_recv", range);
+          asAttribute || staticKind || classKind
+              ? synth::name(candidate.second, range)
+              : synth::name("__ly_recv", range);
       // ⛔ A candidate that redeclares the GETTER and no setter has no setter
       // at all -- redeclaring the property replaces the whole descriptor -- so
       // its arm RAISES the AttributeError CPython raises, rather than falling
@@ -3308,7 +3329,7 @@ ModuleEmitter::virtualDispatcherFor(const parser::Node &anchor, Value receiver,
     } else if (asProperty) {
       body.push_back(
           synth::returnStmt(read(synth::name("__ly_recv", range)), range));
-    } else if (staticKind) {
+    } else if (staticKind || classKind) {
       body.push_back(
           synth::returnStmt(read(synth::name(fallbackClass, range)), range));
     } else {
