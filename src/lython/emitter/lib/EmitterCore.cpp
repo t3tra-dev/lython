@@ -58,6 +58,12 @@ EmitResult ModuleEmitter::emit() {
     if (source.moduleNode && !source.isStub)
       desugarEnumClasses(*source.moduleNode);
   desugarEnumClasses(moduleNode);
+  // Before every binder: the parameters this moves into `type_params` are what
+  // decides whether a class or a def is generic at all.
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (source.moduleNode && !source.isStub)
+      desugarClassicGenerics(*source.moduleNode);
+  desugarClassicGenerics(moduleNode);
   // Before any binder reads an imported module's top level: a container
   // constant there is a module GLOBAL, and the binders below hand out its
   // canonical name.

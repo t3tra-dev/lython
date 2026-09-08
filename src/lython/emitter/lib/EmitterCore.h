@@ -452,6 +452,10 @@ private:
     llvm::SmallVector<EnumMember, 8> members;
   };
   void desugarEnumClasses(const parser::Node &moduleNode);
+  // `T = TypeVar("T")` + `Generic[T]` is the PEP 695 declaration one spelling
+  // back. Rewritten into `type_params` before anything reads the tree, so the
+  // machinery that already compiles `class Stack[T]` compiles both.
+  void desugarClassicGenerics(const parser::Node &moduleNode);
   std::optional<EnumKind> enumBaseKind(const parser::Node &classDef) const;
   void collectEnumMembers(const parser::Node &classDef, EnumKind kind);
   void rewriteEnumClassDef(const parser::Node &classDef);

@@ -1,6 +1,8 @@
 #include "AstSynth.h"
 #include "EmitterCore.h"
 
+#include <cctype>
+
 #include "AstAccess.h"
 
 #include "llvm/ADT/StringSet.h"
@@ -85,6 +87,243 @@ ModuleEmitter::enumBaseKind(const parser::Node &classDef) const {
   if (base == "StrEnum")
     return EnumKind::Str;
   return std::nullopt;
+}
+
+namespace {
+
+// The identifiers a quoted annotation mentions. A string annotation is the
+// spelling `list[T]` arrives in, and the parameter it names is inside it.
+void collectAnnotationIdentifiers(llvm::StringRef text,
+                                  llvm::SmallVectorImpl<std::string> &out) {
+  std::size_t index = 0;
+  while (index < text.size()) {
+    if (!std::isalpha(static_cast<unsigned char>(text[index])) &&
+        text[index] != '_') {
+      ++index;
+      continue;
+    }
+    std::size_t start = index;
+    while (index < text.size() &&
+           (std::isalnum(static_cast<unsigned char>(text[index])) ||
+            text[index] == '_'))
+      ++index;
+    out.push_back(text.substr(start, index - start).str());
+  }
+}
+
+// Every name an annotation mentions, in source order: a bare `T`, a `list[T]`
+// subscript, and the quoted spelling of either.
+void collectAnnotationNames(const parser::Node *annotation,
+                            llvm::SmallVectorImpl<std::string> &out) {
+  if (!annotation)
+    return;
+  if (annotation->kind == "Name") {
+    out.push_back(std::string(ast::nameSpelling(*annotation)));
+    return;
+  }
+  if (annotation->kind == "Constant") {
+    if (std::optional<std::string_view> text = ast::string(*annotation, "value"))
+      collectAnnotationIdentifiers(llvm::StringRef(*text), out);
+    return;
+  }
+  for (const parser::Field &field : annotation->fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectAnnotationNames(child->get(), out);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &child : *children)
+        collectAnnotationNames(child.get(), out);
+  }
+}
+
+// The `TypeVar(name=...)` node PEP 695 puts in `type_params`.
+parser::NodePtr typeParamNode(llvm::StringRef name, parser::SourceRange range) {
+  parser::NodePtr node = parser::makeNode("TypeVar", range);
+  parser::addField(*node, "name", std::string(name));
+  parser::addField(*node, "bound", parser::NodePtr{});
+  parser::addField(*node, "default_value", parser::NodePtr{});
+  return node;
+}
+
+llvm::StringRef calleeLeafName(const parser::Node *callee) {
+  if (!callee)
+    return {};
+  if (callee->kind == "Name")
+    return ast::nameSpelling(*callee);
+  if (callee->kind == "Attribute")
+    if (std::optional<std::string_view> attr = ast::string(*callee, "attr"))
+      return llvm::StringRef(*attr);
+  return {};
+}
+
+} // namespace
+
+// ⭐ THE CLASSIC GENERIC SPELLING IS THE PEP 695 ONE, one declaration back.
+// `class Stack[T]` compiles; `T = TypeVar("T")` with `class Stack(Generic[T])`
+// did not, and it failed by FABRICATING a contract -- `T` became
+// `builtins.T`, so the error arrived as "print() cannot render argument of
+// type builtins.T" for a program whose only unusual feature is that it is
+// written the way every generic before Python 3.12 is written.
+//
+// The rewrite is the whole repair: the parameters move into `type_params`,
+// the `Generic[...]` base is consumed, and the `TypeVar(...)` assignments go
+// away. Everything downstream then sees the tree the new syntax parses to.
+//
+// ⛔ A FUNCTION GETS ITS OWN PARAMETERS ONLY WHERE NO ENCLOSING CLASS DECLARES
+// THEM. Inside `class Stack(Generic[T])`, the `T` in `def push(self, v: T)` is
+// the CLASS's parameter, and re-declaring it on the method would make a
+// second, unrelated one.
+void ModuleEmitter::desugarClassicGenerics(const parser::Node &moduleNode) {
+  const auto *body = ast::nodeList(moduleNode, "body");
+  if (!body)
+    return;
+  llvm::StringSet<> typeVars;
+  for (const parser::NodePtr &statement : *body) {
+    if (!statement || statement->kind != "Assign")
+      continue;
+    const auto *targets = ast::nodeList(*statement, "targets");
+    if (!targets || targets->size() != 1 || !targets->front() ||
+        targets->front()->kind != "Name")
+      continue;
+    const parser::Node *value = ast::node(*statement, "value");
+    if (!value || value->kind != "Call")
+      continue;
+    llvm::StringRef callee = calleeLeafName(ast::node(*value, "func"));
+    if (callee != "TypeVar")
+      continue;
+    typeVars.insert(ast::nameSpelling(*targets->front()));
+  }
+  if (typeVars.empty())
+    return;
+
+  // The parameters a def needs, in the order its annotations name them.
+  auto declareFunctionParams = [&](const parser::Node &function,
+                                   const llvm::StringSet<> &declared) {
+    const auto *existing = ast::nodeList(function, "type_params");
+    if (existing && !existing->empty())
+      return;
+    llvm::SmallVector<std::string, 4> mentioned;
+    if (const parser::Node *args = ast::node(function, "args")) {
+      for (llvm::StringRef group :
+           {"posonlyargs", "args", "kwonlyargs"})
+        if (const auto *list = ast::nodeList(*args, group))
+          for (const parser::NodePtr &arg : *list)
+            if (arg)
+              collectAnnotationNames(ast::node(*arg, "annotation"), mentioned);
+      for (llvm::StringRef group : {"vararg", "kwarg"})
+        if (const parser::Node *arg = ast::node(*args, group))
+          collectAnnotationNames(ast::node(*arg, "annotation"), mentioned);
+    }
+    collectAnnotationNames(ast::node(function, "returns"), mentioned);
+    llvm::SmallVector<parser::NodePtr, 2> params;
+    llvm::StringSet<> seen;
+    for (const std::string &name : mentioned) {
+      if (!typeVars.count(name) || declared.count(name) || !seen.insert(name).second)
+        continue;
+      params.push_back(typeParamNode(name, function.range));
+    }
+    if (params.empty())
+      return;
+    setField(const_cast<parser::Node &>(function), "type_params",
+             std::vector<parser::NodePtr>(params.begin(), params.end()));
+  };
+
+  std::function<void(const parser::Node &, const llvm::StringSet<> &)> walk =
+      [&](const parser::Node &statement, const llvm::StringSet<> &declared) {
+        if (statement.kind == "FunctionDef" ||
+            statement.kind == "AsyncFunctionDef") {
+          declareFunctionParams(statement, declared);
+          llvm::StringSet<> inner(declared);
+          if (const auto *params = ast::nodeList(statement, "type_params"))
+            for (const parser::NodePtr &param : *params)
+              if (param)
+                if (std::optional<std::string_view> name =
+                        ast::string(*param, "name"))
+                  inner.insert(*name);
+          if (const auto *nested = ast::nodeList(statement, "body"))
+            for (const parser::NodePtr &child : *nested)
+              if (child)
+                walk(*child, inner);
+          return;
+        }
+        if (statement.kind != "ClassDef") {
+          if (const auto *nested = ast::nodeList(statement, "body"))
+            for (const parser::NodePtr &child : *nested)
+              if (child)
+                walk(*child, declared);
+          return;
+        }
+        llvm::SmallVector<std::string, 2> classParams;
+        std::vector<parser::NodePtr> keptBases;
+        if (const auto *bases = ast::nodeList(statement, "bases"))
+          for (const parser::NodePtr &base : *bases) {
+            if (!base) {
+              continue;
+            }
+            const parser::Node *owner =
+                base->kind == "Subscript" ? ast::node(*base, "value") : nullptr;
+            if (!owner || owner->kind != "Name" ||
+                llvm::StringRef(ast::nameSpelling(*owner)) != "Generic") {
+              keptBases.push_back(base);
+              continue;
+            }
+            llvm::SmallVector<std::string, 2> named;
+            collectAnnotationNames(ast::node(*base, "slice"), named);
+            for (const std::string &name : named)
+              if (typeVars.count(name) &&
+                  !llvm::is_contained(classParams, name))
+                classParams.push_back(name);
+          }
+        llvm::StringSet<> inner(declared);
+        if (const auto *params = ast::nodeList(statement, "type_params"))
+          for (const parser::NodePtr &param : *params)
+            if (param)
+              if (std::optional<std::string_view> name =
+                      ast::string(*param, "name"))
+                inner.insert(*name);
+        if (!classParams.empty()) {
+          llvm::SmallVector<parser::NodePtr, 2> params;
+          for (const std::string &name : classParams) {
+            params.push_back(typeParamNode(name, statement.range));
+            inner.insert(name);
+          }
+          setField(const_cast<parser::Node &>(statement), "type_params",
+                   std::vector<parser::NodePtr>(params.begin(), params.end()));
+          setField(const_cast<parser::Node &>(statement), "bases",
+                   std::move(keptBases));
+        }
+        if (const auto *nested = ast::nodeList(statement, "body"))
+          for (const parser::NodePtr &child : *nested)
+            if (child)
+              walk(*child, inner);
+      };
+
+  llvm::StringSet<> empty;
+  for (const parser::NodePtr &statement : *body)
+    if (statement)
+      walk(*statement, empty);
+
+  // ⛔ AND THE `TypeVar(...)` CALLS GO. They are declarations, not values:
+  // left in place they emit as a call to a name bound to `object`, which is
+  // "static type builtins.object is not callable" -- the message the whole
+  // program used to fail with.
+  std::vector<parser::NodePtr> kept;
+  for (const parser::NodePtr &statement : *body) {
+    if (statement && statement->kind == "Assign") {
+      const auto *targets = ast::nodeList(*statement, "targets");
+      const parser::Node *value = ast::node(*statement, "value");
+      if (targets && targets->size() == 1 && targets->front() &&
+          targets->front()->kind == "Name" && value && value->kind == "Call" &&
+          calleeLeafName(ast::node(*value, "func")) == "TypeVar" &&
+          typeVars.count(ast::nameSpelling(*targets->front())))
+        continue;
+    }
+    kept.push_back(statement);
+  }
+  setField(const_cast<parser::Node &>(moduleNode), "body", std::move(kept));
 }
 
 void ModuleEmitter::desugarEnumClasses(const parser::Node &moduleNode) {
