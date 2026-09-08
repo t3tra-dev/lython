@@ -2586,6 +2586,15 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
                         entry.canonicalName, strType());
   }
 
+  // The module-attribute spelling of the same constant: `import typing` then
+  // `typing.TYPE_CHECKING`, which is how a module that also needs `typing`
+  // for anything else writes it.
+  if (module == "typing" || module == "typing_extensions") {
+    bindModuleObject();
+    bindCanonicalSymbol(importedAttribute(localName, "TYPE_CHECKING"),
+                        "typing.TYPE_CHECKING", literal("False"));
+  }
+
   for (const ModuleIntConstantImport &entry : kModuleIntConstantImports) {
     if (module != entry.module)
       continue;
@@ -2668,6 +2677,22 @@ bool TypeSystem::bindImportedName(llvm::StringRef module,
     if (module != entry.module || exportedName != entry.exportedName)
       continue;
     bindCanonicalSymbol(localName, entry.canonicalName, strType());
+    return true;
+  }
+
+  // ⭐ `TYPE_CHECKING` IS THE LITERAL False, which is what CPython binds it to
+  // and what makes `if TYPE_CHECKING:` fold. Until now the name was simply
+  // unresolved, so the two lines every annotated module opens with took the
+  // whole program down.
+  //
+  // ⛔ A LITERAL and not `bool`: the branch fold reads the type, and a plain
+  // `bool` decides nothing. The block's own IMPORTS are still bound (see
+  // `predeclareTopLevel`) -- they are declarations for the checker, which is
+  // this compiler's type system, and skipping them would leave every
+  // annotation that names one unresolved.
+  if ((module == "typing" || module == "typing_extensions") &&
+      exportedName == "TYPE_CHECKING") {
+    bindCanonicalSymbol(localName, "typing.TYPE_CHECKING", literal("False"));
     return true;
   }
 
