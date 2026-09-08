@@ -561,9 +561,21 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
           std::optional<std::string_view> method =
               ast::string(*callee, "attr");
           const auto *args = ast::nodeList(*call, "args");
+          // ⛔ `!empty()` BEFORE `front()`. A method call with no arguments
+          // is still a call on this name, so it reaches here -- and
+          // `args->front()` on an empty list read past the end and took the
+          // compiler with it (SIGSEGV, no diagnostic). `xs = []` followed by
+          // `xs.pop()` crashed, and so did `clear`, `copy`, `sort`, `reverse`,
+          // `keys`, `values`, `items`, `popitem`, and every arity mistake
+          // (`xs.append()`, `xs.insert()`), on `[]`, `{}` and `set()` alike:
+          // 54 of 72 spellings measured. Only the ANNOTATED form escaped,
+          // because an annotation means this scan never runs.
+          //
+          // ⛔ Nothing below wants a zero-argument call anyway -- each arm
+          // asks for a size of its own -- so the guard costs no seeding.
           if (receiver && receiver->kind == "Name" &&
               llvm::StringRef(ast::nameSpelling(*receiver)) == name &&
-              method && args && args->front()) {
+              method && args && !args->empty() && args->front()) {
             // ⭐ EVERY OPERATION THAT PUTS SOMETHING IN IT SEEDS IT. Two were
             // recognised, and the rest of the ways Python fills a fresh
             // container left it erased -- each with the same message about a

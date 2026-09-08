@@ -1939,3 +1939,59 @@ TEST(EmitterTest, AUnionFieldReturnedWhereAMemberIsDeclaredIsNamed) {
       right);
   EXPECT_TRUE(proved.ok()) << proved.diagnostics.size();
 }
+
+// What: a method call with NO arguments on a name bound to an empty container
+// literal is still a call on that name, so it reaches the scan that decides
+// the container's element type from what fills it. `xs = []` followed by
+// `xs.pop()` -- and `clear`, `copy`, `sort`, `reverse`, `keys`, `values`,
+// `items`, `popitem`, and every arity mistake -- crashed the compiler with no
+// diagnostic at all: 54 of the 72 spellings measured, on `[]`, `{}` and
+// `set()` alike, and only the ANNOTATED form escaped because an annotation
+// means the scan never runs. The seed the scan is for has to survive beside
+// them.
+TEST(EmitterTest, AZeroArgumentMethodOnAnEmptyLiteralIsNotACrash) {
+  auto emits = [](const char *source) {
+    mlir::MLIRContext context(testRegistry());
+    lython::emitter::EmitResult emitted = emitSource(source, context);
+    return emitted.ok();
+  };
+
+  EXPECT_TRUE(emits("def f() -> int:\n"
+                    "    xs = []\n"
+                    "    xs.clear()\n"
+                    "    return len(xs)\n"
+                    "print(f())\n"));
+  EXPECT_TRUE(emits("def f() -> int:\n"
+                    "    d = {}\n"
+                    "    d.clear()\n"
+                    "    return len(d)\n"
+                    "print(f())\n"));
+  EXPECT_TRUE(emits("def f() -> int:\n"
+                    "    s = set()\n"
+                    "    s.copy()\n"
+                    "    return len(s)\n"
+                    "print(f())\n"));
+  EXPECT_TRUE(emits("xs = []\n"
+                    "xs.sort()\n"
+                    "print(len(xs))\n"));
+
+  // A call written with too few arguments reaches the same place, and the
+  // program is refused for the argument count rather than by dying.
+  EXPECT_FALSE(emits("def f() -> int:\n"
+                     "    xs = []\n"
+                     "    xs.append()\n"
+                     "    return len(xs)\n"
+                     "print(f())\n"));
+
+  // And the seed still arrives past the zero-argument call: without it the
+  // element stays erased and `\"/\".join(parts)` has nothing to join.
+  EXPECT_TRUE(emits("def f(path: str) -> str:\n"
+                    "    parts = []\n"
+                    "    for seg in path.split(\"/\"):\n"
+                    "        if seg == \"..\":\n"
+                    "            parts.pop()\n"
+                    "            continue\n"
+                    "        parts.append(seg)\n"
+                    "    return \"/\".join(parts)\n"
+                    "print(f(\"a/b/../c\"))\n"));
+}
