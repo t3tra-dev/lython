@@ -1332,6 +1332,18 @@ constexpr NameAliasImport kNameAliasImports[] = {
     // one `@overload` and `@final` already carry: the marker constrains the
     // CHECKER, and this compiler's checker is the type system.
     {"abc", "abstractmethod", "abc.abstractmethod", false},
+    // ⭐ `Generic` and `TypeVar` are consumed by `desugarClassicGenerics`,
+    // which rewrites `class Stack(Generic[T])` into the `type_params` PEP 695
+    // parses to -- so these names never evaluate, and the bindings exist only
+    // so the import that declares them resolves.
+    {"typing", "Generic", "typing.Generic", false},
+    {"typing_extensions", "Generic", "typing.Generic", false},
+    // Annotation markers consumed by `annotationType`: each resolves to the
+    // type it wraps, so the binding exists only so the import resolves.
+    {"typing", "ClassVar", "typing.ClassVar", true},
+    {"typing_extensions", "ClassVar", "typing.ClassVar", true},
+    {"typing", "Final", "typing.Final", true},
+    {"typing_extensions", "Final", "typing.Final", true},
 };
 
 constexpr ModuleStringConstantImport kModuleStringConstantImports[] = {
@@ -3096,6 +3108,16 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
     if (annotationNameIs(baseName, "Optional"))
       return py::UnionType::getNormalized(&context,
                                           {annotationType(slice), none()});
+    // ⭐ `ClassVar[T]` AND `Final[T]` ARE `T` WITH A NOTE ON THEM. Both mark
+    // how a binding may be used, not what it holds: a ClassVar is a class
+    // attribute, which this emitter decides from the attribute being assigned
+    // in the class BODY, and Final is an immutability claim the type system
+    // does not enforce. Neither had an annotation arm, so
+    // `count: ClassVar[int] = 0` -- the way a class counter is spelled -- did
+    // not even get past its import.
+    if (annotationNameIs(baseName, "ClassVar") ||
+        annotationNameIs(baseName, "Final"))
+      return annotationType(slice);
     if (annotationNameIs(baseName, "Union")) {
       llvm::SmallVector<mlir::Type, 4> members;
       if (slice && slice->kind == "Tuple") {
