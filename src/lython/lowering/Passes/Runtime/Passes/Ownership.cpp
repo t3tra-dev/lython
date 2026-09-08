@@ -4224,14 +4224,41 @@ mlir::LogicalResult insertOwnedLocalObjectReleases(
     // Straight-line placement failed (e.g. the entity crosses blocks inside a
     // loop body): fall back to CFG liveness, mirroring the owned-call-result
     // path.
+    //
+    // ⭐ AN OWNED RETURN IS A DEATH ON ITS OWN PATH, NOT ON EVERY PATH, and
+    // `deallocators` is the only thing `releaseOwnedGroupByLiveness` reads
+    // before it can call one a transfer. Passed empty, the walk bailed at the
+    // first `func.return` and placed NOTHING, so a function that hands the
+    // element to its caller on one exit and takes another exit besides reached
+    // the affine verifier with that other exit unpaid:
+    //
+    //     def find(names: "list[str]", want: str) -> str:
+    //         for name in names:
+    //             if name == want:
+    //                 return name
+    //         return "<none>"
+    //     # owned resource from builtin.unrealized_conversion_cast result 0
+    //     # reaches function exit without release, transfer, or owned return
+    //
+    // A linear search, refused. `v = xs[0]` returned under a guard, iterating a
+    // dict, a set, a tuple, a global container, returning through a union: 27
+    // of 71 programs written for the shape, and 2 of 4 realistic programs
+    // written for something else. The owned CALL RESULT path
+    // (`insertOwnedValueReleasesByLiveness`) has always passed its
+    // deallocators here; this was the one caller that did not.
+    //
+    // ⛔ Why NOT widen the `canReleaseAtExits` fallback below, which is where
+    // the drop is printed: it writes a release before EVERY return the marker
+    // dominates, and the two exits differ -- the one that transfers must not
+    // release. Telling them apart is this walk's question asked again, in a
+    // walk with no liveness to answer it.
     unsigned before = 0;
     if (ownedLocalTraceEnabled() && enclosing)
       enclosing.walk([&](mlir::func::CallOp) { ++before; });
     if (releaseOwnedGroupByLiveness(contracts, op, op->getBlock(), op->getLoc(),
                                     group, aliases, references,
                                     /*ownsReference=*/retainRooted,
-                                    /*consumeIsDeath=*/true,
-                                    /*deallocators=*/{})) {
+                                    /*consumeIsDeath=*/true, deallocators)) {
       if (ownedLocalTraceEnabled()) {
         unsigned after = 0;
         if (enclosing)
