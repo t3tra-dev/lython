@@ -1019,6 +1019,42 @@ bool RuntimeBundleLowerer::storedSourceOutlivesStore(mlir::Operation *op,
                                                      mlir::Value source) {
   if (!source)
     return false;
+  // ⭐ THROUGH THE CONVERSIONS THAT ARE THE SAME OBJECT. `py.class.upcast` and
+  // `py.class.refine` produce a new SSA value for a value the runtime does not
+  // copy, so a store whose operand is one of them was asked about a value with
+  // exactly one use -- itself -- while the program went on using the original:
+  //
+  //     def fire(self, v: str) -> None:
+  //         self.state = v        # the store takes the UPCAST of v
+  //         self.fn(v)            # the call packs v itself
+  //
+  //     # printed ['a:one', 'a:a:a'] for ['a:one', 'a:two']
+  //
+  // The store read "nobody else needs this", MOVED the frame's token into the
+  // slot and released the source, and the indirect call then packed a string
+  // the frame had just given up. Silent, and it needed the second call to show
+  // -- the first one still read intact memory.
+  //
+  // ⛔ Every value on the chain, not just the root: an upcast may itself be
+  // used again, and the question is whether ANY name for this object outlives
+  // the store.
+  llvm::SmallVector<mlir::Value, 4> aliases;
+  {
+    mlir::Value current = source;
+    while (current) {
+      aliases.push_back(current);
+      mlir::Operation *definition = current.getDefiningOp();
+      if (!definition ||
+          !mlir::isa<py::ClassUpcastOp, py::ClassRefineOp>(definition) ||
+          definition->getNumOperands() == 0)
+        break;
+      current = definition->getOperand(0);
+    }
+  }
+  for (mlir::Value alias : aliases)
+    if (alias != source &&
+        RuntimeBundleLowerer::storedSourceOutlivesStore(op, alias))
+      return true;
   // ⭐ A LOOP-CARRIED VALUE OUTLIVES EVERY STORE INSIDE OR AFTER THE LOOP, and
   // the dominance walk below cannot see it: its other uses are the loop's own,
   // which the store does not dominate, so the store read "nobody else needs
