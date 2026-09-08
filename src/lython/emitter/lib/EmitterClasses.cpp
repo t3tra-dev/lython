@@ -1946,7 +1946,8 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // storage one.
       bool storable =
           widened == types.intType() || widened == types.strType() ||
-          widened == types.floatType() || widened == types.boolType();
+          widened == types.floatType() || widened == types.boolType() ||
+          mlir::isa_and_nonnull<py::CallableType>(widened);
       if (!storable) {
         if (auto attrContract =
                 mlir::dyn_cast_if_present<py::ContractType>(widened)) {

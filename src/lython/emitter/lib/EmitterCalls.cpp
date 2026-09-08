@@ -1430,6 +1430,49 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             return emitCall(*rewritten);
           }
         }
+        // ⭐ A CLASS ATTRIBUTE THAT HOLDS A FUNCTION IS CALLED, NOT
+        // DISPATCHED. `C.V(1)` for `V: Callable[[int], int] = lambda n: n + 1`
+        // in a class body went looking for a METHOD named V on the type object
+        // and reported "type<C> does not provide manifest method 'V'" -- the
+        // compiler saying it asked the wrong table. The attribute is in the
+        // class's static-attribute map, and reading it (`f = C.V`) is what the
+        // slot repair made work; this is the call spelling of the same read.
+        //
+        // ⛔ Before the receiver is emitted, so the attribute read below is the
+        // only emission of it. A type object is pure, but two emissions of the
+        // same node is how a bound-method path grows a second receiver.
+        //
+        // ⛔ AND `type(x)` NAMES A CLASS HERE TOO, which the inference alone
+        // does not say: that fold happens at EMIT time, so asking `inferExpr`
+        // what `type(c)` is answers nothing and `type(c).V(1)` fell through to
+        // the method table while `t = type(c); t.V(1)` -- the same two steps
+        // written apart -- resolved.
+        auto staticAttrClassName = [&]() -> std::string {
+          if (auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(
+                  types.widenLiteral(types.inferExpr(receiverNode))))
+            if (auto instance = mlir::dyn_cast_if_present<py::ContractType>(
+                    typeObject.getInstanceType()))
+              return instance.getContractName().str();
+          if (receiverNode->kind == "Call" &&
+              callsUnshadowedBuiltin(ast::node(*receiverNode, "func"), "type"))
+            if (const auto *typeArgs = ast::nodeList(*receiverNode, "args");
+                typeArgs && typeArgs->size() == 1 && typeArgs->front())
+              if (auto subject = mlir::dyn_cast_if_present<py::ContractType>(
+                      types.widenLiteral(
+                          types.inferExpr(typeArgs->front().get()))))
+                return subject.getContractName().str();
+          return {};
+        };
+        if (std::string staticAttrClass = staticAttrClassName();
+            !staticAttrClass.empty())
+          if (std::optional<mlir::Type> attrType =
+                  types.lookupClassStaticAttrType(staticAttrClass, *methodName))
+            if (mlir::isa_and_nonnull<py::CallableType>(
+                    types.widenLiteral(*attrType))) {
+              Value callee = emitExpr(calleeNode);
+              CallOperands operands = emitCallOperands(expr);
+              return emitCallableDispatch(expr, callee, operands);
+            }
         Value receiver = emitExpr(receiverNode);
         if (dispatchIsUnresolvable(receiver, *methodName, receiverNode,
                                    /*throughSuper=*/false)) {
@@ -1584,6 +1627,32 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         // that does not exist. Whatever is wrong with calling the field, the
         // message for it belongs to the paths below, which know what the field
         // holds.
+        // ⛔ AND A CLASS ATTRIBUTE HOLDING A FUNCTION, READ THROUGH AN
+        // INSTANCE, which is the descriptor corner and not a missing object
+        // default. `c.V(1)` binds the receiver in CPython -- that is what
+        // `@staticmethod` exists to opt out of -- and the class spelling
+        // `C.V(c, 1)` is the same call written out. Saying "'C' inherits
+        // builtins.object.V" for it names a member of object that does not
+        // exist.
+        if (auto receiverContract = mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(receiver.type)))
+          if (std::optional<mlir::Type> attrType =
+                  types.lookupClassStaticAttrType(
+                      receiverContract.getContractName(), *methodName))
+            if (mlir::isa_and_nonnull<py::CallableType>(
+                    types.widenLiteral(*attrType))) {
+              diagnostics.push_back(parser::Diagnostic{
+                  parser::Severity::Error, expr.range.start,
+                  "'" + std::string(*methodName) +
+                      "' is a class attribute holding a function, and reading "
+                      "it through an instance binds the receiver, which is not "
+                      "supported; call it through the class (" +
+                      py::contracts::displayClassNameForContract(
+                          receiverContract.getContractName()) +
+                      "." + std::string(*methodName) +
+                      "(obj, ...)) or declare it @staticmethod"});
+              return emitNone(expr);
+            }
         if (!calleeFieldType &&
             inheritsObjectDefaultDunder(receiver.type, *methodName) &&
             !isImplementedObjectDefault(*methodName)) {
