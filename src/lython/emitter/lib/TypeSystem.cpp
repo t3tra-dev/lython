@@ -2116,10 +2116,20 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
     return;
   }
 
-  std::vector<const parser::Node *> moduleCalls;
+  // Grouped by the statement they sit in, because the names a statement BINDS
+  // have to be in scope before the calls INSIDE it are typed: a `for` header
+  // binds its target and the body reads it.
+  struct StatementCalls {
+    const parser::Node *statement;
+    std::vector<const parser::Node *> calls;
+  };
+  std::vector<StatementCalls> moduleCalls;
+  std::vector<const parser::Node *> decoratorCalls;
   if (const auto *statements = ast::nodeList(moduleNode, "body"))
-    for (const parser::NodePtr &statement : *statements)
-      collectModuleCallNodes(statement.get(), moduleCalls);
+    for (const parser::NodePtr &statement : *statements) {
+      moduleCalls.push_back(StatementCalls{statement.get(), {}});
+      collectModuleCallNodes(statement.get(), moduleCalls.back().calls);
+    }
   if (const auto *statements = ast::nodeList(moduleNode, "body"))
     for (const parser::NodePtr &statement : *statements) {
       if (!statement || (statement->kind != "FunctionDef" &&
@@ -2137,7 +2147,7 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
         decoratorCallNodes.push_back(synth::call(
             synth::name(ast::nameSpelling(*decorator), statement->range),
             std::move(arguments), statement->range));
-        moduleCalls.push_back(decoratorCallNodes.back().get());
+        decoratorCalls.push_back(decoratorCallNodes.back().get());
       }
     }
 
@@ -2162,9 +2172,54 @@ void TypeSystem::registerModule(const parser::Node &moduleNode) {
   for (unsigned iteration = 0; iteration < 8; ++iteration) {
     std::vector<mlir::Type> before = resolvedOverrides();
     sweep(/*memoize=*/false);
-    ExprInferenceContext moduleCallContext{kNoLocalCallables, nullptr, nullptr,
+    // ⭐ A CALL SITE SEES WHAT THE MODULE HAS BOUND SO FAR. With no symbol map
+    // this walk could resolve only literals and calls of already-bound
+    // functions, so every module-level NAME handed to an inferred parameter
+    // contributed nothing and the parameter stayed a variable:
+    //
+    //     def show(s):
+    //         return s + "!"
+    //     x = "a"
+    //     print(show(x))
+    //     # function parameter 's' requires an annotation
+    //
+    // -- `x: str` written out did not help, nor did `show(names[0])` or
+    // `for item in names: show(item)`, while `show("a")` in the same file
+    // compiled. Module assignments reach the shared symbol table only as the
+    // EMITTER walks them, which is after this; `localSymbols` is the channel
+    // for exactly that, and the body walk already builds one.
+    //
+    // ⛔ Why per STATEMENT rather than one pass over the whole body first: a
+    // name must not be visible to the calls that precede its assignment, and
+    // one pass would make the LAST type of a rebound name the one every call
+    // site sees.
+    GeneratorFunctionAnalysis moduleScope;
+    ExprInferenceContext moduleCallContext{kNoLocalCallables, nullptr,
+                                           &moduleScope.localSymbols,
                                            /*strict=*/true};
-    for (const parser::Node *call : moduleCalls)
+    llvm::SaveAndRestore<bool> duringCallSites(defaultsDescribeParameters,
+                                               false);
+    for (const StatementCalls &entry : moduleCalls) {
+      // ⛔ NOT a `def` or a `class`: the walk would bind the name to the
+      // signature AS IT READS TODAY, and `localSymbols` SHADOWS the symbol
+      // table — so a call site would resolve the callee to a frozen copy
+      // instead of the one carrying this round's variables, and the variable
+      // would never be bound at all. `def widened(v=3)` called `widened("a")`
+      // then kept `[builtins.int]` and refused the call, where the widening
+      // to `int | str` is the whole point of
+      // `golden.cases.a_parameter_takes_the_type_of_its_default`. The symbol
+      // table already holds every top-level function.
+      if (entry.statement &&
+          entry.statement->kind != "FunctionDef" &&
+          entry.statement->kind != "AsyncFunctionDef" &&
+          entry.statement->kind != "ClassDef")
+        collectGeneratorFunctionAnalysis(*this, entry.statement,
+                                         kNoLocalCallables, mlir::Type{},
+                                         moduleScope);
+      for (const parser::Node *call : entry.calls)
+        (void)inferExpr(call, moduleCallContext);
+    }
+    for (const parser::Node *call : decoratorCalls)
       (void)inferExpr(call, moduleCallContext);
     if (resolvedOverrides() == before)
       break;
@@ -5699,7 +5754,32 @@ TypeSystem::functionSignature(const parser::Node &function,
       // binding — successive fixpoint rounds join a recursive function's
       // literal base case with its widened recursive case, and an equational
       // variable cannot hold both spellings of the same contract.
-      if (walked) {
+      //
+      // ⭐ AND NOT WHILE THIS FUNCTION'S OWN PARAMETERS ARE STILL UNKNOWN. A
+      // body read with an unresolved parameter does not answer with a
+      // variable — the walk's lenient fallbacks answer `builtins.object` for
+      // an unknown operand and `None` for an unknown subscript, both of which
+      // pass the "fully resolved" test above and freeze:
+      //
+      //     def total(rows):
+      //         n = 0
+      //         for r in rows:
+      //             n += r
+      //         return n
+      //     data = [1, 2, 3, 4]
+      //     print(total(data))
+      //     # cannot unify !py.contract<"builtins.object">
+      //     #        with !py.contract<"builtins.int">
+      //
+      // The round that learns `rows` is `list[int]` then answers `int` and
+      // collides with the object the first round wrote. `def first(rows):
+      // return rows[0]` collides the same way against `!py.literal<None>`.
+      //
+      // ⛔ Why not make the fallbacks answer a variable instead: they are the
+      // LENIENT walk, whose whole job is to keep going past what it cannot
+      // type so the rest of the body is still read. A variable there would
+      // propagate into every join it takes part in.
+      if (walked && sig.missingParameterAnnotations.empty()) {
         mlir::Type resolved = inferenceState.zonk(walked);
         if (!py::containsPyInferVar(resolved)) {
           mlir::Type widened;
