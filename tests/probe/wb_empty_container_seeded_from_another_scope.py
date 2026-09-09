@@ -10,32 +10,39 @@
 #   in one branch of an if, filled after ............. correct
 #   filled by extend / insert / += / update /
 #     setdefault / |= ................................ correct
-#   a class FIELD, filled from another method ........ static type
+#   a class FIELD, filled from another method ........ CORRECT NOW
+#   a module GLOBAL, filled inside a function ........ static type
 #                                                      `builtins.object` does
 #                                                      not provide ...
-#   a module GLOBAL, filled inside a function ........ same
 #   an outer local, filled inside a NESTED def ....... same
 #
-# ⭐ WHY THE LINE IS THERE: the seed scan (`emptyLiteralSeedType`) is a forward
-# look over the suites the emitter is currently walking, and it stops at
-# `suiteStackFloor` -- the callable boundary -- because the same name in an
-# enclosing function is a different binding. The three failures are exactly the
-# cases where the fill is on the other side of that floor, so they are not a
-# wider scan of the same walk: the answer has to come from a pass over the
-# whole class or module before any of it is emitted.
+# ⭐ WHY THE LINE IS THERE: the seed scan (`emptyLiteralSeedTypeIn`) is a
+# forward look over the suites it is handed, and a caller hands it the ones it
+# is walking -- which stop at the callable boundary, because the same name in
+# an enclosing function is a different binding. The two failures are exactly
+# the cases where the fill is on the other side of that boundary.
 #
-# ⛔ The field case is NOT the one `setField` answers. That rule refines a field
-# whose FIRST assignment was empty when a LATER assignment in `__init__` gives a
-# real one; here `__init__` has only the empty assignment and the element type
-# exists only in another method's body.
-class Bag:
-    def __init__(self) -> None:
-        self.xs = []
+# ⭐ THE FIELD CASE WAS NOT (2026-09-09). Every method of a class is available
+# to `collectClassFields` before any of it is emitted, so the class-wide pass
+# the note below asked for already existed; what was missing was a scan that
+# could be asked about `self.xs` rather than about a bare name. It takes a
+# receiver now, and is asked once per method with that method's parameters in
+# scope. Two methods that disagree leave the field erased.
+#
+# ⛔ What is left needs a pass over the whole MODULE before any of it is
+# emitted, which is a different thing: a global is filled by functions whose
+# bodies are typed against the global, and an outer local by a nested def whose
+# own signature the enclosing walk has already answered for.
+#
+# ⛔ The field case was NOT the one `setField` answers. That rule refines a
+# field whose FIRST assignment was empty when a LATER assignment gives a real
+# one; a fill through `append` is not an assignment.
+XS = []
 
-    def put(self, n: int) -> int:
-        self.xs.append(n)
-        return self.xs[0] + 1
+
+def put(n: int) -> None:
+    XS.append(n)
 
 
-b = Bag()
-print(b.put(1))
+put(1)
+print(XS[0] + 1)

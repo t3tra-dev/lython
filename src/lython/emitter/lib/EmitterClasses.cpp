@@ -1,5 +1,6 @@
 #include "AstSynth.h"
 #include "EmitterCore.h"
+#include "EmptyLiteralSeed.h"
 #include "EmitterPyOps.h"
 #include "EmitterSupport.h"
 
@@ -3463,6 +3464,37 @@ void ModuleEmitter::collectClassFields(
     // pass adds NO names (a field this class never declares keeps its own
     // diagnostic, "'C' object has no attribute 'n'") and refines only the
     // None-seeded ones, which is exactly what `optionalPair` above allows.
+    // ⭐ A FIELD WHOSE ONLY ASSIGNMENT WAS AN EMPTY LITERAL takes its element
+    // from the operations that FILL it, and those are usually in another
+    // method:
+    //
+    //     class Bag:
+    //         def __init__(self) -> None:
+    //             self.xs = []
+    //         def put(self, n: int) -> None:
+    //             self.xs.append(n)
+    //     # operand type 'builtins.object' does not match selected evidence
+    //
+    // -- which is how a container held by a class is written when nobody
+    // annotates it. The scan that answers this for a LOCAL takes the container
+    // as an attribute of a receiver now, so the same one answers here; it is
+    // asked once per method, with that method's parameters in scope, and two
+    // methods that disagree leave the field erased where it started.
+    llvm::StringMap<mlir::Type> seededFields;
+    llvm::StringSet<> seedDisagreed;
+    auto erasedContainerKind = [&](mlir::Type type) -> llvm::StringRef {
+      auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+      if (!contract)
+        return {};
+      llvm::StringRef contractName = contract.getContractName();
+      if (contractName == "builtins.list")
+        return "List";
+      if (contractName == "builtins.dict")
+        return "Dict";
+      if (contractName == "builtins.set")
+        return "Set";
+      return {};
+    };
     llvm::SmallVector<const parser::Node *, 4> fieldMethods;
     for (const parser::NodePtr &method : *body)
       if (method && ast::nameSpelling(*method) == "__init__")
@@ -3778,7 +3810,40 @@ void ModuleEmitter::collectClassFields(
             }
           };
       walkInitBody(ast::nodeList(method, "body"));
+
+      // Asked with this method's scope still pushed, so `self.xs.append(n)`
+      // can read `n`.
+      for (auto [fieldIndex, fieldName] : llvm::enumerate(fieldNames)) {
+        if (!provisionalFields.contains(fieldName))
+          continue;
+        llvm::StringRef literalKind = erasedContainerKind(fieldTypes[fieldIndex]);
+        if (literalKind.empty())
+          continue;
+        SuiteCursor cursor{ast::nodeList(method, "body"), 0};
+        mlir::Type seeded =
+            emptyLiteralSeedTypeIn(types, fieldName, literalKind, cursor,
+                                   /*localSymbols=*/nullptr, /*depth=*/0,
+                                   /*subscriptDepth=*/0, /*receiver=*/"self");
+        if (!seeded)
+          continue;
+        auto found = seededFields.find(fieldName);
+        if (found == seededFields.end())
+          seededFields[fieldName] = seeded;
+        else if (found->second != seeded)
+          seedDisagreed.insert(fieldName);
+      }
     }
+
+    for (auto [fieldIndex, fieldName] : llvm::enumerate(fieldNames)) {
+      if (!provisionalFields.contains(fieldName) ||
+          seedDisagreed.contains(fieldName))
+        continue;
+      auto found = seededFields.find(fieldName);
+      if (found != seededFields.end())
+        fieldTypes[fieldIndex] = found->second;
+    }
+    if (publishSoFar)
+      publishSoFar(fieldNames, fieldTypes);
   }
 }
 

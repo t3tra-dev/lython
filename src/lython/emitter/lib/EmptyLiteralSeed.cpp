@@ -74,7 +74,8 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                                   llvm::StringRef literalKind,
                                   llvm::ArrayRef<SuiteCursor> suites,
                                   const llvm::StringMap<mlir::Type> *localSymbols,
-                                  unsigned depth, unsigned subscriptDepth) {
+                                  unsigned depth, unsigned subscriptDepth,
+                                  llvm::StringRef receiver) {
   if (suites.empty() || !suites.front().suite ||
       suites.front().from > suites.front().suite->size())
     return {};
@@ -120,6 +121,22 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // one -- at depth 0 the container IS the name, and a local bound to it is a
   // second reference this scan has no reason to follow.
   llvm::StringSet<> subscriptAliases;
+  // The container itself, however it is spelled: a bare name, or `<receiver>.
+  // <name>` when this scan was asked about a field.
+  auto isTheContainerItself = [&](const parser::Node *node) -> bool {
+    if (!node)
+      return false;
+    if (receiver.empty())
+      return node->kind == "Name" &&
+             llvm::StringRef(ast::nameSpelling(*node)) == name;
+    if (node->kind != "Attribute")
+      return false;
+    const parser::Node *base = ast::node(*node, "value");
+    std::optional<std::string_view> attr = ast::string(*node, "attr");
+    return base && base->kind == "Name" &&
+           llvm::StringRef(ast::nameSpelling(*base)) == receiver && attr &&
+           llvm::StringRef(*attr) == name;
+  };
   auto namesTheContainerAt = [&](const parser::Node *node,
                                  unsigned atDepth) -> bool {
     const parser::Node *current = node;
@@ -128,8 +145,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
         return false;
       current = ast::node(*current, "value");
     }
-    return current && current->kind == "Name" &&
-           llvm::StringRef(ast::nameSpelling(*current)) == name;
+    return isTheContainerItself(current);
   };
   auto namesTheContainer = [&](const parser::Node *node) -> bool {
     if (subscriptDepth > 0 && node && node->kind == "Name" &&
@@ -190,10 +206,13 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // and the pair DISAGREED -- so the whole shape, which is every stack
   // machine, got no seed at all. Skipping it leaves the honest seed standing.
   llvm::StringSet<> derivedFromName;
-  derivedFromName.insert(name);
+  if (receiver.empty())
+    derivedFromName.insert(name);
   auto mentionsName = [&](const parser::Node *node, auto &&recurse) -> bool {
     if (!node)
       return false;
+    if (isTheContainerItself(node))
+      return true;
     if (node->kind == "Name" &&
         derivedFromName.contains(ast::nameSpelling(*node)))
       return true;
@@ -442,8 +461,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
       // scan is deciding.
       if (const auto *targets = ast::nodeList(node, "targets"))
         for (const parser::NodePtr &target : *targets) {
-          if (!target || target->kind != "Name" ||
-              llvm::StringRef(ast::nameSpelling(*target)) != name)
+          if (!target || !isTheContainerItself(target.get()))
             continue;
           const parser::Node *rebound = ast::node(node, "value");
           if (!rebound || isEmptyContainerExpression(rebound) ||

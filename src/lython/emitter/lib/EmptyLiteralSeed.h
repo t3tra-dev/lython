@@ -32,6 +32,10 @@ struct SuiteCursor {
 // `localSymbols`, when given, are the names a walk has bound so far and the
 // symbol table does not hold -- what the SIGNATURE walk carries instead of
 // binding into a scope. The emitter passes none: it has bound them already.
+// `receiver`, when given, makes the key an ATTRIBUTE of it rather than a bare
+// name: `receiver` "self" and `name` "xs" is the field `self.xs`, which is how
+// a container held by a class is spelled at every operation that fills it.
+//
 // `depth` is the recursion this makes into ITSELF for a container that is
 // another empty literal, and `subscriptDepth` is how that container is
 // SPELLED: 0 is the bare name, 1 is `name[...]` -- which is what a container
@@ -42,6 +46,7 @@ emptyLiteralSeedTypeIn(const TypeSystem &types, llvm::StringRef name,
                        llvm::StringRef literalKind,
                        llvm::ArrayRef<SuiteCursor> suites,
                        const llvm::StringMap<mlir::Type> *localSymbols = nullptr,
-                       unsigned depth = 0, unsigned subscriptDepth = 0);
+                       unsigned depth = 0, unsigned subscriptDepth = 0,
+                       llvm::StringRef receiver = {});
 
 } // namespace lython::emitter
