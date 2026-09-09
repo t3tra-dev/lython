@@ -5907,7 +5907,45 @@ TypeSystem::functionSignature(const parser::Node &function,
       // LENIENT walk, whose whole job is to keep going past what it cannot
       // type so the rest of the body is still read. A variable there would
       // propagate into every join it takes part in.
-      if (walked && sig.missingParameterAnnotations.empty()) {
+      // ⭐ AND NOT AN ANSWER THAT STILL CONTAINS THE WALK'S "I DO NOT KNOW".
+      // A parameter of this function being resolved is not enough: the body
+      // may read another function whose own result is still a variable, and
+      // the lenient walk answers `builtins.object` for that too --
+      //
+      //     def tokenize(text):
+      //         out = []
+      //         for w in text.split(" "): out.append(w)
+      //         return out
+      //     def build_index(docs):
+      //         index = {}
+      //         for doc in docs:
+      //             for word in tokenize(doc):   <- a variable, this round
+      //                 index[word] = []
+      //         return index
+      //     # cannot unify builtins.object with builtins.str
+      //
+      // -- `build_index` froze `dict[object, object]` in the round before
+      // `tokenize` resolved, and the round after collided with it.
+      //
+      // ⛔ Only DURING the fixpoint. The last sweep is the authoritative
+      // reading, and a function whose result really is erased has to be able
+      // to say so -- `defaultsDescribeParameters` is what tells the two apart,
+      // being false exactly for the rounds.
+      std::function<bool(mlir::Type)> mentionsErasedTop =
+          [&](mlir::Type type) -> bool {
+        if (!type)
+          return false;
+        if (type == object())
+          return true;
+        if (auto contract = mlir::dyn_cast<py::ContractType>(type))
+          return llvm::any_of(contract.getArguments(), mentionsErasedTop);
+        if (auto unionType = mlir::dyn_cast<py::UnionType>(type))
+          return llvm::any_of(unionType.getMemberTypes(), mentionsErasedTop);
+        return false;
+      };
+      if (walked && sig.missingParameterAnnotations.empty() &&
+          (defaultsDescribeParameters ||
+           !mentionsErasedTop(inferenceState.zonk(walked)))) {
         mlir::Type resolved = inferenceState.zonk(walked);
         if (!py::containsPyInferVar(resolved)) {
           mlir::Type widened;
