@@ -1,0 +1,6 @@
+['end', 'middle', 'start']
+end end reject:start
+[('a', 'middle'), ('b', 'end')]
+middle!
+['a', 'b']
+arc?

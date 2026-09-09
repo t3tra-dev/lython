@@ -251,6 +251,20 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // ⛔ Falls back to reading it when the deeper scan finds nothing: the erased
   // container is what this returned before, and a program that only prints the
   // outer one never decodes an inner element.
+  // ⭐ AND AN EMPTY ONE THAT NOTHING FILLS DOES NOT DISAGREE WITH A FULL ONE.
+  // `emptyFallback` holds what reading an unfilled empty literal answers, and
+  // it is used only when nothing else contributed -- the rule a sibling
+  // literal already follows (`joinIgnoringEmptyLiterals`), which a store had
+  // not:
+  //
+  //     table = {}
+  //     table["start"] = {"a": "middle"}
+  //     table["end"] = {}          <- read as dict[object, object]
+  //     # the pair disagreed and the whole table stayed erased
+  //
+  // -- the shape of every transition table with a terminal state in it.
+  mlir::Type emptyFallback;
+  bool emptyFallbackDisagreed = false;
   auto noteMaybeContainer = [&](mlir::Type &slot, const parser::Node *expr,
                                 auto &&noteType) {
     if (expr && depth < 3 && isEmptyContainerExpression(expr)) {
@@ -258,6 +272,16 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
               types, name, literalKindOf(*expr), suites, localSymbols,
               depth + 1, subscriptDepth + 1)) {
         noteType(slot, inner);
+        return;
+      }
+      if (&slot == &element) {
+        mlir::Type read = types.widenLiteral(inferHere(expr));
+        if (!read)
+          return;
+        if (!emptyFallback)
+          emptyFallback = read;
+        else if (emptyFallback != read)
+          emptyFallbackDisagreed = true;
         return;
       }
     }
@@ -787,6 +811,8 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // still a disagreement.
   if (!disagreed && !element)
     element = deferredElement;
+  if (!disagreed && !element && !emptyFallbackDisagreed)
+    element = emptyFallback;
   if (disagreed || !element)
     return {};
   if (isMapping)
