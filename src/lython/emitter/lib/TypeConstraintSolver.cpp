@@ -410,6 +410,28 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
   // manifest map's. Checked after the object-top acceptors on purpose: a
   // match against the top type carries no information, so the variable must
   // stay free rather than get polluted with object().
+  // ⭐ A PROTOCOL IS A BOUND, NOT AN ANSWER. Binding an inference variable to
+  // one fixes the parameter AT the bound, and the call site can no longer say
+  // what the value is:
+  //
+  //     def show(args):
+  //         if len(args) == 0:
+  //             return ""
+  //         return ",".join(args)
+  //     print(show(["a", "b"]))
+  //     # !py.protocol<"Iterable", [builtins.str]> does not provide '__len__'
+  //
+  // `join` declares `Iterable[str]`, so the body's use answered for the
+  // parameter and `len` was then asked of a protocol. The same function
+  // without the `len` compiled, which is what says the protocol was the
+  // answer rather than a check.
+  //
+  // ⛔ Only in that direction. A protocol-typed VALUE handed to an inferred
+  // parameter really is what the caller has, and binding the variable to it is
+  // the call site speaking.
+  if (py::isPyInferVarType(actual) &&
+      mlir::isa_and_present<py::ProtocolType>(expected))
+    return true;
   if (py::isPyInferVarType(expected) || py::isPyInferVarType(actual))
     return static_cast<bool>(types.inference().unify(expected, actual));
 

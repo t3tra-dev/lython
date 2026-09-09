@@ -1,0 +1,7 @@
+add(1,2)
+arity:add
+ping()
+unknown:nope
+[('add', 2), ('ping', 0)]
+x,y,z (3)
+ (0)
