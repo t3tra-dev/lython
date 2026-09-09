@@ -4,7 +4,9 @@
 #include "PrimitiveTypes.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -71,7 +73,8 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                                   llvm::StringRef name,
                                   llvm::StringRef literalKind,
                                   llvm::ArrayRef<SuiteCursor> suites,
-                                  const llvm::StringMap<mlir::Type> *localSymbols) {
+                                  const llvm::StringMap<mlir::Type> *localSymbols,
+                                  unsigned depth) {
   if (suites.empty() || !suites.front().suite ||
       suites.front().from > suites.front().suite->size())
     return {};
@@ -87,6 +90,17 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                         : types.inferExpr(expr);
   };
   bool isMapping = literalKind == "Dict";
+  // `dict()`/`set()`/`list()` spell the same literals as calls; the callers map
+  // them before asking, and the nested ask below has to map them too.
+  auto literalKindOf = [](const parser::Node &node) -> llvm::StringRef {
+    if (node.kind != "Call")
+      return node.kind;
+    llvm::StringRef callee = ast::nameSpelling(*ast::node(node, "func"));
+    return callee == "dict"    ? "Dict"
+           : callee == "set"   ? "Set"
+           : callee == "tuple" ? "Tuple"
+                               : "List";
+  };
   mlir::Type element;
   mlir::Type key;
   bool disagreed = false;
@@ -112,11 +126,31 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // this scan is trying to decide -- object -- so counting it would make the
   // pair disagree and leave the whole thing at object, which is where it
   // started.
+  //
+  // ⭐ AND A LOCAL THE NAME FLOWED INTO IS THE NAME. `derivedFromName` below
+  // collects the assignments in the scanned suites whose value reads the name
+  // -- directly or through another such local -- because a seed spelled with
+  // one of those reads the type this scan is deciding, one binding removed:
+  //
+  //     stack = []
+  //     for t in toks:
+  //         if t == "+":
+  //             b = stack.pop()
+  //             a = stack.pop()
+  //             stack.append(a + b)      <- reads `stack`, through a and b
+  //         else:
+  //             stack.append(int(t))     <- the seed
+  //
+  // Without it the first append answered `object`, the second answered `int`,
+  // and the pair DISAGREED -- so the whole shape, which is every stack
+  // machine, got no seed at all. Skipping it leaves the honest seed standing.
+  llvm::StringSet<> derivedFromName;
+  derivedFromName.insert(name);
   auto mentionsName = [&](const parser::Node *node, auto &&recurse) -> bool {
     if (!node)
       return false;
     if (node->kind == "Name" &&
-        llvm::StringRef(ast::nameSpelling(*node)) == name)
+        derivedFromName.contains(ast::nameSpelling(*node)))
       return true;
     for (const parser::Field &field : node->fields) {
       if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
@@ -425,7 +459,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
         // Bound AFTER the statement is scanned, so an assignment does not see
         // itself, and only for the rest of THIS suite.
         std::optional<TypeSystem::Scope> suiteScope;
-        for (const parser::NodePtr &child : *children) {
+        for (auto [childIndex, child] : llvm::enumerate(*children)) {
           if (!child)
             continue;
           recurse(*child, recurse);
@@ -455,13 +489,45 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
               !assignTargets->front() ||
               assignTargets->front()->kind != "Name" || !assigned)
             continue;
-          mlir::Type bound = types.widenLiteral(inferHere(assigned));
+          // ⭐ A LOCAL THAT IS ITSELF AN EMPTY LITERAL IS SEEDED, NOT READ.
+          // Reading one answers `list[object]`, which is a type and therefore
+          // passed the test below, so the OUTER container took it and the
+          // inner element was lost two levels down:
+          //
+          //     def grid(rows: int, cols: int):
+          //         out = []
+          //         for _ in range(rows):
+          //             line = []
+          //             for _ in range(cols):
+          //                 line.append(0)
+          //             out.append(line)
+          //         return out
+          //     print(grid(2, 2)[0][0] + 1)
+          //     # builtins.object does not provide manifest method '__add__'
+          //
+          // ⛔ Depth-bounded rather than cycle-detected: the recursion is a
+          // container inside a container, which is two or three deep in real
+          // programs, and a bound is cheaper to be sure of than a visited set
+          // threaded through a scan that pushes type scopes.
+          mlir::Type bound;
+          llvm::StringRef assignedName =
+              ast::nameSpelling(*assignTargets->front());
+          if (depth < 3 && isEmptyContainerExpression(assigned) &&
+              assignedName != name) {
+            llvm::SmallVector<SuiteCursor, 4> nested;
+            nested.push_back(SuiteCursor{children, childIndex + 1});
+            nested.append(suites.begin(), suites.end());
+            bound = emptyLiteralSeedTypeIn(types, assignedName,
+                                           literalKindOf(*assigned), nested,
+                                           localSymbols, depth + 1);
+          }
+          if (!bound)
+            bound = types.widenLiteral(inferHere(assigned));
           if (!bound || bound == types.object())
             continue;
           if (!suiteScope)
             suiteScope.emplace(types.pushScope());
-          types.bindLocalSymbol(ast::nameSpelling(*assignTargets->front()),
-                                bound);
+          types.bindLocalSymbol(assignedName, bound);
         }
       }
     }
@@ -497,6 +563,53 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
       if ((*suite)[index])
         visit(*(*suite)[index], visit);
   };
+  // ⛔ To a FIXPOINT and before any scanning: `a = stack.pop()` has to be known
+  // derived by the time `b = a` is read, and the two can be written in either
+  // order across the suites this walks. Three rounds is a bound, not a count --
+  // each round can only add names, and a chain longer than that leaves the
+  // extra links reading as ordinary locals, which is what they did before.
+  {
+    std::function<void(const parser::Node &)> collect =
+        [&](const parser::Node &node) {
+          if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+              node.kind == "ClassDef")
+            return;
+          if (node.kind == "Assign") {
+            const auto *targets = ast::nodeList(node, "targets");
+            const parser::Node *value = ast::node(node, "value");
+            if (value && targets && targets->size() == 1 &&
+                targets->front() && targets->front()->kind == "Name" &&
+                mentionsName(value, mentionsName))
+              derivedFromName.insert(ast::nameSpelling(*targets->front()));
+          }
+          for (const parser::Field &field : node.fields) {
+            if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+              if (*child)
+                collect(**child);
+              continue;
+            }
+            if (const auto *children =
+                    std::get_if<std::vector<parser::NodePtr>>(&field.value))
+              for (const parser::NodePtr &child : *children)
+                if (child)
+                  collect(*child);
+          }
+        };
+    for (unsigned round = 0; round < 3; ++round) {
+      std::size_t before = derivedFromName.size();
+      for (const SuiteCursor &cursor : suites) {
+        if (!cursor.suite)
+          continue;
+        for (std::size_t index = cursor.from; index < cursor.suite->size();
+             ++index)
+          if ((*cursor.suite)[index])
+            collect(*(*cursor.suite)[index]);
+      }
+      if (derivedFromName.size() == before)
+        break;
+    }
+  }
+
   for (const SuiteCursor &cursor : suites)
     scanRemainder(cursor.suite, cursor.from);
 
