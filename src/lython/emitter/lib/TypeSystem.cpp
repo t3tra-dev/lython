@@ -220,11 +220,17 @@ localCallableTypesInFunction(const TypeSystem &types,
   return localCallables;
 }
 
+mlir::Type joinIgnoringEmptyLiterals(const TypeSystem &types,
+                                     llvm::ArrayRef<mlir::Type> collected,
+                                     llvm::ArrayRef<const parser::Node *> nodes);
+
 void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
                         const llvm::StringMap<mlir::Type> &localCallables,
                         llvm::SmallVectorImpl<mlir::Type> &results,
                         llvm::SmallVectorImpl<std::string> *failureReasons,
-                        const llvm::StringMap<mlir::Type> *localSymbols) {
+                        const llvm::StringMap<mlir::Type> *localSymbols,
+                        llvm::SmallVectorImpl<const parser::Node *>
+                            *resultNodes = nullptr) {
   if (!node)
     return;
   if (node->kind == "FunctionDef" || node->kind == "AsyncFunctionDef" ||
@@ -234,20 +240,23 @@ void collectReturnTypes(const TypeSystem &types, const parser::Node *node,
     mlir::Type type =
         inferReturnExpr(types, ast::node(*node, "value"), localCallables,
                         failureReasons, localSymbols);
-    if (type)
+    if (type) {
       results.push_back(type);
+      if (resultNodes)
+        resultNodes->push_back(ast::node(*node, "value"));
+    }
     return;
   }
   for (const parser::Field &field : node->fields) {
     if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
       if (*child)
         collectReturnTypes(types, child->get(), localCallables, results,
-                           failureReasons, localSymbols);
+                           failureReasons, localSymbols, resultNodes);
     } else if (const auto *children =
                    std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
       for (const parser::NodePtr &child : *children)
         collectReturnTypes(types, child.get(), localCallables, results,
-                           failureReasons, localSymbols);
+                           failureReasons, localSymbols, resultNodes);
     }
   }
 }
@@ -280,11 +289,28 @@ mlir::Type inferredFunctionResult(const TypeSystem &types,
       localCallableTypesInFunction(types, function);
 
   llvm::SmallVector<mlir::Type, 4> results;
+  // ⭐ AN EMPTY CONTAINER RETURN CONTRIBUTES NOTHING TO THE JOIN, which is the
+  // rule a sibling literal already follows. `return []` beside
+  // `return table[key]` joined `list[object]` with `list[int]` and the result
+  // was a union of two lists that nothing accepts:
+  //
+  //     def get(table, key):
+  //         if key not in table:
+  //             return []
+  //         return table[key]
+  //     print(get({"a": [1, 2]}, "a")[0] + 1)
+  //     # builtins.object does not provide manifest method '__add__'
+  //
+  // -- the shape of every lookup with a default, and the annotated spelling of
+  // it has always worked because the annotation IS the element type there.
+  llvm::SmallVector<const parser::Node *, 4> resultNodes;
   if (const auto *body = ast::nodeList(function, "body"))
     for (const parser::NodePtr &statement : *body)
       collectReturnTypes(types, statement.get(), localCallables, results,
-                         failureReasons, localSymbols);
-  return results.empty() ? types.none() : types.join(results);
+                         failureReasons, localSymbols, &resultNodes);
+  if (results.empty())
+    return types.none();
+  return joinIgnoringEmptyLiterals(types, results, resultNodes);
 }
 
 struct GeneratorFunctionAnalysis {
