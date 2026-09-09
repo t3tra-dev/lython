@@ -55,6 +55,12 @@
 #   the same function with `out` annotated ....................... correct
 #   a FLAT list of the same class instances ...................... correct
 #   a list of lists of them (no member read in the key) .......... correct
+#   the same grouping keyed on `str(i)` rather than a member ..... correct
+#   `out[p.sku] = 1`, a member read as the KEY and nothing else .. refused
+#
+# ⭐ SO IT IS THE MEMBER READ, NOT THE CLASS. An instance travels through the
+# scan perfectly well -- it is an element in three of the correct rows above --
+# and what it cannot do there is answer for one of its own attributes.
 #
 # ⛔ Recomputing the signature at declaration time, which is what the generator
 # arm of `emitTopLevelDeclarations` does for the same reason, does not work

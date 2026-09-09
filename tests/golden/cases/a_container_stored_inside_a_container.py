@@ -24,9 +24,15 @@
 # a parameter and its existing arms answer unchanged. Dict-of-list,
 # list-of-list, dict-of-set and dict-of-dict all fall out of that.
 #
-# ⛔ `bucket = out.setdefault(k, [])` is still refused: the local there takes
-# the CALL'S RESULT, which is not one of the shapes this scan reads, and the
-# empty literal it is given is an argument rather than a store.
+# ⭐ AND A LOCAL BOUND TO THE INNER CONTAINER IS THE INNER CONTAINER.
+# `bucket = out.setdefault(k, [])` and `bucket = out[k]` both name `out[k]`,
+# and the appends that follow go through THAT name -- which is the grouping
+# written the short way. Only at a depth where an alias can mean one: at depth
+# 0 the container IS the name.
+#
+# ⭐ A filling call is not always a STATEMENT either. The scan looked at bare
+# expression statements only, so the setdefault above -- the right-hand side of
+# an assignment -- was never seen at all.
 #
 # ⛔ Depth-bounded, and it falls back to reading the empty literal when the
 # deeper scan finds nothing -- the erased container is what this answered
@@ -60,6 +66,24 @@ def index(words):
     return out
 
 
+def short_group(words):
+    out = {}
+    for w in words:
+        bucket = out.setdefault(w[0], [])
+        bucket.append(w)
+    return out
+
+
+def via_index(words):
+    out = {}
+    for w in words:
+        if w[0] not in out:
+            out[w[0]] = []
+        bucket = out[w[0]]
+        bucket.append(w)
+    return out
+
+
 def unique(words):
     out = {}
     for w in words:
@@ -85,3 +109,6 @@ print(sized["cde"]["len"] + 1)
 
 seen = unique(names)
 print(sorted(seen["a"]), len(seen["a"]))
+
+print(short_group(names)["a"][2] + "?")
+print(via_index(names)["b"][0] + "?")

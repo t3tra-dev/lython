@@ -106,15 +106,36 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // one subscript deeper answers what fills the inner container, and the
   // outer element is that answer wrapped -- rather than the `list[object]`
   // reading the empty literal gives on its own.
-  auto namesTheContainer = [&](const parser::Node *node) -> bool {
+  //
+  // ⭐ AND A LOCAL BOUND TO IT IS IT. `bucket = out.setdefault(k, [])` names
+  // `out[k]`, and the appends that follow go through THAT name:
+  //
+  //     out = {}
+  //     for w in words:
+  //         bucket = out.setdefault(w[0], [])
+  //         bucket.append(w)
+  //
+  // which is the grouping written the short way. `bucket = out[k]` is the same
+  // alias; both are collected below and only at a depth where they can mean
+  // one -- at depth 0 the container IS the name, and a local bound to it is a
+  // second reference this scan has no reason to follow.
+  llvm::StringSet<> subscriptAliases;
+  auto namesTheContainerAt = [&](const parser::Node *node,
+                                 unsigned atDepth) -> bool {
     const parser::Node *current = node;
-    for (unsigned level = 0; level < subscriptDepth; ++level) {
+    for (unsigned level = 0; level < atDepth; ++level) {
       if (!current || current->kind != "Subscript")
         return false;
       current = ast::node(*current, "value");
     }
     return current && current->kind == "Name" &&
            llvm::StringRef(ast::nameSpelling(*current)) == name;
+  };
+  auto namesTheContainer = [&](const parser::Node *node) -> bool {
+    if (subscriptDepth > 0 && node && node->kind == "Name" &&
+        subscriptAliases.contains(ast::nameSpelling(*node)))
+      return true;
+    return namesTheContainerAt(node, subscriptDepth);
   };
   auto literalKindOf = [](const parser::Node &node) -> llvm::StringRef {
     if (node.kind != "Call")
@@ -292,9 +313,16 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
     if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
         node.kind == "ClassDef")
       return;
-    if (node.kind == "Expr") {
-      const parser::Node *call = ast::node(node, "value");
-      if (call && call->kind == "Call") {
+    // ⭐ A FILLING CALL IS NOT ALWAYS A STATEMENT. This looked only at a bare
+    // expression statement, so `bucket = out.setdefault(k, [])` -- the short
+    // way to write a grouping -- was never seen: the call is the right-hand
+    // side of an assignment. Every Call the walk reaches is asked now; the
+    // walk descends into an assignment's value already, and the arms below
+    // each require a method name and an arity, so a call that fills nothing
+    // still notes nothing.
+    {
+      const parser::Node *call = &node;
+      if (call->kind == "Call") {
         const parser::Node *callee = ast::node(*call, "func");
         if (callee && callee->kind == "Attribute") {
           const parser::Node *receiver = ast::node(*callee, "value");
@@ -616,6 +644,60 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // order across the suites this walks. Three rounds is a bound, not a count --
   // each round can only add names, and a chain longer than that leaves the
   // extra links reading as ordinary locals, which is what they did before.
+  if (subscriptDepth > 0) {
+    // The value shapes that BIND one: a subscript of the container one level
+    // out, or its `setdefault`/`get`, which is the same read written as a call.
+    auto bindsTheContainer = [&](const parser::Node *value) -> bool {
+      if (!value)
+        return false;
+      if (value->kind == "Subscript")
+        return namesTheContainerAt(ast::node(*value, "value"),
+                                   subscriptDepth - 1);
+      if (value->kind != "Call")
+        return false;
+      const parser::Node *callee = ast::node(*value, "func");
+      if (!callee || callee->kind != "Attribute")
+        return false;
+      std::optional<std::string_view> method = ast::string(*callee, "attr");
+      if (!method || (*method != "setdefault" && *method != "get"))
+        return false;
+      return namesTheContainerAt(ast::node(*callee, "value"),
+                                 subscriptDepth - 1);
+    };
+    std::function<void(const parser::Node &)> collectAliases =
+        [&](const parser::Node &node) {
+          if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+              node.kind == "ClassDef")
+            return;
+          if (node.kind == "Assign") {
+            const auto *targets = ast::nodeList(node, "targets");
+            if (targets && targets->size() == 1 && targets->front() &&
+                targets->front()->kind == "Name" &&
+                bindsTheContainer(ast::node(node, "value")))
+              subscriptAliases.insert(ast::nameSpelling(*targets->front()));
+          }
+          for (const parser::Field &field : node.fields) {
+            if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+              if (*child)
+                collectAliases(**child);
+              continue;
+            }
+            if (const auto *children =
+                    std::get_if<std::vector<parser::NodePtr>>(&field.value))
+              for (const parser::NodePtr &child : *children)
+                if (child)
+                  collectAliases(*child);
+          }
+        };
+    for (const SuiteCursor &cursor : suites) {
+      if (!cursor.suite)
+        continue;
+      for (std::size_t index = cursor.from; index < cursor.suite->size();
+           ++index)
+        if ((*cursor.suite)[index])
+          collectAliases(*(*cursor.suite)[index]);
+    }
+  }
   {
     std::function<void(const parser::Node &)> collect =
         [&](const parser::Node &node) {
