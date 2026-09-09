@@ -2,6 +2,7 @@
 
 #include "Emitter.h"
 #include "EmitterState.h"
+#include "EmptyLiteralSeed.h"
 #include "TypeSystem.h"
 
 #include "mlir/IR/Builders.h"
@@ -419,6 +420,11 @@ private:
   // The union `NAME = None` takes when the rest of the suite binds NAME to
   // something else; null when nothing does or the bindings cannot be typed.
   mlir::Type noneSeedUnionType(llvm::StringRef name);
+  bool functionBindsName(const parser::Node &function, llvm::StringRef name);
+  mlir::Type
+  emptyLiteralSeedAcross(llvm::StringRef name, llvm::StringRef literalKind,
+                         llvm::ArrayRef<SuiteCursor> base,
+                         llvm::ArrayRef<const parser::Node *> callables);
   mlir::Type emptyLiteralSeedType(llvm::StringRef name,
                                   llvm::StringRef literalKind);
   bool isModuleGlobalRead(llvm::StringRef name) const;

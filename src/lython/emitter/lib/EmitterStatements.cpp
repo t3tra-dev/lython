@@ -17,6 +17,7 @@
 #include "llvm/Support/SaveAndRestore.h"
 
 #include <cstddef>
+#include <functional>
 #include <string>
 
 namespace lython::emitter {
@@ -442,7 +443,159 @@ mlir::Type ModuleEmitter::emptyLiteralSeedType(llvm::StringRef name,
     if (suite != currentSuite)
       suites.push_back({suite, index});
   }
-  return emptyLiteralSeedTypeIn(types, name, literalKind, suites);
+  // ⭐ AND EVERY TOP-LEVEL FUNCTION, when the container is a module GLOBAL.
+  // A registry filled by the functions that use it is how module state is
+  // written, and the fills are all on the other side of a callable boundary
+  // this walk stops at:
+  //
+  //     XS = []
+  //     def put(n: int) -> None:
+  //         XS.append(n)
+  //     put(1)
+  //     print(XS[0] + 1)
+  //     # builtins.object does not provide manifest method '__add__'
+  //
+  // ⛔ Only a function that does not BIND the name. In Python an assignment
+  // anywhere in a body makes the name local for the whole body, so `XS = [1]`
+  // inside one says nothing about the global -- unless the function declares
+  // `global XS`, which is the one spelling that puts the store back on it.
+  // ⭐ AND THE CALLABLES THAT FILL IT. A registry filled by the functions that
+  // use it is how module state is written, and an accumulator filled by a
+  // nested def is how a closure builds one -- both on the other side of a
+  // callable boundary the ordinary scan stops at, because the same name in an
+  // enclosing function is usually a different binding. It is not one when the
+  // callable never BINDS the name, which is what `functionBindsName` asks.
+  llvm::SmallVector<const parser::Node *, 4> callables;
+  if (atModuleScope) {
+    if (const auto *moduleBody = ast::nodeList(moduleNode, "body"))
+      for (const parser::NodePtr &statement : *moduleBody)
+        if (statement && (statement->kind == "FunctionDef" ||
+                          statement->kind == "AsyncFunctionDef"))
+          callables.push_back(statement.get());
+  } else {
+    std::function<void(const parser::Node &)> collect =
+        [&](const parser::Node &node) {
+          if (node.kind == "ClassDef")
+            return;
+          if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef") {
+            callables.push_back(&node);
+            return;
+          }
+          for (const parser::Field &field : node.fields) {
+            if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+              if (*child)
+                collect(**child);
+              continue;
+            }
+            if (const auto *children =
+                    std::get_if<std::vector<parser::NodePtr>>(&field.value))
+              for (const parser::NodePtr &child : *children)
+                if (child)
+                  collect(*child);
+          }
+        };
+    for (const SuiteCursor &cursor : suites) {
+      if (!cursor.suite)
+        continue;
+      for (std::size_t index = cursor.from; index < cursor.suite->size();
+           ++index)
+        if ((*cursor.suite)[index])
+          collect(*(*cursor.suite)[index]);
+    }
+  }
+  return emptyLiteralSeedAcross(name, literalKind, suites, callables);
+}
+
+mlir::Type ModuleEmitter::emptyLiteralSeedAcross(
+    llvm::StringRef name, llvm::StringRef literalKind,
+    llvm::ArrayRef<SuiteCursor> base,
+    llvm::ArrayRef<const parser::Node *> callables) {
+  mlir::Type seeded = emptyLiteralSeedTypeIn(types, name, literalKind, base);
+  bool disagreed = false;
+  for (const parser::Node *statement : callables) {
+    const auto *functionBody = ast::nodeList(*statement, "body");
+    if (!functionBody || functionBindsName(*statement, name))
+      continue;
+    // The function's own parameters, because the seed is usually one of them
+    // (`def put(n: int): XS.append(n)`). Asked one function at a time for that
+    // reason -- the scan reads names out of one scope.
+    TypeSystem::Scope functionScope = types.pushScope();
+    if (const parser::Node *arguments = ast::node(*statement, "args"))
+      for (llvm::StringRef group : {"posonlyargs", "args", "kwonlyargs"})
+        if (const auto *args = ast::nodeList(*arguments, group))
+          for (const parser::NodePtr &arg : *args) {
+            if (!arg)
+              continue;
+            if (mlir::Type annotated =
+                    types.annotationType(ast::node(*arg, "annotation")))
+              types.bindLocalSymbol(ast::nameSpelling(*arg), annotated);
+          }
+    SuiteCursor cursor{functionBody, 0};
+    mlir::Type fromFunction =
+        emptyLiteralSeedTypeIn(types, name, literalKind, cursor);
+    if (!fromFunction)
+      continue;
+    if (!seeded)
+      seeded = fromFunction;
+    else if (seeded != fromFunction)
+      disagreed = true;
+  }
+  return disagreed ? mlir::Type() : seeded;
+}
+
+// Does this function make `name` a local of its own? A parameter, or any
+// binding statement in its body -- which in Python makes the name local for
+// the WHOLE body -- unless a `global` declaration hands the stores back to the
+// module's binding.
+bool ModuleEmitter::functionBindsName(const parser::Node &function,
+                                      llvm::StringRef name) {
+  if (const parser::Node *arguments = ast::node(function, "args"))
+    for (llvm::StringRef group : {"posonlyargs", "args", "kwonlyargs"})
+      if (const auto *args = ast::nodeList(*arguments, group))
+        for (const parser::NodePtr &arg : *args)
+          if (arg && llvm::StringRef(ast::nameSpelling(*arg)) == name)
+            return true;
+  bool binds = false;
+  bool declaredGlobal = false;
+  std::function<void(const parser::Node &)> walk =
+      [&](const parser::Node &node) {
+        if (node.kind == "Global" || node.kind == "Nonlocal")
+          if (const auto *names = ast::nodeList(node, "names"))
+            for (const parser::NodePtr &spelled : *names)
+              if (spelled && llvm::StringRef(ast::nameSpelling(*spelled)) == name)
+                declaredGlobal = true;
+        auto isTheName = [&](const parser::Node *target) {
+          return target && target->kind == "Name" &&
+                 llvm::StringRef(ast::nameSpelling(*target)) == name;
+        };
+        if (node.kind == "Assign") {
+          if (const auto *targets = ast::nodeList(node, "targets"))
+            for (const parser::NodePtr &target : *targets)
+              if (isTheName(target.get()))
+                binds = true;
+        } else if (node.kind == "AnnAssign" || node.kind == "AugAssign" ||
+                   node.kind == "For" || node.kind == "AsyncFor") {
+          if (isTheName(ast::node(node, "target")))
+            binds = true;
+        }
+        for (const parser::Field &field : node.fields) {
+          if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              walk(**child);
+            continue;
+          }
+          if (const auto *children =
+                  std::get_if<std::vector<parser::NodePtr>>(&field.value))
+            for (const parser::NodePtr &child : *children)
+              if (child)
+                walk(*child);
+        }
+      };
+  if (const auto *body = ast::nodeList(function, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        walk(*statement);
+  return binds && !declaredGlobal;
 }
 
 void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {

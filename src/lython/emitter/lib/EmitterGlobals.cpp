@@ -332,6 +332,39 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     if (!value)
       continue;
     mlir::Type inferred = types.widenLiteral(types.inferExpr(value));
+    // ⭐ AN EMPTY CONTAINER GLOBAL TAKES ITS ELEMENT FROM THE FUNCTIONS THAT
+    // FILL IT. The cell's type is decided HERE, before any body is emitted, so
+    // seeding it at the assignment (where a local is seeded) is too late --
+    // the reads have already been typed against the erased element:
+    //
+    //     XS = []
+    //     def put(n: int) -> None:
+    //         XS.append(n)
+    //     put(1)
+    //     print(XS[0] + 1)
+    //     # builtins.object does not provide manifest method '__add__'
+    //
+    // A global read from a function is exactly the shape this filter selects
+    // for, so every one of them is a candidate.
+    if (isEmptyContainerExpression(value)) {
+      llvm::StringRef literalKind = value->kind;
+      if (literalKind == "Call") {
+        llvm::StringRef callee = ast::nameSpelling(*ast::node(*value, "func"));
+        literalKind = callee == "dict"    ? "Dict"
+                      : callee == "set"   ? "Set"
+                      : callee == "tuple" ? "Tuple"
+                                          : "List";
+      }
+      SuiteCursor cursor{body, 0};
+      llvm::SmallVector<const parser::Node *, 4> callables;
+      for (const parser::NodePtr &candidate : *body)
+        if (candidate && (candidate->kind == "FunctionDef" ||
+                          candidate->kind == "AsyncFunctionDef"))
+          callables.push_back(candidate.get());
+      if (mlir::Type seededGlobal =
+              emptyLiteralSeedAcross(name, literalKind, cursor, callables))
+        inferred = seededGlobal;
+    }
     // ⭐ A FUNCTION VALUE IS A GLOBAL LIKE ANY OTHER. `CALLBACK = base` read
     // from a function body was "unresolved name 'CALLBACK'": the cell was
     // never declared, because a callable's static type is a `py.callable` and
