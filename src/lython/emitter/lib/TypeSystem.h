@@ -377,6 +377,7 @@ public:
   // symbols. A GENERATOR's signature is the one that also depends on its BODY,
   // and a body that reads `c.n` on a source class inferred `object` there.
   void forgetSignature(const parser::Node *function);
+  void forgetInferredResult(const parser::Node *function);
   mlir::Type annotationType(const parser::Node *node) const;
   // True when the expression NAMES A TYPE rather than a value: a builtin
   // spelling, a declared class, a protocol or contract name, an alias already

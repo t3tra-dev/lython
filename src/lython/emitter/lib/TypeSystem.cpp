@@ -2060,6 +2060,17 @@ void TypeSystem::forgetSignature(const parser::Node *function) {
     signatureMemo.erase(function);
 }
 
+// ⛔ The RESULT VARIABLE goes with the memo, or the recomputation collides with
+// it. The variable exists so callers typed during the module fixpoint can
+// consume a result before its body walk succeeds, and it is bound to whatever
+// that walk answered -- so a caller that forgets a signature because the facts
+// it was read under have CHANGED has to forget the answer too, not unify a
+// second one against it ("cannot unify builtins.object with builtins.str").
+void TypeSystem::forgetInferredResult(const parser::Node *function) {
+  if (function)
+    resultTypeOverrides.erase(function);
+}
+
 void TypeSystem::registerModule(const parser::Node &moduleNode) {
   const auto *body = ast::nodeList(moduleNode, "body");
   if (!body)

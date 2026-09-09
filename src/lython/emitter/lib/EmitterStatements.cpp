@@ -519,17 +519,29 @@ mlir::Type ModuleEmitter::emptyLiteralSeedAcross(
     // The function's own parameters, because the seed is usually one of them
     // (`def put(n: int): XS.append(n)`). Asked one function at a time for that
     // reason -- the scan reads names out of one scope.
+    //
+    // ⭐ FROM THE SIGNATURE, NOT THE ANNOTATIONS. A top-level parameter with no
+    // annotation has a type by the time this runs -- the module fixpoint gave
+    // it one from the call sites -- and reading the annotation instead left
+    // `def add(name, at): TASKS.append((name, at))` seeding its registry with
+    // `object`, which is the spelling a program with no annotations in it uses
+    // throughout.
+    //
+    // ⛔ A parameter still holding an inference variable is left unbound: it is
+    // the fixpoint saying it does not know, and binding it would put a variable
+    // where the scan expects a type.
     TypeSystem::Scope functionScope = types.pushScope();
-    if (const parser::Node *arguments = ast::node(*statement, "args"))
-      for (llvm::StringRef group : {"posonlyargs", "args", "kwonlyargs"})
-        if (const auto *args = ast::nodeList(*arguments, group))
-          for (const parser::NodePtr &arg : *args) {
-            if (!arg)
-              continue;
-            if (mlir::Type annotated =
-                    types.annotationType(ast::node(*arg, "annotation")))
-              types.bindLocalSymbol(ast::nameSpelling(*arg), annotated);
-          }
+    FunctionSignature signature = types.functionSignature(*statement);
+    for (auto [index, parameter] : llvm::enumerate(signature.positionalNames))
+      if (index < signature.positionalTypes.size())
+        if (mlir::Type parameterType = signature.positionalTypes[index];
+            parameterType && !py::containsPyInferVar(parameterType))
+          types.bindLocalSymbol(parameter, parameterType);
+    for (auto [index, parameter] : llvm::enumerate(signature.kwOnlyNames))
+      if (index < signature.kwOnlyTypes.size())
+        if (mlir::Type parameterType = signature.kwOnlyTypes[index];
+            parameterType && !py::containsPyInferVar(parameterType))
+          types.bindLocalSymbol(parameter, parameterType);
     SuiteCursor cursor{functionBody, 0};
     mlir::Type fromFunction =
         emptyLiteralSeedTypeIn(types, name, literalKind, cursor);

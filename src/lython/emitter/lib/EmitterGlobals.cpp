@@ -362,8 +362,20 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
                           candidate->kind == "AsyncFunctionDef"))
           callables.push_back(candidate.get());
       if (mlir::Type seededGlobal =
-              emptyLiteralSeedAcross(name, literalKind, cursor, callables))
+              emptyLiteralSeedAcross(name, literalKind, cursor, callables)) {
         inferred = seededGlobal;
+        // ⛔ AND THE SIGNATURES THAT WERE READ BEFORE THE ANSWER EXISTED. Every
+        // top-level signature was memoized by `registerModule`, whose sweeps
+        // saw this global at its ERASED element -- so a body that measures it
+        // (`len(SAMPLES)`) recorded a failure there, and the memo would report
+        // it at emission for a program that is now fine. Forgotten here, they
+        // are recomputed where they are declared, which is what the generator
+        // arm of `emitTopLevelDeclarations` already does for the same reason.
+        for (const parser::Node *callable : callables) {
+          types.forgetSignature(callable);
+          types.forgetInferredResult(callable);
+        }
+      }
     }
     // ⭐ A FUNCTION VALUE IS A GLOBAL LIKE ANY OTHER. `CALLBACK = base` read
     // from a function body was "unresolved name 'CALLBACK'": the cell was
