@@ -429,8 +429,31 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
   // ⛔ Only in that direction. A protocol-typed VALUE handed to an inferred
   // parameter really is what the caller has, and binding the variable to it is
   // the call site speaking.
-  if (py::isPyInferVarType(actual) &&
-      mlir::isa_and_present<py::ProtocolType>(expected))
+  //
+  // ⛔ And a CONTRACT the protocol table marks as one counts the same. Half of
+  // typing's structural names are spelled as contracts rather than as
+  // `py.protocol` -- `typing.SupportsIndex` is what `xs[i]` asks of `i` --
+  // and binding a variable to that made `column(rows, h["age"])` refuse with
+  // "!py.contract<\"typing.SupportsIndex\"> does not provide ... '__sub__'",
+  // for a parameter every call site hands an int.
+  auto namesAStructuralProtocol = [&](mlir::Type type) {
+    if (mlir::isa_and_present<py::ProtocolType>(type))
+      return true;
+    auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+    if (!contract)
+      return false;
+    const py::protocols::Table &table =
+        py::protocols::Table::get(types.getContext());
+    llvm::StringRef contractName = contract.getContractName();
+    if (table.isProtocol(contractName))
+      return true;
+    // The table keys some of them by the bare class name, which is how the
+    // manifest spells `py.class @SupportsIndex` inside its module.
+    auto dot = contractName.rfind('.');
+    return dot != llvm::StringRef::npos &&
+           table.isProtocol(contractName.substr(dot + 1));
+  };
+  if (py::isPyInferVarType(actual) && namesAStructuralProtocol(expected))
     return true;
   if (py::isPyInferVarType(expected) || py::isPyInferVarType(actual))
     return static_cast<bool>(types.inference().unify(expected, actual));
