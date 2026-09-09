@@ -325,6 +325,88 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
     return nullptr;
   };
 
+  // What a statement leaves BEHIND for the rest of its suite: a nested def's
+  // name, and a simple assignment's target. Bound after the statement is
+  // scanned, so an assignment does not see itself.
+  //
+  // ⛔ Asked from BOTH walks. The generic recursion below reaches the suites
+  // inside a statement; `scanRemainder` reaches the top-level ones, and
+  // without this there it read `CACHE[n] = value` with `value` unbound -- the
+  // memo table, whose store is the only thing that says what the table holds.
+  std::function<void(const std::vector<parser::NodePtr> *, std::size_t,
+                     std::optional<TypeSystem::Scope> &)>
+      bindWhatItLeaves = [&](const std::vector<parser::NodePtr> *suite,
+                             std::size_t index,
+                             std::optional<TypeSystem::Scope> &scope) {
+        if (!suite || index >= suite->size() || !(*suite)[index])
+          return;
+        const parser::Node &child = *(*suite)[index];
+          // A nested def binds its name here too. The recursion above declines
+          // to look INSIDE one (its own binding order), which is a different
+          // question from what the name it leaves behind is worth:
+          // `for i in ...: def f() -> int: return i` then `fs.append(f)` had
+          // the element decided from a name the scan had no type for.
+          if (child.kind == "FunctionDef" ||
+              child.kind == "AsyncFunctionDef") {
+            auto nestedName = ast::string(child, "name");
+            if (!nestedName)
+              return;
+            FunctionSignature nested = types.functionSignature(child);
+            if (!nested.publicCallable)
+              return;
+            if (!scope)
+              scope.emplace(types.pushScope());
+            types.bindLocalSymbol(*nestedName, nested.publicCallable);
+            return;
+          }
+          if (child.kind != "Assign")
+            return;
+          const auto *assignTargets = ast::nodeList(child, "targets");
+          const parser::Node *assigned = ast::node(child, "value");
+          if (!assignTargets || assignTargets->size() != 1 ||
+              !assignTargets->front() ||
+              assignTargets->front()->kind != "Name" || !assigned)
+            return;
+          // ⭐ A LOCAL THAT IS ITSELF AN EMPTY LITERAL IS SEEDED, NOT READ.
+          // Reading one answers `list[object]`, which is a type and therefore
+          // passed the test below, so the OUTER container took it and the
+          // inner element was lost two levels down:
+          //
+          //     def grid(rows: int, cols: int):
+          //         out = []
+          //         for _ in range(rows):
+          //             line = []
+          //             for _ in range(cols):
+          //                 line.append(0)
+          //             out.append(line)
+          //         return out
+          //     print(grid(2, 2)[0][0] + 1)
+          //     # builtins.object does not provide manifest method '__add__'
+          //
+          // ⛔ Depth-bounded rather than cycle-detected: the recursion is a
+          // container inside a container, which is two or three deep in real
+          // programs, and a bound is cheaper to be sure of than a visited set
+          // threaded through a scan that pushes type scopes.
+          mlir::Type bound;
+          llvm::StringRef assignedName =
+              ast::nameSpelling(*assignTargets->front());
+          if (depth < 3 && isEmptyContainerExpression(assigned) &&
+              assignedName != name) {
+            llvm::SmallVector<SuiteCursor, 4> nested;
+            nested.push_back(SuiteCursor{suite, index + 1});
+            nested.append(suites.begin(), suites.end());
+            bound = emptyLiteralSeedTypeIn(types, assignedName,
+                                           literalKindOf(*assigned), nested,
+                                           localSymbols, depth + 1);
+          }
+          if (!bound)
+            bound = types.widenLiteral(inferHere(assigned));
+          if (!bound || bound == types.object())
+            return;
+          if (!scope)
+            scope.emplace(types.pushScope());
+          types.bindLocalSymbol(assignedName, bound);
+      };
   auto visit = [&](const parser::Node &node, auto &&recurse) -> void {
     if (disagreed)
       return;
@@ -557,71 +639,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
           if (!child)
             continue;
           recurse(*child, recurse);
-          // A nested def binds its name here too. The recursion above declines
-          // to look INSIDE one (its own binding order), which is a different
-          // question from what the name it leaves behind is worth:
-          // `for i in ...: def f() -> int: return i` then `fs.append(f)` had
-          // the element decided from a name the scan had no type for.
-          if (child->kind == "FunctionDef" ||
-              child->kind == "AsyncFunctionDef") {
-            auto nestedName = ast::string(*child, "name");
-            if (!nestedName)
-              continue;
-            FunctionSignature nested = types.functionSignature(*child);
-            if (!nested.publicCallable)
-              continue;
-            if (!suiteScope)
-              suiteScope.emplace(types.pushScope());
-            types.bindLocalSymbol(*nestedName, nested.publicCallable);
-            continue;
-          }
-          if (child->kind != "Assign")
-            continue;
-          const auto *assignTargets = ast::nodeList(*child, "targets");
-          const parser::Node *assigned = ast::node(*child, "value");
-          if (!assignTargets || assignTargets->size() != 1 ||
-              !assignTargets->front() ||
-              assignTargets->front()->kind != "Name" || !assigned)
-            continue;
-          // ⭐ A LOCAL THAT IS ITSELF AN EMPTY LITERAL IS SEEDED, NOT READ.
-          // Reading one answers `list[object]`, which is a type and therefore
-          // passed the test below, so the OUTER container took it and the
-          // inner element was lost two levels down:
-          //
-          //     def grid(rows: int, cols: int):
-          //         out = []
-          //         for _ in range(rows):
-          //             line = []
-          //             for _ in range(cols):
-          //                 line.append(0)
-          //             out.append(line)
-          //         return out
-          //     print(grid(2, 2)[0][0] + 1)
-          //     # builtins.object does not provide manifest method '__add__'
-          //
-          // ⛔ Depth-bounded rather than cycle-detected: the recursion is a
-          // container inside a container, which is two or three deep in real
-          // programs, and a bound is cheaper to be sure of than a visited set
-          // threaded through a scan that pushes type scopes.
-          mlir::Type bound;
-          llvm::StringRef assignedName =
-              ast::nameSpelling(*assignTargets->front());
-          if (depth < 3 && isEmptyContainerExpression(assigned) &&
-              assignedName != name) {
-            llvm::SmallVector<SuiteCursor, 4> nested;
-            nested.push_back(SuiteCursor{children, childIndex + 1});
-            nested.append(suites.begin(), suites.end());
-            bound = emptyLiteralSeedTypeIn(types, assignedName,
-                                           literalKindOf(*assigned), nested,
-                                           localSymbols, depth + 1);
-          }
-          if (!bound)
-            bound = types.widenLiteral(inferHere(assigned));
-          if (!bound || bound == types.object())
-            continue;
-          if (!suiteScope)
-            suiteScope.emplace(types.pushScope());
-          types.bindLocalSymbol(assignedName, bound);
+          bindWhatItLeaves(children, childIndex, suiteScope);
         }
       }
     }
@@ -649,13 +667,16 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   //
   // ⛔ Disagreement still decides: two seeds one suite apart that say
   // different things leave the element erased, which is where it started.
+  std::optional<TypeSystem::Scope> remainderScope;
   auto scanRemainder = [&](const std::vector<parser::NodePtr> *suite,
                            std::size_t from) {
     if (!suite)
       return;
     for (std::size_t index = from; index < suite->size(); ++index)
-      if ((*suite)[index])
+      if ((*suite)[index]) {
         visit(*(*suite)[index], visit);
+        bindWhatItLeaves(suite, index, remainderScope);
+      }
   };
   // ⛔ To a FIXPOINT and before any scanning: `a = stack.pop()` has to be known
   // derived by the time `b = a` is read, and the two can be written in either
