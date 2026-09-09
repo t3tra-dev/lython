@@ -633,6 +633,31 @@ void collectGeneratorFunctionAnalysis(
   }
   if (node->kind == "Lambda" || node->kind == "ClassDef")
     return;
+  // ⭐ A CALL IS A CALL WHEREVER IT STANDS. This walk types the expressions it
+  // needs an ANSWER from -- an assigned value, a return, a yield -- and left
+  // the ones it only needs the EFFECT of untyped. A call in a CONDITION is one
+  // of those, and its effect is what binds the callee's unannotated parameter:
+  //
+  //     def is_leap(y):
+  //         return y % 4 == 0
+  //     def month_len(y, m):
+  //         if is_leap(y):
+  //             return 29
+  //         return 30
+  //     print(month_len(2024, 2))
+  //     # function parameter 'y' requires an annotation
+  //
+  // while `return is_leap(y)`, `flag = is_leap(y)` and `int(is_leap(y))` --
+  // the same call, in positions this walk already types -- all resolved it.
+  // `while`, `assert` and a bare expression statement were the same hole.
+  //
+  // ⛔ Inferred for the effect, and the answer thrown away: a test's type is
+  // not the statement's, and recording it would put a bool where the walk
+  // collects yields and returns.
+  if (node->kind == "If" || node->kind == "While" || node->kind == "Assert")
+    (void)lenientWalkInfer(types, ast::node(*node, "test"), analysis);
+  if (node->kind == "Expr")
+    (void)lenientWalkInfer(types, ast::node(*node, "value"), analysis);
   if (node->kind == "Yield") {
     analysis.hasYield = true;
     const parser::Node *value = ast::node(*node, "value");
@@ -3923,6 +3948,11 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     const parser::Node *bodyNode = ast::node(*node, "body");
     const parser::Node *elseNode = ast::node(*node, "orelse");
     const parser::Node *testNode = ast::node(*node, "test");
+    // ⛔ The test is typed and the answer dropped, for the same reason the
+    // statement walk types an `if`: a call there binds the callee's parameter,
+    // and `29 if is_leap(y) else 30` was the one condition position left that
+    // did not.
+    (void)inferExprImpl(testNode, ctx);
     llvm::StringRef narrowedName;
     mlir::Type narrowedPayload;
     bool trueBranchIsNone = false;
