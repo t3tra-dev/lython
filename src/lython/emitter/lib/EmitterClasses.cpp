@@ -3403,6 +3403,34 @@ void ModuleEmitter::collectClassFields(
     };
     collectArgs("posonlyargs");
     collectArgs("args");
+    // ⭐ AND THE KEYWORD-ONLY AND PACKED ONES. A constructor's parameters are
+    // where a field's type comes from, and three of the five kinds were not
+    // read -- so `self.tag = tag` after `*, tag: str = "t"` and
+    // `self.rest = rest` after `*rest: int` both declared `builtins.object`,
+    // which is a field nothing can be read out of:
+    //
+    //     class A:
+    //         def __init__(self, *rest: int) -> None:
+    //             self.rest = rest
+    //         def size(self) -> int:
+    //             return len(self.rest)
+    //     # builtins.object does not provide manifest method '__len__'
+    //
+    // ⛔ The packed ones carry their annotation's CONTAINER, not the
+    // annotation: `*rest: int` binds `rest` to `tuple[int]` and `**kw: int` to
+    // `dict[str, int]`, which is what the parameter itself is worth inside the
+    // body.
+    collectArgs("kwonlyargs");
+    if (const parser::Node *vararg = ast::node(*arguments, "vararg"))
+      if (const parser::Node *annotation = ast::node(*vararg, "annotation"))
+        if (mlir::Type element = types.annotationType(annotation))
+          argTypes[ast::nameSpelling(*vararg)] =
+              types.contract("builtins.tuple", {element});
+    if (const parser::Node *kwarg = ast::node(*arguments, "kwarg"))
+      if (const parser::Node *annotation = ast::node(*kwarg, "annotation"))
+        if (mlir::Type value = types.annotationType(annotation))
+          argTypes[ast::nameSpelling(*kwarg)] =
+              types.contract("builtins.dict", {types.strType(), value});
   };
 
   llvm::StringSet<> propertyNames = classPropertyNames(classDef);
