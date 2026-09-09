@@ -74,7 +74,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                                   llvm::StringRef literalKind,
                                   llvm::ArrayRef<SuiteCursor> suites,
                                   const llvm::StringMap<mlir::Type> *localSymbols,
-                                  unsigned depth) {
+                                  unsigned depth, unsigned subscriptDepth) {
   if (suites.empty() || !suites.front().suite ||
       suites.front().from > suites.front().suite->size())
     return {};
@@ -92,6 +92,30 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   bool isMapping = literalKind == "Dict";
   // `dict()`/`set()`/`list()` spell the same literals as calls; the callers map
   // them before asking, and the nested ask below has to map them too.
+  // ⭐ THE CONTAINER BEING DECIDED IS NOT ALWAYS SPELLED AS A NAME. At
+  // `subscriptDepth` 1 it is `name[...]`, which is how every operation on a
+  // container stored INSIDE another one reads:
+  //
+  //     out = {}
+  //     for w in words:
+  //         if w[0] not in out:
+  //             out[w[0]] = []
+  //         out[w[0]].append(w)
+  //
+  // The adjacency map, the grouping, the bucket table. Asking the same scan
+  // one subscript deeper answers what fills the inner container, and the
+  // outer element is that answer wrapped -- rather than the `list[object]`
+  // reading the empty literal gives on its own.
+  auto namesTheContainer = [&](const parser::Node *node) -> bool {
+    const parser::Node *current = node;
+    for (unsigned level = 0; level < subscriptDepth; ++level) {
+      if (!current || current->kind != "Subscript")
+        return false;
+      current = ast::node(*current, "value");
+    }
+    return current && current->kind == "Name" &&
+           llvm::StringRef(ast::nameSpelling(*current)) == name;
+  };
   auto literalKindOf = [](const parser::Node &node) -> llvm::StringRef {
     if (node.kind != "Call")
       return node.kind;
@@ -172,6 +196,33 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
       return;
     noteType(slot, inferHere(expr));
   };
+  // ⭐ AN EMPTY CONTAINER PUT INTO THIS ONE IS ASKED, NOT READ. Reading one
+  // answers `list[builtins.object]` -- a type, so it was taken -- and the
+  // inner element was lost:
+  //
+  //     out = {}
+  //     out[k] = []
+  //     out[k].append(w)          # nothing looked here
+  //
+  // Asking the same scan one subscript deeper looks exactly there. The same
+  // shape written through a LOCAL (`bucket = []; out[k] = bucket`) was already
+  // answered, one spelling over, by the local seeding beside this.
+  //
+  // ⛔ Falls back to reading it when the deeper scan finds nothing: the erased
+  // container is what this returned before, and a program that only prints the
+  // outer one never decodes an inner element.
+  auto noteMaybeContainer = [&](mlir::Type &slot, const parser::Node *expr,
+                                auto &&noteType) {
+    if (expr && depth < 3 && isEmptyContainerExpression(expr)) {
+      if (mlir::Type inner = emptyLiteralSeedTypeIn(
+              types, name, literalKindOf(*expr), suites, localSymbols,
+              depth + 1, subscriptDepth + 1)) {
+        noteType(slot, inner);
+        return;
+      }
+    }
+    noteExpr(slot, expr, noteType);
+  };
   auto note = [&](mlir::Type &slot, mlir::Type seen) {
     if (!seen || disagreed)
       return;
@@ -214,9 +265,8 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
           callArgs->size() == 2 && (!callKeywords || callKeywords->empty())) {
         const parser::Node *receiver = ast::node(*callee, "value");
         std::optional<std::string_view> method = ast::string(*callee, "attr");
-        if (receiver && receiver->kind == "Name" && method &&
-            *method == "get" &&
-            llvm::StringRef(ast::nameSpelling(*receiver)) == name)
+        if (receiver && namesTheContainer(receiver) && method &&
+            *method == "get")
           return (*callArgs)[1].get();
       }
     }
@@ -263,8 +313,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
           //
           // ⛔ Nothing below wants a zero-argument call anyway -- each arm
           // asks for a size of its own -- so the guard costs no seeding.
-          if (receiver && receiver->kind == "Name" &&
-              llvm::StringRef(ast::nameSpelling(*receiver)) == name &&
+          if (receiver && namesTheContainer(receiver) &&
               method && args && !args->empty() && args->front()) {
             // ⭐ EVERY OPERATION THAT PUTS SOMETHING IN IT SEEDS IT. Two were
             // recognised, and the rest of the ways Python fills a fresh
@@ -307,16 +356,16 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
             };
             if (args->size() == 1 &&
                 (*method == "append" || *method == "add"))
-              noteExpr(element, args->front().get(), note);
+              noteMaybeContainer(element, args->front().get(), note);
             else if (args->size() == 1 &&
                      (*method == "extend" || *method == "update"))
               noteIterableElements(args->front().get());
             else if (args->size() == 2 && *method == "insert" && !isMapping)
-              noteExpr(element, (*args)[1].get(), note);
+              noteMaybeContainer(element, (*args)[1].get(), note);
             else if (args->size() == 2 && *method == "setdefault" &&
                      isMapping) {
               noteExpr(key, args->front().get(), note);
-              noteExpr(element, (*args)[1].get(), note);
+              noteMaybeContainer(element, (*args)[1].get(), note);
             }
           }
         }
@@ -393,8 +442,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
           if (!target || target->kind != "Subscript")
             continue;
           const parser::Node *receiver = ast::node(*target, "value");
-          if (!receiver || receiver->kind != "Name" ||
-              llvm::StringRef(ast::nameSpelling(*receiver)) != name)
+          if (!receiver || !namesTheContainer(receiver))
             continue;
           if (!isMapping) {
             disagreed = true;
@@ -421,7 +469,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                   deferredElement = seeded;
               }
             }
-          noteExpr(element, stored, note);
+          noteMaybeContainer(element, stored, note);
         }
     }
     // ⭐ A `for` target is BOUND while its body is scanned. The seed is

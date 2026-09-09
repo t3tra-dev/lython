@@ -35,6 +35,33 @@
 # `show(Box("a").v)` written at the call site there is no module name in the
 # program at all, which is what separates this from the module-scope defect.
 #
+# ⭐ AND IT REACHES THE CONTAINER SEEDING, which is where it costs most. The
+# scan that decides an empty container's element type runs inside the signature
+# walk too, so a grouping whose ELEMENT is a user class cannot be typed there --
+# while the same grouping over strings can (2026-09-09):
+#
+#     def by_bin(parts: "list[Part]"):
+#         out = {}
+#         for p in parts:
+#             k = p.bin_id            <- the member read, unresolvable here
+#             if k not in out:
+#                 out[k] = []
+#             out[k].append(p)
+#         return out
+#     print(len(by_bin([Part("a", "A1")])["A1"]))
+#     # builtins.object does not provide manifest method '__len__'
+#
+#   the same function over `list[str]`, keyed on `w[0]` .......... correct
+#   the same function with `out` annotated ....................... correct
+#   a FLAT list of the same class instances ...................... correct
+#   a list of lists of them (no member read in the key) .......... correct
+#
+# ⛔ Recomputing the signature at declaration time, which is what the generator
+# arm of `emitTopLevelDeclarations` does for the same reason, does not work
+# here: the fixpoint has already BOUND the result variable to the answer the
+# early walk gave, and the second answer would collide with it rather than
+# replace it.
+#
 # ⛔ Not repaired here because it is an ORDERING change in the emitter
 # (EmitterCore's "after class/import predeclaration ... before any body is
 # typed"), and moving `registerModule` past member registration moves every
