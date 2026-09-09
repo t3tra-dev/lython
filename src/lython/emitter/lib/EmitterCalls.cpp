@@ -1779,9 +1779,30 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                   // to runtime input 2 of builtins.str.join". A self-iterating
                   // argument is a sequence OF the receiver's contract, not one
                   // of it, so the exception does not apply to it.
+                  // ⭐ THE CONTAINER TO BUILD IS THE RECEIVER'S OWN. The
+                  // runtime implements the peer-container case, so what has to
+                  // be materialized is a peer: `s.update([2, 3])` needs a SET
+                  // beside `s`, and a list there only moves the refusal to the
+                  // ABI ("cannot adapt builtins.list to runtime input 1 of
+                  // builtins.set.update"). Asked before the guard below, which
+                  // is "the argument is already what we would build".
+                  llvm::StringRef builder = "list";
+                  llvm::StringRef builderContract = "builtins.list";
+                  if (auto ownContract =
+                          mlir::dyn_cast_if_present<py::ContractType>(
+                              types.widenLiteral(receiver.type))) {
+                    llvm::StringRef ownName = ownContract.getContractName();
+                    if (ownName == "builtins.set") {
+                      builder = "set";
+                      builderContract = "builtins.set";
+                    } else if (ownName == "builtins.dict") {
+                      builder = "dict";
+                      builderContract = "builtins.dict";
+                    }
+                  }
                   bool wantsList = false;
                   if (!generator && index < declaredTypes.size() &&
-                      actual.getContractName() != "builtins.list")
+                      actual.getContractName() != builderContract)
                     if (auto declared = mlir::dyn_cast_if_present<py::ProtocolType>(
                             declaredTypes[index])) {
                       auto receiverContract =
@@ -1800,7 +1821,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                     }
                   if (generator || wantsList) {
                     materialized.push_back(synth::call(
-                        synth::name(std::string("list"), argument->range),
+                        synth::name(builder.str(), argument->range),
                         std::vector<parser::NodePtr>{argument},
                         argument->range));
                     anyMaterialized = true;
