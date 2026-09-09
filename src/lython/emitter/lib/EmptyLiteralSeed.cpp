@@ -447,6 +447,47 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
     // still notes nothing.
     {
       const parser::Node *call = &node;
+      // ⭐ AND A CALLEE THAT DECLARES WHAT IT TAKES. Handing the container to
+      // `def put(heap: "list[int]", value: int)` says its element as plainly
+      // as an append does, and nothing looked:
+      //
+      //     h = []
+      //     put(h, 5)
+      //     print(h[0] + 1)
+      //     # builtins.object does not provide manifest method '__add__'
+      //
+      // ⛔ Only a parameter that is a CONTAINER of this literal's kind with an
+      // element of its own. `print(xs)` takes `object` and `len(xs)` takes a
+      // structural bound; neither says anything about an element, and reading
+      // them as if they did is the mistake the protocol repairs describe.
+      if (call->kind == "Call" && !disagreed)
+        if (const auto *callArgs = ast::nodeList(*call, "args"))
+          for (auto [argIndex, argument] : llvm::enumerate(*callArgs)) {
+            if (!argument || !namesTheContainer(argument.get()))
+              continue;
+            auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+                types.widenLiteral(inferHere(ast::node(*call, "func"))));
+            if (!callable ||
+                argIndex >= callable.getPositionalTypes().size())
+              continue;
+            auto declared = mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(callable.getPositionalTypes()[argIndex]));
+            if (!declared)
+              continue;
+            llvm::StringRef declaredName = declared.getContractName();
+            llvm::StringRef wanted = isMapping         ? "builtins.dict"
+                                     : literalKind == "Set" ? "builtins.set"
+                                                            : "builtins.list";
+            if (declaredName != wanted)
+              continue;
+            llvm::ArrayRef<mlir::Type> arguments = declared.getArguments();
+            if (isMapping && arguments.size() == 2) {
+              note(key, arguments[0]);
+              note(element, arguments[1]);
+            } else if (!isMapping && arguments.size() == 1) {
+              note(element, arguments.front());
+            }
+          }
       if (call->kind == "Call") {
         const parser::Node *callee = ast::node(*call, "func");
         if (callee && callee->kind == "Attribute") {
