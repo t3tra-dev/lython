@@ -7,6 +7,7 @@
 #include "AstAccess.h"
 #include "AstSynth.h"
 #include "CandidateSelection.h"
+#include "EmptyLiteralSeed.h"
 #include "ExceptionTaxonomy.h"
 #include "PlatformConstants.h"
 #include "PrimitiveTypes.h"
@@ -288,6 +289,12 @@ mlir::Type inferredFunctionResult(const TypeSystem &types,
 
 struct GeneratorFunctionAnalysis {
   bool hasYield = false;
+  // The suites the walk is currently inside, OUTERMOST first, each with the
+  // index just past the statement being walked. Carried here rather than as a
+  // parameter because every arm of the walk would otherwise have to forward it;
+  // it is walk state, like `localSymbols` beside it, and is empty again by the
+  // time the walk returns.
+  llvm::SmallVector<SuiteCursor, 4> suites;
   // Locals bound by the walk in statement order; replaces the former
   // bindLocalSymbol side effect on the shared symbol-table scope, and is
   // reused by the return-type inference that runs after the walk.
@@ -698,8 +705,45 @@ void collectGeneratorFunctionAnalysis(
     }
     if (!valueType)
       valueType = lenientWalkInfer(types, value, analysis);
-    if (const auto *targets = ast::nodeList(*node, "targets"))
-      for (const parser::NodePtr &target : *targets)
+    const auto *assignTargets = ast::nodeList(*node, "targets");
+    // ⭐ AN EMPTY LITERAL TAKES ITS ELEMENT FROM WHAT FILLS IT, and this walk
+    // did not ask -- it bound `list[object]` and the EMITTER, which does ask,
+    // then produced a body that disagreed with the signature the walk had
+    // written:
+    //
+    //     def double(xs):
+    //         out = []
+    //         for x in xs:
+    //             out.append(x * 2)
+    //         return out
+    //     def total(xs: "list[int]") -> int: ...
+    //     print(total(double([1, 2])))
+    //     # cannot unify !py.contract<"builtins.int">
+    //     #        with !py.contract<"builtins.object">
+    //
+    // It is the same scan, not a second copy of the rule
+    // (`emptyLiteralSeedTypeIn`), asked with the walk's own names in a context
+    // instead of the emitter's scope.
+    if (assignTargets && assignTargets->size() == 1 &&
+        assignTargets->front() && assignTargets->front()->kind == "Name" &&
+        isEmptyContainerExpression(value) && !analysis.suites.empty()) {
+      llvm::StringRef literalKind = value->kind;
+      if (literalKind == "Call") {
+        llvm::StringRef callee = ast::nameSpelling(*ast::node(*value, "func"));
+        literalKind = callee == "dict"    ? "Dict"
+                      : callee == "set"   ? "Set"
+                      : callee == "tuple" ? "Tuple"
+                                          : "List";
+      }
+      llvm::SmallVector<SuiteCursor, 4> innermostFirst(
+          llvm::reverse(analysis.suites));
+      if (mlir::Type seeded = emptyLiteralSeedTypeIn(
+              types, ast::nameSpelling(*assignTargets->front()), literalKind,
+              innermostFirst, &analysis.localSymbols))
+        valueType = seeded;
+    }
+    if (assignTargets)
+      for (const parser::NodePtr &target : *assignTargets)
         bindGeneratorAnalysisTarget(types, target.get(), valueType, value,
                                     localCallables, analysis);
     return;
@@ -885,9 +929,21 @@ void collectGeneratorFunctionAnalysis(
                                          generatorSendHint, analysis);
     } else if (const auto *children =
                    std::get_if<std::vector<parser::NodePtr>>(&field.value)) {
-      for (const parser::NodePtr &child : *children)
+      // ⛔ Only the STATEMENT lists become a suite. `elts`, `args` and their
+      // kin are expression lists, and a forward scan told one of those was a
+      // suite would read an argument as if it were a statement.
+      const bool isSuite = field.name == "body" || field.name == "orelse" ||
+                           field.name == "finalbody";
+      if (isSuite)
+        analysis.suites.push_back(SuiteCursor{children, 0});
+      for (auto [index, child] : llvm::enumerate(*children)) {
+        if (isSuite)
+          analysis.suites.back().from = index + 1;
         collectGeneratorFunctionAnalysis(types, child.get(), localCallables,
                                          generatorSendHint, analysis);
+      }
+      if (isSuite)
+        analysis.suites.pop_back();
     }
   }
 }
@@ -957,10 +1013,15 @@ analyzeGeneratorFunction(const TypeSystem &types, const parser::Node &function,
   for (const auto &entry : selfCallableFromAnnotations(types, function))
     if (!localCallables.count(entry.getKey()))
       localCallables[entry.getKey()] = entry.getValue();
-  if (const auto *body = ast::nodeList(function, "body"))
-    for (const parser::NodePtr &statement : *body)
+  if (const auto *body = ast::nodeList(function, "body")) {
+    analysis.suites.push_back(SuiteCursor{body, 0});
+    for (auto [index, statement] : llvm::enumerate(*body)) {
+      analysis.suites.back().from = index + 1;
       collectGeneratorFunctionAnalysis(types, statement.get(), localCallables,
                                        generatorSendHint, analysis);
+    }
+    analysis.suites.pop_back();
+  }
   return analysis;
 }
 
