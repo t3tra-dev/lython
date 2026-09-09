@@ -17,6 +17,9 @@
 #     a module-level `for` target ........................... CORRECT NOW
 #     a `for` target inside another function ................ correct
 #
+#   METHOD of a class, argument spelled as
+#     anything ............................................. refused
+#
 #   NESTED def, argument spelled as
 #     a literal ............................................. refused
 #     the enclosing function's parameter .................... refused
@@ -41,6 +44,14 @@
 # argument EXPRESSION and a literal-valued local, and nothing else -- which is
 # the same shape the module scope had before the repair beside it, one scope
 # further in.
+#
+# ⛔ A METHOD is the same boundary seen from the other side, and the one that
+# costs most: `def __init__(self, text)` is how a class is written when nobody
+# annotates it, and every field derived from such a parameter is `object`. Its
+# call sites are `obj.method(...)`, whose callee is an Attribute rather than a
+# Name, so reaching them is a different resolution from the one the pre-pass
+# makes -- measured 2026-09-09 on a parser class whose `__init__` and `fail`
+# were both unannotated.
 #
 # ⛔ The nested `def` is a stated boundary, not an oversight: inference runs in
 # the module pre-pass, which walks `module.body` and finds top-level functions
