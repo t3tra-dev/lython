@@ -473,6 +473,29 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
   return success();
 }
 
+// ⛔ The JIT runs the module in THIS process, and a `--target` naming another
+// OS or architecture compiles it against that target's facts -- struct stat
+// offsets, errno numbers, `sys.platform` -- which this process's libc then
+// answers with its own. `lyc jit --target x86_64-unknown-linux-gnu` on macOS
+// printed "linux" and read Darwin's `struct stat` at Linux's offsets.
+LogicalResult refuseForeignJITTarget() {
+  llvm::StringRef requested = llvm::StringRef(Options.targetTriple).trim();
+  if (requested.empty())
+    return success();
+  llvm::Triple target(llvm::Triple::normalize(requested));
+  llvm::Triple process(llvm::sys::getDefaultTargetTriple());
+  bool sameOS = target.getOS() == process.getOS() ||
+                (target.isOSDarwin() && process.isOSDarwin());
+  if (target.getArch() == process.getArch() && sameOS &&
+      target.getEnvironment() == process.getEnvironment())
+    return success();
+  llvm::errs() << "error: jit runs the program in this process ("
+               << process.normalize() << "), which cannot run --target "
+               << requested << "; compile it instead: lyc <file> --target "
+               << requested << " -o <output>\n";
+  return failure();
+}
+
 static llvm::orc::shared::CWrapperFunctionBuffer
 noopDeregisterEHFrameSectionAllocAction(const char *argData, size_t argSize) {
   return llvm::orc::shared::WrapperFunction<llvm::orc::shared::SPSError(
@@ -934,6 +957,8 @@ int main(int argc, char **argv) {
   }
 
   if (failed(lython::driver::buildSanitizerConfig(Options.sanitizers)))
+    return 1;
+  if (jitMode && failed(refuseForeignJITTarget()))
     return 1;
   if (jitMode && Options.sanitizers.any()) {
     llvm::Triple processTriple(llvm::sys::getDefaultTargetTriple());
