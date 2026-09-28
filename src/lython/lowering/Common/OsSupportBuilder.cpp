@@ -204,7 +204,7 @@ void buildErrnoConstants(SupportBuilder &b) {
   for (const py::exceptions::OSErrorErrnoMapping &row :
        py::exceptions::kOSErrorErrnoMap)
     if (row.posixName == "EISDIR")
-      value = b.host.bsdErrnoValues ? row.darwinValue : row.linuxValue;
+      value = row.valueFor(b.host.errnoNumbering);
   mlir::func::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(value)});
 }
@@ -222,7 +222,7 @@ void buildOSErrorClassId(SupportBuilder &b) {
   mlir::Value result = b.iconst(py::exceptions::kOSErrorClassId);
   for (const py::exceptions::OSErrorErrnoMapping &row :
        py::exceptions::kOSErrorErrnoMap) {
-    int value = b.host.bsdErrnoValues ? row.darwinValue : row.linuxValue;
+    int value = row.valueFor(b.host.errnoNumbering);
     mlir::Value matches =
         b.cmpi(mlir::arith::CmpIPredicate::eq, err, b.iconst32(value));
     result = mlir::arith::SelectOp::create(b.builder, b.loc, matches,

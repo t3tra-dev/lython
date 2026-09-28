@@ -94,6 +94,20 @@ inline EHDataRegisters ehDataRegisters(const llvm::Triple &triple) {
   return {0, 1};   // x0, x1
 }
 
+// Whether a raise can leave its frame at all. WebAssembly has no unwinder to
+// hand a carrier to: its exceptions are an instruction the engine unwinds
+// (`throw` / `try_table`), reached through funclet pads, and every pad this
+// compiler emits is a `landingpad`. Codegen lowers the invokes to calls there,
+// so a raise caught in its own frame -- a branch, see
+// `branchLocalRaisesToTheirHandler` -- still works, and a raise that has to
+// leave the frame goes to `LyEH_NoUnwinder` instead of
+// `_Unwind_RaiseException`.
+inline bool raiseCanLeaveItsFrame(const llvm::Triple &triple) {
+  return !triple.isWasm();
+}
+
+inline constexpr llvm::StringRef kNoUnwinderRaiseName = "LyEH_NoUnwinder";
+
 inline llvm::StringRef personalityNameFor(const llvm::Triple &triple) {
   if (usePythonPersonality(triple))
     return kPythonPersonalityName;

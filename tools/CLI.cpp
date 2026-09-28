@@ -277,6 +277,7 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
 enum class LinkerDriverFlavor {
   Clang,
   MinGWGcc,
+  Emscripten,
 };
 
 struct LinkerDriver {
@@ -333,6 +334,16 @@ findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
   if (targetTriple.isWindowsGNUEnvironment()) {
     if (auto mingw = findMinGWLinkerDriver(targetTriple))
       return LinkerDriver{*mingw, LinkerDriverFlavor::MinGWGcc};
+  }
+  // ⛔ Not clang + wasm-ld. The objects import libc, and Emscripten's libc is
+  // the one whose ABI the runtime was measured against (SupportBuilder.h); emcc
+  // is what builds that sysroot and writes the JS loader that runs the module.
+  if (targetTriple.isOSEmscripten()) {
+    if (auto emcc = findExecutableProgram("emcc"))
+      return LinkerDriver{*emcc, LinkerDriverFlavor::Emscripten};
+    llvm::errs() << "error: emcc executable not found in PATH (linking "
+                 << targetTriple.normalize() << " needs Emscripten)\n";
+    return std::nullopt;
   }
 
   auto clangExe = findLLVMToolProgram("clang++");
@@ -422,6 +433,36 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
   return success();
 }
 
+// The output is whatever emcc makes of `-o`: `x.js` / `x.mjs` a loader beside
+// `x.wasm`, and no extension a node script with a shebang.
+void appendEmscriptenLinkArgs(std::vector<std::string> &args) {
+  args.emplace_back("-m64");
+  // ⛔ Node only, with the host's file system and file descriptors. The
+  // default stdout is a TTY emulation that decodes each line as UTF-8 for
+  // console.log and drops NUL bytes: `print(chr(0))` printed nothing, and a
+  // byte that is not UTF-8 would be replaced. A browser has no stdout to be
+  // exact about; what a page should get instead is part of the JS boundary,
+  // which is not built yet.
+  args.emplace_back("-sENVIRONMENT=node");
+  args.emplace_back("-sNODERAWFS=1");
+  // Returning from main runs atexit and flushes stdio; without it the runtime
+  // stays alive for callbacks that a Python program never registers, and
+  // output still sitting in a FILE buffer is never written.
+  args.emplace_back("-sEXIT_RUNTIME=1");
+  args.emplace_back("-sALLOW_MEMORY_GROWTH=1");
+  // A native main thread's 8 MiB. Emscripten's default is 64 KiB, which a
+  // recursion 2000 frames deep overflows.
+  args.emplace_back("-sSTACK_SIZE=8MB");
+  // ⛔ Stack below static data, not above it. There is no guard page, and
+  // with data first a stack that runs past its bottom writes over globals
+  // without trapping; stack-first makes it wrap below address 0 and trap.
+  args.emplace_back("-Wl,--stack-first");
+  // ⛔ A signature mismatch is only a warning to wasm-ld, which resolves it
+  // with a stub that traps when called: a link that succeeds and a program
+  // that dies at the first call to the misdeclared function.
+  args.emplace_back("-Wl,--fatal-warnings");
+}
+
 LogicalResult linkExecutable(StringRef objectPath,
                              py::TensorLoweringTarget tensorTarget,
                              StringRef outputPath) {
@@ -442,9 +483,13 @@ LogicalResult linkExecutable(StringRef objectPath,
   argStorage.emplace_back(objectPath.str());
   appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
-  // Parallel kernel dispatch calls pthread_create; Darwin ships it in
-  // libSystem, but Linux toolchains still want the explicit flag.
-  argStorage.emplace_back("-pthread");
+  if (linker->flavor == LinkerDriverFlavor::Emscripten) {
+    appendEmscriptenLinkArgs(argStorage);
+  } else {
+    // Parallel kernel dispatch calls pthread_create; Darwin ships it in
+    // libSystem, but Linux toolchains still want the explicit flag.
+    argStorage.emplace_back("-pthread");
+  }
   if (codeGenTripleForTarget(tensorTarget, Options).isOSLinux())
     argStorage.emplace_back("-no-pie");
   argStorage.emplace_back("-o");

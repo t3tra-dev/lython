@@ -6,6 +6,7 @@
 #include "Common/ExceptionABI.h"
 #include "Common/MemRef1D.h"
 #include "Common/UnwindABI.h"
+#include "ExceptionTaxonomy.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -40,7 +41,8 @@ struct HostTargetLayout {
   bool posix = true;
 
   // Which column of kOSErrorErrnoMap the target's errno numbers come from.
-  bool bsdErrnoValues = false;
+  py::exceptions::ErrnoNumbering errnoNumbering =
+      py::exceptions::ErrnoNumbering::Linux;
 
   llvm::StringRef errnoAccessor = "__errno_location";
   llvm::StringRef statSymbol = "stat";
@@ -65,6 +67,10 @@ struct HostTargetLayout {
 
   // CLOCK_MONOTONIC's value (CLOCK_REALTIME is 0 everywhere).
   int clockMonotonic = 1;
+
+  // What `malloc` guarantees: alignof(max_align_t). 16 on every native target
+  // this compiles for; Emscripten's dlmalloc static_asserts 8.
+  int mallocAlignment = 16;
 };
 
 // Derives the layout above from the target triple. Unknown OS/arch pairs keep
@@ -80,7 +86,7 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   }
   if (triple.isOSDarwin()) {
     layout.errnoAccessor = "__error";
-    layout.bsdErrnoValues = true;
+    layout.errnoNumbering = py::exceptions::ErrnoNumbering::BSD;
     // Darwin's 64-bit-inode struct stat/dirent are the default ABI on arm64
     // but a $INODE64-suffixed variant on x86_64, where the unsuffixed symbol
     // is still the deprecated 32-bit-inode one.
@@ -107,6 +113,24 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
     layout.statCtime[0] = 64;
     layout.direntNameOffset = 21;
     layout.clockMonotonic = 6; // CLOCK_MONOTONIC
+    return layout;
+  }
+  // Emscripten's musl, measured on wasm64 (offsetof under `emcc -m64`): dev_t
+  // and mode_t are 32-bit and lead the struct, st_ino sits LAST, and errno
+  // follows WASI's numbering rather than Linux's.
+  if (triple.isOSEmscripten()) {
+    layout.errnoNumbering = py::exceptions::ErrnoNumbering::WASI;
+    layout.mallocAlignment = 8;
+    layout.statDev[1] = 4;
+    layout.statMode[0] = 4;
+    layout.statNlink[0] = 8;
+    layout.statUid[0] = 16;
+    layout.statGid[0] = 20;
+    layout.statSize[0] = 32;
+    layout.statAtime[0] = 48;
+    layout.statMtime[0] = 64;
+    layout.statCtime[0] = 80;
+    layout.statIno[0] = 96;
     return layout;
   }
   // Linux: the kernel struct stat is arch-specific. aarch64 packs st_mode and

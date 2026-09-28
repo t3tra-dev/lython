@@ -39,6 +39,7 @@
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -234,7 +235,7 @@ namespace {
 // only the module matching the final target triple links.
 bool isPlatformNativeSupport(llvm::StringRef name) {
   return name.ends_with("_darwin") || name.ends_with("_linux") ||
-         name.ends_with("_windows");
+         name.ends_with("_windows") || name.ends_with("_emscripten");
 }
 
 bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
@@ -245,6 +246,8 @@ bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
     return targetTriple.isOSLinux();
   if (name.ends_with("_windows"))
     return targetTriple.isOSWindows();
+  if (name.ends_with("_emscripten"))
+    return targetTriple.isOSEmscripten();
   return true;
 }
 
@@ -289,6 +292,30 @@ mlir::LogicalResult lowerNativeRuntimeModule(mlir::ModuleOp module) {
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
   return pm.run(module);
+}
+
+// MLIR's `cf.assert` lowering declares `void puts(ptr)`; C says `int`. A
+// native call ignores the return register either way, but wasm links calls by
+// signature: wasm-ld replaces a mismatched import with a stub that traps when
+// the failed assertion tries to print. Redeclared here, after every module
+// that can carry the MLIR spelling has been linked in.
+void givePutsItsCPrototype(llvm::Module &module) {
+  llvm::Function *puts = module.getFunction("puts");
+  if (!puts || !puts->isDeclaration() || !puts->getReturnType()->isVoidTy())
+    return;
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getInt32Ty(module.getContext()),
+      puts->getFunctionType()->params(), /*isVarArg=*/false);
+  puts->setName("");
+  llvm::Function *declared = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "puts", module);
+  for (llvm::User *user : llvm::make_early_inc_range(puts->users())) {
+    auto *call = llvm::cast<llvm::CallInst>(user);
+    llvm::SmallVector<llvm::Value *, 1> args(call->args());
+    llvm::CallInst::Create(declared, args, "", call->getIterator());
+    call->eraseFromParent();
+  }
+  puts->eraseFromParent();
 }
 
 } // namespace
@@ -372,6 +399,7 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
       return mlir::failure();
 
   py::branchLocalRaisesToTheirHandler(llvmModule);
+  givePutsItsCPrototype(llvmModule);
   if (py::runtime_library::framePointersEnableCompactUnwind(targetTriple))
     py::forceFramePointers(llvmModule);
 

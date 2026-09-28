@@ -611,8 +611,21 @@ constexpr std::int64_t kObjectAllocatorGranularity = 16;
 constexpr std::int64_t kObjectAllocatorClasses = 32;   // 16..512 bytes
 constexpr std::int64_t kObjectAllocatorArenaBytes = 1 << 20;
 
+// ⛔ EVERY BLOCK THIS HANDS OUT IS 16-ALIGNED, and not as a nicety. A
+// `memref.alloc {alignment = 16}` pads the block and hands on an aligned
+// pointer beside the allocated one; the object model later rebuilds a header
+// from that aligned address alone (allocated == aligned) and frees it. That is
+// right only while the two never differ -- while the block was 16-aligned to
+// begin with. Native mallocs promise 16; Emscripten's promises 8, and there
+// every other string freed the interior of its block. So where `malloc` falls
+// short the arenas and large blocks come from `aligned_alloc` instead.
 void buildObjectAllocator(SupportBuilder &b) {
+  const bool mallocIsAligned =
+      b.host.mallocAlignment >= kObjectAllocatorGranularity;
   b.declareExternal("malloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
+  if (!mallocIsAligned)
+    b.declareExternal("aligned_alloc",
+                      b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
   b.declareExternal("calloc",
                     b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
   b.declareExternal("free", b.builder.getFunctionType({b.ptr()}, {}));
@@ -658,6 +671,21 @@ void buildObjectAllocator(SupportBuilder &b) {
                                      b.addrOf("g_lymem_class_heads"),
                                      mlir::ValueRange{classIndex});
   };
+  // A system block of at least `bytes`, 16-aligned. aligned_alloc wants a
+  // size that is a multiple of the alignment.
+  auto systemAlloc = [&](mlir::Value bytes) -> mlir::Value {
+    if (mallocIsAligned)
+      return b.call("malloc", b.ptr(), mlir::ValueRange{bytes}).front();
+    mlir::Value rounded = mlir::arith::AndIOp::create(
+        b.builder, b.loc,
+        mlir::arith::AddIOp::create(b.builder, b.loc, bytes,
+                                    b.iconst(kObjectAllocatorGranularity - 1)),
+        b.iconst(-kObjectAllocatorGranularity));
+    return b
+        .call("aligned_alloc", b.ptr(),
+              mlir::ValueRange{b.iconst(kObjectAllocatorGranularity), rounded})
+        .front();
+  };
 
   // ---- ptr LyMem_Alloc(i64 size) -------------------------------------------
   {
@@ -691,8 +719,7 @@ void buildObjectAllocator(SupportBuilder &b) {
     // Above the threshold the system allocator answers directly; the prefix
     // records that so the free knows which way to go back.
     b.builder.setInsertionPointToEnd(large);
-    mlir::Value block = b.call("malloc", b.ptr(), mlir::ValueRange{total})
-                            .front();
+    mlir::Value block = systemAlloc(total);
     mlir::cf::CondBranchOp::create(
         b.builder, b.loc, b.ptrEq(block, b.nullPtr()), fail,
         mlir::ValueRange{}, take, mlir::ValueRange{b.iconst(-1), block});
@@ -733,10 +760,7 @@ void buildObjectAllocator(SupportBuilder &b) {
     // A new arena. The remainder of the old one is abandoned -- at most one
     // class width, which is why the classes are the granularity.
     b.builder.setInsertionPointToEnd(fresh);
-    mlir::Value chunk =
-        b.call("malloc", b.ptr(),
-               mlir::ValueRange{b.iconst(kObjectAllocatorArenaBytes)})
-            .front();
+    mlir::Value chunk = systemAlloc(b.iconst(kObjectAllocatorArenaBytes));
     mlir::cf::CondBranchOp::create(b.builder, b.loc,
                                    b.ptrEq(chunk, b.nullPtr()), fail,
                                    mlir::ValueRange{}, publish,
@@ -857,13 +881,38 @@ void buildObjectAllocator(SupportBuilder &b) {
         mlir::ValueRange{}, small, mlir::ValueRange{});
 
     b.builder.setInsertionPointToEnd(large);
+    mlir::Value grownBytes =
+        mlir::arith::AddIOp::create(b.builder, b.loc, entry->getArgument(1),
+                                    b.iconst(kObjectAllocatorPrefixBytes));
     mlir::Value grown =
-        b.call("realloc", b.ptr(),
-               mlir::ValueRange{prefix,
-                                mlir::arith::AddIOp::create(
-                                    b.builder, b.loc, entry->getArgument(1),
-                                    b.iconst(kObjectAllocatorPrefixBytes))})
+        b.call("realloc", b.ptr(), mlir::ValueRange{prefix, grownBytes})
             .front();
+    if (!mallocIsAligned) {
+      // realloc keeps only malloc's alignment. A block it moved off the
+      // 16-byte grid is copied onto it: all `grownBytes` of the new block are
+      // readable, and the ones past the old size are copied as garbage that
+      // nothing reads.
+      mlir::Value misaligned =
+          b.cmpi(mlir::arith::CmpIPredicate::ne,
+                 mlir::arith::AndIOp::create(
+                     b.builder, b.loc, b.ptrToInt(grown),
+                     b.iconst(kObjectAllocatorGranularity - 1)),
+                 b.iconst(0));
+      auto realign =
+          mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{b.ptr()},
+                                  misaligned, /*withElse=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(b.builder);
+        b.builder.setInsertionPointToStart(&realign.getThenRegion().front());
+        mlir::Value fixed = systemAlloc(grownBytes);
+        b.call("memcpy", b.ptr(), mlir::ValueRange{fixed, grown, grownBytes});
+        b.call("free", mlir::TypeRange{}, mlir::ValueRange{grown});
+        mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{fixed});
+        b.builder.setInsertionPointToStart(&realign.getElseRegion().front());
+        mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{grown});
+      }
+      grown = realign.getResult(0);
+    }
     mlir::func::ReturnOp::create(
         b.builder, b.loc,
         mlir::ValueRange{
@@ -1863,6 +1912,27 @@ void buildCurrentExceptionClassIdUnchecked(SupportBuilder &b) {
   b.emitTrap(b.i64());
 }
 
+// Ends the in-flight carrier's life: `_Unwind_DeleteException`, which calls
+// the `exception_cleanup` the carrier was built with -- `LyEH_CarrierCleanup`,
+// always, since every carrier is ours by the time a catch holds it. A target
+// with no unwinder has no `_Unwind_DeleteException` to link, so there the call
+// is made directly.
+void emitDeleteCurrentCarrier(SupportBuilder &b) {
+  mlir::Value carrier = mlir::LLVM::LoadOp::create(
+      b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
+      /*alignment=*/8);
+  if (!raiseCanLeaveItsFrame(b.triple)) {
+    // _URC_FOREIGN_EXCEPTION_CAUGHT, the reason the unwinder would pass.
+    mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                               "LyEH_CarrierCleanup",
+                               mlir::ValueRange{b.iconst32(1), carrier});
+    return;
+  }
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                             "_Unwind_DeleteException",
+                             mlir::ValueRange{carrier});
+}
+
 // void LyEH_CarrierCleanup(i32 reason, ptr carrier): the unwinder calls this
 // when an exception it is carrying is deleted without being caught by us.
 // What `_Unwind_DeleteException` calls when a catch is done with the carrier.
@@ -1969,12 +2039,7 @@ void buildEndNativeCatchIfActive(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&endIf.getThenRegion().front());
-    mlir::Value carrier = mlir::LLVM::LoadOp::create(
-        b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
-        /*alignment=*/8);
-    mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                               "_Unwind_DeleteException",
-                               mlir::ValueRange{carrier});
+    emitDeleteCurrentCarrier(b);
     mlir::LLVM::StoreOp::create(
         b.builder, b.loc,
         mlir::arith::ConstantIntOp::create(b.builder, b.loc, 0, 1).getResult(),
@@ -2678,9 +2743,41 @@ void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name,
                                   entry->getArgument(1), b.iconst(1)}));
 }
 
+// void LyEH_NoUnwinder(ptr carrier): a raise that has to leave its frame on a
+// target with no unwinder (UnwindABI.h). Reports the exception exactly as the
+// top of the program would -- traceback, or SystemExit's status -- says that
+// the frames it left were not searched, and exits with that status.
+//
+// ⛔ NOT a trap. Whether an enclosing frame would have caught the exception is
+// not knowable here, so the report cannot claim it was uncaught; but an
+// uncaught exception is the common case, and reporting it the CPython way keeps
+// those programs' output and status right while the note keeps the other case
+// from passing for one.
+void buildNoUnwinderRaise(SupportBuilder &b) {
+  b.stringGlobal(".no_unwinder_note",
+                 "note: this target has no unwinder yet: the exception left "
+                 "its frame, so no handler or cleanup in an enclosing frame "
+                 "ran\n");
+  auto fn = beginLLVMFunction(b, kNoUnwinderRaiseName, {}, {b.ptr()});
+  fn->setAttr("passthrough",
+              b.builder.getArrayAttr({b.builder.getStringAttr("noreturn")}));
+  mlir::Block *entry = fn.addEntryBlock(b.builder);
+  b.builder.setInsertionPointToEnd(entry);
+  mlir::Value status =
+      mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
+                                 "LyRt_ReportUncaught",
+                                 mlir::ValueRange{entry->getArgument(0)})
+          .getResult();
+  mlir::func::CallOp::create(
+      b.builder, b.loc, "write_cstr", mlir::TypeRange{},
+      mlir::ValueRange{b.iconst32(2), b.addrOf(".no_unwinder_note")});
+  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{}, "exit",
+                             mlir::ValueRange{status});
+  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
+}
+
 // i32 LyRunPythonMain(ptr entry): installs the stack guard, invokes the
-// program body, and prints the Python traceback (or the native-exception
-// notice) for anything that unwinds out.
+// program body, and hands anything that unwinds out to LyRt_ReportUncaught.
 //
 // ⛔ THE ONE FRAME THAT KEEPS THE C++ PERSONALITY. `LyEH_Personality` refuses a
 // carrier whose exception class is not ours, so a C++ exception raised behind a
@@ -2690,16 +2787,25 @@ void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name,
 // process with no message at all, and this is the frame that reports it. One
 // unwind of one frame per program run pays the C++ ABI's price; the Python
 // frames do not.
+//
+// i32 LyRt_ReportUncaught(ptr carrier): prints the Python traceback (or the
+// native-exception notice) for the carrier and answers the exit status.
+// Separate from the landing pad because a target with no unwinder reports
+// from the raise itself (buildNoUnwinderRaise).
 void buildRunPythonMain(SupportBuilder &b) {
   auto fn = beginLLVMFunction(b, "LyRunPythonMain", b.i32(), {b.ptr()});
   fn.setPersonalityAttr(mlir::FlatSymbolRefAttr::get(b.builder.getContext(),
                                                      "__gxx_personality_v0"));
   mlir::Block *entry = fn.addEntryBlock(b.builder);
-  mlir::Region &body = fn.getBody();
-  mlir::Block *run = b.builder.createBlock(&body);
-  mlir::Block *ok = b.builder.createBlock(&body);
-  mlir::Block *nullEntry = b.builder.createBlock(&body);
-  mlir::Block *landing = b.builder.createBlock(&body);
+  mlir::Region &runBody = fn.getBody();
+  mlir::Block *run = b.builder.createBlock(&runBody);
+  mlir::Block *ok = b.builder.createBlock(&runBody);
+  mlir::Block *nullEntry = b.builder.createBlock(&runBody);
+  mlir::Block *landing = b.builder.createBlock(&runBody);
+
+  auto report = beginLLVMFunction(b, "LyRt_ReportUncaught", b.i32(), {b.ptr()});
+  mlir::Block *reportEntry = report.addEntryBlock(b.builder);
+  mlir::Region &body = report.getBody();
   mlir::Block *native = b.builder.createBlock(&body);
   mlir::Block *python = b.builder.createBlock(&body);
   mlir::Block *printTraceback = b.builder.createBlock(&body);
@@ -2740,7 +2846,15 @@ void buildRunPythonMain(SupportBuilder &b) {
       mlir::ValueRange{b.nullPtr()});
   mlir::Value exceptionObject = mlir::LLVM::ExtractValueOp::create(
       b.builder, b.loc, pad, llvm::ArrayRef<std::int64_t>{0});
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, exceptionObject,
+  mlir::Value reported =
+      mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
+                                 "LyRt_ReportUncaught",
+                                 mlir::ValueRange{exceptionObject})
+          .getResult();
+  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{reported});
+
+  b.builder.setInsertionPointToEnd(reportEntry);
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, reportEntry->getArgument(0),
                               b.addrOf("g_current_carrier"), /*alignment=*/8);
   mlir::Value descriptor = mlir::LLVM::AllocaOp::create(
       b.builder, b.loc, b.ptr(), exceptionPartsType(b), b.iconst32(1),
@@ -2761,11 +2875,7 @@ void buildRunPythonMain(SupportBuilder &b) {
                              mlir::TypeRange{}, mlir::ValueRange{});
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
-      mlir::ValueRange{mlir::LLVM::LoadOp::create(
-          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
-          /*alignment=*/8)});
+  emitDeleteCurrentCarrier(b);
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -2829,11 +2939,7 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::func::CallOp::create(b.builder, b.loc, "LyTraceback_Clear",
                              mlir::TypeRange{}, mlir::ValueRange{});
   releaseTaken();
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
-      mlir::ValueRange{mlir::LLVM::LoadOp::create(
-          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
-          /*alignment=*/8)});
+  emitDeleteCurrentCarrier(b);
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 
@@ -2865,11 +2971,7 @@ void buildRunPythonMain(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(exitWithStatus);
   releaseTaken();
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
-      mlir::ValueRange{mlir::LLVM::LoadOp::create(
-          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
-          /*alignment=*/8)});
+  emitDeleteCurrentCarrier(b);
   mlir::Value status = mlir::LLVM::SubOp::create(b.builder, b.loc,
                                                  exitCodeBiased, b.iconst(1));
   mlir::Value status32 =
@@ -2878,11 +2980,7 @@ void buildRunPythonMain(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(exitSilently);
   releaseTaken();
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
-      mlir::ValueRange{mlir::LLVM::LoadOp::create(
-          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
-          /*alignment=*/8)});
+  emitDeleteCurrentCarrier(b);
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(0)});
 
@@ -2900,11 +2998,7 @@ void buildRunPythonMain(SupportBuilder &b) {
       mlir::ValueRange{b.iconst32(2), b.iconst8(10)});
   b.call("free", mlir::TypeRange{}, mlir::ValueRange{messageCStr});
   releaseTaken();
-  mlir::LLVM::CallOp::create(
-      b.builder, b.loc, mlir::TypeRange{}, "_Unwind_DeleteException",
-      mlir::ValueRange{mlir::LLVM::LoadOp::create(
-          b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
-          /*alignment=*/8)});
+  emitDeleteCurrentCarrier(b);
   mlir::LLVM::ReturnOp::create(b.builder, b.loc,
                                mlir::ValueRange{b.iconst32(1)});
 }
@@ -3577,6 +3671,11 @@ void buildEHMemoSlot(SupportBuilder &b) {
 // handles this, once to step through it.
 void emitRaiseCarrier(SupportBuilder &b) {
   mlir::Value carrier = b.call("ly_eh_take_carrier", b.ptr(), {}).front();
+  if (!raiseCanLeaveItsFrame(b.triple)) {
+    mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
+                               kNoUnwinderRaiseName, mlir::ValueRange{carrier});
+    return;
+  }
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
                              "_Unwind_RaiseException",
                              mlir::ValueRange{carrier});
@@ -3871,6 +3970,10 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildAdoptStashedAsContext(support);
   buildReleaseCurrentException(support);
   buildRunPythonMain(support);
+  if (!raiseCanLeaveItsFrame(support.triple)) {
+    declareLLVMExternal(support, "exit", {}, {support.i32()});
+    buildNoUnwinderRaise(support);
+  }
 
   return module;
 }

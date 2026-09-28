@@ -20,6 +20,12 @@ Layout notes (mirrors the retired hand-written native modules):
     SA_ONSTACK|SA_SIGINFO = 0x08000004.
   - windows SetUnhandledExceptionFilter; EXCEPTION_STACK_OVERFLOW =
     0xC00000FD (-1073741571 signed).
+  - emscripten installs nothing. WebAssembly has no signals to catch a guard
+    page with, and linear memory has no guard page to fault on. The link puts
+    the stack first in memory (tools/CLI.cpp), so running past its bottom
+    wraps below address 0 and traps as an out-of-bounds access instead of
+    overwriting static data; a RecursionError needs a check the compiler
+    emits, not a handler.
 
 The RecursionError message is materialized into a malloc'd buffer at install
 time as packed 8-byte little-endian words (no str objects may reach the
@@ -228,6 +234,8 @@ def LyRt_InstallStackGuard() -> None:
     if g_installed != 0:
         return
     g_installed = 1
+    if sys.platform == "emscripten":
+        return
     libc = ctypes.CDLL(None)
 
     malloc_fn = libc["malloc"]

@@ -53,6 +53,7 @@ set(LYTHON_LIB_INTERNAL_TRIPLES
     "darwin=arm64-apple-darwin"
     "linux=x86_64-unknown-linux-gnu"
     "windows=x86_64-pc-windows-msvc"
+    "emscripten=wasm64-unknown-emscripten"
 )
 set(LYTHON_LIB_INTERNAL_BYTECODE)
 foreach(lib_module IN LISTS LYTHON_LIB_INTERNAL_PY)
