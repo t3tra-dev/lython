@@ -27,6 +27,13 @@ std::uint64_t expectedCLongWidth(llvm::StringRef tripleText,
 
 bool isSupportedNativeTarget(llvm::StringRef tripleText) {
   llvm::Triple triple(tripleText);
+  // ⛔ wasm64 only. The runtime spells size_t, ssize_t and off_t as i64 in
+  // every libc declaration it emits, and wasm32 checks call signatures at
+  // link time: wasm-ld turns each mismatched import into an `unreachable`
+  // stub, so a wasm32 build links and then traps inside `malloc`. wasm64's
+  // libc is LP64, which is what those declarations already say.
+  if (triple.isOSEmscripten())
+    return triple.getArch() == llvm::Triple::wasm64;
   return triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
 }
 
@@ -61,6 +68,11 @@ mlir::LogicalResult verifyTargetPlatformFacts(mlir::ModuleOp module) {
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
            << "' has unknown architecture";
+  if (triple.isOSEmscripten() && triple.getArch() == llvm::Triple::wasm32)
+    return module.emitError()
+           << kTargetTripleAttr << " '" << tripleAttr.getValue()
+           << "' is not supported: the runtime declares libc with 64-bit "
+              "size_t; use wasm64-unknown-emscripten";
   if (!isSupportedNativeTarget(tripleAttr.getValue()))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()

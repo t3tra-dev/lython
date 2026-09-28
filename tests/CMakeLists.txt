@@ -40,11 +40,11 @@
 #             compiler fix would look like it had not worked
 #
 #   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak,
-#                 aot, release
+#                 aot, release, wasm
 #
-#   `aot` and `release` are agreement stages: the same cases and the same
-#   sidecars as the JIT golden, through the other output mode and through
-#   the verifier-less configuration. They assert nothing new about the
+#   `aot`, `release` and `wasm` are agreement stages: the same cases and the
+#   same sidecars as the JIT golden, through the other output mode, through
+#   the verifier-less configuration, and through wasm64 under node. They assert nothing new about the
 #   program, only that those two answer the same way -- which is a claim
 #   nothing made until a `def main()` turned out to be unbuildable.
 #
@@ -176,7 +176,9 @@ set(LYTHON_UNIT_PATTERNS_abi
     # nothing. It builds target machines and reads the LSDA `@TType` encoding
     # each one would emit, which is a fact about the exception ABI and costs
     # what a table lookup costs.
-    "DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads")
+    "DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads"
+    "DriverTest.EmscriptenNamesItselfTheWayCPythonDoes"
+    "DriverTest.Wasm64EmscriptenReadsMuslsLayout")
 # `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
 # manifest sources and asks a dataflow question about them, which is the suite
 # checking the tree rather than the compiler.
@@ -219,7 +221,11 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ARefusedGeneratorNamesWhatSentItDown"
     "DriverTest.ARecursiveGeneratorMethodNamesTheRealLimit"
     "DriverTest.ABoolLiveAcrossAYieldNamesTheRealLimit"
-    "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation")
+    "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation"
+    "DriverTest.AWasm64RaiseLeavesItsFrameThroughNoUnwinder"
+    "DriverTest.PutsIsDeclaredWithItsCPrototype"
+    "DriverTest.AWasm32TargetIsRefusedByName"
+    "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")
@@ -903,18 +909,24 @@ set(LYTHON_RELEASE_AGREEMENT_CASES
     try_structural_rebind
     ownership_borrowed_container_grow)
 
-function(lython_add_agreement_case kind case_name extra_arg)
-    set(case_path "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${case_name}.py")
+# `case_name` is a golden case, or `errors/<name>` for a golden error case.
+function(lython_add_agreement_case kind case_name)
+    if(case_name MATCHES "/")
+        set(case_path "${CMAKE_CURRENT_SOURCE_DIR}/golden/${case_name}.py")
+    else()
+        set(case_path "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${case_name}.py")
+    endif()
     if(NOT EXISTS "${case_path}")
         message(FATAL_ERROR
             "LYTHON_${kind} names ${case_name}, which is not a golden case. "
             "A stale entry asserts nothing while looking like coverage.")
     endif()
     string(TOLOWER "${kind}" suite)
-    add_test(NAME "golden.${suite}.${case_name}"
+    string(REPLACE "/" "." test_stem "${case_name}")
+    add_test(NAME "golden.${suite}.${test_stem}"
         COMMAND Python3::Interpreter "${LYTHON_GOLDEN_RUNNER}"
-            --lyc $<TARGET_FILE:lyc> --timeout 300 ${extra_arg} "${case_path}")
-    set_tests_properties("golden.${suite}.${case_name}" PROPERTIES
+            --lyc $<TARGET_FILE:lyc> --timeout 300 ${ARGN} "${case_path}")
+    set_tests_properties("golden.${suite}.${test_stem}" PROPERTIES
         TIMEOUT 360 LABELS "e2e;${suite}")
 endfunction()
 
@@ -924,6 +936,62 @@ endforeach()
 foreach(case_name IN LISTS LYTHON_RELEASE_AGREEMENT_CASES)
     lython_add_agreement_case(release "${case_name}" --release)
 endforeach()
+
+# `wasm` builds for wasm64-unknown-emscripten and runs the result under node.
+# Registered only where both halves exist: emcc links it, and node must be new
+# enough for memory64 (24+; 22 rejects the module's table encoding). Neither is
+# required to build Lython, so a machine without them skips the stage rather
+# than failing it. LYTHON_WASM_NODE names a node when the one on PATH is older.
+#
+# ⛔ NOT THE WHOLE SUITE, and not yet able to be. Measured over every golden
+# case: 662 of 767 cases and 100 of 116 error cases agree, and every one of
+# the rest is an exception that has to leave its frame -- which wasm64 has no
+# unwinder for yet (lowering/Common/UnwindABI.h). Members are chosen by
+# mechanism, like the two stages above:
+set(LYTHON_WASM_AGREEMENT_CASES
+    # The floor: link through emcc and run under node.
+    hello
+    # stdout is the process's fd 1, byte for byte: chr(0) survives.
+    builtins_numeric
+    # The object allocator's 16-byte guarantee: environment strings are freed
+    # through headers rebuilt from their aligned address.
+    stdlib_os_env
+    # The host file system (NODERAWFS): write, reopen, seek and read back.
+    open_binary
+    # A raise caught in its own frame is a branch, not an unwind.
+    try_tuple_as
+    # LyEH_NoUnwinder: an uncaught raise reported with its traceback, exit 1.
+    errors/cross_bigint_traceback
+    # LyEH_NoUnwinder on SystemExit: the int code is the exit status.
+    errors/system_exit_int_code)
+
+find_program(LYTHON_EMCC emcc)
+set(LYTHON_WASM_NODE "" CACHE FILEPATH
+    "node (24 or later) that runs the wasm agreement stage; empty looks up node")
+set(lython_wasm_node "${LYTHON_WASM_NODE}")
+if(NOT lython_wasm_node)
+    find_program(lython_wasm_node_found node)
+    set(lython_wasm_node "${lython_wasm_node_found}")
+endif()
+set(lython_wasm_node_major 0)
+if(lython_wasm_node)
+    execute_process(COMMAND "${lython_wasm_node}" --version
+        OUTPUT_VARIABLE lython_wasm_node_version
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(lython_wasm_node_version MATCHES "^v([0-9]+)")
+        set(lython_wasm_node_major "${CMAKE_MATCH_1}")
+    endif()
+endif()
+if(LYTHON_EMCC AND lython_wasm_node_major GREATER_EQUAL 24)
+    foreach(case_name IN LISTS LYTHON_WASM_AGREEMENT_CASES)
+        lython_add_agreement_case(wasm "${case_name}"
+            --wasm-node "${lython_wasm_node}")
+    endforeach()
+else()
+    message(STATUS "Lython: wasm agreement stage skipped (emcc: "
+        "${LYTHON_EMCC}; node: ${lython_wasm_node} "
+        "${lython_wasm_node_version}; needs emcc and node >= 24)")
+endif()
 
 # --- examples/ smoke tests (exit code only) ----------------------------------
 # examples/ stays a user-facing sample directory: no expectation files are

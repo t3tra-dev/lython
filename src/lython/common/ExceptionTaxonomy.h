@@ -195,36 +195,53 @@ inline constexpr std::int64_t kOSErrorClassId = 66;
 
 // errno -> OSError-subclass mapping (CPython exceptions.c oserror_use_init
 // dispatch table). Values are per-libc: the common POSIX subset shares
-// numbers, the socket/async members diverge between the BSD family (Darwin)
-// and Linux. The runtime reads it through LyHost_OSErrorClassId, which the
-// OS support cluster (lowering/Common/OsSupportBuilder.cpp) compiles into a
-// select chain against the target's errno numbering.
+// numbers between the BSD family (Darwin) and Linux, and the socket/async
+// members diverge. Emscripten's musl carries WASI's numbering, which shares
+// nothing with either (ENOENT is 44). The runtime reads it through
+// LyHost_OSErrorClassId, which the OS support cluster
+// (lowering/Common/OsSupportBuilder.cpp) compiles into a select chain against
+// the target's errno numbering.
+enum class ErrnoNumbering { Linux, BSD, WASI };
+
 struct OSErrorErrnoMapping {
   llvm::StringLiteral posixName;
   int darwinValue; // BSD family
   int linuxValue;
+  int wasiValue;
   std::int64_t classId;
+
+  constexpr int valueFor(ErrnoNumbering numbering) const {
+    switch (numbering) {
+    case ErrnoNumbering::BSD:
+      return darwinValue;
+    case ErrnoNumbering::WASI:
+      return wasiValue;
+    case ErrnoNumbering::Linux:
+      break;
+    }
+    return linuxValue;
+  }
 };
 
 inline constexpr OSErrorErrnoMapping kOSErrorErrnoMap[] = {
-    {llvm::StringLiteral("EPERM"), 1, 1, 148},        // PermissionError
-    {llvm::StringLiteral("ENOENT"), 2, 2, 67},        // FileNotFoundError
-    {llvm::StringLiteral("ESRCH"), 3, 3, 149},        // ProcessLookupError
-    {llvm::StringLiteral("EINTR"), 4, 4, 145},        // InterruptedError
-    {llvm::StringLiteral("ECHILD"), 10, 10, 138},     // ChildProcessError
-    {llvm::StringLiteral("EACCES"), 13, 13, 148},     // PermissionError
-    {llvm::StringLiteral("EEXIST"), 17, 17, 144},     // FileExistsError
-    {llvm::StringLiteral("ENOTDIR"), 20, 20, 147},    // NotADirectoryError
-    {llvm::StringLiteral("EISDIR"), 21, 21, 146},     // IsADirectoryError
-    {llvm::StringLiteral("EPIPE"), 32, 32, 140},      // BrokenPipeError
-    {llvm::StringLiteral("EAGAIN"), 35, 11, 137},     // BlockingIOError
-    {llvm::StringLiteral("EINPROGRESS"), 36, 115, 137},
-    {llvm::StringLiteral("EALREADY"), 37, 114, 137},
-    {llvm::StringLiteral("ECONNABORTED"), 53, 103, 141},
-    {llvm::StringLiteral("ECONNRESET"), 54, 104, 143},
-    {llvm::StringLiteral("ESHUTDOWN"), 58, 108, 140},
-    {llvm::StringLiteral("ETIMEDOUT"), 60, 110, 150}, // TimeoutError
-    {llvm::StringLiteral("ECONNREFUSED"), 61, 111, 142},
+    {llvm::StringLiteral("EPERM"), 1, 1, 63, 148},     // PermissionError
+    {llvm::StringLiteral("ENOENT"), 2, 2, 44, 67},     // FileNotFoundError
+    {llvm::StringLiteral("ESRCH"), 3, 3, 71, 149},     // ProcessLookupError
+    {llvm::StringLiteral("EINTR"), 4, 4, 27, 145},     // InterruptedError
+    {llvm::StringLiteral("ECHILD"), 10, 10, 12, 138},  // ChildProcessError
+    {llvm::StringLiteral("EACCES"), 13, 13, 2, 148},   // PermissionError
+    {llvm::StringLiteral("EEXIST"), 17, 17, 20, 144},  // FileExistsError
+    {llvm::StringLiteral("ENOTDIR"), 20, 20, 54, 147}, // NotADirectoryError
+    {llvm::StringLiteral("EISDIR"), 21, 21, 31, 146},  // IsADirectoryError
+    {llvm::StringLiteral("EPIPE"), 32, 32, 64, 140},   // BrokenPipeError
+    {llvm::StringLiteral("EAGAIN"), 35, 11, 6, 137},   // BlockingIOError
+    {llvm::StringLiteral("EINPROGRESS"), 36, 115, 26, 137},
+    {llvm::StringLiteral("EALREADY"), 37, 114, 7, 137},
+    {llvm::StringLiteral("ECONNABORTED"), 53, 103, 13, 141},
+    {llvm::StringLiteral("ECONNRESET"), 54, 104, 15, 143},
+    {llvm::StringLiteral("ESHUTDOWN"), 58, 108, 140, 140},
+    {llvm::StringLiteral("ETIMEDOUT"), 60, 110, 73, 150}, // TimeoutError
+    {llvm::StringLiteral("ECONNREFUSED"), 61, 111, 14, 142},
 };
 
 inline const BuiltinExceptionInfo *findByName(llvm::StringRef name) {

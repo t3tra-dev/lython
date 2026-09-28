@@ -21,6 +21,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "Common/UnwindABI.h"
+#include "PlatformConstants.h"
 
 #include "llvm/IR/Instructions.h"
 #include "llvm/TargetParser/Host.h"
@@ -35,6 +36,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
+#include <memory>
+#include <optional>
 
 #include <string>
 #include <vector>
@@ -1757,4 +1760,185 @@ TEST(DriverTest, AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation) {
                                      "entry with block arguments"),
             std::string::npos)
       << refused.diagnostics;
+}
+
+// What: the names Emscripten answers to. CPython built for Emscripten reports
+// `sys.platform == "emscripten"` and `platform.system() == "Emscripten"`, and
+// both fold from the one row the target triple selects.
+TEST(DriverTest, EmscriptenNamesItselfTheWayCPythonDoes) {
+  EXPECT_EQ(py::platform_constants::staticStringValue(
+                "sys.platform", "wasm64-unknown-emscripten"),
+            std::optional<std::string>("emscripten"));
+  EXPECT_EQ(py::platform_constants::staticStringValue(
+                "platform.system", "wasm64-unknown-emscripten"),
+            std::optional<std::string>("Emscripten"));
+  EXPECT_EQ(py::platform_constants::staticIntValue("sys.maxsize",
+                                                   "wasm64-unknown-emscripten"),
+            std::optional<long long>(9223372036854775807LL));
+}
+
+// What: the libc facts the OS cluster reads on wasm64 Emscripten are musl's as
+// measured under `emcc -m64`: WASI errno numbers, and a `struct stat` that
+// leads with 32-bit dev_t and mode_t and ends with st_ino.
+TEST(DriverTest, Wasm64EmscriptenReadsMuslsLayout) {
+  py::runtime_library::HostTargetLayout layout =
+      py::runtime_library::hostTargetLayout(
+          llvm::Triple("wasm64-unknown-emscripten"));
+  EXPECT_TRUE(layout.posix);
+  EXPECT_EQ(layout.errnoAccessor, "__errno_location");
+  EXPECT_EQ(layout.errnoNumbering, py::exceptions::ErrnoNumbering::WASI);
+  EXPECT_EQ(layout.statDev[0], 0);
+  EXPECT_EQ(layout.statDev[1], 4);
+  EXPECT_EQ(layout.statMode[0], 4);
+  EXPECT_EQ(layout.statNlink[0], 8);
+  EXPECT_EQ(layout.statUid[0], 16);
+  EXPECT_EQ(layout.statGid[0], 20);
+  EXPECT_EQ(layout.statSize[0], 32);
+  EXPECT_EQ(layout.statAtime[0], 48);
+  EXPECT_EQ(layout.statMtime[0], 64);
+  EXPECT_EQ(layout.statCtime[0], 80);
+  EXPECT_EQ(layout.statIno[0], 96);
+  EXPECT_EQ(layout.direntNameOffset, 19);
+  EXPECT_EQ(layout.clockMonotonic, 1);
+
+  int enoent = 0;
+  for (const py::exceptions::OSErrorErrnoMapping &row :
+       py::exceptions::kOSErrorErrnoMap)
+    if (row.posixName == "ENOENT")
+      enoent = row.valueFor(layout.errnoNumbering);
+  EXPECT_EQ(enoent, 44);
+}
+
+namespace {
+
+// Compiles `source` for `triple` and links the runtime into it, which is where
+// the raise primitive and the libc declarations meet. The whole
+// VerifiedLLVMModule comes back because it owns the LLVMContext; `llvmModule`
+// is null when a step failed.
+lython::driver::VerifiedLLVMModule compileAndLinkFor(llvm::StringRef source,
+                                                     llvm::StringRef triple) {
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  lython::driver::DriverOptions options;
+  options.targetTriple = triple.str();
+  CompileResult result = compileSource(source, options);
+  EXPECT_TRUE(result.succeeded) << triple.str() << "\n" << result.diagnostics;
+  if (!result.succeeded)
+    return {};
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  if (mlir::failed(lython::driver::configureLLVMModuleCodeGenTarget(
+          *result.verified.llvmModule,
+          lython::driver::detectTensorLoweringTarget(options), options,
+          diag))) {
+    ADD_FAILURE() << triple.str() << "\n" << diagnostics;
+    return {};
+  }
+  if (mlir::failed(py::runtime_library::linkEmbeddedNativeRuntime(
+          *result.verified.llvmModule))) {
+    ADD_FAILURE() << "runtime link failed for " << triple.str();
+    return {};
+  }
+  return std::move(result.verified);
+}
+
+bool isCalled(const llvm::Module &module, llvm::StringRef name) {
+  const llvm::Function *fn = module.getFunction(name);
+  if (!fn)
+    return false;
+  for (const llvm::User *user : fn->users())
+    if (const auto *call = llvm::dyn_cast<llvm::CallBase>(user))
+      if (call->getCalledOperand() == fn)
+        return true;
+  return false;
+}
+
+} // namespace
+
+// What: on wasm64 a raise that leaves its frame calls `LyEH_NoUnwinder`, and
+// nothing calls into libunwind, which Emscripten does not link without
+// exceptions; on the host the same program still raises through
+// `_Unwind_RaiseException` and has no `LyEH_NoUnwinder` at all.
+TEST(DriverTest, AWasm64RaiseLeavesItsFrameThroughNoUnwinder) {
+  const char *source = "def fail() -> None:\n"
+                       "    raise ValueError('x')\n"
+                       "\n"
+                       "fail()\n";
+  lython::driver::VerifiedLLVMModule wasmResult =
+      compileAndLinkFor(source, "wasm64-unknown-emscripten");
+  ASSERT_TRUE(wasmResult.llvmModule);
+  llvm::Module *wasm = wasmResult.llvmModule.get();
+  const llvm::Function *noUnwinder =
+      wasm->getFunction(py::runtime_library::kNoUnwinderRaiseName);
+  ASSERT_NE(noUnwinder, nullptr);
+  EXPECT_FALSE(noUnwinder->isDeclaration());
+  EXPECT_TRUE(isCalled(*wasm, py::runtime_library::kNoUnwinderRaiseName));
+  for (const char *unwinder :
+       {"_Unwind_RaiseException", "_Unwind_DeleteException", "_Unwind_Resume"})
+    EXPECT_FALSE(isCalled(*wasm, unwinder)) << unwinder;
+
+  lython::driver::VerifiedLLVMModule hostResult =
+      compileAndLinkFor(source, llvm::sys::getDefaultTargetTriple());
+  ASSERT_TRUE(hostResult.llvmModule);
+  llvm::Module *host = hostResult.llvmModule.get();
+  EXPECT_EQ(host->getFunction(py::runtime_library::kNoUnwinderRaiseName),
+            nullptr);
+  EXPECT_TRUE(isCalled(*host, "_Unwind_RaiseException"));
+}
+
+// What: every `puts` the linked module calls is C's `int puts(const char *)`.
+// MLIR's `cf.assert` lowering declares it returning void, and wasm-ld turns a
+// call through the wrong signature into a trap.
+TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
+  lython::driver::VerifiedLLVMModule wasmResult =
+      compileAndLinkFor("print('hi')\n", "wasm64-unknown-emscripten");
+  ASSERT_TRUE(wasmResult.llvmModule);
+  llvm::Module *wasm = wasmResult.llvmModule.get();
+  const llvm::Function *puts = wasm->getFunction("puts");
+  ASSERT_NE(puts, nullptr)
+      << "no cf.assert reaches this module any more; the test looks at nothing";
+  EXPECT_TRUE(puts->getReturnType()->isIntegerTy(32));
+}
+
+// What: wasm32 Emscripten is refused by name before lowering, pointing at
+// wasm64, rather than compiled against a libc it would misdeclare.
+TEST(DriverTest, AWasm32TargetIsRefusedByName) {
+  lython::driver::DriverOptions options;
+  options.targetTriple = "wasm32-unknown-emscripten";
+  CompileResult result = compileSource("print(1)\n", options);
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("use wasm64-unknown-emscripten"),
+            std::string::npos)
+      << result.diagnostics;
+}
+
+// What: where the target's malloc promises less than 16-byte alignment
+// (Emscripten: 8), the object allocator takes its arenas and large blocks from
+// aligned_alloc; where malloc already promises 16 it keeps calling malloc.
+TEST(DriverTest, TheObjectAllocatorAlignsWhereMallocDoesNot) {
+  auto callsFrom = [](const llvm::Module &module, llvm::StringRef caller,
+                      llvm::StringRef callee) {
+    const llvm::Function *fn = module.getFunction(caller);
+    if (!fn)
+      return false;
+    for (const llvm::BasicBlock &block : *fn)
+      for (const llvm::Instruction &instruction : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          if (const llvm::Function *target = call->getCalledFunction())
+            if (target->getName() == callee)
+              return true;
+    return false;
+  };
+
+  lython::driver::VerifiedLLVMModule wasm =
+      compileAndLinkFor("print('hi')\n", "wasm64-unknown-emscripten");
+  ASSERT_TRUE(wasm.llvmModule);
+  EXPECT_TRUE(callsFrom(*wasm.llvmModule, "LyMem_Alloc", "aligned_alloc"));
+  EXPECT_FALSE(callsFrom(*wasm.llvmModule, "LyMem_Alloc", "malloc"));
+
+  lython::driver::VerifiedLLVMModule host =
+      compileAndLinkFor("print('hi')\n", llvm::sys::getDefaultTargetTriple());
+  ASSERT_TRUE(host.llvmModule);
+  EXPECT_TRUE(callsFrom(*host.llvmModule, "LyMem_Alloc", "malloc"));
+  EXPECT_FALSE(callsFrom(*host.llvmModule, "LyMem_Alloc", "aligned_alloc"));
 }

@@ -1,6 +1,8 @@
 #include "Driver.h"
 #include "DriverCodeGen.h"
 
+#include "Common/UnwindABI.h"
+
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
@@ -207,12 +209,20 @@ llvm::ExceptionHandling
 exceptionModelForTargetTriple(const llvm::Triple &triple) {
   if (triple.isOSWindows())
     return llvm::ExceptionHandling::WinEH;
+  // None makes the WebAssembly backend lower every invoke to a call, which is
+  // what `raiseCanLeaveItsFrame` (lowering/Common/UnwindABI.h) promises. The
+  // backend's `Wasm` model wants funclet pads, and instruction selection
+  // crashes on the `landingpad`s this compiler emits.
+  if (!py::runtime_library::raiseCanLeaveItsFrame(triple))
+    return llvm::ExceptionHandling::None;
   return llvm::ExceptionHandling::DwarfCFI;
 }
 
 void applyExceptionUnwindOptions(llvm::TargetOptions &options,
                                  const llvm::Triple &triple) {
   options.ExceptionModel = exceptionModelForTargetTriple(triple);
+  if (options.ExceptionModel == llvm::ExceptionHandling::None)
+    return;
   options.MCOptions.EmitCompactUnwindNonCanonical = true;
   options.ForceDwarfFrameSection = true;
   options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
