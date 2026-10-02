@@ -7,6 +7,7 @@
 #include "DriverCodeGen.h"
 
 #include "Common/RuntimeLibrary.h"
+#include "Common/RuntimeSupport.h"
 #include "Common/SupportBuilder.h"
 #include "Runtime/ABI/BoxLayout.h"
 
@@ -28,6 +29,8 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -1855,35 +1858,67 @@ bool isCalled(const llvm::Module &module, llvm::StringRef name) {
 
 } // namespace
 
-// What: on wasm64 a raise that leaves its frame calls `LyEH_NoUnwinder`, and
-// nothing calls into libunwind, which Emscripten does not link without
-// exceptions; on the host the same program still raises through
-// `_Unwind_RaiseException` and has no `LyEH_NoUnwinder` at all.
-TEST(DriverTest, AWasm64RaiseLeavesItsFrameThroughNoUnwinder) {
-  const char *source = "def fail() -> None:\n"
-                       "    raise ValueError('x')\n"
+// What: a wasm64 module raises through `_Unwind_RaiseException` like every
+// other target, and after the funclet rewrite it holds no landingpad and no
+// resume, names the wasm personality, verifies, and gets through the
+// WebAssembly backend's instruction selection -- which crashed on the
+// landingpads before.
+TEST(DriverTest, AWasm64ModuleCarriesItsPadsAsFunclets) {
+  const char *source = "def fail(n: int) -> int:\n"
+                       "    if n > 0:\n"
+                       "        raise ValueError('x')\n"
+                       "    return n\n"
                        "\n"
-                       "fail()\n";
+                       "try:\n"
+                       "    try:\n"
+                       "        fail(1)\n"
+                       "    finally:\n"
+                       "        print('cleanup')\n"
+                       "except ValueError as e:\n"
+                       "    print('caught', e)\n";
   lython::driver::VerifiedLLVMModule wasmResult =
       compileAndLinkFor(source, "wasm64-unknown-emscripten");
   ASSERT_TRUE(wasmResult.llvmModule);
   llvm::Module *wasm = wasmResult.llvmModule.get();
-  const llvm::Function *noUnwinder =
-      wasm->getFunction(py::runtime_library::kNoUnwinderRaiseName);
-  ASSERT_NE(noUnwinder, nullptr);
-  EXPECT_FALSE(noUnwinder->isDeclaration());
-  EXPECT_TRUE(isCalled(*wasm, py::runtime_library::kNoUnwinderRaiseName));
-  for (const char *unwinder :
-       {"_Unwind_RaiseException", "_Unwind_DeleteException", "_Unwind_Resume"})
-    EXPECT_FALSE(isCalled(*wasm, unwinder)) << unwinder;
+  EXPECT_TRUE(isCalled(*wasm, "_Unwind_RaiseException"));
 
-  lython::driver::VerifiedLLVMModule hostResult =
-      compileAndLinkFor(source, llvm::sys::getDefaultTargetTriple());
-  ASSERT_TRUE(hostResult.llvmModule);
-  llvm::Module *host = hostResult.llvmModule.get();
-  EXPECT_EQ(host->getFunction(py::runtime_library::kNoUnwinderRaiseName),
-            nullptr);
-  EXPECT_TRUE(isCalled(*host, "_Unwind_RaiseException"));
+  EXPECT_TRUE(py::convertLandingPadsToWasmFunclets(*wasm));
+  unsigned catchPads = 0;
+  for (llvm::Function &function : *wasm)
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &instruction : block) {
+        EXPECT_FALSE(llvm::isa<llvm::LandingPadInst>(&instruction))
+            << function.getName().str();
+        EXPECT_FALSE(llvm::isa<llvm::ResumeInst>(&instruction))
+            << function.getName().str();
+        if (llvm::isa<llvm::CatchPadInst>(&instruction)) {
+          ++catchPads;
+          EXPECT_EQ(function.getPersonalityFn()->getName(),
+                    py::runtime_library::kWasmPersonalityName);
+        }
+      }
+  EXPECT_GT(catchPads, 0u);
+  std::string broken;
+  llvm::raw_string_ostream brokenStream(broken);
+  ASSERT_FALSE(llvm::verifyModule(*wasm, &brokenStream)) << broken;
+
+  lython::driver::DriverOptions options;
+  options.targetTriple = "wasm64-unknown-emscripten";
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  llvm::InitializeAllAsmPrinters();
+  std::unique_ptr<llvm::TargetMachine> machine =
+      lython::driver::createCodeGenTargetMachine(
+          lython::driver::detectTensorLoweringTarget(options), options, nullptr,
+          diag);
+  ASSERT_TRUE(machine) << diagnostics;
+  llvm::SmallString<0> object;
+  llvm::raw_svector_ostream objectStream(object);
+  llvm::legacy::PassManager codegen;
+  ASSERT_FALSE(machine->addPassesToEmitFile(codegen, objectStream, nullptr,
+                                            llvm::CodeGenFileType::ObjectFile));
+  codegen.run(*wasm);
+  EXPECT_FALSE(object.empty());
 }
 
 // What: every `puts` the linked module calls is C's `int puts(const char *)`.

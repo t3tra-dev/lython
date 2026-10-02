@@ -222,7 +222,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ARecursiveGeneratorMethodNamesTheRealLimit"
     "DriverTest.ABoolLiveAcrossAYieldNamesTheRealLimit"
     "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation"
-    "DriverTest.AWasm64RaiseLeavesItsFrameThroughNoUnwinder"
+    "DriverTest.AWasm64ModuleCarriesItsPadsAsFunclets"
     "DriverTest.PutsIsDeclaredWithItsCPrototype"
     "DriverTest.AWasm32TargetIsRefusedByName"
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot")
@@ -943,11 +943,12 @@ endforeach()
 # required to build Lython, so a machine without them skips the stage rather
 # than failing it. LYTHON_WASM_NODE names a node when the one on PATH is older.
 #
-# ⛔ NOT THE WHOLE SUITE, and not yet able to be. Measured over every golden
-# case: 662 of 767 cases and 100 of 116 error cases agree, and every one of
-# the rest is an exception that has to leave its frame -- which wasm64 has no
-# unwinder for yet (lowering/Common/UnwindABI.h). Members are chosen by
-# mechanism, like the two stages above:
+# ⛔ NOT THE WHOLE SUITE. Measured over every golden case: 764 of 767 cases
+# and 115 of 116 error cases agree, and the four that do not print an errno
+# number -- `[Errno 44]` where the sidecar says 2, `os.strerror(2)` reading
+# EACCES -- because Emscripten's libc numbers errno the WASI way, as CPython's
+# own Emscripten build does. Members are chosen by mechanism, like the two
+# stages above:
 set(LYTHON_WASM_AGREEMENT_CASES
     # The floor: link through emcc and run under node.
     hello
@@ -960,10 +961,17 @@ set(LYTHON_WASM_AGREEMENT_CASES
     open_binary
     # A raise caught in its own frame is a branch, not an unwind.
     try_tuple_as
-    # LyEH_NoUnwinder: an uncaught raise reported with its traceback, exit 1.
-    errors/cross_bigint_traceback
-    # LyEH_NoUnwinder on SystemExit: the int code is the exit status.
-    errors/system_exit_int_code)
+    # Funclet pads: SystemExit caught by a caller's `except`, through a
+    # `finally` that runs on the way, and the int code as the exit status.
+    sys_exit
+    # A cleanup pad per frame pushes that frame, so an uncaught raise three
+    # calls deep prints all of them.
+    errors/traceback_nested_call
+    # The generator state machine's own pads: `throw()` into a suspended
+    # generator unwinds through its frame.
+    errors/cross_generator_throw_unwind
+    # An uncaught raise in `<module>` reaches LyRunPythonMain's catch-all.
+    errors/cross_bigint_traceback)
 
 find_program(LYTHON_EMCC emcc)
 set(LYTHON_WASM_NODE "" CACHE FILEPATH

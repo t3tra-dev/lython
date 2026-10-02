@@ -10,6 +10,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/AArch64TargetParser.h"
@@ -199,29 +200,40 @@ std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
       appendTargetFeature(features, "sme-f64f64");
     return features;
   }
+  if (py::runtime_library::padsAreFunclets(triple))
+    return "+exception-handling";
   llvm::Triple hostTriple(llvm::sys::getDefaultTargetTriple());
   if (triple.getArch() != hostTriple.getArch())
     return "";
   return hostCPUFeaturesForCodeGen();
 }
 
+// ⛔ The WebAssembly backend takes its EH mode from a command-line flag as well
+// as from TargetOptions, and refuses `ExceptionModel == Wasm` unless
+// `-wasm-enable-eh` is set too ("-exception-model=wasm only allowed with at
+// least one of -wasm-enable-eh or -wasm-enable-sjlj"). The flag is
+// process-wide, and it only reaches the WebAssembly backend.
+static void enableWasmExceptionsInBackend() {
+  auto &registered = llvm::cl::getRegisteredOptions();
+  auto found = registered.find("wasm-enable-eh");
+  if (found == registered.end())
+    return;
+  static_cast<llvm::cl::opt<bool> *>(found->second)->setValue(true);
+}
+
 llvm::ExceptionHandling
 exceptionModelForTargetTriple(const llvm::Triple &triple) {
   if (triple.isOSWindows())
     return llvm::ExceptionHandling::WinEH;
-  // None makes the WebAssembly backend lower every invoke to a call, which is
-  // what `raiseCanLeaveItsFrame` (lowering/Common/UnwindABI.h) promises. The
-  // backend's `Wasm` model wants funclet pads, and instruction selection
-  // crashes on the `landingpad`s this compiler emits.
-  if (!py::runtime_library::raiseCanLeaveItsFrame(triple))
-    return llvm::ExceptionHandling::None;
+  if (py::runtime_library::padsAreFunclets(triple))
+    return llvm::ExceptionHandling::Wasm;
   return llvm::ExceptionHandling::DwarfCFI;
 }
 
 void applyExceptionUnwindOptions(llvm::TargetOptions &options,
                                  const llvm::Triple &triple) {
   options.ExceptionModel = exceptionModelForTargetTriple(triple);
-  if (options.ExceptionModel == llvm::ExceptionHandling::None)
+  if (options.ExceptionModel == llvm::ExceptionHandling::Wasm)
     return;
   options.MCOptions.EmitCompactUnwindNonCanonical = true;
   options.ForceDwarfFrameSection = true;
@@ -276,6 +288,8 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
 
   llvm::TargetOptions opt;
   applyExceptionUnwindOptions(opt, triple);
+  if (opt.ExceptionModel == llvm::ExceptionHandling::Wasm)
+    enableWasmExceptionsInBackend();
   if (!parseConfiguredFloatABI(opt.FloatABIType, options, diag))
     return nullptr;
   std::unique_ptr<llvm::TargetMachine> targetMachine(
