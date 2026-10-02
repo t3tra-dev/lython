@@ -17,6 +17,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsWebAssembly.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Path.h"
 
@@ -922,6 +923,179 @@ bool installPythonExceptionCleanupFrames(
       entry.second.marker->eraseFromParent();
   for (llvm::CallInst *marker : callSiteMarkers)
     marker->eraseFromParent();
+  return changed;
+}
+
+namespace {
+
+// One landingpad, rewritten as a catch-all funclet that it leaves at once:
+//
+//   py.wasm.dispatch:  catchswitch within none [py.wasm.catch] unwind to caller
+//   py.wasm.catch:     catchpad [ptr null]; the carrier; ours or foreign?
+//                      catchret to <the old pad block>, which now starts with
+//                      phis for the carrier and the selector
+//
+// Everything the pad block did after its `landingpad` runs as ordinary code
+// again, so no funclet ever nests and nothing below the pad needs to know.
+void convertLandingPadToCatchAll(llvm::LandingPadInst *pad,
+                                 llvm::Function *getException,
+                                 llvm::Function *rethrow) {
+  llvm::BasicBlock *landing = pad->getParent();
+  llvm::Function *function = landing->getParent();
+  llvm::LLVMContext &context = function->getContext();
+  llvm::PointerType *ptr = llvm::PointerType::getUnqual(context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+
+  llvm::BasicBlock *dispatch =
+      llvm::BasicBlock::Create(context, "py.wasm.dispatch", function, landing);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "py.wasm.catch", function, landing);
+  llvm::BasicBlock *check =
+      llvm::BasicBlock::Create(context, "py.wasm.class", function, landing);
+  llvm::BasicBlock *ours =
+      llvm::BasicBlock::Create(context, "py.wasm.ours", function, landing);
+  llvm::BasicBlock *foreign =
+      llvm::BasicBlock::Create(context, "py.wasm.foreign", function, landing);
+
+  // A pad block is reached only by unwind edges, so its phis are about the
+  // invokes, and they move with the edges.
+  for (llvm::PHINode &phi : llvm::make_early_inc_range(landing->phis())) {
+    phi.removeFromParent();
+    phi.insertInto(dispatch, dispatch->end());
+  }
+  for (llvm::BasicBlock *pred :
+       llvm::make_early_inc_range(llvm::predecessors(landing)))
+    llvm::cast<llvm::InvokeInst>(pred->getTerminator())
+        ->setUnwindDest(dispatch);
+
+  llvm::IRBuilder<> builder(dispatch);
+  llvm::CatchSwitchInst *dispatchSwitch =
+      builder.CreateCatchSwitch(llvm::ConstantTokenNone::get(context),
+                                /*UnwindBB=*/nullptr, 1, "py.wasm.cs");
+  dispatchSwitch->addHandler(entry);
+
+  builder.SetInsertPoint(entry);
+  llvm::CatchPadInst *catchPad = builder.CreateCatchPad(
+      dispatchSwitch, {llvm::ConstantPointerNull::get(ptr)}, "py.wasm.cp");
+  llvm::Value *carrier =
+      builder.CreateCall(getException, {catchPad}, "py.wasm.carrier");
+  builder.CreateCondBr(builder.CreateIsNull(carrier), foreign, check);
+
+  // `_Unwind_Exception.exception_class` is the carrier's first word, and the
+  // personality refuses every class but ours the same way.
+  builder.SetInsertPoint(check);
+  llvm::Value *exceptionClass =
+      builder.CreateAlignedLoad(i64, carrier, llvm::Align(8));
+  builder.CreateCondBr(
+      builder.CreateICmpEQ(
+          exceptionClass, llvm::ConstantInt::get(
+                              i64, py::runtime_library::kLythonExceptionClass)),
+      ours, foreign);
+
+  // The selector a landingpad would have read: non-zero when one of its
+  // clauses matched. A clause list is only ever a search-phase shortcut here
+  // -- the dispatch chain behind it tests each class again and re-raises what
+  // no arm names -- so for our own exception every pad with clauses is entered
+  // as matched, which is the catch-all that list was an optimization of.
+  builder.SetInsertPoint(ours);
+  builder.CreateCatchRet(catchPad, landing);
+  llvm::Value *matched =
+      llvm::ConstantInt::get(i32, pad->getNumClauses() != 0 ? 1 : 0);
+
+  // ⛔ A FOREIGN EXCEPTION IS NOT CAUGHT BY A PYTHON HANDLER, exactly as the
+  // native personality refuses it: a Python catch pad with no cleanup throws
+  // it on from inside the funclet; anything with a cleanup runs only that.
+  // LyRunPythonMain's catch-all is not a Python pad and does take it, to say
+  // that a native exception ended the program.
+  builder.SetInsertPoint(foreign);
+  bool foreignPassesThrough = pad->getMetadata("ly.catch") && !pad->isCleanup();
+  if (foreignPassesThrough) {
+    builder.CreateCall(rethrow, {},
+                       {llvm::OperandBundleDef("funclet", catchPad)});
+    builder.CreateUnreachable();
+  } else {
+    builder.CreateCatchRet(catchPad, landing);
+  }
+
+  builder.SetInsertPoint(pad);
+  llvm::PHINode *carrierIn = builder.CreatePHI(ptr, 2, "py.wasm.exn");
+  llvm::PHINode *selectorIn = builder.CreatePHI(i32, 2, "py.wasm.sel");
+  carrierIn->addIncoming(carrier, ours);
+  selectorIn->addIncoming(matched, ours);
+  if (!foreignPassesThrough) {
+    carrierIn->addIncoming(carrier, foreign);
+    selectorIn->addIncoming(llvm::ConstantInt::get(i32, 0), foreign);
+  }
+  llvm::Value *value = builder.CreateInsertValue(
+      llvm::PoisonValue::get(pad->getType()), carrierIn, {0});
+  value = builder.CreateInsertValue(value, selectorIn, {1});
+  pad->replaceAllUsesWith(value);
+  pad->eraseFromParent();
+}
+
+} // namespace
+
+// ⭐ A LANDINGPAD BECOMES A CATCH-ALL THAT IS LEFT AT ONCE. WebAssembly has
+// funclet pads only, and LLVM's WebAssembly backend crashes instruction
+// selection on a `landingpad`. Rewriting each one as `catchswitch` /
+// `catchpad [ptr null]` / `catchret` keeps every byte of the code that followed
+// it -- the traceback push, LyEH_BeginCatch, the class tests -- running outside
+// any funclet, which is the only reason the rewrite can be this local: funclet
+// rules (no nesting, a "funclet" bundle on every call inside one) bind nothing
+// but the instructions written here.
+//
+// `resume` becomes a fresh `throw` of the same carrier. Emscripten's libunwind
+// raises the same way (`_Unwind_RaiseException` is `__builtin_wasm_throw(0,
+// carrier)`), so the raise side needs no change at all.
+//
+// ⛔ Run LAST, after the LLVM optimization pipeline: every pass of this
+// compiler before it reads the landingpad shape, and that shape is the one the
+// native targets are tested in.
+bool convertLandingPadsToWasmFunclets(llvm::Module &module) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Function *getException = llvm::Intrinsic::getOrInsertDeclaration(
+      &module, llvm::Intrinsic::wasm_get_exception);
+  llvm::Function *throwCarrier = llvm::Intrinsic::getOrInsertDeclaration(
+      &module, llvm::Intrinsic::wasm_throw);
+  llvm::Function *rethrow = llvm::Intrinsic::getOrInsertDeclaration(
+      &module, llvm::Intrinsic::wasm_rethrow);
+  llvm::Constant *personality = llvm::cast<llvm::Constant>(
+      module
+          .getOrInsertFunction(
+              py::runtime_library::kWasmPersonalityName,
+              llvm::FunctionType::get(llvm::Type::getInt32Ty(context),
+                                      /*isVarArg=*/true))
+          .getCallee());
+
+  bool changed = false;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration())
+      continue;
+    llvm::SmallVector<llvm::LandingPadInst *, 8> pads;
+    llvm::SmallVector<llvm::ResumeInst *, 8> resumes;
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &instruction : block) {
+        if (auto *pad = llvm::dyn_cast<llvm::LandingPadInst>(&instruction))
+          pads.push_back(pad);
+        else if (auto *resume = llvm::dyn_cast<llvm::ResumeInst>(&instruction))
+          resumes.push_back(resume);
+      }
+    if (pads.empty() && resumes.empty())
+      continue;
+    function.setPersonalityFn(personality);
+    for (llvm::LandingPadInst *pad : pads)
+      convertLandingPadToCatchAll(pad, getException, rethrow);
+    for (llvm::ResumeInst *resume : resumes) {
+      llvm::IRBuilder<> builder(resume);
+      llvm::Value *carrier =
+          builder.CreateExtractValue(resume->getValue(), {0});
+      builder.CreateCall(throwCarrier, {builder.getInt32(0), carrier});
+      builder.CreateUnreachable();
+      resume->eraseFromParent();
+    }
+    changed = true;
+  }
   return changed;
 }
 

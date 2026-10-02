@@ -1913,21 +1913,11 @@ void buildCurrentExceptionClassIdUnchecked(SupportBuilder &b) {
 }
 
 // Ends the in-flight carrier's life: `_Unwind_DeleteException`, which calls
-// the `exception_cleanup` the carrier was built with -- `LyEH_CarrierCleanup`,
-// always, since every carrier is ours by the time a catch holds it. A target
-// with no unwinder has no `_Unwind_DeleteException` to link, so there the call
-// is made directly.
+// the `exception_cleanup` the carrier was built with.
 void emitDeleteCurrentCarrier(SupportBuilder &b) {
   mlir::Value carrier = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.ptr(), b.addrOf("g_current_carrier"),
       /*alignment=*/8);
-  if (!raiseCanLeaveItsFrame(b.triple)) {
-    // _URC_FOREIGN_EXCEPTION_CAUGHT, the reason the unwinder would pass.
-    mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                               "LyEH_CarrierCleanup",
-                               mlir::ValueRange{b.iconst32(1), carrier});
-    return;
-  }
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "_Unwind_DeleteException",
                              mlir::ValueRange{carrier});
@@ -2743,41 +2733,9 @@ void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name,
                                   entry->getArgument(1), b.iconst(1)}));
 }
 
-// void LyEH_NoUnwinder(ptr carrier): a raise that has to leave its frame on a
-// target with no unwinder (UnwindABI.h). Reports the exception exactly as the
-// top of the program would -- traceback, or SystemExit's status -- says that
-// the frames it left were not searched, and exits with that status.
-//
-// ⛔ NOT a trap. Whether an enclosing frame would have caught the exception is
-// not knowable here, so the report cannot claim it was uncaught; but an
-// uncaught exception is the common case, and reporting it the CPython way keeps
-// those programs' output and status right while the note keeps the other case
-// from passing for one.
-void buildNoUnwinderRaise(SupportBuilder &b) {
-  b.stringGlobal(".no_unwinder_note",
-                 "note: this target has no unwinder yet: the exception left "
-                 "its frame, so no handler or cleanup in an enclosing frame "
-                 "ran\n");
-  auto fn = beginLLVMFunction(b, kNoUnwinderRaiseName, {}, {b.ptr()});
-  fn->setAttr("passthrough",
-              b.builder.getArrayAttr({b.builder.getStringAttr("noreturn")}));
-  mlir::Block *entry = fn.addEntryBlock(b.builder);
-  b.builder.setInsertionPointToEnd(entry);
-  mlir::Value status =
-      mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
-                                 "LyRt_ReportUncaught",
-                                 mlir::ValueRange{entry->getArgument(0)})
-          .getResult();
-  mlir::func::CallOp::create(
-      b.builder, b.loc, "write_cstr", mlir::TypeRange{},
-      mlir::ValueRange{b.iconst32(2), b.addrOf(".no_unwinder_note")});
-  mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{}, "exit",
-                             mlir::ValueRange{status});
-  mlir::LLVM::UnreachableOp::create(b.builder, b.loc);
-}
-
 // i32 LyRunPythonMain(ptr entry): installs the stack guard, invokes the
-// program body, and hands anything that unwinds out to LyRt_ReportUncaught.
+// program body, and prints the Python traceback (or the native-exception
+// notice) for anything that unwinds out.
 //
 // ⛔ THE ONE FRAME THAT KEEPS THE C++ PERSONALITY. `LyEH_Personality` refuses a
 // carrier whose exception class is not ours, so a C++ exception raised behind a
@@ -2787,25 +2745,16 @@ void buildNoUnwinderRaise(SupportBuilder &b) {
 // process with no message at all, and this is the frame that reports it. One
 // unwind of one frame per program run pays the C++ ABI's price; the Python
 // frames do not.
-//
-// i32 LyRt_ReportUncaught(ptr carrier): prints the Python traceback (or the
-// native-exception notice) for the carrier and answers the exit status.
-// Separate from the landing pad because a target with no unwinder reports
-// from the raise itself (buildNoUnwinderRaise).
 void buildRunPythonMain(SupportBuilder &b) {
   auto fn = beginLLVMFunction(b, "LyRunPythonMain", b.i32(), {b.ptr()});
   fn.setPersonalityAttr(mlir::FlatSymbolRefAttr::get(b.builder.getContext(),
                                                      "__gxx_personality_v0"));
   mlir::Block *entry = fn.addEntryBlock(b.builder);
-  mlir::Region &runBody = fn.getBody();
-  mlir::Block *run = b.builder.createBlock(&runBody);
-  mlir::Block *ok = b.builder.createBlock(&runBody);
-  mlir::Block *nullEntry = b.builder.createBlock(&runBody);
-  mlir::Block *landing = b.builder.createBlock(&runBody);
-
-  auto report = beginLLVMFunction(b, "LyRt_ReportUncaught", b.i32(), {b.ptr()});
-  mlir::Block *reportEntry = report.addEntryBlock(b.builder);
-  mlir::Region &body = report.getBody();
+  mlir::Region &body = fn.getBody();
+  mlir::Block *run = b.builder.createBlock(&body);
+  mlir::Block *ok = b.builder.createBlock(&body);
+  mlir::Block *nullEntry = b.builder.createBlock(&body);
+  mlir::Block *landing = b.builder.createBlock(&body);
   mlir::Block *native = b.builder.createBlock(&body);
   mlir::Block *python = b.builder.createBlock(&body);
   mlir::Block *printTraceback = b.builder.createBlock(&body);
@@ -2846,15 +2795,7 @@ void buildRunPythonMain(SupportBuilder &b) {
       mlir::ValueRange{b.nullPtr()});
   mlir::Value exceptionObject = mlir::LLVM::ExtractValueOp::create(
       b.builder, b.loc, pad, llvm::ArrayRef<std::int64_t>{0});
-  mlir::Value reported =
-      mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
-                                 "LyRt_ReportUncaught",
-                                 mlir::ValueRange{exceptionObject})
-          .getResult();
-  mlir::LLVM::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{reported});
-
-  b.builder.setInsertionPointToEnd(reportEntry);
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, reportEntry->getArgument(0),
+  mlir::LLVM::StoreOp::create(b.builder, b.loc, exceptionObject,
                               b.addrOf("g_current_carrier"), /*alignment=*/8);
   mlir::Value descriptor = mlir::LLVM::AllocaOp::create(
       b.builder, b.loc, b.ptr(), exceptionPartsType(b), b.iconst32(1),
@@ -3671,11 +3612,6 @@ void buildEHMemoSlot(SupportBuilder &b) {
 // handles this, once to step through it.
 void emitRaiseCarrier(SupportBuilder &b) {
   mlir::Value carrier = b.call("ly_eh_take_carrier", b.ptr(), {}).front();
-  if (!raiseCanLeaveItsFrame(b.triple)) {
-    mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
-                               kNoUnwinderRaiseName, mlir::ValueRange{carrier});
-    return;
-  }
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{b.i32()},
                              "_Unwind_RaiseException",
                              mlir::ValueRange{carrier});
@@ -3970,10 +3906,6 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildAdoptStashedAsContext(support);
   buildReleaseCurrentException(support);
   buildRunPythonMain(support);
-  if (!raiseCanLeaveItsFrame(support.triple)) {
-    declareLLVMExternal(support, "exit", {}, {support.i32()});
-    buildNoUnwinderRaise(support);
-  }
 
   return module;
 }

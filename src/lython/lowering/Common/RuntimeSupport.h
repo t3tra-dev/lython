@@ -116,6 +116,10 @@ void collectCtypesForeignSymbols(mlir::ModuleOp module,
 // that handler. Runs once the runtime is linked, so the raise primitives have
 // bodies to read.
 bool branchLocalRaisesToTheirHandler(llvm::Module &module);
+// Rewrites every landingpad as a catch-all funclet left at once, and every
+// resume as a throw of the same carrier, for a target whose pads are funclets
+// (UnwindABI.h). The last step before codegen.
+bool convertLandingPadsToWasmFunclets(llvm::Module &module);
 // Makes every frame walkable from x29, which is what lets a raise read the
 // image's compact unwind table instead of its DWARF.
 void forceFramePointers(llvm::Module &module);

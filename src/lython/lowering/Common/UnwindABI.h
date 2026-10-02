@@ -94,19 +94,20 @@ inline EHDataRegisters ehDataRegisters(const llvm::Triple &triple) {
   return {0, 1};   // x0, x1
 }
 
-// Whether a raise can leave its frame at all. WebAssembly has no unwinder to
-// hand a carrier to: its exceptions are an instruction the engine unwinds
-// (`throw` / `try_table`), reached through funclet pads, and every pad this
-// compiler emits is a `landingpad`. Codegen lowers the invokes to calls there,
-// so a raise caught in its own frame -- a branch, see
-// `branchLocalRaisesToTheirHandler` -- still works, and a raise that has to
-// leave the frame goes to `LyEH_NoUnwinder` instead of
-// `_Unwind_RaiseException`.
-inline bool raiseCanLeaveItsFrame(const llvm::Triple &triple) {
-  return !triple.isWasm();
+// Whether this target's exception pads are funclets. WebAssembly has no
+// unwinder walking frames: an exception is an instruction the engine unwinds
+// (`throw` / `catch`), and LLVM reaches it only through `catchswitch` /
+// `catchpad`, never a `landingpad`. The raise is the same on both shapes --
+// Emscripten's libunwind spells `_Unwind_RaiseException` as a wasm `throw` of
+// the carrier -- so everything this compiler builds stays landingpad-shaped
+// and `convertLandingPadsToWasmFunclets` (Passes/Runtime/Cleanup/EH.cpp)
+// rewrites the pads as the last step before codegen.
+inline bool padsAreFunclets(const llvm::Triple &triple) {
+  return triple.isWasm();
 }
 
-inline constexpr llvm::StringRef kNoUnwinderRaiseName = "LyEH_NoUnwinder";
+inline constexpr llvm::StringRef kWasmPersonalityName =
+    "__gxx_wasm_personality_v0";
 
 inline llvm::StringRef personalityNameFor(const llvm::Triple &triple) {
   if (usePythonPersonality(triple))

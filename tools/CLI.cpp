@@ -101,6 +101,7 @@
 #include "Common/LoweringPipeline.h"
 #include "Common/RuntimeLibrary.h"
 #include "Common/RuntimeSupport.h"
+#include "Common/UnwindABI.h"
 #include "embedded.h"
 #include "Emitter.h"
 #include "Parser.h"
@@ -220,6 +221,14 @@ LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
   return success();
 }
 
+// Last, because every check above reads the landingpad shape the native
+// targets are tested in: a target whose pads are funclets gets them here.
+void shapeExceptionPadsForTarget(llvm::Module &llvmModule) {
+  if (py::runtime_library::padsAreFunclets(
+          llvm::Triple(llvmModule.getTargetTriple())))
+    py::convertLandingPadsToWasmFunclets(llvmModule);
+}
+
 // Coro lowering, linked-contract collection, and the optimized thread-safety
 // check are identical on every codegen exit (JIT, object file, --emit-llvm);
 // splitting them per exit is how the safety checks drifted historically.
@@ -237,6 +246,7 @@ LogicalResult finalizeLoweredLLVMModule(llvm::Module &llvmModule,
       failed(verifyOptimizedLLVMThreadSafe(llvmModule, safetyProfile,
                                            llvm::errs())))
     return failure();
+  shapeExceptionPadsForTarget(llvmModule);
   return success();
 }
 
@@ -437,6 +447,9 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
 // `x.wasm`, and no extension a node script with a shebang.
 void appendEmscriptenLinkArgs(std::vector<std::string> &args) {
   args.emplace_back("-m64");
+  // Links the libunwind whose `_Unwind_RaiseException` is a wasm `throw`, and
+  // the personality the funclet pads name (UnwindABI.h).
+  args.emplace_back("-fwasm-exceptions");
   // ⛔ Node only, with the host's file system and file descriptors. The
   // default stdout is a TTY emulation that decodes each line as UTF-8 for
   // console.log and drops NUL bytes: `print(chr(0))` printed nothing, and a
@@ -1113,6 +1126,8 @@ int main(int argc, char **argv) {
                                            llvm::OptimizationLevel::O2,
                                            /*irDump=*/nullptr)))
         return 1;
+    } else {
+      shapeExceptionPadsForTarget(llvmModule);
     }
     return failed(writeLLVMIR(llvmModule, outputPath, llvm::errs())) ? 1 : 0;
   }
