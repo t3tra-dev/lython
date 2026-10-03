@@ -54,6 +54,8 @@ set(LYTHON_LIB_INTERNAL_TRIPLES
     "linux=x86_64-unknown-linux-gnu"
     "windows=x86_64-pc-windows-msvc"
     "emscripten=wasm64-unknown-emscripten"
+    "linux32=armv7-unknown-linux-gnueabihf"
+    "emscripten32=wasm32-unknown-emscripten"
 )
 set(LYTHON_LIB_INTERNAL_BYTECODE)
 foreach(lib_module IN LISTS LYTHON_LIB_INTERNAL_PY)

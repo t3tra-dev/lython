@@ -2362,8 +2362,8 @@ void buildDiscardCurrentException(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&framesIf.getThenRegion().front());
-    mlir::Value bytes =
-        mlir::arith::MulIOp::create(b.builder, b.loc, count, b.iconst(40));
+    mlir::Value bytes = mlir::arith::MulIOp::create(
+        b.builder, b.loc, count, typeSizeBytes(b, tracebackFrameType(b)));
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc,
                                  b.addrOf("g_traceback_stack"), frames, bytes,
                                  /*isVolatile=*/false);
@@ -2588,8 +2588,8 @@ void buildUnstashException(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&framesIf.getThenRegion().front());
-    mlir::Value bytes =
-        mlir::arith::MulIOp::create(b.builder, b.loc, count, b.iconst(40));
+    mlir::Value bytes = mlir::arith::MulIOp::create(
+        b.builder, b.loc, count, typeSizeBytes(b, tracebackFrameType(b)));
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc,
                                  b.addrOf("g_traceback_stack"), frames, bytes,
                                  /*isVolatile=*/false);
@@ -3701,6 +3701,33 @@ mlir::Value nodePartsField(SupportBuilder &b, mlir::Value node,
       mlir::LLVM::GEPNoWrapFlags::inbounds);
 }
 
+// ptr __ly_chain_node_part_field(ptr node, i64 section, i64 field): the
+// address of node->payload[section].field, for a manifest body, which cannot
+// name the node's struct. Every pair is a typed GEP selected by value, so a
+// call with constant arguments folds to one.
+void buildChainNodePartField(SupportBuilder &b) {
+  auto fn = b.beginFunction(
+      "__ly_chain_node_part_field",
+      b.builder.getFunctionType({b.ptr(), b.i64(), b.i64()}, {b.ptr()}));
+  mlir::Block *entry = fn.addEntryBlock();
+  b.builder.setInsertionPointToEnd(entry);
+  constexpr std::int64_t kFields = 5;
+  mlir::Value key = mlir::arith::AddIOp::create(
+      b.builder, b.loc,
+      mlir::arith::MulIOp::create(b.builder, b.loc, entry->getArgument(1),
+                                  b.iconst(kFields)),
+      entry->getArgument(2));
+  mlir::Value address = b.nullPtr();
+  for (std::int32_t section = 0; section < 3; ++section)
+    for (std::int32_t field = 0; field < kFields; ++field)
+      address = mlir::arith::SelectOp::create(
+          b.builder, b.loc,
+          b.cmpi(mlir::arith::CmpIPredicate::eq, key,
+                 b.iconst(section * kFields + field)),
+          nodePartsField(b, entry->getArgument(0), section, field), address);
+  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{address});
+}
+
 MemRef1DParts explodeMemRef1D(SupportBuilder &b, mlir::Value memref) {
   return explodeMemRef1D(b.builder, b.loc, memref);
 }
@@ -3906,6 +3933,7 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildAdoptStashedAsContext(support);
   buildReleaseCurrentException(support);
   buildRunPythonMain(support);
+  buildChainNodePartField(support);
 
   return module;
 }

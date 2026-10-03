@@ -124,11 +124,14 @@ verifyOptimizedLLVMThreadSafe(llvm::Module &llvmModule,
 // (LyMem_Alloc/Free/Realloc) instead of the system one. Answers how many call
 // sites it moved.
 //
-// ⛔ A NO-OP UNDER THE MEMORY SANITIZERS, which is CPython's PYTHONMALLOC=malloc
-// and for the same reason: a pooled block is reachable from the arena, so a
-// leaked object inside one is invisible to LeakSanitizer and the leak gate
-// would go blind. The sanitizer build measures the system allocator; the
-// shipping build uses the pool.
+// ⛔ A NO-OP UNDER THE MEMORY SANITIZERS, which is CPython's
+// PYTHONMALLOC=malloc and for the same reason: a pooled block is reachable from
+// the arena, so a leaked object inside one is invisible to LeakSanitizer and
+// the leak gate would go blind. The sanitizer build measures the system
+// allocator; the shipping build uses the pool. Puts the target's data layout on
+// an MLIR module about to be translated.
+void stampTargetDataLayout(mlir::ModuleOp module, const DriverOptions &options);
+
 unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
                                               bool bypass);
 

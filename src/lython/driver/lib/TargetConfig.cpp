@@ -11,6 +11,8 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/TargetSelect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/AArch64TargetParser.h"
@@ -300,6 +302,22 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   if (!targetMachine)
     diag << "Failed to create target machine for " << targetTripleName << "\n";
   return targetMachine;
+}
+
+void stampTargetDataLayout(mlir::ModuleOp module,
+                           const DriverOptions &options) {
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  std::unique_ptr<llvm::TargetMachine> machine = createCodeGenTargetMachine(
+      detectTensorLoweringTarget(options), options, nullptr, diag);
+  if (!machine)
+    return;
+  module->setAttr(mlir::LLVM::LLVMDialect::getDataLayoutAttrName(),
+                  mlir::StringAttr::get(
+                      module.getContext(),
+                      machine->createDataLayout().getStringRepresentation()));
 }
 
 static bool hostFeatureEnabled(llvm::StringRef feature) {

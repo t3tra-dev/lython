@@ -97,7 +97,7 @@ void buildHostArgvSupport(SupportBuilder &b) {
     mlir::Value vector = b.loadPtrVal(b.addrOf("g_argv_vector"));
     // char** elements have i64 width; gepI64 walks them.
     mlir::Value argument =
-        b.loadPtrVal(b.gepI64(vector, entry->getArgument(0)));
+        b.loadPtrVal(b.gepPtr(vector, entry->getArgument(0)));
     mlir::Value length =
         b.call("strlen", b.i64(), mlir::ValueRange{argument}).front();
     mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{length});
@@ -114,8 +114,7 @@ void buildHostArgvSupport(SupportBuilder &b) {
     mlir::Block *entry = fn.addEntryBlock();
     b.builder.setInsertionPointToEnd(entry);
     mlir::Value vector = b.loadPtrVal(b.addrOf("g_argv_vector"));
-    mlir::Value source =
-        b.loadPtrVal(b.gepI64(vector, entry->getArgument(0)));
+    mlir::Value source = b.loadPtrVal(b.gepPtr(vector, entry->getArgument(0)));
     mlir::Value dest = b.gepI8(entry->getArgument(2), entry->getArgument(3));
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc, dest, source,
                                  entry->getArgument(6), /*isVolatile=*/false);

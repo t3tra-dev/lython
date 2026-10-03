@@ -29,11 +29,13 @@ using py::lowering::explodeMemRef1D;
 using py::lowering::memRef1DDescriptorType;
 
 // The host boundary is otherwise target-independent (portable libc calls at
-// the fopen/fwrite altitude). Three things about the OS cluster cannot be:
-// the errno accessor's symbol name, the byte offsets inside `struct stat` and
-// `struct dirent` (which differ per libc AND per arch), and Darwin's
-// $INODE64 symbol variants on x86_64. They are gathered here so the OS
-// cluster reads offsets by name and every per-target fact has one home.
+// the fopen/fwrite altitude). What about the OS cluster cannot be is gathered
+// here -- the errno accessor's symbol name, the byte offsets inside the libc
+// structs it reads (which differ per libc AND per arch) -- so the OS cluster
+// reads offsets by name and every per-target fact has one home. Which SYMBOL
+// a function is spelled as on the target (`stat$INODE64`, `__stat64_time64`)
+// and its C widths are LibcPrototypes.cpp's, keyed by the same triple: the
+// offsets here are those of the struct that symbol fills.
 //
 // Field widths are byte counts; a negative width means the field is signed
 // (dev_t is int32_t on Darwin) and is sign-extended into the i64 result.
@@ -45,9 +47,6 @@ struct HostTargetLayout {
       py::exceptions::ErrnoNumbering::Linux;
 
   llvm::StringRef errnoAccessor = "__errno_location";
-  llvm::StringRef statSymbol = "stat";
-  llvm::StringRef lstatSymbol = "lstat";
-  llvm::StringRef readdirSymbol = "readdir";
 
   // Offset/width pairs for the os.stat_result fields, in the order
   // posix._stat_fields returns them.
@@ -68,9 +67,14 @@ struct HostTargetLayout {
   // CLOCK_MONOTONIC's value (CLOCK_REALTIME is 0 everywhere).
   int clockMonotonic = 1;
 
-  // What `malloc` guarantees: alignof(max_align_t). 16 on every native target
-  // this compiles for; Emscripten's dlmalloc static_asserts 8.
+  // What `malloc` guarantees: alignof(max_align_t). 16 on the LP64 targets;
+  // 8 on Emscripten's dlmalloc (static_asserted) and 32-bit glibc (measured).
   int mallocAlignment = 16;
+
+  // `struct timespec`'s tv_nsec, a C long after the 64-bit tv_sec, and
+  // `struct tm`'s tm_gmtoff, a C long after the nine ints.
+  int timespecNsec[2] = {8, -8};
+  int tmGmtoff[2] = {40, -8};
 };
 
 // Derives the layout above from the target triple. Unknown OS/arch pairs keep
@@ -79,6 +83,14 @@ struct HostTargetLayout {
 // non-POSIX target (`posix == false` makes every entry point fail loudly).
 inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   HostTargetLayout layout;
+  // ILP32, measured on armv7 glibc 2.36 (time64) and wasm32 Emscripten: the
+  // longs are 4 bytes, and malloc keeps to 8.
+  if (triple.isArch32Bit()) {
+    layout.mallocAlignment = 8;
+    layout.timespecNsec[1] = -4;
+    layout.tmGmtoff[0] = 36;
+    layout.tmGmtoff[1] = -4;
+  }
   if (triple.isOSWindows()) {
     layout.posix = false;
     layout.errnoAccessor = "_errno";
@@ -87,14 +99,6 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   if (triple.isOSDarwin()) {
     layout.errnoAccessor = "__error";
     layout.errnoNumbering = py::exceptions::ErrnoNumbering::BSD;
-    // Darwin's 64-bit-inode struct stat/dirent are the default ABI on arm64
-    // but a $INODE64-suffixed variant on x86_64, where the unsuffixed symbol
-    // is still the deprecated 32-bit-inode one.
-    if (triple.getArch() == llvm::Triple::x86_64) {
-      layout.statSymbol = "stat$INODE64";
-      layout.lstatSymbol = "lstat$INODE64";
-      layout.readdirSymbol = "readdir$INODE64";
-    }
     layout.statMode[0] = 4;
     layout.statMode[1] = 2;
     layout.statIno[0] = 8;
@@ -118,6 +122,23 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   // Emscripten's musl, measured on wasm64 (offsetof under `emcc -m64`): dev_t
   // and mode_t are 32-bit and lead the struct, st_ino sits LAST, and errno
   // follows WASI's numbering rather than Linux's.
+  if (triple.isOSEmscripten() && triple.isArch32Bit()) {
+    // wasm32: as wasm64 except that nlink_t is 32-bit, which moves everything
+    // after st_mode up.
+    layout.errnoNumbering = py::exceptions::ErrnoNumbering::WASI;
+    layout.statDev[1] = 4;
+    layout.statMode[0] = 4;
+    layout.statNlink[0] = 8;
+    layout.statNlink[1] = 4;
+    layout.statUid[0] = 12;
+    layout.statGid[0] = 16;
+    layout.statSize[0] = 24;
+    layout.statAtime[0] = 40;
+    layout.statMtime[0] = 56;
+    layout.statCtime[0] = 72;
+    layout.statIno[0] = 88;
+    return layout;
+  }
   if (triple.isOSEmscripten()) {
     layout.errnoNumbering = py::exceptions::ErrnoNumbering::WASI;
     layout.mallocAlignment = 8;
@@ -131,6 +152,22 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
     layout.statMtime[0] = 64;
     layout.statCtime[0] = 80;
     layout.statIno[0] = 96;
+    return layout;
+  }
+  // 32-bit glibc: the `struct stat` `__stat64_time64` fills (LibcPrototypes
+  // picks that symbol), measured on armv7: 64-bit dev_t and ino_t lead.
+  if (triple.isOSLinux() && triple.isArch32Bit()) {
+    layout.statDev[1] = 8;
+    layout.statIno[0] = 8;
+    layout.statMode[0] = 16;
+    layout.statNlink[0] = 20;
+    layout.statNlink[1] = 4;
+    layout.statUid[0] = 24;
+    layout.statGid[0] = 28;
+    layout.statSize[0] = 40;
+    layout.statAtime[0] = 64;
+    layout.statMtime[0] = 80;
+    layout.statCtime[0] = 96;
     return layout;
   }
   // Linux: the kernel struct stat is arch-specific. aarch64 packs st_mode and
@@ -226,9 +263,15 @@ struct SupportBuilder {
   void storeI8(mlir::Value value, mlir::Value pointer) {
     mlir::LLVM::StoreOp::create(builder, loc, value, pointer, /*alignment=*/1);
   }
+  // At the pointer's own ABI alignment: an element of a `char **` is 4-byte
+  // aligned on a 32-bit target.
   mlir::Value loadPtrVal(mlir::Value pointer) {
-    return mlir::LLVM::LoadOp::create(builder, loc, ptr(), pointer,
-                                      /*alignment=*/8);
+    return mlir::LLVM::LoadOp::create(builder, loc, ptr(), pointer);
+  }
+  // base[index] over an array of pointers, at the target's pointer stride.
+  mlir::Value gepPtr(mlir::Value base, mlir::Value index) {
+    return mlir::LLVM::GEPOp::create(builder, loc, ptr(), ptr(), base,
+                                     mlir::ValueRange{index});
   }
   mlir::Value loadI32(mlir::Value pointer) {
     return mlir::LLVM::LoadOp::create(builder, loc, i32(), pointer,
@@ -428,6 +471,9 @@ inline constexpr std::int64_t kStarClauseLimit = 32;
 // Written rather than a constant because both callers malloc exactly one of
 // these and a constant that drifts from the struct is a heap overrun.
 mlir::Value typeSizeBytes(SupportBuilder &b, mlir::Type type);
+// One traceback frame record: two name pointers and six i32 positions. 40
+// bytes on LP64, 32 on ILP32 -- which is why it is a type and not a count.
+mlir::Type tracebackFrameType(SupportBuilder &b);
 
 mlir::Type starFrameType(SupportBuilder &b);
 mlir::Value starFrameMember(SupportBuilder &b, mlir::Value frame,

@@ -84,13 +84,12 @@ void declareOsExternals(SupportBuilder &b) {
                                                         {b.i32()}));
   b.declareExternal("access",
                     b.builder.getFunctionType({b.ptr(), b.i32()}, {b.i32()}));
-  b.declareExternal(b.host.statSymbol,
+  b.declareExternal("stat",
                     b.builder.getFunctionType({b.ptr(), b.ptr()}, {b.i32()}));
-  b.declareExternal(b.host.lstatSymbol,
+  b.declareExternal("lstat",
                     b.builder.getFunctionType({b.ptr(), b.ptr()}, {b.i32()}));
   b.declareExternal("opendir", b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
-  b.declareExternal(b.host.readdirSymbol,
-                    b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
+  b.declareExternal("readdir", b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
   b.declareExternal("closedir",
                     b.builder.getFunctionType({b.ptr()}, {b.i32()}));
   b.declareExternal("getenv", b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
@@ -381,22 +380,37 @@ void buildPathCalls(SupportBuilder &b) {
 
 // One os.stat_result field: load `width` bytes at `offset` and widen to i64.
 // A negative width marks a signed field (Darwin's dev_t is int32_t).
-void storeStatField(SupportBuilder &b, mlir::Value statBuffer,
-                    const View &out, std::int64_t slot, const int (&field)[2]) {
+// A libc struct field at HostTargetLayout's (offset, width), widened to i64;
+// a negative width is a signed field.
+mlir::Value loadHostField(SupportBuilder &b, mlir::Value base,
+                          const int (&field)[2]) {
   unsigned bits = static_cast<unsigned>(std::abs(field[1])) * 8;
-  mlir::Value at = b.gepI8(statBuffer, b.iconst(field[0]));
+  mlir::Value at = b.gepI8(base, b.iconst(field[0]));
   mlir::Value raw = mlir::LLVM::LoadOp::create(
       b.builder, b.loc, b.builder.getIntegerType(bits), at,
       /*alignment=*/static_cast<unsigned>(std::abs(field[1])));
-  mlir::Value widened =
-      bits == 64 ? raw
-                 : (field[1] < 0 ? mlir::arith::ExtSIOp::create(
-                                       b.builder, b.loc, b.i64(), raw)
-                                       .getResult()
-                                 : mlir::arith::ExtUIOp::create(
-                                       b.builder, b.loc, b.i64(), raw)
-                                       .getResult());
-  mlir::LLVM::StoreOp::create(b.builder, b.loc, widened,
+  if (bits == 64)
+    return raw;
+  if (field[1] < 0)
+    return mlir::arith::ExtSIOp::create(b.builder, b.loc, b.i64(), raw);
+  return mlir::arith::ExtUIOp::create(b.builder, b.loc, b.i64(), raw);
+}
+
+void storeHostField(SupportBuilder &b, mlir::Value base, const int (&field)[2],
+                    mlir::Value value) {
+  unsigned bits = static_cast<unsigned>(std::abs(field[1])) * 8;
+  if (bits != 64)
+    value = mlir::arith::TruncIOp::create(
+        b.builder, b.loc, b.builder.getIntegerType(bits), value);
+  mlir::LLVM::StoreOp::create(
+      b.builder, b.loc, value, b.gepI8(base, b.iconst(field[0])),
+      /*alignment=*/static_cast<unsigned>(std::abs(field[1])));
+}
+
+void storeStatField(SupportBuilder &b, mlir::Value statBuffer, const View &out,
+                    std::int64_t slot, const int (&field)[2]) {
+  mlir::LLVM::StoreOp::create(b.builder, b.loc,
+                              loadHostField(b, statBuffer, field),
                               wordSlot(b, out, slot), /*alignment=*/8);
 }
 
@@ -427,10 +441,9 @@ void buildStatCalls(SupportBuilder &b) {
                                            mlir::LLVM::GEPArg(0)},
         mlir::LLVM::GEPNoWrapFlags::inbounds);
     mlir::Value pathCStr = cstr(b, viewAt(block, 0), block->getArgument(5));
-    mlir::Value status =
-        b.call(follow ? b.host.statSymbol : b.host.lstatSymbol, b.i32(),
-               mlir::ValueRange{pathCStr, buffer})
-            .front();
+    mlir::Value status = b.call(follow ? "stat" : "lstat", b.i32(),
+                                mlir::ValueRange{pathCStr, buffer})
+                             .front();
     b.call("free", mlir::TypeRange{}, mlir::ValueRange{pathCStr});
     mlir::cf::CondBranchOp::create(
         b.builder, b.loc,
@@ -494,7 +507,7 @@ void buildDirectoryCalls(SupportBuilder &b) {
     b.builder.setInsertionPointToEnd(block);
     mlir::Value dir = b.intToPtr(block->getArgument(0));
     mlir::Value record =
-        b.call(b.host.readdirSymbol, b.ptr(), mlir::ValueRange{dir}).front();
+        b.call("readdir", b.ptr(), mlir::ValueRange{dir}).front();
     mlir::cf::CondBranchOp::create(b.builder, b.loc,
                                    b.ptrEq(record, b.nullPtr()), done,
                                    mlir::ValueRange{}, ok, mlir::ValueRange{});
@@ -620,7 +633,7 @@ void buildEnvironmentCalls(SupportBuilder &b) {
                                mlir::ValueRange{b.iconst(0)});
     b.builder.setInsertionPointToEnd(head);
     mlir::Value index = head->getArgument(0);
-    mlir::Value slot = b.loadPtrVal(b.gepI64(vector, index));
+    mlir::Value slot = b.loadPtrVal(b.gepPtr(vector, index));
     mlir::cf::CondBranchOp::create(b.builder, b.loc, b.ptrEq(slot, b.nullPtr()),
                                    done, mlir::ValueRange{}, step,
                                    mlir::ValueRange{});
@@ -638,7 +651,7 @@ void buildEnvironmentCalls(SupportBuilder &b) {
     mlir::Block *block = fn.addEntryBlock();
     b.builder.setInsertionPointToEnd(block);
     mlir::Value vector = b.loadPtrVal(b.addrOf("environ"));
-    mlir::Value slot = b.loadPtrVal(b.gepI64(vector, block->getArgument(0)));
+    mlir::Value slot = b.loadPtrVal(b.gepPtr(vector, block->getArgument(0)));
     mlir::Value length =
         b.call("strlen", b.i64(), mlir::ValueRange{slot}).front();
     mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{length});
@@ -653,7 +666,7 @@ void buildEnvironmentCalls(SupportBuilder &b) {
     mlir::Block *block = fn.addEntryBlock();
     b.builder.setInsertionPointToEnd(block);
     mlir::Value vector = b.loadPtrVal(b.addrOf("environ"));
-    mlir::Value slot = b.loadPtrVal(b.gepI64(vector, block->getArgument(0)));
+    mlir::Value slot = b.loadPtrVal(b.gepPtr(vector, block->getArgument(0)));
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc,
                                  viewBase(b, viewAt(block, 1)), slot,
                                  block->getArgument(6), /*isVolatile=*/false);
@@ -679,7 +692,7 @@ mlir::Value scratch(SupportBuilder &b, unsigned bytes) {
 // `struct tm`'s first nine members are `int tm_sec` through `int tm_isdst` in
 // that order on every POSIX libc, so the nine 4-byte words at offsets 0..32
 // are the one struct layout here that needs no per-target table. tm_gmtoff
-// follows the ints (offset 40 after padding) on both Darwin and glibc.
+// follows the ints, where a C long falls (HostTargetLayout::tmGmtoff).
 void buildTimeCalls(SupportBuilder &b) {
   {
     // i64 LyHost_ClockNs(i64 monotonic): nanoseconds since the epoch, or
@@ -696,7 +709,7 @@ void buildTimeCalls(SupportBuilder &b) {
         b.iconst32(0));
     b.call("clock_gettime", b.i32(), mlir::ValueRange{clockId, spec});
     mlir::Value seconds = b.loadI64(spec);
-    mlir::Value nanos = b.loadI64(b.gepI64(spec, b.iconst(1)));
+    mlir::Value nanos = loadHostField(b, spec, b.host.timespecNsec);
     mlir::Value scaled = mlir::arith::MulIOp::create(
         b.builder, b.loc, seconds, b.iconst(1000000000));
     mlir::Value total =
@@ -721,8 +734,7 @@ void buildTimeCalls(SupportBuilder &b) {
         mlir::arith::RemSIOp::create(b.builder, b.loc, total, billion);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, seconds, spec,
                                 /*alignment=*/8);
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, nanos,
-                                b.gepI64(spec, b.iconst(1)), /*alignment=*/8);
+    storeHostField(b, spec, b.host.timespecNsec, nanos);
     mlir::Value status = b.call("nanosleep", b.i32(),
                                 mlir::ValueRange{spec, b.nullPtr()})
                              .front();
@@ -778,7 +790,7 @@ void buildTimeCalls(SupportBuilder &b) {
       mlir::LLVM::StoreOp::create(b.builder, b.loc, widened,
                                   wordSlot(b, out, index), /*alignment=*/8);
     }
-    mlir::Value gmtoff = b.loadI64(b.gepI8(tm, b.iconst(40)));
+    mlir::Value gmtoff = loadHostField(b, tm, b.host.tmGmtoff);
     mlir::LLVM::StoreOp::create(b.builder, b.loc, gmtoff, wordSlot(b, out, 9),
                                 /*alignment=*/8);
     mlir::func::ReturnOp::create(b.builder, b.loc,

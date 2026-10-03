@@ -8,10 +8,10 @@ Runs `lyc jit <case.py>` and verifies against sidecar files next to the case:
 --exit-only N skips sidecar lookup and only checks the exit code; ctest uses
 it to smoke-run examples/ without adding expectation files there.
 
---wasm-node NODE builds for wasm64-unknown-emscripten and runs the result
-under NODE (a node new enough for memory64, 24 or later); it is --aot with a
-different target and a different way to start the program, and checks the same
-sidecars.
+--wasm-node NODE builds for wasm64-unknown-emscripten (or --wasm-target's
+triple) and runs the result under NODE (24 or later for memory64); it is --aot
+with a different target and a different way to start the program, and checks
+the same sidecars.
 
 --aot builds an executable and runs it instead of JIT-ing, and --release passes
 `--release` to lyc. Both are checked against the SAME sidecars by the SAME code
@@ -96,7 +96,8 @@ def strip_perf(stderr: str) -> str:
 
 def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
             env: "dict[str, str]", release: bool,
-            wasm_node: "pathlib.Path | None" = None
+            wasm_node: "pathlib.Path | None" = None,
+            wasm_target: str = "wasm64-unknown-emscripten"
             ) -> "subprocess.CompletedProcess[str] | None":
     """Build an executable, then run it. Failure to BUILD is returned as the
     result, so the caller reports it as this case failing rather than as a
@@ -108,7 +109,7 @@ def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
         if release:
             command.append("--release")
         if wasm_node:
-            command += ["--target", "wasm64-unknown-emscripten"]
+            command += ["--target", wasm_target]
         command += ["-o", str(binary)]
         launch = [str(wasm_node), str(binary)] if wasm_node else [str(binary)]
         try:
@@ -129,7 +130,8 @@ def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
 
 def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
             perf: bool, aot: bool = False, release: bool = False,
-            wasm_node: "pathlib.Path | None" = None
+            wasm_node: "pathlib.Path | None" = None,
+            wasm_target: str = "wasm64-unknown-emscripten"
             ) -> "subprocess.CompletedProcess[str] | None":
     env = dict(os.environ)
     if perf:
@@ -137,7 +139,8 @@ def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
     else:
         env.pop("LYTHON_PERF", None)
     if aot or wasm_node:
-        return run_aot(lyc, case, timeout, env, release, wasm_node)
+        return run_aot(lyc, case, timeout, env, release, wasm_node,
+                       wasm_target)
     try:
         # stdin=DEVNULL, not inherited: a case calling input() blocks until its
         # stdin reaches EOF, and whether the ambient stdin ever does is a
@@ -189,14 +192,16 @@ def fail(message: str, stdout: str, stderr: str, where: str = "") -> int:
 
 def report_reached_layer(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
                          aot: bool = False, release: bool = False,
-                         wasm_node: "pathlib.Path | None" = None) -> None:
+                         wasm_node: "pathlib.Path | None" = None,
+                         wasm_target: str = "wasm64-unknown-emscripten"
+                         ) -> None:
     """Say which stage the compiler reached, so a red test localizes itself.
 
     The re-run repeats the MODE as well as the case: a JIT re-run of an --aot
     failure would report a stage the failing run never went through.
     """
     result = run_lyc(lyc, case, timeout, perf=True, aot=aot, release=release,
-                     wasm_node=wasm_node)
+                     wasm_node=wasm_node, wasm_target=wasm_target)
     if result is None:
         print("--- reached layer: unknown, the LYTHON_PERF re-run timed out",
               file=sys.stderr)
@@ -224,6 +229,7 @@ def main() -> int:
     parser.add_argument("--aot", action="store_true")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--wasm-node", type=pathlib.Path, default=None)
+    parser.add_argument("--wasm-target", default="wasm64-unknown-emscripten")
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
 
@@ -232,7 +238,8 @@ def main() -> int:
     # case and the report gives no hint that the budget was the cause.
     result = run_lyc(args.lyc, args.case, args.timeout,
                      perf=args.expect_layer is not None, aot=args.aot,
-                     release=args.release, wasm_node=args.wasm_node)
+                     release=args.release, wasm_node=args.wasm_node,
+                     wasm_target=args.wasm_target)
     if result is None:
         # Why no layer report here: the re-run would spend the same budget
         # over again and end the same way.
@@ -252,7 +259,8 @@ def main() -> int:
         if args.expect_layer is None:
             report_reached_layer(args.lyc, args.case, args.timeout,
                                  aot=args.aot, release=args.release,
-                                 wasm_node=args.wasm_node)
+                                 wasm_node=args.wasm_node,
+                                 wasm_target=args.wasm_target)
         else:
             print(f"--- reached layer: {reached}", file=sys.stderr)
         return code

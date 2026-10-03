@@ -34,6 +34,10 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
   llvm::SmallVector<std::string, 4> ctypesSymbols;
   py::collectCtypesForeignSymbols(module, ctypesSymbols);
   attachPythonDebugInfo(module);
+  // Translation folds constant struct GEPs into byte offsets with the
+  // module's layout, so the target's has to be there first (see the same
+  // step in RuntimeLibrary.cpp).
+  stampTargetDataLayout(module, options);
 
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
   auto llvmModule = mlir::translateModuleToLLVMIR(module, *llvmContext);

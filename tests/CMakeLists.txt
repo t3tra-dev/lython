@@ -178,7 +178,8 @@ set(LYTHON_UNIT_PATTERNS_abi
     # what a table lookup costs.
     "DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads"
     "DriverTest.EmscriptenNamesItselfTheWayCPythonDoes"
-    "DriverTest.Wasm64EmscriptenReadsMuslsLayout")
+    "DriverTest.Wasm64EmscriptenReadsMuslsLayout"
+    "DriverTest.ILP32TargetsReadTheirMeasuredLayouts")
 # `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
 # manifest sources and asks a dataflow question about them, which is the suite
 # checking the tree rather than the compiler.
@@ -224,10 +225,11 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation"
     "DriverTest.AWasm64ModuleCarriesItsPadsAsFunclets"
     "DriverTest.PutsIsDeclaredWithItsCPrototype"
-    "DriverTest.A32BitTargetIsRefusedByName"
+    "DriverTest.A32BitTargetCompilesOnlyWhereItsLibcWasMeasured"
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot"
     "DriverTest.ACtypesSymbolAddressIsDeclaredWithItsPrototype"
-    "DriverTest.AnUntypedCtypesSymbolAddressIsRefusedOnWasm")
+    "DriverTest.AnUntypedCtypesSymbolAddressIsRefusedOnWasm"
+    "DriverTest.AnArmv7RuntimeIsBuiltForArmv7")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

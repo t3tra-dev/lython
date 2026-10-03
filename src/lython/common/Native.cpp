@@ -30,6 +30,13 @@ bool isSupportedNativeTarget(llvm::StringRef tripleText) {
   return triple.isOSEmscripten() || triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
 }
 
+bool hasMeasured32BitLibc(const llvm::Triple &triple) {
+  if (triple.isOSEmscripten())
+    return triple.getArch() == llvm::Triple::wasm32;
+  return triple.isOSLinux() && triple.getArch() == llvm::Triple::arm &&
+         triple.isGNUEnvironment();
+}
+
 bool callsAreCheckedBySignature(llvm::StringRef tripleText) {
   return llvm::Triple(tripleText).isWasm();
 }
@@ -65,17 +72,15 @@ mlir::LogicalResult verifyTargetPlatformFacts(mlir::ModuleOp module) {
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
            << "' has unknown architecture";
-  // ⛔ No 32-bit target yet. The runtime declares libc with 64-bit size_t,
-  // which on armv7 puts `fwrite`'s second argument in r2:r3 where glibc reads
-  // r1 -- the first `print` passes a NULL FILE* -- and on wasm32 is an import
-  // wasm-ld replaces with a trap. It also steps through `char **` arrays eight
-  // bytes at a time. Refused here rather than compiled into a program that
-  // cannot run.
-  if (triple.isArch32Bit())
+  // ⛔ Only the 32-bit targets whose libc was MEASURED. Every C struct the
+  // runtime reads moves with the target's widths and its symbol choices, and
+  // a guessed layout reads the wrong words silently; the measurements are
+  // HostTargetLayout's (lowering/Common/SupportBuilder.h).
+  if (triple.isArch32Bit() && !hasMeasured32BitLibc(triple))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
-           << "' is not supported: 32-bit targets need libc declared with "
-              "their own size_t, which the runtime does not do yet";
+           << "' is not supported: no measured libc layout for this 32-bit "
+              "target (armv7 glibc and wasm32 Emscripten are)";
   if (!isSupportedNativeTarget(tripleAttr.getValue()))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()

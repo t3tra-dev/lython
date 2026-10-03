@@ -436,7 +436,14 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
     keepAliveSource(evidence, *source);
     if (isCtypesVoidPointer(*targetContract)) {
       evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
-      evidence.scalarValue = *address;
+      // The cell's Python value is an int, i64 like every other one; the
+      // address is pointer-wide, and a pointer is unsigned.
+      evidence.scalarValue =
+          address->getType().isInteger(64)
+              ? *address
+              : mlir::arith::ExtUIOp::create(builder, op.getLoc(),
+                                             builder.getI64Type(), *address)
+                    .getResult();
       evidence.scalarValid = evidence.addressValid;
     } else if (isCtypesPointerContract(*targetContract)) {
       evidence.kind = RuntimeCtypesEvidence::Kind::Pointer;

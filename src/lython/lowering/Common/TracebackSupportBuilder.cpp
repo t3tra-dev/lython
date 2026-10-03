@@ -22,6 +22,8 @@ namespace {
 // `~~~^^` markers). Faithful translation of the former native module.
 // ---------------------------------------------------------------------------
 
+} // namespace
+
 mlir::Type tracebackFrameType(SupportBuilder &b) {
   auto frame = mlir::LLVM::LLVMStructType::getIdentified(
       b.builder.getContext(), "TracebackFrame");
@@ -31,6 +33,8 @@ mlir::Type tracebackFrameType(SupportBuilder &b) {
                         /*isPacked=*/false);
   return frame;
 }
+
+namespace {
 
 mlir::Type tracebackStackType(SupportBuilder &b) {
   return mlir::LLVM::LLVMArrayType::get(tracebackFrameType(b), 1024);
@@ -531,8 +535,6 @@ void buildTracebackClear(SupportBuilder &b) {
 // them -- the direction the memory model refuses.
 // ---------------------------------------------------------------------------
 
-constexpr std::int64_t kFrameBytes = 40;
-
 // void release_chain_node(ptr node): drop one reference; at zero, release the
 // chained nodes, the traceback snapshot, and the exception payload.
 // ---------------------------------------------------------------------------
@@ -594,10 +596,11 @@ void buildViewFrameAt(SupportBuilder &b) {
 
   b.builder.setInsertionPointToEnd(viewed);
   mlir::Value frames = b.loadPtrVal(nodeMember(b, node, kNodeFrames));
-  mlir::Value offset = mlir::arith::MulIOp::create(
-      b.builder, b.loc, entry->getArgument(0), b.iconst(kFrameBytes));
   mlir::func::ReturnOp::create(
-      b.builder, b.loc, mlir::ValueRange{b.gepI8(frames, offset)});
+      b.builder, b.loc,
+      mlir::ValueRange{mlir::LLVM::GEPOp::create(
+          b.builder, b.loc, b.ptr(), tracebackFrameType(b), frames,
+          mlir::ValueRange{entry->getArgument(0)})});
 
   b.builder.setInsertionPointToEnd(live);
   mlir::func::ReturnOp::create(
@@ -1341,8 +1344,8 @@ void buildStashCurrentAsContext(SupportBuilder &b) {
   {
     mlir::OpBuilder::InsertionGuard guard(b.builder);
     b.builder.setInsertionPointToStart(&framesIf.getThenRegion().front());
-    mlir::Value bytes = mlir::arith::MulIOp::create(b.builder, b.loc, size,
-                                                    b.iconst(kFrameBytes));
+    mlir::Value bytes = mlir::arith::MulIOp::create(
+        b.builder, b.loc, size, typeSizeBytes(b, tracebackFrameType(b)));
     mlir::Value buffer =
         b.call("malloc", b.ptr(), mlir::ValueRange{bytes}).front();
     // Frame-name ownership moves wholesale from the global stack; a failed
@@ -3333,7 +3336,8 @@ void buildStarApplyMatch(SupportBuilder &b) {
     mlir::Value target =
         b.call("frame_at", b.ptr(), mlir::ValueRange{position}).front();
     mlir::LLVM::MemcpyOp::create(b.builder, b.loc, target, source,
-                                 b.iconst(kFrameBytes), /*isVolatile=*/false);
+                                 typeSizeBytes(b, tracebackFrameType(b)),
+                                 /*isVolatile=*/false);
     mlir::Type frameType = tracebackFrameType(b);
     for (std::int64_t nameField = 0; nameField < 2; ++nameField) {
       mlir::Value slot = b.frameField(frameType, target, nameField);

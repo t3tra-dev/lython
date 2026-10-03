@@ -4,6 +4,7 @@
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <cstdint>
 #include <optional>
@@ -59,6 +60,7 @@ std::uint64_t expectedPointerWidth(llvm::StringRef triple);
 std::uint64_t expectedCLongWidth(llvm::StringRef triple,
                                  std::uint64_t pointerWidth);
 bool isSupportedNativeTarget(llvm::StringRef triple);
+bool hasMeasured32BitLibc(const llvm::Triple &triple);
 // Whether the target links a call by its signature, so that a function's
 // declaration has to be its real C prototype even where only its address is
 // taken. WebAssembly checks every import and every table entry; native
