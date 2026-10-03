@@ -37,7 +37,7 @@ uv run pyright
 ctest スイート (`LYTHON_BUILD_TESTS`, デフォルト ON)。CI (`.github/workflows/ci.yml`) も `ctest` を実行する:
 
 ```bash
-ctest --test-dir build -j8 --output-on-failure   # 全件 (447 件、99 s / RelWithDebInfo)
+ctest --test-dir build -j8 --output-on-failure   # 全件 (767 件、91 s / RelWithDebInfo, -j14)
 ctest --test-dir build -L fast                   # lowering を通らない層 (100 件、1.0 s)
 ctest --test-dir build -L emit                   # emitter を触ったとき
 ctest --test-dir build -LE bench                 # 実行律速のベンチを除く
@@ -55,6 +55,7 @@ ctest --test-dir build -N -L fast                # 何が選ばれるか (実行
 
 - **ユニットテスト** (`tests/unit/`, GoogleTest) — C++ API を直接叩く。ドライバ API (`src/lython/driver/include/Driver.h`) は lyc・テスト・fuzzer が共有するコンパイル入口。
 - **golden テスト** (`tests/golden/`) — `cases/*.py` は stdout 完全一致、`errors/*.py` は exit code + stderr 正規表現。実行前に止まるケースは `layers.txt` に段を宣言する。
+- **バッチ golden** (`golden.batch.NNN`, `-L golden-batch`) — 1 件 0.7 s の大半はコンパイルと JIT build の固定費なので、`batch_cases.py` がまとめられる `cases/` (約 575 件) を 6 件ずつ 1 プログラムに連結して払う。各ケースは module レベルのまま、module で束縛する名前だけ `_c<i>_` にリネームする (ソースのトークン位置で書き換え、綴りは保つ)。まとめられないケース (名前が出力に出る / 文脈を観測する / 隣のモジュールを import する / stderr や exit code を見る) は従来どおり単独で登録される。理由は `batch_cases.py --why tests/golden/cases/*.py`。バッチ内で落ちたケースは単独で再実行され、**単独で通るのにバッチで答えが変わったら BATCH-DISAGREE で赤**(ケース間の干渉は欠陥として扱う。`round(-15, -1)` が共有の小さい int を書き換えた欠陥はこれで見つかった)。意図的に文脈依存なケースは理由付きで `batch-exclusions.txt` に書く。1 件を名前で再実行するには FAILED 行のコマンドか `-DLYTHON_GOLDEN_BATCH=OFF`。6 件より大きくしないのは、連結した module 本体が 1 関数になり ownership 系フェーズが超線形に伸びるため (25 件で 1 件あたり 0.99 s)。
 - **examples smoke** — golden とバイト同一でないものだけ exit code 検証。同一な 20 件は golden がより強い assertion を持つので登録しない (`golden.example_twins` が同一性を守る)。
 
 #### 新しいテストを追加するときの判断
