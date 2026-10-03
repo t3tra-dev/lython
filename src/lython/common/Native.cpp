@@ -27,14 +27,7 @@ std::uint64_t expectedCLongWidth(llvm::StringRef tripleText,
 
 bool isSupportedNativeTarget(llvm::StringRef tripleText) {
   llvm::Triple triple(tripleText);
-  // ⛔ wasm64 only. The runtime spells size_t, ssize_t and off_t as i64 in
-  // every libc declaration it emits, and wasm32 checks call signatures at
-  // link time: wasm-ld turns each mismatched import into an `unreachable`
-  // stub, so a wasm32 build links and then traps inside `malloc`. wasm64's
-  // libc is LP64, which is what those declarations already say.
-  if (triple.isOSEmscripten())
-    return triple.getArch() == llvm::Triple::wasm64;
-  return triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
+  return triple.isOSEmscripten() || triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
 }
 
 std::optional<TargetPlatformFacts>
@@ -68,11 +61,17 @@ mlir::LogicalResult verifyTargetPlatformFacts(mlir::ModuleOp module) {
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
            << "' has unknown architecture";
-  if (triple.isOSEmscripten() && triple.getArch() == llvm::Triple::wasm32)
+  // ⛔ No 32-bit target yet. The runtime declares libc with 64-bit size_t,
+  // which on armv7 puts `fwrite`'s second argument in r2:r3 where glibc reads
+  // r1 -- the first `print` passes a NULL FILE* -- and on wasm32 is an import
+  // wasm-ld replaces with a trap. It also steps through `char **` arrays eight
+  // bytes at a time. Refused here rather than compiled into a program that
+  // cannot run.
+  if (triple.isArch32Bit())
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
-           << "' is not supported: the runtime declares libc with 64-bit "
-              "size_t; use wasm64-unknown-emscripten";
+           << "' is not supported: 32-bit targets need libc declared with "
+              "their own size_t, which the runtime does not do yet";
   if (!isSupportedNativeTarget(tripleAttr.getValue()))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()

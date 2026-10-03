@@ -224,7 +224,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation"
     "DriverTest.AWasm64ModuleCarriesItsPadsAsFunclets"
     "DriverTest.PutsIsDeclaredWithItsCPrototype"
-    "DriverTest.AWasm32TargetIsRefusedByName"
+    "DriverTest.A32BitTargetIsRefusedByName"
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")

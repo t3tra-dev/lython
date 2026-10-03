@@ -1935,16 +1935,19 @@ TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
   EXPECT_TRUE(puts->getReturnType()->isIntegerTy(32));
 }
 
-// What: wasm32 Emscripten is refused by name before lowering, pointing at
-// wasm64, rather than compiled against a libc it would misdeclare.
-TEST(DriverTest, AWasm32TargetIsRefusedByName) {
-  lython::driver::DriverOptions options;
-  options.targetTriple = "wasm32-unknown-emscripten";
-  CompileResult result = compileSource("print(1)\n", options);
-  EXPECT_FALSE(result.succeeded);
-  EXPECT_NE(result.diagnostics.find("use wasm64-unknown-emscripten"),
-            std::string::npos)
-      << result.diagnostics;
+// What: a 32-bit target -- armv7 Linux, wasm32 Emscripten -- is refused before
+// lowering, rather than compiled against libc declared with a 64-bit size_t.
+TEST(DriverTest, A32BitTargetIsRefusedByName) {
+  for (const char *triple :
+       {"armv7-unknown-linux-gnueabihf", "wasm32-unknown-emscripten"}) {
+    lython::driver::DriverOptions options;
+    options.targetTriple = triple;
+    CompileResult result = compileSource("print(1)\n", options);
+    EXPECT_FALSE(result.succeeded) << triple;
+    EXPECT_NE(result.diagnostics.find("32-bit targets need libc declared"),
+              std::string::npos)
+        << triple << "\n" << result.diagnostics;
+  }
 }
 
 // What: where the target's malloc promises less than 16-byte alignment
