@@ -2276,8 +2276,24 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       auto exceptionEdges =
           generatorExceptionEdges(clone.getBody(), tryHandlerIds);
       auto liveIns = computeLiveIns(clone.getBody(), exceptionEdges);
-      llvm::SetVector<mlir::Value> lives =
-          liveAfterYield(yield, liveIns, exceptionEdges, &entryBlock);
+      llvm::SetVector<mlir::Value> lives;
+      // The originals each version stands for: a later block that still reads
+      // the original finds the continuation's argument under it as well.
+      llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 2>> originals;
+      // ⭐ EACH LIVE VALUE AS THIS BLOCK HAS IT. A yield in a continuation sees
+      // the values the earlier split made its arguments, but a block further
+      // down -- a `finally` after the `with` -- still reads the original, so
+      // liveness answers the original and the suspend named a value from
+      // outside the continuation ("generator resume continuation live closure
+      // violated").
+      for (mlir::Value live :
+           liveAfterYield(yield, liveIns, exceptionEdges, &entryBlock)) {
+        mlir::BlockArgument version = blockValueArguments.lookup({block, live});
+        mlir::Value kept = version ? mlir::Value(version) : live;
+        lives.insert(kept);
+        if (version)
+          originals[kept].push_back(live);
+      }
       if (lives.size() > frameWidth)
         return yield.emitError()
                << "generator resume live set exceeds the computed frame";
@@ -2300,6 +2316,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
       for (mlir::Value live : liveValues) {
         mlir::BlockArgument arg = cont->addArgument(live.getType(), loc);
         blockValueArguments[{cont, live}] = arg;
+        for (mlir::Value original : originals.lookup(live))
+          blockValueArguments[{cont, original}] = arg;
         live.replaceUsesWithIf(arg, [&](mlir::OpOperand &use) {
           return use.getOwner()->getBlock() == cont;
         });
@@ -2416,6 +2434,40 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
     // block only reads its own arguments, its own ops, and entry arguments.
     // The liveness-derived continuation arguments are closed under this
     // rewrite, so continuations never grow here.
+    // A block inside a `try` can unwind into the handler, so what the handler
+    // reads has to be in the block too (see the trampolines below).
+    llvm::DenseMap<std::int64_t, mlir::Block *> catchBlocks;
+    // The catch block of an id is the one whose leading calls include the
+    // catch marker (its id constant comes first).
+    auto leadingCatchMarker =
+        [](mlir::Block &candidate) -> mlir::func::CallOp {
+      for (mlir::Operation &op : candidate) {
+        if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
+          return call.getCallee() == "LyEH_TryCatchMarker" &&
+                         call.getNumOperands() == 1
+                     ? call
+                     : mlir::func::CallOp();
+        if (!mlir::isa<mlir::arith::ConstantOp>(op))
+          return {};
+      }
+      return {};
+    };
+    for (mlir::Block &candidate : clone.getBody()) {
+      mlir::func::CallOp marker = leadingCatchMarker(candidate);
+      mlir::IntegerAttr id;
+      if (marker &&
+          mlir::matchPattern(marker.getOperand(0), mlir::m_Constant(&id)))
+        catchBlocks[id.getInt()] = &candidate;
+    }
+    auto handlerNeeds = [&](mlir::Block *handler,
+                            llvm::SmallVectorImpl<mlir::Value> &needed) {
+      for (mlir::BlockArgument argument : handler->getArguments())
+        for (auto &[key, threaded] : blockValueArguments)
+          if (key.first == handler && threaded == argument) {
+            needed.push_back(key.second);
+            break;
+          }
+    };
     bool normalizing = true;
     while (normalizing) {
       normalizing = false;
@@ -2434,6 +2486,20 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
               continue;
             }
             external.insert(operand);
+          }
+        if (auto handlerId = tryHandlerIds.find(block);
+            handlerId != tryHandlerIds.end())
+          if (mlir::Block *handler = catchBlocks.lookup(handlerId->second);
+              handler && handler != block) {
+            llvm::SmallVector<mlir::Value, 4> needed;
+            handlerNeeds(handler, needed);
+            for (mlir::Value value : needed) {
+              if (value.getParentBlock() == block ||
+                  value.getParentBlock() == &entryBlock ||
+                  blockValueArguments.count({block, value}))
+                continue;
+              external.insert(value);
+            }
           }
         // ⭐ A value with NO runtime representation is rematerialized, never
         // threaded. `py.type.object` is the whole population: it is
@@ -2503,6 +2569,101 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
             }
           }
         }
+      }
+    }
+
+    // ⭐ A HANDLER ENTRY THAT THE NORMALIZATION GAVE ARGUMENTS IS ENTERED
+    // THROUGH A TRAMPOLINE PER BLOCK. A value a handler reads from before the
+    // `try` is live across a yield inside it, so after the split it reaches
+    // the handler as a block argument -- and a handler is entered only by
+    // unwinding, which has no operands to pass: the final EH lowering drops
+    // the anchor's edge and lands from each call's landing pad, and the unwind
+    // cleanup refused the shape outright ("unwind cleanup cannot target a
+    // handler entry with block arguments"). Each block of the `try` gets a
+    // handler id of its own whose catch block is an argument-free trampoline
+    // passing THAT block's version of each value on to the handler; only that
+    // block can unwind into it, so its values are in scope there.
+    //
+    // ⛔ Why NOT spill the values to stack slots the handler reloads: a resume
+    // enters a continuation in a NEW invocation of the clone, and a slot
+    // written at the `try`'s entry belongs to the invocation that suspended.
+    {
+      llvm::SmallVector<std::pair<mlir::Block *, std::int64_t>, 8> guarded;
+      for (mlir::Block &candidate : clone.getBody()) {
+        auto handlerId = tryHandlerIds.find(&candidate);
+        if (handlerId == tryHandlerIds.end())
+          continue;
+        mlir::Block *handler = catchBlocks.lookup(handlerId->second);
+        if (handler && handler != &candidate && handler->getNumArguments() != 0)
+          guarded.push_back({&candidate, handlerId->second});
+      }
+      for (auto [block, handlerId] : guarded) {
+        mlir::Block *handler = catchBlocks.lookup(handlerId);
+        // The original value behind each of the handler's arguments, and this
+        // block's version of it.
+        llvm::SmallVector<mlir::Value, 8> versions(handler->getNumArguments());
+        for (auto &[key, argument] : blockValueArguments) {
+          if (key.first != handler)
+            continue;
+          mlir::Value original = key.second;
+          mlir::Value version = blockValueArguments.lookup({block, original});
+          if (!version && (original.getParentBlock() == block ||
+                           original.getParentBlock() == &entryBlock))
+            version = original;
+          if (!version)
+            return clone.emitError()
+                   << "a handler reads a value the block that may raise into "
+                      "it does not carry";
+          versions[argument.getArgNumber()] = version;
+        }
+        if (llvm::is_contained(versions, mlir::Value()))
+          return clone.emitError()
+                 << "a handler argument has no value it was threaded from";
+        std::int64_t ownId = nextTryHandlerId++;
+        mlir::Block *trampoline = new mlir::Block();
+        clone.getBody().push_back(trampoline);
+        mlir::OpBuilder b = mlir::OpBuilder::atBlockEnd(trampoline);
+        mlir::func::CallOp::create(
+            b, loc, getOrCreateTryCatchMarker(),
+            mlir::ValueRange{mlir::arith::ConstantIntOp::create(b, loc, ownId, 64)
+                                 .getResult()});
+        mlir::cf::BranchOp::create(b, loc, handler, versions);
+        // The anchor goes after the block's own catch marker, when it is a
+        // catch block of an inner `try` itself.
+        mlir::Block::iterator splitAt = block->begin();
+        if (mlir::func::CallOp marker = leadingCatchMarker(*block))
+          splitAt = std::next(mlir::Block::iterator(marker.getOperation()));
+        mlir::Block *rest = block->splitBlock(splitAt);
+        tryHandlerIds[rest] = ownId;
+        // Markers already placed in the block -- the continuation's guard
+        // rethrows an injected exception -- point at the trampoline too.
+        rest->walk([&](mlir::func::CallOp call) {
+          mlir::IntegerAttr id;
+          if (call.getCallee() == "LyEH_TryCallSiteMarker" &&
+              call.getNumOperands() == 1 &&
+              mlir::matchPattern(call.getOperand(0), mlir::m_Constant(&id)) &&
+              id.getInt() == handlerId) {
+            mlir::OpBuilder at(call);
+            call->setOperand(
+                0, mlir::arith::ConstantIntOp::create(at, loc, ownId, 64)
+                       .getResult());
+          }
+        });
+        tryHandlerIds.erase(block);
+        if (auto inherited = tryHandlerIds.find(handler);
+            inherited != tryHandlerIds.end())
+          tryHandlerIds[trampoline] = inherited->second;
+        b.setInsertionPointToEnd(block);
+        auto anchor = mlir::func::CallOp::create(
+            b, loc, getOrCreateTryCatchAnchor(),
+            mlir::ValueRange{
+                mlir::arith::ConstantIntOp::create(b, loc, ownId, 64)
+                    .getResult()});
+        mlir::cf::CondBranchOp::create(b, loc, anchor.getResult(0), trampoline,
+                                       mlir::ValueRange{}, rest,
+                                       mlir::ValueRange{});
+        if (continuationBlocks.contains(block))
+          continuationBlocks.insert(rest);
       }
     }
 

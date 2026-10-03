@@ -609,6 +609,12 @@ bool rewriteTryCatchAnchor(llvm::CallInst &call) {
     if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(*call.user_begin())) {
       if (branch->isConditional() && branch->getCondition() == &call) {
         llvm::BasicBlock *tryDest = branch->getSuccessor(1);
+        // ⭐ The catch block may take values on this edge -- a generator's
+        // handler entered through its trampolines does -- and its phis must
+        // forget an edge that no longer exists.
+        llvm::BasicBlock *catchDest = branch->getSuccessor(0);
+        if (catchDest != tryDest)
+          catchDest->removePredecessor(branch->getParent());
         llvm::IRBuilder<> builder(branch);
         builder.CreateBr(tryDest);
         branch->eraseFromParent();

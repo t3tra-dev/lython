@@ -1732,11 +1732,10 @@ TEST(DriverTest, ABoolLiveAcrossAYieldNamesTheRealLimit) {
 }
 
 // A `with ... as X` target inside a generator is typed before the body walk
-// reaches the yields, the same way a loop target is. Without it the generator
-// was refused for its own correct annotation; the limit it really meets is the
-// unwind cleanup one (tests/probe/wb_a_try_inside_a_loop_inside_a_generator.py).
+// reaches the yields, the same way a loop target is, and the generator
+// compiles: its exit handler reads the manager from before the `with`.
 TEST(DriverTest, AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation) {
-  CompileResult refused = compileSource(
+  CompileResult accepted = compileSource(
       "from typing import Iterator\n"
       "class Ctx:\n"
       "    def __enter__(self) -> int:\n"
@@ -1747,13 +1746,7 @@ TEST(DriverTest, AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation) {
       "    with Ctx() as base:\n"
       "        yield base\n"
       "print(list(go()))\n");
-  EXPECT_FALSE(refused.succeeded);
-  EXPECT_EQ(refused.diagnostics.find("but yields"), std::string::npos)
-      << refused.diagnostics;
-  EXPECT_NE(refused.diagnostics.find("unwind cleanup cannot target a handler "
-                                     "entry with block arguments"),
-            std::string::npos)
-      << refused.diagnostics;
+  EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
 }
 
 // What: the names Emscripten answers to. CPython built for Emscripten reports
