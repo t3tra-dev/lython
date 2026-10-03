@@ -90,8 +90,8 @@ inline bool isIntegerLiteralSpelling(llvm::StringRef spelling) {
 // classes.
 inline std::string manifestClassNameForContract(llvm::StringRef name) {
   for (llvm::StringRef prefix :
-       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars.", "ctypes.", "_ctypes.", "_typeshed."}) {
+       {"builtins.", "typing.", "types.", "contextlib.", "contextvars.",
+        "ctypes.", "_ctypes.", "_typeshed."}) {
     if (name.consume_front(prefix))
       return name.str();
   }

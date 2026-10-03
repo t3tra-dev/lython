@@ -151,8 +151,6 @@ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createPostCleanupUnwindInsertionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createPyOptimizationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createAsyncThunkLoweringPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createLinalgLoweringPass(TensorLoweringTarget target = {});
 
 } // namespace py

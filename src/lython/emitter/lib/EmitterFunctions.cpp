@@ -308,6 +308,8 @@ void ModuleEmitter::emitInDefiningModuleScope(
                                                      source.packageName);
   llvm::SaveAndRestore<const parser::Node *> savedSourceModuleNode(
       activeSourceModuleNode, source.moduleNode);
+  llvm::SaveAndRestore<const EmitOptions::SourceModule *> savedSourceModule(
+      activeSourceModule, &source);
   auto savedLoops = std::move(loopControlContexts);
   loopControlContexts.clear();
   auto savedInlineReturns = std::move(inlineReturnContexts);
@@ -329,9 +331,18 @@ void ModuleEmitter::emitInDefiningModuleScope(
     ImporterModuleScope importerScope(*this);
     TypeSystem::ScopeIsolation isolation = types.isolateScopes();
     auto moduleScope = types.pushScope();
+    ++definingScopeSetupDepth;
     bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
     bindSourceModuleLocals(source.moduleName, *source.moduleNode,
                            source.isStub);
+    --definingScopeSetupDepth;
+    // Specializations the binding asked for -- a coroutine's signature walks
+    // its body, and a generic class it names is specialized there -- were
+    // held until the module's names were all bound (see
+    // `ensureGenericClassSpecialization`); they go out before the body that
+    // may use them.
+    if (definingScopeSetupDepth == 0 && genericClassEmissionReady)
+      drainGenericClassSpecializations();
     body();
   }
   for (std::size_t index = diagnosticStart; index < diagnostics.size();
@@ -570,8 +581,8 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
                   mlir::TypeAttr::get(sig.kwargType));
   func->setAttr("callable_default_values",
                 emitCallableDefaultValues(callable, sig, symbolName));
-  if (callable.kind == "AsyncFunctionDef")
-    func->setAttr("ly.async.body_result", mlir::TypeAttr::get(sig.resultType));
+  if (sig.isCoroutineFunction)
+    func->setAttr("ly.coroutine", builder.getUnitAttr());
   if (sig.isGeneratorFunction)
     func->setAttr("ly.generator.body_result",
                   mlir::TypeAttr::get(sig.generatorReturnType));
@@ -593,6 +604,8 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       values, currentReturnType, currentFunctionPrefix,
       currentGeneratorSendType, currentGeneratorYieldType, narrowedFromTypes,
       narrowedMemberTypes, types);
+  llvm::SaveAndRestore<bool> savedCoroutine(currentFunctionIsCoroutine,
+                                            sig.isCoroutineFunction);
   // The forward look for a later read stops at this callable's own suites: a
   // name inside a nested function is a different binding, and the enclosing
   // function's remainder says nothing about it.

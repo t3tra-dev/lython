@@ -423,10 +423,6 @@ mlir::LogicalResult ExceptCurrentValueOp::verify() {
   return mlir::success();
 }
 
-mlir::LogicalResult AwaitOp::verify() {
-  return verifyResolvedProtocolCall(getOperation(), "await_contract");
-}
-
 mlir::LogicalResult YieldFromOp::verify() {
   if (mlir::failed(requireProtocolAttr(getOperation(), "yield_from_contract")))
     return mlir::failure();
@@ -484,12 +480,6 @@ mlir::LogicalResult EnterOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }
 mlir::LogicalResult ExitOp::verify() {
-  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
-}
-mlir::LogicalResult AEnterOp::verify() {
-  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
-}
-mlir::LogicalResult AExitOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }
 mlir::LogicalResult RoundOp::verify() {
@@ -729,14 +719,6 @@ mlir::LogicalResult IterOp::verify() {
 mlir::LogicalResult NextOp::verify() {
   if (mlir::failed(requireI1(getOperation(), getValid().getType(), "valid")))
     return mlir::failure();
-  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
-}
-
-mlir::LogicalResult AIterOp::verify() {
-  return verifyResolvedProtocolCall(getOperation(), "callee_contract");
-}
-
-mlir::LogicalResult ANextOp::verify() {
   return verifyResolvedProtocolCall(getOperation(), "callee_contract");
 }
 

@@ -1,8 +1,5 @@
 from typing import (
-    Any,
-    Awaitable,
     Callable,
-    Generator,
     Literal,
     TypeVar,
     overload,
@@ -17,7 +14,6 @@ __all__ = [
     "from_prim",
     "alloc",
     "dealloc",
-    "ReadyIntAwaitable",
 ]
 
 T = TypeVar("T")
@@ -35,10 +31,6 @@ PrimFunc = TypeVar(
 )
 
 type _NestedNumber = int | float | list[_NestedNumber]
-
-class ReadyIntAwaitable(Awaitable[int]):
-    def __init__(self, value: int) -> None: ...
-    def __await__(self) -> Generator[Any, Any, int]: ...
 
 def native(
     *,

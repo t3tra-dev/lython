@@ -437,8 +437,6 @@ std::optional<llvm::StringRef> methodNameFor(mlir::Operation *op) {
       .Case("py.init", llvm::StringRef("__init__"))
       .Case("py.enter", llvm::StringRef("__enter__"))
       .Case("py.exit", llvm::StringRef("__exit__"))
-      .Case("py.aenter", llvm::StringRef("__aenter__"))
-      .Case("py.aexit", llvm::StringRef("__aexit__"))
       .Case("py.round", llvm::StringRef("__round__"))
       .Case("py.getitem", llvm::StringRef("__getitem__"))
       .Case("py.setitem", llvm::StringRef("__setitem__"))
@@ -449,16 +447,13 @@ std::optional<llvm::StringRef> methodNameFor(mlir::Operation *op) {
       .Case("py.str", llvm::StringRef("__str__"))
       .Case("py.iter", llvm::StringRef("__iter__"))
       .Case("py.next", llvm::StringRef("__next__"))
-      .Case("py.aiter", llvm::StringRef("__aiter__"))
-      .Case("py.anext", llvm::StringRef("__anext__"))
       .Case("py.len", llvm::StringRef("__len__"))
       .Default(std::nullopt);
 }
 
 bool shouldValidateManifestCandidate(mlir::Operation *op) {
   llvm::StringRef name = opName(op);
-  if (name == "py.call" || name == "py.invoke" || name == "py.new" ||
-      name == "py.await")
+  if (name == "py.call" || name == "py.invoke" || name == "py.new")
     return false;
   return methodNameFor(op).has_value();
 }
@@ -478,7 +473,7 @@ explicitCallableOperands(mlir::Operation *op) {
 
   if (name == "py.call")
     return operands;
-  if (name == "py.new" || name == "py.invoke" || name == "py.await")
+  if (name == "py.new" || name == "py.invoke")
     return operands;
   if (name == "py.init") {
     if (op->getNumOperands() > 0)
@@ -499,7 +494,7 @@ explicitCallableOperands(mlir::Operation *op) {
 llvm::SmallVector<mlir::Type, 2> callableResultSurface(mlir::Operation *op) {
   llvm::SmallVector<mlir::Type, 2> results;
   llvm::StringRef name = opName(op);
-  if (name == "py.invoke" || name == "py.await")
+  if (name == "py.invoke")
     return results;
   if (name == "py.next") {
     if (op->getNumResults() > 0)
@@ -545,7 +540,7 @@ mlir::LogicalResult verifyCallableOperands(mlir::Operation *op,
 mlir::LogicalResult verifyCallableResults(mlir::Operation *op,
                                           CallableType callable) {
   llvm::StringRef name = opName(op);
-  if (name == "py.invoke" || name == "py.await")
+  if (name == "py.invoke")
     return mlir::success();
 
   if (op->hasAttr("ly.structural_mutation")) {
@@ -703,7 +698,15 @@ mlir::LogicalResult verifyYieldFromEvidenceOp(mlir::Operation *op) {
   result.check(verifyStableEvidenceType(op, sourceType, "source type"));
   result.check(
       verifyStableEvidenceType(op, op->getResult(0).getType(), "result type"));
-  if (!evidenceAssignable(sourceType, selected, op))
+  // ⭐ An `await` of a coroutine delegates to the coroutine itself: its
+  // frame IS a generator's, though its type is kept apart so it is neither
+  // iterable nor a generator anyone may await. The arguments are the same.
+  auto awaitedCoroutine = mlir::dyn_cast<ContractType>(sourceType);
+  bool awaitsCoroutine =
+      awaitedCoroutine && name == "Generator" &&
+      awaitedCoroutine.getContractName() == "types.CoroutineType" &&
+      awaitedCoroutine.getArguments() == protocol.getArguments();
+  if (!awaitsCoroutine && !evidenceAssignable(sourceType, selected, op))
     result.check(op->emitError()
                  << "yield_from_contract " << selected
                  << " is not satisfied by source type " << sourceType);

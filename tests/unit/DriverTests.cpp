@@ -2360,18 +2360,18 @@ TEST(DriverTest, ACallableOfAnyArgumentsTakesAFunctionWithParameters) {
 TEST(DriverTest, AGeneratorResumedByItsFrameNamesWhatItCannotResume) {
   CompileResult stateless =
       compileSource("from typing import Iterator\n\n\n"
-                    "def many(*xs: int) -> Iterator[int]:\n"
+                    "def many(**xs: int) -> Iterator[int]:\n"
                     "    for x in xs:\n"
-                    "        yield x\n\n\n"
+                    "        yield xs[x]\n\n\n"
                     "def total(it: Iterator[int]) -> int:\n"
                     "    t = 0\n"
                     "    for v in it:\n"
                     "        t += v\n"
                     "    return t\n\n\n"
-                    "print(total(many(1, 2)))\n");
+                    "print(total(many(a=1, b=2)))\n");
   EXPECT_FALSE(stateless.succeeded);
   EXPECT_NE(stateless.diagnostics.find("'many' has none (it is not a state "
-                                       "machine: it takes *args"),
+                                       "machine: it takes **kwargs"),
             std::string::npos)
       << stateless.diagnostics;
 

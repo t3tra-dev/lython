@@ -392,18 +392,6 @@ bool ModuleEmitter::requireStaticEvidence(
 }
 
 bool ModuleEmitter::requireStaticEvidence(
-    const parser::Node &anchor, const AwaitInferenceResult &inference) {
-  if (inference)
-    return true;
-  diagnostics.push_back(parser::Diagnostic{
-      parser::Severity::Error, anchor.range.start,
-      inference.failureReason.empty()
-          ? "await expression requires manifest-backed Awaitable evidence"
-          : inference.failureReason});
-  return false;
-}
-
-bool ModuleEmitter::requireStaticEvidence(
     const parser::Node &anchor, const YieldFromInferenceResult &inference) {
   if (inference)
     return true;
@@ -411,32 +399,6 @@ bool ModuleEmitter::requireStaticEvidence(
       parser::Severity::Error, anchor.range.start,
       inference.failureReason.empty()
           ? "yield from requires manifest-backed iterable evidence"
-          : inference.failureReason});
-  return false;
-}
-
-bool ModuleEmitter::requireStaticEvidence(
-    const parser::Node &anchor,
-    const AsyncIterationInferenceResult &inference) {
-  if (inference)
-    return true;
-  diagnostics.push_back(parser::Diagnostic{
-      parser::Severity::Error, anchor.range.start,
-      inference.failureReason.empty()
-          ? "async for requires manifest-backed AsyncIterable evidence"
-          : inference.failureReason});
-  return false;
-}
-
-bool ModuleEmitter::requireStaticEvidence(
-    const parser::Node &anchor,
-    const AsyncContextMethodInferenceResult &inference) {
-  if (inference)
-    return true;
-  diagnostics.push_back(parser::Diagnostic{
-      parser::Severity::Error, anchor.range.start,
-      inference.failureReason.empty()
-          ? "async context manager operation requires manifest-backed evidence"
           : inference.failureReason});
   return false;
 }

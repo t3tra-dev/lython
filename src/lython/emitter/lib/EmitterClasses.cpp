@@ -1052,17 +1052,30 @@ void ModuleEmitter::emitDeferredMethodBodies() {
       continue;
     bool instanceBody =
         entry.kind == "instance" && !entry.signature.positionalNames.empty();
-    if (instanceBody)
-      superContexts.push_back(SuperContext{
-          entry.contractName, entry.signature.positionalNames.front()});
     std::optional<llvm::SaveAndRestore<const std::string *>> frozenInit;
     if (ast::string(*entry.statement, "name").value_or("") == "__init__" &&
         frozenDataclassContracts.count(entry.contractName))
       frozenInit.emplace(frozenInitContract, &entry.contractName);
-    emitCallableFunction(*entry.statement, entry.symbolName, entry.signature,
-                         {}, /*isLambda=*/false);
-    if (instanceBody)
-      superContexts.pop_back();
+    // ⭐ IN THE MODULE THE CLASS WAS DECLARED IN. A generic class from an
+    // imported module is specialized while the importer is being emitted,
+    // and its bodies were queued here and then emitted in the importer's
+    // scope: `get_event_loop()` in asyncio's `Task.__init__` was an
+    // unresolved name in the program that awaited `asyncio.gather`.
+    // ⛔ The super() context is pushed inside: the module scope switch
+    // starts from an empty one.
+    auto emitBody = [&] {
+      if (instanceBody)
+        superContexts.push_back(SuperContext{
+            entry.contractName, entry.signature.positionalNames.front()});
+      emitCallableFunction(*entry.statement, entry.symbolName,
+                           entry.signature, {}, /*isLambda=*/false);
+      if (instanceBody)
+        superContexts.pop_back();
+    };
+    if (entry.source)
+      emitInDefiningModuleScope(*entry.source, emitBody);
+    else
+      emitBody();
   }
   deferredMethodBodies.clear();
 }
@@ -1510,7 +1523,12 @@ mlir::Type ModuleEmitter::ensureGenericClassSpecialization(
   // argument) must resolve to this same contract instead of allocating a
   // second specialization and recursing forever.
   generic->specializations[key] = symbol;
-  if (!genericClassEmissionReady) {
+  // ⛔ NOT while a module's names are being bound for an emission in its
+  // scope: binding computes each function's signature, a coroutine's walks
+  // its body, and a class specialized there emitted its methods before the
+  // module's own functions were bound -- `helper()` in `Box.__init__` was an
+  // unresolved name when `async def co[T]` in the same module made a `Box[T]`.
+  if (!genericClassEmissionReady || definingScopeSetupDepth != 0) {
     pendingClassSpecializations.push_back(PendingClassSpecialization{
         std::string(baseName), symbol,
         llvm::SmallVector<mlir::Type, 4>(arguments.begin(), arguments.end())});
@@ -3035,9 +3053,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
     for (auto [statement, bodySig, symbolName, kind] :
          llvm::zip_equal(pendingBodies, pendingBodySigs, pendingBodySymbols,
                          pendingBodyKinds))
-      deferredMethodBodies.push_back(
-          DeferredMethodBody{statement, bodySig, symbolName, std::string(kind),
-                             std::string(contractName)});
+      deferredMethodBodies.push_back(DeferredMethodBody{
+          statement, bodySig, symbolName, std::string(kind),
+          std::string(contractName), activeSourceModule});
     pendingBodies.clear();
     pendingBodySigs.clear();
     pendingBodySymbols.clear();
@@ -4076,6 +4094,30 @@ ModuleEmitter::tryEmitClassDunder(const parser::Node &anchor, Value receiver,
     return emitNone(anchor);
   if (!method)
     return std::nullopt;
+  // ⭐ A SUSPENDABLE DUNDER IS CALLED, NOT INLINED. `__aenter__`,
+  // `__aexit__` and `__await__` are coroutine or generator functions, and
+  // calling one makes the coroutine or generator: its body runs when it is
+  // awaited or iterated. Inlining substituted the body's own result -- an
+  // `async with` ran `__aenter__` to completion at the call -- which is the
+  // named method call's reason for taking the symbol too.
+  if ((method->async || method->bodySignature.isGeneratorFunction) &&
+      method->kind == "instance" && !method->symbolName.empty() &&
+      methodBindingBindsReceiver(*method) &&
+      !mlir::isa<py::TypeType>(receiver.type))
+    if (auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+            method->signature.publicCallable)) {
+      Value callee = emitBindingRef(anchor, method->symbolName, callable);
+      CallOperands operands;
+      operands.positional.push_back(receiver);
+      operands.positionalTypes.push_back(receiver.type);
+      operands.positionalUnpacked.push_back(0);
+      for (const Value &argument : positional) {
+        operands.positional.push_back(argument);
+        operands.positionalTypes.push_back(argument.type);
+        operands.positionalUnpacked.push_back(0);
+      }
+      return emitCallableDispatch(anchor, callee, operands);
+    }
   return emitInlineOperatorCall(anchor, receiver, *method, positional);
 }
 

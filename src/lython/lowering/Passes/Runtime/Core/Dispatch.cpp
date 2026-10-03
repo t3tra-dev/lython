@@ -84,11 +84,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
           [&](auto step) { return lowerGeneratorStep(step); })
       .Case<py::EnterOp>([&](auto enter) { return lowerEnter(enter); })
       .Case<py::ExitOp>([&](auto exit) { return lowerExit(exit); })
-      .Case<py::AEnterOp>([&](auto enter) { return lowerAEnter(enter); })
-      .Case<py::AExitOp>([&](auto exit) { return lowerAExit(exit); })
-      .Case<py::AIterOp>([&](auto iter) { return lowerAIter(iter); })
-      .Case<py::ANextOp>([&](auto next) { return lowerANext(next); })
-      .Case<py::AwaitOp>([&](auto await) { return lowerAwait(await); })
       .Case<py::YieldValueOp>([&](auto yield) {
         yield.emitError() << "generator function lowering is not implemented "
                              "yet";

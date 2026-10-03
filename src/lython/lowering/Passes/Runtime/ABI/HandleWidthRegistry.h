@@ -276,18 +276,16 @@ namespace py::lowering::handle_width {
 //          contextlib.nullcontext                           share this release
 //                                                           interface 7 ways
 //       3  builtins.float                                   one-lane (converted)
-//          builtins.bool (boxed), lyrt.ReadyIntAwaitable    pre-existing tie
-//       4  lyrt.Counter, lyrt.AsyncCounter,                 NOT AVAILABLE:
-//          lyrt.ReadyAsyncCounter                           3-way tie
+//          builtins.bool (boxed)                            pre-existing tie
+//       4  lyrt.Counter                                     sole owner
 //       5  builtins.range, builtins.range_iterator          one-lane (converted)
 //          types.CoroutineType                              pre-existing tie
 //       6  builtins.bytes                                   one-lane, MERGED
 //                                                           in 00079ef; sole
 //                                                           owner
 //       7  builtins.complex                                 one-lane (converted)
-//       8  builtins.dict, builtins.function,                7-way tie, all
-//          _io.{StringIO,BytesIO,FileIO,TextIOWrapper},     one-lane already
-//          asyncio.AbstractEventLoop
+//       8  builtins.dict, builtins.function,                6-way tie, all
+//          _io.{StringIO,BytesIO,FileIO,TextIOWrapper}      one-lane already
 //       9  builtins.list                                    one-lane, sole
 //                                                           owner. Layout needs
 //                                                           5 words; 9 is the
@@ -296,7 +294,6 @@ namespace py::lowering::handle_width {
 //                                                           interface, and it
 //                                                           must be >= 8 for
 //                                                           isContainerHandleType
-//      10  _asyncio.Future                                  one-lane
 //      11  builtins.set                                     one-lane, sole
 //                                                           owner, CONVERTED.
 //                                                           Layout needs 5 words
@@ -306,8 +303,6 @@ namespace py::lowering::handle_width {
 //                                                           set); 8..10 are dead
 //                                                           space bought for an
 //                                                           untied interface
-//      12  _asyncio.Task                                    leading word of a
-//                                                           multi-input release
 //      13  builtins.frozenset                               one-lane, sole
 //                                                           owner, CONVERTED.
 //                                                           Same layout as
@@ -608,7 +603,8 @@ namespace py::lowering::handle_width {
 // already paid for; it is not evidence that the scheme works.
 // ---------------------------------------------------------------------------
 
-// EMPTY. The resource is exhausted, and this is the entry that records it.
+// TWO: 10 and 12 (below). The resource is otherwise exhausted, and this is the
+// entry that records it.
 //
 // Provenance of each departure: `bytes` took 6 in `00079ef`, `complex` 7,
 // `list` 9 in `7822be4`, `set` 11 and `frozenset` 13 here, and `tuple` 14 /
@@ -618,14 +614,14 @@ namespace py::lowering::handle_width {
 // with `bytes` twice).
 //
 // So `builtins.str`, ~70 exception contracts and class instances have to convert
-// with no unique width available. See the block at the top of this file: for
+// with at most two unique widths between them. See the block at the top of this file: for
 // them the two GAPs are not the durable alternative to a width, they are the
 // only option. `str` is the one that most needed one -- playbook 8.3 measured 27
 // sites depending on the `shapeMatch` score that one-laning `str` destroys.
 //
-// A converter must still update this list when a width is taken, because an
-// EMPTY free list is information: it is what tells the next reader not to spend
-// an afternoon looking for a free width before concluding there is none.
+// A converter must still update this list when a width is taken, because the
+// free list is information: it is what tells the next reader not to spend an
+// afternoon looking for a free width before concluding there is none.
 //
 // Widths that are NOT free despite having no one-lane owner, with WHICH hazard
 // each one carries -- (A) ambiguity, no group forms; (B) preemption, wrong
@@ -635,32 +631,29 @@ namespace py::lowering::handle_width {
 //             multi-input interface of this family (builtins.tuple) plus
 //             str_iterator. It led four before `list`, `set` and `frozenset`
 //             left; `tuple` is the last.
-//     4   (A) 3-way single-input tie (the lyrt counters)
-//     8   (A) 7-way single-input tie -- every member already one-lane
-//    12   (B) only: leading input of _asyncio.Task's and TaskIter's interfaces,
-//             never a single-input interface of its own. `builtins.frozenset`
-//             took 13 rather than 12 for exactly this reason -- 12 was assigned
-//             away from this conversion as a pre-emption hazard, and (B) is the
-//             mechanism that fails SILENTLY.
+//     8   (A) 6-way single-input tie -- every member already one-lane
 //
 // Widths carrying (B) alone are the ones to distrust most, because (B) is the
 // unmeasured mechanism AND it fails silently rather than by omission.
 //
 // Do not read this list as "pick one of these and you are safe". It is what is
-// left of a resource that is NOW EXHAUSTED, kept accurate so the exhaustion is
-// visible. A converter without a free width is not blocked, because the ties are
-// already the tree's normal condition (width 8 ships with `dict` in a 7-way
+// left of a resource that is all but exhausted, kept accurate so the scarcity
+// is visible. A converter without a free width is not blocked, because the ties are
+// already the tree's normal condition (width 8 ships with `dict` in a 6-way
 // tie). Record the tie here and move on.
-// EMPTY. 11, 13, 14 and 15 were the last four and are all assigned (set and
-// frozenset CONVERTED, tuple CONVERTED, int reserved). See the boxed note above
-// the assignment table: `str`, the exception family and class instances have no
-// free width left, and for `str` that is not a cosmetic problem (§8.3).
+// 10 and 12, returned when the `_asyncio` manifest was deleted: 10 was
+// `_asyncio.Future`'s, and 12 led `_asyncio.Task`'s multi-input interfaces --
+// the (B) hazard that sent `builtins.frozenset` to 13 -- and no interface
+// reaches it now. 11, 13, 14 and 15 are all assigned (set and frozenset
+// CONVERTED, tuple CONVERTED, int reserved). See the boxed note above
+// the assignment table: two widths do not cover `str`, the exception family and
+// class instances, and for `str` that is not a cosmetic problem (§8.3).
 //
 // Spelled as a count rather than as `int kFreeHandleWidths[] = {}`, because a
 // zero-length array is not valid C++ and this file should stay compilable if
 // anyone ever does include it. (The set/frozenset track wrote the empty-array
 // form and the tuple track wrote this one; the tuple track's is correct.)
-inline constexpr int kFreeHandleWidthCount = 0;
+inline constexpr int kFreeHandleWidthCount = 2;
 
 // The scarcity a converter should see before assuming a width is available,
 // and -- more importantly -- the ties that are ALREADY suppressing groups by
@@ -827,8 +820,8 @@ inline constexpr int kFreeHandleWidthCount = 0;
 // memref<?xi8>)` whose header is also 3 words -- i.e. the check itself committed
 // the "width is not a proof of kind" fallacy this file exists to prevent. And
 // even with the right filter the result is a CANDIDATE list, not an answer:
-// widths 3 and 5 have several one-lane owners (3: float, boxed bool,
-// lyrt.ReadyIntAwaitable; 5: range, range_iterator, types.CoroutineType), so
+// widths 3 and 5 have several one-lane owners (3: float, boxed bool; 5: range,
+// range_iterator, types.CoroutineType), so
 // which contract a length-1 `memref<3xi64>` result actually is cannot be decided
 // from types. Only the declaration decides -- which is the point.
 

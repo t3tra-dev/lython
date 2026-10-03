@@ -690,7 +690,7 @@ py::CallableType substituteCallable(const TypeSystem &types,
 
 mlir::Type substituteType(const TypeSystem &types, mlir::Type type,
                           const TypeBindingMap &bindings, bool eraseUnbound) {
-  return py::mapPyTypeStructure(
+  mlir::Type substituted = py::mapPyTypeStructure(
       type, [&](mlir::Type node) -> std::optional<mlir::Type> {
         if (std::optional<std::string> name = staticParameterName(node)) {
           auto found = bindings.find(*name);
@@ -715,6 +715,23 @@ mlir::Type substituteType(const TypeSystem &types, mlir::Type type,
         // methods. The arity is what a starred call needs, so the lookup
         // learned the positional spelling instead (protocols::Table) and
         // nothing here rewrites the shape any more.
+        return std::nullopt;
+      });
+  // ⭐ A GENERIC CLASS ITS PARAMETERS NOW GROUND IS ITS SPECIALIZATION. A
+  // generic function declared `-> Box[T]` returns `Box$spec0` at T=int, the
+  // class `Box[int]` names everywhere else; substitution alone left the
+  // contract `Box[int]`, which no class answers ("annotated to return
+  // Box[int] but this return gives Box$spec0", and no method found on it).
+  // ⛔ After the substitution and not inside it: the walk reaches a contract
+  // before its arguments, which are still the parameters then.
+  return py::mapPyTypeStructure(
+      substituted, [&](mlir::Type node) -> std::optional<mlir::Type> {
+        auto contract = mlir::dyn_cast<py::ContractType>(node);
+        if (!contract || contract.getArguments().empty())
+          return std::nullopt;
+        if (mlir::Type ground = types.resolveGenericClass(
+                contract.getContractName(), contract.getArguments()))
+          return ground;
         return std::nullopt;
       });
 }

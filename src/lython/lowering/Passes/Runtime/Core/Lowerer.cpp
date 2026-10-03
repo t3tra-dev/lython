@@ -21,10 +21,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(buildPrimitiveI64CallableClones()))
     return mlir::failure();
-  if (mlir::failed(buildReturnedCoroutineSummaries()))
-    return mlir::failure();
-  if (mlir::failed(buildReturnedObjectEvidenceSummaries()))
-    return mlir::failure();
   if (mlir::failed(buildReturnedStaticObjectSummaries()))
     return mlir::failure();
   if (mlir::failed(buildGeneratorResumeCloneSignatures()))

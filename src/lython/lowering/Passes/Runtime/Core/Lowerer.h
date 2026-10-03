@@ -316,8 +316,6 @@ private:
                             py::CallableType callable) const;
   mlir::LogicalResult buildReturnedValueSummaries();
   mlir::LogicalResult buildReturnedCallableSummaries();
-  mlir::LogicalResult buildReturnedCoroutineSummaries();
-  mlir::LogicalResult buildReturnedObjectEvidenceSummaries();
   mlir::LogicalResult buildReturnedStaticObjectSummaries();
   mlir::LogicalResult buildCallableProtocolArgumentABIs();
   mlir::LogicalResult buildCallableArgumentEvidenceABIs();
@@ -1179,6 +1177,7 @@ private:
     StepFull
   };
   static mlir::Type generatorYieldType(mlir::Type generator);
+  static mlir::Type generatorReturnType(mlir::Type generator);
   static bool isGeneratorProtocol(mlir::Type type);
   static mlir::Type concreteGeneratorType(mlir::Type type);
   mlir::FailureOr<RuntimeBundle> boxForObjectLane(mlir::Operation *op,
@@ -1357,7 +1356,8 @@ private:
   mlir::FailureOr<SourceGeneratorResumeResult> emitDispatchedGeneratorResume(
       mlir::Operation *op, const RuntimeBundle &iterator, mlir::Type elementType,
       bool raiseWhenExhausted = false,
-      std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence = std::nullopt);
+      std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence = std::nullopt,
+      mlir::Type returnType = {});
   mlir::LogicalResult
   lowerStateMachineGeneratorThrow(py::CallOp op, const RuntimeBundle &receiver,
                                   GeneratorResumeInfo *info,
@@ -1599,23 +1599,6 @@ private:
                                                    const RuntimeBundle &payload,
                                                    bool ownsPayload);
   void demoteSequenceEvidence(py::CallOp op, const RuntimeBundle &receiver);
-  mlir::LogicalResult lowerFutureResultEvidence(mlir::Operation *op,
-                                                mlir::Value resultValue,
-                                                const RuntimeBundle &receiver,
-                                                llvm::StringRef label);
-  mlir::LogicalResult bundleCoroutineBodyResults(mlir::Operation *op,
-                                                 mlir::Value resultValue,
-                                                 mlir::ValueRange values,
-                                                 RuntimeBundle &result);
-  mlir::LogicalResult lowerAsyncioSleepEvidenceAwait(mlir::Operation *op,
-                                                     mlir::Value resultValue,
-                                                     RuntimeBundle &awaitable,
-                                                     llvm::StringRef label);
-  mlir::LogicalResult lowerFutureBoundMethod(py::CallOp op,
-                                             RuntimeBundle &receiver,
-                                             llvm::StringRef methodName);
-  mlir::LogicalResult lowerAsyncioSleepCall(py::CallOp op,
-                                            const RuntimeSymbol &symbol);
   mlir::LogicalResult lowerObjectCallableCall(py::CallOp op,
                                               const RuntimeBundle &callable);
   mlir::LogicalResult lowerFunctionTargetCall(py::CallOp op,
@@ -1675,17 +1658,6 @@ private:
   bundlePrimitiveI64CloneCallResult(py::CallOp op, mlir::func::FuncOp target,
                                     mlir::func::CallOp call,
                                     RuntimeBundle &result);
-  mlir::LogicalResult
-  lowerAsyncFunctionTargetCall(py::CallOp op, mlir::func::FuncOp target,
-                               llvm::StringRef targetName,
-                               llvm::ArrayRef<const RuntimeBundle *> sources);
-  mlir::LogicalResult emitAsyncFunctionTargetCallResult(
-      py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
-      llvm::ArrayRef<const RuntimeBundle *> sources, RuntimeBundle &result);
-  mlir::LogicalResult emitAsyncFunctionTargetCallResult(
-      mlir::Operation *op, mlir::Value resultValue, mlir::func::FuncOp target,
-      llvm::StringRef targetName, llvm::ArrayRef<const RuntimeBundle *> sources,
-      RuntimeBundle &result);
   mlir::LogicalResult lowerGeneratorFunctionTargetCall(
       py::CallOp op, mlir::func::FuncOp target, llvm::StringRef targetName,
       llvm::ArrayRef<const RuntimeBundle *> sources);
@@ -1771,34 +1743,6 @@ private:
                             llvm::ArrayRef<const RuntimeBundle *> sources);
   mlir::LogicalResult lowerEnter(py::EnterOp op);
   mlir::LogicalResult lowerExit(py::ExitOp op);
-  mlir::LogicalResult lowerAEnter(py::AEnterOp op);
-  mlir::LogicalResult lowerAExit(py::AExitOp op);
-  // `__enter__`/`__aenter__` and `__exit__`/`__aexit__` lower identically:
-  // the sync and async ops differ in their type, their default method name and
-  // the noun in their diagnostic. The four entry points above stay because the
-  // dispatch is a TypeSwitch over op types.
-  template <typename ManagerOp>
-  mlir::LogicalResult lowerContextEnter(ManagerOp op, llvm::StringRef noun,
-                                        llvm::StringRef defaultMethod);
-  template <typename ManagerOp>
-  mlir::LogicalResult lowerContextExit(ManagerOp op, llvm::StringRef noun,
-                                       llvm::StringRef defaultMethod);
-  mlir::LogicalResult lowerAIter(py::AIterOp op);
-  mlir::LogicalResult lowerANext(py::ANextOp op);
-  mlir::LogicalResult lowerAwait(py::AwaitOp op);
-  mlir::LogicalResult lowerCoroutineObjectAwait(mlir::Operation *op,
-                                                mlir::Value resultValue,
-                                                RuntimeBundle &awaitable,
-                                                llvm::StringRef label);
-  mlir::LogicalResult lowerCoroutineStorageTargetIdAwait(
-      mlir::Operation *op, mlir::Value resultValue, RuntimeBundle &awaitable,
-      llvm::StringRef label);
-  mlir::LogicalResult lowerAwaitIteratorResult(mlir::Operation *op,
-                                               mlir::Value resultValue,
-                                               RuntimeBundle &iterator,
-                                               llvm::StringRef label);
-  mlir::LogicalResult lowerGeneralAwaitableIterator(py::AwaitOp op,
-                                                    RuntimeBundle &awaitable);
   mlir::LogicalResult lowerRound(py::RoundOp op);
   mlir::LogicalResult lowerIncRef(py::IncRefOp op);
   mlir::LogicalResult lowerDecRef(py::DecRefOp op);
@@ -1927,9 +1871,6 @@ private:
   llvm::DenseMap<mlir::Value, mlir::Operation *> ownedLocalObjectMarkers;
   llvm::StringMap<ReturnedValueSummary> returnedValueSummaries;
   llvm::StringMap<ReturnedCallableSummary> returnedCallableSummaries;
-  llvm::StringMap<ReturnedCoroutineSummary> returnedCoroutineSummaries;
-  llvm::StringMap<ReturnedObjectEvidenceSummary>
-      returnedObjectEvidenceSummaries;
   llvm::StringMap<ReturnedStaticObjectSummary> returnedStaticObjectSummaries;
   llvm::StringMap<llvm::SmallVector<mlir::Type, 8>>
       callableProtocolArgumentABIs;
@@ -1959,8 +1900,8 @@ private:
   llvm::SmallVector<mlir::Operation *, 32> erase;
 };
 
-// Peels class-upcast / refine / protocol-view wrappers off a value: summary
-// and await lowering must see the underlying object identity.
+// Peels class-upcast / refine / protocol-view wrappers off a value: the
+// returned-value summaries must see the underlying object identity.
 inline mlir::Value stripReturnedObjectView(mlir::Value value) {
   while (value) {
     mlir::Operation *def = value.getDefiningOp();
@@ -2012,22 +1953,6 @@ template <typename Step> inline void runToFixpoint(Step &&step) {
     changed = false;
     step(changed);
   }
-}
-
-inline bool isCoroutineLikeResultType(mlir::Type type) {
-  if (runtimeContractName(type) == "types.CoroutineType")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Coroutine";
-}
-
-inline bool isAwaitIteratorLikeResultType(mlir::Type type) {
-  std::string contract = runtimeContractName(type);
-  if (contract == "types.CoroutineAwaitIterator" ||
-      contract == "_asyncio.FutureIter" || contract == "_asyncio.TaskIter")
-    return true;
-  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-  return protocol && protocol.getProtocolName() == "Generator";
 }
 
 inline mlir::func::FuncOp

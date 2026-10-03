@@ -47,9 +47,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Manifest/Calls.cpp
     Passes/Runtime/Manifest/Index.cpp
     Passes/Runtime/Model/Support.cpp
-    Passes/Runtime/Ops/AsyncCallableOps.cpp
     Passes/Runtime/Ops/AttributeOps.cpp
-    Passes/Runtime/Ops/AwaitOps.cpp
     Passes/Runtime/Ops/CallableOps.cpp
     Passes/Runtime/Ops/ExceptionOps.cpp
     Passes/Runtime/Ops/FunctionTargetCalls.cpp
@@ -64,7 +62,6 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ops/SpecialMethodOps.cpp
     Passes/Runtime/Ops/TryOps.cpp
     Passes/Runtime/Ops/UnionOps.cpp
-    Passes/Runtime/Passes/AsyncThunk.cpp
     Passes/Runtime/Passes/Lowering.cpp
     Passes/Runtime/Passes/Ownership.cpp
     Passes/Runtime/Passes/RefCountElision.cpp

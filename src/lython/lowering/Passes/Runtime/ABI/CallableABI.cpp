@@ -1201,15 +1201,6 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
                                                                   inputTypes);
           }
-          for (mlir::Type inputType : evidence.coroutineSourceTypes) {
-            if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                    function, inputType, inputTypes))) {
-              result = mlir::failure();
-              return mlir::WalkResult::interrupt();
-            }
-            RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
-                                                                  inputTypes);
-          }
         }
       }
     }
@@ -1242,25 +1233,10 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
     llvm::SmallVector<mlir::Type, 8> resultTypes;
     llvm::SmallVector<std::int64_t, 4> ownedResultOffsets;
     llvm::SmallVector<mlir::Attribute, 4> ownedResultContracts;
-    auto returnedCoroutine =
-        returnedCoroutineSummaries.find(function.getSymName());
-    auto returnedObjectEvidence =
-        returnedObjectEvidenceSummaries.find(function.getSymName());
     auto returnedStaticObject =
         returnedStaticObjectSummaries.find(function.getSymName());
     for (auto [logicalResultIndex, resultType] :
          llvm::enumerate(callable.getResultTypes())) {
-      mlir::Type abiResultType = resultType;
-      if (returnedCoroutine != returnedCoroutineSummaries.end() &&
-          isCoroutineLikeResultType(resultType)) {
-        if (mlir::func::FuncOp target =
-                module.lookupSymbol<mlir::func::FuncOp>(
-                    returnedCoroutine->second.target)) {
-          if (mlir::Type concrete =
-                  concreteCoroutineTypeForTarget(context, target))
-            abiResultType = concrete;
-        }
-      }
       bool protocolPrimaryOwnsResult = false;
       if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
               resultType))
@@ -1299,7 +1275,7 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       // reported "conditionally owned ... without tag-conditioned release":
       // one obligation was being tracked as if it could not be absent.
       if (auto unionResult =
-              mlir::dyn_cast_if_present<py::UnionType>(abiResultType)) {
+              mlir::dyn_cast_if_present<py::UnionType>(resultType)) {
         llvm::SmallVector<std::pair<std::int64_t, std::string>, 2> memberLanes;
         std::int64_t memberOffset =
             static_cast<std::int64_t>(resultTypes.size()) + 1;
@@ -1340,11 +1316,11 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         }
       }
       if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-              function, abiResultType, resultTypes))) {
+              function, resultType, resultTypes))) {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
-      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(abiResultType,
+      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
                                                             resultTypes);
       if (returnedStaticObject != returnedStaticObjectSummaries.end() &&
           returnedStaticObject->second.resultIndex == logicalResultIndex) {
@@ -1370,33 +1346,6 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(objectContract,
                                                               resultTypes);
       }
-      if (returnedCoroutine != returnedCoroutineSummaries.end() &&
-          (isCoroutineLikeResultType(resultType) ||
-           isAwaitIteratorLikeResultType(resultType))) {
-        for (mlir::Type sourceType :
-             returnedCoroutine->second.sourceContracts) {
-          if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                  function, sourceType, resultTypes))) {
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
-          RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(sourceType,
-                                                                resultTypes);
-        }
-      }
-      if (returnedObjectEvidence == returnedObjectEvidenceSummaries.end() ||
-          returnedObjectEvidence->second.resultIndex != logicalResultIndex)
-        continue;
-      for (const ReturnedObjectEvidenceSlot &slot :
-           returnedObjectEvidence->second.slots) {
-        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                function, slot.sourceContract, resultTypes))) {
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(
-            slot.sourceContract, resultTypes);
-      }
     }
     // Returned-closure LOCAL captures ride out as trailing owned result
     // lanes (the nonlocal cell escaping with its closure). Their layout is
@@ -1407,13 +1356,6 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
         returnedCallable != returnedCallableSummaries.end() &&
         returnedCallable->second.alternatives.size() == 1 &&
         returnedCallable->second.alternatives.front().hasLaneCaptures()) {
-      if (returnedObjectEvidence != returnedObjectEvidenceSummaries.end()) {
-        function.emitError()
-            << "returned closure lane captures cannot combine with returned "
-               "object evidence yet";
-        result = mlir::failure();
-        return mlir::WalkResult::interrupt();
-      }
       for (const ReturnedCallableCapture &capture :
            returnedCallable->second.alternatives.front().captures) {
         if (!capture.laneContract)
@@ -1574,8 +1516,6 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
             evidenceSet.alternatives.front();
         if (!evidence.functionTarget.empty())
           bundle.functionTarget = evidence.functionTarget;
-        if (!evidence.coroutineTarget.empty())
-          bundle.coroutineTarget = evidence.coroutineTarget;
       }
       for (const RuntimeArgumentEvidence &evidence : evidenceSet.alternatives) {
         if (!evidence.functionTarget.empty() ||
@@ -1592,25 +1532,6 @@ mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(
           if (evidenceSet.alternatives.size() == 1)
             bundle.closureValues = alternative.closureValues;
           bundle.callableAlternatives.push_back(std::move(alternative));
-        }
-        if (!evidence.coroutineTarget.empty()) {
-          llvm::SmallVector<RuntimeValue, 4> coroutineSources;
-          llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 4>
-              coroutineSourceBundles;
-          for (mlir::Type sourceType : evidence.coroutineSourceTypes) {
-            mlir::FailureOr<RuntimeValue> source =
-                appendHiddenObject(sourceType);
-            if (mlir::failed(source))
-              return mlir::failure();
-            coroutineSources.push_back(*source);
-            coroutineSourceBundles.push_back(std::make_shared<RuntimeBundle>(
-                RuntimeBundle::object(source->contract, source->values)));
-          }
-          if (evidenceSet.alternatives.size() == 1) {
-            bundle.coroutineSources = std::move(coroutineSources);
-            bundle.coroutineSourceBundles =
-                std::move(coroutineSourceBundles);
-          }
         }
       }
     }

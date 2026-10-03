@@ -33,40 +33,9 @@ std::string runtimeShapeContractName(mlir::Type type) {
   return "";
 }
 
-bool compatibleRuntimeObjectEvidenceContract(mlir::Type resultType,
-                                             mlir::Type evidenceType) {
-  std::string resultContract = runtimeContractName(resultType);
-  std::string evidenceContract = runtimeContractName(evidenceType);
-  if (!resultContract.empty() && !evidenceContract.empty())
-    return resultContract == evidenceContract;
-
-  std::string resultShape = runtimeShapeContractName(resultType);
-  std::string evidenceShape = runtimeShapeContractName(evidenceType);
-  if (resultShape.empty() || evidenceShape.empty())
-    return false;
-  if (resultShape == evidenceShape)
-    return true;
-
-  // Protocol-typed values are object-erased at ABI boundaries. The concrete
-  // evidence still belongs to the object returned from the function and may be
-  // carried through the hidden evidence ABI.
-  return resultShape == "builtins.object" || evidenceShape == "builtins.object";
-}
-
 mlir::Type runtimeContractType(mlir::MLIRContext *context,
                                llvm::StringRef contract) {
   return py::ContractType::get(context, contract);
-}
-
-mlir::Type concreteCoroutineTypeForTarget(mlir::MLIRContext *context,
-                                          mlir::func::FuncOp target) {
-  auto bodyResult =
-      target->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
-  if (!bodyResult)
-    return {};
-  mlir::Type object = runtimeContractType(context, "builtins.object");
-  return py::ContractType::get(context, "types.CoroutineType",
-                               {object, object, bodyResult.getValue()});
 }
 
 bool RuntimeSymbol::hasClassIdArgument(unsigned inputIndex) const {

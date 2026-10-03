@@ -39,8 +39,7 @@ inline bool isObjectTop(const TypeSystem &types, mlir::Type type) {
 
 inline std::string manifestNameForContract(llvm::StringRef name) {
   for (llvm::StringRef prefix :
-       {"builtins.", "typing.", "types.", "contextlib.", "_asyncio.",
-        "asyncio.", "contextvars."}) {
+       {"builtins.", "typing.", "types.", "contextlib.", "contextvars."}) {
     if (name.consume_front(prefix))
       return name.str();
   }

@@ -15,8 +15,7 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
        evidence.logicalArguments) {
     for (const RuntimeArgumentEvidence &argumentEvidence :
          evidenceSet.alternatives)
-      hiddenCount += argumentEvidence.closureValueTypes.size() +
-                     argumentEvidence.coroutineSourceTypes.size();
+      hiddenCount += argumentEvidence.closureValueTypes.size();
   }
   evidenceSources.reserve(evidenceSources.size() + hiddenCount);
   sources.reserve(sources.size() + hiddenCount);
@@ -88,47 +87,6 @@ mlir::LogicalResult RuntimeBundleLowerer::appendCallableArgumentEvidenceSources(
          evidenceSet.alternatives) {
       if (argumentEvidence.empty())
         continue;
-
-      if (!argumentEvidence.coroutineTarget.empty()) {
-        if (source->coroutineTarget == argumentEvidence.coroutineTarget) {
-          if (source->coroutineSources.size() !=
-              argumentEvidence.coroutineSourceTypes.size())
-            return op.emitError()
-                   << "argument coroutine evidence source count mismatch for "
-                   << targetName;
-          for (auto [sourceIndex, expected] :
-               llvm::enumerate(argumentEvidence.coroutineSourceTypes)) {
-            const RuntimeValue &value = source->coroutineSources[sourceIndex];
-            if (!py::isAssignableTo(value.contract, expected,
-                                    op.getOperation()))
-              return op.emitError()
-                     << "argument coroutine evidence source " << sourceIndex
-                     << " for " << targetName << " has contract "
-                     << value.contract << ", expected " << expected;
-            if (sourceIndex < source->coroutineSourceBundles.size() &&
-                source->coroutineSourceBundles[sourceIndex]) {
-              if (mlir::failed(appendEvidenceBundle(
-                      *source->coroutineSourceBundles[sourceIndex])))
-                return mlir::failure();
-              continue;
-            }
-            if (mlir::failed(appendEvidenceValue(value)))
-              return mlir::failure();
-          }
-          continue;
-        }
-
-        if (source->coroutineTarget.empty())
-          return op.emitError()
-                 << "argument evidence source for " << targetName
-                 << " has no static coroutine target alternative '"
-                 << argumentEvidence.coroutineTarget << "'";
-
-        for (mlir::Type expected : argumentEvidence.coroutineSourceTypes)
-          if (mlir::failed(appendPlaceholder(expected)))
-            return mlir::failure();
-        continue;
-      }
 
       if (argumentEvidence.functionTarget.empty()) {
         if (mlir::failed(appendClosureEvidence(

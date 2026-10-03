@@ -13,6 +13,7 @@
 #include "Passes/Runtime/Cleanup/Transforms.h"
 #include "Passes/Runtime/Ctypes/CallbackThunks.h"
 #include "Passes/Runtime/Js/Host.h"
+#include "Passes/Runtime/Common/ContractRewrite.h"
 #include "Passes/Runtime/Primitive/TensorParallel.h"
 #include "runtime/Verification.h"
 
@@ -82,7 +83,12 @@ LogicalResult runLoweringPhase(llvm::StringRef name, ModuleOp module,
   if (failed(pm.run(module))) {
     if (llvm::sys::Process::GetEnv("LYTHON_DUMP_ON_FAILURE")) {
       llvm::errs() << "\n=== [FAILED PHASE " << name << "] ===\n";
-      module->print(llvm::errs(), mlir::OpPrintingFlags().assumeVerified());
+      mlir::OpPrintingFlags flags;
+      flags.assumeVerified();
+      // Each op's source location, to find the one a diagnostic names.
+      if (llvm::sys::Process::GetEnv("LYTHON_DUMP_LOCS"))
+        flags.enableDebugInfo(/*enable=*/true, /*prettyForm=*/true);
+      module->print(llvm::errs(), flags);
     }
     return failure();
   }
@@ -288,6 +294,22 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   }
   dumpMLIRForPass(irDump, "js-host-erasure", module);
 
+  // Phase 8d: a coroutine is a generator from here on -- the same frame, the
+  // same drivers. Its own type kept `for` and `await` apart while the program
+  // was checked; nothing below distinguishes them.
+  {
+    PerfScope perf("lowering.coroutine-erasure");
+    lowering::rewriteContracts(module, [](py::ContractType contract)
+                                           -> mlir::Type {
+      if (contract.getContractName() != "types.CoroutineType")
+        return contract;
+      return py::ContractType::get(contract.getContext(),
+                                   "types.GeneratorType",
+                                   contract.getArguments());
+    });
+  }
+  dumpMLIRForPass(irDump, "coroutine-erasure", module);
+
   // Phase 9: lower Py dialect values into runtime bundles and calls.
   if (failed(runPhase("runtime-lowering", [&](PassManager &pm) {
         pm.addPass(createRuntimeLoweringPass());
@@ -345,14 +367,13 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     return failure();
   dumpMLIRForPass(irDump, "pre-cleanup-llvm-call-verifier", module);
 
-  // Phase 11: lower Lython-owned async thunks before symbol cleanup.
-  if (failed(runPhase("async-thunk-lowering", [&](PassManager &pm) {
-        pm.addPass(createAsyncThunkLoweringPass());
+  // Phase 11: fold what the lowering left foldable before symbol cleanup.
+  if (failed(runPhase("post-lowering-canonicalize", [&](PassManager &pm) {
         pm.addPass(createEHSafeCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
       })))
     return failure();
-  dumpMLIRForPass(irDump, "async-thunk-lowering", module);
+  dumpMLIRForPass(irDump, "post-lowering-canonicalize", module);
   if (failed(requireNoAsyncDialectOps(module)))
     return failure();
 

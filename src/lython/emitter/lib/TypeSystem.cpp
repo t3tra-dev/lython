@@ -165,19 +165,6 @@ py::CallableType makeZeroArgStrCallable(const TypeSystem &types) {
   return py::CallableType::get(context, {}, {}, {}, {}, results);
 }
 
-mlir::Type inferAsyncioSleepResult(const TypeSystem &types,
-                                   mlir::ArrayRef<mlir::Type> positional,
-                                   mlir::ArrayRef<CallKeywordType> keywords) {
-  mlir::Type payload = types.none();
-  if (positional.size() > 1)
-    payload = positional[1];
-  for (const CallKeywordType &keyword : keywords)
-    if (keyword.name == "result")
-      payload = keyword.type;
-  return types.contract("types.CoroutineType", {types.any(), types.any(),
-                                                types.widenLiteral(payload)});
-}
-
 void recordInferenceFailure(
     llvm::SmallVectorImpl<std::string> *failureReasons, std::string reason) {
   if (failureReasons && !reason.empty())
@@ -1175,20 +1162,6 @@ std::optional<std::string> protocolAnnotationName(llvm::StringRef name) {
 }
 
 std::optional<std::string> contractAnnotationName(llvm::StringRef name) {
-  if (name == "_asyncio.Future" || name == "asyncio.Future" ||
-      annotationNamespaceTail(name) == "Future")
-    return std::string("_asyncio.Future");
-  if (name == "_asyncio.Task" || name == "asyncio.Task" ||
-      annotationNamespaceTail(name) == "Task")
-    return std::string("_asyncio.Task");
-  if (name == "asyncio.AbstractEventLoop" ||
-      name == "asyncio.events.AbstractEventLoop" ||
-      annotationNamespaceTail(name) == "AbstractEventLoop")
-    return std::string("asyncio.AbstractEventLoop");
-  if (name == "asyncio.CancelledError" ||
-      name == "asyncio.exceptions.CancelledError" ||
-      annotationNamespaceTail(name) == "CancelledError")
-    return std::string("asyncio.CancelledError");
   if (name == "contextvars.Context" ||
       annotationNamespaceTail(name) == "Context")
     return std::string("contextvars.Context");
@@ -4694,8 +4667,6 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 "lyrt.to_prim expects a lyrt.prim type as its second "
                 "argument");
         }
-        if (*canonical == "asyncio.sleep")
-          return inferAsyncioSleepResult(*this, positional, keywords);
       }
       std::optional<mlir::Type> symbol;
       if (ctx && ctx->localSymbols) {
@@ -4741,8 +4712,6 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                 "lyrt.to_prim expects a lyrt.prim type as its second "
                 "argument");
         }
-        if (*canonical == "asyncio.sleep")
-          return inferAsyncioSleepResult(*this, positional, keywords);
       }
       if (auto symbol = lookupSymbol(qualified)) {
         if (strict) {
@@ -5023,84 +4992,6 @@ TypeSystem::inferYieldFromWithEvidence(mlir::Type sourceType) const {
       std::string(
           "yield from requires a Generator, Iterator, or Iterable value, got ") +
           typeText(source)};
-}
-
-AsyncIterationInferenceResult
-TypeSystem::inferAsyncIterationWithEvidence(mlir::Type iterableType) const {
-  mlir::Type iterable = widenLiteral(iterableType);
-  AsyncIterationInferenceResult result;
-  result.aiter = inferMethodCallWithEvidence(iterable, "__aiter__", {});
-  if (!result.aiter) {
-    result.failureReason = result.aiter.failureReason;
-    return result;
-  }
-
-  result.iteratorType = widenLiteral(result.aiter.resultType);
-  const py::protocols::Table &table = py::protocols::Table::get(context);
-  std::optional<std::vector<mlir::Type>> iteratorArgs =
-      table.protocolArgumentsFor(result.iteratorType, "AsyncIterator");
-  if (!iteratorArgs || iteratorArgs->size() != 1) {
-    result.failureReason =
-        "__aiter__ must return an AsyncIterator value, got " +
-        typeText(result.iteratorType);
-    return result;
-  }
-
-  result.anext =
-      inferMethodCallWithEvidence(result.iteratorType, "__anext__", {});
-  if (!result.anext) {
-    result.failureReason = result.anext.failureReason;
-    return result;
-  }
-
-  result.nextAwaitableType = widenLiteral(result.anext.resultType);
-  result.awaitNext = inferAwaitWithEvidence(result.nextAwaitableType);
-  if (!result.awaitNext) {
-    result.failureReason = "__anext__ must return an Awaitable value: " +
-                           result.awaitNext.failureReason;
-    return result;
-  }
-
-  result.itemType = result.awaitNext.resultType;
-  result.resolved = true;
-  return result;
-}
-
-static AsyncContextMethodInferenceResult
-inferAsyncContextMethod(const TypeSystem &types, mlir::Type managerType,
-                        llvm::StringRef methodName,
-                        mlir::ArrayRef<mlir::Type> positional) {
-  AsyncContextMethodInferenceResult result;
-  result.method =
-      types.inferMethodCallWithEvidence(managerType, methodName, positional);
-  if (!result.method) {
-    result.failureReason = result.method.failureReason;
-    return result;
-  }
-
-  result.awaitableType = types.widenLiteral(result.method.resultType);
-  result.awaitResult = types.inferAwaitWithEvidence(result.awaitableType);
-  if (!result.awaitResult) {
-    result.failureReason =
-        methodName.str() +
-        " must return an Awaitable value: " + result.awaitResult.failureReason;
-    return result;
-  }
-
-  result.resultType = result.awaitResult.resultType;
-  result.resolved = true;
-  return result;
-}
-
-AsyncContextMethodInferenceResult
-TypeSystem::inferAsyncContextEnterWithEvidence(mlir::Type managerType) const {
-  return inferAsyncContextMethod(*this, managerType, "__aenter__", {});
-}
-
-AsyncContextMethodInferenceResult TypeSystem::inferAsyncContextExitWithEvidence(
-    mlir::Type managerType, mlir::ArrayRef<mlir::Type> exceptionTypes) const {
-  return inferAsyncContextMethod(*this, managerType, "__aexit__",
-                                 exceptionTypes);
 }
 
 CallInferenceResult TypeSystem::inferCallWithEvidence(
@@ -5979,9 +5870,22 @@ void TypeSystem::refreshCallable(FunctionSignature &sig) const {
   };
 
   sig.callable = makeCallable(sig.resultType);
-  if (sig.isAsyncFunction && !sig.isAsyncGeneratorFunction)
-    sig.publicResultType = coroutineOf(sig.resultType);
-  else if (sig.isGeneratorFunction || sig.isAsyncGeneratorFunction)
+  // ⭐ A COROUTINE IS A GENERATOR BODY. `await x` is `yield from` over what
+  // `x` awaits with (docs/async-design.md), so every suspension is a yield of
+  // that delegate's and the body runs in the generator state machine. Its
+  // public type stays the coroutine's: a coroutine is not iterable, and a
+  // generator is not awaitable.
+  if (sig.isAsyncFunction && !sig.isAsyncGeneratorFunction) {
+    sig.isCoroutineFunction = true;
+    sig.isGeneratorFunction = true;
+    sig.generatorYieldType = contract("builtins.object", {});
+    sig.generatorSendType = none();
+    sig.generatorReturnType = sig.resultType;
+    sig.inferredGeneratorType = contract(
+        "types.CoroutineType",
+        {sig.generatorYieldType, sig.generatorSendType, sig.resultType});
+    sig.publicResultType = sig.inferredGeneratorType;
+  } else if (sig.isGeneratorFunction || sig.isAsyncGeneratorFunction)
     sig.publicResultType = sig.inferredGeneratorType;
   else
     sig.publicResultType = sig.resultType;

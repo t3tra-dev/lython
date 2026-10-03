@@ -64,16 +64,17 @@ module attributes {
     ly.typing.params = ["Y", "S", "R"],
     ly.typing.param_variance = ["covariant", "contravariant", "covariant"],
     ly.typing.base_args = [[!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]],
-    method_names = ["__await__", "send", "throw", "throw", "close"],
+    method_names = ["__await__", "send", "throw", "throw", "throw", "close"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.protocol<"Generator", [!py.contract<"typing.Any">, !py.literal<None>, !py.contract<"$R">]>]>,
       !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"$S">] -> [!py.contract<"$Y">]>,
       !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.type<!py.contract<"builtins.BaseException">>, !py.union<!py.contract<"builtins.BaseException">, !py.contract<"builtins.object">>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
       !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"builtins.BaseException">, !py.literal<None>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"$Y">]>,
+      !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>, !py.contract<"builtins.BaseException">] -> [!py.contract<"$Y">]>,
       !py.protocol<"Callable", [!py.contract<"types.CoroutineType", [!py.contract<"$Y">, !py.contract<"$S">, !py.contract<"$R">]>] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
-                    "instance"]
+                    "instance", "instance"]
   } {}
 
   // ===========================================================

@@ -226,10 +226,6 @@ classContractCandidates(llvm::StringRef className) {
   appendClassContractCandidate(candidates,
                                (llvm::Twine("types.") + className).str());
   appendClassContractCandidate(candidates,
-                               (llvm::Twine("_asyncio.") + className).str());
-  appendClassContractCandidate(candidates,
-                               (llvm::Twine("asyncio.") + className).str());
-  appendClassContractCandidate(candidates,
                                (llvm::Twine("contextlib.") + className).str());
   return candidates;
 }
@@ -608,8 +604,9 @@ RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
   llvm::StringRef className = classOp.getSymName();
   // ⛔ NOT for a class the program declared. The candidate list guesses a
   // manifest namespace in front of a bare name, which is how a manifest
-  // `py.class @Task` finds `_asyncio.Task` -- and how `class Task` in a
-  // program took that id, tagging its instances as asyncio Tasks.
+  // `py.class @GeneratorType` finds `types.GeneratorType` -- and how
+  // `class GeneratorType` in a program would take that id, tagging its
+  // instances as generators.
   bool sourceClass = classOp->hasAttr("ly.class.source");
   if (!sourceClass)
     for (const std::string &candidate : classContractCandidates(className))
@@ -846,9 +843,6 @@ void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
   callableAlternatives = source.callableAlternatives;
   boundMethodReceiver = source.boundMethodReceiver;
   boundMethodName = source.boundMethodName;
-  coroutineTarget = source.coroutineTarget;
-  coroutineSources = source.coroutineSources;
-  coroutineSourceBundles = source.coroutineSourceBundles;
   generatorTarget = source.generatorTarget;
   generatorSources = source.generatorSources;
   generatorSourceBundles = source.generatorSourceBundles;

@@ -234,66 +234,14 @@ schedulerHappensBeforeEdges(const AtomicContract &contract) {
   auto publish = [&](llvm::StringRef resource) {
     edges.push_back({resource.str(), HappensBeforeEffect::Publish});
   };
-  auto acquire = [&](llvm::StringRef resource) {
-    edges.push_back({resource.str(), HappensBeforeEffect::Acquire});
-  };
 
-  if (contract.operationKind == AtomicOperationKind::Load) {
-    if (role == "asyncio.ready.tail.load")
-      acquire("asyncio.ready.tail");
-    else if (role == "asyncio.loop.running.load")
-      acquire("asyncio.loop.running");
-    else if (role == "asyncio.future.state.load")
-      acquire("asyncio.future.state");
-    else if (role == "asyncio.task.coroutine.target.load")
-      acquire("coroutine.target");
-    else if (role == "asyncio.task.state.load")
-      acquire("asyncio.task.state");
-    else if (role == "asyncio.task.cancel.requests.load")
-      acquire("asyncio.task.cancel.requests");
+  if (contract.operationKind == AtomicOperationKind::Load)
     return edges;
-  }
 
   if (role == "coroutine.target.publish")
     publish("coroutine.target");
   else if (role.starts_with("coroutine.state."))
     publish("coroutine.state");
-  else if (role == "asyncio.loop.running.publish")
-    publish("asyncio.loop.running");
-  else if (role == "asyncio.ready.tail.publish" ||
-           role == "asyncio.ready.enqueue")
-    publish("asyncio.ready.tail");
-  else if (role == "asyncio.ready.pop")
-    publish("asyncio.ready.head");
-  else if (role == "asyncio.timer.record" ||
-           role == "asyncio.timer.dispatch_due")
-    publish("asyncio.timer.count");
-  else if (role == "asyncio.future.state.publish" ||
-           role == "asyncio.future.cancel" ||
-           role == "asyncio.future.finish.reserve" ||
-           role == "asyncio.future.finish")
-    publish("asyncio.future.state");
-  else if (role == "asyncio.future.cancel.requests")
-    publish("asyncio.future.cancel.requests");
-  else if (role == "asyncio.future.result.token" ||
-           role == "asyncio.future.result.token.clear" ||
-           role == "asyncio.future.exception.token" ||
-           role == "asyncio.future.exception.token.clear")
-    publish("asyncio.future.payload");
-  else if (role == "asyncio.future.callback.record")
-    publish("asyncio.future.callbacks");
-  else if (role == "asyncio.task.state.publish" ||
-           role == "asyncio.task.cancel" ||
-           role == "asyncio.task.resume.begin" ||
-           role == "asyncio.task.resume.complete" ||
-           role == "asyncio.task.finish")
-    publish("asyncio.task.state");
-  else if (role == "asyncio.task.cancel.requests.publish" ||
-           role == "asyncio.task.cancel.requests" ||
-           role == "asyncio.task.uncancel")
-    publish("asyncio.task.cancel.requests");
-  else if (role == "asyncio.task.callback.record")
-    publish("asyncio.task.callbacks");
 
   return edges;
 }
@@ -303,42 +251,10 @@ std::optional<std::int64_t> expectedAtomicSlot(llvm::StringRef role) {
     return 0;
   return llvm::StringSwitch<std::optional<std::int64_t>>(role)
       .Case("coroutine.target.publish", 3)
-      .Case("asyncio.task.coroutine.target.load", 3)
       .Case("coroutine.state.resume_begin", 2)
       .Case("coroutine.state.resume_complete", 2)
       .Case("coroutine.state.resume_suspend", 2)
       .Case("coroutine.state.close", 2)
-      .Case("asyncio.loop.running.publish", 2)
-      .Case("asyncio.loop.running.load", 2)
-      .Case("asyncio.loop.stop", 3)
-      .Case("asyncio.ready.tail.publish", 5)
-      .Case("asyncio.ready.enqueue", 5)
-      .Case("asyncio.ready.tail.load", 5)
-      .Case("asyncio.ready.pop", 4)
-      .Case("asyncio.timer.record", 6)
-      .Case("asyncio.timer.dispatch_due", 6)
-      .Case("asyncio.future.state.publish", 2)
-      .Case("asyncio.future.state.load", 2)
-      .Case("asyncio.future.cancel", 2)
-      .Case("asyncio.future.cancel.requests", 3)
-      .Case("asyncio.future.finish.reserve", 2)
-      .Case("asyncio.future.finish", 2)
-      .Case("asyncio.future.result.token", 7)
-      .Case("asyncio.future.result.token.clear", 7)
-      .Case("asyncio.future.exception.token", 8)
-      .Case("asyncio.future.exception.token.clear", 8)
-      .Case("asyncio.future.callback.record", 4)
-      .Case("asyncio.task.state.publish", 2)
-      .Case("asyncio.task.state.load", 2)
-      .Case("asyncio.task.cancel", 2)
-      .Case("asyncio.task.cancel.requests.publish", 3)
-      .Case("asyncio.task.cancel.requests", 3)
-      .Case("asyncio.task.cancel.requests.load", 3)
-      .Case("asyncio.task.uncancel", 3)
-      .Case("asyncio.task.resume.begin", 2)
-      .Case("asyncio.task.resume.complete", 2)
-      .Case("asyncio.task.finish", 2)
-      .Case("asyncio.task.callback.record", 4)
       .Default(std::nullopt);
 }
 

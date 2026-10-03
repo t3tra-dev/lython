@@ -2675,6 +2675,22 @@ Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
   if (const parser::Node *dispatching =
           virtualMethodObjectDef(anchor, object, methodBinding))
     wrapped = dispatching;
+  // ⭐ ONE WRAPPER PER METHOD AND RECEIVER TYPE, registered before its body is
+  // emitted. A method that hands itself on as a callback -- a task's step
+  // scheduling the next step, `self.later.append(self.step)` -- reads its own
+  // method object inside its body, and a fresh wrapper per read emitted that
+  // body again from inside itself until the compiler's stack ran out.
+  // ⛔ Why NOT one wrapper per read site, which is what this was: the body is
+  // the method's and the captures are the receiver alone, so two reads off
+  // the same type build the same function.
+  auto wrapperKey = std::make_tuple(
+      wrapped, captures.empty() ? mlir::Type() : captures.front().value.type,
+      preboundTypeObject);
+  if (auto existing = boundMethodWrappers.find(wrapperKey);
+      existing != boundMethodWrappers.end())
+    return emitFunctionObject(anchor, existing->second,
+                              boundPublicSig.publicCallable, captures);
+  boundMethodWrappers[wrapperKey] = symbolName;
   bool pushedSuperContext = wrapped == methodBinding.method &&
                             methodBinding.kind == "instance" &&
                             !methodBinding.definingClass.empty() &&
@@ -3238,39 +3254,56 @@ Value ModuleEmitter::emitAwait(const parser::Node &expr) {
   return emitAwaitValue(expr, awaitable);
 }
 
-// `asyncio.run(coro)` drives the coroutine to completion. The accepted subset
-// executes awaited chains eagerly (see the top-level-await dispatch), so it
-// desugars to awaiting the argument; await inference then types the result
-// from the coroutine's evidence instead of the manifest contract's Any.
-Value ModuleEmitter::emitAsyncioRunCall(const parser::Node &expr) {
-  const auto *args = ast::nodeList(expr, "args");
-  const auto *keywords = ast::nodeList(expr, "keywords");
-  if (!args || args->size() != 1 || !args->front() ||
-      (keywords && !keywords->empty())) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "asyncio.run supports exactly one coroutine argument (the debug "
-        "keyword is not supported)"});
-    return emitNone(expr);
-  }
-  Value awaitable = emitExpr(args->front().get());
-  return emitAwaitValue(expr, awaitable);
-}
-
+// `await x` is `yield from` over what `x` awaits with (PEP 492): a
+// coroutine delegates to itself, anything else to the generator its
+// `__await__` returns. The coroutine body is a generator, so the
+// delegation is the state machine's -- merged, or resumed through the frame.
 Value ModuleEmitter::emitAwaitValue(const parser::Node &anchor,
                                     Value awaitable) {
-  AwaitInferenceResult inference = types.inferAwaitWithEvidence(awaitable.type);
-  return emitAwaitValue(anchor, awaitable, inference);
-}
-
-Value ModuleEmitter::emitAwaitValue(const parser::Node &anchor, Value awaitable,
-                                    const AwaitInferenceResult &inference) {
-  if (!requireStaticEvidence(anchor, inference))
+  if (!currentFunctionIsCoroutine) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "'await' outside an async function"});
     return emitNone(anchor);
-
-  auto op = py::AwaitOp::create(builder, loc(anchor), inference.resultType,
-                                inference.awaitContract, awaitable.value);
-  return {op.getResult(), inference.resultType};
+  }
+  mlir::Type type = types.widenLiteral(awaitable.type);
+  Value delegate = awaitable;
+  if (auto coroutine = mlir::dyn_cast<py::ContractType>(type);
+      !coroutine || coroutine.getContractName() != "types.CoroutineType") {
+    std::optional<Value> awaited =
+        tryEmitClassDunder(anchor, awaitable, "__await__");
+    if (!awaited) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "await needs a coroutine or an object whose class defines "
+          "__await__, got " +
+              typeText(type)});
+      return emitNone(anchor);
+    }
+    delegate = *awaited;
+    type = types.widenLiteral(delegate.type);
+  }
+  llvm::ArrayRef<mlir::Type> arguments;
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type);
+      contract && (contract.getContractName() == "types.CoroutineType" ||
+                   contract.getContractName() == "types.GeneratorType"))
+    arguments = contract.getArguments();
+  else if (auto protocol = mlir::dyn_cast<py::ProtocolType>(type);
+           protocol && protocol.getProtocolName() == "Generator")
+    arguments = protocol.getArguments();
+  if (arguments.size() != 3) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "__await__ must return a generator, and this one returns " +
+            typeText(type)});
+    return emitNone(anchor);
+  }
+  auto op = py::YieldFromOp::create(
+      builder, loc(anchor), arguments[2],
+      types.protocol("Generator",
+                     {arguments[0], arguments[1], arguments[2]}),
+      delegate.value);
+  return {op.getResult(), arguments[2]};
 }
 
 // `[expr for x in it]` desugars to a runtime-list build loop over the

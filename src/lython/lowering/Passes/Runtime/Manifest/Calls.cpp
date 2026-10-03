@@ -505,35 +505,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNew(py::NewOp op) {
   if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
           op, op.getInstance().getType(), call, result)))
     return mlir::failure();
-  if (contract == "_asyncio.Task") {
-    if (sources.empty() || !sources.front() ||
-        sources.front()->kind != RuntimeBundle::Kind::Object ||
-        sources.front()->contractName() != "types.CoroutineType" ||
-        (sources.front()->coroutineTarget.empty() &&
-         !hasAsyncioSleepEvidence(*sources.front())))
-      return op.emitError()
-             << "_asyncio.Task.__new__ requires a lowered coroutine object";
-    result.copyEvidenceFrom(*sources.front());
-    if (hasAsyncioSleepEvidence(result) &&
-        result.objectEvidence.hasFlag(kAsyncioSleepZeroDelayFlag)) {
-      if (const RuntimeValue *sleepResult =
-              result.objectEvidence.slot(kAsyncioSleepResultSlot))
-        result.objectEvidence.setSlot(kFutureResultSlot, *sleepResult);
-      std::optional<RuntimeSymbol> finish =
-          manifest.primitive("_asyncio.Task", "finish.request");
-      if (!finish)
-        return op.emitError()
-               << "runtime manifest has no _asyncio.Task.finish.request";
-      llvm::SmallVector<const RuntimeBundle *, 1> finishSources{&result};
-      llvm::SmallVector<mlir::Value, 4> finishOperands;
-      if (mlir::failed(buildRuntimeCallOperands(op, *finish, finishSources,
-                                                finishOperands,
-                                                /*allowUnusedSources=*/false)))
-        return mlir::failure();
-      RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *finish,
-                                              finishOperands);
-    }
-  }
   valueBundles[op.getInstance()] = std::move(result);
   erase.push_back(op);
   return mlir::success();

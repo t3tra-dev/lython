@@ -1251,7 +1251,10 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           !mlir::isa<py::TryOp>(op))
         unsupported = true;
     });
-    if (!hasYield && !hasYieldFrom)
+    // A coroutine that never awaits is still one: its body runs at the first
+    // resume, not at the call.
+    bool coroutine = body->hasAttr("ly.coroutine");
+    if (!hasYield && !hasYieldFrom && !coroutine)
       continue;
     if (unsupported) {
       generatorDeclineReasons[body.getSymName()] =
@@ -1268,11 +1271,18 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         body->getAttrOfType<mlir::TypeAttr>(ownership::kCallableTypeAttr);
     auto callable = mlir::dyn_cast_if_present<py::CallableType>(
         callableAttr ? callableAttr.getValue() : mlir::Type());
-    if (!callable || callable.hasVararg() || callable.hasKwarg()) {
+    if (!callable || callable.hasKwarg()) {
       generatorDeclineReasons[body.getSymName()] =
-          "it takes *args or **kwargs, which have no argument lane";
+          "it takes **kwargs, which has no argument lane";
       continue;
     }
+    // ⭐ `*args` IS ONE MORE ARGUMENT: the body receives the packed tuple as
+    // its last entry argument, and the tuple rides a lane like any other.
+    llvm::SmallVector<mlir::Type, 8> bodyArguments(
+        callable.getPositionalTypes().begin(),
+        callable.getPositionalTypes().end());
+    if (callable.hasVararg())
+      bodyArguments.push_back(callable.getVarargType());
     // Arguments: int rides the legacy (i64, i1) evidence pair; any object
     // contract with a lane shape rides its physical span (the lazy iterator
     // desugars pass lists/strs/tuples into synthetic generators, and a source
@@ -1280,7 +1290,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     // A parameter with no runtime shape falls back to the legacy tier.
     llvm::SmallVector<GeneratorResumeLane, 4> argumentLanes;
     bool argumentsEligible = true;
-    for (mlir::Type declared : callable.getPositionalTypes()) {
+    for (mlir::Type declared : bodyArguments) {
       // ⭐ A PARAMETER TYPED BY THE `Generator` PROTOCOL IS A GENERATOR. The
       // frame keeps a reference to the object it was handed, and only a
       // generator has a frame to delegate to; the lane and the clone's view
@@ -1540,7 +1550,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           returnType = operand.getType();
         }
     });
-    if (!eligible || yields.empty()) {
+    if (!eligible || (yields.empty() && !coroutine)) {
       clone.erase();
       continue;
     }
@@ -1586,9 +1596,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     // by the argument above, so the sink asks that instead of naming ops.
     {
       llvm::SmallVector<mlir::Operation *, 8> rematerializable;
+      // ⭐ AND A FUNCTION REFERENCE, which names a symbol and carries
+      // nothing: `print(await double(j))` evaluates `print` first, and the
+      // reference was live across the await with no lane to ride.
       clone.walk([&](mlir::Operation *op) {
+        bool reference = mlir::isa<py::BindingRefOp>(op);
         if (op->getNumOperands() == 0 && op->getNumResults() == 1 &&
-            op->getRegions().empty() && mlir::isMemoryEffectFree(op) &&
+            op->getRegions().empty() &&
+            (reference || mlir::isMemoryEffectFree(op)) &&
             !op->hasTrait<mlir::OpTrait::IsTerminator>())
           rematerializable.push_back(op);
       });
@@ -1707,9 +1722,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     }
 
     mlir::Type intContract = runtimeContractType(context, "builtins.int");
-    llvm::SmallVector<mlir::Type, 8> argTypes(
-        callable.getPositionalTypes().begin(),
-        callable.getPositionalTypes().end());
+    llvm::SmallVector<mlir::Type, 8> argTypes(bodyArguments.begin(),
+                                              bodyArguments.end());
     for (unsigned lane = 0; lane < kResumeControlLanes; ++lane)
       argTypes.push_back(intContract); // state, sent, inject
     for (const GeneratorResumeLane &lane : frameLanes)
@@ -1742,8 +1756,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     GeneratorResumeInfo info;
     info.cloneName = cloneName;
     info.frameWidth = frameWidth;
-    info.argumentCount = static_cast<unsigned>(
-        callable.getPositionalTypes().size());
+    info.argumentCount = static_cast<unsigned>(bodyArguments.size());
     info.argumentLanes = argumentLanes;
     info.valueLane = *valueLane;
     info.valueType =
@@ -4249,7 +4262,10 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
   mlir::Value generator = iterator.physicalValues().front();
   if (iterator.generatorSourceBundles.size() != info.argumentCount)
     return op->emitError()
-           << "generator frame source count does not match the resume clone";
+           << "generator frame source count ("
+           << iterator.generatorSourceBundles.size()
+           << ") does not match the resume clone (" << info.argumentCount
+           << ")";
 
   mlir::FailureOr<mlir::func::FuncOp> driver =
       raiseWhenExhausted
@@ -4327,7 +4343,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
                  op.getOperation(), *info)
            : RuntimeBundleLowerer::getOrCreateGeneratorDispatch(
                  op.getOperation(), op.getResult(0).getType(),
-                 GeneratorDriverKind::Throw);
+                 GeneratorDriverKind::Throw,
+                 RuntimeBundleLowerer::generatorReturnType(receiver.contract));
   if (mlir::failed(throwFn))
     return mlir::failure();
 
@@ -4526,6 +4543,18 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
       !isNoneLike(returnType) && !isIntContract(returnType))
     returnKey = generatorLaneKey(returnType);
   auto returnsHere = [&](const GeneratorResumeInfo &info) {
+    // ⭐ A resume that raises the exhaustion StopIteration -- next(), send(),
+    // throw() -- renders the returned value, so its candidates are those the
+    // receiver's type lets return there; a coroutine returning a list cannot
+    // be the one a `CoroutineType[object, None, None]` names.
+    if ((kind == GeneratorDriverKind::Advance ||
+         kind == GeneratorDriverKind::Throw) &&
+        returnType) {
+      if (!info.returnType)
+        return true; // returns no value, so renders none
+      return !isNoneLike(returnType) &&
+             py::isSubtypeOf(info.returnType, returnType);
+    }
     if (kind != GeneratorDriverKind::StepFull)
       return true;
     if (info.returnLane.isControl())
@@ -4574,12 +4603,22 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
     }
     auto body = module.lookupSymbol<mlir::func::FuncOp>(target);
     bool mayBeHere = false;
-    if (body)
+    if (body) {
       body.walk([&](py::YieldValueOp yield) {
         if (yield->getNumOperands() != 0 &&
             mayYieldHere(yield->getOperand(0).getType()))
           mayBeHere = true;
       });
+      // A body that only delegates -- every coroutine -- yields what its
+      // declared type says.
+      if (auto publicType =
+              body->getAttrOfType<mlir::TypeAttr>(kGeneratorPublicResultAttr))
+        if (auto generator =
+                mlir::dyn_cast<py::ContractType>(publicType.getValue());
+            generator && !generator.getArguments().empty() &&
+            mayYieldHere(generator.getArguments().front()))
+          mayBeHere = true;
+    }
     if (!mayBeHere)
       continue;
     std::string reason;
@@ -4604,13 +4643,13 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
                         elementContract)
                            .str();
   // A box serves every union, and which targets join depends on the union;
-  // a StepFull's targets depend on what it returns as well.
-  if (elementContract == "builtins.object" ||
-      kind == GeneratorDriverKind::StepFull) {
+  // a StepFull's targets depend on what it returns as well, and so do those
+  // of a resume that renders the return.
+  if (elementContract == "builtins.object" || returnType) {
     std::string text;
     llvm::raw_string_ostream stream(text);
     stream << elementType;
-    if (kind == GeneratorDriverKind::StepFull)
+    if (returnType)
       stream << "->" << returnType;
     symbol += "$" + llvm::utohexstr(llvm::xxh3_64bits(text));
   }
@@ -4685,14 +4724,16 @@ mlir::FailureOr<RuntimeBundleLowerer::SourceGeneratorResumeResult>
 RuntimeBundleLowerer::emitDispatchedGeneratorResume(
     mlir::Operation *op, const RuntimeBundle &iterator, mlir::Type elementType,
     bool raiseWhenExhausted,
-    std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence) {
+    std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence,
+    mlir::Type returnType) {
   if (iterator.physicalValues().empty())
     return op->emitError() << "generator object has no physical storage";
   mlir::FailureOr<mlir::func::FuncOp> dispatch =
       RuntimeBundleLowerer::getOrCreateGeneratorDispatch(
           op, elementType,
           raiseWhenExhausted ? GeneratorDriverKind::Advance
-                             : GeneratorDriverKind::Step);
+                             : GeneratorDriverKind::Step,
+          raiseWhenExhausted ? returnType : mlir::Type());
   if (mlir::failed(dispatch))
     return mlir::failure();
   mlir::Location loc = op->getLoc();
@@ -4875,12 +4916,48 @@ RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
   function.setPrivate();
   RuntimeBundleLowerer::copyGeneratorDriverContract(*stored, function,
                                                     /*dropped=*/0);
-  function->setAttr(ownership::kOwnedResultsAttr,
-                    mlir::DenseI64ArrayAttr::get(
-                        context, llvm::ArrayRef<std::int64_t>{begin}));
-  function->setAttr(
-      ownership::kOwnedResultContractsAttr,
-      builder.getArrayAttr({builder.getStringAttr("builtins.object")}));
+  // The stored driver's owned results, with the yielded span replaced by
+  // the box. ⛔ Not the box alone: a StepFull's returned value is owned too,
+  // and an adapter that did not say so released it before returning it
+  // (`await task` over a `Task[str]`).
+  {
+    llvm::SmallVector<std::int64_t, 4> owned;
+    llvm::SmallVector<mlir::Attribute, 4> contracts;
+    auto storedOwned =
+        (*stored)->getAttrOfType<mlir::DenseI64ArrayAttr>(
+            ownership::kOwnedResultsAttr);
+    auto storedContracts = (*stored)->getAttrOfType<mlir::ArrayAttr>(
+        ownership::kOwnedResultContractsAttr);
+    bool boxPlaced = false;
+    auto placeBox = [&] {
+      if (boxPlaced)
+        return;
+      owned.push_back(begin);
+      contracts.push_back(builder.getStringAttr("builtins.object"));
+      boxPlaced = true;
+    };
+    if (storedOwned)
+      for (auto [position, index] :
+           llvm::enumerate(storedOwned.asArrayRef())) {
+        if (index >= static_cast<std::int64_t>(begin))
+          placeBox();
+        if (index >= static_cast<std::int64_t>(begin) &&
+            index < static_cast<std::int64_t>(begin + width))
+          continue;
+        owned.push_back(index < static_cast<std::int64_t>(begin)
+                            ? index
+                            : index - static_cast<std::int64_t>(width) + 1);
+        contracts.push_back(storedContracts &&
+                                    position < storedContracts.size()
+                                ? storedContracts[position]
+                                : builder.getStringAttr("builtins.object"));
+      }
+    placeBox();
+    function->setAttr(ownership::kOwnedResultsAttr,
+                      mlir::DenseI64ArrayAttr::get(context, owned));
+    function->setAttr(ownership::kOwnedResultContractsAttr,
+                      builder.getArrayAttr(contracts));
+  }
   mlir::Block *entry = function.addEntryBlock();
   builder.setInsertionPointToStart(entry);
   auto call =
@@ -5053,6 +5130,19 @@ mlir::Type RuntimeBundleLowerer::concreteGeneratorType(mlir::Type type) {
     return type;
   return py::ContractType::get(type.getContext(), "types.GeneratorType",
                                protocol.getArguments());
+}
+
+// What a generator of this static type returns: the third argument of
+// `types.GeneratorType[Y, S, R]` or of a `Generator` protocol; null when the
+// type does not say.
+mlir::Type RuntimeBundleLowerer::generatorReturnType(mlir::Type generator) {
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(generator))
+    if (contract.getArguments().size() == 3)
+      return contract.getArguments()[2];
+  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(generator))
+    if (protocol.getArguments().size() == 3)
+      return protocol.getArguments()[2];
+  return {};
 }
 
 } // namespace py::lowering
