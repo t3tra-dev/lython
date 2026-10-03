@@ -20,7 +20,15 @@ module attributes {
   ly.runtime.only_with = "ly.js.host",
   ly.runtime.contracts = ["_js.JsProxy"],
   ly.typing.module = "_js",
-  ly.typing.class_exports = ["_js.JsProxy=_js.JsProxy"]
+  ly.typing.class_exports = ["_js.JsProxy=_js.JsProxy"],
+  // What runtime/lib/_js_bridge.py keeps callbacks with.
+  ly.typing.callable_exports = ["_js.function_for", "_js.callback_slot", "_js.fail_callback"],
+  ly.typing.function_names = ["_js.function_for", "_js.callback_slot", "_js.fail_callback"],
+  ly.typing.function_contracts = [
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["slot"], arg_defaults = [false], returns = [!py.contract<"_js.JsProxy">]>,
+    !py.callable<[], returns = [!py.contract<"builtins.int">]>,
+    !py.callable<[!py.contract<"builtins.str">], arg_names = ["message"], arg_defaults = [false], returns = [!py.literal<None>]>
+  ]
 } {
   // The internal methods are what a read typed with a union dispatches on
   // (ModuleEmitter::adaptJsHostResult): a test per member, then the
@@ -31,7 +39,7 @@ module attributes {
     method_names = ["__ly_js_is_none__", "__ly_js_is_bool__", "__ly_js_is_int__",
                     "__ly_js_is_float__", "__ly_js_is_str__", "__ly_js_as_bool__",
                     "__ly_js_as_int__", "__ly_js_as_float__", "__ly_js_as_str__",
-                    "__ly_js_as_proxy__"],
+                    "__ly_js_as_proxy__", "__ly_js_instanceof__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.bool">]>,
@@ -42,10 +50,12 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.float">]>,
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"_js.JsProxy">]>
+      !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"_js.JsProxy">]>,
+      !py.protocol<"Callable", [!py.contract<"_js.JsProxy">, !py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
 
   // ===== host imports =====
@@ -72,6 +82,9 @@ module attributes {
   func.func private @LyJs_Is(i32, i32) -> i32
   // A second handle to the same value.
   func.func private @LyJs_Dup(i32) -> i32
+  // `value instanceof constructor`; -1 when the host throws (a constructor
+  // that is not callable).
+  func.func private @LyJs_InstanceOf(i32, i32) -> i32
   func.func private @LyJs_ToF64(i32) -> f64
   func.func private @LyJs_ToI64(i32) -> i64
   // ⛔ i32 and not `index`: on wasm64 an `index` result is a BigInt the host
@@ -81,6 +94,11 @@ module attributes {
   func.func private @LyJs_StrWrite(i32, index, index)
   // The parked message as a host string, and clears it.
   func.func private @LyJs_TakeError() -> i32
+  // A host function that calls the program back with `slot`; the slot of the
+  // callback being run; that callback's exception, as the one value pushed.
+  func.func private @LyJs_MakeFunction(i32) -> i32
+  func.func private @LyJs_CurrentSlot() -> i32
+  func.func private @LyJs_SetCallbackError()
 
   // ===== from builtins =====
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
@@ -90,6 +108,7 @@ module attributes {
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1)
   func.func private @LyLong_Repr(%header: memref<2xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0]}
+  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]}
 
   // ===== the proxy object =====
   // Words: refcount, class id, handle. Width 17 is this contract's alone
@@ -374,5 +393,36 @@ module attributes {
     %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
     %copy = func.call @LyJs_Dup(%handle) : (i32) -> i32
     func.return %copy : i32
+  }
+
+  func.func @LyJsProxy_InstanceOf(%proxy: memref<17xi64> {ly.ownership.object_header}, %constructor: memref<17xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "instanceof"} {
+    %value = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+    %class = func.call @LyJsProxy_Handle(%constructor) : (memref<17xi64>) -> i32
+    %raw = func.call @LyJs_InstanceOf(%value, %class) : (i32, i32) -> i32
+    %answer = func.call @__ly_js_checked(%raw) : (i32) -> i32
+    %zero = arith.constant 0 : i32
+    %is = arith.cmpi ne, %answer, %zero : i32
+    func.return %is : i1
+  }
+
+  // ===== callbacks (runtime/lib/_js_bridge.py) =====
+  func.func @LyJs_FunctionFor(%slot: i64) -> memref<17xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_js.function_for", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "function_for", ly.runtime.result_contract = "_js.JsProxy"} {
+    %slot32 = arith.trunci %slot : i64 to i32
+    %handle = func.call @LyJs_MakeFunction(%slot32) : (i32) -> i32
+    %proxy = func.call @LyJsProxy_New(%handle) : (i32) -> memref<17xi64>
+    func.return %proxy : memref<17xi64>
+  }
+
+  func.func @LyJs_CallbackSlot() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_js.callback_slot", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "callback_slot", ly.runtime.result_contract = "builtins.int"} {
+    %slot32 = func.call @LyJs_CurrentSlot() : () -> i32
+    %slot = arith.extsi %slot32 : i32 to i64
+    %boxed = func.call @LyLong_FromI64(%slot) : (i64) -> memref<2xi64>
+    func.return %boxed : memref<2xi64>
+  }
+
+  func.func @LyJs_FailCallback(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) attributes {ly.runtime.builtin = "_js.fail_callback", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "fail_callback", ly.runtime.result_contract = "types.NoneType"} {
+    func.call @LyJsProxy_PushStr(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> ()
+    func.call @LyJs_SetCallbackError() : () -> ()
+    func.return
   }
 }

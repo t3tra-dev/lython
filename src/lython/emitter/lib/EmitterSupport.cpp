@@ -1,4 +1,6 @@
 #include "EmitterSupport.h"
+#include "JsHost.h"
+#include "PyProtocols.h"
 
 #include "AstAccess.h"
 #include "EmitterPyOps.h"
@@ -357,6 +359,40 @@ mlir::Type removeNoneFromType(mlir::Type type, TypeSystem &types) {
   return sawNone ? types.join(payloads) : mlir::Type{};
 }
 
+bool isJsHostType(mlir::Type type, const TypeSystem &types) {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  if (!contract)
+    return false;
+  if (contract.getContractName() == py::kJsProxyContract)
+    return true;
+  return py::protocols::Table::get(types.getContext())
+      .isManifestSubclassOf(type, py::kJsProxyContract);
+}
+
+// `isinstance(x, HTMLInputElement)`: the second argument is the host's
+// constructor -- a value, typed by the stub's facade class -- and what it
+// tests for is the class its `new` makes.
+static std::optional<mlir::Type> jsConstructedType(mlir::Type constructor,
+                                                   TypeSystem &types) {
+  if (!isJsHostType(constructor, types))
+    return std::nullopt;
+  mlir::Type constructed;
+  for (const py::protocols::ContractResolution &candidate :
+       py::protocols::Table::get(types.getContext())
+           .methodContractCandidatesWithEvidence(constructor, "new")) {
+    llvm::ArrayRef<mlir::Type> results =
+        candidate.method.signature.getResultTypes();
+    if (results.size() != 1 || !isJsHostType(results.front(), types))
+      return std::nullopt;
+    if (constructed && constructed != results.front())
+      return std::nullopt;
+    constructed = results.front();
+  }
+  if (!constructed)
+    return std::nullopt;
+  return constructed;
+}
+
 std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
                                                TypeSystem &types) {
   if (!node)
@@ -396,6 +432,9 @@ std::optional<mlir::Type> isinstanceTargetType(const parser::Node *node,
           }
           return annotated;
         }
+  if (std::optional<mlir::Type> constructed =
+          jsConstructedType(inferred, types))
+    return constructed;
   auto typeObject = mlir::dyn_cast_if_present<py::TypeType>(inferred);
   if (!typeObject)
     return std::nullopt;
@@ -608,6 +647,32 @@ IsInstanceAnalysis analyzeIsInstance(mlir::Type sourceType,
     analysis.kind = IsInstanceAnalysis::Kind::AlwaysFalse;
     analysis.falseType = analysis.sourceType;
   };
+
+  // ⛔ A host class is answered here and nowhere below: the tests below
+  // compare Lython class ids, and every JavaScript value has one class id,
+  // `_js.JsProxy`'s -- a class test would say yes or no about nothing.
+  if (isJsHostType(analysis.targetType, types)) {
+    if (isJsHostType(analysis.sourceType, types)) {
+      if (isinstanceClassMatch(analysis.sourceType, analysis.targetType, types,
+                               from)) {
+        setAlwaysTrue();
+        return analysis;
+      }
+      analysis.kind = IsInstanceAnalysis::Kind::HostTest;
+      analysis.trueType = analysis.targetType;
+      analysis.falseType = analysis.sourceType;
+      return analysis;
+    }
+    if (mlir::isa<py::UnionType>(analysis.sourceType)) {
+      analysis.failureReason =
+          "isinstance against a JavaScript class needs a JavaScript value; "
+          "narrow " +
+          typeText(analysis.sourceType) + " to one first";
+      return analysis;
+    }
+    setAlwaysFalse();
+    return analysis;
+  }
 
   if (isinstanceClassMatch(analysis.sourceType, analysis.targetType, types,
                            from)) {

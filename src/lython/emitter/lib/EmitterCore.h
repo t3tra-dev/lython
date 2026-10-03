@@ -24,6 +24,10 @@ struct StubContractPolicy {
   // static is called with the constructor as `this`, and the stub's
   // `X.new(...)` is how `new X(...)` is spelled.
   bool staticMethodsTakeTheValue = false;
+  // A base every class gets ahead of `object`: for `js`, `_js.JsProxy`, which
+  // is what each of its values is at run time and what tells a host class
+  // from a program's own class of the same name.
+  std::string commonBase;
 };
 
 // The JavaScript host's `js` module: the stub the compiler ships, not a file
@@ -58,12 +62,26 @@ private:
   void predeclareTopLevel();
   void predeclareSourceModules();
   void declareJsHostModule();
+  FunctionSignature
+  importedFunctionSignature(const EmitOptions::SourceModule &source,
+                            const std::vector<parser::NodePtr> &body,
+                            const parser::Node &function);
+  llvm::StringSet<> importedSignatureScopes;
   // A value of one of the host's `js` contracts (EmitterImports.cpp).
   bool isJsHostValueType(mlir::Type type) const;
   // A host member read or call whose declared type is a union: the host's
   // value is taken as it comes and dispatched to the member it is.
   Value adaptJsHostResult(const parser::Node &anchor, mlir::Operation *op,
                           Value declared);
+  // A Python callable where a host member takes a callback (docs/js-host.md).
+  Value wrapJsCallback(const parser::Node &anchor, py::CallableType declared,
+                       Value callable);
+  void wrapJsCallbackArguments(const parser::Node &anchor,
+                               CallInferenceResult &inference,
+                               CallOperands &operands);
+  // One synthesized wrapper per (declared callback type, callable's type).
+  llvm::DenseMap<std::pair<mlir::Type, mlir::Type>, std::string>
+      jsCallbackWrappers;
   void emitTopLevelDeclarations();
   void emitSourceModuleDeclarations();
   void bindSourceModuleLocals(llvm::StringRef moduleName,

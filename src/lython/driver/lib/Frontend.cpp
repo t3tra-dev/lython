@@ -532,6 +532,21 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
           driverOptions.releaseMode,
           codeGenTripleForTarget({}, driverOptions).isOSEmscripten(), diag)))
     return failure();
+  // A program that reaches the host's `js` can hand it callbacks, and the
+  // callbacks' table and entry point are Python (runtime/lib/_js_bridge.py):
+  // compiled with the program as if it had imported them.
+  if (llvm::any_of(localSources, [](const ParsedLocalSourceModule &source) {
+        return source.moduleName == kJsHostModule && source.isEmbedded;
+      })) {
+    lython::parser::ParseResult bridgeImport =
+        lython::parser::parse("import _js_bridge\n", sourcePath.str(), options);
+    if (!bridgeImport.ok() ||
+        failed(collectLocalSourceModules(
+            *bridgeImport.tree, importBaseDir, mainPackageName, sourcePath,
+            localSources, seenSourceModules, visitingSourceModules,
+            driverOptions.releaseMode, /*hasJsHost=*/true, diag)))
+      return failure();
+  }
 
   lython::emitter::EmitResult emitted;
   {

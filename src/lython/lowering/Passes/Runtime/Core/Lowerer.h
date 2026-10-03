@@ -78,7 +78,14 @@ public:
   mlir::LogicalResult lowerModule();
 
 private:
-  enum class DeadObjectStorage { OwningHeap, StaticNonOwning };
+  // StaticMergeableUnion: StaticNonOwning, with an immortal header at each
+  // union member's first lane rather than lane 0 only -- for a value on an
+  // edge that never runs but that a merge still balances with a retain.
+  enum class DeadObjectStorage {
+    OwningHeap,
+    StaticNonOwning,
+    StaticMergeableUnion
+  };
 
   struct EmittedRuntimeCall {
     RuntimeSymbol symbol;
@@ -600,6 +607,9 @@ private:
                              llvm::StringRef purpose);
   mlir::FailureOr<RuntimeValue>
   materializeNonOwningDeadObjectValue(mlir::Operation *op, mlir::Type contract,
+                                      llvm::StringRef purpose);
+  mlir::FailureOr<RuntimeValue>
+  materializeMergeableDeadObjectValue(mlir::Operation *op, mlir::Type contract,
                                       llvm::StringRef purpose);
   mlir::FailureOr<RuntimeValue>
   materializeDeadObjectValueImpl(mlir::Operation *op, mlir::Type contract,

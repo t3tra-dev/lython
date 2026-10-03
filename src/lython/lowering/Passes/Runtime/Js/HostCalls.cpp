@@ -9,6 +9,7 @@
 #include "JsHost.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace py::lowering {
 namespace {
@@ -76,6 +77,42 @@ RuntimeBundleLowerer::jsMemberNameOperands(mlir::Operation *op,
 mlir::LogicalResult
 RuntimeBundleLowerer::pushJsValue(mlir::Operation *op,
                                   const RuntimeBundle &source) {
+  // A union pushes the member it holds: one branch per member on the tag,
+  // each pushing that member's lanes as the member.
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(
+          source.objectValue.contract)) {
+    mlir::ValueRange lanes = source.physicalValues();
+    if (lanes.empty())
+      return op->emitError() << "JavaScript argument union has no tag";
+    mlir::Value tag = lanes.front();
+    for (auto [index, member] : llvm::enumerate(unionType.getMemberTypes())) {
+      mlir::FailureOr<unsigned> offset =
+          RuntimeBundleLowerer::unionMemberValueOffset(
+              op, unionType, static_cast<unsigned>(index),
+              "JavaScript argument");
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, member,
+                                                     "JavaScript argument");
+      if (mlir::failed(offset) || mlir::failed(memberTypes))
+        return mlir::failure();
+      mlir::Value expected = mlir::arith::ConstantIntOp::create(
+          builder, op->getLoc(), static_cast<std::int64_t>(index), 64);
+      mlir::Value holds = mlir::arith::CmpIOp::create(
+          builder, op->getLoc(), mlir::arith::CmpIPredicate::eq, tag, expected);
+      auto branch = mlir::scf::IfOp::create(builder, op->getLoc(), holds,
+                                            /*withElseRegion=*/false);
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(branch.thenBlock()->getTerminator());
+      // Borrowed: the union keeps its member, and a push reads without
+      // taking.
+      RuntimeBundle held = RuntimeBundle::objectWithOwnership(
+          member, lanes.slice(*offset, memberTypes->size()),
+          ownership::OwnershipKind::Borrow);
+      if (mlir::failed(pushJsValue(op, held)))
+        return mlir::failure();
+    }
+    return mlir::success();
+  }
   std::string contract = source.contractName();
   if (contract == "types.NoneType")
     return callJsPrimitive(op, "push.none", {});
@@ -246,6 +283,27 @@ RuntimeBundleLowerer::lowerJsMethodCall(py::CallOp op, RuntimeBundle receiver,
               op, op.getResult(0),
               runtimeContractType(context, "builtins.bool"),
               is->getResults())))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
+    if (methodName == "__ly_js_instanceof__") {
+      llvm::SmallVector<const RuntimeBundle *, 1> sources;
+      if (mlir::failed(collectPackedObjectSources(
+              op, op.getPosargs(), "isinstance constructor", sources)) ||
+          sources.size() != 1 || !sources.front())
+        return op.emitError() << "isinstance against a JavaScript class needs "
+                                 "the constructor";
+      llvm::SmallVector<mlir::Value, 2> operands(
+          receiver.physicalValues().begin(), receiver.physicalValues().end());
+      operands.append(sources.front()->physicalValues().begin(),
+                      sources.front()->physicalValues().end());
+      mlir::FailureOr<mlir::func::CallOp> is =
+          callJsPrimitive(op, "instanceof", operands);
+      if (mlir::failed(is) ||
+          mlir::failed(RuntimeBundleLowerer::assignObjectBundle(
+              op, op.getResult(0),
+              runtimeContractType(context, "builtins.bool"), is->getResults())))
         return mlir::failure();
       erase.push_back(op);
       return mlir::success();

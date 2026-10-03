@@ -2121,3 +2121,38 @@ TEST(EmitterTest, AJsGlobalIsTypedByTheStub) {
   EXPECT_NE(refused.find("'bit_length'"), std::string::npos) << refused;
   EXPECT_NE(refused.find("__add__"), std::string::npos) << refused;
 }
+
+// What: an `Any` result is a bare JavaScript value with no members until an
+// isinstance against a host class narrows it; isinstance of a union against
+// one is refused, since the host can only test a JavaScript value.
+TEST(EmitterTest, AnIsinstanceAgainstAHostClassNarrows) {
+  auto emitFor = [](llvm::StringRef source, std::string &diagnostics) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    llvm::raw_string_ostream diag(diagnostics);
+    lython::driver::DriverOptions options;
+    options.targetTriple = "wasm32-unknown-emscripten";
+    return mlir::succeeded(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", options, context, module,
+        diag));
+  };
+  std::string narrowed;
+  EXPECT_TRUE(emitFor("from js import JSON, URLSearchParams\n"
+                      "v = JSON.parse(\"{}\")\n"
+                      "if isinstance(v, URLSearchParams):\n"
+                      "    print(v.toString())\n",
+                      narrowed))
+      << narrowed;
+  std::string refused;
+  EXPECT_FALSE(emitFor("from js import JSON, URLSearchParams\n"
+                       "v = JSON.parse(\"{}\")\n"
+                       "print(v.toString())\n"
+                       "o = URLSearchParams.new(\"a=1\").get(\"a\")\n"
+                       "print(isinstance(o, URLSearchParams))\n",
+                       refused));
+  EXPECT_NE(refused.find("does not provide manifest method 'toString'"),
+            std::string::npos)
+      << refused;
+  EXPECT_NE(refused.find("needs a JavaScript value"), std::string::npos)
+      << refused;
+}

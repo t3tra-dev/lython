@@ -540,6 +540,17 @@ std::vector<std::string> jsHostImports(const llvm::Module &module) {
   return names;
 }
 
+// The C functions the host calls the program back through (LyJs_Dispatch,
+// LyJs_Release: installJsHostEntryPoints), when the program has them.
+std::vector<std::string> jsHostExports(const llvm::Module &module) {
+  std::vector<std::string> names;
+  for (const llvm::Function &function : module)
+    if (!function.isDeclaration() && function.getName().starts_with("LyJs_") &&
+        function.hasExternalLinkage())
+      names.push_back(function.getName().str());
+  return names;
+}
+
 // emcc's view of the host functions: the core (runtime/js/lython_js.js) as a
 // --pre-js, and a --js-library naming each import as a call into it.
 //
@@ -549,6 +560,7 @@ std::vector<std::string> jsHostImports(const llvm::Module &module) {
 // when the browser target drops it.
 LogicalResult appendEmscriptenJsHostArgs(
     std::vector<std::string> &args, llvm::ArrayRef<std::string> imports,
+    llvm::ArrayRef<std::string> exports,
     std::vector<std::unique_ptr<llvm::FileRemover>> &cleanup) {
   if (imports.empty())
     return success();
@@ -577,11 +589,18 @@ LogicalResult appendEmscriptenJsHostArgs(
     return success();
   };
   std::string adapter = "addToLibrary({\n"
-                        "  $lythonJs: 'LythonJs.create(() => wasmMemory)',\n";
+                        "  $lythonJs: 'LythonJs.create(() => wasmMemory, "
+                        "() => wasmExports)',\n";
   for (const std::string &name : imports)
     adapter += "  " + name + "__deps: ['$lythonJs'],\n  " + name +
                ": (...args) => lythonJs." + name + "(...args),\n";
   adapter += "});\n";
+  if (!exports.empty()) {
+    std::string exported = "-sEXPORTED_FUNCTIONS=_main";
+    for (const std::string &name : exports)
+      exported += ",_" + name;
+    args.push_back(exported);
+  }
   if (failed(writeTemporary("core.js", kLythonJsCore, "--pre-js")) ||
       failed(writeTemporary("library.js", adapter, "--js-library")))
     return failure();
@@ -591,7 +610,8 @@ LogicalResult appendEmscriptenJsHostArgs(
 LogicalResult linkExecutable(StringRef objectPath,
                              py::TensorLoweringTarget tensorTarget,
                              StringRef outputPath,
-                             llvm::ArrayRef<std::string> jsImports) {
+                             llvm::ArrayRef<std::string> jsImports,
+                             llvm::ArrayRef<std::string> jsExports) {
   std::optional<LinkerDriver> linker = findExecutableLinkerDriver(tensorTarget);
   if (!linker)
     return failure();
@@ -613,7 +633,8 @@ LogicalResult linkExecutable(StringRef objectPath,
   if (linker->flavor == LinkerDriverFlavor::Emscripten) {
     appendEmscriptenLinkArgs(argStorage,
                              codeGenTripleForTarget(tensorTarget, Options));
-    if (failed(appendEmscriptenJsHostArgs(argStorage, jsImports, jsHostFiles)))
+    if (failed(appendEmscriptenJsHostArgs(argStorage, jsImports, jsExports,
+                                          jsHostFiles)))
       return failure();
   } else if (linker->flavor == LinkerDriverFlavor::WASI) {
     appendWASILinkArgs(argStorage,
@@ -644,10 +665,12 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
   }
   llvm::FileRemover objCleanup(objectPath);
   std::vector<std::string> jsImports = jsHostImports(llvmModule);
+  std::vector<std::string> jsExports = jsHostExports(llvmModule);
   if (failed(
           emitObjectFile(llvmModule, safetyProfile, tensorTarget, objectPath)))
     return failure();
-  if (failed(linkExecutable(objectPath, tensorTarget, outputPath, jsImports)))
+  if (failed(linkExecutable(objectPath, tensorTarget, outputPath, jsImports,
+                            jsExports)))
     return failure();
   return success();
 }

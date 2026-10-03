@@ -30,6 +30,16 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   `X.new(...)` は `new X(...)` を表す。
 - スタブのエイリアス (`type BodyInit = ...`) は契約を組み立てる間だけ束縛し、
   プログラムの名前空間には出さない。
+- グローバルと同名のクラスは、注釈の中でだけ効くエイリアスとして束縛する
+  (`def f(p: URLSearchParams)`, `"js.Object"`)。値として読めばグローバル。
+- スタブのクラスはすべて `_js.JsProxy` を基底に持つ。JS 値かどうかの判定
+  (`isJsHostType`) はこの関係で行う。そのため、プログラム自身の `js.py` の
+  クラスとは混同しない。
+- `isinstance(x, C)` で C がホストのコンストラクタのとき (`new` の結果が T)、
+  T に対する JS の `instanceof` を実行時に行い、真の側で x を T に絞り込む
+  (`IsInstanceAnalysis::Kind::HostTest`)。Lython の class id の比較には決して
+  回さない (JS 値の class id はすべて同じなので、答えにならない)。union の値は
+  先に None などを外す必要があり、そうでなければ拒否する。
 
 ## 表現: 1 つの runtime 契約
 
@@ -72,15 +82,43 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   だけになる。本体を `lython_js` などの import モジュールとして渡す自前の
   loader を書けばよい。
 
-## 未実装 (段階 2 以降)
+## コールバック
 
-- コールバック (Python の callable を JS 関数として渡す)。寿命は
-  `FinalizationRegistry` で管理する。境界をまたぐ循環参照はリークする
-  (Pyodide と同じ)。
+スタブが callback を受け取ると宣言している引数に Python の callable (関数、
+クロージャ、bound method) を渡すと、JS 側には呼び出すとそれを実行する JS 関数が
+渡る。
+
+- 受け渡しの側ごとに、emitter が包み関数 `__ly_js_wrap$K` を合成する。K は、
+  宣言された callback の型と callable 自身の型の組で決まる。包み関数は、利用者の
+  callable を引数なしのクロージャで包み、ブリッジ (`runtime/lib/_js_bridge.py`)
+  に登録して、その slot の JS 関数を得る。
+- クロージャの中では、JS の引数を `js.$arg$<i>$<K>` というホストグローバル
+  として読む。型は宣言された引数の型で、変換は他のホストの値と同じ。結果は、
+  内部用のホストのクラス `js.$CallbackFrame` の `set_result` で返す。
+  callable が値を返すなら、宣言が `Any` でも返す (JSON の reviver の結果は、JS が
+  保持する値だから)。`$` はプログラムが書けない名前なので、衝突しない。
+- JS から呼ばれる入口は、引数も戻り値もない Python 関数 `_js_bridge.dispatch`
+  1 つだけ。lyc が LLVM の段で C の入口 `LyJs_Dispatch` (解放は
+  `LyJs_Release`) を作り、Emscripten から export する。
+- 例外は `dispatch` が捕まえる。JS の関数は、`"<型>: <メッセージ>"` を持つ
+  Error を投げる。それがホストの呼び出しから戻ると、Python 側では RuntimeError
+  になる。
+- 寿命: JS の関数が回収されたら、`FinalizationRegistry` が slot を外す。
+  回収は JS のイベントループで走るので、同期的なループの中で作ったコールバックは
+  main が終わるまで残る (実測で 1 個あたり約 1 KB)。境界をまたぐ循環参照は
+  リークする (Pyodide と同じ)。
+- 制限:
+  - lambda の引数には、宣言された型が伝わらない (注釈が必要)。
+  - main が返ると Emscripten がランタイムを終えるので、非同期に呼ばれる
+    コールバック (`setTimeout` など) は、段階 3 のイベントループと一緒に扱う。
+  - 属性に callable を代入する形 (`el.onclick = f`) は未対応で、lowering が
+    拒否する。
+
+## 未実装 (段階 3 以降)
+
 - `await` による Promise の待機。WebLoop 方式を採る。待つ間は wasm から JS に
   戻り、Promise の解決で再開する。JSPI はランタイムの対応待ち。ただし、
   サスペンドを抽象の後ろに置き、JSPI のバックエンドを足せる形にしておく。
-- `isinstance(x, js.Element)` による絞り込み (JS の `instanceof`)。
 - `to_js` / `to_py` (list、dict、TypedDict の変換)。
 - グローバルへの代入と、union 型のグローバルの読み出し。今は lowering が
   拒否する。

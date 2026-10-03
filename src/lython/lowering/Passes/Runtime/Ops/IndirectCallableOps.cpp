@@ -607,7 +607,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   if (mlir::failed(RuntimeBundleLowerer::emitRuntimeException(
           op, "builtins.TypeError", "callable target is not available")))
     return mlir::failure();
-  mlir::FailureOr<RuntimeValue> dead = materializeDeadObjectValue(
+  // ⛔ The immortal placeholder and not fresh storage: this edge follows a
+  // raise and never reaches the merge, but the merge still balances it, and a
+  // zeroed allocation has no header a retain can be written against -- a
+  // union result was refused ("the header prefix cannot be spelled") for
+  // `f(1)` on a captured `Callable[[int], Box | None]`.
+  mlir::FailureOr<RuntimeValue> dead = materializeMergeableDeadObjectValue(
       op, op.getResult(0).getType(), "indirect callable dispatch miss");
   if (mlir::failed(dead))
     return mlir::failure();
