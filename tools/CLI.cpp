@@ -100,6 +100,7 @@
 #include "Common/Instrumentation.h"
 #include "Common/LoweringPipeline.h"
 #include "Common/RuntimeLibrary.h"
+#include "Common/LibcPrototypes.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/UnwindABI.h"
 #include "embedded.h"
@@ -219,6 +220,21 @@ LogicalResult runCppParserDump(StringRef inputPath, bool typeComments,
   llvm::outs() << lython::parser::dumpAst(*result.tree, includeAttributes)
                << "\n";
   return success();
+}
+
+// The runtime linked in, its allocator in place of malloc, then libc declared
+// as the target's C does it. In that order: the allocator redirect matches
+// `malloc` and `LyMem_Alloc` by type, and on a 32-bit target the C prototype
+// makes them differ -- the free went to LyMem_Free while the malloc stayed
+// libc's.
+LogicalResult linkRuntime(llvm::Module &llvmModule) {
+  if (failed(py::runtime_library::linkEmbeddedNativeRuntime(llvmModule)))
+    return failure();
+  lython::driver::redirectAllocationsToObjectAllocator(
+      llvmModule, Options.sanitizers.address || Options.sanitizers.leak ||
+                      Options.sanitizers.thread);
+  return py::runtime_library::declareLibcWithTargetPrototypes(llvmModule,
+                                                              llvm::errs());
 }
 
 // Last, because every check above reads the landingpad shape the native
@@ -445,8 +461,10 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
 
 // The output is whatever emcc makes of `-o`: `x.js` / `x.mjs` a loader beside
 // `x.wasm`, and no extension a node script with a shebang.
-void appendEmscriptenLinkArgs(std::vector<std::string> &args) {
-  args.emplace_back("-m64");
+void appendEmscriptenLinkArgs(std::vector<std::string> &args,
+                              const llvm::Triple &triple) {
+  if (triple.isArch64Bit())
+    args.emplace_back("-m64");
   // Links the libunwind whose `_Unwind_RaiseException` is a wasm `throw`, and
   // the personality the funclet pads name (UnwindABI.h).
   args.emplace_back("-fwasm-exceptions");
@@ -497,7 +515,8 @@ LogicalResult linkExecutable(StringRef objectPath,
   appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
   if (linker->flavor == LinkerDriverFlavor::Emscripten) {
-    appendEmscriptenLinkArgs(argStorage);
+    appendEmscriptenLinkArgs(argStorage,
+                             codeGenTripleForTarget(tensorTarget, Options));
   } else {
     // Parallel kernel dispatch calls pthread_create; Darwin ships it in
     // libSystem, but Linux toolchains still want the explicit flag.
@@ -733,11 +752,8 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
     llvmModule->setTargetTriple(jit->getTargetTriple());
     {
       PerfScope perf("jit-build.link-runtime");
-      if (failed(py::runtime_library::linkEmbeddedNativeRuntime(*llvmModule)))
+      if (failed(linkRuntime(*llvmModule)))
         return failure();
-      lython::driver::redirectAllocationsToObjectAllocator(
-          *llvmModule, Options.sanitizers.address || Options.sanitizers.leak ||
-                           Options.sanitizers.thread);
       if (!Options.releaseMode)
         collectLinkedLLVMSafetyContracts(*llvmModule, safetyProfile);
     }
@@ -1099,11 +1115,8 @@ int main(int argc, char **argv) {
                                               Options, llvm::errs())))
     return 1;
 
-  if (failed(py::runtime_library::linkEmbeddedNativeRuntime(llvmModule)))
+  if (failed(linkRuntime(llvmModule)))
     return 1;
-  lython::driver::redirectAllocationsToObjectAllocator(
-      llvmModule, Options.sanitizers.address || Options.sanitizers.leak ||
-                      Options.sanitizers.thread);
   rewriteExceptionPersonalityForTarget(llvmModule);
 
   if (failed(installAOTEntryPoint(llvmModule, llvm::errs())))

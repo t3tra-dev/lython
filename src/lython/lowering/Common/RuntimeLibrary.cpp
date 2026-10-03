@@ -1,5 +1,7 @@
 #include "Common/RuntimeLibrary.h"
 
+#include "Common/LibcPrototypes.h"
+
 #include "Common/RuntimeSupport.h"
 #include "Common/UnwindABI.h"
 #include "Common/RuntimeSupportBuilder.h"
@@ -231,24 +233,43 @@ mlir::LogicalResult applyEmbeddedLoweringStrategies(mlir::ModuleOp module) {
 namespace {
 
 // Platform-specific runtime modules carry an `_<os>` name suffix (the
-// pre-lowered runtime-internal lib modules are compiled once per triple);
-// only the module matching the final target triple links.
+// pre-lowered runtime-internal lib modules are compiled once per triple), with
+// `32` appended for an ILP32 build: their ctypes structs are laid out at the
+// pointer width they were lowered for. Only the module matching the final
+// target triple links.
+constexpr llvm::StringLiteral kPlatformSuffixes[] = {
+    "_darwin",  "_linux",      "_linux32",
+    "_windows", "_emscripten", "_emscripten32"};
+
 bool isPlatformNativeSupport(llvm::StringRef name) {
-  return name.ends_with("_darwin") || name.ends_with("_linux") ||
-         name.ends_with("_windows") || name.ends_with("_emscripten");
+  return llvm::any_of(kPlatformSuffixes, [&](llvm::StringRef suffix) {
+    return name.ends_with(suffix);
+  });
+}
+
+std::string platformSuffixFor(const llvm::Triple &triple) {
+  std::string suffix;
+  if (triple.isOSDarwin())
+    suffix = "_darwin";
+  else if (triple.isOSLinux())
+    suffix = "_linux";
+  else if (triple.isOSWindows())
+    suffix = "_windows";
+  else if (triple.isOSEmscripten())
+    suffix = "_emscripten";
+  else
+    return "";
+  if (triple.isArch32Bit())
+    suffix += "32";
+  return suffix;
 }
 
 bool shouldLinkEmbeddedLLVMRuntimeModule(llvm::StringRef name,
                                          const llvm::Triple &targetTriple) {
-  if (name.ends_with("_darwin"))
-    return targetTriple.isOSDarwin();
-  if (name.ends_with("_linux"))
-    return targetTriple.isOSLinux();
-  if (name.ends_with("_windows"))
-    return targetTriple.isOSWindows();
-  if (name.ends_with("_emscripten"))
-    return targetTriple.isOSEmscripten();
-  return true;
+  if (!isPlatformNativeSupport(name))
+    return true;
+  std::string suffix = platformSuffixFor(targetTriple);
+  return !suffix.empty() && name.ends_with(suffix);
 }
 
 void registerNativeRuntimeDialects(mlir::DialectRegistry &registry) {
@@ -294,30 +315,6 @@ mlir::LogicalResult lowerNativeRuntimeModule(mlir::ModuleOp module) {
   return pm.run(module);
 }
 
-// MLIR's `cf.assert` lowering declares `void puts(ptr)`; C says `int`. A
-// native call ignores the return register either way, but wasm links calls by
-// signature: wasm-ld replaces a mismatched import with a stub that traps when
-// the failed assertion tries to print. Redeclared here, after every module
-// that can carry the MLIR spelling has been linked in.
-void givePutsItsCPrototype(llvm::Module &module) {
-  llvm::Function *puts = module.getFunction("puts");
-  if (!puts || !puts->isDeclaration() || !puts->getReturnType()->isVoidTy())
-    return;
-  auto *type = llvm::FunctionType::get(
-      llvm::Type::getInt32Ty(module.getContext()),
-      puts->getFunctionType()->params(), /*isVarArg=*/false);
-  puts->setName("");
-  llvm::Function *declared = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "puts", module);
-  for (llvm::User *user : llvm::make_early_inc_range(puts->users())) {
-    auto *call = llvm::cast<llvm::CallInst>(user);
-    llvm::SmallVector<llvm::Value *, 1> args(call->args());
-    llvm::CallInst::Create(declared, args, "", call->getIterator());
-    call->eraseFromParent();
-  }
-  puts->eraseFromParent();
-}
-
 } // namespace
 
 mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
@@ -329,15 +326,30 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
   mlir::MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
+  // The ctypes symbols the embedded modules declare. Read before lowering,
+  // where the declarations still say so (`ly.native.symbol`), and marked on
+  // the linked module once every declaration of each has merged.
+  llvm::SmallVector<std::string, 8> ctypesSymbols;
+
   // Lowers a native-runtime MLIR module to LLVM and links it into llvmModule.
   auto lowerTranslateAndLink =
       [&](mlir::ModuleOp nativeModule,
           llvm::StringRef label) -> mlir::LogicalResult {
+    py::collectCtypesForeignSymbols(nativeModule, ctypesSymbols);
     if (mlir::failed(lowerNativeRuntimeModule(nativeModule))) {
       llvm::errs() << "error: failed to lower native runtime module '" << label
                    << "'\n";
       return mlir::failure();
     }
+    // ⛔ The layout goes on BEFORE translation, not after. Translating folds
+    // a constant struct GEP into byte offsets with whatever layout the module
+    // has then -- LLVM's default, 8-byte pointers -- and a `setDataLayout`
+    // afterwards changes the label, not the offsets: on armv7 the runtime
+    // wrote `g_current_parts` as 120 bytes of LP64 descriptors that every
+    // reader read as 96.
+    nativeModule->setAttr(mlir::LLVM::LLVMDialect::getDataLayoutAttrName(),
+                          mlir::StringAttr::get(nativeModule.getContext(),
+                                                llvmModule.getDataLayoutStr()));
     std::unique_ptr<llvm::Module> runtime =
         mlir::translateModuleToLLVMIR(nativeModule, llvmModule.getContext());
     if (!runtime) {
@@ -399,7 +411,9 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
       return mlir::failure();
 
   py::branchLocalRaisesToTheirHandler(llvmModule);
-  givePutsItsCPrototype(llvmModule);
+  for (const std::string &symbol : ctypesSymbols)
+    if (llvm::Function *function = llvmModule.getFunction(symbol))
+      function->addFnAttr(kCtypesForeignSymbolAttr);
   if (py::runtime_library::framePointersEnableCompactUnwind(targetTriple))
     py::forceFramePointers(llvmModule);
 

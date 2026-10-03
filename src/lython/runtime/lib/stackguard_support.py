@@ -15,8 +15,9 @@ pointers pre-resolved at install time into module globals.
 Layout notes (mirrors the retired hand-written native modules):
   - darwin  stack_t {ss_sp, ss_size, ss_flags}; sigaction {handler, mask:u32,
     flags}; si_addr at siginfo+24; SIGBUS=10; SA_ONSTACK|SA_SIGINFO = 0x41.
-  - linux   glibc stack_t {ss_sp, ss_flags, pad, ss_size}; sigaction
-    {handler, mask:128B, flags, restorer}; si_addr at siginfo+16; SIGBUS=7;
+  - linux   glibc stack_t {ss_sp, ss_flags, ss_size}; sigaction
+    {handler, mask:128B, flags, restorer}, both at natural alignment; si_addr
+    at siginfo+16 (LP64) or +12 (ILP32, measured on armv7); SIGBUS=7;
     SA_ONSTACK|SA_SIGINFO = 0x08000004.
   - windows SetUnhandledExceptionFilter; EXCEPTION_STACK_OVERFLOW =
     0xC00000FD (-1073741571 signed).
@@ -67,32 +68,49 @@ class LinuxStackT(ctypes.Structure):
     _fields_ = [
         ("ss_sp", ctypes.c_void_p),
         ("ss_flags", ctypes.c_int),
-        ("ss_pad", ctypes.c_int),
-        ("ss_size", ctypes.c_long),
+        ("ss_size", ctypes.c_size_t),
     ]
 
 
+# sigset_t is 128 bytes on every Linux ABI, so it is spelled in 4-byte words:
+# words as wide as a pointer would make it 64 bytes on a 32-bit target and
+# move sa_flags off its offset (132 there, 136 on LP64).
 class LinuxSigAction(ctypes.Structure):
     _fields_ = [
         ("sa_handler", ctypes.c_void_p),
-        ("m0", ctypes.c_long),
-        ("m1", ctypes.c_long),
-        ("m2", ctypes.c_long),
-        ("m3", ctypes.c_long),
-        ("m4", ctypes.c_long),
-        ("m5", ctypes.c_long),
-        ("m6", ctypes.c_long),
-        ("m7", ctypes.c_long),
-        ("m8", ctypes.c_long),
-        ("m9", ctypes.c_long),
-        ("m10", ctypes.c_long),
-        ("m11", ctypes.c_long),
-        ("m12", ctypes.c_long),
-        ("m13", ctypes.c_long),
-        ("m14", ctypes.c_long),
-        ("m15", ctypes.c_long),
+        ("m0", ctypes.c_uint),
+        ("m1", ctypes.c_uint),
+        ("m2", ctypes.c_uint),
+        ("m3", ctypes.c_uint),
+        ("m4", ctypes.c_uint),
+        ("m5", ctypes.c_uint),
+        ("m6", ctypes.c_uint),
+        ("m7", ctypes.c_uint),
+        ("m8", ctypes.c_uint),
+        ("m9", ctypes.c_uint),
+        ("m10", ctypes.c_uint),
+        ("m11", ctypes.c_uint),
+        ("m12", ctypes.c_uint),
+        ("m13", ctypes.c_uint),
+        ("m14", ctypes.c_uint),
+        ("m15", ctypes.c_uint),
+        ("m16", ctypes.c_uint),
+        ("m17", ctypes.c_uint),
+        ("m18", ctypes.c_uint),
+        ("m19", ctypes.c_uint),
+        ("m20", ctypes.c_uint),
+        ("m21", ctypes.c_uint),
+        ("m22", ctypes.c_uint),
+        ("m23", ctypes.c_uint),
+        ("m24", ctypes.c_uint),
+        ("m25", ctypes.c_uint),
+        ("m26", ctypes.c_uint),
+        ("m27", ctypes.c_uint),
+        ("m28", ctypes.c_uint),
+        ("m29", ctypes.c_uint),
+        ("m30", ctypes.c_uint),
+        ("m31", ctypes.c_uint),
         ("sa_flags", ctypes.c_int),
-        ("sa_pad", ctypes.c_int),
         ("sa_restorer", ctypes.c_void_p),
     ]
 
@@ -157,7 +175,10 @@ def LyStackGuard_HandlerLinux(sig: int, info: int, ctx: int) -> int:
     lo = g_limit
     if lo == 0:
         return 0
-    fault = ctypes.c_long.from_address(info + 16).value
+    # si_addr follows si_signo, si_errno and si_code at pointer alignment.
+    fault = ctypes.c_long.from_address(
+        info + (16 if sys.maxsize > 2147483647 else 12)
+    ).value
     if fault >= lo - 262144:
         if fault < lo + 4096:
             WPROTO = ctypes.CFUNCTYPE(
@@ -383,7 +404,6 @@ def LyRt_InstallStackGuard() -> None:
     alt = LinuxStackT()
     alt.ss_sp = altbuf
     alt.ss_flags = 0
-    alt.ss_pad = 0
     alt.ss_size = 524288
     sigaltstack_fn = libc["sigaltstack"]
     sigaltstack_fn.restype = ctypes.c_int

@@ -27,14 +27,18 @@ std::uint64_t expectedCLongWidth(llvm::StringRef tripleText,
 
 bool isSupportedNativeTarget(llvm::StringRef tripleText) {
   llvm::Triple triple(tripleText);
-  // ⛔ wasm64 only. The runtime spells size_t, ssize_t and off_t as i64 in
-  // every libc declaration it emits, and wasm32 checks call signatures at
-  // link time: wasm-ld turns each mismatched import into an `unreachable`
-  // stub, so a wasm32 build links and then traps inside `malloc`. wasm64's
-  // libc is LP64, which is what those declarations already say.
+  return triple.isOSEmscripten() || triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
+}
+
+bool hasMeasured32BitLibc(const llvm::Triple &triple) {
   if (triple.isOSEmscripten())
-    return triple.getArch() == llvm::Triple::wasm64;
-  return triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
+    return triple.getArch() == llvm::Triple::wasm32;
+  return triple.isOSLinux() && triple.getArch() == llvm::Triple::arm &&
+         triple.isGNUEnvironment();
+}
+
+bool callsAreCheckedBySignature(llvm::StringRef tripleText) {
+  return llvm::Triple(tripleText).isWasm();
 }
 
 std::optional<TargetPlatformFacts>
@@ -68,11 +72,15 @@ mlir::LogicalResult verifyTargetPlatformFacts(mlir::ModuleOp module) {
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
            << "' has unknown architecture";
-  if (triple.isOSEmscripten() && triple.getArch() == llvm::Triple::wasm32)
+  // ⛔ Only the 32-bit targets whose libc was MEASURED. Every C struct the
+  // runtime reads moves with the target's widths and its symbol choices, and
+  // a guessed layout reads the wrong words silently; the measurements are
+  // HostTargetLayout's (lowering/Common/SupportBuilder.h).
+  if (triple.isArch32Bit() && !hasMeasured32BitLibc(triple))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
-           << "' is not supported: the runtime declares libc with 64-bit "
-              "size_t; use wasm64-unknown-emscripten";
+           << "' is not supported: no measured libc layout for this 32-bit "
+              "target (armv7 glibc and wasm32 Emscripten are)";
   if (!isSupportedNativeTarget(tripleAttr.getValue()))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()

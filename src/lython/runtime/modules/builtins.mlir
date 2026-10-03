@@ -2233,19 +2233,16 @@ module attributes {
     %true_v = arith.constant true
     %c2 = arith.constant 2 : i64
     %c3 = arith.constant 3 : i64
-    %c7 = arith.constant 7 : i64
-    %c12 = arith.constant 12 : i64
-    %c14 = arith.constant 14 : i64
+    %part0 = arith.constant 0 : i64
+    %part1 = arith.constant 1 : i64
+    %field_aligned = arith.constant 1 : i64
+    %field_size = arith.constant 3 : i64
 
-    // Borrowed member views out of a parked chain node.
-    //
-    // DO NOT REORDER `ExceptionChainNode` WITHOUT CHANGING THESE. The offsets
-    // are that struct's (SupportBuilder.h), spelled here
-    // as word indices because a manifest body has no way to name a C++ struct.
-    // Nothing checks the two agree -- when the node stopped being 21 untyped
-    // words and became a struct, these kept working only because that change
-    // preserved every offset. A reordering would not fail to build; it would
-    // read the wrong field.
+    // Borrowed member views out of a parked chain node, each field's address
+    // from `__ly_chain_node_part_field` (the node's own struct type, laid out
+    // for the target). These were word indices -- 2, 7, 12, 14 -- which are
+    // the LP64 offsets and nothing else: on armv7 word 2 is the header's
+    // offset field, not its pointer.
     //
     // The clause cells and the node's aligned members hold POINTERS, so they
     // are loaded as pointers. The narrowing at the view calls is the one place
@@ -2258,7 +2255,7 @@ module attributes {
       %i64v = arith.index_cast %i : index to i64
       %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr
       %node_ptr = llvm.load %node_slot : !llvm.ptr -> !llvm.ptr
-      %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh_slot = func.call @__ly_chain_node_part_field(%node_ptr, %part0, %field_aligned) : (!llvm.ptr, i64, i64) -> !llvm.ptr
       %eh_ptr = llvm.load %eh_slot : !llvm.ptr -> !llvm.ptr
       %class_slot = llvm.getelementptr %eh_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
       %class_id = llvm.load %class_slot : !llvm.ptr -> i64
@@ -2284,16 +2281,16 @@ module attributes {
       %i64v = arith.index_cast %i : index to i64
       %node_slot = llvm.getelementptr %nodes_ptr[%i64v] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr
       %node_ptr = llvm.load %node_slot : !llvm.ptr -> !llvm.ptr
-      %eh_slot = llvm.getelementptr %node_ptr[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %eh_slot = func.call @__ly_chain_node_part_field(%node_ptr, %part0, %field_aligned) : (!llvm.ptr, i64, i64) -> !llvm.ptr
       %eh_aligned = llvm.load %eh_slot : !llvm.ptr -> !llvm.ptr
       %eh_word = llvm.ptrtoint %eh_aligned : !llvm.ptr to i64
-      %mh_slot = llvm.getelementptr %node_ptr[%c7] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mh_slot = func.call @__ly_chain_node_part_field(%node_ptr, %part1, %field_aligned) : (!llvm.ptr, i64, i64) -> !llvm.ptr
       %mh_aligned = llvm.load %mh_slot : !llvm.ptr -> !llvm.ptr
       %mh_word = llvm.ptrtoint %mh_aligned : !llvm.ptr to i64
-      %mb_slot = llvm.getelementptr %node_ptr[%c12] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %mb_slot = func.call @__ly_chain_node_part_field(%node_ptr, %c2, %field_aligned) : (!llvm.ptr, i64, i64) -> !llvm.ptr
       %mb_aligned = llvm.load %mb_slot : !llvm.ptr -> !llvm.ptr
       %mb_word = llvm.ptrtoint %mb_aligned : !llvm.ptr to i64
-      %len_slot = llvm.getelementptr %node_ptr[%c14] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %len_slot = func.call @__ly_chain_node_part_field(%node_ptr, %c2, %field_size) : (!llvm.ptr, i64, i64) -> !llvm.ptr
       %mb_len = llvm.load %len_slot : !llvm.ptr -> i64
       %eh_dyn = func.call @__ly_global_view_i64(%eh_word, %c3) : (i64, i64) -> memref<?xi64>
       %eh_view = memref.cast %eh_dyn : memref<?xi64> to memref<3xi64>
@@ -2356,6 +2353,7 @@ module attributes {
   // One declaration per element type so the func-level signature type-checks;
   // narrow to a static shape with memref.cast at the call site.
   func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
+  func.func private @__ly_chain_node_part_field(%node: !llvm.ptr, %section: i64, %field: i64) -> !llvm.ptr
   func.func private @__ly_global_view_i32(%pointer: i64, %size: i64) -> memref<?xi32>
   func.func private @__ly_global_view_f64(%pointer: i64, %size: i64) -> memref<?xf64>
   func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>

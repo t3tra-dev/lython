@@ -1,5 +1,6 @@
 add_library(LythonRuntimeLowering STATIC
     Common/Instrumentation.cpp
+    Common/LibcPrototypes.cpp
     Common/RuntimeLibrary.cpp
     Common/HostSupportBuilder.cpp
     Common/OsSupportBuilder.cpp

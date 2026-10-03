@@ -7,6 +7,7 @@
 #include "DriverCodeGen.h"
 
 #include "Common/RuntimeLibrary.h"
+#include "Common/LibcPrototypes.h"
 #include "Common/RuntimeSupport.h"
 #include "Common/SupportBuilder.h"
 #include "Runtime/ABI/BoxLayout.h"
@@ -29,6 +30,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
@@ -1842,6 +1844,13 @@ lython::driver::VerifiedLLVMModule compileAndLinkFor(llvm::StringRef source,
     ADD_FAILURE() << "runtime link failed for " << triple.str();
     return {};
   }
+  lython::driver::redirectAllocationsToObjectAllocator(
+      *result.verified.llvmModule, /*bypass=*/false);
+  if (mlir::failed(py::runtime_library::declareLibcWithTargetPrototypes(
+          *result.verified.llvmModule, diag))) {
+    ADD_FAILURE() << triple.str() << "\n" << diagnostics;
+    return {};
+  }
   return std::move(result.verified);
 }
 
@@ -1935,16 +1944,28 @@ TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
   EXPECT_TRUE(puts->getReturnType()->isIntegerTy(32));
 }
 
-// What: wasm32 Emscripten is refused by name before lowering, pointing at
-// wasm64, rather than compiled against a libc it would misdeclare.
-TEST(DriverTest, AWasm32TargetIsRefusedByName) {
-  lython::driver::DriverOptions options;
-  options.targetTriple = "wasm32-unknown-emscripten";
-  CompileResult result = compileSource("print(1)\n", options);
-  EXPECT_FALSE(result.succeeded);
-  EXPECT_NE(result.diagnostics.find("use wasm64-unknown-emscripten"),
-            std::string::npos)
-      << result.diagnostics;
+// What: a 32-bit target compiles only where its libc was measured -- armv7
+// glibc and wasm32 Emscripten -- and any other is refused before lowering
+// rather than read through guessed struct layouts.
+TEST(DriverTest, A32BitTargetCompilesOnlyWhereItsLibcWasMeasured) {
+  for (const char *triple :
+       {"armv7-unknown-linux-gnueabihf", "wasm32-unknown-emscripten"}) {
+    lython::driver::DriverOptions options;
+    options.targetTriple = triple;
+    CompileResult result = compileSource("print(1)\n", options);
+    EXPECT_TRUE(result.succeeded) << triple << "\n" << result.diagnostics;
+  }
+  for (const char *triple :
+       {"i686-unknown-linux-gnu", "riscv32-unknown-linux-gnu"}) {
+    lython::driver::DriverOptions options;
+    options.targetTriple = triple;
+    CompileResult result = compileSource("print(1)\n", options);
+    EXPECT_FALSE(result.succeeded) << triple;
+    EXPECT_NE(result.diagnostics.find("no measured libc layout"),
+              std::string::npos)
+        << triple << "\n"
+        << result.diagnostics;
+  }
 }
 
 // What: where the target's malloc promises less than 16-byte alignment
@@ -1976,4 +1997,164 @@ TEST(DriverTest, TheObjectAllocatorAlignsWhereMallocDoesNot) {
   ASSERT_TRUE(host.llvmModule);
   EXPECT_TRUE(callsFrom(*host.llvmModule, "LyMem_Alloc", "malloc"));
   EXPECT_FALSE(callsFrom(*host.llvmModule, "LyMem_Alloc", "aligned_alloc"));
+}
+
+namespace {
+
+const char *ctypesAddressSource(bool withPrototype) {
+  return withPrototype ? "import ctypes\n"
+                         "libc = ctypes.CDLL(None)\n"
+                         "w = libc[\"write\"]\n"
+                         "w.restype = ctypes.c_long\n"
+                         "w.argtypes = [ctypes.c_int, ctypes.c_void_p, "
+                         "ctypes.c_long]\n"
+                         "addr: int = ctypes.cast(w, ctypes.c_void_p).value\n"
+                         "print(addr != 0)\n"
+                       : "import ctypes\n"
+                         "libc = ctypes.CDLL(None)\n"
+                         "w = libc[\"write\"]\n"
+                         "addr: int = ctypes.cast(w, ctypes.c_void_p).value\n"
+                         "print(addr != 0)\n";
+}
+
+} // namespace
+
+// What: a ctypes symbol whose address is taken is declared with the prototype
+// its restype/argtypes name, not as `void (...)` -- on wasm the declaration is
+// the import's signature, and `write` is also the runtime's own import.
+TEST(DriverTest, ACtypesSymbolAddressIsDeclaredWithItsPrototype) {
+  lython::driver::DriverOptions options;
+  options.targetTriple = "wasm64-unknown-emscripten";
+  CompileResult result = compileSource(ctypesAddressSource(true), options);
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *write = result.verified.llvmModule->getFunction("write");
+  ASSERT_NE(write, nullptr);
+  llvm::LLVMContext &context = result.verified.llvmModule->getContext();
+  llvm::FunctionType *expected = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context),
+      {llvm::Type::getInt32Ty(context), llvm::PointerType::getUnqual(context),
+       llvm::Type::getInt64Ty(context)},
+      /*isVarArg=*/false);
+  EXPECT_EQ(write->getFunctionType(), expected);
+}
+
+// What: without a restype the prototype is unknown. A native target links the
+// address by name and compiles it; wasm would import `write` with a made-up
+// signature, so it is refused and the message says what to set.
+TEST(DriverTest, AnUntypedCtypesSymbolAddressIsRefusedOnWasm) {
+  lython::driver::DriverOptions wasm;
+  wasm.targetTriple = "wasm64-unknown-emscripten";
+  CompileResult refused = compileSource(ctypesAddressSource(false), wasm);
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_NE(refused.diagnostics.find("needs its prototype: set restype"),
+            std::string::npos)
+      << refused.diagnostics;
+
+  CompileResult host = compileSource(ctypesAddressSource(false));
+  EXPECT_TRUE(host.succeeded) << host.diagnostics;
+}
+
+// What: the ILP32 libc facts, as measured -- armv7 glibc 2.36 built with
+// _FILE_OFFSET_BITS=64 and _TIME_BITS=64, and wasm32 Emscripten's musl.
+TEST(DriverTest, ILP32TargetsReadTheirMeasuredLayouts) {
+  py::runtime_library::HostTargetLayout arm =
+      py::runtime_library::hostTargetLayout(
+          llvm::Triple("armv7-unknown-linux-gnueabihf"));
+  EXPECT_EQ(arm.errnoNumbering, py::exceptions::ErrnoNumbering::Linux);
+  EXPECT_EQ(arm.mallocAlignment, 8);
+  EXPECT_EQ(arm.statDev[0], 0);
+  EXPECT_EQ(arm.statDev[1], 8);
+  EXPECT_EQ(arm.statIno[0], 8);
+  EXPECT_EQ(arm.statMode[0], 16);
+  EXPECT_EQ(arm.statNlink[0], 20);
+  EXPECT_EQ(arm.statNlink[1], 4);
+  EXPECT_EQ(arm.statUid[0], 24);
+  EXPECT_EQ(arm.statGid[0], 28);
+  EXPECT_EQ(arm.statSize[0], 40);
+  EXPECT_EQ(arm.statAtime[0], 64);
+  EXPECT_EQ(arm.statMtime[0], 80);
+  EXPECT_EQ(arm.statCtime[0], 96);
+  EXPECT_EQ(arm.timespecNsec[0], 8);
+  EXPECT_EQ(arm.timespecNsec[1], -4);
+  EXPECT_EQ(arm.tmGmtoff[0], 36);
+  EXPECT_EQ(arm.tmGmtoff[1], -4);
+
+  py::runtime_library::HostTargetLayout wasm =
+      py::runtime_library::hostTargetLayout(
+          llvm::Triple("wasm32-unknown-emscripten"));
+  EXPECT_EQ(wasm.errnoNumbering, py::exceptions::ErrnoNumbering::WASI);
+  EXPECT_EQ(wasm.mallocAlignment, 8);
+  EXPECT_EQ(wasm.statDev[1], 4);
+  EXPECT_EQ(wasm.statMode[0], 4);
+  EXPECT_EQ(wasm.statNlink[0], 8);
+  EXPECT_EQ(wasm.statNlink[1], 4);
+  EXPECT_EQ(wasm.statUid[0], 12);
+  EXPECT_EQ(wasm.statGid[0], 16);
+  EXPECT_EQ(wasm.statSize[0], 24);
+  EXPECT_EQ(wasm.statAtime[0], 40);
+  EXPECT_EQ(wasm.statMtime[0], 56);
+  EXPECT_EQ(wasm.statCtime[0], 72);
+  EXPECT_EQ(wasm.statIno[0], 88);
+  EXPECT_EQ(wasm.tmGmtoff[0], 36);
+}
+
+// What: after the runtime link on armv7, libc is declared as C declares it
+// there -- size_t and long 32-bit, the time64/LFS symbols for the struct
+// readers -- the allocator still stands in for malloc, and the runtime's
+// struct offsets are armv7's: nothing stores past the 96 bytes
+// `ExceptionParts` occupies with 4-byte pointers.
+TEST(DriverTest, AnArmv7RuntimeIsBuiltForArmv7) {
+  lython::driver::VerifiedLLVMModule result =
+      compileAndLinkFor("import os\n"
+                        "print(os.stat('.').st_mode != 0)\n",
+                        "armv7-unknown-linux-gnueabihf");
+  ASSERT_TRUE(result.llvmModule);
+  llvm::Module &module = *result.llvmModule;
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *ptr = llvm::PointerType::getUnqual(context);
+
+  const llvm::Function *fwrite = module.getFunction("fwrite");
+  ASSERT_NE(fwrite, nullptr);
+  EXPECT_EQ(fwrite->getFunctionType(),
+            llvm::FunctionType::get(i32, {ptr, i32, i32, ptr}, false));
+  EXPECT_EQ(module.getFunction("stat"), nullptr);
+  EXPECT_NE(module.getFunction("__stat64_time64"), nullptr);
+  EXPECT_EQ(module.getFunction("clock_gettime"), nullptr);
+
+  for (const llvm::Function &function : module) {
+    if (function.isDeclaration() || function.getName().starts_with("LyMem_"))
+      continue;
+    for (const llvm::BasicBlock &block : function)
+      for (const llvm::Instruction &instruction : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          if (const llvm::Function *callee = call->getCalledFunction())
+            EXPECT_NE(callee->getName(), "malloc")
+                << function.getName().str()
+                << " calls libc malloc beside LyMem_Free";
+  }
+
+  const llvm::GlobalVariable *parts = module.getNamedGlobal("g_current_parts");
+  ASSERT_NE(parts, nullptr);
+  std::uint64_t bytes =
+      module.getDataLayout().getTypeAllocSize(parts->getValueType());
+  EXPECT_EQ(bytes, 96u);
+  for (const llvm::User *user : parts->users()) {
+    const auto *gep = llvm::dyn_cast<llvm::GEPOperator>(user);
+    if (!gep)
+      continue;
+    llvm::APInt offset(64, 0);
+    if (gep->accumulateConstantOffset(module.getDataLayout(), offset))
+      EXPECT_LT(offset.getZExtValue(), bytes);
+  }
+
+  // A catch pad names no Python class under the C++ ABI's personality, which
+  // would read the clause as a std::type_info.
+  for (const llvm::Function &function : module)
+    for (const llvm::BasicBlock &block : function)
+      if (const auto *pad = block.getLandingPadInst())
+        for (unsigned index = 0; index < pad->getNumClauses(); ++index)
+          EXPECT_TRUE(
+              llvm::isa<llvm::ConstantPointerNull>(pad->getClause(index)))
+              << function.getName().str();
 }

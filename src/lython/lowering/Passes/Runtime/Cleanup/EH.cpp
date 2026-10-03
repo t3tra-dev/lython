@@ -1,5 +1,6 @@
 #include "Common/PythonSourceRange.h"
 #include "Common/RuntimeSupport.h"
+#include "Common/LibcPrototypes.h"
 #include "Common/UnwindABI.h"
 
 #include "Native.h"
@@ -450,19 +451,28 @@ llvm::Constant *exceptionTypeGlobal(llvm::Module &module, std::int64_t classId) 
 // answer during the SEARCH phase, which is what keeps a frame that does not
 // handle this exception from being entered at all.
 //
-// ⛔ Such a pad is ALSO a cleanup, and that is not optional. A Python frame puts
-// itself in the traceback by being entered; a frame skipped for not handling the
-// exception would vanish from what the program prints, which is a wrong answer
-// rather than a slow one. The cleanup entry brings it back in the second phase,
-// where the selector tells the two apart.
+// ⛔ Such a pad is ALSO a cleanup, and that is not optional. A Python frame
+// puts itself in the traceback by being entered; a frame skipped for not
+// handling the exception would vanish from what the program prints, which is a
+// wrong answer rather than a slow one. The cleanup entry brings it back in the
+// second phase, where the selector tells the two apart.
+//
+// ⛔ ONLY UNDER THE PYTHON PERSONALITY. The clauses point at `__ly_exc_type_*`
+// words that only LyEH_Personality knows how to read; the C++ ABI's
+// personality takes a clause for a `std::type_info` and calls into it --
+// ARM EHABI's `__cxa_type_match` faulted on the first `except ValueError`
+// a raise had to reach on armv7. Elsewhere every pad stays a catch-all.
 llvm::LandingPadInst *createCatchLandingPad(llvm::IRBuilder<> &builder,
                                             llvm::StringRef name,
-                                            llvm::BasicBlock *dispatch) {
+                                            llvm::BasicBlock *dispatch,
+                                            const llvm::Triple &triple) {
   llvm::LLVMContext &context = builder.getContext();
   llvm::StructType *landingPadType = llvm::StructType::get(
       llvm::PointerType::getUnqual(context), llvm::Type::getInt32Ty(context));
   std::optional<llvm::SmallVector<std::int64_t, 4>> ids =
-      handledClassIds(dispatch);
+      py::runtime_library::usePythonPersonality(triple)
+          ? handledClassIds(dispatch)
+          : std::nullopt;
   llvm::LandingPadInst *landingPad =
       builder.CreateLandingPad(landingPadType, ids ? ids->size() : 1, name);
   if (!ids) {
@@ -477,10 +487,11 @@ llvm::LandingPadInst *createCatchLandingPad(llvm::IRBuilder<> &builder,
   return landingPad;
 }
 
-llvm::BasicBlock *
-buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
-                              llvm::DILocation &debugLoc,
-                              const PythonCallSiteRange *site) {
+llvm::BasicBlock *buildPythonCatchDispatchBlock(llvm::CallInst &call,
+                                                llvm::BasicBlock *catchDest,
+                                                llvm::DILocation &debugLoc,
+                                                const PythonCallSiteRange *site,
+                                                const llvm::Triple &triple) {
   llvm::Function *function = call.getFunction();
   llvm::Module *module = function->getParent();
   llvm::LLVMContext &context = module->getContext();
@@ -488,7 +499,7 @@ buildPythonCatchDispatchBlock(llvm::CallInst &call, llvm::BasicBlock *catchDest,
       llvm::BasicBlock::Create(context, "py.try.catch", function, catchDest);
   llvm::IRBuilder<> builder(landing);
   llvm::LandingPadInst *landingPad =
-      createCatchLandingPad(builder, "py.catch.lpad", catchDest);
+      createCatchLandingPad(builder, "py.catch.lpad", catchDest, triple);
   llvm::Value *exceptionObject =
       builder.CreateExtractValue(landingPad, {0}, "py.catch.exception");
   // Same rule as the cleanup pads: raise primitives already recorded their
@@ -625,7 +636,7 @@ bool convertCallToPythonTryInvoke(
       [&](llvm::BasicBlock *, llvm::DILocation &debugLoc) {
         return buildPythonCatchDispatchBlock(
             call, marker.catchBlock, debugLoc,
-            matchCallSiteRange(call, callSites, debugLoc));
+            matchCallSiteRange(call, callSites, debugLoc), triple);
       });
 }
 
@@ -665,9 +676,12 @@ void markCLibraryDeclarationsNonUnwinding(
     if (!function.isDeclaration() || function.isIntrinsic())
       continue;
     llvm::StringRef name = function.getName();
+    if (foreign.contains(name)) {
+      function.addFnAttr(py::runtime_library::kCtypesForeignSymbolAttr);
+      continue;
+    }
     if (name.starts_with("Ly") || name.starts_with("__ly") ||
-        name.starts_with("_Unwind") || name.starts_with("__gxx_personality") ||
-        foreign.contains(name))
+        name.starts_with("_Unwind") || name.starts_with("__gxx_personality"))
       continue;
     function.setDoesNotThrow();
   }
@@ -803,7 +817,11 @@ void forceFramePointers(llvm::Module &module) {
 
 void collectCtypesForeignSymbols(mlir::ModuleOp module,
                                  llvm::SmallVectorImpl<std::string> &symbols) {
-  module.walk([&](mlir::func::FuncOp function) {
+  // A `func.func` before the LLVM conversion, an `llvm.func` after it -- the
+  // pre-lowered runtime modules are the second.
+  module.walk([&](mlir::Operation *function) {
+    if (!mlir::isa<mlir::func::FuncOp, mlir::LLVM::LLVMFuncOp>(function))
+      return;
     if (auto symbol = function->getAttrOfType<mlir::StringAttr>(
             py::native::kNativeSymbolAttr))
       symbols.push_back(symbol.getValue().str());

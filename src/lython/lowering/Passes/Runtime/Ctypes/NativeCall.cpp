@@ -1,5 +1,81 @@
 #include "Runtime/Ctypes/Internal.h"
 
+namespace py::lowering::ctypes {
+
+// The C signature a ctypes prototype names: `argtypes` and `restype`, laid
+// out for the target. One answer for a call through the symbol and for its
+// address taken as a pointer, because on a target that checks calls by
+// signature (wasm) the declaration IS the import's type.
+mlir::FailureOr<mlir::FunctionType>
+ctypesNativeFunctionType(mlir::Operation *op, mlir::ModuleOp module,
+                         mlir::OpBuilder &builder,
+                         llvm::ArrayRef<std::string> argTypes,
+                         llvm::StringRef resultType,
+                         const std::optional<TargetPlatformFacts> &facts) {
+  mlir::MLIRContext *context = builder.getContext();
+  llvm::SmallVector<mlir::Type, 4> nativeArgTypes;
+  for (auto [index, argType] : llvm::enumerate(argTypes)) {
+    std::optional<CtypesLayout> layout =
+        ctypesStaticLayout(module, argType, facts);
+    if (!layout)
+      return op->emitError()
+             << "ctypes native argument " << index << " type " << argType
+             << " has no ABI layout for " << targetFactsLabel(facts);
+    if (isIntegerScalarLayout(*layout)) {
+      nativeArgTypes.push_back(nativeIntegerType(builder, *layout));
+      continue;
+    }
+    if (isFloatingScalarLayout(*layout)) {
+      if (layout->size != 8)
+        return op->emitError()
+               << "ctypes native argument " << index << " type " << argType
+               << " requires an explicit f32 precision conversion";
+      nativeArgTypes.push_back(builder.getF64Type());
+      continue;
+    }
+    if (isPointerScalarLayout(*layout)) {
+      nativeArgTypes.push_back(nativePointerType(context));
+      continue;
+    }
+    return op->emitError() << "ctypes native argument " << index << " type "
+                           << argType
+                           << " is not supported by scalar native lowering";
+  }
+
+  llvm::SmallVector<mlir::Type, 1> nativeResultTypes;
+  if (resultType != "types.NoneType") {
+    std::optional<CtypesLayout> resultLayout =
+        ctypesStaticLayout(module, resultType, facts);
+    if (!resultLayout)
+      return op->emitError()
+             << "ctypes native result type " << resultType
+             << " has no ABI layout for " << targetFactsLabel(facts);
+    if (isIntegerScalarLayout(*resultLayout)) {
+      if (resultLayout->kind == CtypesLayout::ABIKind::UnsignedInteger &&
+          resultLayout->size == 8)
+        return op->emitError()
+               << "ctypes native unsigned 64-bit result requires Python "
+                  "bigint materialization";
+      nativeResultTypes.push_back(nativeIntegerType(builder, *resultLayout));
+    } else if (isFloatingScalarLayout(*resultLayout)) {
+      if (resultLayout->size != 8)
+        return op->emitError()
+               << "ctypes native result type " << resultType
+               << " requires an explicit f32 precision conversion";
+      nativeResultTypes.push_back(builder.getF64Type());
+    } else if (isPointerScalarLayout(*resultLayout)) {
+      nativeResultTypes.push_back(nativePointerType(context));
+    } else {
+      return op->emitError()
+             << "ctypes native result type " << resultType
+             << " is not supported by scalar native lowering";
+    }
+  }
+  return builder.getFunctionType(nativeArgTypes, nativeResultTypes);
+}
+
+} // namespace py::lowering::ctypes
+
 namespace py::lowering {
 
 using namespace ctypes;
@@ -65,8 +141,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
            << "ctypes native call requires TargetPlatformFacts before "
               "lowering";
 
+  mlir::FailureOr<mlir::FunctionType> signature = ctypesNativeFunctionType(
+      op, module, builder, evidence.argTypes, *evidence.resultType, facts);
+  if (mlir::failed(signature))
+    return mlir::failure();
+  mlir::FunctionType functionType = *signature;
+  llvm::ArrayRef<mlir::Type> nativeArgTypes = functionType.getInputs();
+  llvm::ArrayRef<mlir::Type> nativeResultTypes = functionType.getResults();
+
   builder.setInsertionPoint(op);
-  llvm::SmallVector<mlir::Type, 4> nativeArgTypes;
   llvm::SmallVector<mlir::Value, 4> nativeArgs;
   for (auto [index, source] : llvm::enumerate(sources)) {
     if (!source)
@@ -75,12 +158,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
     llvm::StringRef argType = evidence.argTypes[index];
     std::optional<CtypesLayout> layout =
         ctypesStaticLayout(module, argType, facts);
-    if (!layout)
-      return op.emitError()
-             << "ctypes native argument " << index << " type " << argType
-             << " has no ABI layout for " << targetFactsLabel(facts);
     if (isIntegerScalarLayout(*layout)) {
-      mlir::IntegerType nativeType = nativeIntegerType(builder, *layout);
       std::optional<mlir::Value> nativeValue = extractNativeIntegerArgument(
           op, builder, *source, argType, *layout, facts);
       if (!nativeValue)
@@ -90,15 +168,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
                   "primitive integer, or a statically range-proven primitive "
                   "integer ("
                << describeNativeArgumentSource(*source) << ")";
-      nativeArgTypes.push_back(nativeType);
       nativeArgs.push_back(*nativeValue);
       continue;
     }
     if (isFloatingScalarLayout(*layout)) {
-      if (layout->size != 8)
-        return op.emitError()
-               << "ctypes native argument " << index << " type " << argType
-               << " requires an explicit f32 precision conversion";
       std::optional<RuntimeSymbol> unbox =
           manifest.primitive(source->contractName(), "unbox.f64");
       if (!unbox)
@@ -112,60 +185,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
           !unboxCall.getResult(0).getType().isF64())
         return op.emitError() << "ctypes native argument " << index
                               << " float unbox primitive must return f64";
-      nativeArgTypes.push_back(builder.getF64Type());
       nativeArgs.push_back(unboxCall.getResult(0));
       continue;
     }
-    if (isPointerScalarLayout(*layout)) {
-      std::optional<mlir::Value> pointer =
-          extractNativePointerArgument(op, builder, *source, facts);
-      if (!pointer)
-        return op.emitError()
-               << "ctypes native argument " << index << " for " << argType
-               << " requires None, c_void_p, primitive pointer integer, or "
-                  "call-region byref evidence ("
-               << describeNativeArgumentSource(*source) << ")";
-      nativeArgTypes.push_back(nativePointerType(context));
-      nativeArgs.push_back(*pointer);
-      continue;
-    }
-    return op.emitError() << "ctypes native argument " << index << " type "
-                          << argType
-                          << " is not supported by scalar native lowering";
-  }
-
-  llvm::SmallVector<mlir::Type, 1> nativeResultTypes;
-  std::optional<CtypesLayout> resultLayout;
-  if (*evidence.resultType != "types.NoneType") {
-    resultLayout = ctypesStaticLayout(module, *evidence.resultType, facts);
-    if (!resultLayout)
+    std::optional<mlir::Value> pointer =
+        extractNativePointerArgument(op, builder, *source, facts);
+    if (!pointer)
       return op.emitError()
-             << "ctypes native result type " << *evidence.resultType
-             << " has no ABI layout for " << targetFactsLabel(facts);
-    if (isIntegerScalarLayout(*resultLayout)) {
-      if (resultLayout->kind == CtypesLayout::ABIKind::UnsignedInteger &&
-          resultLayout->size == 8)
-        return op.emitError()
-               << "ctypes native unsigned 64-bit result requires Python "
-                  "bigint materialization";
-      nativeResultTypes.push_back(nativeIntegerType(builder, *resultLayout));
-    } else if (isFloatingScalarLayout(*resultLayout)) {
-      if (resultLayout->size != 8)
-        return op.emitError()
-               << "ctypes native result type " << *evidence.resultType
-               << " requires an explicit f32 precision conversion";
-      nativeResultTypes.push_back(builder.getF64Type());
-    } else if (isPointerScalarLayout(*resultLayout)) {
-      nativeResultTypes.push_back(nativePointerType(context));
-    } else {
-      return op.emitError()
-             << "ctypes native result type " << *evidence.resultType
-             << " is not supported by scalar native lowering";
-    }
+             << "ctypes native argument " << index << " for " << argType
+             << " requires None, c_void_p, primitive pointer integer, or "
+                "call-region byref evidence ("
+             << describeNativeArgumentSource(*source) << ")";
+    nativeArgs.push_back(*pointer);
   }
-
-  mlir::FunctionType functionType =
-      builder.getFunctionType(nativeArgTypes, nativeResultTypes);
   builder.setInsertionPoint(op);
   mlir::Value indirectResult;
   mlir::func::CallOp call;
@@ -209,6 +241,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
 
   if (op.getNumResults() != 1)
     return op.emitError() << "ctypes native call expects one Python result";
+  std::optional<CtypesLayout> resultLayout;
+  if (*evidence.resultType != "types.NoneType")
+    resultLayout = ctypesStaticLayout(module, *evidence.resultType, facts);
   if (*evidence.resultType == "types.NoneType") {
     if (mlir::failed(assignObjectBundle(
             op, op.getResult(0), runtimeContractType(context, "types.NoneType"),

@@ -372,8 +372,32 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
       // PLACEHOLDER (`() -> i64` declaration carrying ly.symbol_address =
       // "name") + a call to it; phase 13c fills it with addressof+ptrtoint
       // over the linked symbol (same mechanism as callback thunks).
-      std::string placeholder =
-          "__ly_symbol_address_" + source->ctypes->symbolName;
+      //
+      // With a `restype` the prototype is known and goes along, so the symbol
+      // is declared as what it is. Without one a native target needs only the
+      // address, but a wasm import IS its signature, so there it is refused.
+      const RuntimeCtypesEvidence &symbol = *source->ctypes;
+      std::optional<mlir::LLVM::LLVMFunctionType> prototype;
+      if (symbol.resultType) {
+        mlir::FailureOr<mlir::FunctionType> signature =
+            ctypesNativeFunctionType(op, module, builder, symbol.argTypes,
+                                     *symbol.resultType, facts);
+        if (mlir::failed(signature))
+          return mlir::failure();
+        mlir::Type result =
+            signature->getNumResults() == 0
+                ? mlir::Type(mlir::LLVM::LLVMVoidType::get(context))
+                : signature->getResult(0);
+        prototype = mlir::LLVM::LLVMFunctionType::get(
+            result, signature->getInputs(), /*isVarArg=*/false);
+      } else if (py::native::callsAreCheckedBySignature(facts->triple)) {
+        return op.emitError()
+               << "taking the address of ctypes symbol '" << symbol.symbolName
+               << "' on " << facts->triple
+               << " needs its prototype: set restype (and argtypes) first, "
+                  "because this target links a function by its signature";
+      }
+      std::string placeholder = "__ly_symbol_address_" + symbol.symbolName;
       if (!module.lookupSymbol<mlir::func::FuncOp>(placeholder)) {
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToEnd(module.getBody());
@@ -382,7 +406,9 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
             builder.getFunctionType({}, {builder.getI64Type()}));
         fn.setPrivate();
         fn->setAttr("ly.symbol_address",
-                    builder.getStringAttr(source->ctypes->symbolName));
+                    builder.getStringAttr(symbol.symbolName));
+        if (prototype)
+          fn->setAttr("ly.symbol_prototype", mlir::TypeAttr::get(*prototype));
       }
       builder.setInsertionPoint(op);
       auto call = mlir::func::CallOp::create(
@@ -410,7 +436,14 @@ RuntimeBundleLowerer::lowerStaticCtypesCall(
     keepAliveSource(evidence, *source);
     if (isCtypesVoidPointer(*targetContract)) {
       evidence.kind = RuntimeCtypesEvidence::Kind::Cell;
-      evidence.scalarValue = *address;
+      // The cell's Python value is an int, i64 like every other one; the
+      // address is pointer-wide, and a pointer is unsigned.
+      evidence.scalarValue =
+          address->getType().isInteger(64)
+              ? *address
+              : mlir::arith::ExtUIOp::create(builder, op.getLoc(),
+                                             builder.getI64Type(), *address)
+                    .getResult();
       evidence.scalarValid = evidence.addressValid;
     } else if (isCtypesPointerContract(*targetContract)) {
       evidence.kind = RuntimeCtypesEvidence::Kind::Pointer;
