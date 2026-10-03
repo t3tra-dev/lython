@@ -192,7 +192,8 @@ class AbstractEventLoop:
                 return
             raise RuntimeError(
                 "the event loop waits on the JavaScript host, which cannot "
-                "run while the loop blocks it (no JSPI here); schedule the "
+                "run while the loop blocks it (no JSPI here, or inside a host "
+                "callback); schedule the "
                 "coroutine with asyncio.create_task() instead of "
                 "asyncio.run()")
 

@@ -4,15 +4,23 @@
 // (lython_js.js, which lyc puts ahead of this file).
 //
 // With JSPI (`WebAssembly.Suspending` and `WebAssembly.promising`) the
-// program can wait on the host: `poll_oneoff` -- time.sleep -- and
-// LyJs_WaitForHost return a promise and the program is suspended until it
-// settles, so timers fire and promises settle while it waits. Without JSPI
-// both answer at once: a sleep spins, and LyJs_WaitForHost says it cannot
-// wait.
+// program can wait on the host: LyJs_WaitForHost returns a promise and the
+// program is suspended until it settles, so timers fire and promises settle
+// while asyncio waits. Without JSPI it is never called (LyJs_CanWaitForHost
+// says so) and asyncio raises where it would have waited.
 //
-// Only the calls a program without a file system makes are answered: there
-// are no preopened directories, so opening a file fails with ENOENT and the
-// program sees the OSError CPython would.
+// ⛔ `poll_oneoff` -- time.sleep -- does not suspend. wasi-libc calls it from
+// wherever the program sleeps, a callback the host is running included, and a
+// Suspending import called outside WebAssembly.promising traps even when it
+// returns no promise. It spins, as a sleep does on a thread nothing else
+// runs on.
+//
+// Under node the file system is the host's: node's own WASI implementation
+// (`node:wasi`) answers the calls these do not, with the working directory
+// and `/` preopened and the process's environment, as a native program sees
+// them. In a page only the calls a program without a file system makes are
+// answered: there is nothing preopened, so opening a file fails with ENOENT
+// and the program sees the OSError CPython would.
 // eslint-disable-next-line no-unused-vars
 var LythonWasi = (() => {
   const SUCCESS = 0;
@@ -55,7 +63,7 @@ var LythonWasi = (() => {
       ? BigInt(Date.now()) * 1000000n
       : BigInt(Math.round(performance.now() * 1e6));
 
-  const makeWasi = (memory, args, host) => {
+  const makeWasi = (memory, args) => {
     const view = () => new DataView(memory().buffer);
     const bytes = () => new Uint8Array(memory().buffer);
     const encoder = new TextEncoder();
@@ -202,10 +210,6 @@ var LythonWasi = (() => {
           out.setUint32(ready, count, true);
           return SUCCESS;
         };
-        if (delayMs > 0 && host.canSuspend())
-          return new Promise((resolve) => setTimeout(resolve, delayMs)).then(
-            answer,
-          );
         const end = performance.now() + delayMs;
         while (performance.now() < end) {
           // ⛔ A spin, because nothing else can wait here: the program holds
@@ -229,15 +233,45 @@ var LythonWasi = (() => {
       typeof WebAssembly.Suspending === "function" &&
       typeof WebAssembly.promising === "function";
     let instance = null;
-    let running = 0;
     const memory = () => instance.exports.memory;
     const js = LythonJs.create(memory, () => instance.exports, { suspending });
-    const host = {
-      // ⛔ Not while the host runs a callback of the program's: that is the
-      // host's own stack, which no promise can suspend.
-      canSuspend: () => suspending && running === 0,
-    };
-    const wasi = makeWasi(memory, args, host);
+    const wasi = makeWasi(memory, args);
+    // node's WASI for everything this file does not answer itself: the sleep
+    // has to be a promise and the exit an exception this loader catches, and
+    // the standard streams stay character devices -- line-buffered, so
+    // `print` and the host's console.log come out in the order they ran.
+    let nodeWasi = null;
+    if (isNode) {
+      // ⛔ Quiet: node calls its WASI experimental, on stderr, and the
+      // program's stderr is the program's.
+      const warn = process.emitWarning;
+      process.emitWarning = (warning, ...rest) =>
+        String(warning).includes("WASI") ? undefined
+                                         : warn.call(process, warning, ...rest);
+      const { WASI } = require("node:wasi");
+      nodeWasi = new WASI({
+        version: "preview1",
+        args,
+        // PWD is where the program starts (enterHostWorkingDirectory in
+        // the runtime): the process's own, whatever the shell left there.
+        env: { ...process.env, PWD: process.cwd() },
+        preopens: { ".": process.cwd(), "/": "/" },
+      });
+      process.emitWarning = warn;
+      const own = new Set(["poll_oneoff", "proc_exit", "fd_fdstat_get",
+                           "fd_write"]);
+      for (const [name, fn] of Object.entries(nodeWasi.wasiImport))
+        if (!own.has(name)) wasi[name] = fn;
+      const standard = wasi.fd_fdstat_get;
+      const fdstat = nodeWasi.wasiImport.fd_fdstat_get;
+      wasi.fd_fdstat_get = (fd, stat) =>
+        fd <= 2 ? standard(fd, stat) : fdstat(fd, stat);
+      const write = wasi.fd_write;
+      const nodeWrite = nodeWasi.wasiImport.fd_write;
+      wasi.fd_write = (fd, iovs, count, written) =>
+        fd <= 2 ? write(fd, iovs, count, written)
+                : nodeWrite(fd, iovs, count, written);
+    }
     const imports = { wasi_snapshot_preview1: {}, lython_js: {} };
     for (const { module: from, name, kind } of WebAssembly.Module.imports(
       module,
@@ -251,30 +285,19 @@ var LythonWasi = (() => {
                           "host does not have");
         fn = () => ENOSYS;
       }
-      if (suspending && (name === "poll_oneoff" || name === "LyJs_WaitForHost"))
+      if (suspending && name === "LyJs_WaitForHost")
         fn = new WebAssembly.Suspending(fn);
       imports[from][name] = fn;
     }
     instance = await WebAssembly.instantiate(module, imports);
-    // A callback the host runs is a call into an export from outside the
-    // program's own run, which cannot suspend.
-    for (const entry of ["LyJs_Dispatch", "LyJs_Release"]) {
-      const exported = instance.exports[entry];
-      if (!exported) continue;
-      instance = {
-        exports: {
-          ...instance.exports,
-          [entry]: (...callArgs) => {
-            ++running;
-            try {
-              return exported(...callArgs);
-            } finally {
-              --running;
-            }
-          },
-        },
-      };
-    }
+    // ⛔ `initialize` rather than `start`: it only binds the memory, and the
+    // program has to be started under WebAssembly.promising, which `start`
+    // cannot do. A program exports `_start`, which `initialize` refuses, so
+    // it is handed the memory alone.
+    if (nodeWasi)
+      nodeWasi.initialize({
+        exports: { memory: instance.exports.memory, _initialize() {} },
+      });
     const start = suspending
       ? WebAssembly.promising(instance.exports._start)
       : instance.exports._start;

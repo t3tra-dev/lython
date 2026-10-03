@@ -268,11 +268,16 @@ var LythonJs = {
           else data.setUint32(at, point, true);
         });
       },
-      // ⛔ Not inside a callback: the host is running that one on its own
-      // stack, which no promise can suspend, and the program would wait on
-      // itself.
+      // Whether LyJs_WaitForHost may be called: JSPI is there, and the
+      // program is not inside a callback the host is running -- that is the
+      // host's own stack, which no promise can suspend.
+      // ⛔ Asked by a plain import first, because LyJs_WaitForHost is a
+      // Suspending one, and calling it outside WebAssembly.promising traps
+      // even when it would not suspend.
+      LyJs_CanWaitForHost() {
+        return options.suspending && frames.length === 0 ? 1 : 0;
+      },
       LyJs_WaitForHost(ms) {
-        if (!options.suspending || frames.length) return 0;
         return new Promise((resolve) => {
           let timer = null;
           const wake = () => {

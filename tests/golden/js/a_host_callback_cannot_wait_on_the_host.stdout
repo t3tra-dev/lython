@@ -1,0 +1,4 @@
+hosted 8
+main body done
+callback pure 7
+callback hosted: the event loop waits on the JavaScript host, which cannot run while the loop blocks it (no JSPI here, or inside a host callback); schedule the coroutine with asyncio.create_task() instead of asyncio.run()
