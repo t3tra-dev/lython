@@ -394,6 +394,10 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
     if (!root.empty() && values.find(root) != values.end())
       calleeQualified.clear();
   }
+  if (!calleeQualified.empty())
+    if (std::optional<Value> host =
+            tryEmitJsHostFunctionCall(expr, calleeQualified))
+      return *host;
 
   if (std::optional<Value> v = tryEmitSuperCall(expr, calleeNode))
     return *v;

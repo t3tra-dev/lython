@@ -27,6 +27,7 @@ namespace {
 constexpr llvm::StringLiteral kJsBridgeModule = "_js_bridge";
 constexpr llvm::StringLiteral kJsBridgeName = "__ly_js_bridge$";
 constexpr llvm::StringLiteral kJsFrameName = "__ly_js_frame$";
+constexpr llvm::StringLiteral kJsGlobalObjectName = "__ly_js_global$";
 
 bool isTopLevelFunction(const parser::Node &statement) {
   return statement.kind == "FunctionDef" ||
@@ -233,8 +234,51 @@ void declareStubClassContracts(TypeSystem &types, mlir::MLIRContext &context,
   auto read = [&](mlir::Type type) {
     return policy.anyResult && type == any ? policy.anyResult : type;
   };
+  mlir::Type anyCallable;
+  if (policy.callableParameter)
+    anyCallable = py::CallableType::get(&context, {}, {}, types.tupleOf(any),
+                                        types.dictOf(types.strType(), any),
+                                        {types.object()});
+  // TypeScript's callback interfaces (`interface VoidFunction { (): void }`)
+  // reach the stub as classes with nothing in them: the call signature is
+  // what the generator could not render. Such a class is a function type,
+  // like `Function` itself.
+  llvm::DenseSet<mlir::Type> functionTypes;
+  if (policy.callableParameter) {
+    functionTypes.insert(policy.callableParameter);
+    for (const parser::NodePtr &statement : body) {
+      if (!statement || !isTopLevelClass(*statement))
+        continue;
+      const auto *bases = ast::nodeList(*statement, "bases");
+      const auto *classBody = ast::nodeList(*statement, "body");
+      std::optional<std::string_view> name = ast::string(*statement, "name");
+      if (!name || (bases && !bases->empty()) || !classBody ||
+          !isEllipsisStubBody(classBody))
+        continue;
+      functionTypes.insert(
+          types.contract(sourceModuleClassSymbol(moduleName, *name)));
+    }
+  }
+  auto widenCallable = [&](mlir::Type type) -> mlir::Type {
+    if (!policy.callableParameter)
+      return type;
+    if (functionTypes.contains(type))
+      return py::UnionType::getNormalized(&context, {type, anyCallable});
+    if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type))
+      if (llvm::any_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+            return functionTypes.contains(member);
+          })) {
+        llvm::SmallVector<mlir::Type, 4> members(
+            unionType.getMemberTypes().begin(),
+            unionType.getMemberTypes().end());
+        members.push_back(anyCallable);
+        return py::UnionType::getNormalized(&context, members);
+      }
+    return type;
+  };
   auto written = [&](mlir::Type type) {
-    return policy.anyParameter && type == any ? policy.anyParameter : type;
+    return policy.anyParameter && type == any ? policy.anyParameter
+                                              : widenCallable(type);
   };
   for (const parser::NodePtr &statement : body) {
     if (!statement || !isTopLevelClass(*statement))
@@ -538,6 +582,12 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
   // value carries no protocol contract, so any attempt to dispatch on it (call,
   // len, iteration) is rejected for lack of evidence rather than erased.
   types.bindCanonicalSymbol(localName, module, types.object());
+  if (isJsHostModule(*source))
+    for (const auto &function : jsHostGlobalFunctions)
+      if (!moduleGlobals.count(
+              (llvm::Twine(module) + "." + function.getKey()).str()))
+        jsHostFunctionAliases[(llvm::Twine(localName) + "." + function.getKey())
+                                  .str()] = function.getKey().str();
   // A source stdlib module is a module too, and the attribute check needs to
   // know it: without this, `os.nonexistent` and `time.nonexistent` fell
   // through to the dynamic read the manifest modules no longer take.
@@ -878,6 +928,13 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     return false;
   // `from js import Math` is `globalThis.Math`, Pyodide's reading: the object,
   // where the stub's class of the same name only says what the object is.
+  // `from js import setTimeout`: a method of the global object, called on it.
+  if (isJsHostModule(*source) &&
+      !moduleGlobals.count((llvm::Twine(module) + "." + exportedName).str()) &&
+      jsHostGlobalFunctions.contains(exportedName)) {
+    jsHostFunctionAliases[localName] = exportedName.str();
+    return true;
+  }
   if (isJsHostModule(*source))
     if (std::string global = (llvm::Twine(module) + "." + exportedName).str();
         moduleGlobals.count(global)) {
@@ -2261,7 +2318,8 @@ void ModuleEmitter::declareJsHostModule() {
       }
     StubContractPolicy policy{
         types.contract(py::kJsProxyContract), types.object(),
-        /*staticMethodsTakeTheValue=*/true, py::kJsProxyContract.str()};
+        /*staticMethodsTakeTheValue=*/true, py::kJsProxyContract.str(),
+        types.contract(sourceModuleClassSymbol(host->moduleName, "Function"))};
     declareStubClassContracts(types, context, host->moduleName, body, policy);
     auto declareGlobal = [&](llvm::StringRef name, mlir::Type type) {
       if (!type)
@@ -2294,6 +2352,8 @@ void ModuleEmitter::declareJsHostModule() {
         continue;
       for (const auto &[field, type] : info->fields)
         declareGlobal(field, type);
+      for (const auto &[method, signatures] : info->methods)
+        jsHostGlobalFunctions.insert(method);
       for (const py::protocols::ProtocolBase &base : info->bases)
         pending.push_back(base.name);
     }
@@ -2328,6 +2388,11 @@ void ModuleEmitter::declareJsHostModule() {
   std::string frameGlobal = (llvm::Twine(host->moduleName) + ".$frame").str();
   types.bindCanonicalSymbol(kJsFrameName, frameGlobal,
                             moduleGlobals[frameGlobal]);
+  std::string globalObject =
+      (llvm::Twine(host->moduleName) + ".globalThis").str();
+  if (moduleGlobals.count(globalObject))
+    types.bindCanonicalSymbol(kJsGlobalObjectName, globalObject,
+                              moduleGlobals[globalObject]);
 }
 
 bool ModuleEmitter::isJsHostValueType(mlir::Type type) const {
@@ -2449,6 +2514,12 @@ Value ModuleEmitter::wrapJsCallback(const parser::Node &anchor,
   auto received = [&](mlir::Type type) {
     return type == any || !type ? types.contract(py::kJsProxyContract) : type;
   };
+  // A callback declared as "any arguments" (a host `Function`) receives the
+  // host's arguments as the callable declares them.
+  if (py::isCallableEllipsisContract(declared))
+    if (auto actual = mlir::dyn_cast<py::CallableType>(callable.type))
+      declared = py::CallableType::get(&context, actual.getPositionalTypes(),
+                                       {}, {}, {}, actual.getResultTypes());
   std::string &symbol = jsCallbackWrappers[{declared, callable.type}];
   if (symbol.empty()) {
     std::string kind = std::to_string(jsCallbackWrappers.size());
@@ -2604,6 +2675,33 @@ FunctionSignature ModuleEmitter::importedFunctionSignature(
   bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
   return sourceModuleFunctionSignature(types, source.moduleName, body, function,
                                        source.isStub);
+}
+
+// `setTimeout(f, 10)` imported from `js` is `globalThis.setTimeout(f, 10)`:
+// the stub declares the host's global functions as Window's methods, and the
+// call is that method call -- overloads, callback arguments and a union result
+// all as for any other.
+std::optional<Value>
+ModuleEmitter::tryEmitJsHostFunctionCall(const parser::Node &expr,
+                                         llvm::StringRef callee) {
+  auto alias = jsHostFunctionAliases.find(callee);
+  if (alias == jsHostFunctionAliases.end())
+    return std::nullopt;
+  parser::NodePtr call = parser::makeNode("Call", expr.range);
+  parser::addField(
+      *call, "func",
+      synth::attribute(synth::name(kJsGlobalObjectName, expr.range),
+                       alias->second, expr.range));
+  std::vector<parser::NodePtr> arguments;
+  if (const auto *args = ast::nodeList(expr, "args"))
+    arguments.assign(args->begin(), args->end());
+  std::vector<parser::NodePtr> keywords;
+  if (const auto *given = ast::nodeList(expr, "keywords"))
+    keywords.assign(given->begin(), given->end());
+  parser::addField(*call, "args", std::move(arguments));
+  parser::addField(*call, "keywords", std::move(keywords));
+  synthesizedIteratorDefs.push_back(call);
+  return emitExpr(call.get());
 }
 
 } // namespace lython::emitter
