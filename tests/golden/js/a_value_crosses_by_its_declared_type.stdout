@@ -1,0 +1,9 @@
+1.4142135623730951 3.141592653589793 5.5
+8.0
+"é日🐍" true 42
+9 '"\\ud800x"'
+True
+True False False
+BigInt: TypeError: Do not know how to serialize a BigInt
+caught: SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+9007199254740993n 1180591620717411303424n -18446744073709551616n 9007199254740991

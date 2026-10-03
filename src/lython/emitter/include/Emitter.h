@@ -24,6 +24,8 @@ struct EmitOptions {
     std::string sourceName;
     const parser::Node *moduleNode = nullptr;
     bool isStub = false;
+    // Shipped inside the compiler (runtime/lib), not found beside the program.
+    bool isEmbedded = false;
   };
 
   bool sanitizeUndefined = false;

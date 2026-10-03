@@ -395,6 +395,15 @@ bool bindExpectedType(const TypeSystem &types, mlir::Type expected,
   expected = substituteType(types, expected, bindings);
   expected = types.inference().zonk(expected);
   actual = types.inference().zonk(actual);
+  // ⛔ A literal parameter is matched BEFORE the argument is widened: widened,
+  // `"a"` is `str`, which no `Literal["a"]` accepts -- so an overload keyed on
+  // a literal (`createElement("div")`) could never be chosen.
+  if (mlir::isa_and_present<py::LiteralType>(expected))
+    return expected == actual;
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(expected))
+    if (mlir::isa_and_present<py::LiteralType>(actual) &&
+        llvm::is_contained(unionType.getMemberTypes(), actual))
+      return true;
   actual = types.widenLiteral(actual);
 
   if (!expected || !actual)
@@ -1055,13 +1064,22 @@ tryManifestMethod(const TypeSystem &types, mlir::Type receiverType,
 
   // Same explore-then-reapply shape as selectCallableApplication: candidate
   // ranking must not leave inference-variable bindings behind.
+  std::optional<py::protocols::ContractResolution> firstApplicable;
   for (py::protocols::ContractResolution candidate :
        table.methodContractCandidatesWithEvidence(receiverType, methodName)) {
     InferenceContext::Speculation attempt(types.inference());
-    if (std::optional<CallSolution> solution = apply(candidate))
-      selection.consider(
-          RankedResolution{std::move(*solution), std::move(candidate)});
+    std::optional<CallSolution> solution = apply(candidate);
+    if (!solution)
+      continue;
+    if (candidate.method.firstApplicable) {
+      firstApplicable = std::move(candidate);
+      break;
+    }
+    selection.consider(
+        RankedResolution{std::move(*solution), std::move(candidate)});
   }
+  if (firstApplicable)
+    return apply(*firstApplicable);
   std::optional<RankedResolution> best = std::move(selection).finish();
   if (!best)
     return std::nullopt;

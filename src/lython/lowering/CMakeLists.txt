@@ -36,6 +36,8 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ctypes/NativeCall.cpp
     Passes/Runtime/Ctypes/Objects.cpp
     Passes/Runtime/Ctypes/Symbols.cpp
+    Passes/Runtime/Js/HostCalls.cpp
+    Passes/Runtime/Js/HostErasure.cpp
     Passes/Runtime/Evidence/CallableAggregate.cpp
     Passes/Runtime/Evidence/CallableArgument.cpp
     Passes/Runtime/Evidence/CallablePlanning.cpp

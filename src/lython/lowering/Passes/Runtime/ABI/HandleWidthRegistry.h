@@ -336,6 +336,12 @@ namespace py::lowering::handle_width {
 //                                                           `abi.handle_width_reservations`
 //      16  builtins.object                                  payload box / boxed
 //                                                           field slot
+//      17  _js.JsProxy                                      one-lane, sole
+//                                                           owner; 3 words
+//                                                           used. Its release
+//                                                           drops a host
+//                                                           handle, so a tie
+//                                                           would leak one
 //      64  types.GeneratorType                              frame
 //
 // WHY `set` AND `frozenset` DO NOT SHARE A WIDTH, when they share a layout

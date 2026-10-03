@@ -12,6 +12,7 @@
 #include "Passes/Runtime/Arch/Arm/ArmSME.h"
 #include "Passes/Runtime/Cleanup/Transforms.h"
 #include "Passes/Runtime/Ctypes/CallbackThunks.h"
+#include "Passes/Runtime/Js/Host.h"
 #include "Passes/Runtime/Primitive/TensorParallel.h"
 #include "runtime/Verification.h"
 
@@ -278,6 +279,14 @@ LogicalResult runLoweringPipeline(ModuleOp module,
       return failure();
     dumpMLIRForPass(irDump, "runtime-manifest-completeness", module);
   }
+
+  // Phase 8c: every JavaScript value is one runtime contract from here on.
+  // After the verifiers that read the program's types, which are the stub's.
+  {
+    PerfScope perf("lowering.js-host-erasure");
+    lowering::js::eraseJsHostContracts(module);
+  }
+  dumpMLIRForPass(irDump, "js-host-erasure", module);
 
   // Phase 9: lower Py dialect values into runtime bundles and calls.
   if (failed(runPhase("runtime-lowering", [&](PassManager &pm) {

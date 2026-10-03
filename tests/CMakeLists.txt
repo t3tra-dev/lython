@@ -40,7 +40,7 @@
 #             compiler fix would look like it had not worked
 #
 #   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak,
-#                 aot, release, wasm, wasi
+#                 aot, release, wasm, wasi, js
 #
 #   `aot`, `release` and `wasm` are agreement stages: the same cases and the
 #   same sidecars as the JIT golden, through the other output mode, through
@@ -1037,10 +1037,21 @@ else()
         "${LYTHON_WASMTIME}; wasi-sdk: ${LYTHON_WASI_SDK})")
 endif()
 
+# `js` is the JavaScript host's module, which CPython does not have: its cases
+# live in golden/js with their expected output written down, and run as
+# wasm32-unknown-emscripten under the same node -- the browser's word size.
+file(GLOB LYTHON_JS_GOLDEN_CASES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/golden/js/*.py")
 if(LYTHON_EMCC AND lython_wasm_node_major GREATER_EQUAL 24)
     foreach(case_name IN LISTS LYTHON_WASM_AGREEMENT_CASES)
         lython_add_agreement_case(wasm "${case_name}"
             --wasm-node "${lython_wasm_node}")
+    endforeach()
+    foreach(case_path IN LISTS LYTHON_JS_GOLDEN_CASES)
+        get_filename_component(case_name "${case_path}" NAME_WE)
+        lython_add_agreement_case(js "js/${case_name}"
+            --wasm-node "${lython_wasm_node}"
+            --wasm-target wasm32-unknown-emscripten)
     endforeach()
 else()
     message(STATUS "Lython: wasm agreement stage skipped (emcc: "

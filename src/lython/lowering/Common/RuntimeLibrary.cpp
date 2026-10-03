@@ -154,6 +154,15 @@ mlir::LogicalResult importRuntimeModule(mlir::ModuleOp target,
     return mlir::failure();
   }
 
+  // A manifest that names a module attribute is the program's only when the
+  // program has it: `_js` reaches functions only a JavaScript host provides,
+  // and its deallocator is kept by the release dispatch whether or not a
+  // proxy is ever made.
+  if (auto onlyWith =
+          (*source)->getAttrOfType<mlir::StringAttr>("ly.runtime.only_with"))
+    if (!target->hasAttr(onlyWith.getValue()))
+      return mlir::success();
+
   if (mlir::failed(mergeContracts(target, *source)))
     return mlir::failure();
 

@@ -138,9 +138,10 @@ localSourceModulePath(StringRef baseDir,
 
   // Embedded stdlib source (runtime/lib/*.py): resolved after user files,
   // before module manifests; compiled with the program like any source module.
-  if (embeddedStdlibSource(moduleName))
-    return LocalSourceModulePath{("<stdlib>/" + moduleName + ".py").str(),
-                                 false, false, /*isEmbedded=*/true};
+  if (const auto *entry = embeddedStdlibSource(moduleName))
+    return LocalSourceModulePath{
+        ("<stdlib>/" + moduleName + (entry->isStub ? ".pyi" : ".py")).str(),
+        entry->isStub, false, /*isEmbedded=*/true};
   return std::nullopt;
 }
 
@@ -385,6 +386,8 @@ static void collectImportedModuleRequests(
   }
 }
 
+constexpr llvm::StringLiteral kJsHostModule = "js";
+
 struct ParsedLocalSourceModule {
   std::string moduleName;
   std::string packageName;
@@ -392,6 +395,7 @@ struct ParsedLocalSourceModule {
   lython::parser::ParseResult parsed;
   bool isStub = false;
   bool isPackage = false;
+  bool isEmbedded = false;
 };
 
 static LogicalResult
@@ -400,12 +404,30 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                           std::vector<ParsedLocalSourceModule> &sources,
                           std::set<std::string> &seen,
                           std::set<std::string> &visiting, bool releaseMode,
-                          llvm::raw_ostream &diag) {
+                          bool hasJsHost, llvm::raw_ostream &diag) {
   llvm::SmallVector<SourceImportRequest, 8> imports;
   collectImportedModuleRequests(module, baseDir, packageName, imports);
   for (const SourceImportRequest &request : imports) {
     if (llvm::StringRef(request.sourcePath) == mainPath)
       continue;
+    // `js` is the JavaScript host's module (Pyodide's), so it exists only
+    // where there is a host, and there it is not a name a local file can take:
+    // the program would get the file's classes where it wrote the host's.
+    if (request.moduleName == kJsHostModule) {
+      if (request.isEmbedded && !hasJsHost) {
+        diag << mainPath
+             << ": emit error: module 'js' is the JavaScript host's and this "
+                "target has none; compile for wasm32-unknown-emscripten or "
+                "wasm64-unknown-emscripten\n";
+        return failure();
+      }
+      if (!request.isEmbedded && hasJsHost) {
+        diag << request.sourcePath
+             << ": emit error: on a target with a JavaScript host, module "
+                "'js' is the host's; rename this file\n";
+        return failure();
+      }
+    }
     if (seen.find(request.moduleName) != seen.end())
       continue;
     if (visiting.find(request.moduleName) != visiting.end()) {
@@ -464,16 +486,16 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                                         ? request.moduleName
                                         : packageNameForModuleName(
                                               request.moduleName);
-    if (failed(collectLocalSourceModules(*parsed.tree, nestedBaseDir,
-                                         nestedPackageName, mainPath, sources,
-                                         seen, visiting, releaseMode, diag)))
+    if (failed(collectLocalSourceModules(
+            *parsed.tree, nestedBaseDir, nestedPackageName, mainPath, sources,
+            seen, visiting, releaseMode, hasJsHost, diag)))
       return failure();
     visiting.erase(request.moduleName);
     seen.insert(request.moduleName);
     sources.push_back(ParsedLocalSourceModule{
         request.moduleName, nestedPackageName,
-        pythonTracebackPath(request.sourcePath, releaseMode),
-        std::move(parsed), request.isStub, request.isPackage});
+        pythonTracebackPath(request.sourcePath, releaseMode), std::move(parsed),
+        request.isStub, request.isPackage, request.isEmbedded});
   }
   return success();
 }
@@ -507,7 +529,8 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
   if (failed(collectLocalSourceModules(
           *parsed.tree, importBaseDir, mainPackageName, sourcePath,
           localSources, seenSourceModules, visitingSourceModules,
-          driverOptions.releaseMode, diag)))
+          driverOptions.releaseMode,
+          codeGenTripleForTarget({}, driverOptions).isOSEmscripten(), diag)))
     return failure();
 
   lython::emitter::EmitResult emitted;
@@ -523,7 +546,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
       emitOptions.sourceModules.push_back(
           lython::emitter::EmitOptions::SourceModule{
               source.moduleName, source.packageName, source.sourceName,
-              source.parsed.tree.get(), source.isStub});
+              source.parsed.tree.get(), source.isStub, source.isEmbedded});
     }
     emitted = lython::emitter::emitModule(
         *parsed.tree, context, "__main__",

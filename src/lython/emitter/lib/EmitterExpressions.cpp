@@ -3203,6 +3203,8 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   if (methodBinding)
     value.boundMethod = std::make_shared<BoundMethodValue>(
         BoundMethodValue{object, *methodBinding});
+  if (isJsHostValueType(object.type))
+    return adaptJsHostResult(expr, op, value);
   return value;
 }
 
