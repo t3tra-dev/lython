@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 概要
 
-Lython は LLVM/MLIR 22 ベースの Python コンパイラツールチェーン。Python ソースを独自の py dialect (MLIR) に変換し、LLVM IR まで下げて JIT 実行または AOT コンパイルする。C++17 / CMake + Ninja。LLVM/MLIR はメジャーバージョン 22 に固定されており、CMake が version mismatch を FATAL_ERROR で拒否する。
+Lython は LLVM/MLIR 23 ベースの Python コンパイラツールチェーン。Python ソースを独自の py dialect (MLIR) に変換し、LLVM IR まで下げて JIT 実行または AOT コンパイルする。C++17 / CMake + Ninja。LLVM/MLIR はメジャーバージョン 23 に固定されており、CMake が version mismatch を FATAL_ERROR で拒否する。
 
 **プロジェクトの性格**: Python を静的型付けコンパイル言語として再実装するプロジェクトである。基本的に静的に解決できるコードのみを受け入れ、`object` / `Any` に対するランタイム操作は実装しない (動的ディスパッチへのフォールバックは存在せず、静的に解決できない構造は最も早い静的境界で診断を出して拒否する — "never silently mis-execute")。
 
@@ -14,7 +14,7 @@ Lython は LLVM/MLIR 22 ベースの Python コンパイラツールチェーン
 
 ```bash
 uv sync                       # Python 依存 (pyright のみ)
-cmake -B build -S .           # LLVM/MLIR 22 を Homebrew / apt パスから自動検出
+cmake -B build -S .           # LLVM/MLIR 23 を Homebrew / apt パスから自動検出
 cmake --build build -j$(nproc)
 
 # JIT 実行
@@ -30,7 +30,7 @@ cmake --build build -j$(nproc)
 uv run pyright
 ```
 
-主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質) と `-jit-opt=0..3` (JIT の LLVM IR 最適化レベル。AOT は常に O2)。どちらも既定は初回出力レイテンシ優先の最低値。実測の分岐点: `-jit-codegen-opt=less` は jit-build を約 180 ms 増やして実行を約半分にするので、実行が 360 ms を超えるプログラムから得になる (`examples/tarai.py` は合計 1.60 s → 1.11 s、`examples/hello.py` は 0.18 s → 0.35 s)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)、`--target wasm32-wasip1` (`-o prog.wasm` は wasmtime でそのまま動く WASI モジュール。リンクは lyc がリンクしている LLVM の clang と wasm-ld で行い、LLVM に含まれない wasi-libc と wasm32 の compiler-rt は wasi-sdk から探す: `--sysroot`、`WASI_SDK_PATH`、`/opt/wasi-sdk`、`~/.local/wasi-sdk*` など)、`--js-host` (WASI のプログラムを JS ホストの下で動かす。`-o prog.js` がローダで、`prog.wasm` が隣に出る。docs/js-host.md)。
+主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質) と `-jit-opt=0..3` (JIT の LLVM IR 最適化レベル。AOT は常に O2)。どちらも既定は初回出力レイテンシ優先の最低値。実測の分岐点: `-jit-codegen-opt=less` は jit-build を約 180 ms 増やして実行を約半分にするので、実行が 360 ms を超えるプログラムから得になる (`examples/tarai.py` は合計 1.60 s → 1.11 s、`examples/hello.py` は 0.18 s → 0.35 s)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)、`--target wasm32-wasip1` (`-o prog.wasm` は wasmtime でそのまま動く WASI モジュール。リンクは lyc がリンクしている LLVM の clang と wasm-ld で行う。wasi-libc と wasm32 の compiler-rt は Homebrew の `wasi-libc` / `wasi-runtimes` か wasi-sdk から探す: `--sysroot`、`WASI_SDK_PATH`、LLVM の prefix、Homebrew の share、`/opt/wasi-sdk`、`~/.local/wasi-sdk*`)、`--js-host` (WASI のプログラムを JS ホストの下で動かす。`-o prog.js` がローダで、`prog.wasm` が隣に出る。docs/js-host.md)。
 
 ### テスト
 

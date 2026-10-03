@@ -10,7 +10,7 @@
 - CMake 3.20+
 - Ninja
 - C++17 対応コンパイラ
-- LLVM/MLIR 22 (`llvm`/`llvm@22` または `llvm-22-dev` / `libmlir-22-dev`)
+- LLVM/MLIR 23 (`llvm`/`llvm@23` または `llvm-23-dev` / `libmlir-23-dev`)
 - uv (Python パッケージマネージャ)
 
 ### ビルド手順
@@ -22,12 +22,14 @@ uv sync
 
 # macOS:
 brew install llvm
+# WASI (--target wasm32-wasip1) まで使うなら:
+# brew install lld wasi-libc wasi-runtimes
 
 # Ubuntu:
 # wget https://apt.llvm.org/llvm.sh
 # chmod +x llvm.sh
-# sudo ./llvm.sh 22
-# sudo apt-get install -y clang-22 lld-22 llvm-22-dev libmlir-22-dev mlir-22-tools
+# sudo ./llvm.sh 23
+# sudo apt-get install -y clang-23 lld-23 llvm-23-dev libmlir-23-dev mlir-23-tools
 
 # Lython 本体
 cmake -B build -S .
@@ -59,7 +61,7 @@ libFuzzer ベースの fuzzer (`fuzz_parser` / `fuzz_emitter` / `fuzz_pipeline`)
 
 ```bash
 # 専用ビルドディレクトリを構成してビルド
-# (Ubuntu では -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 を追加)
+# (Ubuntu では -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER=clang++-23 を追加)
 cmake -B build-fuzz -S . \
   -DLYTHON_ENABLE_FUZZERS=ON -DLYTHON_BUILD_TESTS=OFF \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo

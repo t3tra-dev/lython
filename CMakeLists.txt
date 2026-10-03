@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(LYTHON_LLVM_MAJOR_VERSION 22)
+set(LYTHON_LLVM_MAJOR_VERSION 23 CACHE STRING
+    "LLVM/MLIR major version Lython builds against")
 
 # Compiler selection must precede project(): that call locks in the toolchain.
 # AppleClang cannot build against this project's Homebrew LLVM/MLIR, so on
@@ -86,16 +87,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 function(lython_configure_llvm)
     file(GLOB LYTHON_HOMEBREW_LLVM_CMAKE_DIRS
-        /opt/homebrew/Cellar/llvm/*/lib/cmake/llvm
-        /usr/local/Cellar/llvm/*/lib/cmake/llvm
+        # ⛔ The versioned keg first, and the bare keg only at the wanted
+        # major: Homebrew's `llvm` moves to the next major while `llvm@N`
+        # keeps the old one, and the bare one found first failed the version
+        # check below.
         /opt/homebrew/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/llvm
         /usr/local/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/llvm
+        /opt/homebrew/Cellar/llvm/${LYTHON_LLVM_MAJOR_VERSION}.*/lib/cmake/llvm
+        /usr/local/Cellar/llvm/${LYTHON_LLVM_MAJOR_VERSION}.*/lib/cmake/llvm
     )
     file(GLOB LYTHON_HOMEBREW_MLIR_CMAKE_DIRS
-        /opt/homebrew/Cellar/llvm/*/lib/cmake/mlir
-        /usr/local/Cellar/llvm/*/lib/cmake/mlir
+        # ⛔ The versioned keg first, and the bare keg only at the wanted
+        # major: Homebrew's `llvm` moves to the next major while `llvm@N`
+        # keeps the old one, and the bare one found first failed the version
+        # check below.
         /opt/homebrew/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/mlir
         /usr/local/Cellar/llvm@${LYTHON_LLVM_MAJOR_VERSION}/*/lib/cmake/mlir
+        /opt/homebrew/Cellar/llvm/${LYTHON_LLVM_MAJOR_VERSION}.*/lib/cmake/mlir
+        /usr/local/Cellar/llvm/${LYTHON_LLVM_MAJOR_VERSION}.*/lib/cmake/mlir
     )
 
     set(LYTHON_NEED_LLVM_CONFIG TRUE)
@@ -122,10 +131,10 @@ function(lython_configure_llvm)
     find_program(LYTHON_LLVM_CONFIG
         NAMES llvm-config-${LYTHON_LLVM_MAJOR_VERSION} llvm-config
         HINTS
-            /opt/homebrew/opt/llvm/bin
-            /usr/local/opt/llvm/bin
             /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
             /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/bin
+            /opt/homebrew/opt/llvm/bin
+            /usr/local/opt/llvm/bin
             /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/bin
     )
     if((NOT LLVM_DIR OR NOT MLIR_DIR) AND LYTHON_LLVM_CONFIG)
@@ -167,10 +176,10 @@ function(lython_configure_llvm)
             NAMES LLVMConfig.cmake
             PATHS
                 ${LYTHON_HOMEBREW_LLVM_CMAKE_DIRS}
-                /opt/homebrew/opt/llvm/lib/cmake/llvm
-                /usr/local/opt/llvm/lib/cmake/llvm
                 /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/llvm
                 /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/llvm
+                /opt/homebrew/opt/llvm/lib/cmake/llvm
+                /usr/local/opt/llvm/lib/cmake/llvm
                 /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/llvm
         )
     endif()
@@ -179,10 +188,10 @@ function(lython_configure_llvm)
             NAMES MLIRConfig.cmake
             PATHS
                 ${LYTHON_HOMEBREW_MLIR_CMAKE_DIRS}
-                /opt/homebrew/opt/llvm/lib/cmake/mlir
-                /usr/local/opt/llvm/lib/cmake/mlir
                 /opt/homebrew/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/mlir
                 /usr/local/opt/llvm@${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/mlir
+                /opt/homebrew/opt/llvm/lib/cmake/mlir
+                /usr/local/opt/llvm/lib/cmake/mlir
                 /usr/lib/llvm-${LYTHON_LLVM_MAJOR_VERSION}/lib/cmake/mlir
         )
     endif()

@@ -17,6 +17,10 @@
 #include "Passes/Runtime/Primitive/TensorParallel.h"
 #include "runtime/Verification.h"
 
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Rewrite/FrozenRewritePatternSet.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
@@ -147,10 +151,119 @@ void discriminateEHMarkers(ModuleOp module) {
 // argument. The final EH phase can only wire invokes to handlers with
 // CONSTANT marker ids, and it erases the anchor edges that fed the merged
 // block's arguments, so the merge leaves unwirable, phi-broken handlers.
+//
+// ⛔ AND NOT UPSTREAM'S `cf` PATTERNS AS A WHOLE: MLIR 23 added a fold that
+// replaces a block argument every predecessor feeds the same value with that
+// value (`simplifyUniformBlockArgs`, in `cf.br`'s canonicalize and in
+// `SimplifyUniformBlockArguments` for `cf.cond_br` / `cf.switch`). These
+// phases run after refcount insertion, which gave such an argument a token of
+// its own and retained it on each edge; folded, the retains name the outer
+// value -- still right at run time, and a use after release to the ownership
+// verifier (`out = {}; for ...: out.setdefault(...)`). `cf.br` keeps the two
+// simplifications it had before, written here, since its canonicalize has no
+// name to disable it by.
+namespace {
+
+// A successor holding nothing but an unconditional branch elsewhere: its
+// destination and the operands it would receive. Upstream's collapseBranch.
+LogicalResult collapsePassThrough(Block *&successor, ValueRange &operands,
+                                  SmallVectorImpl<Value> &storage) {
+  if (std::next(successor->begin()) != successor->end())
+    return failure();
+  auto branch = dyn_cast<cf::BranchOp>(successor->getTerminator());
+  if (!branch)
+    return failure();
+  for (BlockArgument argument : successor->getArguments())
+    for (Operation *user : argument.getUsers())
+      if (user != branch)
+        return failure();
+  Block *destination = branch.getDest();
+  if (destination == successor)
+    return failure();
+  auto next = dyn_cast<cf::BranchOp>(destination->getTerminator());
+  llvm::DenseSet<Block *> visited{successor, destination};
+  while (next) {
+    Block *nextDestination = next.getDest();
+    if (!visited.insert(nextDestination).second)
+      return failure();
+    next = dyn_cast<cf::BranchOp>(nextDestination->getTerminator());
+  }
+  OperandRange forwarded = branch.getOperands();
+  if (successor->args_empty()) {
+    successor = destination;
+    operands = forwarded;
+    return success();
+  }
+  for (Value operand : forwarded) {
+    auto argument = dyn_cast<BlockArgument>(operand);
+    storage.push_back(argument && argument.getOwner() == successor
+                          ? operands[argument.getArgNumber()]
+                          : operand);
+  }
+  successor = destination;
+  operands = storage;
+  return success();
+}
+
+// `cf.br` merged into a single-predecessor destination, or short-circuited
+// past a pass-through block.
+LogicalResult canonicalizeBranch(cf::BranchOp op, PatternRewriter &rewriter) {
+  Block *destination = op.getDest();
+  Block *parent = op->getBlock();
+  if (destination != parent &&
+      llvm::hasSingleElement(destination->getPredecessors()) &&
+      llvm::none_of(op.getOperands(), [&](Value operand) {
+        auto argument = dyn_cast<BlockArgument>(operand);
+        return argument && argument.getOwner() == destination;
+      })) {
+    SmallVector<Value> operands(op.getOperands());
+    rewriter.eraseOp(op);
+    rewriter.mergeBlocks(destination, parent, operands);
+    return success();
+  }
+  ValueRange operands = op.getOperands();
+  SmallVector<Value, 4> storage;
+  if (destination == parent ||
+      failed(collapsePassThrough(destination, operands, storage)))
+    return failure();
+  rewriter.replaceOpWithNewOp<cf::BranchOp>(op, destination, operands);
+  return success();
+}
+
+struct EHSafeCanonicalizer
+    : public PassWrapper<EHSafeCanonicalizer, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EHSafeCanonicalizer)
+
+  StringRef getArgument() const final { return "lython-eh-safe-canonicalize"; }
+
+  LogicalResult initialize(MLIRContext *context) override {
+    RewritePatternSet set(context);
+    for (Dialect *dialect : context->getLoadedDialects())
+      dialect->getCanonicalizationPatterns(set);
+    for (RegisteredOperationName op : context->getRegisteredOperations())
+      if (op.getStringRef() != cf::BranchOp::getOperationName())
+        op.getCanonicalizationPatterns(set, context);
+    set.add(canonicalizeBranch);
+    patterns = FrozenRewritePatternSet(
+        std::move(set),
+        /*disabledPatternLabels=*/
+        {"(anonymous namespace)::SimplifyUniformBlockArguments"});
+    return success();
+  }
+
+  void runOnOperation() override {
+    GreedyRewriteConfig config;
+    config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
+    (void)applyPatternsGreedily(getOperation(), patterns, config);
+  }
+
+  FrozenRewritePatternSet patterns;
+};
+
+} // namespace
+
 std::unique_ptr<Pass> createEHSafeCanonicalizerPass() {
-  GreedyRewriteConfig config;
-  config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
-  return mlir::createCanonicalizerPass(config);
+  return std::make_unique<EHSafeCanonicalizer>();
 }
 
 LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
@@ -437,7 +550,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
     if (failed(runPhase("convert-to-llvm", [&](PassManager &pm) {
           mlir::ConvertVectorToLLVMPassOptions vectorOptions;
           vectorOptions.reassociateFPReductions = true;
-          vectorOptions.x86Vector = tensorTarget.usesX86();
+          vectorOptions.x86 = tensorTarget.usesX86();
           mlir::VectorTransferToSCFOptions transferOptions;
           transferOptions.setTargetRank(1);
           pm.addPass(mlir::createLowerAffinePass());
