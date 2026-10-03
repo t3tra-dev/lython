@@ -431,15 +431,78 @@ endfunction()
 
 file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/*.py")
+
+# --- Batched golden cases ------------------------------------------------------
+#
+# A golden case pays about 0.7 s of compile and JIT build for a program that
+# runs in milliseconds. golden/batch_cases.py joins several cases into one
+# program -- still module-level code, each case's names renamed apart -- and
+# cuts the output back per case, so that price is paid once per batch. It
+# decides which cases can join (`--list-eligible`); the rest register alone
+# below as before. Measured on a Debug build, 518 eligible cases: 1560 s of
+# test time alone, 749 s in batches of six.
+#
+# Why six: the batch is one module-level function, and the ownership phases
+# grow faster than linearly in its size. Per case: 1.07 s at two, 0.64 s at
+# four, 0.68 s at eight, 0.99 s at twenty-five.
+#
+# OFF registers every case alone, the way to rerun one by name; a failing
+# batch also prints the command that runs the failing case alone.
+option(LYTHON_GOLDEN_BATCH "Run eligible golden cases in batches" ON)
+set(LYTHON_GOLDEN_BATCH_SIZE 6 CACHE STRING "Golden cases per batch")
+set(LYTHON_GOLDEN_BATCH_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/golden/batch_cases.py")
+set(LYTHON_GOLDEN_BATCHED)
+if(LYTHON_GOLDEN_BATCH)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${LYTHON_GOLDEN_BATCH_RUNNER}"
+            --list-eligible ${LYTHON_GOLDEN_CASES}
+        OUTPUT_VARIABLE LYTHON_GOLDEN_BATCHED
+        RESULT_VARIABLE batch_list_status)
+    if(NOT batch_list_status EQUAL 0)
+        message(FATAL_ERROR "golden/batch_cases.py --list-eligible failed")
+    endif()
+    # The exclusions decide eligibility too, so editing them reconfigures.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${LYTHON_GOLDEN_BATCH_RUNNER}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/golden/batch-exclusions.txt")
+    foreach(slow_case IN LISTS LYTHON_GOLDEN_SLOW_CASES)
+        list(REMOVE_ITEM LYTHON_GOLDEN_BATCHED
+            "${CMAKE_CURRENT_SOURCE_DIR}/golden/cases/${slow_case}.py")
+    endforeach()
+    list(LENGTH LYTHON_GOLDEN_BATCHED batched_count)
+    set(batch_index 0)
+    set(batch_start 0)
+    while(batch_start LESS batched_count)
+        list(SUBLIST LYTHON_GOLDEN_BATCHED ${batch_start}
+            ${LYTHON_GOLDEN_BATCH_SIZE} batch_cases)
+        string(LENGTH "00${batch_index}" index_length)
+        math(EXPR index_from "${index_length} - 3")
+        string(SUBSTRING "00${batch_index}" ${index_from} 3 batch_label)
+        add_test(NAME "golden.batch.${batch_label}"
+            COMMAND Python3::Interpreter "${LYTHON_GOLDEN_BATCH_RUNNER}"
+                --lyc $<TARGET_FILE:lyc> --timeout 300 ${batch_cases})
+        # Every case may end up alone, one after another.
+        math(EXPR batch_timeout "360 * ${LYTHON_GOLDEN_BATCH_SIZE}")
+        set_tests_properties("golden.batch.${batch_label}" PROPERTIES
+            TIMEOUT ${batch_timeout}
+            LABELS "e2e;golden;golden-cases;golden-batch")
+        math(EXPR batch_index "${batch_index} + 1")
+        math(EXPR batch_start "${batch_start} + ${LYTHON_GOLDEN_BATCH_SIZE}")
+    endwhile()
+endif()
+
 foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
     get_filename_component(case_name "${case_path}" NAME_WE)
+    list(REMOVE_ITEM LYTHON_GOLDEN_DECLARED_LAYERS "cases/${case_name}")
+    if(case_path IN_LIST LYTHON_GOLDEN_BATCHED)
+        continue()
+    endif()
     if(case_name IN_LIST LYTHON_GOLDEN_SLOW_CASES)
         set(case_timeout 900)
     else()
         set(case_timeout 300)
     endif()
     lython_add_golden_case(cases "${case_path}" ${case_timeout})
-    list(REMOVE_ITEM LYTHON_GOLDEN_DECLARED_LAYERS "cases/${case_name}")
 endforeach()
 
 # --- Release-interface width gate --------------------------------------------

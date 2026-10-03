@@ -1,0 +1,9 @@
+# Golden cases that must not join a batch (golden/batch_cases.py), one per
+# line: <case name> <why>.
+#
+# The runner already keeps out every case it can tell is context-dependent;
+# this file is for one it cannot tell, found by a BATCH-DISAGREE that turned out
+# to be the case's own doing rather than the compiler's. Before adding a line,
+# show it is the case's: a disagreement is how cross-case defects are found
+# (`round(-15, -1)` negated the shared small int 20 for every later case), and
+# excluding one of those hides it.
