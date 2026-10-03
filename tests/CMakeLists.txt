@@ -221,7 +221,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnOwnedValueSurvivesTwoRebindingIfChains"
     "DriverTest.ABorrowedParameterRebindsAcrossALoop"
     "DriverTest.ARefusedGeneratorNamesWhatSentItDown"
-    "DriverTest.ARecursiveGeneratorMethodNamesTheRealLimit"
+    "DriverTest.ARecursiveGeneratorMethodRunsThroughItsFrame"
     "DriverTest.ABoolLiveAcrossAYieldNamesTheRealLimit"
     "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation"
     "DriverTest.AWasm64ModuleCarriesItsPadsAsFunclets"

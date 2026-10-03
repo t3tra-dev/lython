@@ -1665,12 +1665,12 @@ TEST(DriverTest, ABorrowedParameterRebindsAcrossALoop) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
-// What: a generator method that recurses into its children is refused for the
-// DELEGATION limit rather than for a method the class plainly declares. The
-// old message named `walk` as missing and pointed at its own `def`, because
-// the yield-type inference walks the body before the method is published.
-TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
-  CompileResult refused = compileSource(
+// What: a generator method that recurses into its children compiles -- its
+// inner walk is resumed through the frame -- and is not refused as a method
+// the class does not declare (the yield-type inference walks the body before
+// the method is published).
+TEST(DriverTest, ARecursiveGeneratorMethodRunsThroughItsFrame) {
+  CompileResult recursive = compileSource(
       "from typing import Iterator\n"
       "class Tree:\n"
       "    def __init__(self, value: int) -> None:\n"
@@ -1682,14 +1682,7 @@ TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
       "            for nested in child.walk():\n"
       "                yield nested\n"
       "print(list(Tree(1).walk()))\n");
-  EXPECT_FALSE(refused.succeeded);
-  EXPECT_NE(refused.diagnostics.find("recursive delegation has no static "
-                                     "expansion"),
-            std::string::npos)
-      << refused.diagnostics;
-  EXPECT_EQ(refused.diagnostics.find("does not provide manifest method"),
-            std::string::npos)
-      << refused.diagnostics;
+  EXPECT_TRUE(recursive.succeeded) << recursive.diagnostics;
 
   // A generator method called from a SIBLING still compiles: the publication
   // change must not disturb the case that already worked.

@@ -1123,6 +1123,8 @@ private:
     // i64 of an int return, or nothing -- unless the body returns an object,
     // which then crosses as an owned span the way a yielded one does.
     GeneratorResumeLane returnLane;
+    // What the body returns, statically; null when it returns no value.
+    mlir::Type returnType;
     // The lane a clone RESULT rides, or null for a control pair: 2 is the
     // yielded value, 3 the returned value, 5.. the frame. The ABI, the
     // return lowering and the drivers all ask this one question.
@@ -1167,9 +1169,18 @@ private:
                                         GeneratorResumeInfo &info,
                                         mlir::Value storage,
                                         llvm::SmallVectorImpl<mlir::Value> &operands);
-  enum class GeneratorDriverKind : unsigned { Step, Advance, Throw, Close };
+  // StepFull is the step that hands back the returned value too, for a
+  // delegation (`py.generator.step`).
+  enum class GeneratorDriverKind : unsigned {
+    Step,
+    Advance,
+    Throw,
+    Close,
+    StepFull
+  };
   static mlir::Type generatorYieldType(mlir::Type generator);
   static bool isGeneratorProtocol(mlir::Type type);
+  static mlir::Type concreteGeneratorType(mlir::Type type);
   mlir::FailureOr<RuntimeBundle> boxUnionForLane(mlir::Operation *op,
                                                  const RuntimeBundle &value);
   mlir::FailureOr<RuntimeBundle>
@@ -1190,7 +1201,9 @@ private:
                                    mlir::func::FuncOp to, unsigned dropped);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorDispatch(mlir::Operation *op, mlir::Type elementType,
-                               GeneratorDriverKind kind);
+                               GeneratorDriverKind kind,
+                               mlir::Type returnType = {});
+  mlir::LogicalResult lowerGeneratorStep(py::GeneratorStepOp op);
   // Why the state machine DECLINED a generator, keyed by the source function.
   // The tier below refuses for its own reason, which is never the reason the
   // program landed there -- see the note at `declineStateMachineGenerator`.
@@ -1314,6 +1327,10 @@ private:
   // shape is not inlinable and the body must fall back to the legacy inline
   // dispatch.
   mlir::FailureOr<bool> inlineDelegatedYieldFroms(mlir::func::FuncOp clone);
+  mlir::FailureOr<bool> inlineOneYieldFrom(mlir::func::FuncOp clone,
+                                           py::YieldFromOp yieldFrom);
+  mlir::FailureOr<bool> rewriteYieldFromAsDelegation(mlir::func::FuncOp clone,
+                                                     py::YieldFromOp yieldFrom);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorStepFunction(mlir::Operation *op,
                                    GeneratorResumeInfo &info);

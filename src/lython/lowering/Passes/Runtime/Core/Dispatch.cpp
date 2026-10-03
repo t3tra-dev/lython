@@ -80,6 +80,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::GetItemOp>([&](auto getItem) { return lowerGetItem(getItem); })
       .Case<py::IterOp>([&](auto iter) { return lowerIter(iter); })
       .Case<py::NextOp>([&](auto next) { return lowerNext(next); })
+      .Case<py::GeneratorStepOp>(
+          [&](auto step) { return lowerGeneratorStep(step); })
       .Case<py::EnterOp>([&](auto enter) { return lowerEnter(enter); })
       .Case<py::ExitOp>([&](auto exit) { return lowerExit(exit); })
       .Case<py::AEnterOp>([&](auto enter) { return lowerAEnter(enter); })

@@ -1,0 +1,11 @@
+[1, 2, 3, 4]
+[3, 2, 1, 0]
+0
+1
+inner finally
+outer got r2
+0
+inner caught
+-1
+inner finally
+closed
