@@ -42,8 +42,11 @@ set(LYTHON_LIB_INTERNAL_PY
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/stackguard_support.py"
 )
 
+# `.pyi` modules are contracts with no implementation of their own: `js`, whose
+# values the JavaScript host supplies.
 file(GLOB LYTHON_STDLIB_PY CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.py"
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/lib/*.pyi"
 )
 list(SORT LYTHON_STDLIB_PY)
 list(REMOVE_ITEM LYTHON_STDLIB_PY ${LYTHON_LIB_INTERNAL_PY})
@@ -97,6 +100,12 @@ if(MODULES)
     string(REPLACE "," ";" module_list "${MODULES}")
     foreach(path IN LISTS module_list)
         get_filename_component(name "${path}" NAME_WE)
+        get_filename_component(extension "${path}" EXT)
+        if(extension STREQUAL ".pyi")
+            set(is_stub true)
+        else()
+            set(is_stub false)
+        endif()
         if(NOT EXISTS "${path}")
             message(FATAL_ERROR "runtime-internal lib bytecode module is missing: ${path}")
         endif()
@@ -175,6 +184,12 @@ if(MODULES)
     string(REPLACE "," ";" module_list "${MODULES}")
     foreach(path IN LISTS module_list)
         get_filename_component(name "${path}" NAME_WE)
+        get_filename_component(extension "${path}" EXT)
+        if(extension STREQUAL ".pyi")
+            set(is_stub true)
+        else()
+            set(is_stub false)
+        endif()
         if(NOT EXISTS "${path}")
             message(FATAL_ERROR "stdlib source module is missing: ${path}")
         endif()
@@ -186,7 +201,7 @@ if(MODULES)
         string(APPEND arrays
             "static const unsigned char k_stdlib_${name}[] = {${bytes}};\n")
         string(APPEND entries
-            "    {\"${name}\", k_stdlib_${name}, sizeof(k_stdlib_${name})},\n")
+            "    {\"${name}\", k_stdlib_${name}, sizeof(k_stdlib_${name}), ${is_stub}},\n")
     endforeach()
 endif()
 

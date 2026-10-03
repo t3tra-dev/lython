@@ -5,6 +5,9 @@
 #include "AstAccess.h"
 #include "AstSynth.h"
 #include "ClosureAnalysis.h"
+#include "Contracts.h"
+#include "EmitterPyOps.h"
+#include "JsHost.h"
 #include "PyProtocols.h"
 
 #include "llvm/Support/SaveAndRestore.h"
@@ -203,6 +206,104 @@ void bindSourceClassLocals(
       continue;
     types.bindClass(*name, types.contract(sourceModuleClassSymbol(moduleName,
                                                                   *name)));
+  }
+}
+
+// A stub's classes, as contracts the protocol table can answer member
+// questions about: fields from `name: T`, methods from each `def` with
+// `@overload` siblings as alternative signatures, bases by name. Nothing is
+// emitted; a stub has no runtime of its own.
+//
+// ⛔ Static methods are not published unless the policy gives them the
+// value as a receiver: the table keys a method by the receiver's class, and a
+// static one has none of its own.
+void declareStubClassContracts(TypeSystem &types, mlir::MLIRContext &context,
+                               llvm::StringRef moduleName,
+                               const std::vector<parser::NodePtr> &body,
+                               const StubContractPolicy &policy) {
+  mlir::Type any = types.any();
+  auto read = [&](mlir::Type type) {
+    return policy.anyResult && type == any ? policy.anyResult : type;
+  };
+  auto written = [&](mlir::Type type) {
+    return policy.anyParameter && type == any ? policy.anyParameter : type;
+  };
+  for (const parser::NodePtr &statement : body) {
+    if (!statement || !isTopLevelClass(*statement))
+      continue;
+    std::optional<std::string_view> name = ast::string(*statement, "name");
+    const auto *classBody = ast::nodeList(*statement, "body");
+    if (!name || !classBody)
+      continue;
+    std::string contractName = sourceModuleClassSymbol(moduleName, *name);
+    py::protocols::ProtocolInfo info;
+    if (const auto *bases = ast::nodeList(*statement, "bases"))
+      for (const parser::NodePtr &base : *bases)
+        if (base)
+          if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                  types.annotationType(base.get())))
+            info.bases.push_back(py::protocols::ProtocolBase{
+                py::contracts::manifestClassNameForContract(
+                    contract.getContractName()),
+                {}});
+    info.bases.push_back(py::protocols::ProtocolBase{
+        py::contracts::manifestClassNameForContract("builtins.object"), {}});
+    mlir::Type receiverType = types.contract(contractName);
+    for (const parser::NodePtr &member : *classBody) {
+      if (!member)
+        continue;
+      if (member->kind == "AnnAssign") {
+        const parser::Node *target = ast::node(*member, "target");
+        if (target && target->kind == "Name")
+          if (mlir::Type type =
+                  types.annotationType(ast::node(*member, "annotation")))
+            info.fields[std::string(ast::nameSpelling(*target))] = read(type);
+        continue;
+      }
+      if (member->kind != "FunctionDef")
+        continue;
+      std::optional<std::string_view> methodName = ast::string(*member, "name");
+      if (!methodName)
+        continue;
+      bool isStatic = false;
+      if (const auto *decorators = ast::nodeList(*member, "decorator_list"))
+        for (const parser::NodePtr &decorator : *decorators)
+          if (decorator && importedDecoratorLeaf(*decorator) == "staticmethod")
+            isStatic = true;
+      if (isStatic && !policy.staticMethodsTakeTheValue)
+        continue;
+      FunctionSignature signature =
+          isStatic ? types.functionSignature(*member)
+                   : types.functionSignature(*member, llvm::StringRef("self"),
+                                             py::CallableType(), receiverType);
+      if (!signature.publicCallable)
+        continue;
+      if (isStatic) {
+        signature.positionalNames.insert(signature.positionalNames.begin(),
+                                         "self");
+        signature.positionalTypes.insert(signature.positionalTypes.begin(),
+                                         receiverType);
+        signature.positionalDefaults.insert(
+            signature.positionalDefaults.begin(), false);
+        ++signature.positionalOnlyCount;
+      }
+      for (mlir::Type &type : signature.positionalTypes)
+        type = written(type);
+      for (mlir::Type &type : signature.kwOnlyTypes)
+        type = written(type);
+      signature.callableVarargType = written(signature.callableVarargType);
+      signature.varargType = written(signature.varargType);
+      signature.resultType = read(signature.resultType);
+      signature.publicResultType = read(signature.publicResultType);
+      types.refreshCallable(signature);
+      py::protocols::ProtocolMethod method;
+      method.signature = signature.publicCallable;
+      method.mayThrow = true;
+      method.firstApplicable = true;
+      info.methods[std::string(*methodName)].push_back(method);
+    }
+    py::protocols::Table::getMutable(context).registerClass(contractName,
+                                                            std::move(info));
   }
 }
 
@@ -553,6 +654,13 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
       continue;
     std::string local =
         (llvm::Twine(localName) + "." + llvm::StringRef(*name)).str();
+    // The host's global of the same name is what `js.Math` reads.
+    if (isJsHostModule(*source) &&
+        moduleGlobals.count(sourceModuleClassSymbol(module, *name))) {
+      std::string global = sourceModuleClassSymbol(module, *name);
+      types.bindCanonicalSymbol(local, global, moduleGlobals[global]);
+      continue;
+    }
     types.bindClass(local, types.contract(sourceModuleClassSymbol(module, *name)));
   }
   for (const parser::NodePtr &statement : *body) {
@@ -750,6 +858,14 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     return false;
   if (exportedName == "*")
     return false;
+  // `from js import Math` is `globalThis.Math`, Pyodide's reading: the object,
+  // where the stub's class of the same name only says what the object is.
+  if (isJsHostModule(*source))
+    if (std::string global = (llvm::Twine(module) + "." + exportedName).str();
+        moduleGlobals.count(global)) {
+      types.bindCanonicalSymbol(localName, global, moduleGlobals[global]);
+      return true;
+    }
   const auto *rawBody = ast::nodeList(*source->moduleNode, "body");
   if (!rawBody)
     return false;
@@ -1251,6 +1367,7 @@ void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,
 }
 
 void ModuleEmitter::predeclareSourceModules() {
+  declareJsHostModule();
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode)
       continue;
@@ -1472,6 +1589,10 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     bindSourceModuleLocals(source.moduleName, *source.moduleNode,
                            source.isStub);
     if (source.isStub) {
+      if (!isJsHostModule(source))
+        declareStubClassContracts(types, context, source.moduleName,
+                                  staticModuleStatements(types, *rawBody),
+                                  StubContractPolicy{});
       activePackageName = std::move(savedPackageName);
       sourceName = std::move(savedSourceName);
       continue;
@@ -2052,6 +2173,204 @@ void ModuleEmitter::emitTopLevelDeclarations() {
   // Stub-declared and never-walked generics still owe their specializations.
   drainGenericClassSpecializations();
   emitDeferredMethodBodies();
+}
+
+bool isJsHostModule(const EmitOptions::SourceModule &source) {
+  return source.isEmbedded && source.isStub && source.moduleName == "js";
+}
+
+// The host's module is declared before any import is bound, because every
+// name in it -- `from js import console` -- is a host global whose type has to
+// exist when the import names it.
+//
+// Its globals are what Pyodide's are: `globalThis[name]`. The stub declares
+// some at module level (`console: Console`) and the rest as Window's
+// properties (`Math`, `JSON`), which is the object globalThis is.
+void ModuleEmitter::declareJsHostModule() {
+  const EmitOptions::SourceModule *host = nullptr;
+  for (const EmitOptions::SourceModule &source : options.sourceModules)
+    if (isJsHostModule(source))
+      host = &source;
+  if (!host || !host->moduleNode)
+    return;
+  module->setAttr(py::kJsHostModuleAttr, mlir::UnitAttr::get(&context));
+  const auto *rawBody = ast::nodeList(*host->moduleNode, "body");
+  if (!rawBody)
+    return;
+  // ⛔ The stub's own diagnostics are not the program's: it is generated from
+  // TypeScript, and what it spells that this compiler cannot read types as
+  // `object` at the stub's use sites, which is where it is the program's
+  // business.
+  parser::Diagnostics programAnnotationDiagnostics =
+      types.takeAnnotationDiagnostics();
+  {
+    TypeSystem::ScopeIsolation isolation = types.isolateScopes();
+    auto moduleScope = types.pushScope();
+    bindModuleImportScope(*host->moduleNode, /*diagnoseUnsupported=*/false);
+    const std::vector<parser::NodePtr> body =
+        staticModuleStatements(types, *rawBody);
+    bindSourceClassLocals(types, host->moduleName, body);
+    // Aliases in source order, twice: the stub spells some before the types
+    // they name. Bound only while the stub is read, then taken back.
+    llvm::SmallVector<std::string, 64> aliases;
+    for (int pass = 0; pass < 2; ++pass)
+      for (const parser::NodePtr &statement : body) {
+        if (!statement || statement->kind != "TypeAlias")
+          continue;
+        const parser::Node *target = ast::node(*statement, "name");
+        const parser::Node *value = ast::node(*statement, "value");
+        if (!target || target->kind != "Name" || !types.namesAType(value))
+          continue;
+        llvm::StringRef alias = ast::nameSpelling(*target);
+        types.bindAnnotationTypeAlias(alias, types.annotationType(value));
+        if (pass == 0)
+          aliases.push_back(alias.str());
+      }
+    StubContractPolicy policy{types.contract(py::kJsProxyContract),
+                              types.object(),
+                              /*staticMethodsTakeTheValue=*/true};
+    declareStubClassContracts(types, context, host->moduleName, body, policy);
+    auto declareGlobal = [&](llvm::StringRef name, mlir::Type type) {
+      if (!type)
+        return;
+      if (type == types.any())
+        type = policy.anyResult;
+      std::string global = (llvm::Twine(host->moduleName) + "." + name).str();
+      if (!moduleGlobals.count(global))
+        moduleGlobals[global] = type;
+    };
+    for (const parser::NodePtr &statement : body) {
+      if (!statement || statement->kind != "AnnAssign")
+        continue;
+      const parser::Node *target = ast::node(*statement, "target");
+      if (target && target->kind == "Name")
+        declareGlobal(
+            ast::nameSpelling(*target),
+            types.annotationType(ast::node(*statement, "annotation")));
+    }
+    const py::protocols::Table &table = py::protocols::Table::get(context);
+    llvm::SmallVector<std::string, 16> pending{
+        sourceModuleClassSymbol(host->moduleName, "Window")};
+    llvm::StringSet<> visited;
+    while (!pending.empty()) {
+      std::string className = pending.pop_back_val();
+      if (!visited.insert(className).second)
+        continue;
+      const py::protocols::ProtocolInfo *info = table.lookup(className);
+      if (!info)
+        continue;
+      for (const auto &[field, type] : info->fields)
+        declareGlobal(field, type);
+      for (const py::protocols::ProtocolBase &base : info->bases)
+        pending.push_back(base.name);
+    }
+    for (const std::string &alias : aliases)
+      types.unbindAnnotationTypeAlias(alias);
+  }
+  types.takeAnnotationDiagnostics();
+  types.restoreAnnotationDiagnostics(std::move(programAnnotationDiagnostics));
+}
+
+bool ModuleEmitter::isJsHostValueType(mlir::Type type) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
+  return contract && module->hasAttr(py::kJsHostModuleAttr) &&
+         (contract.getContractName() == py::kJsProxyContract ||
+          contract.getContractName().starts_with(
+              (py::kJsHostModule + ".").str()));
+}
+
+// `el.offsetParent` is `Element | None`: the host hands back whichever it
+// has, and the program gets a value of the union it was typed with. The read
+// is retyped to the host value as it comes; each member is then tested for
+// in turn and the value converted to the first it is -- None, then the
+// scalars, then a host object, which takes whatever is left.
+//
+// ⛔ Here and not in the lowering: the union is built by the same branch
+// merge every conditional value takes, which is the shape the ownership
+// verifier follows; a union assembled from runtime tests inside one lowered
+// op would be one it has never seen.
+Value ModuleEmitter::adaptJsHostResult(const parser::Node &anchor,
+                                       mlir::Operation *op, Value declared) {
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(declared.type);
+  if (!unionType)
+    return declared;
+  struct Arm {
+    mlir::Type member;
+    llvm::StringRef test;
+    llvm::StringRef conversion;
+  };
+  llvm::SmallVector<Arm, 4> arms;
+  std::optional<Arm> object;
+  for (mlir::Type member : unionType.getMemberTypes()) {
+    if (member == types.none())
+      arms.insert(arms.begin(), Arm{member, "__ly_js_is_none__", ""});
+    else if (member == types.boolType())
+      arms.push_back(Arm{member, "__ly_js_is_bool__", "__ly_js_as_bool__"});
+    else if (member == types.intType())
+      arms.push_back(Arm{member, "__ly_js_is_int__", "__ly_js_as_int__"});
+    else if (member == types.floatType())
+      arms.push_back(Arm{member, "__ly_js_is_float__", "__ly_js_as_float__"});
+    else if (member == types.strType())
+      arms.push_back(Arm{member, "__ly_js_is_str__", "__ly_js_as_str__"});
+    else if (isJsHostValueType(member) && !object)
+      object = Arm{member, "", "__ly_js_as_proxy__"};
+    else {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "a JavaScript value typed " + typeText(declared.type) +
+              " cannot be read: its members must be None, bool, int, float, "
+              "str or one JavaScript class"});
+      return declared;
+    }
+  }
+  if (object)
+    arms.push_back(*object);
+  mlir::Type raw = types.contract(py::kJsProxyContract);
+  op->getResult(0).setType(raw);
+  // The call's selected signature says what it returns, and is checked
+  // against the result's type.
+  if (auto call = mlir::dyn_cast<py::CallOp>(op))
+    if (auto callable =
+            mlir::dyn_cast<py::CallableType>(call.getCallContract())) {
+      auto retyped = py::CallableType::get(
+          &context, callable.getPositionalTypes(), callable.getKwOnlyTypes(),
+          callable.getVarargType(), callable.getKwargType(), {raw},
+          callable.getPositionalNames(), callable.getKwOnlyNames(),
+          callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
+          callable.getVarargName(), callable.getKwargName(),
+          callable.getPositionalOnlyCount());
+      call.setCallContractAttr(mlir::TypeAttr::get(callProtocolFor(retyped)));
+    }
+  Value host{op->getResult(0), raw};
+  auto internal = [&](llvm::StringRef method, mlir::Type result) -> Value {
+    auto callable =
+        py::CallableType::get(&context, {raw}, {}, {}, {}, {result});
+    Value positional = emitPack({});
+    Value names = emitPack({});
+    Value values = emitPack({});
+    auto call =
+        py::CallOp::create(builder, loc(anchor), mlir::TypeRange{result},
+                           callProtocolFor(callable), host.value,
+                           positional.value, names.value, values.value);
+    call->setAttr("ly.bound_method", builder.getStringAttr(method));
+    return Value{call.getResults().front(), result};
+  };
+  std::function<mlir::Value(std::size_t)> emitArm = [&](std::size_t index) {
+    const Arm &arm = arms[index];
+    auto convert = [&]() -> mlir::Value {
+      Value converted = arm.conversion.empty()
+                            ? emitNone(anchor)
+                            : internal(arm.conversion, arm.member);
+      return coerceValue(converted, declared.type, anchor).value;
+    };
+    if (index + 1 == arms.size())
+      return convert();
+    mlir::Value condition =
+        emitBoolValue(internal(arm.test, types.boolType()), anchor);
+    return emitValueDiamond(loc(anchor), condition, declared.type, convert,
+                            [&] { return emitArm(index + 1); });
+  };
+  return Value{emitArm(0), declared.type};
 }
 
 } // namespace lython::emitter

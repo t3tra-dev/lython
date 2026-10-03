@@ -1,0 +1,2 @@
+TypeError: JavaScript returned undefined where a string was declared
+RuntimeError: ReferenceError: document is not defined

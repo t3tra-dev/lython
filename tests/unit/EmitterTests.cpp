@@ -58,9 +58,11 @@ struct ImportedModuleEmit {
   std::string diagnostics;
 };
 
-ImportedModuleEmit emitWithImportedModule(llvm::StringRef helperName,
-                                          llvm::StringRef helperSource,
-                                          llvm::StringRef mainSource) {
+ImportedModuleEmit
+emitWithImportedModule(llvm::StringRef helperName, llvm::StringRef helperSource,
+                       llvm::StringRef mainSource,
+                       llvm::StringRef helperExtension = ".py",
+                       llvm::StringRef targetTriple = {}) {
   ImportedModuleEmit result;
   llvm::SmallString<128> dir;
   if (llvm::sys::fs::createUniqueDirectory("lython-emit-import", dir)) {
@@ -68,7 +70,8 @@ ImportedModuleEmit emitWithImportedModule(llvm::StringRef helperName,
     return result;
   }
   llvm::SmallString<128> helperPath(dir);
-  llvm::sys::path::append(helperPath, llvm::Twine(helperName) + ".py");
+  llvm::sys::path::append(helperPath,
+                          llvm::Twine(helperName) + helperExtension);
   {
     std::error_code error;
     llvm::raw_fd_ostream out(helperPath, error);
@@ -85,7 +88,9 @@ ImportedModuleEmit emitWithImportedModule(llvm::StringRef helperName,
   mlir::OwningOpRef<mlir::ModuleOp> module;
   llvm::raw_string_ostream diag(result.diagnostics);
   lython::driver::DriverOptions options;
-  options.targetTriple = llvm::sys::getDefaultTargetTriple();
+  options.targetTriple = targetTriple.empty()
+                             ? llvm::sys::getDefaultTargetTriple()
+                             : targetTriple.str();
   result.succeeded = mlir::succeeded(lython::driver::emitMLIRFromSource(
       mainSource, mainPath, dir, options, context, module, diag));
   llvm::sys::fs::remove(helperPath);
@@ -1994,4 +1999,125 @@ TEST(EmitterTest, AZeroArgumentMethodOnAnEmptyLiteralIsNotACrash) {
                     "        parts.append(seg)\n"
                     "    return \"/\".join(parts)\n"
                     "print(f(\"a/b/../c\"))\n"));
+}
+
+// What: a stub's classes answer member questions -- a field, a method found
+// through a base, an overload chosen by a literal argument -- and a literal no
+// overload names is refused.
+TEST(EmitterTest, AStubsClassesAreContracts) {
+  const char *stub = "import typing as t\n"
+                     "class Shape:\n"
+                     "    sides: int\n"
+                     "    def area(self, scale: float) -> float: ...\n"
+                     "    @t.overload\n"
+                     "    def pick(self, k: t.Literal[\"a\"]) -> int: ...\n"
+                     "    @t.overload\n"
+                     "    def pick(self, k: t.Literal[\"b\"]) -> str: ...\n"
+                     "class Square(Shape):\n"
+                     "    side: float\n";
+  ImportedModuleEmit typed =
+      emitWithImportedModule("shape", stub,
+                             "import shape\n"
+                             "def use(s: shape.Square) -> None:\n"
+                             "    x: float = s.area(2.0) + s.side\n"
+                             "    n: int = s.sides + s.pick(\"a\")\n"
+                             "    b: str = s.pick(\"b\")\n",
+                             ".pyi");
+  EXPECT_TRUE(typed.succeeded) << typed.diagnostics;
+
+  ImportedModuleEmit unnamed =
+      emitWithImportedModule("shape", stub,
+                             "import shape\n"
+                             "def use(s: shape.Square) -> None:\n"
+                             "    s.pick(\"c\")\n",
+                             ".pyi");
+  EXPECT_FALSE(unnamed.succeeded);
+  EXPECT_NE(unnamed.diagnostics.find("has manifest method 'pick' but no "
+                                     "signature that accepts"),
+            std::string::npos)
+      << unnamed.diagnostics;
+}
+
+// What: a stub's overloads are tried in declaration order and the first that
+// accepts the call answers (PEP 484), where two that both accept would
+// otherwise tie.
+TEST(EmitterTest, AStubsFirstApplicableOverloadAnswers) {
+  const char *stub = "import typing as t\n"
+                     "class Box:\n"
+                     "    @t.overload\n"
+                     "    def get(self, k: object) -> int: ...\n"
+                     "    @t.overload\n"
+                     "    def get(self, k: object) -> str: ...\n";
+  ImportedModuleEmit first =
+      emitWithImportedModule("box", stub,
+                             "import box\ndef use(b: box.Box) -> None:\n"
+                             "    print(b.get(1).bit_length())\n",
+                             ".pyi");
+  EXPECT_TRUE(first.succeeded) << first.diagnostics;
+  ImportedModuleEmit second =
+      emitWithImportedModule("box", stub,
+                             "import box\ndef use(b: box.Box) -> None:\n"
+                             "    print(b.get(1).upper())\n",
+                             ".pyi");
+  EXPECT_FALSE(second.succeeded);
+}
+
+// What: `js` is the JavaScript host's module: refused where the target has no
+// host, and on one that does, a local js.py may not take its name.
+TEST(EmitterTest, TheJsModuleIsTheHosts) {
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+      "from js import console\nconsole.log(1)\n", "main.py",
+      "<lython-no-import-dir>", native, context, module, diag)));
+  EXPECT_NE(diagnostics.find("module 'js' is the JavaScript host's and this "
+                             "target has none"),
+            std::string::npos)
+      << diagnostics;
+
+  ImportedModuleEmit shadowed = emitWithImportedModule(
+      "js", "def log() -> None:\n    pass\n", "import js\njs.log()\n", ".py",
+      "wasm32-unknown-emscripten");
+  EXPECT_FALSE(shadowed.succeeded);
+  EXPECT_NE(shadowed.diagnostics.find("module 'js' is the host's; rename this "
+                                      "file"),
+            std::string::npos)
+      << shadowed.diagnostics;
+}
+
+// What: a name imported from `js` is the host's global typed by the stub --
+// `Math` the object, not the class of that name -- so its members are typed:
+// a float where the stub says float, and a str refused where an int is
+// declared.
+TEST(EmitterTest, AJsGlobalIsTypedByTheStub) {
+  auto emitFor = [](llvm::StringRef source, std::string &diagnostics) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    llvm::raw_string_ostream diag(diagnostics);
+    lython::driver::DriverOptions options;
+    options.targetTriple = "wasm32-unknown-emscripten";
+    return mlir::succeeded(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", options, context, module,
+        diag));
+  };
+  std::string typed;
+  EXPECT_TRUE(emitFor("from js import Math, URLSearchParams\n"
+                      "x: float = Math.sqrt(2.0) + Math.PI\n"
+                      "v = URLSearchParams.new(\"a=1\").get(\"a\")\n"
+                      "if v is not None:\n"
+                      "    print(v + \"!\")\n",
+                      typed))
+      << typed;
+  std::string refused;
+  EXPECT_FALSE(emitFor("from js import JSON, URLSearchParams\n"
+                       "print(JSON.stringify(1).bit_length())\n"
+                       "v = URLSearchParams.new(\"a=1\").get(\"a\")\n"
+                       "print(v + \"!\")\n",
+                       refused));
+  EXPECT_NE(refused.find("'bit_length'"), std::string::npos) << refused;
+  EXPECT_NE(refused.find("__add__"), std::string::npos) << refused;
 }

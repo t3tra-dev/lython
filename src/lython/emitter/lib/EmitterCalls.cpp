@@ -1930,6 +1930,9 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                callProtocolFor(inference), receiver.value,
                                posPack.value, namePack.value, valuePack.value);
         op->setAttr("ly.bound_method", builder.getStringAttr(*methodName));
+        if (isJsHostValueType(receiver.type))
+          return adaptJsHostResult(expr, op,
+                                   Value{op.getResults().front(), resultType});
         return {op.getResults().front(), resultType};
       }
       }

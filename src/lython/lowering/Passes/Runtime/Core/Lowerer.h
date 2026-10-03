@@ -1372,6 +1372,24 @@ private:
                           llvm::ArrayRef<mlir::Value> values);
   mlir::LogicalResult lowerClassTest(py::ClassTestOp op);
   mlir::LogicalResult lowerTypeObject(py::TypeObjectOp op);
+  // The JavaScript host's members (Runtime/Js/HostCalls.cpp).
+  bool isJsProxyBundle(const RuntimeBundle &bundle) const;
+  bool isJsHostGlobal(py::GlobalGetOp op) const;
+  mlir::FailureOr<mlir::func::CallOp>
+  callJsPrimitive(mlir::Operation *op, llvm::StringRef name,
+                  mlir::ValueRange operands);
+  std::pair<mlir::Value, mlir::Value>
+  jsMemberNameOperands(mlir::Operation *op, llvm::StringRef pythonName);
+  mlir::LogicalResult pushJsValue(mlir::Operation *op,
+                                  const RuntimeBundle &source);
+  mlir::LogicalResult takeJsResult(mlir::Operation *op, mlir::Value result,
+                                   mlir::Value handle);
+  mlir::LogicalResult lowerJsGlobalGet(py::GlobalGetOp op);
+  mlir::LogicalResult lowerJsAttrGet(py::AttrGetOp op,
+                                     const RuntimeBundle &object);
+  mlir::LogicalResult lowerJsAttrSet(py::AttrSetOp op, RuntimeBundle object);
+  mlir::LogicalResult lowerJsMethodCall(py::CallOp op, RuntimeBundle receiver,
+                                        llvm::StringRef methodName);
   mlir::LogicalResult lowerAttrGet(py::AttrGetOp op);
   mlir::LogicalResult lowerAttrSet(py::AttrSetOp op);
   mlir::LogicalResult lowerPack(py::PackOp op);

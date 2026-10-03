@@ -388,10 +388,15 @@ public:
   // name to another SPELLING (what an import rename needs), this carries the
   // resolved type, so `Row = list[int]` works as well as `Name = str`.
   void bindAnnotationTypeAlias(llvm::StringRef name, mlir::Type type);
+  // Takes back an alias bound for one module's contracts only (a stub's
+  // aliases name types inside the stub and are not the program's to spell).
+  void unbindAnnotationTypeAlias(llvm::StringRef name);
   // Diagnostics recorded while resolving annotations (string forward
   // references whose text is not a simple name). Drained once by the
   // emitter when it assembles its result.
   parser::Diagnostics takeAnnotationDiagnostics();
+  // Puts back what a take set aside, ahead of anything recorded since.
+  void restoreAnnotationDiagnostics(parser::Diagnostics diagnostics);
   // The element an iteration over `node` yields (a generator expression or a
   // plain iterable); null when it cannot be seen.
   mlir::Type iterationElementType(const parser::Node *node) const;

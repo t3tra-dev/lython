@@ -31,6 +31,17 @@ if(LYTHON_CLANG_FOR_RESOURCE_DIR)
     )
 endif()
 
+# The JavaScript host's half of `js` (runtime/js/lython_js.js), handed to emcc
+# with every program that imports it.
+set(LYTHON_JS_CORE_SOURCE "${CMAKE_SOURCE_DIR}/src/lython/runtime/js/lython_js.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${LYTHON_JS_CORE_SOURCE}")
+file(READ "${LYTHON_JS_CORE_SOURCE}" LYTHON_JS_CORE)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/LythonJsCore.inc"
+    "// Generated from src/lython/runtime/js/lython_js.js. Do not edit.\n"
+    "static const char kLythonJsCore[] = R\"LYJS(${LYTHON_JS_CORE})LYJS\";\n")
+target_include_directories(lyc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
 target_compile_definitions(lyc
     PRIVATE
     LYTHON_LLVM_TOOLS_BINARY_DIR="${LLVM_TOOLS_BINARY_DIR}"

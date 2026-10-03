@@ -2424,6 +2424,10 @@ void TypeSystem::bindAnnotationTypeAlias(llvm::StringRef name,
     annotationTypeAliases[name] = type;
 }
 
+void TypeSystem::unbindAnnotationTypeAlias(llvm::StringRef name) {
+  annotationTypeAliases.erase(name);
+}
+
 // ⭐ WHAT MAKES AN ASSIGNMENT A TYPE ALIAS. Only the shapes an annotation can
 // be: a spelling this function can already resolve, a subscript of one, or a
 // `|` of those. `Name = "str"` and `LIMIT = 10` are values and answer false,
@@ -3064,6 +3068,13 @@ parser::Diagnostics TypeSystem::takeAnnotationDiagnostics() {
   parser::Diagnostics drained = std::move(annotationDiagnostics);
   annotationDiagnostics.clear();
   return drained;
+}
+
+void TypeSystem::restoreAnnotationDiagnostics(parser::Diagnostics diagnostics) {
+  diagnostics.insert(diagnostics.end(),
+                     std::make_move_iterator(annotationDiagnostics.begin()),
+                     std::make_move_iterator(annotationDiagnostics.end()));
+  annotationDiagnostics = std::move(diagnostics);
 }
 
 // The element an iteration over `node` yields: a generator expression infers

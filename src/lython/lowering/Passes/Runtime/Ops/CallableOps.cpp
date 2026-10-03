@@ -450,6 +450,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerRuntimeListInsert(
 // at the boundary retires the whole class.
 mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     py::CallOp op, RuntimeBundle receiver, llvm::StringRef methodName) {
+  if (RuntimeBundleLowerer::isJsProxyBundle(receiver))
+    return RuntimeBundleLowerer::lowerJsMethodCall(op, std::move(receiver),
+                                                   methodName);
   if (receiver.kind == RuntimeBundle::Kind::TypeObject) {
     // Builtin classmethods (bytes.fromhex, ...) are manifest initializers
     // named after the method; the ctypes type-object surface keeps its own

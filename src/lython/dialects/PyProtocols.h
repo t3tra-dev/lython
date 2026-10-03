@@ -42,6 +42,10 @@ struct ProtocolMethod {
   py::CallableType signature;
   bool mayThrow = false;
   bool noThrow = false;
+  // One of a stub's `@overload`s: PEP 484 tries them in declaration order and
+  // the first that accepts the call is the answer, however a later one would
+  // score. A manifest's overloads keep scoring, with a tie refused.
+  bool firstApplicable = false;
 };
 
 bool sameMethodContract(const ProtocolMethod &lhs, const ProtocolMethod &rhs);

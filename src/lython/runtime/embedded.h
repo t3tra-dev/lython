@@ -44,6 +44,8 @@ struct StdlibSourceModule {
   const char *name;
   const unsigned char *source;
   std::size_t size;
+  // A `.pyi`: the module's contract, with no implementation to compile.
+  bool isStub;
 };
 const StdlibSourceModule *stdlibSourceModules();
 std::size_t stdlibSourceModuleCount();

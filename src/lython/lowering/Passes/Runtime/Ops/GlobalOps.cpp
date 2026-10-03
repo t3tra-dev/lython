@@ -277,6 +277,8 @@ RuntimeBundleLowerer::lowerAddressGlobalSet(py::GlobalSetOp op,
 // rather than a name test -- the runtime's modules are emitted as `__main__`
 // as well, so the emitter cannot tell them apart by module name.
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalGet(py::GlobalGetOp op) {
+  if (RuntimeBundleLowerer::isJsHostGlobal(op))
+    return RuntimeBundleLowerer::lowerJsGlobalGet(op);
   if (RuntimeBundleLowerer::isAddressGlobalType(op.getResult().getType()))
     return RuntimeBundleLowerer::lowerAddressGlobalGet(op);
   if (runtimeContractName(op.getResult().getType()) != "builtins.int" ||

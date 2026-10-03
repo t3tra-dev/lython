@@ -1235,6 +1235,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   const RuntimeBundle *object = RuntimeBundleLowerer::bundleFor(op.getObject());
   if (!object)
     return op.emitError() << "attr.get object has no lowered runtime bundle";
+  if (RuntimeBundleLowerer::isJsProxyBundle(*object))
+    return RuntimeBundleLowerer::lowerJsAttrGet(op, RuntimeBundle(*object));
   if (object->kind == RuntimeBundle::Kind::TypeObject) {
     if (isMethodDescriptorKind(op) &&
         RuntimeBundleLowerer::classDefinesMethod(object->instanceContract,
@@ -2758,6 +2760,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
               "static attributes in the class body";
   if (!object || object->kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "attr.set object has no lowered runtime bundle";
+  if (RuntimeBundleLowerer::isJsProxyBundle(*object))
+    return RuntimeBundleLowerer::lowerJsAttrSet(op, *object);
   if (object->ctypes &&
       object->ctypes->kind == RuntimeCtypesEvidence::Kind::Symbol)
     return RuntimeBundleLowerer::lowerStaticCtypesAttrSet(op, *object, value);

@@ -15,6 +15,21 @@
 
 namespace lython::emitter {
 
+// What a stub's contracts make of what TypeScript left untyped (`t.Any`):
+// left alone, or a type for each direction a value crosses.
+struct StubContractPolicy {
+  mlir::Type anyResult;
+  mlir::Type anyParameter;
+  // A static method is also a method of the class's VALUES: a JavaScript
+  // static is called with the constructor as `this`, and the stub's
+  // `X.new(...)` is how `new X(...)` is spelled.
+  bool staticMethodsTakeTheValue = false;
+};
+
+// The JavaScript host's `js` module: the stub the compiler ships, not a file
+// of that name beside the program.
+bool isJsHostModule(const EmitOptions::SourceModule &source);
+
 class ModuleEmitter {
 public:
   ModuleEmitter(const parser::Node &moduleNode, mlir::MLIRContext &context,
@@ -42,6 +57,13 @@ private:
                         const AsyncContextMethodInferenceResult &inference);
   void predeclareTopLevel();
   void predeclareSourceModules();
+  void declareJsHostModule();
+  // A value of one of the host's `js` contracts (EmitterImports.cpp).
+  bool isJsHostValueType(mlir::Type type) const;
+  // A host member read or call whose declared type is a union: the host's
+  // value is taken as it comes and dispatched to the member it is.
+  Value adaptJsHostResult(const parser::Node &anchor, mlir::Operation *op,
+                          Value declared);
   void emitTopLevelDeclarations();
   void emitSourceModuleDeclarations();
   void bindSourceModuleLocals(llvm::StringRef moduleName,
