@@ -1819,9 +1819,11 @@ namespace {
 // Compiles `source` for `triple` and links the runtime into it, which is where
 // the raise primitive and the libc declarations meet. The whole
 // VerifiedLLVMModule comes back because it owns the LLVMContext; `llvmModule`
-// is null when a step failed.
-lython::driver::VerifiedLLVMModule compileAndLinkFor(llvm::StringRef source,
-                                                     llvm::StringRef triple) {
+// is null when a step failed. With `refusal`, the libc prototype pass may
+// refuse the program: its message lands there instead of failing the test.
+lython::driver::VerifiedLLVMModule
+compileAndLinkFor(llvm::StringRef source, llvm::StringRef triple,
+                  std::string *refusal = nullptr) {
   llvm::InitializeAllTargets();
   llvm::InitializeAllTargetMCs();
   lython::driver::DriverOptions options;
@@ -1848,7 +1850,10 @@ lython::driver::VerifiedLLVMModule compileAndLinkFor(llvm::StringRef source,
       *result.verified.llvmModule, /*bypass=*/false);
   if (mlir::failed(py::runtime_library::declareLibcWithTargetPrototypes(
           *result.verified.llvmModule, diag))) {
-    ADD_FAILURE() << triple.str() << "\n" << diagnostics;
+    if (refusal)
+      *refusal = diagnostics;
+    else
+      ADD_FAILURE() << triple.str() << "\n" << diagnostics;
     return {};
   }
   return std::move(result.verified);
@@ -2188,44 +2193,16 @@ TEST(DriverTest, WasiPreview1ReadsWasiLibcsLayout) {
 // it, naming the path from `__main__`; a program that does not reach it
 // links, with clock_gettime taking wasi-libc's pointer clockid_t.
 TEST(DriverTest, AWasiProgramIsRefusedOnlyWhereItReachesWhatWasiLacks) {
-  auto link =
-      [](llvm::StringRef source,
-         std::string &diagnostics) -> lython::driver::VerifiedLLVMModule {
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    lython::driver::DriverOptions options;
-    options.targetTriple = "wasm32-wasip1";
-    CompileResult result = compileSource(source, options);
-    EXPECT_TRUE(result.succeeded) << result.diagnostics;
-    if (!result.succeeded)
-      return {};
-    llvm::raw_string_ostream diag(diagnostics);
-    EXPECT_TRUE(
-        mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
-            *result.verified.llvmModule,
-            lython::driver::detectTensorLoweringTarget(options), options,
-            diag)));
-    EXPECT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
-        *result.verified.llvmModule)));
-    lython::driver::redirectAllocationsToObjectAllocator(
-        *result.verified.llvmModule, /*bypass=*/false);
-    if (mlir::failed(py::runtime_library::declareLibcWithTargetPrototypes(
-            *result.verified.llvmModule, diag)))
-      return {};
-    return std::move(result.verified);
-  };
-
   std::string refused;
-  lython::driver::VerifiedLLVMModule uid =
-      link("import os\nprint(os.getuid())\n", refused);
+  lython::driver::VerifiedLLVMModule uid = compileAndLinkFor(
+      "import os\nprint(os.getuid())\n", "wasm32-wasip1", &refused);
   EXPECT_FALSE(uid.llvmModule);
   EXPECT_NE(refused.find("has no 'getuid'"), std::string::npos) << refused;
   EXPECT_NE(refused.find("__main__ -> "), std::string::npos) << refused;
 
-  std::string none;
-  lython::driver::VerifiedLLVMModule clock =
-      link("import time\nprint(time.monotonic() > 0)\n", none);
-  ASSERT_TRUE(clock.llvmModule) << none;
+  lython::driver::VerifiedLLVMModule clock = compileAndLinkFor(
+      "import time\nprint(time.monotonic() > 0)\n", "wasm32-wasip1");
+  ASSERT_TRUE(clock.llvmModule);
   const llvm::Function *gettime =
       clock.llvmModule->getFunction("clock_gettime");
   ASSERT_NE(gettime, nullptr);
@@ -2248,4 +2225,47 @@ TEST(DriverTest, APythonFunctionIsNotAnExternalSymbol) {
       result.verified.llvmModule->getFunction("__main__");
   ASSERT_NE(main, nullptr);
   EXPECT_FALSE(main->hasLocalLinkage());
+}
+
+// What: a ctypes library other than the program itself is refused where it is
+// constructed, whether or not its symbols are later called -- nothing opens
+// it, so its names would resolve among the program's own.
+TEST(DriverTest, ACtypesLibraryOtherThanTheProgramIsRefused) {
+  for (llvm::StringRef use :
+       {"f = lib[\"cos\"]\n"
+        "f.restype = ctypes.c_double\n"
+        "f.argtypes = [ctypes.c_double]\n"
+        "print(f(0.0))\n",
+        "f = lib[\"cos\"]\n"
+        "print(ctypes.cast(f, ctypes.c_void_p).value)\n"}) {
+    CompileResult result = compileSource(
+        ("import ctypes\nlib = ctypes.CDLL(\"libm.so.6\")\n" + use).str());
+    EXPECT_FALSE(result.succeeded) << use.str();
+    EXPECT_NE(result.diagnostics.find(
+                  "ctypes.CDLL can only name the program itself (None)"),
+              std::string::npos)
+        << result.diagnostics;
+  }
+}
+
+// What: the address of a C function the libc table does not know (`cos`),
+// with a restype, links on wasm32-wasip1 -- declared with the program's
+// prototype and marked as the program's, where it used to be refused as a gap
+// in the table.
+TEST(DriverTest, AnUntabledCtypesSymbolsAddressLinksOnWasi) {
+  lython::driver::VerifiedLLVMModule linked =
+      compileAndLinkFor("import ctypes\n"
+                        "libc = ctypes.CDLL(None)\n"
+                        "f = libc[\"cos\"]\n"
+                        "f.restype = ctypes.c_double\n"
+                        "f.argtypes = [ctypes.c_double]\n"
+                        "address: int = ctypes.cast(f, ctypes.c_void_p).value\n"
+                        "print(address != 0)\n",
+                        "wasm32-wasip1");
+  ASSERT_TRUE(linked.llvmModule);
+  const llvm::Function *cos = linked.llvmModule->getFunction("cos");
+  ASSERT_NE(cos, nullptr);
+  EXPECT_TRUE(cos->getReturnType()->isDoubleTy());
+  EXPECT_TRUE(
+      cos->hasFnAttribute(py::runtime_library::kCtypesForeignSymbolAttr));
 }

@@ -28,7 +28,6 @@ mlir::LogicalResult RuntimeBundleLowerer::bindStaticCtypesLibrarySymbol(
     evidence.lifetime = RuntimeCtypesEvidence::Lifetime::Static;
     evidence.ctypeName = "_ctypes.CFuncPtr";
     evidence.ctype = result.getType();
-    evidence.libraryName = library.ctypes->libraryName;
     evidence.abi = library.ctypes->abi;
     evidence.processLibrary = library.ctypes->processLibrary;
     evidence.symbolName = symbol.str();

@@ -232,7 +232,9 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnUntypedCtypesSymbolAddressIsRefusedOnWasm"
     "DriverTest.AnArmv7RuntimeIsBuiltForArmv7"
     "DriverTest.AWasiProgramIsRefusedOnlyWhereItReachesWhatWasiLacks"
-    "DriverTest.APythonFunctionIsNotAnExternalSymbol")
+    "DriverTest.APythonFunctionIsNotAnExternalSymbol"
+    "DriverTest.ACtypesLibraryOtherThanTheProgramIsRefused"
+    "DriverTest.AnUntabledCtypesSymbolsAddressLinksOnWasi")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

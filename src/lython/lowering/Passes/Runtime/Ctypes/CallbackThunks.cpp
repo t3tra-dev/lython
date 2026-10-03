@@ -1,5 +1,7 @@
 #include "Runtime/Ctypes/CallbackThunks.h"
 
+#include "Common/LibcPrototypes.h"
+
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseSet.h"
@@ -114,9 +116,15 @@ mlir::LogicalResult materializeSymbolAddresses(mlir::ModuleOp module) {
                           /*isVarArg=*/true);
       // Unknown location: an external declaration must not carry a !dbg
       // subprogram attachment.
-      mlir::LLVM::LLVMFuncOp::create(
+      auto declaration = mlir::LLVM::LLVMFuncOp::create(
           builder, builder.getUnknownLoc(), symbol.getValue(),
           mlir::cast<mlir::LLVM::LLVMFunctionType>(type));
+      // A ctypes symbol like a called one: its prototype is the program's,
+      // not the libc table's to know. ⛔ Not `ly.native.symbol`, which says
+      // the declaration came from a ctypes CALL and carries its argtypes.
+      declaration.setPassthroughAttr(
+          builder.getArrayAttr({builder.getStringAttr(
+              py::runtime_library::kCtypesForeignSymbolAttr)}));
     }
     placeholder->removeAttr("ly.symbol_prototype");
     mlir::Block *entry = placeholder.addEntryBlock(builder);
