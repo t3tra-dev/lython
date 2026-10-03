@@ -2321,3 +2321,18 @@ TEST(DriverTest, AnImportedFunctionReturnsTheClassItsModuleImports) {
                          "import maker\nprint(maker.make(3).n)\n");
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
+
+// What: an imported module may keep callables in a container global, the
+// same as one callable global; the element type is resolved.
+TEST(DriverTest, AnImportedModuleKeepsCallablesInAContainer) {
+  CompileResult result = compileWithModules(
+      {{"registry", "from typing import Callable\n\n"
+                    "HANDLERS: dict[int, Callable[[], None]] = {}\n\n\n"
+                    "def add(slot: int, run: Callable[[], None]) -> None:\n"
+                    "    HANDLERS[slot] = run\n\n\n"
+                    "def fire(slot: int) -> None:\n"
+                    "    HANDLERS[slot]()\n"}},
+      "import registry\n\n\ndef hello() -> None:\n    print(\"hi\")\n\n\n"
+      "registry.add(1, hello)\nregistry.fire(1)\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}

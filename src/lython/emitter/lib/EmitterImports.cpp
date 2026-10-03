@@ -1149,6 +1149,10 @@ bool isStorableContainerType(mlir::Type type) {
     for (mlir::Type argument : contract.getArguments()) {
       if (mlir::isa<py::UnionType>(argument))
         return false;
+      // A function object is as resolved an element as a class instance --
+      // the reason a bare Callable global is storable above.
+      if (mlir::isa<py::CallableType>(argument))
+        continue;
       auto element = mlir::dyn_cast_if_present<py::ContractType>(argument);
       if (!element || element.getContractName() == "builtins.object")
         return false;
