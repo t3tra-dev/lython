@@ -30,6 +30,16 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   `X.new(...)` は `new X(...)` を表す。
 - スタブのエイリアス (`type BodyInit = ...`) は契約を組み立てる間だけ束縛し、
   プログラムの名前空間には出さない。
+- グローバルと同名のクラスは、注釈の中でだけ効くエイリアスとして束縛する
+  (`def f(p: URLSearchParams)`, `"js.Object"`)。値として読めばグローバル。
+- スタブのクラスはすべて `_js.JsProxy` を基底に持つ。JS 値かどうかの判定
+  (`isJsHostType`) はこの関係で行う。そのため、プログラム自身の `js.py` の
+  クラスとは混同しない。
+- `isinstance(x, C)` で C がホストのコンストラクタのとき (`new` の結果が T)、
+  T に対する JS の `instanceof` を実行時に行い、真の側で x を T に絞り込む
+  (`IsInstanceAnalysis::Kind::HostTest`)。Lython の class id の比較には決して
+  回さない (JS 値の class id はすべて同じなので、答えにならない)。union の値は
+  先に None などを外す必要があり、そうでなければ拒否する。
 
 ## 表現: 1 つの runtime 契約
 
@@ -80,7 +90,6 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
 - `await` による Promise の待機。WebLoop 方式を採る。待つ間は wasm から JS に
   戻り、Promise の解決で再開する。JSPI はランタイムの対応待ち。ただし、
   サスペンドを抽象の後ろに置き、JSPI のバックエンドを足せる形にしておく。
-- `isinstance(x, js.Element)` による絞り込み (JS の `instanceof`)。
 - `to_js` / `to_py` (list、dict、TypedDict の変換)。
 - グローバルへの代入と、union 型のグローバルの読み出し。今は lowering が
   拒否する。

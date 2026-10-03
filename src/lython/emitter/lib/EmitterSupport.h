@@ -114,6 +114,8 @@ struct IsInstanceAnalysis {
     UnionTest,
     UnionClassTest,
     ClassTest,
+    // A JavaScript value against a host class: the host's `instanceof`.
+    HostTest,
     Unsupported
   };
 
@@ -161,6 +163,10 @@ isinstanceTargetTypes(const parser::Node *node, TypeSystem &types);
 // declares (`builtins.BaseException`). The two are told apart by the dot: only
 // a manifest contract is module-qualified.
 bool isSourceDefinedContract(mlir::Type type);
+// A JavaScript value's type: `_js.JsProxy`, or a class of the host's `js`
+// stub, every one of which has it as a base (a program's own `js.py` classes
+// do not).
+bool isJsHostType(mlir::Type type, const TypeSystem &types);
 
 // The subclass relation the module PRE-PASS recorded, for two source classes
 // whose class ops the subtype walk may not have created yet.

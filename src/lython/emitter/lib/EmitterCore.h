@@ -24,6 +24,10 @@ struct StubContractPolicy {
   // static is called with the constructor as `this`, and the stub's
   // `X.new(...)` is how `new X(...)` is spelled.
   bool staticMethodsTakeTheValue = false;
+  // A base every class gets ahead of `object`: for `js`, `_js.JsProxy`, which
+  // is what each of its values is at run time and what tells a host class
+  // from a program's own class of the same name.
+  std::string commonBase;
 };
 
 // The JavaScript host's `js` module: the stub the compiler ships, not a file

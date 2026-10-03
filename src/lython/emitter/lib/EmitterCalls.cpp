@@ -2843,6 +2843,22 @@ ModuleEmitter::tryEmitIsInstanceCall(const parser::Node &expr,
         mlir::arith::AndIOp::create(builder, loc(expr), unionTest.getResult(),
                                     classTest.getResult())
             .getResult();
+  } else if (analysis.kind == IsInstanceAnalysis::Kind::HostTest) {
+    // The constructor is the host's value and the test is the host's.
+    Value constructor = emitExpr((*args)[1].get());
+    mlir::Type boolType = types.boolType();
+    auto callable = py::CallableType::get(
+        &context, {input.type, constructor.type}, {}, {}, {}, {boolType});
+    Value positional = emitPack({constructor});
+    Value names = emitPack({});
+    Value values = emitPack({});
+    auto call =
+        py::CallOp::create(builder, loc(expr), mlir::TypeRange{boolType},
+                           callProtocolFor(callable), input.value,
+                           positional.value, names.value, values.value);
+    call->setAttr("ly.bound_method",
+                  builder.getStringAttr("__ly_js_instanceof__"));
+    return Value{call.getResults().front(), boolType};
   } else if (analysis.kind == IsInstanceAnalysis::Kind::ClassTest) {
     auto test = py::ClassTestOp::create(
         builder, loc(expr), builder.getI1Type(), input.value,

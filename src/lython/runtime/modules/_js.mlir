@@ -31,7 +31,7 @@ module attributes {
     method_names = ["__ly_js_is_none__", "__ly_js_is_bool__", "__ly_js_is_int__",
                     "__ly_js_is_float__", "__ly_js_is_str__", "__ly_js_as_bool__",
                     "__ly_js_as_int__", "__ly_js_as_float__", "__ly_js_as_str__",
-                    "__ly_js_as_proxy__"],
+                    "__ly_js_as_proxy__", "__ly_js_instanceof__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.bool">]>,
@@ -42,10 +42,12 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.float">]>,
       !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"_js.JsProxy">]>
+      !py.protocol<"Callable", [!py.contract<"_js.JsProxy">] -> [!py.contract<"_js.JsProxy">]>,
+      !py.protocol<"Callable", [!py.contract<"_js.JsProxy">, !py.contract<"_js.JsProxy">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance"]
   } {}
 
   // ===== host imports =====
@@ -72,6 +74,9 @@ module attributes {
   func.func private @LyJs_Is(i32, i32) -> i32
   // A second handle to the same value.
   func.func private @LyJs_Dup(i32) -> i32
+  // `value instanceof constructor`; -1 when the host throws (a constructor
+  // that is not callable).
+  func.func private @LyJs_InstanceOf(i32, i32) -> i32
   func.func private @LyJs_ToF64(i32) -> f64
   func.func private @LyJs_ToI64(i32) -> i64
   // ⛔ i32 and not `index`: on wasm64 an `index` result is a BigInt the host
@@ -374,5 +379,15 @@ module attributes {
     %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
     %copy = func.call @LyJs_Dup(%handle) : (i32) -> i32
     func.return %copy : i32
+  }
+
+  func.func @LyJsProxy_InstanceOf(%proxy: memref<17xi64> {ly.ownership.object_header}, %constructor: memref<17xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "instanceof"} {
+    %value = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+    %class = func.call @LyJsProxy_Handle(%constructor) : (memref<17xi64>) -> i32
+    %raw = func.call @LyJs_InstanceOf(%value, %class) : (i32, i32) -> i32
+    %answer = func.call @__ly_js_checked(%raw) : (i32) -> i32
+    %zero = arith.constant 0 : i32
+    %is = arith.cmpi ne, %answer, %zero : i32
+    func.return %is : i1
   }
 }

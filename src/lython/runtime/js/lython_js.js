@@ -173,6 +173,13 @@ var LythonJs = {
       LyJs_Dup(handle) {
         return intern(values[handle]);
       },
+      LyJs_InstanceOf(value, constructor) {
+        try {
+          return values[value] instanceof values[constructor] ? 1 : 0;
+        } catch (error) {
+          return fail(error);
+        }
+      },
       LyJs_IsNullish(handle) {
         return values[handle] == null ? 1 : 0;
       },

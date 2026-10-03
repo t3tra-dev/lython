@@ -250,6 +250,27 @@ RuntimeBundleLowerer::lowerJsMethodCall(py::CallOp op, RuntimeBundle receiver,
       erase.push_back(op);
       return mlir::success();
     }
+    if (methodName == "__ly_js_instanceof__") {
+      llvm::SmallVector<const RuntimeBundle *, 1> sources;
+      if (mlir::failed(collectPackedObjectSources(
+              op, op.getPosargs(), "isinstance constructor", sources)) ||
+          sources.size() != 1 || !sources.front())
+        return op.emitError() << "isinstance against a JavaScript class needs "
+                                 "the constructor";
+      llvm::SmallVector<mlir::Value, 2> operands(
+          receiver.physicalValues().begin(), receiver.physicalValues().end());
+      operands.append(sources.front()->physicalValues().begin(),
+                      sources.front()->physicalValues().end());
+      mlir::FailureOr<mlir::func::CallOp> is =
+          callJsPrimitive(op, "instanceof", operands);
+      if (mlir::failed(is) ||
+          mlir::failed(RuntimeBundleLowerer::assignObjectBundle(
+              op, op.getResult(0),
+              runtimeContractType(context, "builtins.bool"), is->getResults())))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
     mlir::FailureOr<mlir::func::CallOp> copy =
         callJsPrimitive(op, "duplicate", receiver.physicalValues());
     if (mlir::failed(copy) ||

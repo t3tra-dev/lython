@@ -246,6 +246,9 @@ void declareStubClassContracts(TypeSystem &types, mlir::MLIRContext &context,
                 py::contracts::manifestClassNameForContract(
                     contract.getContractName()),
                 {}});
+    if (!policy.commonBase.empty())
+      info.bases.push_back(py::protocols::ProtocolBase{
+          py::contracts::manifestClassNameForContract(policy.commonBase), {}});
     info.bases.push_back(py::protocols::ProtocolBase{
         py::contracts::manifestClassNameForContract("builtins.object"), {}});
     mlir::Type receiverType = types.contract(contractName);
@@ -654,11 +657,18 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
       continue;
     std::string local =
         (llvm::Twine(localName) + "." + llvm::StringRef(*name)).str();
-    // The host's global of the same name is what `js.Math` reads.
+    // A host global of the same name is what `js.Object` READS, and the class
+    // is what the annotation `js.Object` means.
+    //
+    // ⛔ The class as an annotation alias and not a class binding: a value
+    // read prefers a class of its spelling, and `isinstance(v, js.Object)`
+    // then handed the host a type object, which has no value to test with.
     if (isJsHostModule(*source) &&
         moduleGlobals.count(sourceModuleClassSymbol(module, *name))) {
       std::string global = sourceModuleClassSymbol(module, *name);
       types.bindCanonicalSymbol(local, global, moduleGlobals[global]);
+      types.bindAnnotationTypeAlias(
+          local, types.contract(sourceModuleClassSymbol(module, *name)));
       continue;
     }
     types.bindClass(local, types.contract(sourceModuleClassSymbol(module, *name)));
@@ -864,6 +874,9 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
     if (std::string global = (llvm::Twine(module) + "." + exportedName).str();
         moduleGlobals.count(global)) {
       types.bindCanonicalSymbol(localName, global, moduleGlobals[global]);
+      // `def f(p: URLSearchParams)` names the class the global constructs.
+      if (py::protocols::Table::get(context).lookup(global))
+        types.bindAnnotationTypeAlias(localName, types.contract(global));
       return true;
     }
   const auto *rawBody = ast::nodeList(*source->moduleNode, "body");
@@ -2226,9 +2239,9 @@ void ModuleEmitter::declareJsHostModule() {
         if (pass == 0)
           aliases.push_back(alias.str());
       }
-    StubContractPolicy policy{types.contract(py::kJsProxyContract),
-                              types.object(),
-                              /*staticMethodsTakeTheValue=*/true};
+    StubContractPolicy policy{
+        types.contract(py::kJsProxyContract), types.object(),
+        /*staticMethodsTakeTheValue=*/true, py::kJsProxyContract.str()};
     declareStubClassContracts(types, context, host->moduleName, body, policy);
     auto declareGlobal = [&](llvm::StringRef name, mlir::Type type) {
       if (!type)
@@ -2272,11 +2285,7 @@ void ModuleEmitter::declareJsHostModule() {
 }
 
 bool ModuleEmitter::isJsHostValueType(mlir::Type type) const {
-  auto contract = mlir::dyn_cast_if_present<py::ContractType>(type);
-  return contract && module->hasAttr(py::kJsHostModuleAttr) &&
-         (contract.getContractName() == py::kJsProxyContract ||
-          contract.getContractName().starts_with(
-              (py::kJsHostModule + ".").str()));
+  return isJsHostType(type, types);
 }
 
 // `el.offsetParent` is `Element | None`: the host hands back whichever it

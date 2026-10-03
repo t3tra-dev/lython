@@ -489,9 +489,13 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
                  mlir::isa<py::ContractType>(narrowed) &&
                  (py::isAssignableTo(narrowed, found->second.value.getType(),
                                      module) ||
-                  declaredSubclassOfType(narrowed,
-                                         found->second.value.getType(),
-                                         types))) {
+                  declaredSubclassOfType(
+                      narrowed, found->second.value.getType(), types) ||
+                  // The host's classes live in the protocol table, which is
+                  // where their hierarchy is; the test that got here was the
+                  // host's `instanceof`.
+                  (isJsHostType(narrowed, types) &&
+                   isJsHostType(found->second.value.getType(), types)))) {
         auto refine = py::ClassRefineOp::create(builder, loc(anchor),
                                                 narrowed, found->second.value);
         found->second.value = refine.getResult();
