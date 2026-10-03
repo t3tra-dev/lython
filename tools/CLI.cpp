@@ -595,6 +595,18 @@ LogicalResult appendEmscriptenJsHostArgs(
     adapter += "  " + name + "__deps: ['$lythonJs'],\n  " + name +
                ": (...args) => lythonJs." + name + "(...args),\n";
   adapter += "});\n";
+  // A program that hands the host a callback is not finished when main
+  // returns: the host may call it from a timer or an event. The runtime stays
+  // up and node ends the process when nothing is left to run; the exit code
+  // main returned is still the process's (emcc's quit_ sets it either way).
+  //
+  // ⛔ Not for every host program: keeping the runtime up skips its exit,
+  // which is where C's stdio buffers are flushed, and a program with no
+  // callback has nothing after main to wait for.
+  if (llvm::is_contained(imports, "LyJs_MakeFunction"))
+    for (std::string &arg : args)
+      if (arg == "-sEXIT_RUNTIME=1")
+        arg = "-sEXIT_RUNTIME=0";
   if (!exports.empty()) {
     std::string exported = "-sEXPORTED_FUNCTIONS=_main";
     for (const std::string &name : exports)

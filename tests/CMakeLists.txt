@@ -237,7 +237,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnUntabledCtypesSymbolsAddressLinksOnWasi"
     "DriverTest.AnImportedFunctionReturnsTheClassItsModuleImports"
     "DriverTest.AnImportedModuleKeepsCallablesInAContainer"
-    "DriverTest.AClosureCallsACapturedCallableReturningAnOptional")
+    "DriverTest.AClosureCallsACapturedCallableReturningAnOptional"
+    "DriverTest.ACallableOfAnyArgumentsTakesAFunctionWithParameters")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

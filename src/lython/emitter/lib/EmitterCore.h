@@ -28,6 +28,9 @@ struct StubContractPolicy {
   // is what each of its values is at run time and what tells a host class
   // from a program's own class of the same name.
   std::string commonBase;
+  // A parameter of this type -- `js.Function` -- also takes any Python
+  // callable, which crosses as a function the host can call.
+  mlir::Type callableParameter;
 };
 
 // The JavaScript host's `js` module: the stub the compiler ships, not a file
@@ -67,6 +70,12 @@ private:
                             const std::vector<parser::NodePtr> &body,
                             const parser::Node &function);
   llvm::StringSet<> importedSignatureScopes;
+  // The host's global functions (Window's methods), and the spellings the
+  // program imported them by.
+  llvm::StringSet<> jsHostGlobalFunctions;
+  llvm::StringMap<std::string> jsHostFunctionAliases;
+  std::optional<Value> tryEmitJsHostFunctionCall(const parser::Node &expr,
+                                                 llvm::StringRef callee);
   // A value of one of the host's `js` contracts (EmitterImports.cpp).
   bool isJsHostValueType(mlir::Type type) const;
   // A host member read or call whose declared type is a union: the host's

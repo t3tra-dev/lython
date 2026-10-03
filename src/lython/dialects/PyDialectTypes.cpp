@@ -814,16 +814,26 @@ bool isCallableEllipsisContract(CallableType signature) {
       !signature.getKwOnlyTypes().empty() || !signature.hasVararg() ||
       !signature.hasKwarg() || signature.hasParameterMetadata())
     return false;
+  // ⭐ `Any` as well as `object`: the annotation `Callable[..., R]` spells its
+  // tail with `Any`, and this asked for `object` only -- so the contract the
+  // annotation makes was never recognised as the "any arguments" it is, and
+  // a function with parameters was refused against it.
+  auto isTop = [](mlir::Type type) {
+    if (isPyObjectType(type))
+      return true;
+    auto contract = mlir::dyn_cast<ContractType>(type);
+    return contract && contract.getContractName() == "typing.Any";
+  };
   auto varargTuple = mlir::dyn_cast<ContractType>(signature.getVarargType());
   if (!varargTuple || varargTuple.getContractName() != "builtins.tuple" ||
       varargTuple.getArguments().size() != 1 ||
-      !isPyObjectType(varargTuple.getArguments().front()))
+      !isTop(varargTuple.getArguments().front()))
     return false;
   auto kwargsDict = mlir::dyn_cast<ContractType>(signature.getKwargType());
   return kwargsDict && kwargsDict.getContractName() == "builtins.dict" &&
          kwargsDict.getArguments().size() == 2 &&
          isPyStrType(kwargsDict.getArguments()[0]) &&
-         isPyObjectType(kwargsDict.getArguments()[1]);
+         isTop(kwargsDict.getArguments()[1]);
 }
 
 namespace {

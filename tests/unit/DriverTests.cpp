@@ -2355,3 +2355,20 @@ TEST(DriverTest, AClosureCallsACapturedCallableReturningAnOptional) {
                     "outer(g)\n");
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
+
+// What: `Callable[..., R]` takes any callable returning R -- one with
+// parameters as well as one without -- in the emitter's check and in the
+// lowering's, which read the annotation's `Any` tail as the same "any
+// arguments".
+TEST(DriverTest, ACallableOfAnyArgumentsTakesAFunctionWithParameters) {
+  CompileResult result =
+      compileSource("from typing import Callable\n\n\n"
+                    "def run(f: \"Callable[..., object]\") -> None:\n"
+                    "    print(\"got\")\n\n\n"
+                    "def none() -> None:\n"
+                    "    pass\n\n\n"
+                    "def two(a: int, b: str) -> int:\n"
+                    "    return a\n\n\n"
+                    "run(none)\nrun(two)\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}

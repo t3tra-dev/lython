@@ -350,6 +350,22 @@ bool bindContractView(const TypeSystem &types, py::ContractType expected,
 
 bool bindCallableView(const TypeSystem &types, py::CallableType expected,
                       py::CallableType actual, TypeBindingMap &bindings) {
+  // `Callable[..., R]` is any callable returning R (PEP 484): its parameters
+  // are not a shape to match, only its result is. Without this a function
+  // with parameters was refused where the annotation says "any arguments",
+  // and one with none was accepted only because nothing was compared.
+  if (py::isCallableEllipsisContract(expected)) {
+    TypeBindingMap candidateBindings = bindings;
+    if (expected.getResultTypes().size() != actual.getResultTypes().size())
+      return false;
+    for (auto [expectedResult, actualResult] :
+         llvm::zip(expected.getResultTypes(), actual.getResultTypes()))
+      if (!bindExpectedType(types, expectedResult, actualResult,
+                            candidateBindings))
+        return false;
+    bindings = std::move(candidateBindings);
+    return true;
+  }
   llvm::SmallVector<CallKeywordType, 4> actualKeywords;
   llvm::ArrayRef<mlir::StringAttr> actualKwNames = actual.getKwOnlyNames();
   for (auto [index, type] : llvm::enumerate(actual.getKwOnlyTypes())) {
