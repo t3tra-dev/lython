@@ -306,7 +306,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
           return op->emitError() << "generator argument " << index
                                  << " has no union value to persist";
         mlir::FailureOr<RuntimeBundle> boxed =
-            RuntimeBundleLowerer::boxUnionForLane(op, *source);
+            RuntimeBundleLowerer::boxForObjectLane(op, *source);
         if (mlir::failed(boxed))
           return mlir::failure();
         mlir::FailureOr<mlir::func::FuncOp> store =

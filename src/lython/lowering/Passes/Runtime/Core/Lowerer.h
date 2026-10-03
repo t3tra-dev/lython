@@ -1181,7 +1181,7 @@ private:
   static mlir::Type generatorYieldType(mlir::Type generator);
   static bool isGeneratorProtocol(mlir::Type type);
   static mlir::Type concreteGeneratorType(mlir::Type type);
-  mlir::FailureOr<RuntimeBundle> boxUnionForLane(mlir::Operation *op,
+  mlir::FailureOr<RuntimeBundle> boxForObjectLane(mlir::Operation *op,
                                                  const RuntimeBundle &value);
   mlir::FailureOr<RuntimeBundle>
   unboxUnionFromLane(mlir::Operation *op, py::UnionType unionType,

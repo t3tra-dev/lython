@@ -196,7 +196,7 @@ mlir::MemRefType generatorStorageType(mlir::OpBuilder &builder) {
 }
 
 // The lane a value of this type rides: its own contract, or the payload box
-// for a union (see `boxUnionForLane`). Empty when it has none.
+// for a union (see `boxForObjectLane`). Empty when it has none.
 std::string generatorLaneKey(mlir::Type type) {
   if (isIntContract(type))
     return "builtins.int";
@@ -421,9 +421,9 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
           function, bundle.physicalValues());
 
   if (lane.contract == "builtins.object" &&
-      mlir::isa_and_nonnull<py::UnionType>(bundle.contract)) {
+      runtimeContractName(bundle.contract) != "builtins.object") {
     mlir::FailureOr<RuntimeBundle> boxed =
-        RuntimeBundleLowerer::boxUnionForLane(op.getOperation(), bundle);
+        RuntimeBundleLowerer::boxForObjectLane(op.getOperation(), bundle);
     if (mlir::failed(boxed))
       return mlir::failure();
     operands.append(boxed->physicalValues().begin(),
@@ -1464,10 +1464,36 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         return std::string();
       return contract;
     };
+    // ⭐ A GENERATOR DECLARED TO YIELD `object` -- or a union -- YIELDS
+    // THROUGH THE PAYLOAD BOX whatever each yield's own type is: a coroutine
+    // yields the future it waits on and None to give up its turn, both as
+    // `object`, and the emitter leaves `yield fut` typed as the future. Each
+    // value is boxed at its suspend, the way a union is.
+    mlir::Type declaredYield;
+    if (auto publicType =
+            body->getAttrOfType<mlir::TypeAttr>(kGeneratorPublicResultAttr))
+      if (auto generator =
+              mlir::dyn_cast<py::ContractType>(publicType.getValue());
+          generator && !generator.getArguments().empty())
+        declaredYield = generator.getArguments().front();
+    bool boxedYield =
+        declaredYield && generatorLaneKey(declaredYield) == "builtins.object";
+    if (boxedYield) {
+      valueContract = "builtins.object";
+      valueType = declaredYield;
+    }
     llvm::SmallVector<py::YieldValueOp, 8> yields;
     clone.walk([&](mlir::Operation *op) {
       if (auto yield = mlir::dyn_cast<py::YieldValueOp>(op)) {
         yields.push_back(yield);
+        if (boxedYield) {
+          if (generatorLaneKey(yield.getValue().getType()).empty())
+            eligible = false;
+          if (!yield.getSent().use_empty() &&
+              !isIntContract(yield.getSent().getType()))
+            eligible = false;
+          return;
+        }
         std::string contract =
             laneEligibleContract(yield.getValue().getType(),
                                  /*allowBool=*/true);
@@ -4587,7 +4613,7 @@ RuntimeBundleLowerer::refuseProtocolGeneratorResume(mlir::Operation *op,
 // tag-conditioned ownership the call ABI has -- four places to get one rule
 // right instead of none.
 mlir::FailureOr<RuntimeBundle>
-RuntimeBundleLowerer::boxUnionForLane(mlir::Operation *op,
+RuntimeBundleLowerer::boxForObjectLane(mlir::Operation *op,
                                       const RuntimeBundle &value) {
   mlir::FailureOr<RuntimeBundle> boxed =
       RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
@@ -4715,7 +4741,7 @@ RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
       mlir::arith::ConstantIndexOp::create(builder, loc, 0);
   builder.setInsertionPoint(anchor);
   mlir::FailureOr<RuntimeBundle> boxed =
-      RuntimeBundleLowerer::boxUnionForLane(anchor, yielded);
+      RuntimeBundleLowerer::boxForObjectLane(anchor, yielded);
   if (mlir::failed(boxed))
     return mlir::failure();
   if (!lane.isNone && !lane.isBool &&
