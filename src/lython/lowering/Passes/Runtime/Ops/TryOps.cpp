@@ -305,6 +305,16 @@ void RuntimeBundleLowerer::emitTryCallSiteMarkerIfNeeded(mlir::Location loc) {
     emitTryCallSiteMarker(loc, *id);
 }
 
+void RuntimeBundleLowerer::eraseLoweredFunction(mlir::Operation *function) {
+  // ⛔ Not left to go stale: the map is keyed by address, and a block the
+  // lowering creates afterwards -- a hook, a return's continuation -- can be
+  // allocated where an erased one was and inherit its try. A generator's
+  // close path then raised GeneratorExit "inside" a handler of a body that no
+  // longer existed, and its `finally` ran or did not depending on the heap.
+  function->walk([&](mlir::Block *block) { tryHandlerIds.erase(block); });
+  function->erase();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   bool hasExcept = !op.getExceptRegion().empty();
   bool hasFinally = !op.getFinallyRegion().empty();

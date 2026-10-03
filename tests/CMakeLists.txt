@@ -198,6 +198,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
     "DriverTest.AnEmscriptenTargetNamesWhatReplacedIt"
     "DriverTest.AWasmModuleDefinesTheUnwinderItUses"
+    "DriverTest.AnErasedGeneratorBodyLeavesNoTryIdBehind"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"

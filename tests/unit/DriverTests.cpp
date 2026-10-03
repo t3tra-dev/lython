@@ -2401,6 +2401,32 @@ TEST(DriverTest, AWASIProgramWithAJsHostImportsLythonJs) {
             "LyJs_Dispatch");
 }
 
+// A generator with a `finally`, abandoned after two items, lowers with no try
+// id left on a block the lowering erased. One was left on every block of the
+// generator's source body, which is erased after it is lowered; a block made
+// later at the same address took the id, and the close path's `finally` ran in
+// about 14 compiles of 15. The lowering refuses a stale entry, so the left-over
+// fails here every time rather than when the allocator reuses the address.
+TEST(DriverTest, AnErasedGeneratorBodyLeavesNoTryIdBehind) {
+  CompileResult result = compileSource(
+      "from typing import Iterator\n\n\n"
+      "def words(prefix: str, n: int) -> Iterator[str]:\n"
+      "    try:\n"
+      "        for i in range(n):\n"
+      "            yield prefix + str(i)\n"
+      "    finally:\n"
+      "        print(\"closed\", prefix)\n\n\n"
+      "def take(source: Iterator[str], k: int) -> list[str]:\n"
+      "    out: list[str] = []\n"
+      "    for v in source:\n"
+      "        out.append(v)\n"
+      "        if len(out) == k:\n"
+      "            break\n"
+      "    return out\n\n\n"
+      "print(take(words(\"w\", 5), 2))\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
 // What: a wasm module raises through `_Unwind_RaiseException` and carries its
 // own definition of it -- one `throw` under the `__cpp_exception` tag, which
 // the module's assembly defines -- so a WASI program links against a

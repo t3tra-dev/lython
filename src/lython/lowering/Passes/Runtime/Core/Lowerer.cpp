@@ -97,6 +97,22 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   // to be done first.
   if (mlir::failed(foldUnprovenPrimitiveI64Speculations()))
     return mlir::failure();
+  // Every try id still recorded belongs to a block still in the module. An
+  // entry that outlived its block is checked here rather than at the lookup
+  // that would read it, because that lookup only goes wrong when the
+  // allocator happens to put a new block at the old address -- 1 compile in
+  // 15 for the generator close path this was found in -- while the entry is
+  // there every time.
+  {
+    llvm::DenseSet<mlir::Block *> live;
+    module.walk([&](mlir::Block *block) { live.insert(block); });
+    for (auto &entry : tryHandlerIds)
+      if (!live.contains(entry.first))
+        return module.emitError()
+               << "internal: try handler " << entry.second
+               << " is still recorded for an erased block; erase lowered "
+                  "functions with eraseLoweredFunction";
+  }
   // Class ops survive eraseLoweredPyOps so the hooks above can resolve
   // source-class ids and method symbols; drop them now that dispatch is built.
   llvm::SmallVector<py::ClassOp, 8> classOps;
@@ -117,7 +133,7 @@ mlir::LogicalResult RuntimeBundleLowerer::eraseSourceGeneratorBodyFunctions() {
                    [&](CallableLogicalEntryArgs entryArgs) {
                      return entryArgs.function == function;
                    });
-    function.erase();
+    eraseLoweredFunction(function);
   }
   return mlir::success();
 }
@@ -130,7 +146,7 @@ RuntimeBundleLowerer::eraseCallableProtocolTemplateFunctions() {
       templates.push_back(function);
   });
   for (mlir::func::FuncOp function : templates)
-    function.erase();
+    eraseLoweredFunction(function);
   return mlir::success();
 }
 
