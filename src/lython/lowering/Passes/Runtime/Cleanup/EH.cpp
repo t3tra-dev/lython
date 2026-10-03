@@ -690,7 +690,9 @@ void markCLibraryDeclarationsNonUnwinding(
     if (!function.isDeclaration() || function.isIntrinsic())
       continue;
     llvm::StringRef name = function.getName();
-    if (foreign.contains(name)) {
+    if (foreign.contains(name) ||
+        function.hasFnAttribute(
+            py::runtime_library::kCtypesForeignSymbolAttr)) {
       function.addFnAttr(py::runtime_library::kCtypesForeignSymbolAttr);
       continue;
     }
