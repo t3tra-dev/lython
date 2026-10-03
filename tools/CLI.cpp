@@ -242,8 +242,10 @@ LogicalResult linkRuntime(llvm::Module &llvmModule) {
 // targets are tested in: a target whose pads are funclets gets them here.
 void shapeExceptionPadsForTarget(llvm::Module &llvmModule) {
   if (py::runtime_library::padsAreFunclets(
-          llvm::Triple(llvmModule.getTargetTriple())))
+          llvm::Triple(llvmModule.getTargetTriple()))) {
     py::convertLandingPadsToWasmFunclets(llvmModule);
+    py::installWasmUnwinder(llvmModule);
+  }
 }
 
 // Coro lowering, linked-contract collection, and the optimized thread-safety
@@ -358,9 +360,8 @@ std::optional<std::string> findMinGWLinkerDriver(const llvm::Triple &triple) {
 }
 
 // The WASI pieces the program links against, which an LLVM install does not
-// carry: wasi-libc (a sysroot with its `eh` multilib, whose libunwind raises
-// with a wasm `throw`) and compiler-rt's builtins for wasm32 -- `long double`
-// is binary128 there, and wasi-libc's printf calls the soft-float routines.
+// carry: wasi-libc and compiler-rt's builtins for wasm32 -- `long double` is
+// binary128 there, and wasi-libc's printf calls the soft-float routines.
 struct WASIRuntime {
   std::string sysroot;
   // Empty when the driver's own resource directory has the builtins.
@@ -530,13 +531,6 @@ std::optional<LinkerDriver> findWASILinkerDriver(const llvm::Triple &triple) {
   // ⛔ -fuse-ld with the path, not --ld-path: the WebAssembly toolchain
   // reads only the former, and warned the latter was unused.
   driver.toolchainArgs.push_back("-fuse-ld=" + *wasmLd);
-  // The `eh` multilib first: its libunwind raises with a wasm `throw`, and a
-  // driver older than the sysroot may not select it by itself.
-  llvm::SmallString<256> eh(runtime->sysroot);
-  llvm::sys::path::append(eh, "lib", triple.getArchName().str() + "-wasip1",
-                          "eh");
-  if (llvm::sys::fs::is_directory(eh))
-    driver.toolchainArgs.push_back("-L" + eh.str().str());
   return driver;
 }
 
@@ -641,8 +635,9 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
 void appendWASILinkArgs(std::vector<std::string> &args,
                         const llvm::Triple &triple) {
   args.emplace_back("--target=" + triple.normalize());
+  // ⛔ No -lunwind: the module defines the three symbols of it a program
+  // uses (installWasmUnwinder), and a wasi-libc may ship none.
   args.emplace_back("-fwasm-exceptions");
-  args.emplace_back("-lunwind");
   // The libc pieces WASI has no call for, which wasi-libc emulates in
   // separate archives: getpid() a constant, raise() the default action of a
   // signal in-process, clock() from the monotonic clock.

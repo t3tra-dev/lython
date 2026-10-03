@@ -197,6 +197,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
     "DriverTest.AnEmscriptenTargetNamesWhatReplacedIt"
+    "DriverTest.AWasmModuleDefinesTheUnwinderItUses"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
@@ -1005,7 +1006,7 @@ endif()
 # wasmtime, the working directory, the case's directory and /dev preopened and
 # the environment inherited, so a case sees the host it would see natively.
 # Registered where both exist: wasmtime on PATH (or LYTHON_WASMTIME) and a
-# wasi-sdk at LYTHON_WASI_SDK or $WASI_SDK_PATH. Measured over every golden
+# wasi-libc lyc can link with (below). Measured over every golden
 # case: 764 of 768 cases and 115 of 116 error cases agree; the rest print WASI
 # errno numbers or the 32-bit sys.maxsize, or call os.getppid, which wasi-libc
 # does not have and the compiler refuses.
@@ -1024,32 +1025,30 @@ set(LYTHON_WASI_AGREEMENT_CASES
     errors/cross_bigint_traceback)
 
 find_program(LYTHON_WASMTIME wasmtime)
-# lyc finds wasi-libc by itself (findWASIRuntime in tools/CLI.cpp); this only
-# decides whether the stages that need one are registered, and looks where lyc
-# looks for a wasi-sdk.
-set(lython_wasi_sdk_default "$ENV{WASI_SDK_PATH}")
-if(NOT lython_wasi_sdk_default)
-    file(GLOB lython_wasi_sdk_found LIST_DIRECTORIES true
-        "/opt/wasi-sdk" "/opt/wasi-sdk*" "$ENV{HOME}/.local/wasi-sdk*")
-    if(lython_wasi_sdk_found)
-        list(SORT lython_wasi_sdk_found ORDER DESCENDING)
-        list(GET lython_wasi_sdk_found 0 lython_wasi_sdk_default)
+# lyc finds wasi-libc by itself (findWASIRuntime in tools/CLI.cpp): Homebrew's
+# wasi-libc and wasi-runtimes, or a wasi-sdk. This only decides whether the
+# stages that need one are registered, by looking where lyc looks; the tests
+# run lyc with the environment they were given and let it choose.
+set(lython_wasi_sysroots "$ENV{WASI_SDK_PATH}/share/wasi-sysroot"
+    "/opt/homebrew/share/wasi-sysroot" "/usr/local/share/wasi-sysroot"
+    "/usr/share/wasi-sysroot" "/opt/wasi-sdk/share/wasi-sysroot")
+file(GLOB lython_wasi_sdk_found LIST_DIRECTORIES true
+    "/opt/wasi-sdk*/share/wasi-sysroot" "$ENV{HOME}/.local/wasi-sdk*/share/wasi-sysroot")
+list(APPEND lython_wasi_sysroots ${lython_wasi_sdk_found})
+set(LYTHON_WASI_SYSROOT "")
+foreach(candidate IN LISTS lython_wasi_sysroots)
+    if(NOT LYTHON_WASI_SYSROOT AND EXISTS "${candidate}/lib/wasm32-wasip1/libc.a")
+        set(LYTHON_WASI_SYSROOT "${candidate}")
     endif()
-endif()
-set(LYTHON_WASI_SDK "${lython_wasi_sdk_default}" CACHE PATH
-    "wasi-sdk directory the wasi agreement stage links with")
-if(LYTHON_WASMTIME AND LYTHON_WASI_SDK AND
-   EXISTS "${LYTHON_WASI_SDK}/share/wasi-sysroot")
+endforeach()
+if(LYTHON_WASMTIME AND LYTHON_WASI_SYSROOT)
     foreach(case_name IN LISTS LYTHON_WASI_AGREEMENT_CASES)
         lython_add_agreement_case(wasi "${case_name}"
             --wasmtime "${LYTHON_WASMTIME}")
-        string(REPLACE "/" "." test_stem "${case_name}")
-        set_tests_properties("golden.wasi.${test_stem}" PROPERTIES
-            ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
     endforeach()
 else()
     message(STATUS "Lython: wasi agreement stage skipped (wasmtime: "
-        "${LYTHON_WASMTIME}; wasi-sdk: ${LYTHON_WASI_SDK})")
+        "${LYTHON_WASMTIME}; wasi sysroot: ${LYTHON_WASI_SYSROOT})")
 endif()
 
 # `js` is the JavaScript host's module, which CPython does not have: its cases
@@ -1057,26 +1056,20 @@ endif()
 # same loader and node, which suspends the program with JSPI.
 file(GLOB LYTHON_JS_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/js/*.py")
-if(LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/share/wasi-sysroot" AND
-   lython_wasm_node_major GREATER_EQUAL 24)
+if(LYTHON_WASI_SYSROOT AND lython_wasm_node_major GREATER_EQUAL 24)
     foreach(case_name IN LISTS LYTHON_WASM_AGREEMENT_CASES)
         lython_add_agreement_case(wasm "${case_name}"
             --wasm-node "${lython_wasm_node}")
-        string(REPLACE "/" "." test_stem "${case_name}")
-        set_tests_properties("golden.wasm.${test_stem}" PROPERTIES
-            ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
     endforeach()
     foreach(case_path IN LISTS LYTHON_JS_GOLDEN_CASES)
         get_filename_component(case_name "${case_path}" NAME_WE)
         lython_add_agreement_case(js "js/${case_name}"
             --wasm-node "${lython_wasm_node}")
-        set_tests_properties("golden.js.js.${case_name}" PROPERTIES
-            ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
     endforeach()
 else()
-    message(STATUS "Lython: wasm agreement stage skipped (wasi-sdk: "
-        "${LYTHON_WASI_SDK}; node: ${lython_wasm_node} "
-        "${lython_wasm_node_version}; needs wasi-sdk and node >= 24)")
+    message(STATUS "Lython: wasm agreement stage skipped (wasi sysroot: "
+        "${LYTHON_WASI_SYSROOT}; node: ${lython_wasm_node} "
+        "${lython_wasm_node_version}; needs a wasi-libc and node >= 24)")
 endif()
 
 # --- examples/ smoke tests (exit code only) ----------------------------------
