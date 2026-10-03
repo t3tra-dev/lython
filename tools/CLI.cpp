@@ -309,6 +309,8 @@ enum class LinkerDriverFlavor {
 struct LinkerDriver {
   std::string program;
   LinkerDriverFlavor flavor = LinkerDriverFlavor::Clang;
+  // Arguments the driver needs to find its target's libraries (WASI).
+  std::vector<std::string> toolchainArgs;
 };
 
 std::optional<std::string> findExecutableProgram(llvm::StringRef name) {
@@ -354,6 +356,171 @@ std::optional<std::string> findMinGWLinkerDriver(const llvm::Triple &triple) {
   return findHomebrewMinGWProgram(programName);
 }
 
+// The WASI pieces the program links against, which an LLVM install does not
+// carry: wasi-libc (a sysroot with its `eh` multilib, whose libunwind raises
+// with a wasm `throw`) and compiler-rt's builtins for wasm32 -- `long double`
+// is binary128 there, and wasi-libc's printf calls the soft-float routines.
+struct WASIRuntime {
+  std::string sysroot;
+  // Empty when the driver's own resource directory has the builtins.
+  std::string resourceDir;
+};
+
+bool isWASISysroot(llvm::StringRef path, const llvm::Triple &triple) {
+  llvm::SmallString<256> libc(path);
+  llvm::sys::path::append(libc, "lib", triple.getArchName().str() + "-wasip1",
+                          "libc.a");
+  return llvm::sys::fs::exists(libc);
+}
+
+bool hasWASIBuiltins(llvm::StringRef resourceDir, const llvm::Triple &triple) {
+  llvm::SmallString<256> builtins(resourceDir);
+  llvm::sys::path::append(builtins, "lib", triple.normalize(),
+                          "libclang_rt.builtins.a");
+  return llvm::sys::fs::exists(builtins);
+}
+
+// A wasi-sdk keeps its builtins under `<sdk>/lib/clang/<version>`, two levels
+// above the sysroot.
+std::optional<std::string> wasiSDKResourceDir(llvm::StringRef sysroot,
+                                              const llvm::Triple &triple) {
+  llvm::SmallString<256> clangDir(sysroot);
+  llvm::sys::path::append(clangDir, "..", "..", "lib", "clang");
+  std::error_code ec;
+  for (llvm::sys::fs::directory_iterator it(clangDir, ec), end;
+       !ec && it != end; it.increment(ec))
+    if (hasWASIBuiltins(it->path(), triple))
+      return it->path();
+  return std::nullopt;
+}
+
+// Where an installed wasi-libc is found, in order: lyc's own --sysroot, the
+// wasi-sdk WASI_SDK_PATH names, WASI_SYSROOT, the linked LLVM's prefix, the
+// package managers' shared directories, and wasi-sdk's usual install places.
+std::vector<std::string> wasiSysrootCandidates() {
+  std::vector<std::string> candidates;
+  auto add = [&](llvm::StringRef path) {
+    if (!path.empty())
+      candidates.push_back(path.str());
+  };
+  add(configuredTargetSysrootOverride(Options));
+  auto sdkSysroot = [](llvm::StringRef sdk) {
+    llvm::SmallString<256> path(sdk);
+    llvm::sys::path::append(path, "share", "wasi-sysroot");
+    return path.str().str();
+  };
+  if (const char *sdk = std::getenv("WASI_SDK_PATH"))
+    add(sdkSysroot(sdk));
+  if (const char *sysroot = std::getenv("WASI_SYSROOT"))
+    add(sysroot);
+  llvm::StringRef toolsDir = LYTHON_LLVM_TOOLS_BINARY_DIR;
+  if (!toolsDir.empty()) {
+    llvm::SmallString<256> prefix(toolsDir);
+    llvm::sys::path::append(prefix, "..", "share", "wasi-sysroot");
+    add(prefix);
+  }
+  for (const char *shared :
+       {"/opt/homebrew/share/wasi-sysroot", "/usr/local/share/wasi-sysroot",
+        "/usr/share/wasi-sysroot"})
+    add(shared);
+  add(sdkSysroot("/opt/wasi-sdk"));
+  // Versioned wasi-sdk directories, newest name first.
+  llvm::SmallVector<std::string, 4> versioned;
+  llvm::SmallString<256> home;
+  llvm::sys::path::home_directory(home);
+  llvm::SmallString<256> local(home);
+  llvm::sys::path::append(local, ".local");
+  for (llvm::StringRef parent : {llvm::StringRef("/opt"), local.str()}) {
+    std::error_code ec;
+    for (llvm::sys::fs::directory_iterator it(parent, ec), end;
+         !ec && it != end; it.increment(ec))
+      if (llvm::sys::path::filename(it->path()).starts_with("wasi-sdk"))
+        versioned.push_back(sdkSysroot(it->path()));
+  }
+  llvm::sort(versioned, std::greater<>());
+  for (const std::string &path : versioned)
+    add(path);
+  return candidates;
+}
+
+std::optional<WASIRuntime> findWASIRuntime(const llvm::Triple &triple) {
+  llvm::StringRef ownResourceDir = LYTHON_CLANG_RESOURCE_DIR;
+  bool ownBuiltins =
+      !ownResourceDir.empty() && hasWASIBuiltins(ownResourceDir, triple);
+  std::vector<std::string> candidates = wasiSysrootCandidates();
+  for (const std::string &sysroot : candidates) {
+    if (!isWASISysroot(sysroot, triple))
+      continue;
+    if (ownBuiltins)
+      return WASIRuntime{sysroot, ""};
+    if (std::optional<std::string> resourceDir =
+            wasiSDKResourceDir(sysroot, triple))
+      return WASIRuntime{sysroot, *resourceDir};
+  }
+  llvm::errs() << "error: linking " << triple.normalize()
+               << " needs wasi-libc and compiler-rt's wasm32 builtins, which "
+                  "the LLVM lyc is linked against does not carry; install "
+                  "wasi-sdk (https://github.com/WebAssembly/wasi-sdk) to "
+                  "/opt/wasi-sdk, or name one with WASI_SDK_PATH or "
+                  "--sysroot. Searched:\n";
+  for (const std::string &sysroot : candidates)
+    llvm::errs() << "  " << sysroot << "\n";
+  return std::nullopt;
+}
+
+// The wasm linker beside the linked LLVM's tools, on PATH, or from
+// Homebrew's lld, which ships apart from its llvm.
+std::optional<std::string> findWasmLinker() {
+  if (auto linker = findLLVMToolProgram("wasm-ld"))
+    return linker;
+  for (const char *prefix :
+       {"/opt/homebrew/opt/lld/bin", "/usr/local/opt/lld/bin"}) {
+    llvm::SmallString<256> path(prefix);
+    llvm::sys::path::append(path, "wasm-ld");
+    if (llvm::sys::fs::can_execute(path))
+      return path.str().str();
+  }
+  return std::nullopt;
+}
+
+// ⭐ THE LINKED LLVM'S CLANG, not wasi-sdk's: the objects come from this
+// LLVM, and its driver is the one whose multilib and flag rules match them.
+// What the LLVM install lacks -- wasi-libc and the wasm32 builtins -- is found
+// on disk and handed over with --sysroot and -resource-dir.
+std::optional<LinkerDriver> findWASILinkerDriver(const llvm::Triple &triple) {
+  std::optional<std::string> clang = findLLVMToolProgram("clang");
+  if (!clang) {
+    llvm::errs() << "error: linking " << triple.normalize()
+                 << " needs the clang of the LLVM lyc is linked against\n";
+    return std::nullopt;
+  }
+  std::optional<WASIRuntime> runtime = findWASIRuntime(triple);
+  if (!runtime)
+    return std::nullopt;
+  std::optional<std::string> wasmLd = findWasmLinker();
+  if (!wasmLd) {
+    llvm::errs() << "error: linking " << triple.normalize()
+                 << " needs wasm-ld (LLVM's lld)\n";
+    return std::nullopt;
+  }
+  LinkerDriver driver{*clang, LinkerDriverFlavor::WASI, {}};
+  if (configuredTargetSysrootOverride(Options).empty())
+    driver.toolchainArgs.push_back("--sysroot=" + runtime->sysroot);
+  if (!runtime->resourceDir.empty())
+    driver.toolchainArgs.push_back("-resource-dir=" + runtime->resourceDir);
+  // ⛔ -fuse-ld with the path, not --ld-path: the WebAssembly toolchain
+  // reads only the former, and warned the latter was unused.
+  driver.toolchainArgs.push_back("-fuse-ld=" + *wasmLd);
+  // The `eh` multilib first: its libunwind raises with a wasm `throw`, and a
+  // driver older than the sysroot may not select it by itself.
+  llvm::SmallString<256> eh(runtime->sysroot);
+  llvm::sys::path::append(eh, "lib", triple.getArchName().str() + "-wasip1",
+                          "eh");
+  if (llvm::sys::fs::is_directory(eh))
+    driver.toolchainArgs.push_back("-L" + eh.str().str());
+  return driver;
+}
+
 std::optional<LinkerDriver>
 findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
   llvm::Triple targetTriple = codeGenTripleForTarget(tensorTarget, Options);
@@ -361,20 +528,8 @@ findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
     if (auto mingw = findMinGWLinkerDriver(targetTriple))
       return LinkerDriver{*mingw, LinkerDriverFlavor::MinGWGcc};
   }
-  // wasi-sdk's clang: its sysroot is wasi-libc, and its `eh` multilib holds
-  // the libunwind whose `_Unwind_RaiseException` is a wasm `throw`. Named by
-  // WASI_SDK_PATH, the variable wasi-sdk's own documentation uses.
-  if (targetTriple.isOSWASI()) {
-    if (const char *sdk = std::getenv("WASI_SDK_PATH")) {
-      llvm::SmallString<256> clang(sdk);
-      llvm::sys::path::append(clang, "bin", "clang");
-      if (llvm::sys::fs::can_execute(clang))
-        return LinkerDriver{clang.str().str(), LinkerDriverFlavor::WASI};
-    }
-    llvm::errs() << "error: linking " << targetTriple.normalize()
-                 << " needs wasi-sdk: set WASI_SDK_PATH to its directory\n";
-    return std::nullopt;
-  }
+  if (targetTriple.isOSWASI())
+    return findWASILinkerDriver(targetTriple);
   auto clangExe = findLLVMToolProgram("clang++");
   if (!clangExe)
     clangExe = findLLVMToolProgram("clang");
@@ -546,6 +701,16 @@ LogicalResult linkExecutable(StringRef objectPath,
   if (linker->flavor == LinkerDriverFlavor::WASI) {
     appendWASILinkArgs(argStorage,
                        codeGenTripleForTarget(tensorTarget, Options));
+    argStorage.insert(argStorage.end(), linker->toolchainArgs.begin(),
+                      linker->toolchainArgs.end());
+    if (!Options.jsHost &&
+        (outputPath.ends_with(".js") || outputPath.ends_with(".cjs"))) {
+      llvm::errs() << "error: " << outputPath
+                   << " names a JavaScript loader; add --js-host to run the "
+                      "program under a JavaScript host, or name a .wasm for "
+                      "a WASI runtime\n";
+      return failure();
+    }
     if (Options.jsHost) {
       if (failed(checkWASIJsHostOutput(outputPath)))
         return failure();

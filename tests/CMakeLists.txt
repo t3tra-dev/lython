@@ -1024,9 +1024,22 @@ set(LYTHON_WASI_AGREEMENT_CASES
     errors/cross_bigint_traceback)
 
 find_program(LYTHON_WASMTIME wasmtime)
-set(LYTHON_WASI_SDK "$ENV{WASI_SDK_PATH}" CACHE PATH
+# lyc finds wasi-libc by itself (findWASIRuntime in tools/CLI.cpp); this only
+# decides whether the stages that need one are registered, and looks where lyc
+# looks for a wasi-sdk.
+set(lython_wasi_sdk_default "$ENV{WASI_SDK_PATH}")
+if(NOT lython_wasi_sdk_default)
+    file(GLOB lython_wasi_sdk_found LIST_DIRECTORIES true
+        "/opt/wasi-sdk" "/opt/wasi-sdk*" "$ENV{HOME}/.local/wasi-sdk*")
+    if(lython_wasi_sdk_found)
+        list(SORT lython_wasi_sdk_found ORDER DESCENDING)
+        list(GET lython_wasi_sdk_found 0 lython_wasi_sdk_default)
+    endif()
+endif()
+set(LYTHON_WASI_SDK "${lython_wasi_sdk_default}" CACHE PATH
     "wasi-sdk directory the wasi agreement stage links with")
-if(LYTHON_WASMTIME AND LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/bin/clang")
+if(LYTHON_WASMTIME AND LYTHON_WASI_SDK AND
+   EXISTS "${LYTHON_WASI_SDK}/share/wasi-sysroot")
     foreach(case_name IN LISTS LYTHON_WASI_AGREEMENT_CASES)
         lython_add_agreement_case(wasi "${case_name}"
             --wasmtime "${LYTHON_WASMTIME}")
@@ -1044,7 +1057,7 @@ endif()
 # same loader and node, which suspends the program with JSPI.
 file(GLOB LYTHON_JS_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/js/*.py")
-if(LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/bin/clang" AND
+if(LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/share/wasi-sysroot" AND
    lython_wasm_node_major GREATER_EQUAL 24)
     foreach(case_name IN LISTS LYTHON_WASM_AGREEMENT_CASES)
         lython_add_agreement_case(wasm "${case_name}"
