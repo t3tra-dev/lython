@@ -47,7 +47,9 @@ elif [ -f $b.stdout ] && ! cmp -s $b.out $b.stdout; then echo "OUT $b"
 else echo "OK $b"; fi
 rm -f $b.bin
 EOR
+# ${...} around every expansion that precedes a `:`: zsh reads `$d:ro` as `$d`
+# with the `:r` modifier and mounts at `<dir>o`.
 dirs=(); for f in "$@"; do dirs+=(${f:A:h}); done
-mounts=(-v $OUT:/w:Z); for d in ${(u)dirs}; do mounts+=(-v $d:$d:ro); done
+mounts=(-v ${OUT}:/w:Z); for d in ${(u)dirs}; do mounts+=(-v ${d}:${d}:ro); done
 podman --connection podman-machine-default-root run --rm --platform linux/arm/v7 \
   $mounts -w /w lython-armv7 sh -c 'ls *.o | xargs -P 6 -n 1 sh ./run1.sh'

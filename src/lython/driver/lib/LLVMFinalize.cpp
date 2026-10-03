@@ -185,10 +185,15 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
   thunkBuilder.CreateCall(pythonMain->getFunctionType(), pythonMain, {});
   thunkBuilder.CreateRetVoid();
 
+  // On wasm the C ABI spells `int main(int, char **)` `__main_argc_argv`:
+  // clang renames it, and wasi-libc's startup calls that name, not `main`.
+  llvm::StringRef entryName =
+      llvm::Triple(llvmModule.getTargetTriple()).isWasm() ? "__main_argc_argv"
+                                                          : "main";
   llvm::FunctionType *mainType =
       llvm::FunctionType::get(i32, {i32, ptr}, /*isVarArg=*/false);
   llvm::Function *main = llvm::Function::Create(
-      mainType, llvm::GlobalValue::ExternalLinkage, "main", llvmModule);
+      mainType, llvm::GlobalValue::ExternalLinkage, entryName, llvmModule);
   main->setUWTableKind(llvm::UWTableKind::Async);
 
   llvm::FunctionType *initArgsType =

@@ -2158,3 +2158,94 @@ TEST(DriverTest, AnArmv7RuntimeIsBuiltForArmv7) {
               llvm::isa<llvm::ConstantPointerNull>(pad->getClause(index)))
               << function.getName().str();
 }
+
+// What: wasm32-wasip1 reads wasi-libc's facts as measured under wasmtime --
+// WASI errno numbers, a 16-byte malloc, a dirent name after a u64 inode and a
+// u8 type, clockid_t as the address of `_CLOCK_*` -- and calls itself what
+// CPython's WASI build calls itself.
+TEST(DriverTest, WasiPreview1ReadsWasiLibcsLayout) {
+  py::runtime_library::HostTargetLayout wasi =
+      py::runtime_library::hostTargetLayout(
+          llvm::Triple("wasm32-unknown-wasip1"));
+  EXPECT_EQ(wasi.errnoNumbering, py::exceptions::ErrnoNumbering::WASI);
+  EXPECT_EQ(wasi.mallocAlignment, 16);
+  EXPECT_EQ(wasi.direntNameOffset, 9);
+  EXPECT_EQ(wasi.statMode[0], 24);
+  EXPECT_EQ(wasi.statSize[0], 48);
+  EXPECT_EQ(wasi.timespecNsec[1], -4);
+  EXPECT_EQ(wasi.tmGmtoff[0], 36);
+  EXPECT_EQ(wasi.clockMonotonicGlobal, "_CLOCK_MONOTONIC");
+  EXPECT_EQ(wasi.clockRealtimeGlobal, "_CLOCK_REALTIME");
+  EXPECT_EQ(py::platform_constants::staticStringValue("sys.platform",
+                                                      "wasm32-wasip1"),
+            std::optional<std::string>("wasi"));
+  EXPECT_EQ(py::platform_constants::staticStringValue("platform.system",
+                                                      "wasm32-wasip1"),
+            std::optional<std::string>("wasi"));
+}
+
+// What: a call wasi-libc cannot answer is refused when the program reaches
+// it, naming the path from `__main__`; a program that does not reach it
+// links, with clock_gettime taking wasi-libc's pointer clockid_t.
+TEST(DriverTest, AWasiProgramIsRefusedOnlyWhereItReachesWhatWasiLacks) {
+  auto link =
+      [](llvm::StringRef source,
+         std::string &diagnostics) -> lython::driver::VerifiedLLVMModule {
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    lython::driver::DriverOptions options;
+    options.targetTriple = "wasm32-wasip1";
+    CompileResult result = compileSource(source, options);
+    EXPECT_TRUE(result.succeeded) << result.diagnostics;
+    if (!result.succeeded)
+      return {};
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(
+        mlir::succeeded(lython::driver::configureLLVMModuleCodeGenTarget(
+            *result.verified.llvmModule,
+            lython::driver::detectTensorLoweringTarget(options), options,
+            diag)));
+    EXPECT_TRUE(mlir::succeeded(py::runtime_library::linkEmbeddedNativeRuntime(
+        *result.verified.llvmModule)));
+    lython::driver::redirectAllocationsToObjectAllocator(
+        *result.verified.llvmModule, /*bypass=*/false);
+    if (mlir::failed(py::runtime_library::declareLibcWithTargetPrototypes(
+            *result.verified.llvmModule, diag)))
+      return {};
+    return std::move(result.verified);
+  };
+
+  std::string refused;
+  lython::driver::VerifiedLLVMModule uid =
+      link("import os\nprint(os.getuid())\n", refused);
+  EXPECT_FALSE(uid.llvmModule);
+  EXPECT_NE(refused.find("has no 'getuid'"), std::string::npos) << refused;
+  EXPECT_NE(refused.find("__main__ -> "), std::string::npos) << refused;
+
+  std::string none;
+  lython::driver::VerifiedLLVMModule clock =
+      link("import time\nprint(time.monotonic() > 0)\n", none);
+  ASSERT_TRUE(clock.llvmModule) << none;
+  const llvm::Function *gettime =
+      clock.llvmModule->getFunction("clock_gettime");
+  ASSERT_NE(gettime, nullptr);
+  EXPECT_TRUE(gettime->getFunctionType()->getParamType(0)->isPointerTy());
+}
+
+// What: a Python function is local to the module, so its name -- here a C
+// library function's -- is never the symbol the runtime's call binds to.
+TEST(DriverTest, APythonFunctionIsNotAnExternalSymbol) {
+  CompileResult result = compileSource("def write(fd: int) -> int:\n"
+                                       "    return fd + 1\n"
+                                       "\n"
+                                       "print(write(1))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *write =
+      result.verified.llvmModule->getFunction("write");
+  ASSERT_NE(write, nullptr);
+  EXPECT_TRUE(write->hasLocalLinkage());
+  const llvm::Function *main =
+      result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+  EXPECT_FALSE(main->hasLocalLinkage());
+}

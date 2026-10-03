@@ -118,7 +118,9 @@ llvm::Triple codeGenTripleForTarget(py::TensorLoweringTarget target,
   std::string override = configuredTargetTripleOverride(options);
   if (override.empty())
     return llvm::Triple(llvm::sys::getDefaultTargetTriple());
-  llvm::Triple triple(override);
+  // Normalized: `wasm32-wasip1` read positionally has vendor "wasip1" and no
+  // OS at all.
+  llvm::Triple triple(llvm::Triple::normalize(override));
   fillDarwinOSVersionFromHost(triple);
   return triple;
 }
@@ -210,17 +212,23 @@ std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
   return hostCPUFeaturesForCodeGen();
 }
 
-// ⛔ The WebAssembly backend takes its EH mode from a command-line flag as well
+// ⛔ The WebAssembly backend takes its EH mode from command-line flags as well
 // as from TargetOptions, and refuses `ExceptionModel == Wasm` unless
 // `-wasm-enable-eh` is set too ("-exception-model=wasm only allowed with at
-// least one of -wasm-enable-eh or -wasm-enable-sjlj"). The flag is
-// process-wide, and it only reaches the WebAssembly backend.
-static void enableWasmExceptionsInBackend() {
+// least one of -wasm-enable-eh or -wasm-enable-sjlj"); the encoding is
+// `-wasm-use-legacy-eh`. Both are process-wide and only reach the WebAssembly
+// backend, so they are set for the target each time one of its machines is
+// made.
+static void enableWasmExceptionsInBackend(const llvm::Triple &triple) {
   auto &registered = llvm::cl::getRegisteredOptions();
-  auto found = registered.find("wasm-enable-eh");
-  if (found == registered.end())
-    return;
-  static_cast<llvm::cl::opt<bool> *>(found->second)->setValue(true);
+  auto set = [&](llvm::StringRef name, bool value) {
+    auto found = registered.find(name);
+    if (found != registered.end())
+      static_cast<llvm::cl::opt<bool> *>(found->second)->setValue(value);
+  };
+  set("wasm-enable-eh", true);
+  set("wasm-use-legacy-eh",
+      py::runtime_library::useLegacyWasmExceptions(triple));
 }
 
 llvm::ExceptionHandling
@@ -291,7 +299,7 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   llvm::TargetOptions opt;
   applyExceptionUnwindOptions(opt, triple);
   if (opt.ExceptionModel == llvm::ExceptionHandling::Wasm)
-    enableWasmExceptionsInBackend();
+    enableWasmExceptionsInBackend(triple);
   if (!parseConfiguredFloatABI(opt.FloatABIType, options, diag))
     return nullptr;
   std::unique_ptr<llvm::TargetMachine> targetMachine(

@@ -1,7 +1,10 @@
 #include "Common/LibcPrototypes.h"
 
+#include "Common/SupportBuilder.h"
+
 #include "Native.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -23,7 +26,21 @@ namespace {
 // The C types a prototype here is written in. `Int64` is `time_t` and `off_t`:
 // 64-bit on every target, because the 32-bit glibc spellings below are the
 // time64/LFS ones.
-enum class CType { Void, Int, UInt, Long, SizeT, SSizeT, Int64, Ptr, Double };
+//
+// `ClockId` is an int except where HostTargetLayout names the `_CLOCK_*`
+// globals clockid_t points at (wasi-libc).
+enum class CType {
+  Void,
+  Int,
+  UInt,
+  Long,
+  SizeT,
+  SSizeT,
+  Int64,
+  Ptr,
+  Double,
+  ClockId
+};
 
 struct LibcPrototype {
   llvm::StringLiteral name;
@@ -48,7 +65,7 @@ constexpr LibcPrototype kLibc[] = {
     {"aligned_alloc", C::Ptr, {C::SizeT, C::SizeT}, 2},
     {"calloc", C::Ptr, {C::SizeT, C::SizeT}, 2},
     {"chdir", C::Int, {C::Ptr}, 1},
-    {"clock_gettime", C::Int, {C::Int, C::Ptr}, 2},
+    {"clock_gettime", C::Int, {C::ClockId, C::Ptr}, 2},
     {"closedir", C::Int, {C::Ptr}, 1},
     {"dlsym", C::Ptr, {C::Ptr, C::Ptr}, 2},
     {"exit", C::Void, {C::Int}, 1},
@@ -156,9 +173,61 @@ llvm::StringRef targetSymbolFor(llvm::StringRef name,
   return name;
 }
 
+// What the target's libc does not have at all. Measured, not recalled: the
+// table's names that `llvm-nm --defined-only` finds in none of wasi-sdk 34's
+// libc.a, its libwasi-emulated-{getpid,signal,process-clocks}.a and the `eh`
+// libunwind.a (the archives the WASI link uses).
+bool missingFromTargetLibc(llvm::StringRef name, const llvm::Triple &triple) {
+  if (!triple.isOSWASI())
+    return false;
+  return llvm::StringSwitch<bool>(name)
+      .Cases({"getuid", "geteuid", "getgid", "getegid", "getppid"}, true)
+      .Cases({"sigaction", "sigaltstack", "dlsym"}, true)
+      .Default(false);
+}
+
+// The call path from the program's entry to `target`, or empty when the
+// program never reaches it. Roots are `__main__` and every function whose
+// address is taken (a callback, a thunk, a vtable slot) -- what a linker
+// keeps when it garbage-collects from the entry.
+llvm::SmallVector<llvm::StringRef, 8> pathFromEntry(llvm::Module &module,
+                                                    llvm::Function *target) {
+  llvm::DenseMap<llvm::Function *, llvm::Function *> parent;
+  llvm::SmallVector<llvm::Function *, 64> work;
+  auto visit = [&](llvm::Function *function, llvm::Function *from) {
+    if (function && parent.try_emplace(function, from).second)
+      work.push_back(function);
+  };
+  visit(module.getFunction("__main__"), nullptr);
+  for (llvm::Function &function : module)
+    for (const llvm::User *user : function.users()) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(user);
+      if (!call || call->getCalledOperand() != &function) {
+        visit(&function, nullptr);
+        break;
+      }
+    }
+  while (!work.empty()) {
+    llvm::Function *function = work.pop_back_val();
+    if (function == target)
+      break;
+    for (llvm::BasicBlock &block : *function)
+      for (llvm::Instruction &instruction : block)
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          visit(call->getCalledFunction(), function);
+  }
+  llvm::SmallVector<llvm::StringRef, 8> path;
+  if (!parent.count(target))
+    return path;
+  for (llvm::Function *at = target; at; at = parent.lookup(at))
+    path.insert(path.begin(), at->getName());
+  return path;
+}
+
 struct TargetWidths {
   unsigned pointerBits;
   unsigned longBits;
+  bool clockIdIsPointer;
 };
 
 bool isSigned(CType type) {
@@ -171,6 +240,10 @@ llvm::Type *lower(CType type, const TargetWidths &widths,
   switch (type) {
   case C::Void:
     return llvm::Type::getVoidTy(context);
+  case C::ClockId:
+    if (widths.clockIdIsPointer)
+      return llvm::PointerType::getUnqual(context);
+    return llvm::Type::getInt32Ty(context);
   case C::Int:
   case C::UInt:
     return llvm::Type::getInt32Ty(context);
@@ -317,11 +390,34 @@ mlir::LogicalResult declareLibcWithTargetPrototypes(llvm::Module &module,
   widths.pointerBits = module.getDataLayout().getPointerSizeInBits();
   widths.longBits = static_cast<unsigned>(
       py::native::expectedCLongWidth(triple.str(), widths.pointerBits));
+  widths.clockIdIsPointer =
+      !hostTargetLayout(triple).clockMonotonicGlobal.empty();
   // Where every C prototype here would spell itself the runtime's way anyway,
   // a function the table lacks is linked by name and cannot be misread.
   bool needsExactPrototypes =
       widths.pointerBits != 64 || widths.longBits != 64 ||
       py::native::callsAreCheckedBySignature(triple.str());
+
+  // ⛔ Refused only when the program reaches it. The runtime defines every
+  // wrapper whether or not the program calls it, and the link drops the ones
+  // it does not; a call that IS reached would be an undefined symbol at link
+  // -- this says which Python call got there, where CPython's own build for
+  // the target has no such attribute at all.
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration() ||
+        !missingFromTargetLibc(function.getName(), triple))
+      continue;
+    llvm::SmallVector<llvm::StringRef, 8> path =
+        pathFromEntry(module, &function);
+    if (path.empty())
+      continue;
+    diag << "error: " << triple.str() << "'s C library has no '"
+         << function.getName() << "', and the program calls it:";
+    for (llvm::StringRef step : path)
+      diag << (step == path.front() ? " " : " -> ") << step;
+    diag << "\n";
+    return mlir::failure();
+  }
 
   llvm::SmallVector<std::pair<llvm::Function *, const LibcPrototype *>, 32>
       declared;

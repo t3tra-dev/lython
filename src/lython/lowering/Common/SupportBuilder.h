@@ -64,8 +64,12 @@ struct HostTargetLayout {
   // `struct dirent`'s NUL-terminated d_name.
   int direntNameOffset = 19;
 
-  // CLOCK_MONOTONIC's value (CLOCK_REALTIME is 0 everywhere).
+  // CLOCK_MONOTONIC's value (CLOCK_REALTIME is 0 everywhere) -- or, where
+  // clockid_t is a pointer (wasi-libc), the globals the two macros take the
+  // address of.
   int clockMonotonic = 1;
+  llvm::StringRef clockMonotonicGlobal;
+  llvm::StringRef clockRealtimeGlobal;
 
   // What `malloc` guarantees: alignof(max_align_t). 16 on the LP64 targets;
   // 8 on Emscripten's dlmalloc (static_asserted) and 32-bit glibc (measured).
@@ -83,8 +87,9 @@ struct HostTargetLayout {
 // non-POSIX target (`posix == false` makes every entry point fail loudly).
 inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   HostTargetLayout layout;
-  // ILP32, measured on armv7 glibc 2.36 (time64) and wasm32 Emscripten: the
-  // longs are 4 bytes, and malloc keeps to 8.
+  // ILP32, measured on armv7 glibc 2.36 (time64), wasm32 Emscripten and
+  // wasi-libc: the longs are 4 bytes, and malloc keeps to 8 (wasi-libc's to
+  // 16, below).
   if (triple.isArch32Bit()) {
     layout.mallocAlignment = 8;
     layout.timespecNsec[1] = -4;
@@ -122,6 +127,17 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   // Emscripten's musl, measured on wasm64 (offsetof under `emcc -m64`): dev_t
   // and mode_t are 32-bit and lead the struct, st_ino sits LAST, and errno
   // follows WASI's numbering rather than Linux's.
+  // wasi-libc (wasi-sdk 34), measured under wasmtime: x86_64 Linux's
+  // `struct stat`, a dirent whose name follows a u64 inode and a u8 type,
+  // a 16-byte malloc, and clockid_t a pointer to `_CLOCK_*`.
+  if (triple.isOSWASI()) {
+    layout.errnoNumbering = py::exceptions::ErrnoNumbering::WASI;
+    layout.mallocAlignment = 16;
+    layout.direntNameOffset = 9;
+    layout.clockMonotonicGlobal = "_CLOCK_MONOTONIC";
+    layout.clockRealtimeGlobal = "_CLOCK_REALTIME";
+    return layout;
+  }
   if (triple.isOSEmscripten() && triple.isArch32Bit()) {
     // wasm32: as wasm64 except that nlink_t is 32-bit, which moves everything
     // after st_mode up.

@@ -106,6 +106,14 @@ inline bool padsAreFunclets(const llvm::Triple &triple) {
   return triple.isWasm();
 }
 
+// Which encoding of wasm exceptions the module uses. Emscripten links its
+// libunwind built for the legacy one (try/catch/delegate) unless told
+// otherwise; wasmtime runs only the standard one (try_table/exnref), and
+// wasi-sdk's libunwind is built for that.
+inline bool useLegacyWasmExceptions(const llvm::Triple &triple) {
+  return triple.isOSEmscripten();
+}
+
 inline constexpr llvm::StringRef kWasmPersonalityName =
     "__gxx_wasm_personality_v0";
 

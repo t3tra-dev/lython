@@ -304,6 +304,7 @@ enum class LinkerDriverFlavor {
   Clang,
   MinGWGcc,
   Emscripten,
+  WASI,
 };
 
 struct LinkerDriver {
@@ -360,6 +361,20 @@ findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
   if (targetTriple.isWindowsGNUEnvironment()) {
     if (auto mingw = findMinGWLinkerDriver(targetTriple))
       return LinkerDriver{*mingw, LinkerDriverFlavor::MinGWGcc};
+  }
+  // wasi-sdk's clang: its sysroot is wasi-libc, and its `eh` multilib holds
+  // the libunwind whose `_Unwind_RaiseException` is a wasm `throw`. Named by
+  // WASI_SDK_PATH, the variable wasi-sdk's own documentation uses.
+  if (targetTriple.isOSWASI()) {
+    if (const char *sdk = std::getenv("WASI_SDK_PATH")) {
+      llvm::SmallString<256> clang(sdk);
+      llvm::sys::path::append(clang, "bin", "clang");
+      if (llvm::sys::fs::can_execute(clang))
+        return LinkerDriver{clang.str().str(), LinkerDriverFlavor::WASI};
+    }
+    llvm::errs() << "error: linking " << targetTriple.normalize()
+                 << " needs wasi-sdk: set WASI_SDK_PATH to its directory\n";
+    return std::nullopt;
   }
   // ⛔ Not clang + wasm-ld. The objects import libc, and Emscripten's libc is
   // the one whose ABI the runtime was measured against (SupportBuilder.h); emcc
@@ -494,6 +509,25 @@ void appendEmscriptenLinkArgs(std::vector<std::string> &args,
   args.emplace_back("-Wl,--fatal-warnings");
 }
 
+// The output is a core module for a WASI preview-1 host:
+// `wasmtime run -W exceptions=y --dir=. prog.wasm`.
+void appendWASILinkArgs(std::vector<std::string> &args,
+                        const llvm::Triple &triple) {
+  args.emplace_back("--target=" + triple.normalize());
+  args.emplace_back("-fwasm-exceptions");
+  args.emplace_back("-lunwind");
+  // The libc pieces WASI has no call for, which wasi-libc emulates in
+  // separate archives: getpid() a constant, raise() the default action of a
+  // signal in-process, clock() from the monotonic clock.
+  args.emplace_back("-lwasi-emulated-getpid");
+  args.emplace_back("-lwasi-emulated-signal");
+  args.emplace_back("-lwasi-emulated-process-clocks");
+  args.emplace_back("-Wl,-z,stack-size=8388608");
+  // As for Emscripten: the stack below static data, so an overflow traps.
+  args.emplace_back("-Wl,--stack-first");
+  args.emplace_back("-Wl,--fatal-warnings");
+}
+
 LogicalResult linkExecutable(StringRef objectPath,
                              py::TensorLoweringTarget tensorTarget,
                              StringRef outputPath) {
@@ -517,6 +551,9 @@ LogicalResult linkExecutable(StringRef objectPath,
   if (linker->flavor == LinkerDriverFlavor::Emscripten) {
     appendEmscriptenLinkArgs(argStorage,
                              codeGenTripleForTarget(tensorTarget, Options));
+  } else if (linker->flavor == LinkerDriverFlavor::WASI) {
+    appendWASILinkArgs(argStorage,
+                       codeGenTripleForTarget(tensorTarget, Options));
   } else {
     // Parallel kernel dispatch calls pthread_create; Darwin ships it in
     // libSystem, but Linux toolchains still want the explicit flag.
