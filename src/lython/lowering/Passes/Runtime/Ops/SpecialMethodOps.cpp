@@ -2378,6 +2378,10 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
       return RuntimeBundleLowerer::lowerListRuntimeNext(op, *iterator);
     return RuntimeBundleLowerer::lowerListEvidenceNext(op, *iterator);
   }
+  if (RuntimeBundleLowerer::isGeneratorProtocol(op.getIterator().getType()) &&
+      iterator->contractName() != "types.GeneratorType")
+    return RuntimeBundleLowerer::refuseProtocolGeneratorResume(
+        op.getOperation(), op.getIterator().getType());
   if (iterator->contractName() == "types.GeneratorType") {
     // ⭐ AND THE SAME FORWARDING FOR A GENERATOR'S FRAME TARGET. The state
     // machine threads a loop's iterator through the resume function's block
@@ -2396,9 +2400,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
                     // call that created it; when the state machine has split
                     // the loop across resume functions they do not dominate
                     // the `py.next` in the block that reads them, and adopting
-                    // the bundle anyway turns a sentence the reader can act on
-                    // into "operand #0 does not dominate this use". That shape
-                    // is the generator-frame work below, not this forwarding.
+                    // the bundle anyway is "operand #0 does not dominate this
+                    // use". That read resumes through the frame instead, which
+                    // needs nothing but the generator.
                     mlir::DominanceInfo dominance;
                     for (const RuntimeValue &source : bundle.generatorSources)
                       for (mlir::Value value : source.values)
@@ -2410,27 +2414,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerNext(py::NextOp op) {
         forwardedIterator = *forwarded;
         iterator = &forwardedIterator;
       }
-    if (!iterator->generatorTarget.empty())
-      return RuntimeBundleLowerer::lowerSourceGeneratorNext(op, *iterator);
-    // ⛔ A generator VALUE with no frame target that the forwarding above
-    // could not reach either: the loop lives across a suspension, so the
-    // resume's own operands are defined in a block that does not dominate
-    // this read. Falling through to the manifest path reported "runtime
-    // manifest has no types.GeneratorType.__next__ method" -- a sentence
-    // about the manifest for a program that did nothing to it. Named here
-    // rather than repaired: carrying the frame across a suspension is the
-    // generator-frame work the resume lane note in GeneratorStateMachine.cpp
-    // describes.
-    //
-    // ⛔ The advice has to be the advice that WORKS. `bind it to a local in
-    // the same function` was in this sentence and does not help inside a
-    // generator -- the local is the same value across the same suspension --
-    // and it is the shape a reader most naturally tries next.
-    return op.emitError()
-           << "a generator returned out of a function cannot be resumed here: "
-              "the frame it resumes into is not reachable from this read. "
-              "Outside a generator, iterate it directly; inside one, "
-              "materialize it first (`for v in list(inner())`)";
+    // ⭐ With no creation site in reach, the frame names its own body
+    // (`emitDispatchedGeneratorResume`).
+    return RuntimeBundleLowerer::lowerSourceGeneratorNext(op, *iterator);
   }
 
   llvm::SmallVector<const RuntimeBundle *, 1> sources{iterator};

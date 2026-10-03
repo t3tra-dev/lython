@@ -499,6 +499,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
   }
   if (receiver.kind != RuntimeBundle::Kind::Object)
     return op.emitError() << "bound method receiver must be an object bundle";
+  if (RuntimeBundleLowerer::isGeneratorProtocol(op.getCallable().getType()) &&
+      receiver.contractName() != "types.GeneratorType" &&
+      llvm::is_contained({"__next__", "send", "throw", "close"}, methodName))
+    return RuntimeBundleLowerer::refuseProtocolGeneratorResume(
+        op.getOperation(), op.getCallable().getType());
   bool structuralMutation =
       op->hasAttr("ly.structural_mutation") && op.getNumResults() == 2;
   if (op.getNumResults() != 1 && !structuralMutation)
@@ -525,19 +530,25 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     return mlir::failure();
 
   if (receiver.contractName() == "types.GeneratorType" &&
-      !receiver.generatorTarget.empty() && methodName == "send")
+      methodName == "send")
     return RuntimeBundleLowerer::lowerSourceGeneratorSend(op, receiver,
                                                           sources);
   if (receiver.contractName() == "types.GeneratorType" &&
-      !receiver.generatorTarget.empty() && methodName == "__next__")
+      methodName == "__next__")
     return RuntimeBundleLowerer::lowerSourceGeneratorDunderNext(op, receiver,
                                                                 sources);
   if (receiver.contractName() == "types.GeneratorType" &&
-      !receiver.generatorTarget.empty() && methodName == "throw")
+      methodName == "throw")
     return RuntimeBundleLowerer::lowerSourceGeneratorThrow(op, receiver,
                                                            sources);
   if (receiver.contractName() == "types.GeneratorType" &&
-      !receiver.generatorTarget.empty() && methodName == "close") {
+      methodName == "close") {
+    // ⭐ A generator whose function is not known here closes through its
+    // frame. The manifest close below only marks the object closed, so
+    // taking it would skip every `finally` the body is suspended in.
+    if (receiver.generatorTarget.empty())
+      return RuntimeBundleLowerer::lowerStateMachineGeneratorClose(op, receiver,
+                                                                   nullptr);
     // State-machine generators run their close protocol (GeneratorExit
     // injection, so finally blocks execute); inline-dispatch generators
     // have straight-line bodies without handlers, so the manifest close
@@ -546,7 +557,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
         generatorResumeClones.find(receiver.generatorTarget);
     if (closeResumeInfo != generatorResumeClones.end())
       return RuntimeBundleLowerer::lowerStateMachineGeneratorClose(
-          op, receiver, closeResumeInfo->second);
+          op, receiver, &closeResumeInfo->second);
   }
 
   // Evidence-backed dicts qualify too: their payload arrays are kept in

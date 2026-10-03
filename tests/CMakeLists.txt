@@ -238,7 +238,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnImportedFunctionReturnsTheClassItsModuleImports"
     "DriverTest.AnImportedModuleKeepsCallablesInAContainer"
     "DriverTest.AClosureCallsACapturedCallableReturningAnOptional"
-    "DriverTest.ACallableOfAnyArgumentsTakesAFunctionWithParameters")
+    "DriverTest.ACallableOfAnyArgumentsTakesAFunctionWithParameters"
+    "DriverTest.AGeneratorResumedByItsFrameNamesWhatItCannotResume")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

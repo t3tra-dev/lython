@@ -4,6 +4,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1146,6 +1147,9 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       bodies.push_back(fn);
   });
 
+  for (mlir::func::FuncOp body : bodies)
+    generatorBodies.insert(body.getSymName());
+
   for (mlir::func::FuncOp body : bodies) {
     bool hasYield = false;
     bool hasYieldFrom = false;
@@ -1169,8 +1173,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           !mlir::isa<py::TryOp>(op))
         unsupported = true;
     });
-    if (unsupported || (!hasYield && !hasYieldFrom))
+    if (!hasYield && !hasYieldFrom)
       continue;
+    if (unsupported) {
+      generatorDeclineReasons[body.getSymName()] =
+          "its body has a structured region other than `try` at a yield";
+      continue;
+    }
     // Straight-line int bodies also take the state machine: the inline
     // re-dispatch raises its exhaustion StopIteration inside an scf.if that
     // falls through, and an unwind that starts after the caller's releases
@@ -1181,8 +1190,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         body->getAttrOfType<mlir::TypeAttr>(ownership::kCallableTypeAttr);
     auto callable = mlir::dyn_cast_if_present<py::CallableType>(
         callableAttr ? callableAttr.getValue() : mlir::Type());
-    if (!callable || callable.hasVararg() || callable.hasKwarg())
+    if (!callable || callable.hasVararg() || callable.hasKwarg()) {
+      generatorDeclineReasons[body.getSymName()] =
+          "it takes *args or **kwargs, which have no argument lane";
       continue;
+    }
     // Arguments: int rides the legacy (i64, i1) evidence pair; any object
     // contract with a lane shape rides its physical span (the lazy iterator
     // desugars pass lists/strs/tuples into synthetic generators, and a source
@@ -1219,6 +1231,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
       std::string contract = runtimeContractName(positional);
       if (contract.empty()) {
+        std::string reason;
+        llvm::raw_string_ostream stream(reason);
+        stream << "a parameter of type " << positional
+               << " has no argument lane";
+        generatorDeclineReasons[body.getSymName()] = reason;
         argumentsEligible = false;
         break;
       }
@@ -1254,6 +1271,11 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
             RuntimeBundleLowerer::generatorLaneParts(body.getOperation(),
                                                      positional);
         if (!parts || parts->empty()) {
+          std::string reason;
+          llvm::raw_string_ostream stream(reason);
+          stream << "a parameter of type " << positional
+                 << " has no argument lane";
+          generatorDeclineReasons[body.getSymName()] = reason;
           argumentsEligible = false;
           break;
         }
@@ -3231,6 +3253,54 @@ RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
 // close raises (finalization has no propagation context), and then releases
 // whatever the frame still holds (the close path zeroes slots it consumed;
 // placeholders are immortal, so their release is a no-op).
+// The generator's arguments as the frame stored them at creation, BORROWED:
+// the creation-time references stay with the frame until its finalizer
+// releases them. What a resume needs when nothing but the object is in hand.
+mlir::LogicalResult RuntimeBundleLowerer::appendStoredGeneratorArgumentOperands(
+    mlir::Operation *op, GeneratorResumeInfo &info, mlir::Value storage,
+    llvm::SmallVectorImpl<mlir::Value> &operands) {
+  mlir::Location loc = op->getLoc();
+  auto i64Const = [&](std::int64_t value) { return constantI64(builder, loc, value); };
+  auto slotIndex = [&](std::int64_t slot) { return constantIndex(builder, loc, slot); };
+  llvm::SmallVector<unsigned, 8> argumentWordOffsets =
+      RuntimeBundleLowerer::generatorArgumentWordOffsets(info);
+  for (unsigned index = 0; index < info.argumentCount; ++index) {
+    const GeneratorResumeLane *argumentLane =
+        index < info.argumentLanes.size() ? &info.argumentLanes[index]
+                                          : nullptr;
+    unsigned base = index < argumentWordOffsets.size()
+                        ? argumentWordOffsets[index]
+                        : 8 + 2 * index;
+    if (!argumentLane || argumentLane->isInt || argumentLane->isControl()) {
+      mlir::Value raw =
+          mlir::memref::LoadOp::create(builder, loc, storage, slotIndex(base))
+              .getResult();
+      mlir::Value validWord =
+          mlir::memref::LoadOp::create(builder, loc, storage,
+                                       slotIndex(base + 1))
+              .getResult();
+      mlir::Value valid = mlir::arith::CmpIOp::create(
+          builder, loc, mlir::arith::CmpIPredicate::ne, validWord,
+          i64Const(0));
+      operands.push_back(raw);
+      operands.push_back(valid);
+      continue;
+    }
+    // Object argument: the span borrowed from the storage words; a resume
+    // must not consume the frame's own reference.
+    mlir::FailureOr<mlir::func::FuncOp> load =
+        RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
+            op, *argumentLane);
+    if (mlir::failed(load))
+      return mlir::failure();
+    mlir::func::CallOp loaded = mlir::func::CallOp::create(
+        builder, loc, *load, mlir::ValueRange{storage, i64Const(base)});
+    operands.append(loaded.getResults().begin(),
+                         loaded.getResults().end());
+  }
+  return mlir::success();
+}
+
 mlir::FailureOr<mlir::func::FuncOp>
 RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
     GeneratorResumeInfo &info) {
@@ -3294,43 +3364,11 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
   builder.setInsertionPointToEnd(closeBlock);
   llvm::SmallVector<mlir::Value, 10> closeOperands;
   closeOperands.push_back(storage);
+  if (mlir::failed(RuntimeBundleLowerer::appendStoredGeneratorArgumentOperands(
+          op, info, storage, closeOperands)))
+    return mlir::failure();
   llvm::SmallVector<unsigned, 8> argumentWordOffsets =
       RuntimeBundleLowerer::generatorArgumentWordOffsets(info);
-  for (unsigned index = 0; index < info.argumentCount; ++index) {
-    const GeneratorResumeLane *argumentLane =
-        index < info.argumentLanes.size() ? &info.argumentLanes[index]
-                                          : nullptr;
-    unsigned base = index < argumentWordOffsets.size()
-                        ? argumentWordOffsets[index]
-                        : 8 + 2 * index;
-    if (!argumentLane || argumentLane->isInt || argumentLane->isControl()) {
-      mlir::Value raw =
-          mlir::memref::LoadOp::create(builder, loc, storage, slotIndex(base))
-              .getResult();
-      mlir::Value validWord =
-          mlir::memref::LoadOp::create(builder, loc, storage,
-                                       slotIndex(base + 1))
-              .getResult();
-      mlir::Value valid = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::ne, validWord,
-          i64Const(0));
-      closeOperands.push_back(raw);
-      closeOperands.push_back(valid);
-      continue;
-    }
-    // Object argument: borrow the span from the storage words (the
-    // generator's creation-time reference stays put until the release pass
-    // below — the close resume must not consume it).
-    mlir::FailureOr<mlir::func::FuncOp> load =
-        RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
-            op, *argumentLane);
-    if (mlir::failed(load))
-      return mlir::failure();
-    mlir::func::CallOp loaded = mlir::func::CallOp::create(
-        builder, loc, *load, mlir::ValueRange{storage, i64Const(base)});
-    closeOperands.append(loaded.getResults().begin(),
-                         loaded.getResults().end());
-  }
   mlir::func::CallOp::create(builder, loc, getOrCreateTryCallSiteMarker(),
                              mlir::ValueRange{i64Const(handlerId)});
   mlir::func::CallOp::create(builder, loc, *close, closeOperands);
@@ -3571,16 +3609,18 @@ RuntimeBundleLowerer::emitStateMachineGeneratorResume(
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
-    py::CallOp op, const RuntimeBundle &receiver, GeneratorResumeInfo &info,
+    py::CallOp op, const RuntimeBundle &receiver, GeneratorResumeInfo *info,
     llvm::ArrayRef<const RuntimeBundle *> sources) {
   if (sources.size() != 2 || !sources[1])
     return op.emitError()
            << "generator throw expects exactly one exception value";
-  if (op.getNumResults() != 1 ||
-      runtimeContractName(op.getResult(0).getType()) != info.valueLane.contract)
+  if (op.getNumResults() != 1)
+    return op.emitError() << "generator throw expects one result";
+  if (info &&
+      runtimeContractName(op.getResult(0).getType()) != info->valueLane.contract)
     return op.emitError()
            << "generator throw result must match the yield lane contract "
-           << info.valueLane.contract;
+           << info->valueLane.contract;
   const RuntimeBundle &exception = *sources[1];
   if (exception.physicalValues().size() != 3)
     return op.emitError()
@@ -3591,8 +3631,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
     return op.emitError() << "generator object has no physical storage";
 
   mlir::FailureOr<mlir::func::FuncOp> throwFn =
-      RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
-          op.getOperation(), info);
+      info ? RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(
+                 op.getOperation(), *info)
+           : RuntimeBundleLowerer::getOrCreateGeneratorDispatch(
+                 op.getOperation(), op.getResult(0).getType(),
+                 GeneratorDriverKind::Throw);
   if (mlir::failed(throwFn))
     return mlir::failure();
 
@@ -3606,8 +3649,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
   // chain globals when the throw returns normally.
   llvm::SmallVector<mlir::Value, 16> operands;
   operands.push_back(receiver.physicalValues().front());
-  if (mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
-          op.getOperation(), info, receiver.generatorSourceBundles, operands)))
+  if (info &&
+      mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
+          op.getOperation(), *info, receiver.generatorSourceBundles, operands)))
     return mlir::failure();
   for (mlir::Value value : exception.physicalValues())
     operands.push_back(value);
@@ -3626,14 +3670,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorClose(
-    py::CallOp op, const RuntimeBundle &receiver, GeneratorResumeInfo &info) {
+    py::CallOp op, const RuntimeBundle &receiver, GeneratorResumeInfo *info) {
   if (op.getNumResults() != 1)
     return op.emitError() << "generator close expects one (None) result";
   if (receiver.physicalValues().empty())
     return op.emitError() << "generator object has no physical storage";
   mlir::FailureOr<mlir::func::FuncOp> closeFn =
-      RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(op.getOperation(),
-                                                              info);
+      info ? RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(
+                 op.getOperation(), *info)
+           : RuntimeBundleLowerer::getOrCreateGeneratorDispatch(
+                 op.getOperation(),
+                 RuntimeBundleLowerer::generatorYieldType(receiver.contract),
+                 GeneratorDriverKind::Close);
   if (mlir::failed(closeFn))
     return mlir::failure();
 
@@ -3641,8 +3689,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorClose(
   mlir::Location loc = op.getLoc();
   llvm::SmallVector<mlir::Value, 16> operands;
   operands.push_back(receiver.physicalValues().front());
-  if (mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
-          op.getOperation(), info, receiver.generatorSourceBundles, operands)))
+  if (info &&
+      mlir::failed(RuntimeBundleLowerer::appendGeneratorArgumentOperands(
+          op.getOperation(), *info, receiver.generatorSourceBundles, operands)))
     return mlir::failure();
   emitTryCallSiteMarkerIfNeeded(loc);
   mlir::func::CallOp::create(builder, loc, *closeFn, operands);
@@ -3652,6 +3701,307 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorClose(
     return mlir::failure();
   erase.push_back(op);
   return mlir::success();
+}
+
+// A driver that needs the generator object and nothing else: the arguments
+// are read back from the frame, where the creation site stored them, instead
+// of from the creation site's values, which only a site the creation
+// dominates can name. Its inputs are the driver's own minus the argument
+// span, so step/advance keep (sent, valid, inject), throw keeps the
+// exception, and close keeps nothing.
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateStoredGeneratorDriver(
+    mlir::Operation *op, GeneratorResumeInfo &info, GeneratorDriverKind kind) {
+  mlir::FailureOr<mlir::func::FuncOp> driver = mlir::failure();
+  switch (kind) {
+  case GeneratorDriverKind::Step:
+    driver = RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(op, info);
+    break;
+  case GeneratorDriverKind::Advance:
+    driver = RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(op, info);
+    break;
+  case GeneratorDriverKind::Throw:
+    driver = RuntimeBundleLowerer::getOrCreateGeneratorThrowFunction(op, info);
+    break;
+  case GeneratorDriverKind::Close:
+    driver = RuntimeBundleLowerer::getOrCreateGeneratorCloseFunction(op, info);
+    break;
+  }
+  if (mlir::failed(driver))
+    return mlir::failure();
+  std::string name = driver->getSymName().str() + "_stored";
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  unsigned skipped = RuntimeBundleLowerer::generatorArgumentPhysicalCount(info);
+  mlir::FunctionType driverType = driver->getFunctionType();
+  llvm::SmallVector<mlir::Type, 6> inputs{driverType.getInput(0)};
+  for (unsigned index = 1 + skipped; index < driverType.getNumInputs(); ++index)
+    inputs.push_back(driverType.getInput(index));
+  mlir::Location loc = driver->getLoc();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name,
+      builder.getFunctionType(inputs, driverType.getResults()));
+  function.setPrivate();
+  RuntimeBundleLowerer::copyGeneratorDriverContract(*driver, function,
+                                                    skipped);
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  llvm::SmallVector<mlir::Value, 16> operands{entry->getArgument(0)};
+  if (mlir::failed(RuntimeBundleLowerer::appendStoredGeneratorArgumentOperands(
+          function.getOperation(), info, entry->getArgument(0), operands)))
+    return mlir::failure();
+  for (mlir::BlockArgument rest : entry->getArguments().drop_front())
+    operands.push_back(rest);
+  auto call = mlir::func::CallOp::create(builder, loc, *driver, operands);
+  mlir::func::ReturnOp::create(builder, loc, call.getResults());
+  return function;
+}
+
+// The ownership contract a driver states about its inputs and results, onto a
+// function that forwards to it with `dropped` inputs after the storage gone.
+void RuntimeBundleLowerer::copyGeneratorDriverContract(mlir::func::FuncOp from,
+                                                       mlir::func::FuncOp to,
+                                                       unsigned dropped) {
+  for (llvm::StringRef attr :
+       {ownership::kOwnedResultsAttr, ownership::kOwnedResultContractsAttr})
+    if (mlir::Attribute value = from->getAttr(attr))
+      to->setAttr(attr, value);
+  if (auto transfers = from->getAttrOfType<mlir::ArrayAttr>(
+          "ly.ownership.transfer_args")) {
+    llvm::SmallVector<std::int64_t, 4> shifted;
+    for (mlir::Attribute index : transfers)
+      shifted.push_back(mlir::cast<mlir::IntegerAttr>(index).getInt() -
+                        static_cast<std::int64_t>(dropped));
+    to->setAttr("ly.ownership.transfer_args", builder.getI64ArrayAttr(shifted));
+  }
+  for (unsigned index = 1 + dropped; index < from.getNumArguments(); ++index)
+    if (mlir::DictionaryAttr attrs = from.getArgAttrDict(index))
+      for (mlir::NamedAttribute attr : attrs)
+        to.setArgAttr(index - dropped, attr.getName(), attr.getValue());
+}
+
+// The call of a generator whose creating function is not known here -- a
+// parameter, a container's element, a field: the frame's target id (word 3)
+// picks the body among every generator that can produce what this generator
+// yields. One dispatcher per (yield contract, driver kind).
+//
+// ⛔ Not keyed on the generator's public type: every generator function's is
+// the bare `types.GeneratorType`, so it separates nothing. The yield lane's
+// contract does, and it is also what decides a resume's result shape.
+//
+// ⛔ A generator that MAY be the value here and cannot join -- not a state
+// machine, so it has no frame to resume; or one yielding a subtype through a
+// lane of its own -- is refused, naming it. Leaving it out would make its
+// frame reach the trap at the end of the chain.
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
+                                                   mlir::Type elementType,
+                                                   GeneratorDriverKind kind) {
+  std::string elementContract = runtimeContractName(elementType);
+  if (elementContract.empty())
+    return op->emitError() << "a generator whose function is not known here "
+                              "is resumed by its frame, and "
+                           << elementType << " has no lane to yield through";
+  auto mayYieldHere = [&](mlir::Type yielded) {
+    return yielded && py::isSubtypeOf(yielded, elementType);
+  };
+  llvm::SmallVector<llvm::StringRef, 8> targets;
+  llvm::SmallVector<llvm::StringRef, 8> bodies;
+  for (auto &entry : generatorBodies)
+    bodies.push_back(entry.getKey());
+  llvm::sort(bodies);
+  for (llvm::StringRef target : bodies) {
+    auto info = generatorResumeClones.find(target);
+    if (info != generatorResumeClones.end()) {
+      const GeneratorResumeLane &lane = info->second.valueLane;
+      if (lane.contract == elementContract) {
+        targets.push_back(target);
+        continue;
+      }
+      if (mayYieldHere(runtimeContractType(context, lane.contract)))
+        return op->emitError()
+               << "a generator whose function is not known here is resumed "
+                  "by its frame, and '"
+               << target << "' yields '" << lane.contract
+               << "' where this read takes '" << elementContract
+               << "': one resume cannot hand back both";
+      continue;
+    }
+    auto body = module.lookupSymbol<mlir::func::FuncOp>(target);
+    bool mayBeHere = false;
+    if (body)
+      body.walk([&](py::YieldValueOp yield) {
+        if (yield->getNumOperands() != 0 &&
+            mayYieldHere(yield->getOperand(0).getType()))
+          mayBeHere = true;
+      });
+    if (!mayBeHere)
+      continue;
+    std::string reason;
+    if (auto declined = generatorDeclineReasons.find(target);
+        declined != generatorDeclineReasons.end())
+      reason = ": " + declined->getValue();
+    return op->emitError()
+           << "a generator whose function is not known here is resumed by its "
+              "frame, and '"
+           << target << "' has none (it is not a state machine" << reason
+           << ")";
+  }
+  if (targets.empty())
+    return op->emitError() << "no generator function yields '"
+                           << elementContract
+                           << "', so there is nothing to resume here";
+
+  static constexpr llvm::StringLiteral kKindNames[] = {"step", "advance",
+                                                       "throw", "close"};
+  std::string symbol = (llvm::Twine("__ly_generator_") +
+                        kKindNames[static_cast<unsigned>(kind)] + "$" +
+                        elementContract)
+                           .str();
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(symbol))
+    return existing;
+
+  llvm::SmallVector<mlir::func::FuncOp, 8> drivers;
+  for (llvm::StringRef target : targets) {
+    mlir::FailureOr<mlir::func::FuncOp> driver =
+        RuntimeBundleLowerer::getOrCreateStoredGeneratorDriver(
+            op, generatorResumeClones[target], kind);
+    if (mlir::failed(driver))
+      return mlir::failure();
+    drivers.push_back(*driver);
+  }
+  mlir::FunctionType type = drivers.front().getFunctionType();
+  mlir::Location loc = op->getLoc();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto dispatch = mlir::func::FuncOp::create(builder, loc, symbol, type);
+  dispatch.setPrivate();
+  RuntimeBundleLowerer::copyGeneratorDriverContract(drivers.front(), dispatch,
+                                                    /*dropped=*/0);
+  mlir::Block *entry = dispatch.addEntryBlock();
+  mlir::Region &body = dispatch.getBody();
+  builder.setInsertionPointToStart(entry);
+  mlir::Value storage = entry->getArgument(0);
+  mlir::Value targetId =
+      mlir::memref::LoadOp::create(builder, loc, storage,
+                                   constantIndex(builder, loc, 3))
+          .getResult();
+  mlir::Block *current = entry;
+  for (auto [target, driver] : llvm::zip(targets, drivers)) {
+    mlir::Block *match = builder.createBlock(&body);
+    mlir::Block *next = builder.createBlock(&body);
+    builder.setInsertionPointToEnd(current);
+    mlir::Value expected = constantI64(
+        builder, loc, RuntimeBundleLowerer::functionTargetId(target));
+    mlir::Value matches = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, targetId, expected);
+    mlir::cf::CondBranchOp::create(builder, loc, matches, match,
+                                   mlir::ValueRange{}, next,
+                                   mlir::ValueRange{});
+    builder.setInsertionPointToEnd(match);
+    auto call = mlir::func::CallOp::create(builder, loc, driver,
+                                           entry->getArguments());
+    mlir::func::ReturnOp::create(builder, loc, call.getResults());
+    current = next;
+  }
+  // Unreachable: a frame of this type was made by one of the targets. Trap
+  // rather than invent a result.
+  builder.setInsertionPointToEnd(current);
+  mlir::LLVM::Trap::create(builder, loc);
+  llvm::SmallVector<mlir::Value, 8> dead;
+  for (mlir::Type result : type.getResults()) {
+    mlir::FailureOr<mlir::Value> value =
+        RuntimeBundleLowerer::materializeDeadPhysicalValue(op, result);
+    if (mlir::failed(value))
+      return mlir::failure();
+    dead.push_back(*value);
+  }
+  mlir::func::ReturnOp::create(builder, loc, dead);
+  return dispatch;
+}
+
+// The resume `emitStateMachineGeneratorResume` performs when the creating
+// function is known, through the dispatch over the frame when it is not.
+mlir::FailureOr<RuntimeBundleLowerer::SourceGeneratorResumeResult>
+RuntimeBundleLowerer::emitDispatchedGeneratorResume(
+    mlir::Operation *op, const RuntimeBundle &iterator, mlir::Type elementType,
+    bool raiseWhenExhausted,
+    std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence) {
+  if (iterator.physicalValues().empty())
+    return op->emitError() << "generator object has no physical storage";
+  mlir::FailureOr<mlir::func::FuncOp> dispatch =
+      RuntimeBundleLowerer::getOrCreateGeneratorDispatch(
+          op, elementType,
+          raiseWhenExhausted ? GeneratorDriverKind::Advance
+                             : GeneratorDriverKind::Step);
+  if (mlir::failed(dispatch))
+    return mlir::failure();
+  mlir::Location loc = op->getLoc();
+  builder.setInsertionPoint(op);
+  llvm::SmallVector<mlir::Value, 4> operands{
+      iterator.physicalValues().front(),
+      sentI64Evidence
+          ? sentI64Evidence->value
+          : mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult(),
+      sentI64Evidence ? sentI64Evidence->valid
+                      : constantBool(builder, loc, false),
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult()};
+  emitTryCallSiteMarkerIfNeeded(loc);
+  auto call = mlir::func::CallOp::create(builder, loc, *dispatch, operands);
+  unsigned spanBegin = raiseWhenExhausted ? 0 : 1;
+  unsigned spanEnd = call.getNumResults() - (raiseWhenExhausted ? 0 : 2);
+  SourceGeneratorResumeResult result;
+  result.hasValue = raiseWhenExhausted ? constantBool(builder, loc, true)
+                                       : call.getResult(0);
+  for (unsigned lane = spanBegin; lane < spanEnd; ++lane)
+    result.lanePhysicals.push_back(call.getResult(lane));
+  unsigned spanWidth = spanEnd - spanBegin;
+  if (spanWidth >= 2 && result.lanePhysicals[spanWidth - 1].getType().isInteger(1) &&
+      result.lanePhysicals[spanWidth - 2].getType().isInteger(64)) {
+    result.value = result.lanePhysicals[spanWidth - 2];
+    result.valid = result.lanePhysicals[spanWidth - 1];
+  } else {
+    result.value = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+    result.valid = constantBool(builder, loc, false);
+  }
+  return result;
+}
+
+// What a generator of this static type yields: the first argument of
+// `types.GeneratorType[Y, S, R]` or of a `Generator`/`Iterator` protocol.
+mlir::Type RuntimeBundleLowerer::generatorYieldType(mlir::Type generator) {
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(generator))
+    if (!contract.getArguments().empty())
+      return contract.getArguments().front();
+  if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(generator))
+    if (!protocol.getArguments().empty())
+      return protocol.getArguments().front();
+  return {};
+}
+
+bool RuntimeBundleLowerer::isGeneratorProtocol(mlir::Type type) {
+  auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
+  return protocol && protocol.getProtocolName() == "Generator";
+}
+
+// A generator held as a `Generator[Y, S, R]` -- a container's element, a
+// field, any slot the protocol types -- is refused at its resume.
+//
+// ⛔ Not resumed through the entity header the protocol value is, though that
+// works for a read the container outlives: a protocol type has no runtime
+// contract, so ownership treats the value as NonObject and takes no reference.
+// `t = tasks.pop(0); next(t)` resumed a frame `pop` had already released.
+// The contract the inference gives the same list keeps the generator counted.
+mlir::LogicalResult
+RuntimeBundleLowerer::refuseProtocolGeneratorResume(mlir::Operation *op,
+                                                    mlir::Type staticType) {
+  return op->emitError()
+         << "a generator held as " << staticType
+         << " cannot be resumed: a value typed by the protocol is not "
+            "reference counted. Let the type come from the generator "
+            "function (`tasks = [worker()]`), which keeps it a generator";
 }
 
 } // namespace py::lowering

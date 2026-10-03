@@ -2372,3 +2372,38 @@ TEST(DriverTest, ACallableOfAnyArgumentsTakesAFunctionWithParameters) {
                     "run(none)\nrun(two)\n");
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
+
+// A generator resumed where its creating function is not known goes through
+// its frame; that is refused, naming the function, when a generator that may
+// be the value there has no frame (it is not a state machine), and when the
+// value is typed by the `Generator` protocol, which is not reference counted.
+TEST(DriverTest, AGeneratorResumedByItsFrameNamesWhatItCannotResume) {
+  CompileResult stateless =
+      compileSource("from typing import Iterator\n\n\n"
+                    "def many(*xs: int) -> Iterator[int]:\n"
+                    "    for x in xs:\n"
+                    "        yield x\n\n\n"
+                    "def total(it: Iterator[int]) -> int:\n"
+                    "    t = 0\n"
+                    "    for v in it:\n"
+                    "        t += v\n"
+                    "    return t\n\n\n"
+                    "print(total(many(1, 2)))\n");
+  EXPECT_FALSE(stateless.succeeded);
+  EXPECT_NE(stateless.diagnostics.find("'many' has none (it is not a state "
+                                       "machine: it takes *args"),
+            std::string::npos)
+      << stateless.diagnostics;
+
+  CompileResult protocol =
+      compileSource("from typing import Generator\n\n\n"
+                    "def worker(n: int) -> Generator[int, None, None]:\n"
+                    "    yield n\n\n\n"
+                    "tasks: list[Generator[int, None, None]] = [worker(2)]\n"
+                    "t = tasks.pop(0)\n"
+                    "print(next(t))\n");
+  EXPECT_FALSE(protocol.succeeded);
+  EXPECT_NE(protocol.diagnostics.find("is not reference counted"),
+            std::string::npos)
+      << protocol.diagnostics;
+}

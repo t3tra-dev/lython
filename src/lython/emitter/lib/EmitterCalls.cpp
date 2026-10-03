@@ -1761,8 +1761,22 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 if (auto actual = mlir::dyn_cast_if_present<py::ContractType>(
                         types.widenLiteral(types.inferExpr(argument.get())));
                     actual) {
+                  // ⛔ Not when the parameter takes the generator ITSELF.
+                  // `tasks.append(task)` declares the list's element type, and
+                  // materializing there stored a list where the program stored
+                  // a generator -- refused only because the element types
+                  // disagreed. A consumer declares `Iterable`; a parameter of
+                  // no declared type keeps the rewrite.
+                  mlir::Type declaredHere = index < declaredTypes.size()
+                                                ? declaredTypes[index]
+                                                : mlir::Type();
+                  auto declaredProtocol =
+                      mlir::dyn_cast_if_present<py::ProtocolType>(declaredHere);
                   bool generator =
-                      actual.getContractName() == "types.GeneratorType";
+                      actual.getContractName() == "types.GeneratorType" &&
+                      (!declaredHere ||
+                       (declaredProtocol &&
+                        declaredProtocol.getProtocolName() == "Iterable"));
                   // The declared parameter is the PROTOCOL `Iterable`, not a
                   // list: the manifest promises to consume any iterable and the
                   // runtime implements the list case, which is why the refusal

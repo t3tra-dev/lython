@@ -2156,3 +2156,26 @@ TEST(EmitterTest, AnIsinstanceAgainstAHostClassNarrows) {
   EXPECT_NE(refused.find("needs a JavaScript value"), std::string::npos)
       << refused;
 }
+
+// A generator handed to a manifest method whose parameter takes the generator
+// itself is passed as it is; only a parameter declared `Iterable` consumes it
+// into a list.
+TEST(EmitterTest, AGeneratorAppendedToAListStaysAGenerator) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult appended = emitSource(
+      "from typing import Generator\n\n\n"
+      "def worker(n: int) -> Generator[int, None, None]:\n"
+      "    yield n\n\n\n"
+      "tasks = [worker(1)]\n"
+      "task = tasks.pop(0)\n"
+      "tasks.append(task)\n",
+      context);
+  EXPECT_TRUE(appended.ok());
+  lython::emitter::EmitResult joined = emitSource(
+      "from typing import Iterator\n\n\n"
+      "def words() -> Iterator[str]:\n"
+      "    yield \"a\"\n\n\n"
+      "print(\"-\".join(words()))\n",
+      context);
+  EXPECT_TRUE(joined.ok());
+}
