@@ -30,8 +30,8 @@ jobs:
           sudo apt-get install -y clang cmake ninja-build wget lsb-release software-properties-common gnupg
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y clang-22 lld-22 llvm-22-dev libmlir-22-dev mlir-22-tools
+          sudo ./llvm.sh 23
+          sudo apt-get install -y clang-23 lld-23 llvm-23-dev libmlir-23-dev mlir-23-tools
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine_1.20.0_amd64.deb
           sudo dpkg -i hyperfine_1.20.0_amd64.deb
           uv sync
@@ -39,10 +39,10 @@ jobs:
       - name: Build Lython
         run: |
           cmake -B build -S . -G Ninja \
-            -DCMAKE_C_COMPILER=clang-22 \
-            -DCMAKE_CXX_COMPILER=clang++-22 \
-            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir \
+            -DCMAKE_C_COMPILER=clang-23 \
+            -DCMAKE_CXX_COMPILER=clang++-23 \
+            -DLLVM_DIR=/usr/lib/llvm-23/lib/cmake/llvm \
+            -DMLIR_DIR=/usr/lib/llvm-23/lib/cmake/mlir \
             -DLYTHON_BUILD_TESTS=ON
           cmake --build build -j$(nproc)
 
@@ -81,16 +81,16 @@ jobs:
           sudo apt-get install -y cmake ninja-build wget lsb-release software-properties-common gnupg
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y clang-22 lld-22 llvm-22-dev libmlir-22-dev mlir-22-tools
+          sudo ./llvm.sh 23
+          sudo apt-get install -y clang-23 lld-23 llvm-23-dev libmlir-23-dev mlir-23-tools
 
       - name: Build fuzzers
         run: |
           cmake -B build-fuzz -S . -G Ninja \
-            -DCMAKE_C_COMPILER=clang-22 \
-            -DCMAKE_CXX_COMPILER=clang++-22 \
-            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir \
+            -DCMAKE_C_COMPILER=clang-23 \
+            -DCMAKE_CXX_COMPILER=clang++-23 \
+            -DLLVM_DIR=/usr/lib/llvm-23/lib/cmake/llvm \
+            -DMLIR_DIR=/usr/lib/llvm-23/lib/cmake/mlir \
             -DLYTHON_ENABLE_FUZZERS=ON \
             -DLYTHON_BUILD_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
