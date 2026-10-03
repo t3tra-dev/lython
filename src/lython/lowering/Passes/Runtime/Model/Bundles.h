@@ -161,7 +161,6 @@ struct RuntimeCtypesEvidence {
   Lifetime lifetime = Lifetime::Unknown;
   std::string ctypeName;
   mlir::Type ctype;
-  std::string libraryName;
   std::string abi;
   std::string symbolName;
   std::string fieldName;

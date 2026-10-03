@@ -97,11 +97,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesNativeCall(
   if (!evidence.resultType)
     return op.emitError() << "ctypes call target requires a static restype "
                              "before calling";
-  if (!callThroughAddress &&
-      (!evidence.processLibrary || !evidence.libraryName.empty()))
-    return op.emitError()
-           << "ctypes native call lowering currently supports only "
-              "ctypes.CDLL(None) process symbols";
   // The compiler itself emits declarations for the C allocator / mem
   // primitives during LLVM lowering, so a same-named ctypes declaration would
   // collide at link. Direct calls to these are rejected with a clear message;

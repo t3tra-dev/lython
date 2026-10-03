@@ -2249,3 +2249,24 @@ TEST(DriverTest, APythonFunctionIsNotAnExternalSymbol) {
   ASSERT_NE(main, nullptr);
   EXPECT_FALSE(main->hasLocalLinkage());
 }
+
+// What: a ctypes library other than the program itself is refused where it is
+// constructed, whether or not its symbols are later called -- nothing opens
+// it, so its names would resolve among the program's own.
+TEST(DriverTest, ACtypesLibraryOtherThanTheProgramIsRefused) {
+  for (llvm::StringRef use :
+       {"f = lib[\"cos\"]\n"
+        "f.restype = ctypes.c_double\n"
+        "f.argtypes = [ctypes.c_double]\n"
+        "print(f(0.0))\n",
+        "f = lib[\"cos\"]\n"
+        "print(ctypes.cast(f, ctypes.c_void_p).value)\n"}) {
+    CompileResult result = compileSource(
+        ("import ctypes\nlib = ctypes.CDLL(\"libm.so.6\")\n" + use).str());
+    EXPECT_FALSE(result.succeeded) << use.str();
+    EXPECT_NE(result.diagnostics.find(
+                  "ctypes.CDLL can only name the program itself (None)"),
+              std::string::npos)
+        << result.diagnostics;
+  }
+}

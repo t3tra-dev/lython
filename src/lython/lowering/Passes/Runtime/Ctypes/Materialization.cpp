@@ -183,17 +183,17 @@ materializeCtypesLibrary(mlir::Operation *op, mlir::ModuleOp module,
   evidence.ctypeName = ctypeName.str();
   evidence.ctype = ctype;
   evidence.abi = ctypesLibraryABI(ctypeName);
-  if (sources.empty() || isNoneBundle(*sources.front())) {
-    evidence.processLibrary = true;
-    evidence.libraryName.clear();
-  } else if (sources.front() && sources.front()->literalText) {
-    evidence.processLibrary = false;
-    evidence.libraryName = *sources.front()->literalText;
-  } else {
+  // ⛔ A named library is refused here rather than where a symbol of it is
+  // used: nothing opens it, so every use would resolve the name among the
+  // program's own linked symbols -- a different library's function, or the
+  // same name from libc, with CPython's OSError for a missing one never
+  // raised.
+  if (!sources.empty() && !isNoneBundle(*sources.front()))
     return op->emitError()
            << ctypeName
-           << " requires a literal library name or None on the static path";
-  }
+           << " can only name the program itself (None): symbols are the "
+              "ones its link resolves, and no library is opened at run time";
+  evidence.processLibrary = true;
   result.ctypes = std::move(evidence);
   return result;
 }
