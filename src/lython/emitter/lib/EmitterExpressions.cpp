@@ -497,11 +497,18 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // passing goldens into "a generator returned out of a function cannot be
     // resumed" -- the loop iterates a generator VALUE, which is a different
     // (and refused) shape. The rewrite is for the iterables that had no path.
-    auto sourceContract = mlir::dyn_cast_if_present<py::ContractType>(
-        types.widenLiteral(types.inferExpr(source)));
+    //
+    // ⭐ AND A VALUE TYPED BY THE `Generator` PROTOCOL IS A SUB-GENERATOR. Its
+    // static type promises send, throw and a return value, so the loop would
+    // drop all three: `r = yield from g` for a `g: Generator[int, None, str]`
+    // parameter left r None.
+    mlir::Type sourceType = types.widenLiteral(types.inferExpr(source));
+    auto sourceContract = mlir::dyn_cast_if_present<py::ContractType>(sourceType);
+    auto sourceProtocol = mlir::dyn_cast_if_present<py::ProtocolType>(sourceType);
     bool delegatesToGenerator =
-        sourceContract &&
-        sourceContract.getContractName() == "types.GeneratorType";
+        (sourceContract &&
+         sourceContract.getContractName() == "types.GeneratorType") ||
+        (sourceProtocol && sourceProtocol.getProtocolName() == "Generator");
     if (source && !delegatesToGenerator) {
       std::string element = "__ly_yieldfrom_" +
                             std::to_string(syntheticFunctionCounter++);
