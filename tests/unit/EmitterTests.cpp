@@ -2265,3 +2265,36 @@ TEST(EmitterTest, AnAsyncGeneratorIsRefusedAtItsDefinition) {
   EXPECT_TRUE(reportsDiagnostic(
       emitted, "async generator function lowering is not implemented yet"));
 }
+
+namespace {
+
+// The driver's emit entry point for one main source on `triple`, which is
+// where `js` exists and where module-level platform branches are decided.
+ImportedModuleEmit emitMainFor(llvm::StringRef source, llvm::StringRef triple) {
+  ImportedModuleEmit result;
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  llvm::raw_string_ostream diag(result.diagnostics);
+  lython::driver::DriverOptions options;
+  options.targetTriple =
+      triple.empty() ? llvm::sys::getDefaultTargetTriple() : triple.str();
+  result.succeeded = mlir::succeeded(lython::driver::emitMLIRFromSource(
+      source, "main.py", "<lython-no-import-dir>", options, context, module,
+      diag));
+  return result;
+}
+
+} // namespace
+
+// What: a parameter shadows a module imported under its name, in the
+// program and in a module it imports (time.py's `mktime(t)` under
+// `import time as t`).
+TEST(EmitterTest, AParameterShadowsAModuleOfItsName) {
+  ImportedModuleEmit emitted = emitMainFor(
+      "import time as t\n\n\n"
+      "def f(t: list[int]) -> int:\n"
+      "    return t.count(1)\n\n\n"
+      "print(f([1, 2, 1]), t.monotonic() > 0)\n",
+      {});
+  EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
+}

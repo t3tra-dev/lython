@@ -393,8 +393,16 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       if (const parser::Node *receiverNode = ast::node(*expr, "value")) {
         std::string receiverQualified = ast::qualifiedName(receiverNode);
         std::optional<std::string_view> attribute = ast::string(*expr, "attr");
+        // ⛔ Not when the receiver is a local of the same spelling: it
+        // shadows the module, as in CPython. The module-name set is not
+        // scoped, so `import time as t` in one module made time.py's own
+        // `def mktime(t: struct_time)` read `t.tm_sec` as the module's.
+        std::optional<mlir::Type> receiverType =
+            types.lookupSymbol(receiverQualified);
         if (!receiverQualified.empty() && attribute &&
-            types.isImportedModuleName(receiverQualified)) {
+            types.isImportedModuleName(receiverQualified) &&
+            !values.count(receiverQualified) &&
+            (!receiverType || *receiverType == types.object())) {
           diagnostics.push_back(parser::Diagnostic{
               parser::Severity::Error, expr->range.start,
               "module '" + receiverQualified +
