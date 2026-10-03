@@ -2407,3 +2407,23 @@ TEST(DriverTest, AGeneratorResumedByItsFrameNamesWhatItCannotResume) {
             std::string::npos)
       << protocol.diagnostics;
 }
+
+// next() and send() carry a generator's return value in the StopIteration
+// they raise, as str(value); a returned instance of the program's own class
+// has no runtime __str__ to render there, and next() on it is refused.
+TEST(DriverTest, ANextOnAGeneratorReturningAClassIsRefused) {
+  CompileResult result =
+      compileSource("from typing import Generator\n\n\n"
+                    "class Box:\n"
+                    "    def __init__(self, v: int) -> None:\n"
+                    "        self.v = v\n\n\n"
+                    "def boxed() -> Generator[int, None, Box]:\n"
+                    "    yield 1\n"
+                    "    return Box(2)\n\n\n"
+                    "g = boxed()\n"
+                    "print(next(g))\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("'Box' value has no runtime __str__"),
+            std::string::npos)
+      << result.diagnostics;
+}

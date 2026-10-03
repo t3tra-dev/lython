@@ -1111,6 +1111,23 @@ private:
     // The yielded-value lane (result index 2 of the resume clone). Control
     // lane in the legacy int tier; object-family for boxed yields.
     GeneratorResumeLane valueLane;
+    // The returned-value lane (result index 3): a control lane -- the raw
+    // i64 of an int return, or nothing -- unless the body returns an object,
+    // which then crosses as an owned span the way a yielded one does.
+    GeneratorResumeLane returnLane;
+    // The lane a clone RESULT rides, or null for a control pair: 2 is the
+    // yielded value, 3 the returned value, 5.. the frame. The ABI, the
+    // return lowering and the drivers all ask this one question.
+    const GeneratorResumeLane *resultLane(unsigned index) const {
+      const GeneratorResumeLane *lane = nullptr;
+      if (index == 2)
+        lane = &valueLane;
+      else if (index == 3)
+        lane = &returnLane;
+      else if (index >= 5 && index - 5 < frameLanes.size())
+        lane = &frameLanes[index - 5];
+      return lane && !lane->isControl() ? lane : nullptr;
+    }
     // Values live across a yield, one lane each. Lanes are grouped per
     // contract (lexicographic order) sized by the maximum same-contract live
     // count over all yields, so every suspension state maps its live values
@@ -1123,6 +1140,7 @@ private:
     // raises StopIteration on exhaustion; throw/close inject exceptions at
     // the suspension point through the EH TLS slot.
     std::string stepName;
+    std::string stepFullName;
     std::string advanceName;
     std::string throwName;
     std::string closeName;
@@ -1286,6 +1304,12 @@ private:
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorThrowFunction(mlir::Operation *op,
                                     GeneratorResumeInfo &info);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorStepFullFunction(mlir::Operation *op,
+                                       GeneratorResumeInfo &info);
+  mlir::LogicalResult releaseGeneratorReturnSpan(mlir::Operation *op,
+                                                 const GeneratorResumeInfo &info,
+                                                 llvm::ArrayRef<mlir::Value> span);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorCloseFunction(mlir::Operation *op,
                                     GeneratorResumeInfo &info);

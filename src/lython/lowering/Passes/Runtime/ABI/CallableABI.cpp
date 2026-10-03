@@ -1084,8 +1084,7 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
               llvm::enumerate(callable.getResultTypes()), [&](auto indexed) {
                 if (generatorInfo &&
                     (indexed.index() == 2 ||
-                     (indexed.index() >= 5 &&
-                      indexed.index() - 5 < generatorInfo->frameLanes.size())))
+                     generatorInfo->resultLane(indexed.index())))
                   return true;
                 return runtimeContractName(indexed.value()) == "builtins.int";
               })) {
@@ -1100,14 +1099,8 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       llvm::SmallVector<mlir::Attribute, 2> generatorSuspendLanes;
       for (auto [resultIndex, resultType] :
            llvm::enumerate(callable.getResultTypes())) {
-        const GeneratorResumeLane *suspendLane = nullptr;
-        if (generatorInfo && resultIndex == 2 &&
-            !generatorInfo->valueLane.isControl())
-          suspendLane = &generatorInfo->valueLane;
-        else if (generatorInfo && resultIndex >= 5 &&
-                 resultIndex - 5 < generatorInfo->frameLanes.size() &&
-                 !generatorInfo->frameLanes[resultIndex - 5].isControl())
-          suspendLane = &generatorInfo->frameLanes[resultIndex - 5];
+        const GeneratorResumeLane *suspendLane =
+            generatorInfo ? generatorInfo->resultLane(resultIndex) : nullptr;
         if (suspendLane) {
           const GeneratorResumeLane &lane = *suspendLane;
           llvm::SmallVector<mlir::Type, 6> laneTypes =

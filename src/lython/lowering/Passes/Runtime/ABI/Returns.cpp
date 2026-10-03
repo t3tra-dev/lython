@@ -251,18 +251,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           return mlir::WalkResult::interrupt();
         }
         const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(operand);
-        // Generator suspend lanes: the yielded-value lane (logical result 2)
-        // transfers to the resumer through the clone's owned-results
-        // contract; frame lanes (logical results 5..) transfer into the
-        // generator frame the same way. No release is emitted here.
-        const GeneratorResumeLane *suspendLane = nullptr;
-        if (generatorInfo && operandIndex == 2 &&
-            !generatorInfo->valueLane.isControl())
-          suspendLane = &generatorInfo->valueLane;
-        else if (generatorInfo && operandIndex >= 5 &&
-                 operandIndex - 5 < generatorInfo->frameLanes.size() &&
-                 !generatorInfo->frameLanes[operandIndex - 5].isControl())
-          suspendLane = &generatorInfo->frameLanes[operandIndex - 5];
+        // Generator suspend lanes: the yielded and returned values (logical
+        // results 2 and 3) transfer to the resumer through the clone's
+        // owned-results contract; frame lanes (logical results 5..) transfer
+        // into the generator frame the same way. No release is emitted here.
+        const GeneratorResumeLane *suspendLane =
+            generatorInfo ? generatorInfo->resultLane(operandIndex) : nullptr;
         if (suspendLane) {
           if (!bundle) {
             op.emitError() << "generator suspend lane return value has no "
