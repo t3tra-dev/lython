@@ -30,15 +30,17 @@ Deviations from CPython:
     class specialized before its base class is declared misses the base's
     fields, and the loop is declared before the futures it would make.
 
-On a JavaScript host (Emscripten) the loop is also the host's, as Pyodide's
-WebLoop is: whenever it has work and nothing is running it, it asks the host
-to call it back (`setTimeout`). It counts as always running, so `create_task`
-works at module level and those tasks run after the program's main body
-returns. `await` on a JavaScript Promise waits on a Future the promise's
-settlement resolves; a rejection raises RuntimeError("<name>: <message>"), as
-other JavaScript errors do. `run()` still blocks, and works while the
-coroutine waits only on Python; once it waits on the host -- which cannot run
-while the program does -- it raises RuntimeError instead of hanging.
+On a JavaScript host (`sys._js_host`: Emscripten, or WASI with `--js-host`)
+the loop is also the host's, as Pyodide's WebLoop is: whenever it has work
+and nothing is running it, it asks the host to call it back (`setTimeout`).
+It counts as always running, so `create_task` works at module level and
+those tasks run after the program's main body returns. `await` on a
+JavaScript Promise waits on a Future the promise's settlement resolves; a
+rejection raises RuntimeError("<name>: <message>"), as other JavaScript errors
+do. `run()` blocks: where the host can suspend the program (JSPI, under the
+WASI loader) the loop waits on the host whenever only the host can make
+progress, so it can await promises; elsewhere it raises RuntimeError at that
+point instead of hanging.
 """
 
 import sys
@@ -46,7 +48,8 @@ from time import monotonic as _monotonic, sleep as _sleep_blocking
 from types import CoroutineType
 from typing import Callable, Generator
 
-if sys.platform == "emscripten":
+if sys._js_host:
+    from _js import wait_for_host as _wait_for_host
     from js import setTimeout
 
     def _on_host() -> bool:
@@ -54,6 +57,12 @@ if sys.platform == "emscripten":
 
     def _host_call_later(delay: float, callback: Callable[[], None]) -> None:
         setTimeout(callback, delay * 1000.0)
+
+    def _host_wait(timeout: float) -> bool:
+        """Suspends until the host has called the program back or `timeout`
+        seconds have passed (negative: no limit); False where the program
+        cannot be suspended."""
+        return _wait_for_host(int(timeout * 1000.0) if timeout >= 0.0 else -1)
 else:
 
     def _on_host() -> bool:
@@ -61,6 +70,9 @@ else:
 
     def _host_call_later(delay: float, callback: Callable[[], None]) -> None:
         raise RuntimeError("this target has no JavaScript host")
+
+    def _host_wait(timeout: float) -> bool:
+        return False
 
 __all__ = [
     "CancelledError", "InvalidStateError", "AbstractEventLoop", "Future",
@@ -173,12 +185,16 @@ class AbstractEventLoop:
 
     def _check_host_progress(self) -> None:
         # With nothing ready and nothing scheduled, only the host can make
-        # progress, and it cannot run until the program returns to it.
+        # progress: the loop waits on it where the program can be suspended,
+        # and elsewhere the host cannot run until the program returns to it.
         if _on_host() and not self._ready and not self._scheduled:
+            if _host_wait(-1.0):
+                return
             raise RuntimeError(
                 "the event loop waits on the JavaScript host, which cannot "
-                "run while the loop blocks it; schedule the coroutine with "
-                "asyncio.create_task() instead of asyncio.run()")
+                "run while the loop blocks it (no JSPI here); schedule the "
+                "coroutine with asyncio.create_task() instead of "
+                "asyncio.run()")
 
     def _enter(self) -> None:
         self._check_closed()
@@ -234,7 +250,8 @@ class AbstractEventLoop:
         if block and not self._ready and self._scheduled:
             first = self._scheduled[0]
             wait = first.when - self.time()
-            if wait > 0:
+            # Waiting on the host lets a promise settle meanwhile.
+            if wait > 0 and not _host_wait(wait):
                 _sleep_blocking(wait)
         now = self.time()
         while self._scheduled and self._scheduled[0].when <= now:
@@ -288,6 +305,11 @@ class _Waiter:
     """
 
     def __init__(self, is_task: bool) -> None:
+        # The loop its callbacks run on, as a CPython future's `_loop`.
+        # ⛔ Not whichever loop is current when it completes: a promise that
+        # settles after `run()` has closed its loop then resumed the
+        # abandoned task on the next one.
+        self._loop = get_event_loop()
         self._state = "PENDING"
         self._callbacks: list[Callable[[], None]] = []
         self._exception: BaseException | None = None
@@ -339,14 +361,14 @@ class _Waiter:
 
     def _wake(self, callback: Callable[[], None]) -> None:
         if self._state != "PENDING":
-            get_event_loop().call_soon(callback)
+            self._loop.call_soon(callback)
         else:
             self._callbacks.append(callback)
 
     def _schedule_callbacks(self) -> None:
         callbacks = self._callbacks
         self._callbacks = []
-        loop = get_event_loop()
+        loop = self._loop
         for callback in callbacks:
             loop.call_soon(callback)
 
@@ -402,7 +424,7 @@ class Task[T](_Waiter):
         self._result: list[T] = []
         self._coro = coro
         self._driver: CoroutineType[object, None, None] = self._drive()
-        get_event_loop().call_soon(self._step)
+        self._loop.call_soon(self._step)
 
     async def _drive(self) -> None:
         value = await self._coro
@@ -433,7 +455,7 @@ class Task[T](_Waiter):
                     yielded.cancel(self._cancel_message)
                 yielded._wake(self._step)
             else:
-                get_event_loop().call_soon(self._step)
+                self._loop.call_soon(self._step)
         except StopIteration:
             self._state = "FINISHED"
             self._schedule_callbacks()
@@ -450,7 +472,7 @@ class Task[T](_Waiter):
         return self.result()
 
 
-if sys.platform == "emscripten":
+if sys._js_host:
     from _js import JsProxy
     from js import Promise, String
 

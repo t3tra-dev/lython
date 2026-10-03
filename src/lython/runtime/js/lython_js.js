@@ -22,7 +22,10 @@
 var LythonJs = {
   // `exports` gives the module's exports once it is instantiated:
   // LyJs_Dispatch and LyJs_Release, which a callback calls back in through.
-  create(memory, exports) {
+  // `options.suspending`: the loader wraps LyJs_WaitForHost in
+  // WebAssembly.Suspending and runs the program under WebAssembly.promising
+  // (JSPI), so a promise it returns suspends the program.
+  create(memory, exports, options = {}) {
     const values = [undefined, null, true, false];
     const freeHandles = [];
     let pending = [];
@@ -80,12 +83,16 @@ var LythonJs = {
     // one entry point; the program reads the frame through the `$`-named
     // globals below and leaves its result or its exception in it.
     const frames = [];
+    // A program suspended in LyJs_WaitForHost, waiting for the host to call
+    // it back.
+    const waiters = new Set();
     const enter = (frame, entry) => {
       frames.push(frame);
       try {
         entry();
       } finally {
         frames.pop();
+        if (frames.length === 0) for (const wake of [...waiters]) wake();
       }
     };
     const callbacks = new FinalizationRegistry((slot) =>
@@ -259,6 +266,22 @@ var LythonJs = {
           if (size == 1) data.setUint8(at, point);
           else if (size == 2) data.setUint16(at, point, true);
           else data.setUint32(at, point, true);
+        });
+      },
+      // ⛔ Not inside a callback: the host is running that one on its own
+      // stack, which no promise can suspend, and the program would wait on
+      // itself.
+      LyJs_WaitForHost(ms) {
+        if (!options.suspending || frames.length) return 0;
+        return new Promise((resolve) => {
+          let timer = null;
+          const wake = () => {
+            if (timer !== null) clearTimeout(timer);
+            waiters.delete(wake);
+            resolve(1);
+          };
+          waiters.add(wake);
+          if (ms >= 0) timer = setTimeout(wake, ms);
         });
       },
       LyJs_TakeError() {

@@ -22,12 +22,13 @@ module attributes {
   ly.typing.module = "_js",
   ly.typing.class_exports = ["_js.JsProxy=_js.JsProxy"],
   // What runtime/lib/_js_bridge.py keeps callbacks with.
-  ly.typing.callable_exports = ["_js.function_for", "_js.callback_slot", "_js.fail_callback"],
-  ly.typing.function_names = ["_js.function_for", "_js.callback_slot", "_js.fail_callback"],
+  ly.typing.callable_exports = ["_js.function_for", "_js.callback_slot", "_js.fail_callback", "_js.wait_for_host"],
+  ly.typing.function_names = ["_js.function_for", "_js.callback_slot", "_js.fail_callback", "_js.wait_for_host"],
   ly.typing.function_contracts = [
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["slot"], arg_defaults = [false], returns = [!py.contract<"_js.JsProxy">]>,
     !py.callable<[], returns = [!py.contract<"builtins.int">]>,
-    !py.callable<[!py.contract<"builtins.str">], arg_names = ["message"], arg_defaults = [false], returns = [!py.literal<None>]>
+    !py.callable<[!py.contract<"builtins.str">], arg_names = ["message"], arg_defaults = [false], returns = [!py.literal<None>]>,
+    !py.callable<[!py.contract<"builtins.int">], arg_names = ["timeout_ms"], arg_defaults = [false], returns = [!py.contract<"builtins.bool">]>
   ]
 } {
   // The internal methods are what a read typed with a union dispatches on
@@ -99,6 +100,10 @@ module attributes {
   func.func private @LyJs_MakeFunction(i32) -> i32
   func.func private @LyJs_CurrentSlot() -> i32
   func.func private @LyJs_SetCallbackError()
+  // Suspends the program until the host has called it back or `ms` have
+  // passed (negative: no limit), and says whether it did suspend: 0 where it
+  // cannot -- no JSPI, or inside a callback the host is running.
+  func.func private @LyJs_WaitForHost(f64) -> i32
 
   // ===== from builtins =====
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
@@ -418,6 +423,14 @@ module attributes {
     %slot = arith.extsi %slot32 : i32 to i64
     %boxed = func.call @LyLong_FromI64(%slot) : (i64) -> memref<2xi64>
     func.return %boxed : memref<2xi64>
+  }
+
+  func.func @LyJs_WaitForHostBuiltin(%timeout_ms: i64) -> i1 attributes {ly.runtime.builtin = "_js.wait_for_host", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "wait_for_host", ly.runtime.result_contract = "builtins.bool"} {
+    %ms = arith.sitofp %timeout_ms : i64 to f64
+    %waited = func.call @LyJs_WaitForHost(%ms) : (f64) -> i32
+    %zero = arith.constant 0 : i32
+    %did = arith.cmpi ne, %waited, %zero : i32
+    func.return %did : i1
   }
 
   func.func @LyJs_FailCallback(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) attributes {ly.runtime.builtin = "_js.fail_callback", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "fail_callback", ly.runtime.result_contract = "types.NoneType"} {

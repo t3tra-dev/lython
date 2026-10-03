@@ -165,6 +165,40 @@ asyncio を CPython の形で載せる。JSPI はその後で WASI 側に繋ぐ�
        注釈の文脈から決まらず拒否される。
      - Promise 以外の thenable への await は拒否する。
 7. **WASI 側で JSPI に繋ぐ**。
+   - **済 (2026-10-04)**。
+     - `lyc --target wasm32-wasip1 --js-host -o prog.js` で、WASI のプログラムを
+       JS ホストの下で動かす。出力は `prog.wasm` と、Emscripten を使わない自前の
+       ローダ `prog.js` (CommonJS。`lython_js.js` と
+       `runtime/js/lython_wasi.js` から成る)。ローダは WASI preview-1 の呼び出し
+       (stdio、時計、乱数、引数、`poll_oneoff`、`proc_exit`。ファイルは開けない)
+       に答え、`lython_js` の import に JS 側の本体を渡す。
+     - LLVM の段で、`LyJs_*` の宣言に `wasm-import-module = "lython_js"`、
+       JS から呼ばれる入口に `wasm-export-name` を付ける
+       (`installJsHostEntryPoints`)。
+     - `sys._js_host`: JS ホストがあるか (Emscripten、または `--js-host` 付きの
+       WASI)。`sys.platform` では WASI のホストの有無を言えないので、Lython 独自の
+       静的な定数にした。ドライバの import 収集と emitter の分岐の両方で
+       折り畳む。
+     - JSPI: ローダは `poll_oneoff` (`time.sleep`) と `LyJs_WaitForHost`
+       (`_js.wait_for_host`) を `WebAssembly.Suspending` で包み、`_start` を
+       `WebAssembly.promising` で呼ぶ。眠る間も、ループがホストを待つ間も、JS の
+       イベントループが進む。ホストが呼び戻すと (コールバックの終わりで) 待ちが
+       解ける。
+       - コールバックの最中は、ホスト自身のスタックなので中断しない
+         (`wait_for_host` は False を返し、`sleep` は空回りする)。
+     - asyncio: ループがホストしか進められない状態になると、`_host_wait` で
+       中断して待つ。中断できない所 (Emscripten、JSPI のない環境) では、
+       これまでどおり RuntimeError にする。タイマーを待つ間も、ホストを待つ
+       ので、待っている間に Promise が解決できる。
+       - `asyncio.run()` が Promise を await できるようになった
+         (golden `a_blocked_program_lets_the_host_run_under_jspi`)。
+   - 途中で直したこと: Future が完了時のコールバックを、その時点の
+     `get_event_loop()` に積んでいた。`run()` が失敗した後に Promise が
+     解決すると、放棄された task が次のループで再開していた。CPython と
+     同じく、作られたループに結び付けた。
+   - テスト: `tests/golden/js` の各ケースを、Emscripten (`js`) と WASI の
+     ローダ (`jspi`) の両方で走らせる。答えが違うケースは `.jspi.stdout` に
+     持つ。
 
 各段階で、native と全ターゲットの golden を通す。境界の外の形は、最も早い
 静的な境界で拒否する。
