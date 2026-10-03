@@ -1,0 +1,4 @@
+['first:a=1', 'first:b=two', 'first:c=3', '39']
+['second:a=1', 'second:b=two', 'second:c=3', '39']
+{"a":1,"c":[3]}
+caught: Error: ValueError: bad a

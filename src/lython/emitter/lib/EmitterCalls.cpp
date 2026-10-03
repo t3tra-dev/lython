@@ -1885,15 +1885,17 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
               operands.failureReason});
           return emitNone(expr);
         }
-        Value posPack =
-            emitPack(operands.positional, operands.positionalUnpacked);
-        Value namePack = emitPack(operands.keywordNames);
-        Value valuePack = emitPack(operands.keywordValues);
         CallInferenceResult inference = types.inferMethodCallWithEvidence(
             receiver.type, *methodName, operands.positionalTypes,
             operands.keywordTypes);
         if (!requireStaticEvidence(expr, inference))
           return emitNone(expr);
+        if (isJsHostValueType(receiver.type))
+          wrapJsCallbackArguments(expr, inference, operands);
+        Value posPack =
+            emitPack(operands.positional, operands.positionalUnpacked);
+        Value namePack = emitPack(operands.keywordNames);
+        Value valuePack = emitPack(operands.keywordValues);
         if (std::string mismatch = cellElementRepresentationMismatch(
                 receiverNode, receiver.type, inference,
                 operands.positionalTypes);

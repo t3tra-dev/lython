@@ -20,7 +20,9 @@
 //     which LyJs_TakeError hands back as a string.
 // eslint-disable-next-line no-unused-vars
 var LythonJs = {
-  create(memory) {
+  // `exports` gives the module's exports once it is instantiated:
+  // LyJs_Dispatch and LyJs_Release, which a callback calls back in through.
+  create(memory, exports) {
     const values = [undefined, null, true, false];
     const freeHandles = [];
     let pending = [];
@@ -72,6 +74,48 @@ var LythonJs = {
     const pointsOf = (text) => Array.from(text, (unit) => unit.codePointAt(0));
     const describe = (value) =>
       value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    // A Python callable handed to the host is a slot in the program's
+    // callback table (runtime/lib/_js_bridge.py). The function the host gets
+    // pushes a frame -- which slot, what arguments -- and calls the program's
+    // one entry point; the program reads the frame through the `$`-named
+    // globals below and leaves its result or its exception in it.
+    const frames = [];
+    const enter = (frame, entry) => {
+      frames.push(frame);
+      try {
+        entry();
+      } finally {
+        frames.pop();
+      }
+    };
+    const callbacks = new FinalizationRegistry((slot) =>
+      enter({ slot }, () => exports().LyJs_Release()),
+    );
+    const makeFunction = (slot) => {
+      const callback = function (...args) {
+        const frame = {
+          slot,
+          args,
+          result: undefined,
+          error: null,
+          set_result(value) {
+            this.result = value;
+          },
+        };
+        enter(frame, () => exports().LyJs_Dispatch());
+        if (frame.error !== null) throw new Error(frame.error);
+        return frame.result;
+      };
+      callbacks.register(callback, slot);
+      return callback;
+    };
+    const frameGlobal = (name) => {
+      const frame = frames[frames.length - 1];
+      if (name == "$frame") return frame;
+      // `$arg$<index>$<kind>`: the kind only keeps the program's globals
+      // apart; the index is the argument.
+      return frame.args[Number(name.split("$")[2])];
+    };
     // LyJsKind: what `kind` asks of a value in LyJs_Expect.
     const kinds = {
       1: ["a number", (value) => typeof value === "number"],
@@ -90,6 +134,7 @@ var LythonJs = {
     return {
       LyJs_Global(pointer, length) {
         const name = memberName(pointer, length);
+        if (name.startsWith("$")) return intern(frameGlobal(name));
         // ⛔ Not `globalThis[name]` unchecked: a global the host does not
         // have is JavaScript's ReferenceError, not an undefined to carry on
         // with.
@@ -137,6 +182,15 @@ var LythonJs = {
         } catch (error) {
           return fail(error);
         }
+      },
+      LyJs_MakeFunction(slot) {
+        return intern(makeFunction(slot));
+      },
+      LyJs_CurrentSlot() {
+        return frames[frames.length - 1].slot;
+      },
+      LyJs_SetCallbackError() {
+        frames[frames.length - 1].error = String(takePending()[0]);
       },
       LyJs_Drop(handle) {
         if (handle < 4) return;

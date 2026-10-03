@@ -73,6 +73,15 @@ private:
   // value is taken as it comes and dispatched to the member it is.
   Value adaptJsHostResult(const parser::Node &anchor, mlir::Operation *op,
                           Value declared);
+  // A Python callable where a host member takes a callback (docs/js-host.md).
+  Value wrapJsCallback(const parser::Node &anchor, py::CallableType declared,
+                       Value callable);
+  void wrapJsCallbackArguments(const parser::Node &anchor,
+                               CallInferenceResult &inference,
+                               CallOperands &operands);
+  // One synthesized wrapper per (declared callback type, callable's type).
+  llvm::DenseMap<std::pair<mlir::Type, mlir::Type>, std::string>
+      jsCallbackWrappers;
   void emitTopLevelDeclarations();
   void emitSourceModuleDeclarations();
   void bindSourceModuleLocals(llvm::StringRef moduleName,

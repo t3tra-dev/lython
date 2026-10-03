@@ -10,6 +10,7 @@
 #include "JsHost.h"
 #include "PyProtocols.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -20,6 +21,12 @@
 
 namespace lython::emitter {
 namespace {
+
+// The callback machinery's names in the program's scope (docs/js-host.md):
+// `$` cannot appear in an identifier a program writes.
+constexpr llvm::StringLiteral kJsBridgeModule = "_js_bridge";
+constexpr llvm::StringLiteral kJsBridgeName = "__ly_js_bridge$";
+constexpr llvm::StringLiteral kJsFrameName = "__ly_js_frame$";
 
 bool isTopLevelFunction(const parser::Node &statement) {
   return statement.kind == "FunctionDef" ||
@@ -1386,6 +1393,8 @@ void ModuleEmitter::bindModuleImportScope(const parser::Node &sourceModule,
 
 void ModuleEmitter::predeclareSourceModules() {
   declareJsHostModule();
+  if (lookupSourceModule(kJsBridgeModule))
+    bindSourceModuleNamespace(kJsBridgeModule, kJsBridgeName);
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode)
       continue;
@@ -1739,6 +1748,12 @@ void ModuleEmitter::emitSourceModuleDeclarations() {
     activePackageName = std::move(savedPackageName);
     sourceName = std::move(savedSourceName);
   }
+  // The bridge's entry points are reached from the host, not from the
+  // program, and a private function nobody calls is dropped.
+  for (llvm::StringRef entry : {"dispatch", "release"})
+    if (auto function = module.lookupSymbol<mlir::func::FuncOp>(
+            sourceModuleFunctionSymbol(kJsBridgeModule, entry)))
+      function.setPublic();
 }
 
 void ModuleEmitter::predeclareTopLevel() {
@@ -2282,11 +2297,37 @@ void ModuleEmitter::declareJsHostModule() {
       for (const py::protocols::ProtocolBase &base : info->bases)
         pending.push_back(base.name);
     }
+    // The frame of the callback being run (runtime/js/lython_js.js): a host
+    // object whose one method takes the callback's result. `$` keeps its
+    // names out of anything a program can spell.
+    {
+      std::string frameClass =
+          sourceModuleClassSymbol(host->moduleName, "$CallbackFrame");
+      py::protocols::ProtocolInfo frame;
+      frame.bases.push_back(
+          py::protocols::ProtocolBase{py::kJsProxyContract.str(), {}});
+      py::protocols::ProtocolMethod setResult;
+      setResult.signature = py::CallableType::get(
+          &context, {types.contract(frameClass), types.object()}, {}, {}, {},
+          {types.none()});
+      setResult.mayThrow = true;
+      frame.methods["set_result"].push_back(setResult);
+      py::protocols::Table::getMutable(context).registerClass(frameClass,
+                                                              frame);
+      std::string frameGlobal =
+          (llvm::Twine(host->moduleName) + ".$frame").str();
+      moduleGlobals[frameGlobal] = types.contract(frameClass);
+    }
     for (const std::string &alias : aliases)
       types.unbindAnnotationTypeAlias(alias);
   }
   types.takeAnnotationDiagnostics();
   types.restoreAnnotationDiagnostics(std::move(programAnnotationDiagnostics));
+  // Bound in the program's scope, where the callback wrappers are read; the
+  // stub's own was isolated above.
+  std::string frameGlobal = (llvm::Twine(host->moduleName) + ".$frame").str();
+  types.bindCanonicalSymbol(kJsFrameName, frameGlobal,
+                            moduleGlobals[frameGlobal]);
 }
 
 bool ModuleEmitter::isJsHostValueType(mlir::Type type) const {
@@ -2385,6 +2426,157 @@ Value ModuleEmitter::adaptJsHostResult(const parser::Node &anchor,
                             [&] { return emitArm(index + 1); });
   };
   return Value{emitArm(0), declared.type};
+}
+
+// A Python callable going to the host where the stub declares a callback:
+// the host gets a function that runs it. One wrapper per callback TYPE,
+// synthesized as
+//
+//     def __ly_js_wrap$K(__ly_f: <the declared callable>) -> JsProxy:
+//         def __ly_run() -> None:
+//             __ly_js_frame$.set_result(__ly_f(__ly_js_arg$0$K, ...))
+//         return __ly_js_bridge$.wrap(__ly_run)
+//
+// where `__ly_js_arg$i$K` is a host global typed as the callback's i-th
+// declared parameter -- read from the frame of the call being run, and
+// converted on the way in like any host value -- and whatever the callable
+// returns goes back through the frame, the stub's `Any` included: a JSON
+// reviver's result is the value the host keeps. `__ly_f` is typed as the
+// callable IS, so its result has the type that says how it crosses.
+Value ModuleEmitter::wrapJsCallback(const parser::Node &anchor,
+                                    py::CallableType declared, Value callable) {
+  mlir::Type any = types.any();
+  auto received = [&](mlir::Type type) {
+    return type == any || !type ? types.contract(py::kJsProxyContract) : type;
+  };
+  std::string &symbol = jsCallbackWrappers[{declared, callable.type}];
+  if (symbol.empty()) {
+    std::string kind = std::to_string(jsCallbackWrappers.size());
+    symbol = "__ly_js_wrap$" + kind;
+    parser::SourceRange range = anchor.range;
+    std::vector<parser::NodePtr> arguments;
+    for (auto [index, parameter] :
+         llvm::enumerate(declared.getPositionalTypes())) {
+      std::string name = "__ly_js_arg$" + std::to_string(index) + "$" + kind;
+      // `js.$arg$<i>$<K>`, which the host reads from the frame.
+      std::string global =
+          (py::kJsHostModule + ".$" + llvm::StringRef(name).drop_front(8))
+              .str();
+      moduleGlobals[global] = received(parameter);
+      types.bindCanonicalSymbol(name, global, received(parameter));
+      arguments.push_back(synth::name(name, range));
+    }
+    parser::NodePtr invoke =
+        synth::call(synth::name("__ly_f", range), std::move(arguments), range);
+    mlir::Type result = types.none();
+    if (auto actual = mlir::dyn_cast<py::CallableType>(callable.type))
+      if (!actual.getResultTypes().empty())
+        result = types.widenLiteral(actual.getResultTypes().front());
+    parser::NodePtr runStatement =
+        result == types.none()
+            ? synth::exprStmt(std::move(invoke), range)
+            : synth::exprStmt(
+                  synth::call(synth::attribute(synth::name(kJsFrameName, range),
+                                               "set_result", range),
+                              {std::move(invoke)}, range),
+                  range);
+    std::vector<parser::NodePtr> runBody;
+    runBody.push_back(std::move(runStatement));
+    parser::NodePtr run =
+        synth::functionDef("__ly_run", {}, {}, std::move(runBody),
+                           synth::noneConstant(range), {}, range);
+    std::string callableAlias = "__ly_js_callback$" + kind;
+    types.bindAnnotationTypeAlias(callableAlias, callable.type);
+    types.bindAnnotationTypeAlias("__ly_js_proxy$",
+                                  types.contract(py::kJsProxyContract));
+    std::vector<parser::NodePtr> body;
+    body.push_back(std::move(run));
+    body.push_back(synth::returnStmt(
+        synth::call(
+            synth::attribute(synth::name(kJsBridgeName, range), "wrap", range),
+            {synth::name("__ly_run", range)}, range),
+        range));
+    parser::NodePtr def = synth::functionDef(
+        symbol, {synth::Param{"__ly_f", synth::name(callableAlias, range)}}, {},
+        std::move(body), synth::name("__ly_js_proxy$", range), {}, range);
+    synthesizedIteratorDefs.push_back(def);
+    FunctionSignature sig = types.functionSignature(*def);
+    types.bindRootSymbol(symbol, sig.publicCallable);
+    auto savedLoops = std::move(loopControlContexts);
+    loopControlContexts.clear();
+    auto savedInlineReturns = std::move(inlineReturnContexts);
+    inlineReturnContexts.clear();
+    auto savedSupers = std::move(superContexts);
+    superContexts.clear();
+    auto savedInlining = std::move(methodsBeingInlined);
+    methodsBeingInlined.clear();
+    auto savedInlineFrames = std::move(inlineFrames);
+    inlineFrames.clear();
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      emitCallableFunction(*def, symbol, sig, {}, /*isLambda=*/false);
+    }
+    loopControlContexts = std::move(savedLoops);
+    inlineReturnContexts = std::move(savedInlineReturns);
+    superContexts = std::move(savedSupers);
+    methodsBeingInlined = std::move(savedInlining);
+    inlineFrames = std::move(savedInlineFrames);
+  }
+  parser::NodePtr call = synth::call(
+      synth::name(symbol, anchor.range),
+      {synth::name("__ly_js_callable$", anchor.range)}, anchor.range);
+  values["__ly_js_callable$"] = callable;
+  auto scope = types.pushScope();
+  types.bindLocalSymbol("__ly_js_callable$", callable.type);
+  synthesizedIteratorDefs.push_back(std::move(call));
+  Value wrapped = emitExpr(synthesizedIteratorDefs.back().get());
+  values.erase("__ly_js_callable$");
+  return wrapped;
+}
+
+// Every argument of a host call whose declared type is a callback, wrapped.
+// The call's selected signature is told the argument is now a host value.
+void ModuleEmitter::wrapJsCallbackArguments(const parser::Node &anchor,
+                                            CallInferenceResult &inference,
+                                            CallOperands &operands) {
+  auto selected = mlir::dyn_cast_if_present<py::CallableType>(
+      inference.evidence.callableContract);
+  if (!selected)
+    return;
+  llvm::SmallVector<mlir::Type, 8> positional(
+      selected.getPositionalTypes().begin(),
+      selected.getPositionalTypes().end());
+  bool changed = false;
+  for (auto [index, argument] : llvm::enumerate(operands.positional)) {
+    std::size_t parameter = index + 1; // after the receiver
+    if (parameter >= positional.size() || operands.positionalUnpacked[index])
+      continue;
+    py::CallableType callback;
+    mlir::Type declared = positional[parameter];
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(declared)) {
+      for (mlir::Type member : unionType.getMemberTypes())
+        if (auto candidate = mlir::dyn_cast<py::CallableType>(member))
+          callback = candidate;
+    } else {
+      callback = mlir::dyn_cast<py::CallableType>(declared);
+    }
+    if (!callback || argument.type == types.none() ||
+        isJsHostValueType(argument.type))
+      continue;
+    argument = wrapJsCallback(anchor, callback, argument);
+    operands.positionalTypes[index] = argument.type;
+    positional[parameter] = argument.type;
+    changed = true;
+  }
+  if (!changed)
+    return;
+  inference.evidence.callableContract = py::CallableType::get(
+      &context, positional, selected.getKwOnlyTypes(), selected.getVarargType(),
+      selected.getKwargType(), selected.getResultTypes(),
+      selected.getPositionalNames(), selected.getKwOnlyNames(),
+      selected.getPositionalDefaults(), selected.getKwOnlyDefaults(),
+      selected.getVarargName(), selected.getKwargName(),
+      selected.getPositionalOnlyCount());
 }
 
 // An imported function's signature as its importer sees it: read in the

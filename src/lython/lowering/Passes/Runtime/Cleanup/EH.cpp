@@ -650,6 +650,24 @@ bool convertCallToPythonTryInvoke(
 // name out of the symbol space; on a clash the linker gives the C name to the
 // runtime's declaration and renames the local. `__main__` stays external: the
 // JIT finds the program's body by that name.
+void installJsHostEntryPoints(llvm::Module &module) {
+  for (auto [entry, target] : {std::pair<llvm::StringRef, llvm::StringRef>{
+                                   "LyJs_Dispatch", "_js_bridge.dispatch"},
+                               {"LyJs_Release", "_js_bridge.release"}}) {
+    llvm::Function *python = module.getFunction(target);
+    if (!python || python->isDeclaration() || module.getFunction(entry))
+      continue;
+    auto *function = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(module.getContext()),
+                                false),
+        llvm::GlobalValue::ExternalLinkage, entry, module);
+    llvm::IRBuilder<> builder(
+        llvm::BasicBlock::Create(module.getContext(), "entry", function));
+    builder.CreateCall(python);
+    builder.CreateRetVoid();
+  }
+}
+
 void internalizePythonFunctions(llvm::Module &module) {
   for (llvm::Function &function : module)
     if (isPythonDebugFunction(&function) && function.getName() != "__main__")
