@@ -6,3 +6,11 @@ box 30
 0
 0
 stop: done1
+3
+got 6
+0
+got None
+5
+stop: '10'
+0
+stop: ''

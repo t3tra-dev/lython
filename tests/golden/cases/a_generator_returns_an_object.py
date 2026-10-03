@@ -38,3 +38,26 @@ try:
     next(g)
 except StopIteration as e:
     print("stop:", str(e))
+
+
+def opt(n: int) -> Generator[int, None, int | None]:
+    yield n
+    return n * 2 if n > 0 else None
+
+
+def delegate() -> Generator[int, None, None]:
+    r = yield from opt(3)
+    print("got", r)
+    s = yield from opt(0)
+    print("got", s)
+
+
+for v in delegate():
+    print(v)
+for n in [5, 0]:
+    h = opt(n)
+    print(next(h))
+    try:
+        next(h)
+    except StopIteration as e:
+        print("stop:", repr(str(e)))

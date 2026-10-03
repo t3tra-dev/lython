@@ -2972,8 +2972,24 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   mlir::Block *valueBlock = builder.createBlock(&body);
   mlir::Block *plainBlock = builder.createBlock(&body);
   builder.setInsertionPointToEnd(stoppedBlock);
-  mlir::cf::CondBranchOp::create(builder, loc, call.getResult(hasretIndex),
-                                 valueBlock, mlir::ValueRange{}, plainBlock,
+  mlir::Value carriesValue = call.getResult(hasretIndex);
+  // ⭐ A RETURNED UNION THAT IS None AT RUN TIME RAISES A BARE StopIteration,
+  // as CPython does for a None return value (`str(e)` is '', not 'None').
+  // The return is a value of the union type either way, so only the box
+  // knows; None's box has no class.
+  if (info.returnLane.contract == "builtins.object") {
+    mlir::Value classWord =
+        mlir::memref::LoadOp::create(builder, loc, returnSpan.front(),
+                                     constantIndex(builder, loc, 1))
+            .getResult();
+    mlir::Value notNone = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::ne, classWord,
+        constantI64(builder, loc, 0));
+    carriesValue =
+        mlir::arith::AndIOp::create(builder, loc, carriesValue, notNone);
+  }
+  mlir::cf::CondBranchOp::create(builder, loc, carriesValue, valueBlock,
+                                 mlir::ValueRange{}, plainBlock,
                                  mlir::ValueRange{});
 
   // return X → StopIteration whose message is str(X). Exhaustion can be
