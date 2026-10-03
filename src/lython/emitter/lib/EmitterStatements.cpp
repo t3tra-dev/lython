@@ -683,6 +683,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     if (value && value->kind == "Constant" &&
         ast::isEllipsisField(*value, "value"))
       return;
+    llvm::SaveAndRestore<const parser::Node *> discarded(discardedHostResult,
+                                                         value);
     emitExpr(value);
   } else if (statement.kind == "Import") {
     bindImportStatement(statement, /*diagnoseUnsupported=*/true);

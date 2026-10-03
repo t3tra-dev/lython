@@ -2316,3 +2316,21 @@ TEST(EmitterTest, ABranchForAnotherPlatformImportsNothing) {
       "import hosted\nprint(hosted.where())\n");
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
 }
+
+// What: a generic host class used with arguments -- `Promise[int]` as an
+// annotation and as a call's result -- has its methods, read with T as int,
+// and a host `number` parameter takes an int.
+TEST(EmitterTest, AGenericHostClassIsReadWithItsArguments) {
+  ImportedModuleEmit emitted = emitMainFor(
+      "from js import Promise, setTimeout\n\n\n"
+      "def show(p: Promise[int]) -> None:\n"
+      "    def ok(v: int) -> None:\n"
+      "        print(v)\n\n"
+      "    p.then(ok)\n\n\n"
+      "def later() -> None:\n"
+      "    print(\"later\")\n\n\n"
+      "show(Promise.resolve(4))\n"
+      "setTimeout(later, 10)\n",
+      "wasm32-unknown-emscripten");
+  EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
+}

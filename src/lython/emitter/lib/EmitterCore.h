@@ -1541,6 +1541,9 @@ private:
       boundMethodWrappers;
   // The body being emitted is a coroutine's: `await` is legal in it.
   bool currentFunctionIsCoroutine = false;
+  // The call an expression statement discards the value of: a host call's
+  // result there is not converted (adaptJsHostResult).
+  const parser::Node *discardedHostResult = nullptr;
   std::string currentFunctionPrefix;
   std::vector<parser::NodePtr> synthesizedDefaultProviders;
   // Non-constant defaults of MODULE-level defs (R6): evaluated once when

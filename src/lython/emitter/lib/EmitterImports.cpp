@@ -276,9 +276,34 @@ void declareStubClassContracts(TypeSystem &types, mlir::MLIRContext &context,
       }
     return type;
   };
+  // A host parameter declared `float` (TypeScript's `number`) also takes an
+  // int: the value crosses by its own type, and an int is the host's number
+  // when it fits one exactly -- `setTimeout(f, 10)`. Pyodide converts the
+  // same way.
+  // ⛔ Not by converting at the call, as a manifest export's double is: there
+  // is no Python-visible parameter on the other side to keep the rung in, and
+  // nothing for a conversion to add.
+  auto widenNumber = [&](mlir::Type type) -> mlir::Type {
+    if (!policy.anyParameter)
+      return type;
+    if (type == types.floatType())
+      return py::UnionType::getNormalized(&context,
+                                          {type, types.intType()});
+    if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type))
+      if (llvm::is_contained(unionType.getMemberTypes(), types.floatType()) &&
+          !llvm::is_contained(unionType.getMemberTypes(), types.intType())) {
+        llvm::SmallVector<mlir::Type, 4> members(
+            unionType.getMemberTypes().begin(),
+            unionType.getMemberTypes().end());
+        members.push_back(types.intType());
+        return py::UnionType::getNormalized(&context, members);
+      }
+    return type;
+  };
   auto written = [&](mlir::Type type) {
-    return policy.anyParameter && type == any ? policy.anyParameter
-                                              : widenCallable(type);
+    return policy.anyParameter && type == any
+               ? policy.anyParameter
+               : widenNumber(widenCallable(type));
   };
   for (const parser::NodePtr &statement : body) {
     if (!statement || !isTopLevelClass(*statement))
@@ -289,6 +314,25 @@ void declareStubClassContracts(TypeSystem &types, mlir::MLIRContext &context,
       continue;
     std::string contractName = sourceModuleClassSymbol(moduleName, *name);
     py::protocols::ProtocolInfo info;
+    // `class Promise[T]`: the parameters a `Promise[int]` binds, so its
+    // methods are read with T as int. Without them a host class used with
+    // arguments had no methods at all.
+    // ⛔ And bound as type variables while the members are read, or a bare
+    // `T` there names a class `builtins.T` nothing declares.
+    auto typeParamScope = types.pushScope();
+    llvm::SmallVector<mlir::Type, 2> typeVariables;
+    if (const auto *typeParams = ast::nodeList(*statement, "type_params"))
+      for (const parser::NodePtr &param : *typeParams)
+        if (param)
+          if (std::optional<std::string_view> paramName =
+                  ast::string(*param, "name")) {
+            info.params.emplace_back(*paramName);
+            info.paramVariance.emplace_back("invariant");
+            mlir::Type variable =
+                py::TypeVarType::get(&context, llvm::StringRef(*paramName));
+            types.bindLocalSymbol(*paramName, variable);
+            typeVariables.push_back(variable);
+          }
     if (const auto *bases = ast::nodeList(*statement, "bases"))
       for (const parser::NodePtr &base : *bases)
         if (base)
@@ -303,7 +347,7 @@ void declareStubClassContracts(TypeSystem &types, mlir::MLIRContext &context,
           py::contracts::manifestClassNameForContract(policy.commonBase), {}});
     info.bases.push_back(py::protocols::ProtocolBase{
         py::contracts::manifestClassNameForContract("builtins.object"), {}});
-    mlir::Type receiverType = types.contract(contractName);
+    mlir::Type receiverType = types.contract(contractName, typeVariables);
     for (const parser::NodePtr &member : *classBody) {
       if (!member)
         continue;
@@ -2411,6 +2455,34 @@ bool ModuleEmitter::isJsHostValueType(mlir::Type type) const {
 // op would be one it has never seen.
 Value ModuleEmitter::adaptJsHostResult(const parser::Node &anchor,
                                        mlir::Operation *op, Value declared) {
+  mlir::Type raw = types.contract(py::kJsProxyContract);
+  // The read is retyped to the host value as it comes, and the call's
+  // selected signature, which is checked against it, with it.
+  auto retypeToHostValue = [&] {
+    op->getResult(0).setType(raw);
+    if (auto call = mlir::dyn_cast<py::CallOp>(op))
+      if (auto callable =
+              mlir::dyn_cast<py::CallableType>(call.getCallContract())) {
+        auto retyped = py::CallableType::get(
+            &context, callable.getPositionalTypes(),
+            callable.getKwOnlyTypes(), callable.getVarargType(),
+            callable.getKwargType(), {raw}, callable.getPositionalNames(),
+            callable.getKwOnlyNames(), callable.getPositionalDefaults(),
+            callable.getKwOnlyDefaults(), callable.getVarargName(),
+            callable.getKwargName(), callable.getPositionalOnlyCount());
+        call.setCallContractAttr(
+            mlir::TypeAttr::get(callProtocolFor(retyped)));
+      }
+  };
+  // ⭐ A RESULT NOBODY READS IS NOT CHECKED. `setTimeout(f, 10)` as a
+  // statement: node returns a Timeout object where the stub (a browser's)
+  // declares a number, and checking the value refused a program that never
+  // looks at it.
+  if (&anchor == discardedHostResult && declared.type != raw &&
+      op->getNumResults() == 1) {
+    retypeToHostValue();
+    return Value{op->getResult(0), raw};
+  }
   auto unionType = mlir::dyn_cast_if_present<py::UnionType>(declared.type);
   if (!unionType)
     return declared;
@@ -2445,22 +2517,7 @@ Value ModuleEmitter::adaptJsHostResult(const parser::Node &anchor,
   }
   if (object)
     arms.push_back(*object);
-  mlir::Type raw = types.contract(py::kJsProxyContract);
-  op->getResult(0).setType(raw);
-  // The call's selected signature says what it returns, and is checked
-  // against the result's type.
-  if (auto call = mlir::dyn_cast<py::CallOp>(op))
-    if (auto callable =
-            mlir::dyn_cast<py::CallableType>(call.getCallContract())) {
-      auto retyped = py::CallableType::get(
-          &context, callable.getPositionalTypes(), callable.getKwOnlyTypes(),
-          callable.getVarargType(), callable.getKwargType(), {raw},
-          callable.getPositionalNames(), callable.getKwOnlyNames(),
-          callable.getPositionalDefaults(), callable.getKwOnlyDefaults(),
-          callable.getVarargName(), callable.getKwargName(),
-          callable.getPositionalOnlyCount());
-      call.setCallContractAttr(mlir::TypeAttr::get(callProtocolFor(retyped)));
-    }
+  retypeToHostValue();
   Value host{op->getResult(0), raw};
   auto internal = [&](llvm::StringRef method, mlir::Type result) -> Value {
     auto callable =
@@ -2701,6 +2758,9 @@ ModuleEmitter::tryEmitJsHostFunctionCall(const parser::Node &expr,
   parser::addField(*call, "args", std::move(arguments));
   parser::addField(*call, "keywords", std::move(keywords));
   synthesizedIteratorDefs.push_back(call);
+  llvm::SaveAndRestore<const parser::Node *> discarded(
+      discardedHostResult,
+      &expr == discardedHostResult ? call.get() : discardedHostResult);
   return emitExpr(call.get());
 }
 

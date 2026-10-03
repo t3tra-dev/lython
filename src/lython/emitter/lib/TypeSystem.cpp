@@ -3433,6 +3433,15 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
       return protocol(*protocolName, arguments);
     if (auto contractName = contractAnnotationName(baseName))
       return contract(*contractName, arguments);
+    // ⭐ AN ALIAS FOR A GENERIC CLASS TAKES ARGUMENTS TOO. A host class with
+    // a global of its name is bound as an annotation alias (`Promise` reads
+    // the global, `p: Promise` means the class), and `Promise[int]` fell
+    // through to `object` -- a parameter with no methods at all.
+    if (auto alias = annotationTypeAliases.find(baseName);
+        alias != annotationTypeAliases.end())
+      if (auto aliased = mlir::dyn_cast<py::ContractType>(alias->second);
+          aliased && aliased.getArguments().empty() && !arguments.empty())
+        return contract(aliased.getContractName(), arguments);
     if (auto knownClass = lookupClass(baseName)) {
       if (auto contractType =
               mlir::dyn_cast_if_present<py::ContractType>(*knownClass)) {
