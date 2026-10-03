@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(LYTHON_LLVM_MAJOR_VERSION 22 CACHE STRING
+set(LYTHON_LLVM_MAJOR_VERSION 23 CACHE STRING
     "LLVM/MLIR major version Lython builds against")
 
 # Compiler selection must precede project(): that call locks in the toolchain.

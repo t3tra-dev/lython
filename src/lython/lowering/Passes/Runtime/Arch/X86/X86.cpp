@@ -1,6 +1,6 @@
 #include "X86.h"
 
-#include "mlir/Dialect/X86Vector/X86VectorDialect.h"
+#include "mlir/Dialect/X86/X86Dialect.h"
 #include "mlir/Transforms/Passes.h"
 
 namespace py::lowering::arch::x86 {
@@ -10,7 +10,7 @@ bool usesX86(const py::TensorLoweringTarget &target) {
 }
 
 void registerX86Dialects(mlir::DialectRegistry &registry) {
-  registry.insert<mlir::x86vector::X86VectorDialect>();
+  registry.insert<mlir::x86::X86Dialect>();
 }
 
 void registerX86Translations(mlir::DialectRegistry &registry) {

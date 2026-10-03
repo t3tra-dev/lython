@@ -342,7 +342,7 @@ void attachPythonDebugInfo(ModuleOp module) {
         compileUnit, StringAttr::get(module.getContext(), displayName),
         StringAttr::get(module.getContext(), linkageName), file,
         sourceLoc->getLine(), sourceLoc->getLine(), flags, subroutineType,
-        ArrayRef<LLVM::DINodeAttr>{}, ArrayRef<LLVM::DINodeAttr>{});
+        ArrayRef<Attribute>{}, ArrayRef<LLVM::DINodeAttr>{});
 
     function->setLoc(scopedPythonDebugLoc(function.getLoc(), subprogram));
     function.walk([&](Operation *op) {

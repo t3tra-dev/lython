@@ -160,12 +160,6 @@ private:
 namespace llvm {
 template <> struct DenseMapInfo<py::ownership::Reference> {
   using Reference = py::ownership::Reference;
-  static Reference getEmptyKey() {
-    return {DenseMapInfo<mlir::Operation *>::getEmptyKey(), 0};
-  }
-  static Reference getTombstoneKey() {
-    return {DenseMapInfo<mlir::Operation *>::getTombstoneKey(), 0};
-  }
   static unsigned getHashValue(const Reference &reference) {
     return hash_combine(reference.creator, reference.index);
   }

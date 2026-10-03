@@ -1680,11 +1680,20 @@ unknownOperandConstants(mlir::Operation *op) {
 // continuation is the op's own next node, a region entry is that region's
 // first block. The two walks differ in what they CARRY, not in where the edge
 // goes, so the state type is the only parameter.
+// The values a region successor receives, which the owner's interface
+// answers for each of its successors.
+mlir::ValueRange successorInputs(mlir::Operation *owner,
+                                 mlir::RegionSuccessor successor) {
+  if (auto branch = mlir::dyn_cast<mlir::RegionBranchOpInterface>(owner))
+    return branch.getSuccessorInputs(successor);
+  return {};
+}
+
 template <typename State>
 void enqueueRegionSuccessor(mlir::Operation *owner, mlir::RegionSuccessor succ,
                             State state,
                             llvm::SmallVectorImpl<State> &worklist) {
-  if (succ.isParent()) {
+  if (succ.isOperation()) {
     state.block = owner->getBlock();
     state.start = owner->getNextNode();
   } else {
@@ -1717,7 +1726,7 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, State state,
   bool handled = false;
   bool hasNoUseRegionPath = false;
   for (mlir::RegionSuccessor successor : successors) {
-    if (!successor.isParent() &&
+    if (!successor.isOperation() &&
         !walk.regionMentionsGroup(*successor.getSuccessor(), state.group)) {
       hasNoUseRegionPath = true;
       continue;
@@ -1726,7 +1735,7 @@ bool enqueueRegionEntryPaths(mlir::Operation *op, State state,
     State next = state;
     mlir::OperandRange sources = branch.getEntrySuccessorOperands(successor);
     next.group = remapGroupThroughValueMapping(
-        sources, successor.getSuccessorInputs(), state.group, aliases);
+        sources, successorInputs(op, successor), state.group, aliases);
     enqueueRegionSuccessor(op, successor, std::move(next), worklist);
     handled = true;
   }
@@ -1794,7 +1803,7 @@ handleRegionTerminator(mlir::Operation *terminator, TrackedResource &resource,
     llvm::SmallVector<bool, 4> mappedMask;
     llvm::SmallVector<mlir::Value, 4> mappedGroup =
         remapGroupThroughValueMapping(terminator->getOperands(),
-                                      successor.getSuccessorInputs(),
+                                      successorInputs(owner, successor),
                                       state.group, aliases, &mappedMask);
     bool fullyMapped =
         llvm::all_of(mappedMask, [](bool mapped) { return mapped; });
@@ -1915,7 +1924,7 @@ mlir::LogicalResult handleBorrowedRegionTerminator(
     llvm::SmallVector<bool, 4> mappedMask;
     llvm::SmallVector<mlir::Value, 4> mappedGroup =
         remapGroupThroughValueMapping(terminator->getOperands(),
-                                      successor.getSuccessorInputs(),
+                                      successorInputs(owner, successor),
                                       state.group, aliases, &mappedMask);
     bool fullyMapped =
         llvm::all_of(mappedMask, [](bool mapped) { return mapped; });

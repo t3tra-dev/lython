@@ -887,9 +887,12 @@ FailureOr<int> runJIT(ModuleOp module, const py::IRDumpConfig &irDump,
           std::move(*tmOrErr));
     };
 
-    auto objectLayerCreator = [](llvm::orc::ExecutionSession &session)
+    auto objectLayerCreator =
+        [](llvm::orc::ExecutionSession &session,
+           llvm::jitlink::JITLinkMemoryManager &memoryManager)
         -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
-      auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
+      auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(
+          session, memoryManager);
       const llvm::Triple &tt = session.getTargetTriple();
       if (tt.isOSBinFormatELF()) {
         // GitHub Actions' Linux runner can abort in libgcc's
