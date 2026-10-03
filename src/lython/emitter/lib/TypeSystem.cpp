@@ -5742,25 +5742,25 @@ TypeSystem::functionSignature(const parser::Node &function,
 
     if (returns && !py::isAssignableTo(sig.inferredGeneratorType,
                                        annotatedReturn)) {
-      // ⭐ A YIELD INSIDE A GUARD YIELDS WHAT THE GUARD PROVED, and this walk
-      // cannot see guards: it types each `yield` expression on its own, so
+      // ⭐ THE ANNOTATION IS THE YIELD TYPE, and each yield is checked at its
+      // own site (EmitterExpressions.cpp, `Yield`), where the guards above it
+      // have been spent. This walk types each `yield` with no flow facts, so
       //
-      //     def gen(xs: list[int | None]) -> Iterator[int]:
-      //         for v in xs:
-      //             if v is not None:
-      //                 yield v * 2
+      //     def walk(head: Node | None) -> Iterator[str]:
+      //         cur = head
+      //         while cur is not None:
+      //             yield cur.name
+      //             cur = cur.nxt
       //
-      // came out as `int | None` and the annotation was reported as a
-      // mismatch, for a program whose every yield is an int. The annotation is
-      // the CONTRACT here, as it is everywhere else: when every inferred yield
-      // either satisfies it or is a union that CONTAINS it, the annotation is
-      // taken and each yield is checked at its own site, where the narrowing
-      // is available. A yield that really cannot produce the annotated type is
-      // then refused there, naming the yield instead of the function.
+      // read `cur.name` on `Node | None` and inferred `object`, refusing a
+      // program whose every yield is a str -- while the same loop appending
+      // to a list in a plain function compiles.
       //
-      // ⛔ Only when the union CONTAINS it: a yield of an unrelated type is
-      // still the function-level mismatch, because no guard could make it
-      // right and the message that names the whole function is the better one.
+      // ⛔ It was taken only when every inferred yield already satisfied the
+      // annotation or was a union containing it, because the site coercion
+      // passed a wrong-typed value through and moved `-> Iterator[str]` with
+      // `yield 1` to "Failed to run lowering pipeline". The site now refuses
+      // that itself, naming the yield.
       std::optional<mlir::Type> annotatedYield;
       if (const py::protocols::Table &table =
               py::protocols::Table::get(context);
@@ -5773,34 +5773,9 @@ TypeSystem::functionSignature(const parser::Node &function,
                     table.protocolArgumentsFor(annotatedReturn, protocolName))
               if (!args->empty() && (*args)[0])
                 annotatedYield = (*args)[0];
-      // ⭐ AND A YIELDED LAMBDA TAKES THE ANNOTATION, the way an assigned one
-      // does. An unannotated lambda has no type of its own -- its parameters
-      // read as `object` -- so `yield lambda n: n + 1` under
-      // `-> Iterator[Callable[[int], int]]` was the function-level mismatch,
-      // while `v: Callable[[int], int] = lambda n: n + 1` one line over is
-      // exactly the same expectation and compiles. The lambda is checked at
-      // its own site against that expectation, so this cannot accept a
-      // generator the site would refuse.
-      auto yieldNarrows = [&](std::size_t index, mlir::Type yielded) {
-        mlir::Type widened = widenLiteral(yielded);
-        if (py::isAssignableTo(widened, *annotatedYield))
-          return true;
-        if (index < generator.yieldNodes.size() && generator.yieldNodes[index] &&
-            generator.yieldNodes[index]->kind == "Lambda" &&
-            mlir::isa<py::CallableType>(*annotatedYield))
-          return true;
-        auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened);
-        return unionType && unionType.hasMember(*annotatedYield);
-      };
-      bool everyYieldNarrows =
+      bool takesAnnotatedYield =
           annotatedYield && *annotatedYield && !generator.yieldTypes.empty();
-      if (everyYieldNarrows)
-        for (auto [index, yielded] : llvm::enumerate(generator.yieldTypes))
-          if (!yieldNarrows(index, yielded)) {
-            everyYieldNarrows = false;
-            break;
-          }
-      if (everyYieldNarrows) {
+      if (takesAnnotatedYield) {
         sig.generatorYieldType = *annotatedYield;
         sig.generatorYieldTypeIsAnnotated = true;
         sig.inferredGeneratorType =
@@ -5811,17 +5786,10 @@ TypeSystem::functionSignature(const parser::Node &function,
                            {sig.generatorYieldType, sig.generatorSendType,
                             sig.generatorReturnType});
       }
-      if (!everyYieldNarrows ||
+      if (!takesAnnotatedYield ||
           !py::isAssignableTo(sig.inferredGeneratorType, annotatedReturn))
-        // ⛔ MEASURED AND DROPPED: taking the annotation whatever the walk
-        // inferred. It also accepts the shapes whose yield EXPRESSION needs
-        // the narrowing (`yield v.upper()` types as None because the lookup on
-        // the union fails), but it moved a genuinely wrong generator --
-        // `-> Iterator[str]` with `yield v` for an int v -- from this
-        // sentence to "Failed to run lowering pipeline", because the site
-        // coercion does not refuse int where str is declared. A worse
-        // diagnostic for a wrong program is not a trade worth the extra right
-        // ones; those need a narrowing-aware yield walk.
+        // An annotation with no yield type to take (`-> int`), or a generator
+        // type the annotation does not accept (its send or return type).
         sig.generatorAnnotationMismatch =
             "generator function is annotated " + typeText(annotatedReturn) +
             " but yields " + typeText(sig.generatorYieldType) + " (inferred " +

@@ -1096,6 +1096,11 @@ private:
     // carry, and every generator yielding a user class fell back to the
     // int-only inline tier (seven probes, tests/probe/rebind_gen_w*.py).
     llvm::SmallVector<mlir::Type, 4> physicalTypes;
+    // An ARGUMENT lane for a union: the frame keeps it boxed (`contract` is
+    // `builtins.object` and `physicalTypes` the box), and the drivers hand
+    // the clone the union's own values -- `passTypes` -- read out of the box.
+    py::UnionType unionType;
+    llvm::SmallVector<mlir::Type, 8> passTypes;
     bool isControl() const { return contract.empty(); }
   };
   struct GeneratorResumeInfo {
@@ -1111,6 +1116,28 @@ private:
     // The yielded-value lane (result index 2 of the resume clone). Control
     // lane in the legacy int tier; object-family for boxed yields.
     GeneratorResumeLane valueLane;
+    // What the body yields, statically: the lane's contract unless that is a
+    // payload box, where it is the union the box holds.
+    mlir::Type valueType;
+    // The returned-value lane (result index 3): a control lane -- the raw
+    // i64 of an int return, or nothing -- unless the body returns an object,
+    // which then crosses as an owned span the way a yielded one does.
+    GeneratorResumeLane returnLane;
+    // What the body returns, statically; null when it returns no value.
+    mlir::Type returnType;
+    // The lane a clone RESULT rides, or null for a control pair: 2 is the
+    // yielded value, 3 the returned value, 5.. the frame. The ABI, the
+    // return lowering and the drivers all ask this one question.
+    const GeneratorResumeLane *resultLane(unsigned index) const {
+      const GeneratorResumeLane *lane = nullptr;
+      if (index == 2)
+        lane = &valueLane;
+      else if (index == 3)
+        lane = &returnLane;
+      else if (index >= 5 && index - 5 < frameLanes.size())
+        lane = &frameLanes[index - 5];
+      return lane && !lane->isControl() ? lane : nullptr;
+    }
     // Values live across a yield, one lane each. Lanes are grouped per
     // contract (lexicographic order) sized by the maximum same-contract live
     // count over all yields, so every suspension state maps its live values
@@ -1123,6 +1150,7 @@ private:
     // raises StopIteration on exhaustion; throw/close inject exceptions at
     // the suspension point through the EH TLS slot.
     std::string stepName;
+    std::string stepFullName;
     std::string advanceName;
     std::string throwName;
     std::string closeName;
@@ -1141,19 +1169,41 @@ private:
                                         GeneratorResumeInfo &info,
                                         mlir::Value storage,
                                         llvm::SmallVectorImpl<mlir::Value> &operands);
-  enum class GeneratorDriverKind : unsigned { Step, Advance, Throw, Close };
+  // StepFull is the step that hands back the returned value too, for a
+  // delegation (`py.generator.step`).
+  enum class GeneratorDriverKind : unsigned {
+    Step,
+    Advance,
+    Throw,
+    Close,
+    StepFull
+  };
   static mlir::Type generatorYieldType(mlir::Type generator);
   static bool isGeneratorProtocol(mlir::Type type);
+  static mlir::Type concreteGeneratorType(mlir::Type type);
+  mlir::FailureOr<RuntimeBundle> boxUnionForLane(mlir::Operation *op,
+                                                 const RuntimeBundle &value);
+  mlir::FailureOr<RuntimeBundle>
+  unboxUnionFromLane(mlir::Operation *op, py::UnionType unionType,
+                     llvm::ArrayRef<mlir::Value> box);
+  mlir::LogicalResult unboxGeneratorYield(mlir::Operation *op,
+                                          mlir::Type elementType,
+                                          SourceGeneratorResumeResult &result);
   mlir::LogicalResult refuseProtocolGeneratorResume(mlir::Operation *op,
                                                     mlir::Type staticType);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateStoredGeneratorDriver(mlir::Operation *op, GeneratorResumeInfo &info,
                                    GeneratorDriverKind kind);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateBoxedGeneratorDriver(mlir::Operation *op, GeneratorResumeInfo &info,
+                                  GeneratorDriverKind kind);
   void copyGeneratorDriverContract(mlir::func::FuncOp from,
                                    mlir::func::FuncOp to, unsigned dropped);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorDispatch(mlir::Operation *op, mlir::Type elementType,
-                               GeneratorDriverKind kind);
+                               GeneratorDriverKind kind,
+                               mlir::Type returnType = {});
+  mlir::LogicalResult lowerGeneratorStep(py::GeneratorStepOp op);
   // Why the state machine DECLINED a generator, keyed by the source function.
   // The tier below refuses for its own reason, which is never the reason the
   // program landed there -- see the note at `declineStateMachineGenerator`.
@@ -1277,6 +1327,10 @@ private:
   // shape is not inlinable and the body must fall back to the legacy inline
   // dispatch.
   mlir::FailureOr<bool> inlineDelegatedYieldFroms(mlir::func::FuncOp clone);
+  mlir::FailureOr<bool> inlineOneYieldFrom(mlir::func::FuncOp clone,
+                                           py::YieldFromOp yieldFrom);
+  mlir::FailureOr<bool> rewriteYieldFromAsDelegation(mlir::func::FuncOp clone,
+                                                     py::YieldFromOp yieldFrom);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorStepFunction(mlir::Operation *op,
                                    GeneratorResumeInfo &info);
@@ -1286,6 +1340,12 @@ private:
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorThrowFunction(mlir::Operation *op,
                                     GeneratorResumeInfo &info);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorStepFullFunction(mlir::Operation *op,
+                                       GeneratorResumeInfo &info);
+  mlir::LogicalResult releaseGeneratorReturnSpan(mlir::Operation *op,
+                                                 const GeneratorResumeInfo &info,
+                                                 llvm::ArrayRef<mlir::Value> span);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorCloseFunction(mlir::Operation *op,
                                     GeneratorResumeInfo &info);

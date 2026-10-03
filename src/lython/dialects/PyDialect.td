@@ -233,6 +233,27 @@ def Py_YieldFromOp : Py_Op<"yield_from"> {
   let hasVerifier = 1;
 }
 
+def Py_GeneratorStepOp : Py_Op<"generator.step"> {
+  let summary = "Resume a generator object once, through its frame";
+  let description = [{
+    One step of PEP 380 delegation over a generator OBJECT: resumes
+    `generator` with `sent` (None for next()) or, when `inject` is set, with
+    the pending exception delivered at its suspension point. `has` says
+    whether it yielded `value`; when it did not, `returned` is its return
+    value. Only a generator resume clone holds this op: the state machine
+    rewrites a `yield from` it cannot inline into a loop of these around a
+    `py.yield_value`, and the lowering resumes through the frame dispatch.
+  }];
+
+  let arguments = (ins Py_ContractType:$generator, Py_ContractType:$sent,
+      I1:$inject);
+  let results = (outs I1:$has, Py_ContractType:$value,
+      Py_ContractType:$returned);
+  let assemblyFormat =
+      "$generator `,` $sent `,` $inject `:` type($generator) `,` type($sent) "
+      "attr-dict `->` type($value) `,` type($returned)";
+}
+
 def Py_RaiseOp : Py_Op<"raise", [Terminator]> {
   let description = [{
     Raises a Python value proven by the manifest to be compatible with

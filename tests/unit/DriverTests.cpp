@@ -1417,31 +1417,22 @@ TEST(DriverTest, EveryTargetsExceptionTableIsTheOneTheReaderReads) {
   }
 }
 
-// WHAT: the refusal a generator gets when the state machine declines it names
-// the value that made it decline, not just the tier's own limit.
-//
-// `prev: "int | None"` carried across the suspension lands in the single-lane
-// tier and is refused for yielding a two-lane union -- and the same generator
-// with a plain int prev compiles, so the yield's arity is not the whole story.
-// What sent it down is the UNION being live across the yield with no frame
-// lane, and a frame lane is keyed on a runtime contract. Reading the lower
-// message alone sends the reader after the yield.
-//
-// The dict.items() spelling this used to assert is compiled now (a generator's
-// dict walk goes through its keys); the probe for the union is
-// tests/probe/wb_generator_carries_an_optional.py.
-//
-// Driver-layer and not golden: the whole behaviour is a refusal, and the
-// control is the same generator without the union, which compiles.
+// A generator the state machine declines is refused by the tier below with
+// the state machine's reason appended: here a value typed by the `Iterator`
+// protocol, live across a yield, which has no frame lane. An `int | None`
+// live across a yield rides a boxed lane and compiles.
 TEST(DriverTest, ARefusedGeneratorNamesWhatSentItDown) {
   CompileResult refused =
-      compileSource("def pairwise(xs: \"list[int]\"):\n"
-                    "    prev: \"int | None\" = None\n"
-                    "    for x in xs:\n"
-                    "        if prev is not None:\n"
-                    "            yield prev + x\n"
-                    "        prev = x\n"
-                    "print(list(pairwise([1, 2, 3])))\n");
+      compileSource("from typing import Iterator\n"
+                    "def inner(n: int) -> Iterator[int]:\n"
+                    "    for i in range(n):\n"
+                    "        yield i\n"
+                    "def make(n: int) -> Iterator[int]:\n"
+                    "    return inner(n)\n"
+                    "def outer() -> Iterator[int]:\n"
+                    "    for v in make(3):\n"
+                    "        yield v * 10\n"
+                    "print(list(outer()))\n");
   EXPECT_FALSE(refused.succeeded);
   EXPECT_NE(refused.diagnostics.find("declined this generator because"),
             std::string::npos)
@@ -1449,6 +1440,16 @@ TEST(DriverTest, ARefusedGeneratorNamesWhatSentItDown) {
   EXPECT_NE(refused.diagnostics.find("is live across a yield"),
             std::string::npos)
       << refused.diagnostics;
+
+  CompileResult optional =
+      compileSource("def pairwise(xs: \"list[int]\"):\n"
+                    "    prev: \"int | None\" = None\n"
+                    "    for x in xs:\n"
+                    "        if prev is not None:\n"
+                    "            yield prev + x\n"
+                    "        prev = x\n"
+                    "print(list(pairwise([1, 2, 3])))\n");
+  EXPECT_TRUE(optional.succeeded) << optional.diagnostics;
 
   // A `continue` before the yield leaves an `arith.constant true` live across
   // the suspension; it is rematerialized at its uses now rather than needing a
@@ -1664,12 +1665,12 @@ TEST(DriverTest, ABorrowedParameterRebindsAcrossALoop) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
-// What: a generator method that recurses into its children is refused for the
-// DELEGATION limit rather than for a method the class plainly declares. The
-// old message named `walk` as missing and pointed at its own `def`, because
-// the yield-type inference walks the body before the method is published.
-TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
-  CompileResult refused = compileSource(
+// What: a generator method that recurses into its children compiles -- its
+// inner walk is resumed through the frame -- and is not refused as a method
+// the class does not declare (the yield-type inference walks the body before
+// the method is published).
+TEST(DriverTest, ARecursiveGeneratorMethodRunsThroughItsFrame) {
+  CompileResult recursive = compileSource(
       "from typing import Iterator\n"
       "class Tree:\n"
       "    def __init__(self, value: int) -> None:\n"
@@ -1681,14 +1682,7 @@ TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
       "            for nested in child.walk():\n"
       "                yield nested\n"
       "print(list(Tree(1).walk()))\n");
-  EXPECT_FALSE(refused.succeeded);
-  EXPECT_NE(refused.diagnostics.find("recursive delegation has no static "
-                                     "expansion"),
-            std::string::npos)
-      << refused.diagnostics;
-  EXPECT_EQ(refused.diagnostics.find("does not provide manifest method"),
-            std::string::npos)
-      << refused.diagnostics;
+  EXPECT_TRUE(recursive.succeeded) << recursive.diagnostics;
 
   // A generator method called from a SIBLING still compiles: the publication
   // change must not disturb the case that already worked.
@@ -1708,10 +1702,9 @@ TEST(DriverTest, ARecursiveGeneratorMethodNamesTheRealLimit) {
   EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
 }
 
-// A bool LIVE ACROSS a yield still has no frame lane, and the tier that
-// refuses it must say so: its own sentence is about int yield bodies, which is
-// never why a generator arrived there. The yielded value's lane is separate and
-// compiles (tests/golden/cases/a_generator_that_yields_a_bool.py).
+// A bool and an Optional live across a yield each have a frame lane. The
+// yielded value's lane is separate and compiles
+// (tests/golden/cases/a_generator_that_yields_a_bool.py).
 TEST(DriverTest, ABoolLiveAcrossAYieldNamesTheRealLimit) {
   // A bool live across a yield has a frame lane now: the frame WORD accounting
   // always gave it one and the STORE side always took one word for a bare i1;
@@ -1727,21 +1720,15 @@ TEST(DriverTest, ABoolLiveAcrossAYieldNamesTheRealLimit) {
       "print(list(go()))\n");
   EXPECT_TRUE(flag.succeeded) << flag.diagnostics;
 
-  // The limit the message names is real for a UNION, which has no lane at all:
-  // the sentence has to keep naming the VALUE, because the tier below refuses
-  // for a reason that is never why the program came down to it.
-  CompileResult refused = compileSource(
+  // An Optional live across a yield rides a boxed frame lane.
+  CompileResult optional = compileSource(
       "from typing import Iterator, Optional\n"
       "def go() -> Iterator[int]:\n"
       "    v: Optional[int] = 3\n"
       "    yield 0\n"
       "    yield 0 if v is None else v\n"
       "print(list(go()))\n");
-  EXPECT_FALSE(refused.succeeded);
-  EXPECT_NE(refused.diagnostics.find("is live across a yield and has no "
-                                     "generator frame lane"),
-            std::string::npos)
-      << refused.diagnostics;
+  EXPECT_TRUE(optional.succeeded) << optional.diagnostics;
 }
 
 // A `with ... as X` target inside a generator is typed before the body walk
@@ -2406,4 +2393,24 @@ TEST(DriverTest, AGeneratorResumedByItsFrameNamesWhatItCannotResume) {
   EXPECT_NE(protocol.diagnostics.find("is not reference counted"),
             std::string::npos)
       << protocol.diagnostics;
+}
+
+// next() and send() carry a generator's return value in the StopIteration
+// they raise, as str(value); a returned instance of the program's own class
+// has no runtime __str__ to render there, and next() on it is refused.
+TEST(DriverTest, ANextOnAGeneratorReturningAClassIsRefused) {
+  CompileResult result =
+      compileSource("from typing import Generator\n\n\n"
+                    "class Box:\n"
+                    "    def __init__(self, v: int) -> None:\n"
+                    "        self.v = v\n\n\n"
+                    "def boxed() -> Generator[int, None, Box]:\n"
+                    "    yield 1\n"
+                    "    return Box(2)\n\n\n"
+                    "g = boxed()\n"
+                    "print(next(g))\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("'Box' value has no runtime __str__"),
+            std::string::npos)
+      << result.diagnostics;
 }

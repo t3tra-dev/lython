@@ -1111,6 +1111,9 @@ RuntimeBundleLowerer::lowerSourceGeneratorNext(
   if (mlir::failed(yieldedOr))
     return mlir::failure();
   SourceGeneratorResumeResult yielded = *yieldedOr;
+  if (mlir::failed(RuntimeBundleLowerer::unboxGeneratorYield(
+          op.getOperation(), op.getElement().getType(), yielded)))
+    return mlir::failure();
 
   // The object-lane element ABI: the yielded value's physical span (plus the
   // trailing evidence pair for int). Legacy pure-pair resumes synthesize the
@@ -1293,6 +1296,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorAdvance(
                   /*useCurrentInsertionPoint=*/false, sentI64Evidence,
                   /*raiseWhenExhausted=*/true);
     if (mlir::failed(yieldedOr))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::unboxGeneratorYield(
+            op.getOperation(), op.getResult(0).getType(), *yieldedOr)))
       return mlir::failure();
     RuntimeBundle result;
     if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
