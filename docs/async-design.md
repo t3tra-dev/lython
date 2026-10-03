@@ -67,8 +67,20 @@ asyncio を CPython の形で載せる。JSPI はその後で WASI 側に繋ぐ�
 2. **送る値、戻り値、フレームの型を広げる** (制約 2〜4)。オブジェクトと None を
    送れるようにし、任意のオブジェクトを返せるようにする。union を含む値を
    フレームに保持し、yield の型を union にできるようにする。
+   - **済 (2026-10-03)**: 戻り値は lane の形を持つ任意の契約になった
+     (`returnLane`)。`__step` は戻り値を解放し、`__step_full` は所有権付きで
+     返す。union は payload box に詰めて `builtins.object` の lane で中断を
+     またぐ。対象は、引数、frame、yield する値、戻り値。union の読み取りに
+     member 型の generator が来る場合は、box に詰める adapter を挟む。
+   - **未 (後回し)**: int 以外のオブジェクトを `send` すること。asyncio の
+     Task は `send(None)` と `throw` しか使わないので、急がない。
 3. **`yield from` の実行時の委譲** (制約 5)。インライン展開できない委譲先
    (generator オブジェクト、`__await__` の戻り値) を、実行時に駆動する。
+   - **済 (2026-10-03)**: 展開できない `yield from` は、`py.generator.step`
+     (frame の dispatcher で 1 回進める) と、委譲の印付きの `py.yield_value`
+     のループになる。外側に throw/close が届くと、inject として委譲先に
+     転送される。静的な展開は 16 回までで、自分自身には行わない (再帰する
+     委譲は、実行時の委譲になる)。
 4. **コルーチンを状態機械に載せる**。`async def` を generator として扱い、
    `await` を `yield from __await__()` にする。今の同期的な経路は廃止する。
 5. **asyncio を Python で書く** (Future、Task、ループ、`sleep`、`gather`、
