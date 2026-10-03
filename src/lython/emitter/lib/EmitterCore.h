@@ -54,14 +54,7 @@ private:
   bool requireStaticEvidence(const parser::Node &anchor,
                              const CallInferenceResult &inference);
   bool requireStaticEvidence(const parser::Node &anchor,
-                             const AwaitInferenceResult &inference);
-  bool requireStaticEvidence(const parser::Node &anchor,
                              const YieldFromInferenceResult &inference);
-  bool requireStaticEvidence(const parser::Node &anchor,
-                             const AsyncIterationInferenceResult &inference);
-  bool
-  requireStaticEvidence(const parser::Node &anchor,
-                        const AsyncContextMethodInferenceResult &inference);
   void predeclareTopLevel();
   void predeclareSourceModules();
   void declareJsHostModule();
@@ -1070,10 +1063,7 @@ private:
                            const parser::Node &sliceNode);
   Value emitAttribute(const parser::Node &expr);
   Value emitAwait(const parser::Node &expr);
-  Value emitAsyncioRunCall(const parser::Node &expr);
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable);
-  Value emitAwaitValue(const parser::Node &anchor, Value awaitable,
-                       const AwaitInferenceResult &inference);
   // The element type an EMPTY container literal inside `literal` takes from
   // its siblings; null unless `element` is one (EmitterExpressions.cpp).
   mlir::Type siblingExpectationFor(const parser::Node &literal,
@@ -1315,6 +1305,9 @@ private:
   // facts (fields, methods, MRO) before the statement it appears in
   // finishes.
   bool genericClassEmissionReady = false;
+  // Nonzero while a module's names are being bound for an emission in its
+  // scope (`emitInDefiningModuleScope`).
+  unsigned definingScopeSetupDepth = 0;
   parser::Diagnostics diagnostics;
   llvm::StringMap<Value> values;
   llvm::StringMap<PrimitiveConstant> primitiveConstants;
@@ -1342,8 +1335,13 @@ private:
     std::string symbolName;
     std::string kind;
     std::string contractName;
+    // The module the class was declared in, when it is not the one being
+    // emitted: its body reads that module's names.
+    const EmitOptions::SourceModule *source = nullptr;
   };
   std::vector<DeferredMethodBody> deferredMethodBodies;
+  // The module `emitInDefiningModuleScope` is emitting in, if any.
+  const EmitOptions::SourceModule *activeSourceModule = nullptr;
   bool deferClassMethodBodies = false;
   void emitDeferredMethodBodies();
   // Canonical (resolved) base contract names per class, in declaration order.
@@ -1536,6 +1534,13 @@ private:
   // `yield` is checked against it at its own site, where the flow facts a guard
   // proved are available and the whole-body walk's are not.
   mlir::Type currentGeneratorYieldType;
+  // The bound-method wrapper emitted for (method body, receiver type, bound
+  // class), reused by every later read of the same method off the same type.
+  llvm::DenseMap<std::tuple<const parser::Node *, mlir::Type, mlir::Type>,
+                 std::string>
+      boundMethodWrappers;
+  // The body being emitted is a coroutine's: `await` is legal in it.
+  bool currentFunctionIsCoroutine = false;
   std::string currentFunctionPrefix;
   std::vector<parser::NodePtr> synthesizedDefaultProviders;
   // Non-constant defaults of MODULE-level defs (R6): evaluated once when

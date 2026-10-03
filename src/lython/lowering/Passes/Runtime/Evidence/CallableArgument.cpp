@@ -7,7 +7,6 @@ using namespace callable_evidence;
 mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
   enum EvidenceKind : unsigned {
     CallableEvidence = 1u << 0,
-    CoroutineEvidence = 1u << 1,
   };
 
   struct Slot {
@@ -27,10 +26,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
     auto sameEvidence = [&](const RuntimeArgumentEvidence &candidate) {
       return candidate.functionTarget == evidence.functionTarget &&
              sameTypeSequence(candidate.closureValueTypes,
-                              evidence.closureValueTypes) &&
-             candidate.coroutineTarget == evidence.coroutineTarget &&
-             sameTypeSequence(candidate.coroutineSourceTypes,
-                              evidence.coroutineSourceTypes);
+                              evidence.closureValueTypes);
     };
     if (llvm::any_of(slot.alternatives, sameEvidence))
       return false;
@@ -67,50 +63,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
     return {};
   };
 
-  auto isCoroutineLikeType = [](mlir::Type type) {
-    if (runtimeContractName(type) == "types.CoroutineType")
-      return true;
-    auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(type);
-    return protocol && protocol.getProtocolName() == "Coroutine";
-  };
-
-  auto coroutineEvidenceFromCall =
-      [&](py::CallOp call) -> std::optional<RuntimeArgumentEvidence> {
-    if (!call || call.getNumResults() != 1 ||
-        !isCoroutineLikeType(call.getResult(0).getType()))
-      return std::nullopt;
-
-    mlir::Value callee = stripReturnedObjectView(call.getCallable());
-    auto binding = callee.getDefiningOp<py::BindingRefOp>();
-    if (!binding)
-      return std::nullopt;
-
-    mlir::func::FuncOp target =
-        module.lookupSymbol<mlir::func::FuncOp>(binding.getBinding());
-    if (!target || target.isDeclaration() ||
-        !target->hasAttr("ly.async.body_result"))
-      return std::nullopt;
-
-    py::CallableType callable = callableTypeOf(target);
-    if (!callable)
-      return std::nullopt;
-
-    std::optional<llvm::SmallVector<mlir::Type, 4>> sourceTypes =
-        RuntimeBundleLowerer::collectCallableArgumentSourceTypes(call,
-                                                                 callable);
-    if (!sourceTypes)
-      return std::nullopt;
-
-    llvm::SmallVector<mlir::Type, 4> closureTypes =
-        callableClosureTypes(target);
-    sourceTypes->append(closureTypes.begin(), closureTypes.end());
-
-    RuntimeArgumentEvidence evidence;
-    evidence.coroutineTarget = target.getSymName().str();
-    evidence.coroutineSourceTypes = std::move(*sourceTypes);
-    return evidence;
-  };
-
   auto evidenceAlternativesFromValue = [&](mlir::Value value,
                                            unsigned requiredKinds)
       -> std::optional<llvm::SmallVector<RuntimeArgumentEvidence, 4>> {
@@ -132,16 +84,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
                                             closureTypes.end());
           alternatives.push_back(std::move(evidence));
           coveredKinds |= CallableEvidence;
-        }
-      }
-    }
-
-    if ((requiredKinds & CoroutineEvidence) != 0) {
-      if (auto call = value.getDefiningOp<py::CallOp>()) {
-        if (std::optional<RuntimeArgumentEvidence> evidence =
-                coroutineEvidenceFromCall(call)) {
-          alternatives.push_back(std::move(*evidence));
-          coveredKinds |= CoroutineEvidence;
         }
       }
     }
@@ -223,17 +165,6 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableArgumentEvidenceABIs() {
       unsigned index = argument.getArgNumber();
       if (index < required.size())
         required[index] |= CallableEvidence;
-    });
-    function.walk([&](py::AwaitOp awaitOp) {
-      if (awaitOp->getParentOfType<mlir::func::FuncOp>() != function)
-        return;
-      mlir::Value awaitable = stripReturnedObjectView(awaitOp.getAwaitable());
-      auto argument = mlir::dyn_cast<mlir::BlockArgument>(awaitable);
-      if (!argument || argument.getOwner() != &entry)
-        return;
-      unsigned index = argument.getArgNumber();
-      if (index < required.size())
-        required[index] |= CoroutineEvidence;
     });
     if (llvm::any_of(required, [](char value) { return value != 0; }))
       requirements[function.getSymName()] = std::move(required);

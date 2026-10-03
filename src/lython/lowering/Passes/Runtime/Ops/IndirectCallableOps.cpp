@@ -16,27 +16,6 @@ findCallableAlternative(const RuntimeBundle &callable, llvm::StringRef target) {
   return nullptr;
 }
 
-py::CallableType callableContractForDispatchMatch(mlir::func::FuncOp function,
-                                                  py::CallableType callable) {
-  auto bodyResult =
-      function->getAttrOfType<mlir::TypeAttr>("ly.async.body_result");
-  if (!bodyResult)
-    return callable;
-
-  mlir::MLIRContext *context = function.getContext();
-  mlir::Type object = runtimeContractType(context, "builtins.object");
-  mlir::Type coroutine = py::ContractType::get(
-      context, "types.CoroutineType", {object, object, bodyResult.getValue()});
-  return py::CallableType::get(
-      context, callable.getPositionalTypes(), callable.getKwOnlyTypes(),
-      callable.hasVararg() ? callable.getVarargType() : mlir::Type(),
-      callable.hasKwarg() ? callable.getKwargType() : mlir::Type(),
-      llvm::ArrayRef<mlir::Type>{coroutine}, callable.getPositionalNames(),
-      callable.getKwOnlyNames(), callable.getPositionalDefaults(),
-      callable.getKwOnlyDefaults(), callable.getVarargName(),
-      callable.getKwargName(), callable.getPositionalOnlyCount());
-}
-
 } // namespace
 
 llvm::SmallVector<mlir::func::FuncOp, 8>
@@ -69,6 +48,12 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
     // so once the clone is the target nothing recognises it as one.
     if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function))
       return;
+    // ⛔ Nor is a generator's or a coroutine's body: its `callable_type`
+    // returns what the body returns, and calling the function makes the
+    // generator, which an arm calling the body would not. A
+    // `Callable[[Task], None]` matched the body of `async def _drive(self)`.
+    if (function->hasAttr("ly.generator.body_result"))
+      return;
 
     py::CallableType callable = callableTypeOf(function);
     if (!callable || callable.getResultTypes().size() != 1)
@@ -82,9 +67,7 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
         !findCallableAlternative(callableBundle, functionName))
       return;
 
-    py::CallableType matchCallable =
-        callableContractForDispatchMatch(function, callable);
-    if (!py::isAssignableTo(matchCallable, expected, op.getOperation()))
+    if (!py::isAssignableTo(callable, expected, op.getOperation()))
       return;
     if (!RuntimeBundleLowerer::collectCallableArgumentPlan(
             op, callable, /*emitErrors=*/false))
@@ -367,11 +350,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
       return mlir::failure();
     RuntimeBundle result;
     bool usedPrimitiveClone = false;
-    if (target->hasAttr("ly.async.body_result")) {
-      if (mlir::failed(RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
-              op, target, targetName, sources, result)))
-        return mlir::failure();
-    } else if (std::optional<std::string> cloneName =
+    if (std::optional<std::string> cloneName =
                    RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
       if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
         if (mlir::func::FuncOp clone =
@@ -384,7 +363,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
         }
       }
     }
-    if (!target->hasAttr("ly.async.body_result") && !usedPrimitiveClone) {
+    if (!usedPrimitiveClone) {
       mlir::FailureOr<mlir::func::CallOp> call =
           RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
               op, target, targetName, sources);
@@ -554,11 +533,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
       return mlir::failure();
     RuntimeBundle targetResult;
     bool usedPrimitiveClone = false;
-    if (target->hasAttr("ly.async.body_result")) {
-      if (mlir::failed(RuntimeBundleLowerer::emitAsyncFunctionTargetCallResult(
-              op, target, targetName, sources, targetResult)))
-        return mlir::failure();
-    } else if (std::optional<std::string> cloneName =
+    if (std::optional<std::string> cloneName =
                    RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
       if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
         if (mlir::func::FuncOp clone =
@@ -571,7 +546,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
         }
       }
     }
-    if (!target->hasAttr("ly.async.body_result") && !usedPrimitiveClone) {
+    if (!usedPrimitiveClone) {
       mlir::FailureOr<mlir::func::CallOp> call =
           RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
               op, target, targetName, sources);

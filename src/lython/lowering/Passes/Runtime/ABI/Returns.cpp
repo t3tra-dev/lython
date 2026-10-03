@@ -217,10 +217,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       logicalResultTypes.append(callable.getResultTypes().begin(),
                                 callable.getResultTypes().end());
 
-    auto returnedCoroutine =
-        returnedCoroutineSummaries.find(function.getSymName());
-    auto returnedObjectEvidence =
-        returnedObjectEvidenceSummaries.find(function.getSymName());
     auto returnedStaticObject =
         returnedStaticObjectSummaries.find(function.getSymName());
     mlir::FunctionType functionType = function.getFunctionType();
@@ -595,89 +591,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
                                             objectContract))) {
           result = mlir::failure();
           return mlir::WalkResult::interrupt();
-        }
-      }
-      if (returnedCoroutine != returnedCoroutineSummaries.end() &&
-          bundle->kind == RuntimeBundle::Kind::Object &&
-          !bundle->coroutineTarget.empty() &&
-          (isCoroutineLikeResultType(logicalResultType) ||
-           isAwaitIteratorLikeResultType(logicalResultType))) {
-        if (bundle->coroutineTarget != returnedCoroutine->second.target) {
-          op.emitError()
-              << "returned coroutine target evidence does not match function "
-                 "ABI summary";
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        if (bundle->coroutineSources.size() !=
-            returnedCoroutine->second.sourceContracts.size()) {
-          op.emitError() << "returned coroutine frame source count does not "
-                            "match function ABI summary";
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        for (auto [index, source] : llvm::enumerate(bundle->coroutineSources)) {
-          mlir::Type expected =
-              returnedCoroutine->second.sourceContracts[index];
-          if (runtimeContractName(source.contract) !=
-              runtimeContractName(expected)) {
-            op.emitError() << "returned coroutine frame source " << index
-                           << " has contract " << source.contract
-                           << ", expected " << expected;
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
-          RuntimeBundle sourceBundle =
-              index < bundle->coroutineSourceBundles.size() &&
-                      bundle->coroutineSourceBundles[index]
-                  ? *bundle->coroutineSourceBundles[index]
-                  : RuntimeBundle::object(source.contract, source.values);
-          sourceBundle.contract = source.contract;
-          sourceBundle.objectValue = source;
-          if (mlir::failed(appendReturnObject(
-                  sourceBundle, "coroutine frame source", expected))) {
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
-        }
-      }
-      if (returnedObjectEvidence != returnedObjectEvidenceSummaries.end() &&
-          returnedObjectEvidence->second.resultIndex == logicalResultIndex) {
-        for (llvm::StringRef flag : returnedObjectEvidence->second.flags) {
-          if (!bundle->objectEvidence.hasFlag(flag)) {
-            op.emitError() << "returned object evidence for "
-                           << function.getSymName() << " is missing flag '"
-                           << flag << "'";
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
-        }
-        for (const ReturnedObjectEvidenceSlot &slot :
-             returnedObjectEvidence->second.slots) {
-          const RuntimeValue *value = bundle->objectEvidence.slot(slot.name);
-          if (!value) {
-            op.emitError() << "returned object evidence for "
-                           << function.getSymName() << " is missing slot '"
-                           << slot.name << "'";
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
-          if (runtimeContractName(value->contract) !=
-              runtimeContractName(slot.sourceContract)) {
-            op.emitError() << "returned object evidence slot '" << slot.name
-                           << "' has contract " << value->contract
-                           << ", expected " << slot.sourceContract;
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
-          RuntimeBundle valueBundle =
-              RuntimeBundle::object(value->contract, value->values);
-          if (mlir::failed(appendReturnObject(valueBundle,
-                                              "returned object evidence slot",
-                                              slot.sourceContract))) {
-            result = mlir::failure();
-            return mlir::WalkResult::interrupt();
-          }
         }
       }
       ++logicalResultIndex;

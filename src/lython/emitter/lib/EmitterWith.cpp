@@ -22,12 +22,11 @@ void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {
         // `async with R():` over a Python context manager reached the lowering
         // and was refused there -- "runtime manifest has no R.__aexit__
         // method" -- while the synchronous spelling of the same class worked.
-        // ⛔ NOT awaited here: the inline dispatch emits the method BODY, so
-        // what comes back is the value the coroutine would have resolved to.
-        // The manifest arm awaits because its op yields an awaitable object.
+        // The method is a coroutine function like any `async def`: calling it
+        // makes the coroutine, and the `async with` awaits it.
         if (std::optional<Value> opened =
                 tryEmitClassDunder(item, contextValue, "__aenter__")) {
-          entered = *opened;
+          entered = emitAwaitValue(item, *opened);
           if (const parser::Node *optional = ast::node(item, "optional_vars"))
             emitAssignTarget(*optional, entered);
           if (std::optional<MethodBinding> exit =
@@ -36,19 +35,14 @@ void ModuleEmitter::emitWithEnter(const parser::Node &item, bool async) {
           activeWithCleanups.push_back(WithCleanup{contextValue, async});
           return;
         }
-        AsyncContextMethodInferenceResult enterInference =
-            types.inferAsyncContextEnterWithEvidence(contextValue.type);
-        if (!requireStaticEvidence(item, enterInference))
-          return;
-        auto enter = py::AEnterOp::create(
-            builder, loc(item), enterInference.awaitableType, "__aenter__",
-            callProtocolFor(enterInference.method), contextValue.value,
-            mlir::UnitAttr());
-        entered =
-            emitAwaitValue(item,
-                           Value{enter.getResult(),
-                                 enterInference.awaitableType},
-                           enterInference.awaitResult);
+        // ⛔ No manifest arm: an `__aenter__` is a coroutine function, and
+        // no native class has one -- asyncio is Python (runtime/lib).
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, item.range.start,
+            "async with needs a class that defines __aenter__ and __aexit__ "
+            "in Python; " +
+                typeText(contextValue.type) + " defines no __aenter__"});
+        return;
       } else if (std::optional<Value> opened =
                      tryEmitClassDunder(item, contextValue, "__enter__")) {
         // ⭐ A context manager written in Python. `py.enter` is answered from
@@ -241,27 +235,15 @@ void ModuleEmitter::emitWithCleanup(const parser::Node &anchor,
     // constraint here.
     if (std::optional<Value> exited = tryEmitClassDunder(
             anchor, cleanup.manager, "__aexit__", {none, exception, none})) {
-      Value suppress = *exited;
+      Value suppress = emitAwaitValue(anchor, *exited);
       emitWithExitDecision(anchor, exceptionNode ? &suppress : nullptr);
       return;
     }
-    // ⛔ Three Nones even on the exception path once the manifest op is what
-    // runs: a manifest __aexit__ is a native function with no slots for the
-    // triple.
-    AsyncContextMethodInferenceResult exitInference =
-        types.inferAsyncContextExitWithEvidence(
-            cleanup.manager.type, {none.type, none.type, none.type});
-    if (!requireStaticEvidence(anchor, exitInference))
-      return;
-    auto exit = py::AExitOp::create(
-        builder, loc(anchor), exitInference.awaitableType, "__aexit__",
-        callProtocolFor(exitInference.method), cleanup.manager.value,
-        none.value, none.value, none.value, mlir::UnitAttr());
-    Value suppress =
-        emitAwaitValue(anchor,
-                       Value{exit.getResult(), exitInference.awaitableType},
-                       exitInference.awaitResult);
-    emitWithExitDecision(anchor, exceptionNode ? &suppress : nullptr);
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, anchor.range.start,
+        "async with needs a class that defines __aenter__ and __aexit__ in "
+        "Python; " +
+            typeText(cleanup.manager.type) + " defines no __aexit__"});
     return;
   }
 

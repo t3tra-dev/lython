@@ -22,8 +22,8 @@ struct BuiltinExceptionInfo {
   std::int64_t classId;
   llvm::StringLiteral name;
   std::int64_t baseClassId;
-  // Manifest contract; not always under builtins (CancelledError is asyncio's,
-  // UnsupportedOperation is _io's).
+  // Manifest contract; not always under builtins (UnsupportedOperation is
+  // _io's).
   llvm::StringLiteral contract;
 };
 
@@ -54,8 +54,6 @@ inline constexpr BuiltinExceptionInfo kBuiltinExceptions[] = {
      llvm::StringLiteral("builtins.LookupError")},
     {61, llvm::StringLiteral("ZeroDivisionError"), 59,
      llvm::StringLiteral("builtins.ZeroDivisionError")},
-    {62, llvm::StringLiteral("CancelledError"), 5,
-     llvm::StringLiteral("asyncio.CancelledError")},
     {64, llvm::StringLiteral("SystemExit"), 5,
      llvm::StringLiteral("builtins.SystemExit")},
     {68, llvm::StringLiteral("GeneratorExit"), 5,

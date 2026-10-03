@@ -129,9 +129,6 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(
   target = *selected;
   targetName = target.getSymName().str();
 
-  if (target->hasAttr("ly.async.body_result"))
-    return RuntimeBundleLowerer::lowerAsyncFunctionTargetCall(
-        op, target, targetName, sources);
   if (target->hasAttr("ly.generator.body_result"))
     return RuntimeBundleLowerer::lowerGeneratorFunctionTargetCall(
         op, target, targetName, sources);
@@ -192,6 +189,13 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
     mlir::Operation *op, mlir::Value resultValue, mlir::func::FuncOp target,
     llvm::StringRef targetName, llvm::ArrayRef<const RuntimeBundle *> sources,
     RuntimeBundle &result) {
+  // A state machine's frame holds the body's own arguments -- the packed
+  // `*args` tuple last -- and nothing the call ABI appends after them for
+  // evidence; those go to a body the state machine does not call.
+  if (auto resumeInfo = generatorResumeClones.find(targetName);
+      resumeInfo != generatorResumeClones.end() &&
+      sources.size() > resumeInfo->second.argumentCount)
+    sources = sources.take_front(resumeInfo->second.argumentCount);
   std::optional<RuntimeSymbol> initializer =
       manifest.initializer("types.GeneratorType", "__new__");
   if (!initializer)
@@ -306,7 +310,7 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
           return op->emitError() << "generator argument " << index
                                  << " has no union value to persist";
         mlir::FailureOr<RuntimeBundle> boxed =
-            RuntimeBundleLowerer::boxUnionForLane(op, *source);
+            RuntimeBundleLowerer::boxForObjectLane(op, *source);
         if (mlir::failed(boxed))
           return mlir::failure();
         mlir::FailureOr<mlir::func::FuncOp> store =
@@ -798,24 +802,9 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
     mlir::Type expectedResult,
     llvm::ArrayRef<const RuntimeBundle *> sources, bool applyReturnedSummaries,
     llvm::StringRef abiLabel, RuntimeBundle &result) {
-  auto returnedCoroutine = returnedCoroutineSummaries.find(targetName);
-  auto returnedObjectEvidence =
-      returnedObjectEvidenceSummaries.find(targetName);
   auto returnedStaticObject = returnedStaticObjectSummaries.find(targetName);
-  mlir::Type primaryResultType = expectedResult;
-  if (returnedCoroutine != returnedCoroutineSummaries.end() &&
-      isCoroutineLikeResultType(expectedResult)) {
-    if (mlir::func::FuncOp coroutineTarget =
-            module.lookupSymbol<mlir::func::FuncOp>(
-                returnedCoroutine->second.target)) {
-      if (mlir::Type concrete =
-              concreteCoroutineTypeForTarget(context, coroutineTarget))
-        primaryResultType = concrete;
-    }
-  }
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> resultTypes =
-      RuntimeBundleLowerer::runtimeValueTypesFor(
-          op, primaryResultType, abiLabel);
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, expectedResult, abiLabel);
   if (mlir::failed(resultTypes))
     return mlir::failure();
   if (call.getNumResults() < resultTypes->size())
@@ -844,7 +833,7 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
        resultIndex < end; ++resultIndex)
     objectValues.push_back(call.getResult(resultIndex));
   if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-          op, primaryResultType, objectValues, result)))
+          op, expectedResult, objectValues, result)))
     return mlir::failure();
   if (mlir::failed(
           consumePrimitiveI64Evidence(expectedResult, result, "result object")))
@@ -877,15 +866,10 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
             objectContract, staticResult, "static returned object evidence")))
       return mlir::failure();
 
-    bool useStaticProtocolObject = false;
-    if (auto protocol =
-            mlir::dyn_cast_if_present<py::ProtocolType>(expectedResult))
-      useStaticProtocolObject =
-          runtimeContractName(expectedResult).empty() &&
-          (py::isAssignableTo(objectContract, expectedResult,
-                              op) ||
-           (protocol.getProtocolName() == "Generator" &&
-            isAwaitIteratorLikeResultType(objectContract)));
+    bool useStaticProtocolObject =
+        mlir::isa_and_present<py::ProtocolType>(expectedResult) &&
+        runtimeContractName(expectedResult).empty() &&
+        py::isAssignableTo(objectContract, expectedResult, op);
     if (useStaticProtocolObject) {
       result = std::move(staticResult);
     } else if (result.kind == RuntimeBundle::Kind::Object) {
@@ -904,45 +888,6 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
       if (staticAssignableToResult)
         result.boxedObject =
             std::make_shared<RuntimeBundle>(std::move(staticResult));
-    }
-  }
-
-  if (returnedCoroutine != returnedCoroutineSummaries.end()) {
-    if (!isCoroutineLikeResultType(expectedResult) &&
-        !isAwaitIteratorLikeResultType(expectedResult))
-      return op->emitError() << "function target '" << targetName
-                            << "' has coroutine return evidence, but result "
-                               "contract is "
-                            << expectedResult;
-
-    result.coroutineTarget = returnedCoroutine->second.target;
-    for (mlir::Type sourceType : returnedCoroutine->second.sourceContracts) {
-      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> sourceTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(
-              op, sourceType, "returned coroutine frame source ABI");
-      if (mlir::failed(sourceTypes))
-        return mlir::failure();
-      if (resultIndex + sourceTypes->size() > call.getNumResults())
-        return op->emitError()
-               << "function target '" << targetName
-               << "' returned too few values for coroutine frame ABI";
-
-      llvm::SmallVector<mlir::Value, 4> sourceValues;
-      for (unsigned end =
-               resultIndex + static_cast<unsigned>(sourceTypes->size());
-           resultIndex < end; ++resultIndex)
-        sourceValues.push_back(call.getResult(resultIndex));
-
-      RuntimeBundle sourceBundle;
-      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-              op, sourceType, sourceValues, sourceBundle)))
-        return mlir::failure();
-      if (mlir::failed(consumePrimitiveI64Evidence(sourceType, sourceBundle,
-                                                   "coroutine frame source")))
-        return mlir::failure();
-      result.coroutineSources.push_back(sourceBundle.objectValue);
-      result.coroutineSourceBundles.push_back(
-          std::make_shared<RuntimeBundle>(sourceBundle));
     }
   }
 
@@ -1075,39 +1020,6 @@ mlir::LogicalResult RuntimeBundleLowerer::consumeFunctionTargetCallResult(
     }
   }
 
-  if (returnedObjectEvidence != returnedObjectEvidenceSummaries.end() &&
-      compatibleRuntimeObjectEvidenceContract(
-          expectedResult, returnedObjectEvidence->second.objectContract)) {
-    for (llvm::StringRef flag : returnedObjectEvidence->second.flags)
-      result.objectEvidence.setFlag(flag);
-    for (const ReturnedObjectEvidenceSlot &slot :
-         returnedObjectEvidence->second.slots) {
-      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> slotTypes =
-          RuntimeBundleLowerer::runtimeValueTypesFor(
-              op, slot.sourceContract, "returned object evidence slot ABI");
-      if (mlir::failed(slotTypes))
-        return mlir::failure();
-      if (resultIndex + slotTypes->size() > call.getNumResults())
-        return op->emitError()
-               << "function target '" << targetName
-               << "' returned too few values for object evidence ABI";
-
-      llvm::SmallVector<mlir::Value, 4> slotValues;
-      for (unsigned end =
-               resultIndex + static_cast<unsigned>(slotTypes->size());
-           resultIndex < end; ++resultIndex)
-        slotValues.push_back(call.getResult(resultIndex));
-
-      RuntimeBundle slotBundle;
-      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-              op, slot.sourceContract, slotValues, slotBundle)))
-        return mlir::failure();
-      if (mlir::failed(consumePrimitiveI64Evidence(
-              slot.sourceContract, slotBundle, "object evidence slot")))
-        return mlir::failure();
-      result.objectEvidence.setSlot(slot.name, slotBundle.objectValue);
-    }
-  }
   if (resultIndex != call.getNumResults())
     return op->emitError() << "function target '" << targetName << "' returned "
                           << call.getNumResults()

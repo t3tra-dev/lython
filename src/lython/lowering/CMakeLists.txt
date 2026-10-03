@@ -38,6 +38,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ctypes/Symbols.cpp
     Passes/Runtime/Js/HostCalls.cpp
     Passes/Runtime/Js/HostErasure.cpp
+    Passes/Runtime/Common/ContractRewrite.cpp
     Passes/Runtime/Evidence/CallableAggregate.cpp
     Passes/Runtime/Evidence/CallableArgument.cpp
     Passes/Runtime/Evidence/CallablePlanning.cpp
@@ -46,9 +47,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Manifest/Calls.cpp
     Passes/Runtime/Manifest/Index.cpp
     Passes/Runtime/Model/Support.cpp
-    Passes/Runtime/Ops/AsyncCallableOps.cpp
     Passes/Runtime/Ops/AttributeOps.cpp
-    Passes/Runtime/Ops/AwaitOps.cpp
     Passes/Runtime/Ops/CallableOps.cpp
     Passes/Runtime/Ops/ExceptionOps.cpp
     Passes/Runtime/Ops/FunctionTargetCalls.cpp
@@ -63,7 +62,6 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ops/SpecialMethodOps.cpp
     Passes/Runtime/Ops/TryOps.cpp
     Passes/Runtime/Ops/UnionOps.cpp
-    Passes/Runtime/Passes/AsyncThunk.cpp
     Passes/Runtime/Passes/Lowering.cpp
     Passes/Runtime/Passes/Ownership.cpp
     Passes/Runtime/Passes/RefCountElision.cpp

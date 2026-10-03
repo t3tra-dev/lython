@@ -698,15 +698,6 @@ RuntimeManifestIndex::verifyBuiltinCallable(RuntimeSymbol &symbol) {
     return mlir::success();
   }
 
-  if (symbol.builtinLowering == "asyncio_sleep") {
-    if (symbol.resultContract != "types.CoroutineType")
-      return symbol.function.emitError()
-             << "runtime builtin binding " << symbol.builtinName
-             << " with asyncio_sleep lowering must declare "
-                "ly.runtime.result_contract = \"types.CoroutineType\"";
-    return mlir::success();
-  }
-
   return symbol.function.emitError()
          << "runtime builtin binding " << symbol.builtinName
          << " has unsupported lowering strategy " << symbol.builtinLowering;

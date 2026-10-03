@@ -444,24 +444,6 @@ def Py_ExceptCurrentValueOp : Py_Op<"except.current_value", []> {
   let hasVerifier = 1;
 }
 
-def Py_AwaitOp : Py_Op<"await"> {
-  let summary = "Await an object with a resolved __await__ contract";
-  let description = [{
-    Represents Python `await x` after resolving `x.__await__` from the manifest.
-    Awaitable is therefore a structural contract, not a coro/task dialect type.
-    The result type is the return value obtained by driving the iterator
-    produced by `__await__`.
-  }];
-
-  let arguments = (ins TypeAttrOf<Py_ProtocolType>:$await_contract,
-      Py_ContractType:$awaitable);
-  let results = (outs Py_ContractType:$result);
-  let assemblyFormat =
-      "$await_contract `(` $awaitable `:` type($awaitable) `)` "
-      "attr-dict `->` type($result)";
-  let hasVerifier = 1;
-}
-
 //===----------------------------------------------------------------------===//
 // Resolved special-method protocol operations
 //===----------------------------------------------------------------------===//
@@ -550,50 +532,6 @@ def Py_ExitOp : Py_Op<"exit"> {
     Represents `manager.__exit__(exc_type, exc_value, traceback)` after the
     frontend has resolved the matching ContextManager contract from
     runtime/typing.mlir and selected the concrete method implementation.
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target,
-      TypeAttrOf<Py_ProtocolType>:$callee_contract, Py_ContractType:$manager,
-      Py_ContractType:$exc_type, Py_ContractType:$exc_value,
-      Py_ContractType:$traceback, OptionalAttr<UnitAttr>:$async_method);
-
-  let results = (outs Py_ContractType:$result);
-
-  let assemblyFormat =
-      "$target `:` $callee_contract `(` $manager `:` type($manager) `,` "
-      "$exc_type `:` type($exc_type) `,` $exc_value `:` type($exc_value) `,` "
-      "$traceback `:` type($traceback) `)` attr-dict `->` type($result)";
-  let hasVerifier = 1;
-}
-
-def Py_AEnterOp : Py_Op<"aenter"> {
-  let summary = "Invoke a statically resolved __aenter__ contract";
-  let description = [{
-    Represents `manager.__aenter__()` after the frontend has resolved the
-    matching AsyncContextManager contract from runtime/typing.mlir and selected
-    the concrete method implementation. The result is the awaitable produced by
-    the special method.
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target,
-      TypeAttrOf<Py_ProtocolType>:$callee_contract, Py_ContractType:$manager,
-      OptionalAttr<UnitAttr>:$async_method);
-
-  let results = (outs Py_ContractType:$result);
-
-  let assemblyFormat =
-      "$target `:` $callee_contract `(` $manager `:` type($manager) `)` "
-      "attr-dict `->` type($result)";
-  let hasVerifier = 1;
-}
-
-def Py_AExitOp : Py_Op<"aexit"> {
-  let summary = "Invoke a statically resolved __aexit__ contract";
-  let description = [{
-    Represents `manager.__aexit__(exc_type, exc_value, traceback)` after the
-    frontend has resolved the matching AsyncContextManager contract from
-    runtime/typing.mlir and selected the concrete method implementation. The
-    result is the awaitable produced by the special method.
   }];
 
   let arguments = (ins FlatSymbolRefAttr:$target,
@@ -1329,47 +1267,6 @@ def Py_NextOp : Py_Op<"next", [AllTypesMatch<["iterator", "next"]>]> {
 
   let assemblyFormat = "$target `:` $callee_contract `(` $iterator `:` "
                        "type($iterator) `)` attr-dict `->` type($element)";
-  let hasVerifier = 1;
-}
-
-def Py_AIterOp : Py_Op<"aiter", []> {
-  let summary = "Invoke a statically resolved __aiter__ contract";
-  let description = [{
-    Represents `async_iterable.__aiter__()` after manifest contract resolution.
-    `AsyncIterable` and `AsyncIterator` are typing.mlir contracts; this op only
-    records the selected special method and its instantiated protocol contract.
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target,
-      TypeAttrOf<Py_ProtocolType>:$callee_contract,
-      Py_ContractType:$async_iterable, OptionalAttr<UnitAttr>:$returned_self);
-
-  let results = (outs Py_ContractType:$result);
-
-  let assemblyFormat =
-      "$target `:` $callee_contract `(` $async_iterable `:` "
-      "type($async_iterable) `)` attr-dict `->` type($result)";
-  let hasVerifier = 1;
-}
-
-def Py_ANextOp : Py_Op<"anext"> {
-  let summary = "Invoke a statically resolved __anext__ contract";
-  let description = [{
-    Represents `async_iterator.__anext__()` after manifest contract resolution.
-    The result is the awaitable returned by `__anext__`; awaiting it is expressed
-    by `py.await`, and `StopAsyncIteration` handling remains ordinary exception
-    control flow rather than a separate async-next dialect primitive.
-  }];
-
-  let arguments = (ins FlatSymbolRefAttr:$target,
-      TypeAttrOf<Py_ProtocolType>:$callee_contract,
-      Py_ContractType:$async_iterator);
-
-  let results = (outs Py_ContractType:$awaitable);
-
-  let assemblyFormat =
-      "$target `:` $callee_contract `(` $async_iterator `:` "
-      "type($async_iterator) `)` attr-dict `->` type($awaitable)";
   let hasVerifier = 1;
 }
 

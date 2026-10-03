@@ -19,27 +19,6 @@
 
 namespace py::lowering {
 
-inline constexpr llvm::StringLiteral kFutureResultSlot{"asyncio.future.result"};
-inline constexpr llvm::StringLiteral kFutureExceptionSlot{
-    "asyncio.future.exception"};
-inline constexpr llvm::StringLiteral kFutureCancelMessageSlot{
-    "asyncio.future.cancel_message"};
-inline constexpr llvm::StringLiteral kFutureCancelledFlag{
-    "asyncio.future.cancelled"};
-inline constexpr llvm::StringLiteral kCoroutineAwaitConsumedFlag{
-    "asyncio.coroutine.await_consumed"};
-inline constexpr llvm::StringLiteral kAsyncioSleepDelaySlot{
-    "asyncio.sleep.delay"};
-inline constexpr llvm::StringLiteral kAsyncioSleepResultSlot{
-    "asyncio.sleep.result"};
-inline constexpr llvm::StringLiteral kAsyncioSleepZeroDelayFlag{
-    "asyncio.sleep.zero_delay"};
-inline constexpr llvm::StringLiteral kAsyncioSleepTimerPendingFlag{
-    "asyncio.sleep.timer_pending"};
-inline constexpr llvm::StringLiteral kAsyncioSleepTimerScheduledFlag{
-    "asyncio.sleep.timer_scheduled"};
-inline constexpr llvm::StringLiteral kAsyncioSleepLoopSlot{
-    "asyncio.sleep.loop"};
 inline constexpr llvm::StringLiteral kCurrentExceptionBorrowFlag{
     "exception.current.borrow"};
 
@@ -203,9 +182,6 @@ struct RuntimeBundle {
   llvm::SmallVector<RuntimeCallableAlternative, 4> callableAlternatives;
   std::shared_ptr<RuntimeBundle> boundMethodReceiver;
   std::string boundMethodName;
-  std::string coroutineTarget;
-  llvm::SmallVector<RuntimeValue, 8> coroutineSources;
-  llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> coroutineSourceBundles;
   std::string generatorTarget;
   llvm::SmallVector<RuntimeValue, 8> generatorSources;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> generatorSourceBundles;
@@ -277,16 +253,6 @@ struct RuntimeBundle {
   withObjectOwnership(ownership::OwnershipKind ownership) const;
 };
 
-inline bool hasFutureTerminalEvidence(const RuntimeBundle &future) {
-  return future.objectEvidence.slot(kFutureResultSlot) ||
-         future.objectEvidence.slot(kFutureExceptionSlot) ||
-         future.objectEvidence.hasFlag(kFutureCancelledFlag);
-}
-
-inline bool hasAsyncioSleepEvidence(const RuntimeBundle &coroutine) {
-  return coroutine.objectEvidence.slot(kAsyncioSleepResultSlot);
-}
-
 struct CallableLogicalEntryArgs {
   mlir::func::FuncOp function;
   unsigned count = 0;
@@ -351,23 +317,6 @@ struct ReturnedCallableSummary {
   llvm::SmallVector<ReturnedCallableAlternativeSummary, 4> alternatives;
 };
 
-struct ReturnedCoroutineSummary {
-  std::string target;
-  llvm::SmallVector<mlir::Type, 4> sourceContracts;
-};
-
-struct ReturnedObjectEvidenceSlot {
-  std::string name;
-  mlir::Type sourceContract;
-};
-
-struct ReturnedObjectEvidenceSummary {
-  mlir::Type objectContract;
-  unsigned resultIndex = 0;
-  llvm::SmallVector<std::string, 4> flags;
-  llvm::SmallVector<ReturnedObjectEvidenceSlot, 4> slots;
-};
-
 struct ReturnedStaticObjectSummary {
   mlir::Type objectContract;
   unsigned resultIndex = 0;
@@ -393,12 +342,9 @@ struct CallableArgumentPlan {
 struct RuntimeArgumentEvidence {
   std::string functionTarget;
   llvm::SmallVector<mlir::Type, 4> closureValueTypes;
-  std::string coroutineTarget;
-  llvm::SmallVector<mlir::Type, 4> coroutineSourceTypes;
 
   bool empty() const {
-    return functionTarget.empty() && closureValueTypes.empty() &&
-           coroutineTarget.empty() && coroutineSourceTypes.empty();
+    return functionTarget.empty() && closureValueTypes.empty();
   }
 };
 

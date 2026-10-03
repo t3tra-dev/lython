@@ -1804,7 +1804,6 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
   mlir::Type iteratorType;
   Value iteratorValue;
   Value sourceIteratorReceiver;
-  std::optional<AsyncIterationInferenceResult> staticIteration;
   if (std::optional<MethodBinding> sourceAiter =
           lookupClassMethod(methodIterable.type, "__aiter__")) {
     if (sourceAiter->async) {
@@ -1821,19 +1820,13 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
         sourceIteratorReceiver = methodIterable;
     }
   } else {
-    AsyncIterationInferenceResult iterInference =
-        types.inferAsyncIterationWithEvidence(iterable.type);
-    if (!requireStaticEvidence(statement, iterInference))
-      return;
-    iteratorType = iterInference.iteratorType;
-    mlir::UnitAttr returnedSelf = iteratorType == iterable.type
-                                      ? builder.getUnitAttr()
-                                      : mlir::UnitAttr();
-    auto iterator = py::AIterOp::create(
-        builder, loc(statement), iteratorType, "__aiter__",
-        callProtocolFor(iterInference.aiter), iterable.value, returnedSelf);
-    iteratorValue = Value{iterator.getResult(), iteratorType};
-    staticIteration = iterInference;
+    // ⛔ No manifest arm, for the reason `async with` has none.
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "async for needs a class that defines __aiter__ and __anext__ in "
+        "Python; " +
+            typeText(iterable.type) + " defines no __aiter__"});
+    return;
   }
 
   Value sourceAnextReceiver =
@@ -1844,6 +1837,14 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
             lookupClassMethod(sourceAnextReceiver.type, "__anext__")) {
       sourceAnextMethod = *method;
     }
+  if (!sourceAnextMethod) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, statement.range.start,
+        "async for needs a class that defines __aiter__ and __anext__ in "
+        "Python; " +
+            typeText(iteratorType) + " defines no __anext__"});
+    return;
+  }
 
   mlir::Block *entryBlock = builder.getInsertionBlock();
   mlir::Region *region = entryBlock ? entryBlock->getParent() : nullptr;
@@ -1886,48 +1887,22 @@ void ModuleEmitter::emitAsyncFor(const parser::Node &statement) {
   mlir::Block *tryBlock = new mlir::Block;
   tryOp.getTryRegion().push_back(tryBlock);
   builder.setInsertionPointToStart(tryBlock);
-  mlir::Type awaitableType;
   Value awaitable;
-  if (sourceAnextMethod) {
+  {
     if (sourceAnextMethod->async) {
-      if (sourceAnextMethod->symbolName.empty()) {
-        diagnostics.push_back(parser::Diagnostic{
-            parser::Severity::Error, statement.range.start,
-            "async __anext__ method has no lowered callable symbol"});
-        awaitable = emitNone(statement);
-      } else {
-        Value sourceAnextCallable = emitMethodObject(
-            statement, sourceAnextReceiver, *sourceAnextMethod);
-        awaitable = emitCallableDispatch(
-            statement, sourceAnextCallable,
-            emitCallOperands(statement, {}, /*includeAstArguments=*/false));
-      }
+      // ⛔ Not through the bound method object: it captures the receiver in
+      // a closure, and the coroutine's frame has no lane for a capture
+      // ("cannot carry a value of contract 'Ticker' across a suspension").
+      // The dunder call passes the receiver as a positional.
+      std::optional<Value> made =
+          tryEmitClassDunder(statement, sourceAnextReceiver, "__anext__");
+      awaitable = made ? *made : emitNone(statement);
     } else {
       awaitable = emitInlineMethodCall(statement, sourceAnextReceiver,
                                        *sourceAnextMethod);
     }
-    awaitableType = awaitable.type;
-  } else if (staticIteration) {
-    awaitableType = staticIteration->nextAwaitableType;
-    auto next = py::ANextOp::create(
-        builder, loc(statement), awaitableType, "__anext__",
-        callProtocolFor(staticIteration->anext), iteratorValue.value);
-    awaitable = Value{next.getAwaitable(), awaitableType};
-  } else {
-    CallInferenceResult nextInference =
-        types.inferMethodCallWithEvidence(iteratorType, "__anext__", {});
-    if (!requireStaticEvidence(statement, nextInference))
-      return;
-    if (nextInference)
-      awaitableType = nextInference.resultType;
-    auto next = py::ANextOp::create(builder, loc(statement), awaitableType,
-                                    "__anext__", callProtocolFor(nextInference),
-                                    iteratorValue.value);
-    awaitable = Value{next.getAwaitable(), awaitableType};
   }
-  Value item = staticIteration ? emitAwaitValue(statement, awaitable,
-                                                staticIteration->awaitNext)
-                               : emitAwaitValue(statement, awaitable);
+  Value item = emitAwaitValue(statement, awaitable);
   {
     ScopedEmitterScope scope(values, types);
     emitAssignTarget(*ast::node(statement, "target"), item);

@@ -2198,3 +2198,70 @@ TEST(EmitterTest, AYieldUnderAWhileGuardTakesTheAnnotation) {
       context);
   EXPECT_TRUE(emitted.ok());
 }
+
+// What: `await` reaches only what can suspend -- a coroutine, or an object
+// whose class defines `__await__` -- and only inside `async def`.
+TEST(EmitterTest, AnAwaitTakesACoroutineInsideACoroutine) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult outside = emitSource(
+      "async def one() -> int:\n"
+      "    return 1\n\n\n"
+      "def f() -> None:\n"
+      "    await one()\n",
+      context);
+  EXPECT_TRUE(reportsDiagnostic(outside, "'await' outside an async function"));
+  lython::emitter::EmitResult notAwaitable = emitSource(
+      "async def f() -> None:\n"
+      "    await 3\n",
+      context);
+  EXPECT_TRUE(reportsDiagnostic(
+      notAwaitable,
+      "await needs a coroutine or an object whose class defines __await__"));
+  lython::emitter::EmitResult awaited = emitSource(
+      "from typing import Generator\n\n\n"
+      "class Ready:\n"
+      "    def __await__(self) -> Generator[object, None, int]:\n"
+      "        yield None\n"
+      "        return 2\n\n\n"
+      "async def one() -> int:\n"
+      "    return 1\n\n\n"
+      "async def f() -> int:\n"
+      "    return await one() + await Ready()\n",
+      context);
+  EXPECT_TRUE(awaited.ok());
+}
+
+// What: `async with` and `async for` call Python dunders; a class without
+// them is refused by name, with the dunder it lacks.
+TEST(EmitterTest, AsyncWithAndAsyncForNameTheMissingDunder) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult syncManager = emitSource(
+      "class Plain:\n"
+      "    def __enter__(self) -> \"Plain\":\n"
+      "        return self\n\n"
+      "    def __exit__(self, a: object, b: object, c: object) -> None:\n"
+      "        pass\n\n\n"
+      "async def f() -> None:\n"
+      "    async with Plain():\n"
+      "        pass\n",
+      context);
+  EXPECT_TRUE(reportsDiagnostic(syncManager, "defines no __aenter__"));
+  lython::emitter::EmitResult list = emitSource(
+      "async def f() -> None:\n"
+      "    async for x in [1, 2]:\n"
+      "        print(x)\n",
+      context);
+  EXPECT_TRUE(reportsDiagnostic(list, "defines no __aiter__"));
+}
+
+// What: an async generator is refused where it is defined.
+TEST(EmitterTest, AnAsyncGeneratorIsRefusedAtItsDefinition) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted = emitSource(
+      "from typing import AsyncIterator\n\n\n"
+      "async def ticks() -> AsyncIterator[int]:\n"
+      "    yield 1\n",
+      context);
+  EXPECT_TRUE(reportsDiagnostic(
+      emitted, "async generator function lowering is not implemented yet"));
+}

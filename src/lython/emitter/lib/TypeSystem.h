@@ -42,6 +42,10 @@ struct FunctionSignature {
   bool isAsyncFunction = false;
   bool isGeneratorFunction = false;
   bool isAsyncGeneratorFunction = false;
+  // An `async def` without `yield`: its body is a generator's -- one that
+  // yields `object` (what it awaits hands to the task) and returns the
+  // declared result -- and calling it makes a `types.CoroutineType`.
+  bool isCoroutineFunction = false;
   // The mismatch MESSAGE, not a flag: the two types are known only here, and
   // "incompatible with inferred Generator contract" left the reader to guess
   // which of the yield, send and return channels disagreed.
@@ -121,36 +125,6 @@ struct YieldFromInferenceResult {
     return resolved && static_cast<bool>(elementType) &&
            static_cast<bool>(completionType) &&
            static_cast<bool>(protocolContract);
-  }
-};
-
-struct AsyncIterationInferenceResult {
-  mlir::Type iteratorType;
-  mlir::Type nextAwaitableType;
-  mlir::Type itemType;
-  CallInferenceResult aiter;
-  CallInferenceResult anext;
-  AwaitInferenceResult awaitNext;
-  bool resolved = false;
-  std::string failureReason;
-
-  explicit operator bool() const {
-    return resolved && static_cast<bool>(iteratorType) &&
-           static_cast<bool>(itemType);
-  }
-};
-
-struct AsyncContextMethodInferenceResult {
-  mlir::Type awaitableType;
-  mlir::Type resultType;
-  CallInferenceResult method;
-  AwaitInferenceResult awaitResult;
-  bool resolved = false;
-  std::string failureReason;
-
-  explicit operator bool() const {
-    return resolved && static_cast<bool>(awaitableType) &&
-           static_cast<bool>(resultType);
   }
 };
 
@@ -428,12 +402,6 @@ public:
   AwaitInferenceResult inferAwaitWithEvidence(mlir::Type awaitableType) const;
   YieldFromInferenceResult
   inferYieldFromWithEvidence(mlir::Type sourceType) const;
-  AsyncIterationInferenceResult
-  inferAsyncIterationWithEvidence(mlir::Type iterableType) const;
-  AsyncContextMethodInferenceResult
-  inferAsyncContextEnterWithEvidence(mlir::Type managerType) const;
-  AsyncContextMethodInferenceResult inferAsyncContextExitWithEvidence(
-      mlir::Type managerType, mlir::ArrayRef<mlir::Type> exceptionTypes) const;
   mlir::Type inferCall(mlir::Type calleeType,
                        mlir::ArrayRef<mlir::Type> positional,
                        mlir::ArrayRef<CallKeywordType> keywords) const;

@@ -83,8 +83,51 @@ asyncio を CPython の形で載せる。JSPI はその後で WASI 側に繋ぐ�
      委譲は、実行時の委譲になる)。
 4. **コルーチンを状態機械に載せる**。`async def` を generator として扱い、
    `await` を `yield from __await__()` にする。今の同期的な経路は廃止する。
+   - **済 (2026-10-04)**。`async def` は、yield が object、send が None、
+     戻り値が R の generator 本体になる (公開の型は
+     `types.CoroutineType[object, None, R]`。Phase 8d が
+     `types.GeneratorType` に書き換える)。yield を持たないコルーチンも状態機械に
+     載せる。`await x` は、x がコルーチンならそれ自身への、そうでなければ
+     `x.__await__()` への `yield from` になる。`async with` は
+     `__aenter__`/`__aexit__` を、`async for` は `__aiter__`/`__anext__` を、
+     それぞれ Python で書いたクラスのメソッドとして呼んで await する。
+     中断し得る dunder は、本体をインライン展開せずに symbol で呼ぶ
+     (インライン展開すると、呼んだ場所で本体を最後まで実行してしまう)。
+   - 旧モデル (`py.await`、`py.aenter`、`py.aexit`、`py.aiter`、`py.anext`、
+     AsyncThunk、`modules/asyncio.mlir`、`_asyncio.mlir`、coroutine の
+     evidence) は削除した。manifest のクラスで `async with` / `async for` を
+     使うと、欠けている dunder を名指しで拒否する。
+   - 拒否するもの: async generator (`async def` の中の `yield`。定義の場所で
+     拒否する)、async の `__aiter__`、async for/else、async for の中の return。
 5. **asyncio を Python で書く** (Future、Task、ループ、`sleep`、`gather`、
    `create_task`)。CPython と同じ出力の golden で確かめる。
+   - **済 (2026-10-04)**: `src/lython/runtime/lib/asyncio.py`。CPython の
+     events.py、base_events.py、futures.py、tasks.py の移植。CPython からの
+     逸脱は、ファイル冒頭の docstring に列挙してある。主なもの:
+     - Task は Future の派生ではない。両方とも `_Waiter` から派生する。
+     - コールバックは引数を取らない。
+     - Task は、コルーチンの結果を `StopIteration.value` からではなく、
+       それを await する包みのコルーチンから受け取る。
+     - ループは `create_future()` を持たない。
+   - golden: `asyncio_tasks_interleave_and_settle` (交互の実行、gather、
+     タイマーの順序、例外、cancel、Future)、
+     `an_async_for_suspends_inside_anext`。
+   - 途中で直した欠陥:
+     - 空の union member から例外の message を読んでいた
+       (`BaseException | None` が None のときの segfault)。
+     - 関数参照が await をまたいで生きていた。
+     - 同じ値を 2 本の block 引数に渡す edge で、所有権の挿入と検証が
+       食い違っていた。挿入の前に 1 本にまとめる。
+     - union 読み出し用の box adapter が、StepFull の戻り値の所有権を
+       落としていた。
+   - 残った穴 (asyncio はこれらに依存しないように書いてある):
+     - generic クラスが、自分の型引数を持つ generic な基底から派生できない
+       (`class B(A[T])`)。
+     - 基底クラスが宣言される前に特殊化された generic クラスは、基底の
+       フィールドを持たない。
+     - generic なサブクラスに対する仮想ディスパッチがない。
+     - `isinstance(o, int)` で object を絞り込めない。
+     - int 以外のオブジェクトを `send` できない (段階 2 から持ち越し)。
 6. **JS との接続**: Promise と Future の橋渡し、WebLoop。
 7. **WASI 側で JSPI に繋ぐ**。
 

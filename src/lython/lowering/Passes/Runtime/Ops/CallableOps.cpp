@@ -152,8 +152,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCall(py::CallOp op) {
     return RuntimeBundleLowerer::lowerBuiltinMethodSinkCall(op, *builtin);
   if (builtin->builtinLowering == "direct")
     return RuntimeBundleLowerer::lowerDirectBuiltinCall(op, *builtin);
-  if (builtin->builtinLowering == "asyncio_sleep")
-    return RuntimeBundleLowerer::lowerAsyncioSleepCall(op, *builtin);
   return op.emitError() << "builtin callable '" << callable->binding
                         << "' has unsupported lowering strategy '"
                         << builtin->builtinLowering << "'";
@@ -513,11 +511,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       mlir::failed(requireEmptyAggregate(op, op.getKwvalues(), "kw values")))
     return mlir::failure();
 
-  auto receiverIt = valueBundles.find(op.getCallable());
-  if (receiverIt != valueBundles.end() &&
-      receiverIt->second.contractName() == "_asyncio.Future")
-    return RuntimeBundleLowerer::lowerFutureBoundMethod(op, receiverIt->second,
-                                                        methodName);
   if (receiver.ctypes &&
       receiver.ctypes->kind == RuntimeCtypesEvidence::Kind::Module)
     return RuntimeBundleLowerer::lowerStaticCtypesModuleCall(op, receiver,

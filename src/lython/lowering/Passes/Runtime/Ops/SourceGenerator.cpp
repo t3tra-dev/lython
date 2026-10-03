@@ -1290,7 +1290,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorAdvance(
         receiver.generatorTarget.empty()
             ? RuntimeBundleLowerer::emitDispatchedGeneratorResume(
                   op.getOperation(), receiver, op.getResult(0).getType(),
-                  /*raiseWhenExhausted=*/true, sentI64Evidence)
+                  /*raiseWhenExhausted=*/true, sentI64Evidence,
+                  RuntimeBundleLowerer::generatorReturnType(
+                      receiver.contract))
             : RuntimeBundleLowerer::emitStateMachineGeneratorResume(
                   op.getOperation(), receiver, sendResumeInfo->second,
                   /*useCurrentInsertionPoint=*/false, sentI64Evidence,
@@ -1350,16 +1352,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorThrow(
   if (sources.size() != 2 || !sources[1])
     return op.emitError()
            << "source generator throw expects exactly one exception value";
-  if (op.getNumResults() != 1 ||
-      runtimeContractName(op.getResult(0).getType()) != "builtins.int")
-    return op.emitError()
-           << "source generator throw currently supports int yield results";
+  if (op.getNumResults() != 1)
+    return op.emitError() << "source generator throw expects one result";
   const RuntimeBundle &exception = *sources[1];
-  if (!manifest.primitive(exception.contractName(), "raise"))
-    return op.emitError() << "source generator throw exception type "
-                          << exception.contractName()
-                          << " has no raise primitive";
-
   if (receiver.generatorTarget.empty())
     return RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
         op, receiver, nullptr, sources);
@@ -1368,6 +1363,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorThrow(
     return RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
         op, receiver, &throwResumeInfo->second, sources);
 
+  if (runtimeContractName(op.getResult(0).getType()) != "builtins.int")
+    return op.emitError()
+           << "source generator throw currently supports int yield results";
+  if (!manifest.primitive(exception.contractName(), "raise"))
+    return op.emitError() << "source generator throw exception type "
+                          << exception.contractName()
+                          << " has no raise primitive";
   // Inline-dispatch generators have straight-line bodies without handlers,
   // so the exception can never be caught inside the body: closing the
   // generator and raising at the call site is observably CPython's throw().

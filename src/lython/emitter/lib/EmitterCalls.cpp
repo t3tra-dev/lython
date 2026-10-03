@@ -1230,13 +1230,6 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             }
           }
         }
-        if (*canonical == "asyncio.sleep")
-          if (auto symbol = types.lookupSymbol(name))
-            return emitCallableDispatch(
-                expr, emitBindingRef(*calleeNode, *canonical, *symbol),
-                emitCallOperands(expr), types.inferExpr(&expr));
-        if (*canonical == "asyncio.run")
-          return emitAsyncioRunCall(expr);
       }
   }
 
@@ -1256,8 +1249,6 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                 emitStaticStringConstant(expr, binding,
                                          /*allowCallable=*/true))
           return *constant;
-      if (binding == "asyncio.run")
-        return emitAsyncioRunCall(expr);
       // Qualified references to imported generics (module.fn(...)) resolve
       // through the canonical binding to the same registration the bare
       // import-name path uses.
@@ -1283,8 +1274,7 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
         return emitArgumentSpecializedCall(
             expr, *calleeNode, mono->second,
             emitBindingRef(*calleeNode, binding, *symbol));
-      mlir::Type resultOverride =
-          binding == "asyncio.sleep" ? types.inferExpr(&expr) : mlir::Type();
+      mlir::Type resultOverride;
       Value callee = emitBindingRef(*calleeNode, binding, *symbol);
       auto declaredCallable =
           mlir::dyn_cast_if_present<py::CallableType>(callee.type);

@@ -6424,6 +6424,63 @@ public:
       }
     }
     {
+      // Fold a block argument that every edge feeds the same value as an
+      // earlier argument into that earlier one.
+      //
+      // ⛔ Not left to the per-edge transfer below, which gives the one token
+      // to the lowest argument and lends it to the rest: the release the
+      // program already places may name a lending lineage, and the verifier
+      // then finds the owning one still held. Two names for one object on
+      // every edge are one name. A coroutine whose awaited `__aenter__`
+      // returns `self` met this: the try normalization threads both `span`
+      // and the receiver, and the merged body folds them together.
+      py::PerfScope perf("refcount-insertion.fold-duplicate-arguments");
+      bool folded = true;
+      while (folded) {
+        folded = false;
+        module.walk([&](mlir::Block *block) {
+          if (block->isEntryBlock() || block->getNumArguments() < 2)
+            return;
+          llvm::SmallVector<std::pair<mlir::BranchOpInterface, unsigned>, 4>
+              edges;
+          for (auto it = block->pred_begin(), e = block->pred_end(); it != e;
+               ++it) {
+            auto branch =
+                mlir::dyn_cast<mlir::BranchOpInterface>((*it)->getTerminator());
+            if (!branch)
+              return;
+            mlir::SuccessorOperands operands =
+                branch.getSuccessorOperands(it.getSuccessorIndex());
+            if (operands.getProducedOperandCount() != 0)
+              return;
+            edges.push_back({branch, it.getSuccessorIndex()});
+          }
+          if (edges.empty())
+            return;
+          for (unsigned later = block->getNumArguments(); later-- > 1;) {
+            for (unsigned earlier = 0; earlier < later; ++earlier) {
+              bool same = llvm::all_of(edges, [&](auto &edge) {
+                mlir::SuccessorOperands operands =
+                    edge.first.getSuccessorOperands(edge.second);
+                return operands[earlier] == operands[later];
+              });
+              if (!same ||
+                  block->getArgument(earlier).getType() !=
+                      block->getArgument(later).getType())
+                continue;
+              block->getArgument(later).replaceAllUsesWith(
+                  block->getArgument(earlier));
+              for (auto &edge : edges)
+                edge.first.getSuccessorOperands(edge.second).erase(later);
+              block->eraseArgument(later);
+              folded = true;
+              break;
+            }
+          }
+        });
+      }
+    }
+    {
       // Expand `arith.select` over an object handle back into the branch the
       // canonicalizer folded it from.
       //
