@@ -2158,3 +2158,21 @@ TEST(DriverTest, AnArmv7RuntimeIsBuiltForArmv7) {
               llvm::isa<llvm::ConstantPointerNull>(pad->getClause(index)))
               << function.getName().str();
 }
+
+// What: a Python function is local to the module, so its name -- here a C
+// library function's -- is never the symbol the runtime's call binds to.
+TEST(DriverTest, APythonFunctionIsNotAnExternalSymbol) {
+  CompileResult result = compileSource("def write(fd: int) -> int:\n"
+                                       "    return fd + 1\n"
+                                       "\n"
+                                       "print(write(1))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *write =
+      result.verified.llvmModule->getFunction("write");
+  ASSERT_NE(write, nullptr);
+  EXPECT_TRUE(write->hasLocalLinkage());
+  const llvm::Function *main =
+      result.verified.llvmModule->getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+  EXPECT_FALSE(main->hasLocalLinkage());
+}

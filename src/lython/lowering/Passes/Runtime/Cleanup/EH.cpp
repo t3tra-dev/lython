@@ -642,6 +642,20 @@ bool convertCallToPythonTryInvoke(
 
 } // namespace
 
+// ⛔ A PYTHON FUNCTION IS NOT A C SYMBOL. A program's `def rename(...)` was an
+// external `rename`, and the runtime's declaration of libc's `rename` merged
+// into it when the runtime was linked: `os.rename` called the program's
+// function. Any C name does it -- `write`, `malloc` -- and a static libc
+// (wasi-libc) also finds two definitions. Local linkage keeps the program's
+// name out of the symbol space; on a clash the linker gives the C name to the
+// runtime's declaration and renames the local. `__main__` stays external: the
+// JIT finds the program's body by that name.
+void internalizePythonFunctions(llvm::Module &module) {
+  for (llvm::Function &function : module)
+    if (isPythonDebugFunction(&function) && function.getName() != "__main__")
+      function.setLinkage(llvm::GlobalValue::InternalLinkage);
+}
+
 // ⭐ A C FUNCTION DOES NOT UNWIND, AND SAYING SO IS WHAT SHRINKS THE LSDA.
 // Without it LLVM has to assume `puts` might throw, so anything calling it
 // might throw, so every call to that is an invoke with a landing pad and a

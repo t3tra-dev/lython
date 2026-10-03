@@ -229,7 +229,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot"
     "DriverTest.ACtypesSymbolAddressIsDeclaredWithItsPrototype"
     "DriverTest.AnUntypedCtypesSymbolAddressIsRefusedOnWasm"
-    "DriverTest.AnArmv7RuntimeIsBuiltForArmv7")
+    "DriverTest.AnArmv7RuntimeIsBuiltForArmv7"
+    "DriverTest.APythonFunctionIsNotAnExternalSymbol")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")
