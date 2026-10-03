@@ -37,6 +37,10 @@ struct StubContractPolicy {
 // of that name beside the program.
 bool isJsHostModule(const EmitOptions::SourceModule &source);
 
+// asyncio's namespace under a name the program cannot spell, for the `await`
+// on a host Promise the emitter turns into a call into it.
+inline constexpr llvm::StringLiteral kAsyncioName = "__ly_asyncio$";
+
 class ModuleEmitter {
 public:
   ModuleEmitter(const parser::Node &moduleNode, mlir::MLIRContext &context,
@@ -1541,6 +1545,9 @@ private:
       boundMethodWrappers;
   // The body being emitted is a coroutine's: `await` is legal in it.
   bool currentFunctionIsCoroutine = false;
+  // The call an expression statement discards the value of: a host call's
+  // result there is not converted (adaptJsHostResult).
+  const parser::Node *discardedHostResult = nullptr;
   std::string currentFunctionPrefix;
   std::vector<parser::NodePtr> synthesizedDefaultProviders;
   // Non-constant defaults of MODULE-level defs (R6): evaluated once when

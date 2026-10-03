@@ -129,6 +129,41 @@ asyncio を CPython の形で載せる。JSPI はその後で WASI 側に繋ぐ�
      - `isinstance(o, int)` で object を絞り込めない。
      - int 以外のオブジェクトを `send` できない (段階 2 から持ち越し)。
 6. **JS との接続**: Promise と Future の橋渡し、WebLoop。
+   - **済 (2026-10-04)**。asyncio.py の `if sys.platform == "emscripten":`
+     分岐に置いた (別モジュールにすると asyncio と import が循環する)。
+     - ループは Pyodide の WebLoop と同じく、ホストのループでもある。仕事が
+       あって誰もループを回していないとき、`setTimeout` でホストに呼び戻しを
+       頼む (`_wake_host` / `_host_tick`)。ホスト上のループは常に実行中と
+       みなすので、module レベルの `create_task` が使え、その task は main の
+       本体が返った後にホストのループで進む。
+     - `await promise` は、emitter が `asyncio._host_future(promise)` の
+       呼び出しに書き換え、返った Future を待つ。解決値は Promise の型引数で
+       検査し (`then` のコールバックの引数の変換)、食い違いも reject も
+       `catch` で Future に届ける。reject は
+       RuntimeError("<名前>: <メッセージ>")。
+     - `asyncio.run()` はホスト上でもブロックする。Python だけを待つ間は
+       動き、ホストしか進められない状態 (ready もタイマーもない) になると
+       RuntimeError にする (JSPI の段階で、ここが中断になる)。ホストの呼び
+       戻しの中から呼ぶと、CPython と同じく「実行中のループ」で拒否する。
+   - そのために直したこと:
+     - ドライバの import 収集が、`sys.platform` の比較で決まる module
+       レベルの分岐を、ターゲットで折り畳む。死んだ分岐の `import js` で、
+       native が拒否されなくなった。
+     - generic な stub クラス (`class Promise[T]`) の型パラメータを登録し、
+       メンバーを読む間は型変数として束縛する。`Promise[int]` のメソッドが
+       解決できなかった。注釈の `Promise[int]` (グローバルと同名のクラスの
+       エイリアスへの添字) も読めるようにした。
+     - stub が `number` (float) と宣言した引数は int も受ける
+       (`setTimeout(f, 10)`)。値は自分の型で境界を越える。
+     - 式文で捨てられるホスト呼び出しの結果は、検査も変換もしない (node の
+       `setTimeout` は number ではなく Timeout を返す)。
+     - 局所変数が、同名で import された module を隠す。module 名の集合に
+       スコープがないため、`import time as t` で time.py の `mktime(t)` が
+       壊れていた。
+   - 残った穴:
+     - 戻り値にしか現れないメソッドの型変数 (`Promise.reject[T](...)`) は、
+       注釈の文脈から決まらず拒否される。
+     - Promise 以外の thenable への await は拒否する。
 7. **WASI 側で JSPI に繋ぐ**。
 
 各段階で、native と全ターゲットの golden を通す。境界の外の形は、最も早い

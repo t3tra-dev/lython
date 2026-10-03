@@ -109,16 +109,17 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   リークする (Pyodide と同じ)。
 - 制限:
   - lambda の引数には、宣言された型が伝わらない (注釈が必要)。
-  - main が返ると Emscripten がランタイムを終えるので、非同期に呼ばれる
-    コールバック (`setTimeout` など) は、段階 3 のイベントループと一緒に扱う。
+  - コールバックを渡すプログラムは、main が返ってもランタイムを終えない
+    (`-sEXIT_RUNTIME=0`)。`setTimeout` などで後から呼ばれる。
   - 属性に callable を代入する形 (`el.onclick = f`) は未対応で、lowering が
     拒否する。
 
 ## 未実装 (段階 3 以降)
 
-- `await` による Promise の待機。WebLoop 方式を採る。待つ間は wasm から JS に
-  戻り、Promise の解決で再開する。JSPI はランタイムの対応待ち。ただし、
-  サスペンドを抽象の後ろに置き、JSPI のバックエンドを足せる形にしておく。
+- `await` による Promise の待機は実装済み (docs/async-design.md の段階 6)。
+  asyncio のループがホストのループで進む (WebLoop) ので、待つ間は wasm から
+  JS に戻る。`asyncio.run()` のようにブロックしたまま Promise を待つことは、
+  JSPI (段階 7) まで RuntimeError になる。
 - `to_js` / `to_py` (list、dict、TypedDict の変換)。
 - グローバルへの代入と、union 型のグローバルの読み出し。今は lowering が
   拒否する。

@@ -29,11 +29,38 @@ Deviations from CPython:
   - The loop has no `create_future()`: construct `Future[T]()`. A generic
     class specialized before its base class is declared misses the base's
     fields, and the loop is declared before the futures it would make.
+
+On a JavaScript host (Emscripten) the loop is also the host's, as Pyodide's
+WebLoop is: whenever it has work and nothing is running it, it asks the host
+to call it back (`setTimeout`). It counts as always running, so `create_task`
+works at module level and those tasks run after the program's main body
+returns. `await` on a JavaScript Promise waits on a Future the promise's
+settlement resolves; a rejection raises RuntimeError("<name>: <message>"), as
+other JavaScript errors do. `run()` still blocks, and works while the
+coroutine waits only on Python; once it waits on the host -- which cannot run
+while the program does -- it raises RuntimeError instead of hanging.
 """
 
+import sys
 from time import monotonic as _monotonic, sleep as _sleep_blocking
 from types import CoroutineType
 from typing import Callable, Generator
+
+if sys.platform == "emscripten":
+    from js import setTimeout
+
+    def _on_host() -> bool:
+        return True
+
+    def _host_call_later(delay: float, callback: Callable[[], None]) -> None:
+        setTimeout(callback, delay * 1000.0)
+else:
+
+    def _on_host() -> bool:
+        return False
+
+    def _host_call_later(delay: float, callback: Callable[[], None]) -> None:
+        raise RuntimeError("this target has no JavaScript host")
 
 __all__ = [
     "CancelledError", "InvalidStateError", "AbstractEventLoop", "Future",
@@ -81,6 +108,9 @@ class AbstractEventLoop:
         self._running = False
         self._stopping = False
         self._closed = False
+        # On a JavaScript host: when the host is due to call `_host_tick`,
+        # or -1.0 when it is not.
+        self._host_wake_at = -1.0
 
     def time(self) -> float:
         return _monotonic()
@@ -88,6 +118,8 @@ class AbstractEventLoop:
     def call_soon(self, callback: Callable[[], None]) -> None:
         self._check_closed()
         self._ready.append(callback)
+        if _on_host():
+            self._wake_host()
 
     def call_later(self, delay: float, callback: Callable[[], None]) -> _TimerHandle:
         return self.call_at(self.time() + delay, callback)
@@ -100,6 +132,8 @@ class AbstractEventLoop:
         while index > 0 and timer.before(self._scheduled[index - 1]):
             index -= 1
         self._scheduled.insert(index, timer)
+        if _on_host():
+            self._wake_host()
         return timer
 
     def is_running(self) -> bool:
@@ -122,6 +156,7 @@ class AbstractEventLoop:
         self._enter()
         try:
             while not self._stopping:
+                self._check_host_progress()
                 self._run_once()
         finally:
             self._stopping = False
@@ -131,9 +166,19 @@ class AbstractEventLoop:
         self._enter()
         try:
             while not waiter.done():
+                self._check_host_progress()
                 self._run_once()
         finally:
             self._leave()
+
+    def _check_host_progress(self) -> None:
+        # With nothing ready and nothing scheduled, only the host can make
+        # progress, and it cannot run until the program returns to it.
+        if _on_host() and not self._ready and not self._scheduled:
+            raise RuntimeError(
+                "the event loop waits on the JavaScript host, which cannot "
+                "run while the loop blocks it; schedule the coroutine with "
+                "asyncio.create_task() instead of asyncio.run()")
 
     def _enter(self) -> None:
         self._check_closed()
@@ -148,13 +193,45 @@ class AbstractEventLoop:
     def _leave(self) -> None:
         self._running = False
         _running_loop.clear()
+        if _on_host():
+            self._wake_host()
 
     def _check_closed(self) -> None:
         if self._closed:
             raise RuntimeError("Event loop is closed")
 
-    def _run_once(self) -> None:
-        if not self._ready and self._scheduled:
+    def _wake_host(self) -> None:
+        # The host calls `_host_tick` when the first piece of work is due. A
+        # wake already asked for that comes no later is enough; an earlier
+        # deadline asks for another, and the later one then finds nothing.
+        # A loop something is running needs no wake.
+        if self._running or self._closed:
+            return
+        if self._ready:
+            when = self.time()
+        elif self._scheduled:
+            when = self._scheduled[0].when
+        else:
+            return
+        if 0.0 <= self._host_wake_at <= when:
+            return
+        self._host_wake_at = when
+        _host_call_later(max(0.0, when - self.time()), self._host_tick)
+
+    def _host_tick(self) -> None:
+        self._host_wake_at = -1.0
+        if self._closed or self._running:
+            return
+        # Running for the turn, so a task that calls `run()` is told the loop
+        # is running, as CPython tells it.
+        self._enter()
+        try:
+            self._run_once(False)
+        finally:
+            self._leave()
+
+    def _run_once(self, block: bool = True) -> None:
+        if block and not self._ready and self._scheduled:
             first = self._scheduled[0]
             wait = first.when - self.time()
             if wait > 0:
@@ -178,6 +255,9 @@ _event_loop: list[AbstractEventLoop] = []
 
 def get_running_loop() -> AbstractEventLoop:
     if not _running_loop:
+        # The host's loop is always running.
+        if _on_host():
+            return get_event_loop()
         raise RuntimeError("no running event loop")
     return _running_loop[0]
 
@@ -368,6 +448,32 @@ class Task[T](_Waiter):
         if not self.done():
             raise RuntimeError("await wasn't used with future")
         return self.result()
+
+
+if sys.platform == "emscripten":
+    from _js import JsProxy
+    from js import Promise, String
+
+    def _host_future[T](promise: Promise[T]) -> Future[T]:
+        """The Future `await promise` waits on: the promise's settlement
+        resolves it."""
+        future = Future[T]()
+
+        def resolved(value: T) -> None:
+            if not future.done():
+                future.set_result(value)
+
+        def rejected(reason: JsProxy) -> None:
+            if not future.done():
+                future.set_exception(
+                    RuntimeError(String.new(reason).toString()))
+
+        # ⛔ `catch` after `then`, not `then(resolved, rejected)`: a value
+        # that is not the T the promise was declared with fails in
+        # `resolved`'s argument check, and only a `catch` downstream of it
+        # hears that -- otherwise the task waited forever.
+        promise.then(resolved).catch(rejected)
+        return future
 
 
 class _Yield:

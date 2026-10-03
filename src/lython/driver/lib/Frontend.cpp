@@ -2,6 +2,7 @@
 #include "DriverCodeGen.h"
 
 #include "Common/Instrumentation.h"
+#include "PlatformConstants.h"
 #include "Emitter.h"
 #include "Parser.h"
 #include "embedded.h"
@@ -61,6 +62,56 @@ stringField(const lython::parser::Node &node, StringRef name) {
   if (const auto *value = std::get_if<std::string>(&field->value))
     return *value;
   return std::nullopt;
+}
+
+static const lython::parser::Node *nodeField(const lython::parser::Node &node,
+                                             StringRef name) {
+  const lython::parser::Field *field =
+      lython::parser::findField(node, name.str());
+  if (!field)
+    return nullptr;
+  if (const auto *value = std::get_if<lython::parser::NodePtr>(&field->value))
+    return value->get();
+  return nullptr;
+}
+
+// A module-level `if sys.platform == "..."` (or `!=`) decided for the target:
+// true or false, or nullopt for any other test, whose branches are both
+// collected. The emitter folds the same comparison the same way
+// (`staticModuleStatements`), so a module it binds was collected here.
+static std::optional<bool> staticPlatformTest(const lython::parser::Node &test,
+                                              const llvm::Triple &triple) {
+  if (test.kind != "Compare")
+    return std::nullopt;
+  const auto *ops = nodeListField(test, "ops");
+  const auto *comparators = nodeListField(test, "comparators");
+  const lython::parser::Node *left = nodeField(test, "left");
+  if (!ops || ops->size() != 1 || !comparators || comparators->size() != 1 ||
+      !left || !ops->front() || !comparators->front())
+    return std::nullopt;
+  llvm::StringRef op = ops->front()->kind;
+  if (op != "Eq" && op != "NotEq")
+    return std::nullopt;
+  auto isSysPlatform = [](const lython::parser::Node &node) {
+    const lython::parser::Node *value = nodeField(node, "value");
+    return node.kind == "Attribute" && stringField(node, "attr") == "platform" &&
+           value && value->kind == "Name" && stringField(*value, "id") == "sys";
+  };
+  auto literal =
+      [](const lython::parser::Node &node) -> std::optional<std::string> {
+    if (node.kind != "Constant")
+      return std::nullopt;
+    return stringField(node, "value");
+  };
+  const lython::parser::Node &right = *comparators->front();
+  std::optional<std::string> spelled =
+      isSysPlatform(*left) ? literal(right)
+                           : (isSysPlatform(right) ? literal(*left)
+                                                   : std::nullopt);
+  std::optional<std::string> platform = py::platform_constants::sysPlatform(triple);
+  if (!spelled || !platform)
+    return std::nullopt;
+  return (*spelled == *platform) == (op == "Eq");
 }
 
 static std::int64_t
@@ -268,7 +319,7 @@ static void appendDottedImportSourceRequests(
 
 static void collectImportedModuleRequests(
     const lython::parser::Node &module, StringRef baseDir,
-    StringRef packageName,
+    StringRef packageName, const llvm::Triple &triple,
     llvm::SmallVectorImpl<SourceImportRequest> &requests) {
   std::set<std::string> requestedModules;
   auto appendIfLocal = [&](StringRef moduleName,
@@ -284,6 +335,10 @@ static void collectImportedModuleRequests(
   // `if os.name == "posix": from posix import *`). Discovery collects BOTH
   // branches: the emitter later folds the test and binds only the taken one,
   // and dead modules cost only their (DCE-able) compilation.
+  // ⭐ EXCEPT a `sys.platform` comparison, decided here: a dead branch may
+  // import a module that does not exist on this target -- asyncio's
+  // `if sys.platform == "emscripten": import js` -- and collecting it would
+  // refuse the program for a module it never reaches.
   std::vector<const lython::parser::Node *> statements;
   std::function<void(const std::vector<lython::parser::NodePtr> &)> flatten =
       [&](const std::vector<lython::parser::NodePtr> &list) {
@@ -291,10 +346,15 @@ static void collectImportedModuleRequests(
           if (!statement)
             continue;
           if (statement->kind == "If") {
-            if (const auto *thenBody = nodeListField(*statement, "body"))
-              flatten(*thenBody);
-            if (const auto *elseBody = nodeListField(*statement, "orelse"))
-              flatten(*elseBody);
+            const lython::parser::Node *test = nodeField(*statement, "test");
+            std::optional<bool> taken =
+                test ? staticPlatformTest(*test, triple) : std::nullopt;
+            if (taken != false)
+              if (const auto *thenBody = nodeListField(*statement, "body"))
+                flatten(*thenBody);
+            if (taken != true)
+              if (const auto *elseBody = nodeListField(*statement, "orelse"))
+                flatten(*elseBody);
             continue;
           }
           statements.push_back(statement.get());
@@ -404,9 +464,11 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                           std::vector<ParsedLocalSourceModule> &sources,
                           std::set<std::string> &seen,
                           std::set<std::string> &visiting, bool releaseMode,
-                          bool hasJsHost, llvm::raw_ostream &diag) {
+                          const llvm::Triple &triple,
+                          llvm::raw_ostream &diag) {
+  bool hasJsHost = triple.isOSEmscripten();
   llvm::SmallVector<SourceImportRequest, 8> imports;
-  collectImportedModuleRequests(module, baseDir, packageName, imports);
+  collectImportedModuleRequests(module, baseDir, packageName, triple, imports);
   for (const SourceImportRequest &request : imports) {
     if (llvm::StringRef(request.sourcePath) == mainPath)
       continue;
@@ -488,7 +550,7 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                                               request.moduleName);
     if (failed(collectLocalSourceModules(
             *parsed.tree, nestedBaseDir, nestedPackageName, mainPath, sources,
-            seen, visiting, releaseMode, hasJsHost, diag)))
+            seen, visiting, releaseMode, triple, diag)))
       return failure();
     visiting.erase(request.moduleName);
     seen.insert(request.moduleName);
@@ -529,8 +591,8 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
   if (failed(collectLocalSourceModules(
           *parsed.tree, importBaseDir, mainPackageName, sourcePath,
           localSources, seenSourceModules, visitingSourceModules,
-          driverOptions.releaseMode,
-          codeGenTripleForTarget({}, driverOptions).isOSEmscripten(), diag)))
+          driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
+          diag)))
     return failure();
   // A program that reaches the host's `js` can hand it callbacks, and the
   // callbacks' table and entry point are Python (runtime/lib/_js_bridge.py):
@@ -544,7 +606,8 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
         failed(collectLocalSourceModules(
             *bridgeImport.tree, importBaseDir, mainPackageName, sourcePath,
             localSources, seenSourceModules, visitingSourceModules,
-            driverOptions.releaseMode, /*hasJsHost=*/true, diag)))
+            driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
+            diag)))
       return failure();
   }
 
