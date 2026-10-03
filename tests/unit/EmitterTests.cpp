@@ -1858,15 +1858,15 @@ TEST(EmitterTest, APropertyRedeclaredWithoutASetterRefusesTheWrite) {
   EXPECT_TRUE(withSetter.ok()) << withSetter.diagnostics.size();
 }
 
-// What: a generator whose ANNOTATION is genuinely wrong still gets the clean
-// emit diagnostic. The guard narrowing that made `yield v.upper()` type under
-// `if v is not None` must not become "take the annotation": that was measured
-// and dropped once, because it moves `-> Iterator[str]` with `yield v` for an
-// int `v` from this sentence to "Failed to run lowering pipeline".
+// What: a generator whose ANNOTATION is genuinely wrong is refused at emit,
+// naming the yield that does not match it: `-> Iterator[str]` with `yield v`
+// for an int `v` under a guard.
 TEST(EmitterTest, AGeneratorAnnotationThatIsWrongIsStillNamed) {
   auto refusedNaming = [](lython::emitter::EmitResult &emitted) {
     for (const lython::parser::Diagnostic &diagnostic : emitted.diagnostics)
-      if (diagnostic.message.find("but yields") != std::string::npos)
+      if (diagnostic.message.find("yield of !py.contract<\"builtins.int\"> "
+                                  "in a generator annotated to yield") !=
+          std::string::npos)
         return true;
     return false;
   };
@@ -2178,4 +2178,23 @@ TEST(EmitterTest, AGeneratorAppendedToAListStaysAGenerator) {
       "print(\"-\".join(words()))\n",
       context);
   EXPECT_TRUE(joined.ok());
+}
+
+// A yield whose expression is typed by the narrowing above it -- a `while`
+// guard on an Optional -- takes the generator's annotation.
+TEST(EmitterTest, AYieldUnderAWhileGuardTakesTheAnnotation) {
+  mlir::MLIRContext context(testRegistry());
+  lython::emitter::EmitResult emitted = emitSource(
+      "from typing import Iterator\n"
+      "class Node:\n"
+      "    def __init__(self, name: str, nxt: \"Node | None\") -> None:\n"
+      "        self.name = name\n"
+      "        self.nxt = nxt\n"
+      "def walk(head: Node | None) -> Iterator[str]:\n"
+      "    cur = head\n"
+      "    while cur is not None:\n"
+      "        yield cur.name\n"
+      "        cur = cur.nxt\n",
+      context);
+  EXPECT_TRUE(emitted.ok());
 }

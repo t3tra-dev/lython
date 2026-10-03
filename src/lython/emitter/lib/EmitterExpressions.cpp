@@ -434,8 +434,26 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     // was refused as "annotated Iterator[int] but yields int | None" for a
     // program whose every yield is an int -- while the same guard around
     // `out.append(v * 2)` in a plain function has always compiled.
-    if (currentGeneratorYieldType)
+    //
+    // ⭐ AND REFUSED HERE, which is what lets the function take its annotation
+    // whatever the whole-body walk inferred: `coerceValue` passes a value it
+    // cannot convert through untouched, so a yield of the wrong type has to be
+    // named at its own site or it reaches the lowering unconverted.
+    if (currentGeneratorYieldType) {
+      mlir::Type actual = types.widenLiteral(yielded.type);
+      if (!(valueNode && valueNode->kind == "Lambda") &&
+          !py::isAssignableTo(actual, currentGeneratorYieldType) &&
+          !isAssignableWithStaticEvidence(actual, currentGeneratorYieldType,
+                                          module)) {
+        diagnostics.push_back(parser::Diagnostic{
+            parser::Severity::Error, expr->range.start,
+            "yield of " + typeText(actual) +
+                " in a generator annotated to yield " +
+                typeText(currentGeneratorYieldType)});
+        return emitNone(*expr);
+      }
       yielded = coerceValue(yielded, currentGeneratorYieldType, *expr);
+    }
     mlir::Type sentType =
         currentGeneratorSendType ? currentGeneratorSendType : types.none();
     auto op =
