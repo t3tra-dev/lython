@@ -43,6 +43,7 @@
 #include "llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h"
 #include "llvm/Support/Error.h"
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -381,9 +382,14 @@ bool hasWASIBuiltins(llvm::StringRef resourceDir, const llvm::Triple &triple) {
 }
 
 // A wasi-sdk keeps its builtins under `<sdk>/lib/clang/<version>`, two levels
-// above the sysroot.
+// above the sysroot; Homebrew's wasi-runtimes in `share/wasi-runtimes`, beside
+// its wasi-libc's sysroot, laid out as a resource directory.
 std::optional<std::string> wasiSDKResourceDir(llvm::StringRef sysroot,
                                               const llvm::Triple &triple) {
+  llvm::SmallString<256> runtimes(sysroot);
+  llvm::sys::path::append(runtimes, "..", "wasi-runtimes");
+  if (hasWASIBuiltins(runtimes, triple))
+    return runtimes.str().str();
   llvm::SmallString<256> clangDir(sysroot);
   llvm::sys::path::append(clangDir, "..", "..", "lib", "clang");
   std::error_code ec;
@@ -471,16 +477,29 @@ std::optional<WASIRuntime> findWASIRuntime(const llvm::Triple &triple) {
 // The wasm linker beside the linked LLVM's tools, on PATH, or from
 // Homebrew's lld, which ships apart from its llvm.
 std::optional<std::string> findWasmLinker() {
-  if (auto linker = findLLVMToolProgram("wasm-ld"))
-    return linker;
-  for (const char *prefix :
-       {"/opt/homebrew/opt/lld/bin", "/usr/local/opt/lld/bin"}) {
-    llvm::SmallString<256> path(prefix);
+  // The lld of this LLVM's major first: PATH's may be a newer one.
+  std::string versioned = "lld@" + std::to_string(LLVM_VERSION_MAJOR);
+  auto inKeg = [](llvm::StringRef keg) -> std::optional<std::string> {
+    for (llvm::StringRef prefix : {"/opt/homebrew/opt", "/usr/local/opt"}) {
+      llvm::SmallString<256> path(prefix);
+      llvm::sys::path::append(path, keg, "bin", "wasm-ld");
+      if (llvm::sys::fs::can_execute(path))
+        return path.str().str();
+    }
+    return std::nullopt;
+  };
+  llvm::StringRef toolsDir = LYTHON_LLVM_TOOLS_BINARY_DIR;
+  if (!toolsDir.empty()) {
+    llvm::SmallString<256> path(toolsDir);
     llvm::sys::path::append(path, "wasm-ld");
     if (llvm::sys::fs::can_execute(path))
       return path.str().str();
   }
-  return std::nullopt;
+  if (auto linker = inKeg(versioned))
+    return linker;
+  if (auto linker = findExecutableProgram("wasm-ld"))
+    return linker;
+  return inKeg("lld");
 }
 
 // ⭐ THE LINKED LLVM'S CLANG, not wasi-sdk's: the objects come from this
