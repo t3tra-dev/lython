@@ -1649,7 +1649,18 @@ module attributes {
     %message_slot = arith.constant 6 : i64
     %two = arith.constant 2 : i64
     %msg_ptr = func.call @__ly_entity_word_get(%obj_ptr, %message_slot) : (i64, i64) -> i64
-    %bytes_ptr, %byte_len = func.call @__ly_unicode_lane_words(%msg_ptr) : (i64) -> (i64, i64)
+    // ⛔ Not followed when it is 0: the immortal dead header an absent union
+    // member is read from carries no message, and a union read takes every
+    // member's lanes before its tag selects one (`BaseException | None`
+    // holding None segfaulted here).
+    %zero = arith.constant 0 : i64
+    %has_message = arith.cmpi ne, %msg_ptr, %zero : i64
+    %bytes_ptr, %byte_len = scf.if %has_message -> (i64, i64) {
+      %ptr, %len = func.call @__ly_unicode_lane_words(%msg_ptr) : (i64) -> (i64, i64)
+      scf.yield %ptr, %len : i64, i64
+    } else {
+      scf.yield %zero, %zero : i64, i64
+    }
     func.return %msg_ptr, %two, %bytes_ptr, %byte_len : i64, i64, i64, i64
   }
 
