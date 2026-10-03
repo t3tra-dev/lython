@@ -1496,6 +1496,10 @@ void ModuleEmitter::predeclareSourceModules() {
   declareJsHostModule();
   if (lookupSourceModule(kJsBridgeModule))
     bindSourceModuleNamespace(kJsBridgeModule, kJsBridgeName);
+  // `await` on a host Promise reaches asyncio by this name, whatever the
+  // program calls it (emitAwaitValue).
+  if (lookupSourceModule("asyncio") && lookupSourceModule(py::kJsHostModule))
+    bindSourceModuleNamespace("asyncio", kAsyncioName);
   for (const EmitOptions::SourceModule &source : options.sourceModules) {
     if (!source.moduleNode)
       continue;

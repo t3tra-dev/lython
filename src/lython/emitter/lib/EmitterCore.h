@@ -37,6 +37,10 @@ struct StubContractPolicy {
 // of that name beside the program.
 bool isJsHostModule(const EmitOptions::SourceModule &source);
 
+// asyncio's namespace under a name the program cannot spell, for the `await`
+// on a host Promise the emitter turns into a call into it.
+inline constexpr llvm::StringLiteral kAsyncioName = "__ly_asyncio$";
+
 class ModuleEmitter {
 public:
   ModuleEmitter(const parser::Node &moduleNode, mlir::MLIRContext &context,

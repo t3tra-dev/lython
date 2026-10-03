@@ -1,4 +1,5 @@
 #include "AstSynth.h"
+#include "JsHost.h"
 #include "EmitterCore.h"
 
 #include "EmitterOps.h" // IWYU pragma: keep
@@ -3275,6 +3276,41 @@ Value ModuleEmitter::emitAwaitValue(const parser::Node &anchor,
     return emitNone(anchor);
   }
   mlir::Type type = types.widenLiteral(awaitable.type);
+  // A host Promise is awaited through the Future its settlement resolves,
+  // which the loop knows how to wait on.
+  // ⛔ Not through the stub's `__await__`: it has no body, and the waiting
+  // is the loop's, which is Python.
+  if (isJsHostValueType(type)) {
+    auto promise = mlir::dyn_cast<py::ContractType>(type);
+    if (!promise ||
+        promise.getContractName() !=
+            (py::kJsHostModule + ".Promise").str() ||
+        promise.getArguments().size() != 1) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "await on a JavaScript value needs a Promise, got " +
+              typeText(type)});
+      return emitNone(anchor);
+    }
+    if (!lookupSourceModule("asyncio")) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, anchor.range.start,
+          "await on a JavaScript Promise needs asyncio, whose loop waits on "
+          "it; import asyncio"});
+      return emitNone(anchor);
+    }
+    parser::NodePtr call = synth::call(
+        synth::attribute(synth::name(kAsyncioName, anchor.range),
+                         "_host_future", anchor.range),
+        {synth::name("__ly_awaited_promise$", anchor.range)}, anchor.range);
+    values["__ly_awaited_promise$"] = awaitable;
+    auto scope = types.pushScope();
+    types.bindLocalSymbol("__ly_awaited_promise$", awaitable.type);
+    synthesizedIteratorDefs.push_back(std::move(call));
+    Value future = emitExpr(synthesizedIteratorDefs.back().get());
+    values.erase("__ly_awaited_promise$");
+    return emitAwaitValue(anchor, future);
+  }
   Value delegate = awaitable;
   if (auto coroutine = mlir::dyn_cast<py::ContractType>(type);
       !coroutine || coroutine.getContractName() != "types.CoroutineType") {

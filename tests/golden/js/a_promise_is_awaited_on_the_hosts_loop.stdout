@@ -1,0 +1,6 @@
+scheduled
+text hi
+rejected: Error: ValueError: boom 1
+[30, 10, 20]
+mismatch: Error: TypeError: JavaScript returned string where an integer was declared
+run: asyncio.run() cannot be called from a running event loop

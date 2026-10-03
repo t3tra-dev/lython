@@ -2286,17 +2286,48 @@ ImportedModuleEmit emitMainFor(llvm::StringRef source, llvm::StringRef triple) {
 
 } // namespace
 
-// What: a parameter shadows a module imported under its name, in the
-// program and in a module it imports (time.py's `mktime(t)` under
-// `import time as t`).
-TEST(EmitterTest, AParameterShadowsAModuleOfItsName) {
+// What: a generic host class used with arguments -- `Promise[int]` as an
+// annotation and as a call's result -- has its methods, read with T as int,
+// and a host `number` parameter takes an int.
+TEST(EmitterTest, AGenericHostClassIsReadWithItsArguments) {
   ImportedModuleEmit emitted = emitMainFor(
-      "import time as t\n\n\n"
-      "def f(t: list[int]) -> int:\n"
-      "    return t.count(1)\n\n\n"
-      "print(f([1, 2, 1]), t.monotonic() > 0)\n",
-      {});
+      "from js import Promise, setTimeout\n\n\n"
+      "def show(p: Promise[int]) -> None:\n"
+      "    def ok(v: int) -> None:\n"
+      "        print(v)\n\n"
+      "    p.then(ok)\n\n\n"
+      "def later() -> None:\n"
+      "    print(\"later\")\n\n\n"
+      "show(Promise.resolve(4))\n"
+      "setTimeout(later, 10)\n",
+      "wasm32-unknown-emscripten");
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
+}
+
+// What: `await` on a host value takes a Promise, and asyncio, whose loop is
+// what waits on it.
+TEST(EmitterTest, AnAwaitOnAHostValueTakesAPromiseAndAsyncio) {
+  ImportedModuleEmit noAsyncio = emitMainFor(
+      "from js import Promise\n\n\n"
+      "async def f() -> int:\n"
+      "    return await Promise.resolve(1)\n",
+      "wasm32-unknown-emscripten");
+  EXPECT_FALSE(noAsyncio.succeeded);
+  EXPECT_NE(noAsyncio.diagnostics.find(
+                "await on a JavaScript Promise needs asyncio"),
+            std::string::npos)
+      << noAsyncio.diagnostics;
+  ImportedModuleEmit notAPromise = emitMainFor(
+      "import asyncio\n"
+      "from js import document\n\n\n"
+      "async def f() -> None:\n"
+      "    await document\n",
+      "wasm32-unknown-emscripten");
+  EXPECT_FALSE(notAPromise.succeeded);
+  EXPECT_NE(notAPromise.diagnostics.find(
+                "await on a JavaScript value needs a Promise"),
+            std::string::npos)
+      << notAPromise.diagnostics;
 }
 
 // What: a module-level `if sys.platform == ...` branch for another platform
@@ -2317,20 +2348,15 @@ TEST(EmitterTest, ABranchForAnotherPlatformImportsNothing) {
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
 }
 
-// What: a generic host class used with arguments -- `Promise[int]` as an
-// annotation and as a call's result -- has its methods, read with T as int,
-// and a host `number` parameter takes an int.
-TEST(EmitterTest, AGenericHostClassIsReadWithItsArguments) {
+// What: a parameter shadows a module imported under its name, in the
+// program and in a module it imports (time.py's `mktime(t)` under
+// `import time as t`).
+TEST(EmitterTest, AParameterShadowsAModuleOfItsName) {
   ImportedModuleEmit emitted = emitMainFor(
-      "from js import Promise, setTimeout\n\n\n"
-      "def show(p: Promise[int]) -> None:\n"
-      "    def ok(v: int) -> None:\n"
-      "        print(v)\n\n"
-      "    p.then(ok)\n\n\n"
-      "def later() -> None:\n"
-      "    print(\"later\")\n\n\n"
-      "show(Promise.resolve(4))\n"
-      "setTimeout(later, 10)\n",
-      "wasm32-unknown-emscripten");
+      "import time as t\n\n\n"
+      "def f(t: list[int]) -> int:\n"
+      "    return t.count(1)\n\n\n"
+      "print(f([1, 2, 1]), t.monotonic() > 0)\n",
+      {});
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
 }

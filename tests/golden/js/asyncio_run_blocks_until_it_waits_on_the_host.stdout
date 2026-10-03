@@ -1,0 +1,2 @@
+pure 7
+hosted: the event loop waits on the JavaScript host, which cannot run while the loop blocks it; schedule the coroutine with asyncio.create_task() instead of asyncio.run()
