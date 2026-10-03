@@ -1980,3 +1980,58 @@ TEST(DriverTest, TheObjectAllocatorAlignsWhereMallocDoesNot) {
   EXPECT_TRUE(callsFrom(*host.llvmModule, "LyMem_Alloc", "malloc"));
   EXPECT_FALSE(callsFrom(*host.llvmModule, "LyMem_Alloc", "aligned_alloc"));
 }
+
+namespace {
+
+const char *ctypesAddressSource(bool withPrototype) {
+  return withPrototype ? "import ctypes\n"
+                         "libc = ctypes.CDLL(None)\n"
+                         "w = libc[\"write\"]\n"
+                         "w.restype = ctypes.c_long\n"
+                         "w.argtypes = [ctypes.c_int, ctypes.c_void_p, "
+                         "ctypes.c_long]\n"
+                         "addr: int = ctypes.cast(w, ctypes.c_void_p).value\n"
+                         "print(addr != 0)\n"
+                       : "import ctypes\n"
+                         "libc = ctypes.CDLL(None)\n"
+                         "w = libc[\"write\"]\n"
+                         "addr: int = ctypes.cast(w, ctypes.c_void_p).value\n"
+                         "print(addr != 0)\n";
+}
+
+} // namespace
+
+// What: a ctypes symbol whose address is taken is declared with the prototype
+// its restype/argtypes name, not as `void (...)` -- on wasm the declaration is
+// the import's signature, and `write` is also the runtime's own import.
+TEST(DriverTest, ACtypesSymbolAddressIsDeclaredWithItsPrototype) {
+  lython::driver::DriverOptions options;
+  options.targetTriple = "wasm64-unknown-emscripten";
+  CompileResult result = compileSource(ctypesAddressSource(true), options);
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *write = result.verified.llvmModule->getFunction("write");
+  ASSERT_NE(write, nullptr);
+  llvm::LLVMContext &context = result.verified.llvmModule->getContext();
+  llvm::FunctionType *expected = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context),
+      {llvm::Type::getInt32Ty(context), llvm::PointerType::getUnqual(context),
+       llvm::Type::getInt64Ty(context)},
+      /*isVarArg=*/false);
+  EXPECT_EQ(write->getFunctionType(), expected);
+}
+
+// What: without a restype the prototype is unknown. A native target links the
+// address by name and compiles it; wasm would import `write` with a made-up
+// signature, so it is refused and the message says what to set.
+TEST(DriverTest, AnUntypedCtypesSymbolAddressIsRefusedOnWasm) {
+  lython::driver::DriverOptions wasm;
+  wasm.targetTriple = "wasm64-unknown-emscripten";
+  CompileResult refused = compileSource(ctypesAddressSource(false), wasm);
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_NE(refused.diagnostics.find("needs its prototype: set restype"),
+            std::string::npos)
+      << refused.diagnostics;
+
+  CompileResult host = compileSource(ctypesAddressSource(false));
+  EXPECT_TRUE(host.succeeded) << host.diagnostics;
+}

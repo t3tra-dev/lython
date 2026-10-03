@@ -30,6 +30,10 @@ bool isSupportedNativeTarget(llvm::StringRef tripleText) {
   return triple.isOSEmscripten() || triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
 }
 
+bool callsAreCheckedBySignature(llvm::StringRef tripleText) {
+  return llvm::Triple(tripleText).isWasm();
+}
+
 std::optional<TargetPlatformFacts>
 readTargetPlatformFacts(mlir::ModuleOp module) {
   auto triple = module->getAttrOfType<mlir::StringAttr>(kTargetTripleAttr);

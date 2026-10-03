@@ -235,6 +235,12 @@ std::optional<mlir::Value>
 extractPointerAddressInteger(mlir::Operation *op, mlir::OpBuilder &builder,
                              const RuntimeBundle &source,
                              const std::optional<TargetPlatformFacts> &facts);
+mlir::FailureOr<mlir::FunctionType>
+ctypesNativeFunctionType(mlir::Operation *op, mlir::ModuleOp module,
+                         mlir::OpBuilder &builder,
+                         llvm::ArrayRef<std::string> argTypes,
+                         llvm::StringRef resultType,
+                         const std::optional<TargetPlatformFacts> &facts);
 mlir::FailureOr<mlir::func::FuncOp> getOrCreateNativeDeclaration(
     mlir::Operation *op, mlir::ModuleOp module, mlir::OpBuilder &builder,
     llvm::StringRef name, mlir::FunctionType type,

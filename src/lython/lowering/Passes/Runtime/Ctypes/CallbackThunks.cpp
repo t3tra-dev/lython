@@ -99,17 +99,26 @@ mlir::LogicalResult materializeSymbolAddresses(mlir::ModuleOp module) {
     if (!symbol)
       return placeholder.emitError() << "symbol address placeholder is missing "
                                         "its symbol name";
-    // Ensure a declaration of the target symbol exists to take its address.
+    // Ensure a declaration of the target symbol exists to take its address:
+    // with the prototype the ctypes object named, or -- only where the target
+    // links by name (Calls.cpp refuses the rest) -- an untyped `void (...)`.
     if (!module.lookupSymbol(symbol.getValue())) {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToEnd(module.getBody());
+      auto prototype =
+          placeholder->getAttrOfType<mlir::TypeAttr>("ly.symbol_prototype");
+      mlir::Type type =
+          prototype ? prototype.getValue()
+                    : mlir::LLVM::LLVMFunctionType::get(
+                          mlir::LLVM::LLVMVoidType::get(context), {},
+                          /*isVarArg=*/true);
       // Unknown location: an external declaration must not carry a !dbg
       // subprogram attachment.
       mlir::LLVM::LLVMFuncOp::create(
           builder, builder.getUnknownLoc(), symbol.getValue(),
-          mlir::LLVM::LLVMFunctionType::get(
-              mlir::LLVM::LLVMVoidType::get(context), {}, /*isVarArg=*/true));
+          mlir::cast<mlir::LLVM::LLVMFunctionType>(type));
     }
+    placeholder->removeAttr("ly.symbol_prototype");
     mlir::Block *entry = placeholder.addEntryBlock(builder);
     builder.setInsertionPointToStart(entry);
     mlir::Value pointer = mlir::LLVM::AddressOfOp::create(
