@@ -1,0 +1,2 @@
+FROM docker.io/arm32v7/debian:bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev && rm -rf /var/lib/apt/lists/*
