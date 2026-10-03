@@ -7,6 +7,7 @@
 
 #include "pegen.h"
 
+#include <stdint.h>
 #include <string.h>
 
 extern void *_PyPegen_parse(Parser *p);
@@ -23,12 +24,80 @@ static char *lython_last_root_recursive_shape = NULL;
 static _Thread_local PyArena *lython_current_arena = NULL;
 static _Thread_local Token *lython_current_tokens = NULL;
 static _Thread_local size_t lython_current_token_count = 0;
-static _Thread_local void **lython_current_ast_nodes = NULL;
-static _Thread_local size_t lython_current_ast_node_count = 0;
-static _Thread_local size_t lython_current_ast_node_capacity = 0;
-static _Thread_local asdl_seq **lython_current_asdl_seqs = NULL;
-static _Thread_local size_t lython_current_asdl_seq_count = 0;
-static _Thread_local size_t lython_current_asdl_seq_capacity = 0;
+// The nodes and sequences this parse allocated, asked "is this one of ours?"
+// once per child visited.
+//
+// ⛔ Hash sets and not the arrays they were: a linear scan per question made
+// a parse quadratic in the file, and a 33k-line stub (runtime/lib/js.pyi)
+// took three minutes.
+typedef struct {
+  void **slots;
+  size_t capacity; // a power of two, or 0
+  size_t count;
+} lython_pointer_set;
+
+static size_t lython_pointer_hash(const void *pointer) {
+  uint64_t x = (uint64_t)(uintptr_t)pointer;
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  return (size_t)x;
+}
+
+static int lython_pointer_set_contains(const lython_pointer_set *set,
+                                       const void *pointer) {
+  if (!pointer || set->capacity == 0)
+    return 0;
+  size_t mask = set->capacity - 1;
+  for (size_t i = lython_pointer_hash(pointer) & mask;; i = (i + 1) & mask) {
+    if (set->slots[i] == NULL)
+      return 0;
+    if (set->slots[i] == pointer)
+      return 1;
+  }
+}
+
+static void lython_pointer_set_insert(lython_pointer_set *set, void *pointer) {
+  if (!pointer)
+    return;
+  if ((set->count + 1) * 2 > set->capacity) {
+    size_t next_capacity = set->capacity == 0 ? 64 : set->capacity * 2;
+    void **next = (void **)calloc(next_capacity, sizeof(void *));
+    if (!next)
+      return;
+    for (size_t i = 0; i < set->capacity; ++i) {
+      void *old = set->slots[i];
+      if (!old)
+        continue;
+      size_t j = lython_pointer_hash(old) & (next_capacity - 1);
+      while (next[j])
+        j = (j + 1) & (next_capacity - 1);
+      next[j] = old;
+    }
+    free(set->slots);
+    set->slots = next;
+    set->capacity = next_capacity;
+  }
+  size_t mask = set->capacity - 1;
+  size_t i = lython_pointer_hash(pointer) & mask;
+  while (set->slots[i]) {
+    if (set->slots[i] == pointer)
+      return;
+    i = (i + 1) & mask;
+  }
+  set->slots[i] = pointer;
+  ++set->count;
+}
+
+static void lython_pointer_set_clear(lython_pointer_set *set) {
+  free(set->slots);
+  set->slots = NULL;
+  set->capacity = 0;
+  set->count = 0;
+}
+
+static _Thread_local lython_pointer_set lython_current_ast_nodes;
+static _Thread_local lython_pointer_set lython_current_asdl_seqs;
 
 static void *lython_pegen_alloc(size_t size) {
   void *ptr = calloc(1, size);
@@ -96,70 +165,30 @@ const char *lython_cpython_generated_last_root_recursive_shape(void) {
 }
 
 static void lython_ast_registry_reset(void) {
-  free(lython_current_ast_nodes);
-  lython_current_ast_nodes = NULL;
-  lython_current_ast_node_count = 0;
-  lython_current_ast_node_capacity = 0;
-  free(lython_current_asdl_seqs);
-  lython_current_asdl_seqs = NULL;
-  lython_current_asdl_seq_count = 0;
-  lython_current_asdl_seq_capacity = 0;
+  lython_pointer_set_clear(&lython_current_ast_nodes);
+  lython_pointer_set_clear(&lython_current_asdl_seqs);
 }
 
 static void lython_register_ast_node(void *node) {
-  if (!node)
-    return;
-  if (lython_current_ast_node_count == lython_current_ast_node_capacity) {
-    size_t next_capacity = lython_current_ast_node_capacity == 0
-                               ? 64
-                               : lython_current_ast_node_capacity * 2;
-    void **next = (void **)realloc(lython_current_ast_nodes,
-                                   next_capacity * sizeof(void *));
-    if (!next)
-      return;
-    lython_current_ast_nodes = next;
-    lython_current_ast_node_capacity = next_capacity;
-  }
-  lython_current_ast_nodes[lython_current_ast_node_count++] = node;
+  lython_pointer_set_insert(&lython_current_ast_nodes, node);
 }
 
 static void lython_register_asdl_seq(asdl_seq *seq) {
-  if (!seq)
-    return;
-  if (lython_current_asdl_seq_count == lython_current_asdl_seq_capacity) {
-    size_t next_capacity = lython_current_asdl_seq_capacity == 0
-                               ? 64
-                               : lython_current_asdl_seq_capacity * 2;
-    asdl_seq **next = (asdl_seq **)realloc(lython_current_asdl_seqs,
-                                           next_capacity * sizeof(asdl_seq *));
-    if (!next)
-      return;
-    lython_current_asdl_seqs = next;
-    lython_current_asdl_seq_capacity = next_capacity;
-  }
-  lython_current_asdl_seqs[lython_current_asdl_seq_count++] = seq;
+  lython_pointer_set_insert(&lython_current_asdl_seqs, seq);
 }
 
 static int lython_is_registered_asdl_seq(void *value) {
-  if (!value)
-    return 0;
-  for (size_t i = 0; i < lython_current_asdl_seq_count; ++i)
-    if ((void *)lython_current_asdl_seqs[i] == value)
-      return 1;
-  return 0;
+  return lython_pointer_set_contains(&lython_current_asdl_seqs, value);
+}
+
+static int lython_is_registered_ast_node(void *node) {
+  return lython_pointer_set_contains(&lython_current_ast_nodes, node);
 }
 
 static const char *lython_ast_kind(void *node) {
   if (!node)
     return "none";
-  int registered = 0;
-  for (size_t i = 0; i < lython_current_ast_node_count; ++i) {
-    if (lython_current_ast_nodes[i] == node) {
-      registered = 1;
-      break;
-    }
-  }
-  if (!registered)
+  if (!lython_is_registered_ast_node(node))
     return "unknown";
   const struct _expr *ast = (const struct _expr *)node;
   return ast->lython_kind ? ast->lython_kind : "unknown";
@@ -168,14 +197,7 @@ static const char *lython_ast_kind(void *node) {
 static int lython_ast_child_count(void *node) {
   if (!node)
     return 0;
-  int registered = 0;
-  for (size_t i = 0; i < lython_current_ast_node_count; ++i) {
-    if (lython_current_ast_nodes[i] == node) {
-      registered = 1;
-      break;
-    }
-  }
-  if (!registered)
+  if (!lython_is_registered_ast_node(node))
     return -1;
   const struct _expr *ast = (const struct _expr *)node;
   if (ast->lython_kind && strcmp(ast->lython_kind, "FunctionType") == 0) {
@@ -198,11 +220,9 @@ static int lython_ast_child_count(void *node) {
 static const char *lython_registered_ast_kind(void *node) {
   if (!node)
     return "None";
-  for (size_t i = 0; i < lython_current_ast_node_count; ++i) {
-    if (lython_current_ast_nodes[i] == node) {
-      const struct _expr *ast = (const struct _expr *)node;
-      return ast->lython_kind ? ast->lython_kind : "Unknown";
-    }
+  if (lython_is_registered_ast_node(node)) {
+    const struct _expr *ast = (const struct _expr *)node;
+    return ast->lython_kind ? ast->lython_kind : "Unknown";
   }
   if (lython_current_tokens && lython_current_token_count > 0) {
     Token *token = (Token *)node;
@@ -258,25 +278,20 @@ static void lython_digest_append_kind(char **buffer, size_t *size,
 static asdl_seq *lython_root_sequence_for_digest(void *node) {
   if (!node)
     return NULL;
-  for (size_t i = 0; i < lython_current_ast_node_count; ++i) {
-    if (lython_current_ast_nodes[i] != node)
-      continue;
-    const struct _expr *ast = (const struct _expr *)node;
-    if (ast->lython_kind && strcmp(ast->lython_kind, "FunctionType") == 0 &&
-        lython_is_registered_asdl_seq(ast->lython_primary))
-      return (asdl_seq *)ast->lython_primary;
-    return ast->lython_seq;
-  }
-  return NULL;
+  if (!lython_is_registered_ast_node(node))
+    return NULL;
+  const struct _expr *ast = (const struct _expr *)node;
+  if (ast->lython_kind && strcmp(ast->lython_kind, "FunctionType") == 0 &&
+      lython_is_registered_asdl_seq(ast->lython_primary))
+    return (asdl_seq *)ast->lython_primary;
+  return ast->lython_seq;
 }
 
 static const struct _expr *pegen_registered_ast(void *node) {
   if (!node)
     return NULL;
-  for (size_t i = 0; i < lython_current_ast_node_count; ++i)
-    if (lython_current_ast_nodes[i] == node)
-      return (const struct _expr *)node;
-  return NULL;
+  return lython_is_registered_ast_node(node) ? (const struct _expr *)node
+                                             : NULL;
 }
 
 static void pegen_digest_sequence_child_kinds(char **buffer, size_t *size,

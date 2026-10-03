@@ -440,8 +440,14 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
 
     lython::parser::ParseOptions options;
     options.typeComments = true;
-    lython::parser::ParseResult parsed = lython::parser::parse(
-        buffer->getBuffer(), request.sourcePath, options);
+    lython::parser::ParseResult parsed;
+    {
+      // Its own scope: an imported module can dwarf the program (the `js`
+      // stub is 33k lines), and `parse` above times the main file only.
+      PerfScope perf("parse.imported-module");
+      parsed = lython::parser::parse(buffer->getBuffer(), request.sourcePath,
+                                     options);
+    }
     if (!parsed.ok()) {
       for (const lython::parser::Diagnostic &diagnostic : parsed.diagnostics) {
         diag << request.sourcePath << ':' << diagnostic.location.line << ':'
