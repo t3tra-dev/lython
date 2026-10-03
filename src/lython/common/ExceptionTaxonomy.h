@@ -194,8 +194,8 @@ inline constexpr std::int64_t kOSErrorClassId = 66;
 // errno -> OSError-subclass mapping (CPython exceptions.c oserror_use_init
 // dispatch table). Values are per-libc: the common POSIX subset shares
 // numbers between the BSD family (Darwin) and Linux, and the socket/async
-// members diverge. Emscripten's musl carries WASI's numbering, which shares
-// nothing with either (ENOENT is 44). The runtime reads it through
+// members diverge. wasi-libc numbers them its own way, sharing nothing with
+// either (ENOENT is 44). The runtime reads it through
 // LyHost_OSErrorClassId, which the OS support cluster
 // (lowering/Common/OsSupportBuilder.cpp) compiles into a select chain against
 // the target's errno numbering.

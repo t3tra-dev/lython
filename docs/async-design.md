@@ -199,6 +199,13 @@ asyncio を CPython の形で載せる。JSPI はその後で WASI 側に繋ぐ�
    - テスト: `tests/golden/js` の各ケースを、Emscripten (`js`) と WASI の
      ローダ (`jspi`) の両方で走らせる。答えが違うケースは `.jspi.stdout` に
      持つ。
+   - **その後 (2026-10-04)**: Emscripten を外した (docs/js-host.md)。JS ホストは
+     WASI のローダだけになり、段階 6 で Emscripten 向けに書いた箇所 (ホストを
+     待てずに RuntimeError になる経路) は、JSPI のない環境とコールバックの中に
+     残る。コールバックの中で Suspending の import を呼ぶと trap することが
+     分かったので、`time.sleep` は中断しないことにし、asyncio は
+     `LyJs_CanWaitForHost` で中断できるかを先に尋ねる。テストの段は `js`
+     (WASI のローダ) と `wasm` (同じローダで golden の一部) の 2 つになった。
 
 各段階で、native と全ターゲットの golden を通す。境界の外の形は、最も早い
 静的な境界で拒否する。

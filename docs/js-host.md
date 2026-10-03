@@ -1,8 +1,14 @@
 # JavaScript ホストとの境界 (`js` モジュール)
 
-Pyodide の `from js import ...` に相当する機能の設計メモ。対象はブラウザ向けの
-`wasm32-unknown-emscripten` / `wasm64-unknown-emscripten`。他のターゲットで
-`import js` すると、ドライバが「JavaScript ホストのないターゲット」として拒否する。
+Pyodide の `from js import ...` に相当する機能の設計メモ。対象は、JS ホストの下で
+動く WASI のプログラム (`--target wasm32-wasip1 --js-host`、下記の「ローダ」)。
+他のターゲットで `import js` すると、ドライバが「JavaScript ホストのない
+ターゲット」として拒否する。
+
+Emscripten は使わない (2026-10-04 に外した)。JS との境界は最初から Emscripten に
+依存しない形で作ってあり、Emscripten が担っていた libc と起動は、wasi-libc と
+自前のローダに置き換えた。wasm64 は、wasi-sdk に 64 ビットの libc がないため、
+扱わない。
 
 ## 型: スタブが契約
 
@@ -67,37 +73,39 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   `JsException` は独立したクラスとして未実装。`except JsException` は、名前が
   未定義なのでコンパイル時に拒否される。
 
-## ホスト側: グルーの本体とアダプタ
+## ホスト側: グルーの本体
 
-- 本体は `src/lython/runtime/js/lython_js.js`。Emscripten を知らず、wasm の
+- 本体は `src/lython/runtime/js/lython_js.js`。ローダを知らず、wasm の
   メモリは渡されたアクセサからだけ読む。lyc に埋め込まれている。
 - 引数は値ごとに `LyJs_Push*` で積み、呼び出し側がまとめて受け取る。配列を
   wasm メモリに並べる必要も、一時的な handle も不要になる。
-- Emscripten 用のアダプタは、lyc がリンクのたびに、オブジェクトが実際に
-  import している `LyJs_*` から `--js-library` として生成する。本体は
-  `--pre-js` で渡す。jsifier は、`--js-library` に定義のない import を、
-  モジュール名に関係なく拒否する。そのため、wasm の独自 import モジュールは
-  使えない。
-- **Emscripten を剥がすとき**に差し替えるのは、このアダプタの 2 ファイル分
-  だけになる。本体を `lython_js` などの import モジュールとして渡す自前の
-  loader を書けばよい。
 
-## WASI のローダ (`--js-host`)
+## ローダ (`--js-host`)
 
-`lyc --target wasm32-wasip1 --js-host -o prog.js` は、Emscripten を使わずに
-`js` を持つプログラムを作る。出力は `prog.wasm` とローダ `prog.js` の 2 つ。
+`lyc --target wasm32-wasip1 --js-host -o prog.js` は、`js` を持つプログラムを
+作る。出力は `prog.wasm` とローダ `prog.js` (CommonJS) の 2 つ。
 
 - ローダは `lython_js.js` (本体はそのまま) と `runtime/js/lython_wasi.js`
   (WASI preview-1 の shim と起動) から成る。`node prog.js` でも、ブラウザの
-  `<script>` でも動く。
+  `<script>` でも動くように書いてある (確かめているのは node)。
 - プログラムは、ホストの関数を `lython_js` から import し、`LyJs_Dispatch` /
   `LyJs_Release` を export する (LLVM の段で付ける属性による)。
-- shim が答えるのは、ファイルシステムを持たないプログラムが使う呼び出しだけ。
-  preopen がないので、ファイルを開くと ENOENT になる。
-- JSPI がある所では、`time.sleep` と、asyncio がホストを待つ点で、プログラムを
-  中断する。その間も JS のイベントループが進む (docs/async-design.md の
-  段階 7)。
-- `sys._js_host` は、Emscripten と `--js-host` 付きの WASI で True。
+- node では、ファイルシステム、環境変数、標準入力を node の `node:wasi` に
+  任せる。作業ディレクトリと `/` を preopen し、プログラムは起動時に
+  `PWD` (ローダが渡す、node の作業ディレクトリ) へ `chdir` する
+  (`enterHostWorkingDirectory`)。相対パスはネイティブと同じものを指す。
+- ブラウザでは、ファイルシステムを持たないプログラムが使う呼び出しだけに
+  答える。preopen がないので、ファイルを開くと ENOENT になる。
+- 標準出力と標準エラーは、自前の実装で書く。種別を文字デバイスと答えるので、
+  libc は行単位でバッファする (`print` と `console.log` の順序が保たれる)。
+- JSPI がある所では、asyncio がホストを待つ点でプログラムを中断する。その間も
+  JS のイベントループが進む (docs/async-design.md の段階 7)。
+  - `time.sleep` (`poll_oneoff`) は中断しない。wasi-libc はコールバックの中
+    からも呼び、`WebAssembly.Suspending` の import は `promising` の外で
+    呼ぶと、Promise を返さなくても trap する。
+  - 同じ理由で、asyncio は中断用の import を呼ぶ前に、ふつうの import
+    (`LyJs_CanWaitForHost`) で中断できるかを尋ねる。
+- `sys._js_host` は、`--js-host` 付きの WASI で True。
 
 ## コールバック
 
@@ -116,7 +124,7 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   保持する値だから)。`$` はプログラムが書けない名前なので、衝突しない。
 - JS から呼ばれる入口は、引数も戻り値もない Python 関数 `_js_bridge.dispatch`
   1 つだけ。lyc が LLVM の段で C の入口 `LyJs_Dispatch` (解放は
-  `LyJs_Release`) を作り、Emscripten から export する。
+  `LyJs_Release`) を作り、モジュールから export する。
 - 例外は `dispatch` が捕まえる。JS の関数は、`"<型>: <メッセージ>"` を持つ
   Error を投げる。それがホストの呼び出しから戻ると、Python 側では RuntimeError
   になる。
@@ -126,8 +134,8 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   リークする (Pyodide と同じ)。
 - 制限:
   - lambda の引数には、宣言された型が伝わらない (注釈が必要)。
-  - コールバックを渡すプログラムは、main が返ってもランタイムを終えない
-    (`-sEXIT_RUNTIME=0`)。`setTimeout` などで後から呼ばれる。
+  - main が返ってもインスタンスは残るので、`setTimeout` などで後から
+    呼ばれるコールバックも動く。node は、保留中の処理がなくなると終わる。
   - 属性に callable を代入する形 (`el.onclick = f`) は未対応で、lowering が
     拒否する。
 
@@ -135,9 +143,9 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
 
 - `await` による Promise の待機は実装済み (docs/async-design.md の段階 6)。
   asyncio のループがホストのループで進む (WebLoop) ので、待つ間は wasm から
-  JS に戻る。`asyncio.run()` のようにブロックしたまま Promise を待つことは、
-  Emscripten では RuntimeError になる。WASI のローダ (下記) では JSPI で
-  中断して待つ。
+  JS に戻る。`asyncio.run()` のようにブロックしたまま Promise を待つときは、
+  JSPI で中断して待つ。JSPI のない環境とコールバックの中では RuntimeError に
+  なる。
 - `to_js` / `to_py` (list、dict、TypedDict の変換)。
 - グローバルへの代入と、union 型のグローバルの読み出し。今は lowering が
   拒否する。

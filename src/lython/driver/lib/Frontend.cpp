@@ -65,7 +65,7 @@ stringField(const lython::parser::Node &node, StringRef name) {
 }
 
 bool targetHasJsHost(const llvm::Triple &triple, const DriverOptions &options) {
-  return triple.isOSEmscripten() || (triple.isOSWASI() && options.jsHost);
+  return triple.isOSWASI() && options.jsHost;
 }
 
 static const lython::parser::Node *nodeField(const lython::parser::Node &node,
@@ -356,7 +356,7 @@ static void collectImportedModuleRequests(
   // and dead modules cost only their (DCE-able) compilation.
   // ⭐ EXCEPT a `sys.platform` comparison, decided here: a dead branch may
   // import a module that does not exist on this target -- asyncio's
-  // `if sys.platform == "emscripten": import js` -- and collecting it would
+  // `if sys._js_host: import js` -- and collecting it would
   // refuse the program for a module it never reaches.
   std::vector<const lython::parser::Node *> statements;
   std::function<void(const std::vector<lython::parser::NodePtr> &)> flatten =
@@ -499,8 +499,7 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
       if (request.isEmbedded && !hasJsHost) {
         diag << mainPath
              << ": emit error: module 'js' is the JavaScript host's and this "
-                "target has none; compile for wasm32-unknown-emscripten, "
-                "wasm64-unknown-emscripten, or wasm32-wasip1 with --js-host\n";
+                "target has none; compile for wasm32-wasip1 with --js-host\n";
         return failure();
       }
       if (!request.isEmbedded && hasJsHost) {

@@ -303,7 +303,6 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
 enum class LinkerDriverFlavor {
   Clang,
   MinGWGcc,
-  Emscripten,
   WASI,
 };
 
@@ -376,17 +375,6 @@ findExecutableLinkerDriver(py::TensorLoweringTarget tensorTarget) {
                  << " needs wasi-sdk: set WASI_SDK_PATH to its directory\n";
     return std::nullopt;
   }
-  // ⛔ Not clang + wasm-ld. The objects import libc, and Emscripten's libc is
-  // the one whose ABI the runtime was measured against (SupportBuilder.h); emcc
-  // is what builds that sysroot and writes the JS loader that runs the module.
-  if (targetTriple.isOSEmscripten()) {
-    if (auto emcc = findExecutableProgram("emcc"))
-      return LinkerDriver{*emcc, LinkerDriverFlavor::Emscripten};
-    llvm::errs() << "error: emcc executable not found in PATH (linking "
-                 << targetTriple.normalize() << " needs Emscripten)\n";
-    return std::nullopt;
-  }
-
   auto clangExe = findLLVMToolProgram("clang++");
   if (!clangExe)
     clangExe = findLLVMToolProgram("clang");
@@ -474,41 +462,6 @@ LogicalResult runLinkerCommand(StringRef clangProgram,
   return success();
 }
 
-// The output is whatever emcc makes of `-o`: `x.js` / `x.mjs` a loader beside
-// `x.wasm`, and no extension a node script with a shebang.
-void appendEmscriptenLinkArgs(std::vector<std::string> &args,
-                              const llvm::Triple &triple) {
-  if (triple.isArch64Bit())
-    args.emplace_back("-m64");
-  // Links the libunwind whose `_Unwind_RaiseException` is a wasm `throw`, and
-  // the personality the funclet pads name (UnwindABI.h).
-  args.emplace_back("-fwasm-exceptions");
-  // ⛔ Node only, with the host's file system and file descriptors. The
-  // default stdout is a TTY emulation that decodes each line as UTF-8 for
-  // console.log and drops NUL bytes: `print(chr(0))` printed nothing, and a
-  // byte that is not UTF-8 would be replaced. A browser has no stdout to be
-  // exact about; what a page should get instead is part of the JS boundary,
-  // which is not built yet.
-  args.emplace_back("-sENVIRONMENT=node");
-  args.emplace_back("-sNODERAWFS=1");
-  // Returning from main runs atexit and flushes stdio; without it the runtime
-  // stays alive for callbacks that a Python program never registers, and
-  // output still sitting in a FILE buffer is never written.
-  args.emplace_back("-sEXIT_RUNTIME=1");
-  args.emplace_back("-sALLOW_MEMORY_GROWTH=1");
-  // A native main thread's 8 MiB. Emscripten's default is 64 KiB, which a
-  // recursion 2000 frames deep overflows.
-  args.emplace_back("-sSTACK_SIZE=8MB");
-  // ⛔ Stack below static data, not above it. There is no guard page, and
-  // with data first a stack that runs past its bottom writes over globals
-  // without trapping; stack-first makes it wrap below address 0 and trap.
-  args.emplace_back("-Wl,--stack-first");
-  // ⛔ A signature mismatch is only a warning to wasm-ld, which resolves it
-  // with a stub that traps when called: a link that succeeds and a program
-  // that dies at the first call to the misdeclared function.
-  args.emplace_back("-Wl,--fatal-warnings");
-}
-
 // The output is a core module for a WASI preview-1 host:
 // `wasmtime run -W exceptions=y --dir=. prog.wasm`.
 void appendWASILinkArgs(std::vector<std::string> &args,
@@ -523,7 +476,9 @@ void appendWASILinkArgs(std::vector<std::string> &args,
   args.emplace_back("-lwasi-emulated-signal");
   args.emplace_back("-lwasi-emulated-process-clocks");
   args.emplace_back("-Wl,-z,stack-size=8388608");
-  // As for Emscripten: the stack below static data, so an overflow traps.
+  // ⛔ Stack below static data, not above it. There is no guard page, and
+  // with data first a stack that runs past its bottom writes over globals
+  // without trapping; stack-first makes it wrap below address 0 and trap.
   args.emplace_back("-Wl,--stack-first");
   args.emplace_back("-Wl,--fatal-warnings");
 }
@@ -568,100 +523,9 @@ LogicalResult writeWASIJsHostLoader(StringRef outputPath) {
   return success();
 }
 
-// The host functions the program imports from JavaScript (`LyJs_*`, declared
-// by runtime/modules/_js.mlir), by the names its object will import.
-std::vector<std::string> jsHostImports(const llvm::Module &module) {
-  std::vector<std::string> names;
-  for (const llvm::Function &function : module)
-    if (function.isDeclaration() && function.getName().starts_with("LyJs_"))
-      names.push_back(function.getName().str());
-  return names;
-}
-
-// The C functions the host calls the program back through (LyJs_Dispatch,
-// LyJs_Release: installJsHostEntryPoints), when the program has them.
-std::vector<std::string> jsHostExports(const llvm::Module &module) {
-  std::vector<std::string> names;
-  for (const llvm::Function &function : module)
-    if (!function.isDeclaration() && function.getName().starts_with("LyJs_") &&
-        function.hasExternalLinkage())
-      names.push_back(function.getName().str());
-  return names;
-}
-
-// emcc's view of the host functions: the core (runtime/js/lython_js.js) as a
-// --pre-js, and a --js-library naming each import as a call into it.
-//
-// ⛔ The core does not know it is in Emscripten, and the adapter is generated
-// from the object's own imports rather than kept by hand: what ties the
-// program to Emscripten here is these two files, which is the part to replace
-// when the browser target drops it.
-LogicalResult appendEmscriptenJsHostArgs(
-    std::vector<std::string> &args, llvm::ArrayRef<std::string> imports,
-    llvm::ArrayRef<std::string> exports,
-    std::vector<std::unique_ptr<llvm::FileRemover>> &cleanup) {
-  if (imports.empty())
-    return success();
-  auto writeTemporary = [&](StringRef suffix, StringRef content,
-                            StringRef flag) -> LogicalResult {
-    llvm::SmallString<256> path;
-    if (auto ec =
-            llvm::sys::fs::createTemporaryFile("lython-js", suffix, path)) {
-      llvm::errs() << "error: failed to create " << suffix
-                   << " for the JavaScript host: " << ec.message() << "\n";
-      return failure();
-    }
-    // Behind a pointer: a FileRemover that a growing vector moves deletes
-    // the file when the moved-from copy is destroyed.
-    cleanup.push_back(std::make_unique<llvm::FileRemover>(path));
-    std::error_code ec;
-    llvm::raw_fd_ostream out(path, ec);
-    if (ec) {
-      llvm::errs() << "error: failed to write " << path << ": " << ec.message()
-                   << "\n";
-      return failure();
-    }
-    out << content;
-    args.emplace_back(flag.str());
-    args.emplace_back(path.str().str());
-    return success();
-  };
-  std::string adapter = "addToLibrary({\n"
-                        "  $lythonJs: 'LythonJs.create(() => wasmMemory, "
-                        "() => wasmExports)',\n";
-  for (const std::string &name : imports)
-    adapter += "  " + name + "__deps: ['$lythonJs'],\n  " + name +
-               ": (...args) => lythonJs." + name + "(...args),\n";
-  adapter += "});\n";
-  // A program that hands the host a callback is not finished when main
-  // returns: the host may call it from a timer or an event. The runtime stays
-  // up and node ends the process when nothing is left to run; the exit code
-  // main returned is still the process's (emcc's quit_ sets it either way).
-  //
-  // ⛔ Not for every host program: keeping the runtime up skips its exit,
-  // which is where C's stdio buffers are flushed, and a program with no
-  // callback has nothing after main to wait for.
-  if (llvm::is_contained(imports, "LyJs_MakeFunction"))
-    for (std::string &arg : args)
-      if (arg == "-sEXIT_RUNTIME=1")
-        arg = "-sEXIT_RUNTIME=0";
-  if (!exports.empty()) {
-    std::string exported = "-sEXPORTED_FUNCTIONS=_main";
-    for (const std::string &name : exports)
-      exported += ",_" + name;
-    args.push_back(exported);
-  }
-  if (failed(writeTemporary("core.js", kLythonJsCore, "--pre-js")) ||
-      failed(writeTemporary("library.js", adapter, "--js-library")))
-    return failure();
-  return success();
-}
-
 LogicalResult linkExecutable(StringRef objectPath,
                              py::TensorLoweringTarget tensorTarget,
-                             StringRef outputPath,
-                             llvm::ArrayRef<std::string> jsImports,
-                             llvm::ArrayRef<std::string> jsExports) {
+                             StringRef outputPath) {
   std::optional<LinkerDriver> linker = findExecutableLinkerDriver(tensorTarget);
   if (!linker)
     return failure();
@@ -679,14 +543,7 @@ LogicalResult linkExecutable(StringRef objectPath,
   argStorage.emplace_back(objectPath.str());
   appendLinkTargetLibraries(argStorage, tensorTarget);
   argStorage.emplace_back("-O2");
-  std::vector<std::unique_ptr<llvm::FileRemover>> jsHostFiles;
-  if (linker->flavor == LinkerDriverFlavor::Emscripten) {
-    appendEmscriptenLinkArgs(argStorage,
-                             codeGenTripleForTarget(tensorTarget, Options));
-    if (failed(appendEmscriptenJsHostArgs(argStorage, jsImports, jsExports,
-                                          jsHostFiles)))
-      return failure();
-  } else if (linker->flavor == LinkerDriverFlavor::WASI) {
+  if (linker->flavor == LinkerDriverFlavor::WASI) {
     appendWASILinkArgs(argStorage,
                        codeGenTripleForTarget(tensorTarget, Options));
     if (Options.jsHost) {
@@ -724,13 +581,10 @@ LogicalResult buildExecutable(llvm::Module &llvmModule,
     return failure();
   }
   llvm::FileRemover objCleanup(objectPath);
-  std::vector<std::string> jsImports = jsHostImports(llvmModule);
-  std::vector<std::string> jsExports = jsHostExports(llvmModule);
   if (failed(
           emitObjectFile(llvmModule, safetyProfile, tensorTarget, objectPath)))
     return failure();
-  if (failed(linkExecutable(objectPath, tensorTarget, outputPath, jsImports,
-                            jsExports)))
+  if (failed(linkExecutable(objectPath, tensorTarget, outputPath)))
     return failure();
   return success();
 }
@@ -1189,8 +1043,7 @@ int main(int argc, char **argv) {
       !llvm::Triple(llvm::Triple::normalize(Options.targetTriple))
            .isOSWASI()) {
     llvm::errs() << "error: --js-host runs a WASI program under a JavaScript "
-                    "host and needs --target wasm32-wasip1; an Emscripten "
-                    "target always has one\n";
+                    "host and needs --target wasm32-wasip1\n";
     return 1;
   }
   py::IRDumpConfig irDump = py::IRDumpConfig::fromEnv();

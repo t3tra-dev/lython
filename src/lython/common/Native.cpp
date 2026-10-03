@@ -27,8 +27,8 @@ std::uint64_t expectedCLongWidth(llvm::StringRef tripleText,
 
 bool isSupportedNativeTarget(llvm::StringRef tripleText) {
   llvm::Triple triple(tripleText);
-  return triple.isOSEmscripten() || isWASIPreview1(triple) ||
-         triple.isOSDarwin() || triple.isOSLinux() || triple.isOSWindows();
+  return isWASIPreview1(triple) || triple.isOSDarwin() ||
+         triple.isOSLinux() || triple.isOSWindows();
 }
 
 bool isWASIPreview1(const llvm::Triple &triple) {
@@ -37,7 +37,7 @@ bool isWASIPreview1(const llvm::Triple &triple) {
 }
 
 bool hasMeasured32BitLibc(const llvm::Triple &triple) {
-  if (triple.isOSEmscripten() || isWASIPreview1(triple))
+  if (isWASIPreview1(triple))
     return triple.getArch() == llvm::Triple::wasm32;
   return triple.isOSLinux() && triple.getArch() == llvm::Triple::arm &&
          triple.isGNUEnvironment();
@@ -78,6 +78,11 @@ mlir::LogicalResult verifyTargetPlatformFacts(mlir::ModuleOp module) {
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
            << "' has unknown architecture";
+  if (triple.isOSEmscripten())
+    return module.emitError()
+           << kTargetTripleAttr << " '" << tripleAttr.getValue()
+           << "' is not supported: a program for a JavaScript host is built "
+              "with --target wasm32-wasip1 --js-host";
   // ⛔ Only the 32-bit targets whose libc was MEASURED. Every C struct the
   // runtime reads moves with the target's widths and its symbol choices, and
   // a guessed layout reads the wrong words silently; the measurements are
@@ -86,8 +91,7 @@ mlir::LogicalResult verifyTargetPlatformFacts(mlir::ModuleOp module) {
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()
            << "' is not supported: no measured libc layout for this 32-bit "
-              "target (armv7 glibc, wasm32 Emscripten and wasm32 WASI 0.1 "
-              "are)";
+              "target (armv7 glibc and wasm32 WASI 0.1 are)";
   if (!isSupportedNativeTarget(tripleAttr.getValue()))
     return module.emitError()
            << kTargetTripleAttr << " '" << tripleAttr.getValue()

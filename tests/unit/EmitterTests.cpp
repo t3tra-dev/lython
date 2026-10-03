@@ -62,7 +62,8 @@ ImportedModuleEmit
 emitWithImportedModule(llvm::StringRef helperName, llvm::StringRef helperSource,
                        llvm::StringRef mainSource,
                        llvm::StringRef helperExtension = ".py",
-                       llvm::StringRef targetTriple = {}) {
+                       llvm::StringRef targetTriple = {},
+                       bool jsHost = false) {
   ImportedModuleEmit result;
   llvm::SmallString<128> dir;
   if (llvm::sys::fs::createUniqueDirectory("lython-emit-import", dir)) {
@@ -91,6 +92,7 @@ emitWithImportedModule(llvm::StringRef helperName, llvm::StringRef helperSource,
   options.targetTriple = targetTriple.empty()
                              ? llvm::sys::getDefaultTargetTriple()
                              : targetTriple.str();
+  options.jsHost = jsHost;
   result.succeeded = mlir::succeeded(lython::driver::emitMLIRFromSource(
       mainSource, mainPath, dir, options, context, module, diag));
   llvm::sys::fs::remove(helperPath);
@@ -2081,7 +2083,7 @@ TEST(EmitterTest, TheJsModuleIsTheHosts) {
 
   ImportedModuleEmit shadowed = emitWithImportedModule(
       "js", "def log() -> None:\n    pass\n", "import js\njs.log()\n", ".py",
-      "wasm32-unknown-emscripten");
+      "wasm32-wasip1", /*jsHost=*/true);
   EXPECT_FALSE(shadowed.succeeded);
   EXPECT_NE(shadowed.diagnostics.find("module 'js' is the host's; rename this "
                                       "file"),
@@ -2099,7 +2101,8 @@ TEST(EmitterTest, AJsGlobalIsTypedByTheStub) {
     mlir::OwningOpRef<mlir::ModuleOp> module;
     llvm::raw_string_ostream diag(diagnostics);
     lython::driver::DriverOptions options;
-    options.targetTriple = "wasm32-unknown-emscripten";
+    options.targetTriple = "wasm32-wasip1";
+    options.jsHost = true;
     return mlir::succeeded(lython::driver::emitMLIRFromSource(
         source, "main.py", "<lython-no-import-dir>", options, context, module,
         diag));
@@ -2131,7 +2134,8 @@ TEST(EmitterTest, AnIsinstanceAgainstAHostClassNarrows) {
     mlir::OwningOpRef<mlir::ModuleOp> module;
     llvm::raw_string_ostream diag(diagnostics);
     lython::driver::DriverOptions options;
-    options.targetTriple = "wasm32-unknown-emscripten";
+    options.targetTriple = "wasm32-wasip1";
+    options.jsHost = true;
     return mlir::succeeded(lython::driver::emitMLIRFromSource(
         source, "main.py", "<lython-no-import-dir>", options, context, module,
         diag));
@@ -2302,7 +2306,7 @@ TEST(EmitterTest, AGenericHostClassIsReadWithItsArguments) {
       "    print(\"later\")\n\n\n"
       "show(Promise.resolve(4))\n"
       "setTimeout(later, 10)\n",
-      "wasm32-unknown-emscripten");
+      "wasm32-wasip1", /*jsHost=*/true);
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
 }
 
@@ -2313,7 +2317,7 @@ TEST(EmitterTest, AnAwaitOnAHostValueTakesAPromiseAndAsyncio) {
       "from js import Promise\n\n\n"
       "async def f() -> int:\n"
       "    return await Promise.resolve(1)\n",
-      "wasm32-unknown-emscripten");
+      "wasm32-wasip1", /*jsHost=*/true);
   EXPECT_FALSE(noAsyncio.succeeded);
   EXPECT_NE(noAsyncio.diagnostics.find(
                 "await on a JavaScript Promise needs asyncio"),
@@ -2324,7 +2328,7 @@ TEST(EmitterTest, AnAwaitOnAHostValueTakesAPromiseAndAsyncio) {
       "from js import document\n\n\n"
       "async def f() -> None:\n"
       "    await document\n",
-      "wasm32-unknown-emscripten");
+      "wasm32-wasip1", /*jsHost=*/true);
   EXPECT_FALSE(notAPromise.succeeded);
   EXPECT_NE(notAPromise.diagnostics.find(
                 "await on a JavaScript value needs a Promise"),
@@ -2339,7 +2343,7 @@ TEST(EmitterTest, ABranchForAnotherPlatformImportsNothing) {
   ImportedModuleEmit emitted = emitWithImportedModule(
       "hosted",
       "import sys\n\n"
-      "if sys.platform == \"emscripten\":\n"
+      "if sys.platform == \"wasi\":\n"
       "    import js\n\n"
       "    def where() -> str:\n"
       "        return \"host\"\n"
@@ -2387,15 +2391,11 @@ TEST(EmitterTest, AWASIProgramHasAJsHostOnlyWhenAskedFor) {
   for (auto [triple, jsHost] :
        {std::pair<const char *, bool>{"", false},
         {"wasm32-wasip1", false},
-        {"wasm32-wasip1", true},
-        {"wasm32-unknown-emscripten", false}}) {
-    ImportedModuleEmit emitted = emitWithImportedModule(
-        "guarded", guarded, "import guarded\nguarded.say()\n", ".py", triple);
-    if (jsHost)
-      emitted = [&] {
-        // The helper takes no host flag; the main-source form does.
-        return emitMainFor(std::string(guarded) + "say()\n", triple, true);
-      }();
+        {"wasm32-wasip1", true}}) {
+    ImportedModuleEmit emitted =
+        emitWithImportedModule("guarded", guarded,
+                               "import guarded\nguarded.say()\n", ".py",
+                               triple, jsHost);
     EXPECT_TRUE(emitted.succeeded) << triple << " " << emitted.diagnostics;
   }
 }

@@ -8,18 +8,12 @@ Runs `lyc jit <case.py>` and verifies against sidecar files next to the case:
 --exit-only N skips sidecar lookup and only checks the exit code; ctest uses
 it to smoke-run examples/ without adding expectation files there.
 
---wasm-node NODE builds for wasm64-unknown-emscripten (or --wasm-target's
-triple) and runs the result under NODE (24 or later for memory64); --wasmtime
-WASMTIME builds for wasm32-wasip1 and runs it under WASMTIME, the working
-directory and the case's directory preopened (WASI_SDK_PATH must name a
-wasi-sdk). Each is --aot with a different target and a different way to start
-the program, and checks the same sidecars.
-
---js-host, with --wasm-node and --wasm-target wasm32-wasip1, links the WASI
-program to run under its JavaScript loader (`lyc --js-host`), which suspends
-it with JSPI where node has it. A case whose answer there differs -- it can
-wait on a promise where Emscripten cannot -- keeps it in <case>.jspi.stdout,
-which is compared instead of <case>.stdout.
+--wasm-node NODE builds for wasm32-wasip1 under a JavaScript host
+(`lyc --js-host`) and runs the loader under NODE (24 or later, for JSPI and
+exnref); --wasmtime WASMTIME builds for wasm32-wasip1 and runs it under
+WASMTIME, the working directory and the case's directory preopened. Both need
+WASI_SDK_PATH to name a wasi-sdk. Each is --aot with a different target and a
+different way to start the program, and checks the same sidecars.
 
 --aot builds an executable and runs it instead of JIT-ing, and --release passes
 `--release` to lyc. Both are checked against the SAME sidecars by the SAME code
@@ -119,9 +113,9 @@ class CrossRun:
 def cross_run_from(args: argparse.Namespace) -> "CrossRun | None":
     if args.wasm_node:
         node = str(args.wasm_node)
-        return CrossRun(args.wasm_target, "prog.js",
+        return CrossRun("wasm32-wasip1", "prog.js",
                         lambda binary, case: [node, str(binary)],
-                        ["--js-host"] if args.js_host else [])
+                        ["--js-host"])
     if args.wasmtime:
         wasmtime = str(args.wasmtime)
         return CrossRun(
@@ -264,9 +258,7 @@ def main() -> int:
     parser.add_argument("--aot", action="store_true")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--wasm-node", type=pathlib.Path, default=None)
-    parser.add_argument("--wasm-target", default="wasm64-unknown-emscripten")
     parser.add_argument("--wasmtime", type=pathlib.Path, default=None)
-    parser.add_argument("--js-host", action="store_true")
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
     cross = cross_run_from(args)
@@ -316,8 +308,6 @@ def main() -> int:
                       f"expected {expected_exit}")
 
     stdout_file = args.case.with_suffix(".stdout")
-    if args.js_host and args.case.with_suffix(".jspi.stdout").exists():
-        stdout_file = args.case.with_suffix(".jspi.stdout")
     if stdout_file.exists():
         expected_stdout = stdout_file.read_text()
         if stdout != expected_stdout:

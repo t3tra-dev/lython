@@ -58,8 +58,6 @@ operatingSystemNames(const llvm::Triple &triple) {
     return OperatingSystemNames{"openbsd", "OpenBSD"};
   if (triple.isOSNetBSD())
     return OperatingSystemNames{"netbsd", "NetBSD"};
-  if (triple.isOSEmscripten())
-    return OperatingSystemNames{"emscripten", "Emscripten"};
   // CPython's WASI build: sys.platform, and the sysname wasi-libc's uname()
   // reports, which is what platform.system() returns.
   if (triple.isOSWASI())

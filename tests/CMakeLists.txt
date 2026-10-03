@@ -177,8 +177,6 @@ set(LYTHON_UNIT_PATTERNS_abi
     # each one would emit, which is a fact about the exception ABI and costs
     # what a table lookup costs.
     "DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads"
-    "DriverTest.EmscriptenNamesItselfTheWayCPythonDoes"
-    "DriverTest.Wasm64EmscriptenReadsMuslsLayout"
     "DriverTest.ILP32TargetsReadTheirMeasuredLayouts"
     "DriverTest.WasiPreview1ReadsWasiLibcsLayout")
 # `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
@@ -198,6 +196,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
+    "DriverTest.AnEmscriptenTargetNamesWhatReplacedIt"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
@@ -225,7 +224,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ARecursiveGeneratorMethodRunsThroughItsFrame"
     "DriverTest.ABoolLiveAcrossAYieldNamesTheRealLimit"
     "DriverTest.AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation"
-    "DriverTest.AWasm64ModuleCarriesItsPadsAsFunclets"
+    "DriverTest.AWasmModuleCarriesItsPadsAsFunclets"
     "DriverTest.PutsIsDeclaredWithItsCPrototype"
     "DriverTest.A32BitTargetCompilesOnlyWhereItsLibcWasMeasured"
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot"
@@ -953,27 +952,24 @@ foreach(case_name IN LISTS LYTHON_RELEASE_AGREEMENT_CASES)
     lython_add_agreement_case(release "${case_name}" --release)
 endforeach()
 
-# `wasm` builds for wasm64-unknown-emscripten and runs the result under node.
-# Registered only where both halves exist: emcc links it, and node must be new
-# enough for memory64 (24+; 22 rejects the module's table encoding). Neither is
-# required to build Lython, so a machine without them skips the stage rather
-# than failing it. LYTHON_WASM_NODE names a node when the one on PATH is older.
-#
-# ⛔ NOT THE WHOLE SUITE. Measured over every golden case: 764 of 767 cases
-# and 115 of 116 error cases agree, and the four that do not print an errno
-# number -- `[Errno 44]` where the sidecar says 2, `os.strerror(2)` reading
-# EACCES -- because Emscripten's libc numbers errno the WASI way, as CPython's
-# own Emscripten build does. Members are chosen by mechanism, like the two
-# stages above:
+# `wasm` builds for wasm32-wasip1 with `--js-host` and runs the result under
+# node, through the loader lyc writes beside it (runtime/js/lython_wasi.js):
+# the same programs the `wasi` stage runs under wasmtime, with node's WASI
+# answering the file system and the loader the rest. Registered only where
+# wasi-sdk links it and node is new enough for JSPI and exnref (24+). Neither
+# is required to build Lython, so a machine without them skips the stage
+# rather than failing it. LYTHON_WASM_NODE names a node when the one on PATH
+# is older. Members are chosen by mechanism, like the two stages above:
 set(LYTHON_WASM_AGREEMENT_CASES
-    # The floor: link through emcc and run under node.
+    # The floor: link with wasi-sdk and run under the loader.
     hello
     # stdout is the process's fd 1, byte for byte: chr(0) survives.
     builtins_numeric
     # The object allocator's 16-byte guarantee: environment strings are freed
     # through headers rebuilt from their aligned address.
     stdlib_os_env
-    # The host file system (NODERAWFS): write, reopen, seek and read back.
+    # The host file system, through node's WASI, from the directory the
+    # program was started in: write, reopen, seek and read back.
     open_binary
     # A raise caught in its own frame is a branch, not an unwind.
     try_tuple_as
@@ -989,7 +985,6 @@ set(LYTHON_WASM_AGREEMENT_CASES
     # An uncaught raise in `<module>` reaches LyRunPythonMain's catch-all.
     errors/cross_bigint_traceback)
 
-find_program(LYTHON_EMCC emcc)
 set(LYTHON_WASM_NODE "" CACHE FILEPATH
     "node (24 or later) that runs the wasm agreement stage; empty looks up node")
 set(lython_wasm_node "${LYTHON_WASM_NODE}")
@@ -1045,38 +1040,30 @@ else()
 endif()
 
 # `js` is the JavaScript host's module, which CPython does not have: its cases
-# live in golden/js with their expected output written down, and run as
-# wasm32-unknown-emscripten under the same node -- the browser's word size.
+# live in golden/js with their expected output written down, and run under the
+# same loader and node, which suspends the program with JSPI.
 file(GLOB LYTHON_JS_GOLDEN_CASES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/js/*.py")
-if(LYTHON_EMCC AND lython_wasm_node_major GREATER_EQUAL 24)
+if(LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/bin/clang" AND
+   lython_wasm_node_major GREATER_EQUAL 24)
     foreach(case_name IN LISTS LYTHON_WASM_AGREEMENT_CASES)
         lython_add_agreement_case(wasm "${case_name}"
             --wasm-node "${lython_wasm_node}")
+        string(REPLACE "/" "." test_stem "${case_name}")
+        set_tests_properties("golden.wasm.${test_stem}" PROPERTIES
+            ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
     endforeach()
     foreach(case_path IN LISTS LYTHON_JS_GOLDEN_CASES)
         get_filename_component(case_name "${case_path}" NAME_WE)
         lython_add_agreement_case(js "js/${case_name}"
-            --wasm-node "${lython_wasm_node}"
-            --wasm-target wasm32-unknown-emscripten)
+            --wasm-node "${lython_wasm_node}")
+        set_tests_properties("golden.js.js.${case_name}" PROPERTIES
+            ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
     endforeach()
-    # The same cases as a WASI program under its own JavaScript loader
-    # (`--js-host`), which suspends it with JSPI: the host half of `js` without
-    # Emscripten, and asyncio waiting on the host where Emscripten cannot.
-    if(LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/bin/clang")
-        foreach(case_path IN LISTS LYTHON_JS_GOLDEN_CASES)
-            get_filename_component(case_name "${case_path}" NAME_WE)
-            lython_add_agreement_case(jspi "js/${case_name}"
-                --wasm-node "${lython_wasm_node}"
-                --wasm-target wasm32-wasip1 --js-host)
-            set_tests_properties("golden.jspi.js.${case_name}" PROPERTIES
-                ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
-        endforeach()
-    endif()
 else()
-    message(STATUS "Lython: wasm agreement stage skipped (emcc: "
-        "${LYTHON_EMCC}; node: ${lython_wasm_node} "
-        "${lython_wasm_node_version}; needs emcc and node >= 24)")
+    message(STATUS "Lython: wasm agreement stage skipped (wasi-sdk: "
+        "${LYTHON_WASI_SDK}; node: ${lython_wasm_node} "
+        "${lython_wasm_node_version}; needs wasi-sdk and node >= 24)")
 endif()
 
 # --- examples/ smoke tests (exit code only) ----------------------------------

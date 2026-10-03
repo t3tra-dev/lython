@@ -2,10 +2,9 @@
 // imports to reach JavaScript values (runtime/modules/_js.mlir declares them).
 //
 // Host-neutral on purpose. It knows the wasm memory only through the accessor
-// it is given and nothing of the loader that instantiated the module, so the
-// same object serves an Emscripten build (through the adapter lyc generates
-// with --js-library) and a module instantiated by any other loader that hands
-// these functions over as imports.
+// it is given and nothing of the loader that instantiated the module: the
+// WASI loader (lython_wasi.js) hands these functions over as the module's
+// `lython_js` imports, and any other loader may.
 //
 // A JavaScript value lives in `values` and the program holds its index -- a
 // handle -- for as long as a Python reference does; the program drops it when

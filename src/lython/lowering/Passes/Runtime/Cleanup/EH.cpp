@@ -673,10 +673,9 @@ void installJsHostEntryPoints(llvm::Module &module,
     builder.CreateCall(python);
     builder.CreateRetVoid();
   }
-  // On WASI the host is whatever loader instantiates the module, and the
-  // names cross as the module's own imports and exports: `lython_js` is the
-  // import module the loader (runtime/js/lython_wasi.js) answers. Emscripten
-  // routes the same names through its generated library instead.
+  // The host is whatever loader instantiates the module, and the names cross
+  // as the module's own imports and exports: `lython_js` is the import module
+  // the loader (runtime/js/lython_wasi.js) answers.
   if (!triple.isOSWASI())
     return;
   for (llvm::Function &function : module) {
@@ -1120,7 +1119,7 @@ void convertLandingPadToCatchAll(llvm::LandingPadInst *pad,
 // rules (no nesting, a "funclet" bundle on every call inside one) bind nothing
 // but the instructions written here.
 //
-// `resume` becomes a fresh `throw` of the same carrier. Emscripten's libunwind
+// `resume` becomes a fresh `throw` of the same carrier. wasi-sdk's libunwind
 // raises the same way (`_Unwind_RaiseException` is `__builtin_wasm_throw(0,
 // carrier)`), so the raise side needs no change at all.
 //

@@ -1749,51 +1749,19 @@ TEST(DriverTest, AWithTargetInAGeneratorIsNotBlamedOnTheAnnotation) {
   EXPECT_TRUE(accepted.succeeded) << accepted.diagnostics;
 }
 
-// What: the names Emscripten answers to. CPython built for Emscripten reports
-// `sys.platform == "emscripten"` and `platform.system() == "Emscripten"`, and
-// both fold from the one row the target triple selects.
-TEST(DriverTest, EmscriptenNamesItselfTheWayCPythonDoes) {
-  EXPECT_EQ(py::platform_constants::staticStringValue(
-                "sys.platform", "wasm64-unknown-emscripten"),
-            std::optional<std::string>("emscripten"));
-  EXPECT_EQ(py::platform_constants::staticStringValue(
-                "platform.system", "wasm64-unknown-emscripten"),
-            std::optional<std::string>("Emscripten"));
-  EXPECT_EQ(py::platform_constants::staticIntValue("sys.maxsize",
-                                                   "wasm64-unknown-emscripten"),
-            std::optional<long long>(9223372036854775807LL));
-}
-
-// What: the libc facts the OS cluster reads on wasm64 Emscripten are musl's as
-// measured under `emcc -m64`: WASI errno numbers, and a `struct stat` that
-// leads with 32-bit dev_t and mode_t and ends with st_ino.
-TEST(DriverTest, Wasm64EmscriptenReadsMuslsLayout) {
-  py::runtime_library::HostTargetLayout layout =
-      py::runtime_library::hostTargetLayout(
-          llvm::Triple("wasm64-unknown-emscripten"));
-  EXPECT_TRUE(layout.posix);
-  EXPECT_EQ(layout.errnoAccessor, "__errno_location");
-  EXPECT_EQ(layout.errnoNumbering, py::exceptions::ErrnoNumbering::WASI);
-  EXPECT_EQ(layout.statDev[0], 0);
-  EXPECT_EQ(layout.statDev[1], 4);
-  EXPECT_EQ(layout.statMode[0], 4);
-  EXPECT_EQ(layout.statNlink[0], 8);
-  EXPECT_EQ(layout.statUid[0], 16);
-  EXPECT_EQ(layout.statGid[0], 20);
-  EXPECT_EQ(layout.statSize[0], 32);
-  EXPECT_EQ(layout.statAtime[0], 48);
-  EXPECT_EQ(layout.statMtime[0], 64);
-  EXPECT_EQ(layout.statCtime[0], 80);
-  EXPECT_EQ(layout.statIno[0], 96);
-  EXPECT_EQ(layout.direntNameOffset, 19);
-  EXPECT_EQ(layout.clockMonotonic, 1);
-
-  int enoent = 0;
-  for (const py::exceptions::OSErrorErrnoMapping &row :
-       py::exceptions::kOSErrorErrnoMap)
-    if (row.posixName == "ENOENT")
-      enoent = row.valueFor(layout.errnoNumbering);
-  EXPECT_EQ(enoent, 44);
+// What: an Emscripten triple is refused with the target that replaced it: a
+// program for a JavaScript host is a WASI program run by lyc's own loader.
+TEST(DriverTest, AnEmscriptenTargetNamesWhatReplacedIt) {
+  for (const char *triple :
+       {"wasm32-unknown-emscripten", "wasm64-unknown-emscripten"}) {
+    lython::driver::DriverOptions options;
+    options.targetTriple = triple;
+    CompileResult result = compileSource("print(1)\n", options);
+    EXPECT_FALSE(result.succeeded) << triple;
+    EXPECT_NE(result.diagnostics.find("--target wasm32-wasip1 --js-host"),
+              std::string::npos)
+        << triple << "\n" << result.diagnostics;
+  }
 }
 
 namespace {
@@ -1854,12 +1822,12 @@ bool isCalled(const llvm::Module &module, llvm::StringRef name) {
 
 } // namespace
 
-// What: a wasm64 module raises through `_Unwind_RaiseException` like every
+// What: a wasm module raises through `_Unwind_RaiseException` like every
 // other target, and after the funclet rewrite it holds no landingpad and no
 // resume, names the wasm personality, verifies, and gets through the
 // WebAssembly backend's instruction selection -- which crashed on the
 // landingpads before.
-TEST(DriverTest, AWasm64ModuleCarriesItsPadsAsFunclets) {
+TEST(DriverTest, AWasmModuleCarriesItsPadsAsFunclets) {
   const char *source = "def fail(n: int) -> int:\n"
                        "    if n > 0:\n"
                        "        raise ValueError('x')\n"
@@ -1873,7 +1841,7 @@ TEST(DriverTest, AWasm64ModuleCarriesItsPadsAsFunclets) {
                        "except ValueError as e:\n"
                        "    print('caught', e)\n";
   lython::driver::VerifiedLLVMModule wasmResult =
-      compileAndLinkFor(source, "wasm64-unknown-emscripten");
+      compileAndLinkFor(source, "wasm32-wasip1");
   ASSERT_TRUE(wasmResult.llvmModule);
   llvm::Module *wasm = wasmResult.llvmModule.get();
   EXPECT_TRUE(isCalled(*wasm, "_Unwind_RaiseException"));
@@ -1899,7 +1867,7 @@ TEST(DriverTest, AWasm64ModuleCarriesItsPadsAsFunclets) {
   ASSERT_FALSE(llvm::verifyModule(*wasm, &brokenStream)) << broken;
 
   lython::driver::DriverOptions options;
-  options.targetTriple = "wasm64-unknown-emscripten";
+  options.targetTriple = "wasm32-wasip1";
   std::string diagnostics;
   llvm::raw_string_ostream diag(diagnostics);
   llvm::InitializeAllAsmPrinters();
@@ -1922,7 +1890,7 @@ TEST(DriverTest, AWasm64ModuleCarriesItsPadsAsFunclets) {
 // call through the wrong signature into a trap.
 TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
   lython::driver::VerifiedLLVMModule wasmResult =
-      compileAndLinkFor("print('hi')\n", "wasm64-unknown-emscripten");
+      compileAndLinkFor("print('hi')\n", "wasm32-wasip1");
   ASSERT_TRUE(wasmResult.llvmModule);
   llvm::Module *wasm = wasmResult.llvmModule.get();
   const llvm::Function *puts = wasm->getFunction("puts");
@@ -1932,11 +1900,11 @@ TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
 }
 
 // What: a 32-bit target compiles only where its libc was measured -- armv7
-// glibc and wasm32 Emscripten -- and any other is refused before lowering
+// glibc and wasm32 wasi-libc -- and any other is refused before lowering
 // rather than read through guessed struct layouts.
 TEST(DriverTest, A32BitTargetCompilesOnlyWhereItsLibcWasMeasured) {
   for (const char *triple :
-       {"armv7-unknown-linux-gnueabihf", "wasm32-unknown-emscripten"}) {
+       {"armv7-unknown-linux-gnueabihf", "wasm32-wasip1"}) {
     lython::driver::DriverOptions options;
     options.targetTriple = triple;
     CompileResult result = compileSource("print(1)\n", options);
@@ -1956,7 +1924,7 @@ TEST(DriverTest, A32BitTargetCompilesOnlyWhereItsLibcWasMeasured) {
 }
 
 // What: where the target's malloc promises less than 16-byte alignment
-// (Emscripten: 8), the object allocator takes its arenas and large blocks from
+// (32-bit glibc: 8), the object allocator takes its arenas and large blocks from
 // aligned_alloc; where malloc already promises 16 it keeps calling malloc.
 TEST(DriverTest, TheObjectAllocatorAlignsWhereMallocDoesNot) {
   auto callsFrom = [](const llvm::Module &module, llvm::StringRef caller,
@@ -1973,11 +1941,11 @@ TEST(DriverTest, TheObjectAllocatorAlignsWhereMallocDoesNot) {
     return false;
   };
 
-  lython::driver::VerifiedLLVMModule wasm =
-      compileAndLinkFor("print('hi')\n", "wasm64-unknown-emscripten");
-  ASSERT_TRUE(wasm.llvmModule);
-  EXPECT_TRUE(callsFrom(*wasm.llvmModule, "LyMem_Alloc", "aligned_alloc"));
-  EXPECT_FALSE(callsFrom(*wasm.llvmModule, "LyMem_Alloc", "malloc"));
+  lython::driver::VerifiedLLVMModule arm =
+      compileAndLinkFor("print('hi')\n", "armv7-unknown-linux-gnueabihf");
+  ASSERT_TRUE(arm.llvmModule);
+  EXPECT_TRUE(callsFrom(*arm.llvmModule, "LyMem_Alloc", "aligned_alloc"));
+  EXPECT_FALSE(callsFrom(*arm.llvmModule, "LyMem_Alloc", "malloc"));
 
   lython::driver::VerifiedLLVMModule host =
       compileAndLinkFor("print('hi')\n", llvm::sys::getDefaultTargetTriple());
@@ -2011,16 +1979,17 @@ const char *ctypesAddressSource(bool withPrototype) {
 // the import's signature, and `write` is also the runtime's own import.
 TEST(DriverTest, ACtypesSymbolAddressIsDeclaredWithItsPrototype) {
   lython::driver::DriverOptions options;
-  options.targetTriple = "wasm64-unknown-emscripten";
+  options.targetTriple = "wasm32-wasip1";
   CompileResult result = compileSource(ctypesAddressSource(true), options);
   ASSERT_TRUE(result.succeeded) << result.diagnostics;
   const llvm::Function *write = result.verified.llvmModule->getFunction("write");
   ASSERT_NE(write, nullptr);
   llvm::LLVMContext &context = result.verified.llvmModule->getContext();
+  // ssize_t write(int, const void *, size_t), with wasm32's 32-bit long.
   llvm::FunctionType *expected = llvm::FunctionType::get(
-      llvm::Type::getInt64Ty(context),
+      llvm::Type::getInt32Ty(context),
       {llvm::Type::getInt32Ty(context), llvm::PointerType::getUnqual(context),
-       llvm::Type::getInt64Ty(context)},
+       llvm::Type::getInt32Ty(context)},
       /*isVarArg=*/false);
   EXPECT_EQ(write->getFunctionType(), expected);
 }
@@ -2030,7 +1999,7 @@ TEST(DriverTest, ACtypesSymbolAddressIsDeclaredWithItsPrototype) {
 // signature, so it is refused and the message says what to set.
 TEST(DriverTest, AnUntypedCtypesSymbolAddressIsRefusedOnWasm) {
   lython::driver::DriverOptions wasm;
-  wasm.targetTriple = "wasm64-unknown-emscripten";
+  wasm.targetTriple = "wasm32-wasip1";
   CompileResult refused = compileSource(ctypesAddressSource(false), wasm);
   EXPECT_FALSE(refused.succeeded);
   EXPECT_NE(refused.diagnostics.find("needs its prototype: set restype"),
@@ -2042,7 +2011,7 @@ TEST(DriverTest, AnUntypedCtypesSymbolAddressIsRefusedOnWasm) {
 }
 
 // What: the ILP32 libc facts, as measured -- armv7 glibc 2.36 built with
-// _FILE_OFFSET_BITS=64 and _TIME_BITS=64, and wasm32 Emscripten's musl.
+// _FILE_OFFSET_BITS=64 and _TIME_BITS=64, and wasi-libc.
 TEST(DriverTest, ILP32TargetsReadTheirMeasuredLayouts) {
   py::runtime_library::HostTargetLayout arm =
       py::runtime_library::hostTargetLayout(
@@ -2068,20 +2037,11 @@ TEST(DriverTest, ILP32TargetsReadTheirMeasuredLayouts) {
 
   py::runtime_library::HostTargetLayout wasm =
       py::runtime_library::hostTargetLayout(
-          llvm::Triple("wasm32-unknown-emscripten"));
+          llvm::Triple("wasm32-unknown-wasip1"));
   EXPECT_EQ(wasm.errnoNumbering, py::exceptions::ErrnoNumbering::WASI);
-  EXPECT_EQ(wasm.mallocAlignment, 8);
-  EXPECT_EQ(wasm.statDev[1], 4);
-  EXPECT_EQ(wasm.statMode[0], 4);
-  EXPECT_EQ(wasm.statNlink[0], 8);
-  EXPECT_EQ(wasm.statNlink[1], 4);
-  EXPECT_EQ(wasm.statUid[0], 12);
-  EXPECT_EQ(wasm.statGid[0], 16);
-  EXPECT_EQ(wasm.statSize[0], 24);
-  EXPECT_EQ(wasm.statAtime[0], 40);
-  EXPECT_EQ(wasm.statMtime[0], 56);
-  EXPECT_EQ(wasm.statCtime[0], 72);
-  EXPECT_EQ(wasm.statIno[0], 88);
+  EXPECT_EQ(wasm.mallocAlignment, 16);
+  EXPECT_EQ(wasm.direntNameOffset, 9);
+  EXPECT_EQ(wasm.clockMonotonicGlobal, "_CLOCK_MONOTONIC");
   EXPECT_EQ(wasm.tmGmtoff[0], 36);
 }
 
