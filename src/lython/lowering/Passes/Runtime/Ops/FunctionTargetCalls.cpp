@@ -299,6 +299,30 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
       // is what `type[X]` and `None` arguments get, and `retainAggregateSlot`
       // refused the first of them outright ("aggregate slot retain requires an
       // object bundle", for a `TypeObject`).
+      // ⭐ A union argument is kept boxed; the frame owns the box, and its
+      // finalizer's release of it drops the payload with it.
+      if (lane && lane->unionType) {
+        if (!source)
+          return op->emitError() << "generator argument " << index
+                                 << " has no union value to persist";
+        mlir::FailureOr<RuntimeBundle> boxed =
+            RuntimeBundleLowerer::boxUnionForLane(op, *source);
+        if (mlir::failed(boxed))
+          return mlir::failure();
+        mlir::FailureOr<mlir::func::FuncOp> store =
+            RuntimeBundleLowerer::getOrCreateGeneratorFrameStoreFunction(
+                op, *lane);
+        if (mlir::failed(store))
+          return mlir::failure();
+        llvm::SmallVector<mlir::Value, 4> storeOperands{
+            storage,
+            mlir::arith::ConstantIntOp::create(builder, loc, base, 64)
+                .getResult()};
+        storeOperands.append(boxed->physicalValues().begin(),
+                             boxed->physicalValues().end());
+        mlir::func::CallOp::create(builder, loc, *store, storeOperands);
+        continue;
+      }
       if (lane && !lane->isInt && !lane->isControl() && !lane->isNone) {
         if (!source || source->physicalValues().size() != lane->physicalCount)
           return op->emitError()

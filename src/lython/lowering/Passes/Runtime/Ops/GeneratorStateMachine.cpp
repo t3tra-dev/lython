@@ -4,6 +4,9 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "Runtime/ABI/BoxLayout.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/xxhash.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 
 #include <algorithm>
@@ -183,6 +186,24 @@ bool isNoneLike(mlir::Type type) {
 mlir::MemRefType generatorStorageType(mlir::OpBuilder &builder) {
   return mlir::MemRefType::get({kGeneratorFrameSlotLimit},
                                builder.getI64Type());
+}
+
+// The lane a value of this type rides: its own contract, or the payload box
+// for a union (see `boxUnionForLane`). Empty when it has none.
+std::string generatorLaneKey(mlir::Type type) {
+  if (isIntContract(type))
+    return "builtins.int";
+  if (isNoneLike(type))
+    return "types.NoneType";
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
+    // ⛔ A `type[X]` member has no value to box (`objectPayloadHandleWords`).
+    for (mlir::Type member : unionType.getMemberTypes())
+      if (mlir::isa<py::TypeType>(member) ||
+          (!isNoneLike(member) && runtimeContractName(member).empty()))
+        return std::string();
+    return "builtins.object";
+  }
+  return runtimeContractName(type);
 }
 
 std::int64_t exceptionClassId(llvm::StringRef name) {
@@ -392,6 +413,16 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
       borrowedEntryReturn = ownership::valueGroupEqualsEntryArgumentGroup(
           function, bundle.physicalValues());
 
+  if (lane.contract == "builtins.object" &&
+      mlir::isa_and_nonnull<py::UnionType>(bundle.contract)) {
+    mlir::FailureOr<RuntimeBundle> boxed =
+        RuntimeBundleLowerer::boxUnionForLane(op.getOperation(), bundle);
+    if (mlir::failed(boxed))
+      return mlir::failure();
+    operands.append(boxed->physicalValues().begin(),
+                    boxed->physicalValues().end());
+    return mlir::success();
+  }
   bool bundleIsNone = bundle.contractName() == "types.NoneType";
   if (bundleIsNone) {
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead =
@@ -567,6 +598,10 @@ RuntimeBundleLowerer::generatorArgumentPhysicalTypes(
     types.push_back(mlir::IntegerType::get(context, 1));
     return types;
   }
+  if (lane.unionType) {
+    types.append(lane.passTypes.begin(), lane.passTypes.end());
+    return types;
+  }
   types.append(lane.physicalTypes.begin(), lane.physicalTypes.end());
   return types;
 }
@@ -645,11 +680,26 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
       operands.push_back(source->primitiveI64->valid);
       continue;
     }
-    if (source->physicalValues().size() != lane->physicalCount)
+    // A member's value passed where the parameter is the union is wrapped,
+    // as the call would have wrapped it.
+    if (lane->unionType &&
+        !mlir::isa_and_nonnull<py::UnionType>(source->contract)) {
+      builder.setInsertionPoint(op);
+      llvm::SmallVector<mlir::Value, 8> wrapped;
+      if (mlir::failed(RuntimeBundleLowerer::appendUnionRuntimeValues(
+              op, lane->unionType, *source, source->contract, wrapped)))
+        return mlir::failure();
+      operands.append(wrapped.begin(), wrapped.end());
+      continue;
+    }
+    unsigned expected = lane->unionType
+                            ? static_cast<unsigned>(lane->passTypes.size())
+                            : lane->physicalCount;
+    if (source->physicalValues().size() != expected)
       return op->emitError()
              << "generator argument " << index << " (" << lane->contract
-             << ") expected " << lane->physicalCount
-             << " physical values, got " << source->physicalValues().size();
+             << ") expected " << expected << " physical values, got "
+             << source->physicalValues().size();
     operands.append(source->physicalValues().begin(),
                     source->physicalValues().end());
   }
@@ -1002,8 +1052,13 @@ RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::Location loc = op->getLoc();
   mlir::Type i64 = builder.getI64Type();
+  // ⛔ The STORED form: a union argument is its box here, and the drivers
+  // read the union out of it.
   llvm::SmallVector<mlir::Type, 6> laneTypes =
-      RuntimeBundleLowerer::generatorArgumentPhysicalTypes(lane);
+      lane.unionType
+          ? llvm::SmallVector<mlir::Type, 6>(lane.physicalTypes.begin(),
+                                             lane.physicalTypes.end())
+          : RuntimeBundleLowerer::generatorArgumentPhysicalTypes(lane);
   builder.setInsertionPointToEnd(module.getBody());
   auto function = mlir::func::FuncOp::create(
       builder, loc, name,
@@ -1230,6 +1285,22 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         argumentLanes.push_back(zeroWidth);
         continue;
       }
+      if (auto unionType = mlir::dyn_cast<py::UnionType>(positional);
+          unionType && generatorLaneKey(positional) == "builtins.object") {
+        mlir::FailureOr<GeneratorResumeLane> boxLane =
+            RuntimeBundleLowerer::computeGeneratorResumeLane(
+                body.getOperation(),
+                runtimeContractType(context, "builtins.object"));
+        mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> passTypes =
+            RuntimeBundleLowerer::runtimeValueTypesFor(
+                body.getOperation(), positional, "generator argument lane");
+        if (mlir::failed(boxLane) || mlir::failed(passTypes))
+          return mlir::failure();
+        boxLane->unionType = unionType;
+        boxLane->passTypes.assign(passTypes->begin(), passTypes->end());
+        argumentLanes.push_back(*boxLane);
+        continue;
+      }
       std::string contract = runtimeContractName(positional);
       if (contract.empty()) {
         std::string reason;
@@ -1326,6 +1397,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
     // lane, which has no suspension ABI yet.
     bool eligible = true;
     std::string valueContract;
+    mlir::Type valueType;
     std::string returnContract;
     // ⭐ A YIELDED BOOL RIDES ITS OWN BIT, the way a bool ARGUMENT already
     // does. `builtins.bool`'s manifest value shape is a bare `i1`
@@ -1353,12 +1425,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
                                     bool allowBool) -> std::string {
       if (isIntContract(type))
         return "builtins.int";
-      std::string contract = runtimeContractName(type);
+      std::string contract = generatorLaneKey(type);
       if (contract.empty())
         return std::string();
       if (allowBool && contract == "builtins.bool")
         return contract;
-      if (!RuntimeBundleLowerer::generatorLaneParts(clone.getOperation(), type))
+      if (!RuntimeBundleLowerer::generatorLaneParts(
+              clone.getOperation(), runtimeContractType(context, contract)))
         return std::string();
       return contract;
     };
@@ -1375,6 +1448,14 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
           valueContract = contract;
         else if (valueContract != contract)
           eligible = false;
+        // A union is boxed, and the box says nothing of which union: every
+        // yield has to be the same one for a reader to unbox it.
+        if (mlir::isa<py::UnionType>(yield.getValue().getType())) {
+          if (!valueType)
+            valueType = yield.getValue().getType();
+          else if (valueType != yield.getValue().getType())
+            eligible = false;
+        }
         if (!yield.getSent().use_empty() &&
             !isIntContract(yield.getSent().getType()))
           eligible = false;
@@ -1609,6 +1690,8 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         callable.getPositionalTypes().size());
     info.argumentLanes = argumentLanes;
     info.valueLane = *valueLane;
+    info.valueType =
+        valueType ? valueType : runtimeContractType(context, valueContract);
     info.returnLane = returnLane;
     info.frameLanes = frameLanes;
     generatorResumeClones[body.getSymName().str()] = info;
@@ -1855,11 +1938,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
     for (auto [index, lane] : llvm::enumerate(info.frameLanes))
       laneStarts.try_emplace(lane.contract, static_cast<unsigned>(index));
     auto liveContract = [&](mlir::Value value) -> std::string {
-      if (isIntContract(value.getType()))
-        return "builtins.int";
-      if (isNoneLike(value.getType()))
-        return "types.NoneType";
-      return runtimeContractName(value.getType());
+      return generatorLaneKey(value.getType());
     };
     auto assignFrameLanes =
         [&](llvm::ArrayRef<mlir::Value> lives,
@@ -2264,6 +2343,23 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
           if (lane.isInt)
             bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
                 owned[lane.physicalCount], owned[lane.physicalCount + 1]};
+          if (auto unionType = mlir::dyn_cast<py::UnionType>(
+                  cont->getArgument(position).getType())) {
+            // ⛔ The helpers insert BEFORE the op they are given, so it has
+            // to be one in this block: the clone itself would put the unbox
+            // outside every function.
+            mlir::Operation *anchor =
+                mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+            builder.setInsertionPoint(anchor);
+            mlir::FailureOr<RuntimeBundle> unboxed =
+                RuntimeBundleLowerer::unboxUnionFromLane(
+                    anchor, unionType, parts.take_front(lane.physicalCount));
+            if (mlir::failed(unboxed))
+              return mlir::failure();
+            builder.setInsertionPointAfter(anchor);
+            anchor->erase();
+            bundle = std::move(*unboxed);
+          }
         }
         valueBundles[cont->getArgument(position)] = std::move(bundle);
       }
@@ -3480,6 +3576,22 @@ mlir::LogicalResult RuntimeBundleLowerer::appendStoredGeneratorArgumentOperands(
       return mlir::failure();
     mlir::func::CallOp loaded = mlir::func::CallOp::create(
         builder, loc, *load, mlir::ValueRange{storage, i64Const(base)});
+    if (argumentLane->unionType) {
+      // Borrowed out of the box, which the frame keeps until its finalizer.
+      mlir::Value box = loaded.getResult(0);
+      auto word = [&](std::int64_t index) {
+        return mlir::memref::LoadOp::create(builder, loc, box,
+                                            constantIndex(builder, loc, index))
+            .getResult();
+      };
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> values =
+          RuntimeBundleLowerer::unionValuesFromBoxWords(
+              op, argumentLane->unionType, word(1), word(2));
+      if (mlir::failed(values))
+        return mlir::failure();
+      operands.append(values->begin(), values->end());
+      continue;
+    }
     operands.append(loaded.getResults().begin(),
                          loaded.getResults().end());
   }
@@ -3844,9 +3956,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
   mlir::func::CallOp call =
       mlir::func::CallOp::create(builder, loc, *throwFn, operands);
 
+  SourceGeneratorResumeResult thrown;
+  thrown.lanePhysicals.assign(call.getResults().begin(),
+                              call.getResults().end());
+  if (mlir::failed(RuntimeBundleLowerer::unboxGeneratorYield(
+          op.getOperation(), op.getResult(0).getType(), thrown)))
+    return mlir::failure();
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-          op.getOperation(), op.getResult(0).getType(), call, result)))
+          op.getOperation(), op.getResult(0).getType(),
+          mlir::ValueRange(thrown.lanePhysicals), result)))
     return mlir::failure();
   result.setObjectLogicalOwnership(/*ownsObject=*/true);
   valueBundles[op.getResult(0)] = std::move(result);
@@ -3984,7 +4103,7 @@ mlir::FailureOr<mlir::func::FuncOp>
 RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
                                                    mlir::Type elementType,
                                                    GeneratorDriverKind kind) {
-  std::string elementContract = runtimeContractName(elementType);
+  std::string elementContract = generatorLaneKey(elementType);
   if (elementContract.empty())
     return op->emitError() << "a generator whose function is not known here "
                               "is resumed by its frame, and "
@@ -3993,6 +4112,9 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
     return yielded && py::isSubtypeOf(yielded, elementType);
   };
   llvm::SmallVector<llvm::StringRef, 8> targets;
+  // Targets whose own lane is not the read's box: their yield is boxed on the
+  // way out (`getOrCreateBoxedGeneratorDriver`).
+  llvm::DenseSet<llvm::StringRef> boxedTargets;
   llvm::SmallVector<llvm::StringRef, 8> bodies;
   for (auto &entry : generatorBodies)
     bodies.push_back(entry.getKey());
@@ -4001,8 +4123,23 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
     auto info = generatorResumeClones.find(target);
     if (info != generatorResumeClones.end()) {
       const GeneratorResumeLane &lane = info->second.valueLane;
-      if (lane.contract == elementContract) {
+      // ⛔ A payload box is one lane for every union, so the box alone does
+      // not say this generator yields what the read unboxes: its union does.
+      if (lane.contract == elementContract &&
+          (elementContract != "builtins.object" ||
+           mayYieldHere(info->second.valueType))) {
         targets.push_back(target);
+        continue;
+      }
+      if (lane.contract == elementContract)
+        continue;
+      // ⭐ A READ OF A UNION TAKES A MEMBER'S GENERATOR TOO, boxed: a
+      // `str` generator handed where `Iterator[str | None]` is read yields
+      // what the read can hold, and the box is the union's own lane.
+      if (elementContract == "builtins.object" &&
+          mayYieldHere(info->second.valueType)) {
+        targets.push_back(target);
+        boxedTargets.insert(target);
         continue;
       }
       if (mayYieldHere(runtimeContractType(context, lane.contract)))
@@ -4045,14 +4182,24 @@ RuntimeBundleLowerer::getOrCreateGeneratorDispatch(mlir::Operation *op,
                         kKindNames[static_cast<unsigned>(kind)] + "$" +
                         elementContract)
                            .str();
+  // A box serves every union, and which targets join depends on the union.
+  if (elementContract == "builtins.object") {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    stream << elementType;
+    symbol += "$" + llvm::utohexstr(llvm::xxh3_64bits(text));
+  }
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(symbol))
     return existing;
 
   llvm::SmallVector<mlir::func::FuncOp, 8> drivers;
   for (llvm::StringRef target : targets) {
     mlir::FailureOr<mlir::func::FuncOp> driver =
-        RuntimeBundleLowerer::getOrCreateStoredGeneratorDriver(
-            op, generatorResumeClones[target], kind);
+        boxedTargets.contains(target) && kind != GeneratorDriverKind::Close
+            ? RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
+                  op, generatorResumeClones[target], kind)
+            : RuntimeBundleLowerer::getOrCreateStoredGeneratorDriver(
+                  op, generatorResumeClones[target], kind);
     if (mlir::failed(driver))
       return mlir::failure();
     drivers.push_back(*driver);
@@ -4187,6 +4334,163 @@ RuntimeBundleLowerer::refuseProtocolGeneratorResume(mlir::Operation *op,
          << " cannot be resumed: a value typed by the protocol is not "
             "reference counted. Let the type come from the generator "
             "function (`tasks = [worker()]`), which keeps it a generator";
+}
+
+// ⭐ A UNION CROSSES A SUSPENSION IN A BOX. Its physical value is a tag plus
+// every member's lanes, and the frame, the drivers and the dispatch all carry
+// one object span with one owner; the payload box `list[int | None]` already
+// holds its elements in is exactly that, so a union lane is a
+// `builtins.object` lane and the logical type at each end says to box or
+// unbox.
+//
+// ⛔ Why NOT lay the members out in the frame words: each member then owns a
+// lane only when the tag names it, and every driver's owned-results contract,
+// the frame store's transfer and the finalizer's release would each need the
+// tag-conditioned ownership the call ABI has -- four places to get one rule
+// right instead of none.
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::boxUnionForLane(mlir::Operation *op,
+                                      const RuntimeBundle &value) {
+  mlir::FailureOr<RuntimeBundle> boxed =
+      RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+          op, value, /*retainPayload=*/true);
+  if (mlir::failed(boxed))
+    return mlir::failure();
+  boxed->setObjectLogicalOwnership(/*ownsObject=*/true);
+  return boxed;
+}
+
+mlir::FailureOr<RuntimeBundle>
+RuntimeBundleLowerer::unboxUnionFromLane(mlir::Operation *op,
+                                         py::UnionType unionType,
+                                         llvm::ArrayRef<mlir::Value> box) {
+  if (box.empty())
+    return op->emitError() << "a union lane has no box to read";
+  mlir::Location loc = op->getLoc();
+  auto words = [&](std::int64_t index) {
+    return mlir::memref::LoadOp::create(builder, loc, box.front(),
+                                        constantIndex(builder, loc, index))
+        .getResult();
+  };
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> values =
+      RuntimeBundleLowerer::unionValuesFromBoxWords(op, unionType, words(1),
+                                                    words(2));
+  if (mlir::failed(values))
+    return mlir::failure();
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+      RuntimeBundleLowerer::retainUnionMemberValues(op, unionType, *values);
+  if (mlir::failed(owned))
+    return mlir::failure();
+  RuntimeBundle boxBundle;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          op, runtimeContractType(context, "builtins.object"), box, boxBundle,
+          /*ownsObject=*/true)))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+          op, boxBundle, "generator union lane box")))
+    return mlir::failure();
+  RuntimeBundle result;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+          op, unionType, *owned, result,
+          ownership::logicalOwnershipKind(unionType, /*ownsObject=*/true))))
+    return mlir::failure();
+  return result;
+}
+
+// A yielded union arrives as the payload box its lane carries; the reader
+// takes it back as the union it reads.
+mlir::LogicalResult RuntimeBundleLowerer::unboxGeneratorYield(
+    mlir::Operation *op, mlir::Type elementType,
+    SourceGeneratorResumeResult &result) {
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(elementType);
+  if (!unionType || generatorLaneKey(elementType) != "builtins.object")
+    return mlir::success();
+  mlir::FailureOr<RuntimeBundle> unboxed =
+      RuntimeBundleLowerer::unboxUnionFromLane(op, unionType,
+                                               result.lanePhysicals);
+  if (mlir::failed(unboxed))
+    return mlir::failure();
+  result.lanePhysicals.assign(unboxed->physicalValues().begin(),
+                              unboxed->physicalValues().end());
+  return mlir::success();
+}
+
+// A stored driver whose yielded value comes out boxed, for a dispatch that
+// reads a union this generator yields a member of.
+mlir::FailureOr<mlir::func::FuncOp>
+RuntimeBundleLowerer::getOrCreateBoxedGeneratorDriver(
+    mlir::Operation *op, GeneratorResumeInfo &info, GeneratorDriverKind kind) {
+  mlir::FailureOr<mlir::func::FuncOp> stored =
+      RuntimeBundleLowerer::getOrCreateStoredGeneratorDriver(op, info, kind);
+  if (mlir::failed(stored))
+    return mlir::failure();
+  std::string name = stored->getSymName().str() + "_boxed";
+  if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(name))
+    return existing;
+  const GeneratorResumeLane &lane = info.valueLane;
+  unsigned width = static_cast<unsigned>(
+      RuntimeBundleLowerer::generatorLanePhysicalTypes(lane).size());
+  unsigned begin = kind == GeneratorDriverKind::Step ? 1 : 0;
+  mlir::FunctionType storedType = stored->getFunctionType();
+  mlir::MemRefType boxType = box_abi::boxWordsType(builder);
+  llvm::SmallVector<mlir::Type, 6> results(
+      storedType.getResults().take_front(begin));
+  results.push_back(boxType);
+  results.append(storedType.getResults().begin() + begin + width,
+                 storedType.getResults().end());
+  mlir::Location loc = stored->getLoc();
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto function = mlir::func::FuncOp::create(
+      builder, loc, name,
+      builder.getFunctionType(storedType.getInputs(), results));
+  function.setPrivate();
+  RuntimeBundleLowerer::copyGeneratorDriverContract(*stored, function,
+                                                    /*dropped=*/0);
+  function->setAttr(ownership::kOwnedResultsAttr,
+                    mlir::DenseI64ArrayAttr::get(
+                        context, llvm::ArrayRef<std::int64_t>{begin}));
+  function->setAttr(
+      ownership::kOwnedResultContractsAttr,
+      builder.getArrayAttr({builder.getStringAttr("builtins.object")}));
+  mlir::Block *entry = function.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  auto call =
+      mlir::func::CallOp::create(builder, loc, *stored, entry->getArguments());
+  llvm::SmallVector<mlir::Value, 6> span(
+      call.getResults().begin() + begin,
+      call.getResults().begin() + begin + width);
+  RuntimeBundle yielded;
+  if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+          function, runtimeContractType(context, lane.contract),
+          llvm::ArrayRef<mlir::Value>(span).take_front(lane.physicalCount),
+          yielded, /*ownsObject=*/!lane.isNone && !lane.isBool)))
+    return mlir::failure();
+  if (lane.isInt)
+    yielded.primitiveI64 = RuntimePrimitiveI64Evidence{
+        span[lane.physicalCount], span[lane.physicalCount + 1]};
+  // ⛔ The helpers insert BEFORE the op they are given.
+  mlir::Operation *anchor =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  builder.setInsertionPoint(anchor);
+  mlir::FailureOr<RuntimeBundle> boxed =
+      RuntimeBundleLowerer::boxUnionForLane(anchor, yielded);
+  if (mlir::failed(boxed))
+    return mlir::failure();
+  if (!lane.isNone && !lane.isBool &&
+      mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+          anchor, yielded, "generator yield boxed for a union read")))
+    return mlir::failure();
+  builder.setInsertionPointAfter(anchor);
+  anchor->erase();
+  llvm::SmallVector<mlir::Value, 6> forwarded(
+      call.getResults().take_front(begin));
+  forwarded.append(boxed->physicalValues().begin(),
+                   boxed->physicalValues().end());
+  forwarded.append(call.getResults().begin() + begin + width,
+                   call.getResults().end());
+  mlir::func::ReturnOp::create(builder, loc, forwarded);
+  return function;
 }
 
 } // namespace py::lowering

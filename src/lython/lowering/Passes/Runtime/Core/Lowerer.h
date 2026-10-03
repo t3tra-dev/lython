@@ -1096,6 +1096,11 @@ private:
     // carry, and every generator yielding a user class fell back to the
     // int-only inline tier (seven probes, tests/probe/rebind_gen_w*.py).
     llvm::SmallVector<mlir::Type, 4> physicalTypes;
+    // An ARGUMENT lane for a union: the frame keeps it boxed (`contract` is
+    // `builtins.object` and `physicalTypes` the box), and the drivers hand
+    // the clone the union's own values -- `passTypes` -- read out of the box.
+    py::UnionType unionType;
+    llvm::SmallVector<mlir::Type, 8> passTypes;
     bool isControl() const { return contract.empty(); }
   };
   struct GeneratorResumeInfo {
@@ -1111,6 +1116,9 @@ private:
     // The yielded-value lane (result index 2 of the resume clone). Control
     // lane in the legacy int tier; object-family for boxed yields.
     GeneratorResumeLane valueLane;
+    // What the body yields, statically: the lane's contract unless that is a
+    // payload box, where it is the union the box holds.
+    mlir::Type valueType;
     // The returned-value lane (result index 3): a control lane -- the raw
     // i64 of an int return, or nothing -- unless the body returns an object,
     // which then crosses as an owned span the way a yielded one does.
@@ -1162,11 +1170,22 @@ private:
   enum class GeneratorDriverKind : unsigned { Step, Advance, Throw, Close };
   static mlir::Type generatorYieldType(mlir::Type generator);
   static bool isGeneratorProtocol(mlir::Type type);
+  mlir::FailureOr<RuntimeBundle> boxUnionForLane(mlir::Operation *op,
+                                                 const RuntimeBundle &value);
+  mlir::FailureOr<RuntimeBundle>
+  unboxUnionFromLane(mlir::Operation *op, py::UnionType unionType,
+                     llvm::ArrayRef<mlir::Value> box);
+  mlir::LogicalResult unboxGeneratorYield(mlir::Operation *op,
+                                          mlir::Type elementType,
+                                          SourceGeneratorResumeResult &result);
   mlir::LogicalResult refuseProtocolGeneratorResume(mlir::Operation *op,
                                                     mlir::Type staticType);
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateStoredGeneratorDriver(mlir::Operation *op, GeneratorResumeInfo &info,
                                    GeneratorDriverKind kind);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateBoxedGeneratorDriver(mlir::Operation *op, GeneratorResumeInfo &info,
+                                  GeneratorDriverKind kind);
   void copyGeneratorDriverContract(mlir::func::FuncOp from,
                                    mlir::func::FuncOp to, unsigned dropped);
   mlir::FailureOr<mlir::func::FuncOp>
