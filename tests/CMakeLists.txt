@@ -197,6 +197,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.StringAndBytesLiteralsInALoopStayOutOfTheFrame"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
+    "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"

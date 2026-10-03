@@ -37,6 +37,8 @@ struct EmitOptions {
   bool runtimeInternal = false;
   std::string mainPackageName;
   std::string targetTriple;
+  // The program runs with a JavaScript host (`sys._js_host`).
+  bool jsHost = false;
   std::vector<SourceModule> sourceModules;
 };
 

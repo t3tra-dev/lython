@@ -1487,6 +1487,19 @@ std::optional<bool> optionalStaticBranchTruth(const parser::Node &test,
     }
   }
 
+  // `sys._js_host`, a fact of the target like `sys.platform`.
+  // ⛔ Only that binding, not any name typed as a True or False literal: a
+  // local bound to `True` is a value the program may rebind.
+  if (test.kind == "Attribute" || test.kind == "Name") {
+    std::string qualified = ast::qualifiedName(&test);
+    std::string canonical =
+        types.lookupCanonicalBinding(qualified).value_or(qualified);
+    if (canonical == py::kJsHostBinding)
+      if (auto literal =
+              mlir::dyn_cast_if_present<py::LiteralType>(types.inferExpr(&test)))
+        return literal.getSpelling() == "True";
+  }
+
   std::optional<IsInstanceBranchAnalysis> analyzed =
       optionalIsInstanceBranchAnalysis(test, types, from);
   if (!analyzed)

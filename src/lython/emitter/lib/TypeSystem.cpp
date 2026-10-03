@@ -5,6 +5,7 @@
 #include "llvm/ADT/StringExtras.h"
 
 #include "AstAccess.h"
+#include "JsHost.h"
 #include "AstSynth.h"
 #include "CandidateSelection.h"
 #include "EmptyLiteralSeed.h"
@@ -3635,6 +3636,8 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
       [&](llvm::StringRef binding) -> std::optional<mlir::Type> {
     std::string canonical =
         lookupCanonicalBinding(binding).value_or(binding.str());
+    if (canonical == py::kJsHostBinding)
+      return literal(jsHost ? "True" : "False");
     if (!py::platform_constants::isStaticStringBinding(canonical))
       return std::nullopt;
     if (std::optional<std::string> value =

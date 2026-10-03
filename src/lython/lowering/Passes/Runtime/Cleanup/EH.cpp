@@ -656,7 +656,8 @@ bool convertCallToPythonTryInvoke(
 // name out of the symbol space; on a clash the linker gives the C name to the
 // runtime's declaration and renames the local. `__main__` stays external: the
 // JIT finds the program's body by that name.
-void installJsHostEntryPoints(llvm::Module &module) {
+void installJsHostEntryPoints(llvm::Module &module,
+                              const llvm::Triple &triple) {
   for (auto [entry, target] : {std::pair<llvm::StringRef, llvm::StringRef>{
                                    "LyJs_Dispatch", "_js_bridge.dispatch"},
                                {"LyJs_Release", "_js_bridge.release"}}) {
@@ -671,6 +672,22 @@ void installJsHostEntryPoints(llvm::Module &module) {
         llvm::BasicBlock::Create(module.getContext(), "entry", function));
     builder.CreateCall(python);
     builder.CreateRetVoid();
+  }
+  // On WASI the host is whatever loader instantiates the module, and the
+  // names cross as the module's own imports and exports: `lython_js` is the
+  // import module the loader (runtime/js/lython_wasi.js) answers. Emscripten
+  // routes the same names through its generated library instead.
+  if (!triple.isOSWASI())
+    return;
+  for (llvm::Function &function : module) {
+    if (!function.getName().starts_with("LyJs_"))
+      continue;
+    if (function.isDeclaration()) {
+      function.addFnAttr("wasm-import-module", "lython_js");
+      function.addFnAttr("wasm-import-name", function.getName());
+    } else if (function.hasExternalLinkage()) {
+      function.addFnAttr("wasm-export-name", function.getName());
+    }
   }
 }
 

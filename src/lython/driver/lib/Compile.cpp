@@ -45,7 +45,8 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     diag << "Failed to translate to LLVM IR\n";
     return failure();
   }
-  py::installJsHostEntryPoints(*llvmModule);
+  py::installJsHostEntryPoints(
+      *llvmModule, codeGenTripleForTarget(py::TensorLoweringTarget{}, options));
   py::internalizePythonFunctions(*llvmModule);
   dumpLLVMForPass(irDump, "pre-eh-llvm", *llvmModule);
   py::markCLibraryDeclarationsNonUnwinding(*llvmModule, ctypesSymbols);

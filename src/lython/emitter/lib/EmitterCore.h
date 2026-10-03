@@ -1098,6 +1098,8 @@ private:
   std::optional<Value> emitStaticStringConstant(const parser::Node &anchor,
                                                 llvm::StringRef binding,
                                                 bool allowCallable = false);
+  std::optional<Value> emitStaticBoolConstant(const parser::Node &anchor,
+                                              llvm::StringRef binding);
   std::optional<Value> emitStaticIntConstant(const parser::Node &anchor,
                                              llvm::StringRef binding);
   std::optional<Value> emitLiteralTypeConstant(const parser::Node &anchor,

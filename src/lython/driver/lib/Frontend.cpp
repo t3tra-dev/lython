@@ -64,6 +64,10 @@ stringField(const lython::parser::Node &node, StringRef name) {
   return std::nullopt;
 }
 
+bool targetHasJsHost(const llvm::Triple &triple, const DriverOptions &options) {
+  return triple.isOSEmscripten() || (triple.isOSWASI() && options.jsHost);
+}
+
 static const lython::parser::Node *nodeField(const lython::parser::Node &node,
                                              StringRef name) {
   const lython::parser::Field *field =
@@ -80,7 +84,24 @@ static const lython::parser::Node *nodeField(const lython::parser::Node &node,
 // collected. The emitter folds the same comparison the same way
 // (`staticModuleStatements`), so a module it binds was collected here.
 static std::optional<bool> staticPlatformTest(const lython::parser::Node &test,
-                                              const llvm::Triple &triple) {
+                                              const llvm::Triple &triple,
+                                              bool hasJsHost) {
+  auto isSysAttribute = [](const lython::parser::Node &node,
+                           llvm::StringRef attribute) {
+    const lython::parser::Node *value = nodeField(node, "value");
+    return node.kind == "Attribute" && stringField(node, "attr") == attribute &&
+           value && value->kind == "Name" && stringField(*value, "id") == "sys";
+  };
+  // `sys._js_host` and `not sys._js_host`.
+  if (isSysAttribute(test, "_js_host"))
+    return hasJsHost;
+  if (test.kind == "UnaryOp") {
+    const lython::parser::Node *op = nodeField(test, "op");
+    const lython::parser::Node *operand = nodeField(test, "operand");
+    if (op && op->kind == "Not" && operand &&
+        isSysAttribute(*operand, "_js_host"))
+      return !hasJsHost;
+  }
   if (test.kind != "Compare")
     return std::nullopt;
   const auto *ops = nodeListField(test, "ops");
@@ -92,10 +113,8 @@ static std::optional<bool> staticPlatformTest(const lython::parser::Node &test,
   llvm::StringRef op = ops->front()->kind;
   if (op != "Eq" && op != "NotEq")
     return std::nullopt;
-  auto isSysPlatform = [](const lython::parser::Node &node) {
-    const lython::parser::Node *value = nodeField(node, "value");
-    return node.kind == "Attribute" && stringField(node, "attr") == "platform" &&
-           value && value->kind == "Name" && stringField(*value, "id") == "sys";
+  auto isSysPlatform = [&](const lython::parser::Node &node) {
+    return isSysAttribute(node, "platform");
   };
   auto literal =
       [](const lython::parser::Node &node) -> std::optional<std::string> {
@@ -319,7 +338,7 @@ static void appendDottedImportSourceRequests(
 
 static void collectImportedModuleRequests(
     const lython::parser::Node &module, StringRef baseDir,
-    StringRef packageName, const llvm::Triple &triple,
+    StringRef packageName, const llvm::Triple &triple, bool hasJsHost,
     llvm::SmallVectorImpl<SourceImportRequest> &requests) {
   std::set<std::string> requestedModules;
   auto appendIfLocal = [&](StringRef moduleName,
@@ -348,7 +367,8 @@ static void collectImportedModuleRequests(
           if (statement->kind == "If") {
             const lython::parser::Node *test = nodeField(*statement, "test");
             std::optional<bool> taken =
-                test ? staticPlatformTest(*test, triple) : std::nullopt;
+                test ? staticPlatformTest(*test, triple, hasJsHost)
+                     : std::nullopt;
             if (taken != false)
               if (const auto *thenBody = nodeListField(*statement, "body"))
                 flatten(*thenBody);
@@ -464,11 +484,11 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                           std::vector<ParsedLocalSourceModule> &sources,
                           std::set<std::string> &seen,
                           std::set<std::string> &visiting, bool releaseMode,
-                          const llvm::Triple &triple,
+                          const llvm::Triple &triple, bool hasJsHost,
                           llvm::raw_ostream &diag) {
-  bool hasJsHost = triple.isOSEmscripten();
   llvm::SmallVector<SourceImportRequest, 8> imports;
-  collectImportedModuleRequests(module, baseDir, packageName, triple, imports);
+  collectImportedModuleRequests(module, baseDir, packageName, triple, hasJsHost,
+                                imports);
   for (const SourceImportRequest &request : imports) {
     if (llvm::StringRef(request.sourcePath) == mainPath)
       continue;
@@ -479,8 +499,8 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
       if (request.isEmbedded && !hasJsHost) {
         diag << mainPath
              << ": emit error: module 'js' is the JavaScript host's and this "
-                "target has none; compile for wasm32-unknown-emscripten or "
-                "wasm64-unknown-emscripten\n";
+                "target has none; compile for wasm32-unknown-emscripten, "
+                "wasm64-unknown-emscripten, or wasm32-wasip1 with --js-host\n";
         return failure();
       }
       if (!request.isEmbedded && hasJsHost) {
@@ -550,7 +570,7 @@ collectLocalSourceModules(const lython::parser::Node &module, StringRef baseDir,
                                               request.moduleName);
     if (failed(collectLocalSourceModules(
             *parsed.tree, nestedBaseDir, nestedPackageName, mainPath, sources,
-            seen, visiting, releaseMode, triple, diag)))
+            seen, visiting, releaseMode, triple, hasJsHost, diag)))
       return failure();
     visiting.erase(request.moduleName);
     seen.insert(request.moduleName);
@@ -584,6 +604,8 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
     return failure();
   }
 
+  bool hasJsHost =
+      targetHasJsHost(codeGenTripleForTarget({}, driverOptions), driverOptions);
   std::vector<ParsedLocalSourceModule> localSources;
   std::set<std::string> seenSourceModules;
   std::set<std::string> visitingSourceModules;
@@ -592,7 +614,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
           *parsed.tree, importBaseDir, mainPackageName, sourcePath,
           localSources, seenSourceModules, visitingSourceModules,
           driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
-          diag)))
+          hasJsHost, diag)))
     return failure();
   // A program that reaches the host's `js` can hand it callbacks, and the
   // callbacks' table and entry point are Python (runtime/lib/_js_bridge.py):
@@ -607,7 +629,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
             *bridgeImport.tree, importBaseDir, mainPackageName, sourcePath,
             localSources, seenSourceModules, visitingSourceModules,
             driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
-            diag)))
+            hasJsHost, diag)))
       return failure();
   }
 
@@ -619,6 +641,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
     emitOptions.mainPackageName = mainPackageName;
     emitOptions.targetTriple =
         codeGenTripleForTarget({}, driverOptions).normalize();
+    emitOptions.jsHost = hasJsHost;
     emitOptions.sourceModules.reserve(localSources.size());
     for (const ParsedLocalSourceModule &source : localSources) {
       emitOptions.sourceModules.push_back(

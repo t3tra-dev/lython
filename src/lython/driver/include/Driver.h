@@ -12,6 +12,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <memory>
 #include <string>
@@ -30,7 +31,14 @@ struct DriverOptions {
   SanitizerConfig sanitizers;
   bool releaseMode = false;
   bool auditRuntimeManifest = false;
+  // A WASI program linked to run under a JavaScript host (`--js-host`): it
+  // may import `js`, and the host's loader runs it. Emscripten always has one.
+  bool jsHost = false;
 };
+
+// Whether the program has a JavaScript host on `triple`: every Emscripten
+// target, and WASI when it was asked for.
+bool targetHasJsHost(const llvm::Triple &triple, const DriverOptions &options);
 
 // Registers every dialect, external model, translation interface, and pass
 // registry entry the compilation pipeline depends on. Idempotent.
