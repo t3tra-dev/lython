@@ -100,7 +100,9 @@ void declareOsExternals(SupportBuilder &b) {
                     b.builder.getFunctionType({b.ptr()}, {b.i32()}));
   b.declareExternal(
       "clock_gettime",
-      b.builder.getFunctionType({b.i32(), b.ptr()}, {b.i32()}));
+      b.builder.getFunctionType(
+          {b.host.clockMonotonicGlobal.empty() ? b.i32() : b.ptr(), b.ptr()},
+          {b.i32()}));
   b.declareExternal("nanosleep", b.builder.getFunctionType({b.ptr(), b.ptr()},
                                                            {b.i32()}));
   b.declareExternal("localtime_r", b.builder.getFunctionType({b.ptr(), b.ptr()},
@@ -704,9 +706,27 @@ void buildTimeCalls(SupportBuilder &b) {
     mlir::Value spec = scratch(b, 16);
     mlir::Value wantMonotonic = b.cmpi(mlir::arith::CmpIPredicate::ne,
                                        block->getArgument(0), b.iconst(0));
-    mlir::Value clockId = mlir::arith::SelectOp::create(
-        b.builder, b.loc, wantMonotonic, b.iconst32(b.host.clockMonotonic),
-        b.iconst32(0));
+    mlir::Value clockId;
+    if (b.host.clockMonotonicGlobal.empty()) {
+      clockId = mlir::arith::SelectOp::create(b.builder, b.loc, wantMonotonic,
+                                              b.iconst32(b.host.clockMonotonic),
+                                              b.iconst32(0));
+    } else {
+      for (llvm::StringRef global :
+           {b.host.clockMonotonicGlobal, b.host.clockRealtimeGlobal})
+        if (!b.module.lookupSymbol(global)) {
+          mlir::OpBuilder::InsertionGuard guard(b.builder);
+          b.builder.setInsertionPointToEnd(b.module.getBody());
+          mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i8(),
+                                       /*isConstant=*/true,
+                                       mlir::LLVM::Linkage::External, global,
+                                       mlir::Attribute());
+        }
+      clockId =
+          mlir::arith::SelectOp::create(b.builder, b.loc, wantMonotonic,
+                                        b.addrOf(b.host.clockMonotonicGlobal),
+                                        b.addrOf(b.host.clockRealtimeGlobal));
+    }
     b.call("clock_gettime", b.i32(), mlir::ValueRange{clockId, spec});
     mlir::Value seconds = b.loadI64(spec);
     mlir::Value nanos = loadHostField(b, spec, b.host.timespecNsec);

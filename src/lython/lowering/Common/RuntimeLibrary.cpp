@@ -238,8 +238,8 @@ namespace {
 // pointer width they were lowered for. Only the module matching the final
 // target triple links.
 constexpr llvm::StringLiteral kPlatformSuffixes[] = {
-    "_darwin",  "_linux",      "_linux32",
-    "_windows", "_emscripten", "_emscripten32"};
+    "_darwin",     "_linux",        "_linux32", "_windows",
+    "_emscripten", "_emscripten32", "_wasi32"};
 
 bool isPlatformNativeSupport(llvm::StringRef name) {
   return llvm::any_of(kPlatformSuffixes, [&](llvm::StringRef suffix) {
@@ -257,6 +257,8 @@ std::string platformSuffixFor(const llvm::Triple &triple) {
     suffix = "_windows";
   else if (triple.isOSEmscripten())
     suffix = "_emscripten";
+  else if (triple.isOSWASI())
+    suffix = "_wasi";
   else
     return "";
   if (triple.isArch32Bit())

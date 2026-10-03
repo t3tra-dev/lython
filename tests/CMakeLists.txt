@@ -40,7 +40,7 @@
 #             compiler fix would look like it had not worked
 #
 #   Suite labels: unit, golden, golden-cases, golden-errors, examples, leak,
-#                 aot, release, wasm
+#                 aot, release, wasm, wasi
 #
 #   `aot`, `release` and `wasm` are agreement stages: the same cases and the
 #   same sidecars as the JIT golden, through the other output mode, through
@@ -179,7 +179,8 @@ set(LYTHON_UNIT_PATTERNS_abi
     "DriverTest.EveryTargetsExceptionTableIsTheOneTheReaderReads"
     "DriverTest.EmscriptenNamesItselfTheWayCPythonDoes"
     "DriverTest.Wasm64EmscriptenReadsMuslsLayout"
-    "DriverTest.ILP32TargetsReadTheirMeasuredLayouts")
+    "DriverTest.ILP32TargetsReadTheirMeasuredLayouts"
+    "DriverTest.WasiPreview1ReadsWasiLibcsLayout")
 # `meta`, not `abi`: it reaches no compiler stage at all -- it parses the runtime
 # manifest sources and asks a dataflow question about them, which is the suite
 # checking the tree rather than the compiler.
@@ -230,6 +231,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ACtypesSymbolAddressIsDeclaredWithItsPrototype"
     "DriverTest.AnUntypedCtypesSymbolAddressIsRefusedOnWasm"
     "DriverTest.AnArmv7RuntimeIsBuiltForArmv7"
+    "DriverTest.AWasiProgramIsRefusedOnlyWhereItReachesWhatWasiLacks"
     "DriverTest.APythonFunctionIsNotAnExternalSymbol")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
@@ -995,6 +997,44 @@ if(lython_wasm_node)
         set(lython_wasm_node_major "${CMAKE_MATCH_1}")
     endif()
 endif()
+# `wasi` builds for wasm32-wasip1 with wasi-sdk and runs the result under
+# wasmtime, the working directory, the case's directory and /dev preopened and
+# the environment inherited, so a case sees the host it would see natively.
+# Registered where both exist: wasmtime on PATH (or LYTHON_WASMTIME) and a
+# wasi-sdk at LYTHON_WASI_SDK or $WASI_SDK_PATH. Measured over every golden
+# case: 764 of 768 cases and 115 of 116 error cases agree; the rest print WASI
+# errno numbers or the 32-bit sys.maxsize, or call os.getppid, which wasi-libc
+# does not have and the compiler refuses.
+set(LYTHON_WASI_AGREEMENT_CASES
+    hello
+    builtins_numeric
+    stdlib_os_env
+    open_binary
+    try_tuple_as
+    sys_exit
+    # The program's `write` is not libc's (internal linkage for Python
+    # functions); a static libc made it a duplicate symbol besides.
+    a_function_named_after_a_c_symbol
+    errors/traceback_nested_call
+    errors/cross_generator_throw_unwind
+    errors/cross_bigint_traceback)
+
+find_program(LYTHON_WASMTIME wasmtime)
+set(LYTHON_WASI_SDK "$ENV{WASI_SDK_PATH}" CACHE PATH
+    "wasi-sdk directory the wasi agreement stage links with")
+if(LYTHON_WASMTIME AND LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/bin/clang")
+    foreach(case_name IN LISTS LYTHON_WASI_AGREEMENT_CASES)
+        lython_add_agreement_case(wasi "${case_name}"
+            --wasmtime "${LYTHON_WASMTIME}")
+        string(REPLACE "/" "." test_stem "${case_name}")
+        set_tests_properties("golden.wasi.${test_stem}" PROPERTIES
+            ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
+    endforeach()
+else()
+    message(STATUS "Lython: wasi agreement stage skipped (wasmtime: "
+        "${LYTHON_WASMTIME}; wasi-sdk: ${LYTHON_WASI_SDK})")
+endif()
+
 if(LYTHON_EMCC AND lython_wasm_node_major GREATER_EQUAL 24)
     foreach(case_name IN LISTS LYTHON_WASM_AGREEMENT_CASES)
         lython_add_agreement_case(wasm "${case_name}"

@@ -35,7 +35,7 @@ inline std::string effectiveTriple(llvm::StringRef targetTriple) {
   return llvm::Triple(llvm::sys::getDefaultTargetTriple()).normalize();
 }
 
-// `sys.platform` and `platform.system()` name the same seven operating systems
+// `sys.platform` and `platform.system()` name the same eight operating systems
 // with different spellings (and `win32` / `Windows` is not even a case
 // difference), so the table is one row per OS: adding a target must not be
 // able to teach one of the two and not the other.
@@ -60,6 +60,10 @@ operatingSystemNames(const llvm::Triple &triple) {
     return OperatingSystemNames{"netbsd", "NetBSD"};
   if (triple.isOSEmscripten())
     return OperatingSystemNames{"emscripten", "Emscripten"};
+  // CPython's WASI build: sys.platform, and the sysname wasi-libc's uname()
+  // reports, which is what platform.system() returns.
+  if (triple.isOSWASI())
+    return OperatingSystemNames{"wasi", "wasi"};
   return std::nullopt;
 }
 

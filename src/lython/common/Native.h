@@ -61,6 +61,9 @@ std::uint64_t expectedCLongWidth(llvm::StringRef triple,
                                  std::uint64_t pointerWidth);
 bool isSupportedNativeTarget(llvm::StringRef triple);
 bool hasMeasured32BitLibc(const llvm::Triple &triple);
+// wasm32-wasip1 (and the deprecated plain `wasi`): the preview-1 imports
+// wasi-libc is built on. Preview 2 and later are the component model.
+bool isWASIPreview1(const llvm::Triple &triple);
 // Whether the target links a call by its signature, so that a function's
 // declaration has to be its real C prototype even where only its address is
 // taken. WebAssembly checks every import and every table entry; native
