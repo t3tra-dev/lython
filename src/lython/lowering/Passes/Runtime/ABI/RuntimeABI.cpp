@@ -1291,13 +1291,37 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
   if (mlir::failed(valueTypes))
     return mlir::failure();
 
+  // Which lanes begin an entity, and so carry a header a retain may read:
+  // lane 0, or for a mergeable union -- whose lane 0 is the tag -- each
+  // member's first.
+  //
+  // ⛔ Only for that storage: the other static readers rely on a union's
+  // member lanes being the zeroed payload global, and turning them into
+  // header globals broke a container's union element read
+  // (a_union_element_read_from_its_container).
+  llvm::SmallDenseSet<unsigned, 4> headerLanes;
+  auto unionType = mlir::dyn_cast<py::UnionType>(contract);
+  if (storage == DeadObjectStorage::StaticMergeableUnion && unionType) {
+    for (unsigned member = 0; member < unionType.getMemberTypes().size();
+         ++member) {
+      mlir::FailureOr<unsigned> offset =
+          RuntimeBundleLowerer::unionMemberValueOffset(op, unionType, member,
+                                                       purpose);
+      if (mlir::failed(offset))
+        return mlir::failure();
+      headerLanes.insert(*offset);
+    }
+  } else {
+    headerLanes.insert(0);
+  }
   llvm::SmallVector<mlir::Value, 4> values;
   values.reserve(valueTypes->size());
   for (auto [index, valueType] : llvm::enumerate(*valueTypes)) {
     mlir::FailureOr<mlir::Value> value =
-        storage == DeadObjectStorage::StaticNonOwning
-            ? materializeStaticDeadPhysicalValue(module, builder, op, valueType,
-                                                 /*objectHeader=*/index == 0)
+        storage != DeadObjectStorage::OwningHeap
+            ? materializeStaticDeadPhysicalValue(
+                  module, builder, op, valueType,
+                  /*objectHeader=*/headerLanes.contains(index))
             : RuntimeBundleLowerer::materializeDeadPhysicalValue(op, valueType);
     if (mlir::failed(value))
       return mlir::failure();
@@ -1396,7 +1420,7 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
   }
   return RuntimeValue::objectWithOwnership(
       contract, values,
-      storage == DeadObjectStorage::StaticNonOwning
+      storage != DeadObjectStorage::OwningHeap
           ? own::OwnershipKind::Immortal
           : own::logicalOwnershipKind(contract, /*ownsObject=*/true));
 }
@@ -1412,6 +1436,13 @@ RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
     mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose) {
   return RuntimeBundleLowerer::materializeDeadObjectValueImpl(
       op, contract, purpose, DeadObjectStorage::StaticNonOwning);
+}
+
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializeMergeableDeadObjectValue(
+    mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose) {
+  return RuntimeBundleLowerer::materializeDeadObjectValueImpl(
+      op, contract, purpose, DeadObjectStorage::StaticMergeableUnion);
 }
 
 mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(

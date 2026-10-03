@@ -2336,3 +2336,22 @@ TEST(DriverTest, AnImportedModuleKeepsCallablesInAContainer) {
       "registry.add(1, hello)\nregistry.fire(1)\n");
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
+
+// What: a closure that calls a captured callable returning a union of a
+// class and None compiles: the edge after the dispatch-miss raise carries an
+// immortal placeholder whose member header a retain can be written against.
+TEST(DriverTest, AClosureCallsACapturedCallableReturningAnOptional) {
+  CompileResult result =
+      compileSource("from typing import Callable\n\n\n"
+                    "class Box:\n"
+                    "    def __init__(self, n: int) -> None:\n"
+                    "        self.n = n\n\n\n"
+                    "def outer(f: Callable[[int], \"Box | None\"]) -> None:\n"
+                    "    def run() -> None:\n"
+                    "        print(f(1) is None)\n"
+                    "    run()\n\n\n"
+                    "def g(n: int) -> \"Box | None\":\n"
+                    "    return None if n == 1 else Box(n)\n\n\n"
+                    "outer(g)\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
