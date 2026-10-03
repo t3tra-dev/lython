@@ -1843,6 +1843,9 @@ private:
   std::optional<std::int64_t> currentTryHandlerId() const;
   void emitTryCallSiteMarker(mlir::Location loc, std::int64_t id);
   void emitTryCallSiteMarkerIfNeeded(mlir::Location loc);
+  // Erases a function this lowering made or lowered, and the try ids its
+  // blocks carried.
+  void eraseLoweredFunction(mlir::Operation *function);
   mlir::func::FuncOp getOrCreateTryCallSiteMarker();
   mlir::func::FuncOp getOrCreateTryCatchMarker();
   mlir::func::FuncOp getOrCreateTryCatchAnchor();

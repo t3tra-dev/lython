@@ -72,9 +72,18 @@ an absence and an absence is what a broken instrument also reports:
 Exit 0 = net zero. 1 = leaked. 2 = could not measure (refusal). ctest maps 2 to
 SKIP, so a toolchain without a leak sanitizer skips the stage rather than failing
 it -- and rather than silently registering a green it never measured.
+
+⭐ THE BASELINE IS BUILT ONCE PER RUN. `--build-baseline DIR` (a ctest fixture
+setup) builds and measures `print(0)` and records the figure, and the compiler
+it came from, in DIR/baseline.json; each case reads it with `--baseline FILE`.
+Every case used to build its own -- the same sanitized binary 94 times, about
+half of the stage. A recorded baseline from a different lyc (path, size,
+modification time, extra flags) is refused rather than used: a stale zero point
+would make every figure below it wrong without saying so.
 """
 
 import argparse
+import json
 import os
 import pathlib
 import re
@@ -193,16 +202,84 @@ def build(lyc: pathlib.Path, source: pathlib.Path, out: pathlib.Path,
     return r.returncode == 0
 
 
+def compiler_fingerprint(lyc: pathlib.Path) -> "dict[str, object]":
+    stat = lyc.stat()
+    return {"lyc": str(lyc), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+            "flags": EXTRA_LYC_FLAGS}
+
+
+def build_baseline(lyc: pathlib.Path, work: pathlib.Path,
+                   timeout: float) -> "tuple[int, int] | str":
+    """Build and measure `print(0)`: the figure or why there is none."""
+    baseline_src = work / "_baseline.py"
+    baseline_src.write_text("print(0)\n")
+    baseline_bin = work / "baseline"
+    if not build(lyc, baseline_src, baseline_bin, timeout):
+        return ("could not build a leak-sanitized binary for `print(0)`; this "
+                "toolchain cannot measure leaks")
+    code = run_alone(baseline_bin, timeout)
+    if code != 0:
+        return (f"the baseline exits {code} on its own, not 0; the sanitizer's "
+                f"own status would mask that")
+    base = measure(baseline_bin, timeout)
+    if isinstance(base, str):
+        return ("no leak summary for the baseline: with detection on, the "
+                "stack-guard root is always found, so a missing summary means "
+                f"the instrument is not running ({base})")
+    return base
+
+
+def write_baseline(lyc: pathlib.Path, out_dir: pathlib.Path,
+                   timeout: float) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as scratch:
+        base = build_baseline(lyc, pathlib.Path(scratch), timeout)
+    record = compiler_fingerprint(lyc)
+    if isinstance(base, str):
+        # ⛔ Recorded, not raised: the cases read it and skip with the reason,
+        # as each did when it built its own.
+        record["unmeasurable"] = base
+    else:
+        record["bytes"], record["allocs"] = base
+    (out_dir / "baseline.json").write_text(json.dumps(record))
+    print(f"baseline: {record}")
+    return 0
+
+
+def read_baseline(path: pathlib.Path,
+                  lyc: pathlib.Path) -> "tuple[int, int] | str":
+    if not path.exists():
+        return f"no recorded baseline at {path}"
+    record = json.loads(path.read_text())
+    expected = compiler_fingerprint(lyc)
+    for key, value in expected.items():
+        if record.get(key) != value:
+            return (f"the recorded baseline came from another compiler "
+                    f"({key}: {record.get(key)!r}, now {value!r})")
+    if "unmeasurable" in record:
+        return str(record["unmeasurable"])
+    return int(record["bytes"]), int(record["allocs"])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("lyc", type=pathlib.Path)
-    ap.add_argument("source", type=pathlib.Path)
+    ap.add_argument("source", type=pathlib.Path, nargs="?")
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--build-baseline", type=pathlib.Path, default=None,
+                    help="build and record the baseline in this directory")
+    ap.add_argument("--baseline", type=pathlib.Path, default=None,
+                    help="the recorded baseline.json to measure against")
     # The subject's own exit code. The BASELINE is always 0: it is `print(0)`.
     ap.add_argument("--expect-exit", type=int, default=0)
     args = ap.parse_args()
 
     lyc = args.lyc.resolve()
+    if args.build_baseline is not None:
+        return write_baseline(lyc, args.build_baseline, args.timeout)
+    if args.source is None:
+        print("a source to measure is required", file=sys.stderr)
+        return 2
     source = args.source.resolve()
     # The suppressions file is checked like the binary and the source, not
     # assumed: LSan aborts the child when it cannot open one, which arrives here
@@ -218,37 +295,23 @@ def main() -> int:
     # makes the NEXT program fail to link with "symbol 'main' already exists".
     with tempfile.TemporaryDirectory() as scratch:
         work = pathlib.Path(scratch)
-        baseline_src = work / "_baseline.py"
-        baseline_src.write_text("print(0)\n")
-
         subject_bin = work / "subject"
-        baseline_bin = work / "baseline"
-        # The baseline builds FIRST: it is `print(0)`, so if the toolchain has no
-        # leak sanitizer at all this fails on the cheapest possible program and
-        # the stage skips, instead of reporting a subject-specific failure for a
+        # The baseline FIRST: it is `print(0)`, so if the toolchain has no leak
+        # sanitizer at all this fails on the cheapest possible program and the
+        # stage skips, instead of reporting a subject-specific failure for a
         # missing runtime.
-        if not build(lyc, baseline_src, baseline_bin, args.timeout):
-            print("could not build a leak-sanitized binary for `print(0)`; this "
-                  "toolchain cannot measure leaks. Skipping.", file=sys.stderr)
+        base = (read_baseline(args.baseline, lyc) if args.baseline is not None
+                else build_baseline(lyc, work, args.timeout))
+        if isinstance(base, str):
+            print(f"{base}. Refusing.", file=sys.stderr)
             return 2
         if not build(lyc, source, subject_bin, args.timeout):
             return 2
-
-        for label, binary, want in (("subject", subject_bin, args.expect_exit),
-                                    ("baseline", baseline_bin, 0)):
-            code = run_alone(binary, args.timeout)
-            if code != want:
-                print(f"{label} exits {code} on its own, not the declared "
-                      f"{want}; the sanitizer's own status would mask that, so a "
-                      f"measurement here could read as zero. Refusing.",
-                      file=sys.stderr)
-                return 2
-
-        base = measure(baseline_bin, args.timeout)
-        if isinstance(base, str):
-            print("no leak summary for the baseline: with detection on, the "
-                  "stack-guard root is always found, so a missing summary means "
-                  f"the instrument is not running ({base}). Refusing.",
+        code = run_alone(subject_bin, args.timeout)
+        if code != args.expect_exit:
+            print(f"subject exits {code} on its own, not the declared "
+                  f"{args.expect_exit}; the sanitizer's own status would mask "
+                  f"that, so a measurement here could read as zero. Refusing.",
                   file=sys.stderr)
             return 2
         subject = measure(subject_bin, args.timeout)

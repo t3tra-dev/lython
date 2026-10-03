@@ -9376,14 +9376,19 @@ module attributes {
     %one_digits = memref.cast %one_digits_static : memref<1xi32> to memref<?xi32>
     %bumped = func.call @__ly_long_add_abs(%one, %qr_p0_meta, %qr_p0_digits, %one_meta, %one_digits) : (i64, memref<2xi64>, memref<?xi32>, memref<2xi64>, memref<?xi32>) -> memref<2xi64>
     func.call @LyLong_DecRef(%qr#0) : (memref<2xi64>) -> ()
-    %br = func.call @LyLong_Mul(%bumped, %scale) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
-    %br_p0_meta, %br_p0_digits = func.call @__ly_long_parts(%br) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %bm = func.call @LyLong_Mul(%bumped, %scale) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    %bm_p0_meta, %bm_p0_digits = func.call @__ly_long_parts(%bm) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     func.call @LyLong_DecRef(%bumped) : (memref<2xi64>) -> ()
     func.call @LyLong_DecRef(%scale) : (memref<2xi64>) -> ()
-    // Reapply the input's sign; the product of nonzero magnitudes is nonzero.
+    // Reapply the input's sign on a copy; the product of nonzero magnitudes
+    // is nonzero.
+    // ⛔ Not stored into the product: a small one is the shared immortal
+    // object (`__ly_long_small_ints`), and `round(-15, -1)` made every 20 in
+    // the program -20.
     %b_sign_slot = arith.constant 0 : index
     %b_input_sign = memref.load %meta[%b_sign_slot] : memref<2xi64>
-    memref.store %b_input_sign, %br_p0_meta[%b_sign_slot] : memref<2xi64>
+    %br = func.call @__ly_long_copy_with_sign(%b_input_sign, %bm_p0_meta, %bm_p0_digits) : (i64, memref<2xi64>, memref<?xi32>) -> memref<2xi64>
+    func.call @LyLong_DecRef(%bm) : (memref<2xi64>) -> ()
     func.return %br : memref<2xi64>
 
   ^scale_back:
@@ -9401,14 +9406,16 @@ module attributes {
     func.return %qz_h : memref<2xi64>
 
   ^scale_back_mul:
-    %sr = func.call @LyLong_Mul(%qr#0, %scale) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
-    %sr_p0_meta, %sr_p0_digits = func.call @__ly_long_parts(%sr) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %sm = func.call @LyLong_Mul(%qr#0, %scale) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    %sm_p0_meta, %sm_p0_digits = func.call @__ly_long_parts(%sm) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     func.call @LyLong_DecRef(%qr#0) : (memref<2xi64>) -> ()
     func.call @LyLong_DecRef(%scale) : (memref<2xi64>) -> ()
-    // The product of nonzero magnitudes is nonzero: reapply the input's sign.
+    // The product of nonzero magnitudes is nonzero: reapply the input's sign,
+    // on a copy for the reason above.
     %s_sign_slot = arith.constant 0 : index
     %s_input_sign = memref.load %meta[%s_sign_slot] : memref<2xi64>
-    memref.store %s_input_sign, %sr_p0_meta[%s_sign_slot] : memref<2xi64>
+    %sr = func.call @__ly_long_copy_with_sign(%s_input_sign, %sm_p0_meta, %sm_p0_digits) : (i64, memref<2xi64>, memref<?xi32>) -> memref<2xi64>
+    func.call @LyLong_DecRef(%sm) : (memref<2xi64>) -> ()
     func.return %sr : memref<2xi64>
   }
 

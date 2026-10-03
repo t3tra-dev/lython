@@ -198,6 +198,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
     "DriverTest.AnEmscriptenTargetNamesWhatReplacedIt"
     "DriverTest.AWasmModuleDefinesTheUnwinderItUses"
+    "DriverTest.AnErasedGeneratorBodyLeavesNoTryIdBehind"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
@@ -815,6 +816,15 @@ foreach(leak_case IN LISTS LYTHON_LEAK_GATE_CASES)
 endforeach()
 list(APPEND LYTHON_LEAK_GATE_ENTRIES ${LYTHON_LEAK_GATE_EXIT_CASES})
 
+# The `print(0)` baseline every case subtracts, built and measured once per run
+# by this fixture setup instead of once per case (leak_gate.py).
+set(LYTHON_LEAK_BASELINE_DIR "${CMAKE_CURRENT_BINARY_DIR}/leak-baseline")
+add_test(NAME "leak.baseline"
+    COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
+        $<TARGET_FILE:lyc> --build-baseline "${LYTHON_LEAK_BASELINE_DIR}")
+set_tests_properties("leak.baseline" PROPERTIES
+    TIMEOUT 600 LABELS "e2e;leak" FIXTURES_SETUP lython_leak_baseline)
+
 foreach(leak_entry IN LISTS LYTHON_LEAK_GATE_ENTRIES)
     string(REGEX MATCH "^([a-z]+)/([A-Za-z0-9_]+)=(-?[0-9]+)$" _m "${leak_entry}")
     if(NOT _m)
@@ -832,16 +842,16 @@ foreach(leak_entry IN LISTS LYTHON_LEAK_GATE_ENTRIES)
     endif()
     add_test(NAME "leak.${leak_case}"
         COMMAND Python3::Interpreter "${LYTHON_LEAK_GATE_RUNNER}"
-            $<TARGET_FILE:lyc> "${leak_source}" --expect-exit ${leak_exit})
+            $<TARGET_FILE:lyc> "${leak_source}" --expect-exit ${leak_exit}
+            --baseline "${LYTHON_LEAK_BASELINE_DIR}/baseline.json")
     # SKIP_RETURN_CODE 2 is the gate's "could not measure": no leak sanitizer in
     # this toolchain, a program that does not exit 0 on its own, or a sanitizer
     # that stayed silent on every attempt. A skip says so; a pass would be a green
     # nobody measured, which is the failure this whole stage exists to avoid.
     #
-    # 600 s rather than 360: each member now builds TWO sanitized binaries (the
-    # subject and the `print(0)` baseline) and may run each up to three times.
     set_tests_properties("leak.${leak_case}" PROPERTIES
-        TIMEOUT 600 LABELS "e2e;leak" SKIP_RETURN_CODE 2)
+        TIMEOUT 600 LABELS "e2e;leak" SKIP_RETURN_CODE 2
+        FIXTURES_REQUIRED lython_leak_baseline)
 endforeach()
 file(GLOB LYTHON_GOLDEN_ERRORS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/golden/errors/*.py")

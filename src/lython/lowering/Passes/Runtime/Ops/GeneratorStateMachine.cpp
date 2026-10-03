@@ -1422,7 +1422,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       if (mlir::failed(inlined))
         return mlir::failure();
       if (!*inlined) {
-        clone.erase();
+        eraseLoweredFunction(clone);
         continue;
       }
     }
@@ -1551,7 +1551,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
         }
     });
     if (!eligible || (yields.empty() && !coroutine)) {
-      clone.erase();
+      eraseLoweredFunction(clone);
       continue;
     }
 
@@ -1696,7 +1696,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       argumentWords += RuntimeBundleLowerer::generatorArgumentFrameWords(lane);
     if (!livesEligible || kGeneratorFrameSlotBase + argumentWords + frameWords >
                               kGeneratorEHStashWordBase) {
-      clone.erase();
+      eraseLoweredFunction(clone);
       continue;
     }
 
