@@ -197,6 +197,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.StringAndBytesLiteralsInALoopStayOutOfTheFrame"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
+    "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
@@ -1059,6 +1060,19 @@ if(LYTHON_EMCC AND lython_wasm_node_major GREATER_EQUAL 24)
             --wasm-node "${lython_wasm_node}"
             --wasm-target wasm32-unknown-emscripten)
     endforeach()
+    # The same cases as a WASI program under its own JavaScript loader
+    # (`--js-host`), which suspends it with JSPI: the host half of `js` without
+    # Emscripten, and asyncio waiting on the host where Emscripten cannot.
+    if(LYTHON_WASI_SDK AND EXISTS "${LYTHON_WASI_SDK}/bin/clang")
+        foreach(case_path IN LISTS LYTHON_JS_GOLDEN_CASES)
+            get_filename_component(case_name "${case_path}" NAME_WE)
+            lython_add_agreement_case(jspi "js/${case_name}"
+                --wasm-node "${lython_wasm_node}"
+                --wasm-target wasm32-wasip1 --js-host)
+            set_tests_properties("golden.jspi.js.${case_name}" PROPERTIES
+                ENVIRONMENT "WASI_SDK_PATH=${LYTHON_WASI_SDK}")
+        endforeach()
+    endif()
 else()
     message(STATUS "Lython: wasm agreement stage skipped (emcc: "
         "${LYTHON_EMCC}; node: ${lython_wasm_node} "

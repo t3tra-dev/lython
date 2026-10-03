@@ -228,6 +228,7 @@ public:
   // Target triple for platform-constant typing (sys.platform / os.name /
   // platform.system() infer as string literals of THIS target).
   void setTargetTriple(std::string triple) { targetTriple = std::move(triple); }
+  void setJsHost(bool value) { jsHost = value; }
 
   // Module pre-pass: resolves the signatures of all top-level functions in
   // callee-first (SCC topological) order, memoizes them, and binds their
@@ -494,6 +495,7 @@ private:
   mutable bool defaultsDescribeParameters = true;
   llvm::DenseMap<const parser::Node *, mlir::Type> resultTypeOverrides;
   std::string targetTriple;
+  bool jsHost = false;
   llvm::StringMap<mlir::Type> symbols;
   llvm::StringMap<mlir::Type> classes;
   llvm::StringMap<llvm::SmallVector<std::string, 4>> declaredBases;

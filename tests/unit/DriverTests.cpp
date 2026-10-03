@@ -2407,3 +2407,36 @@ TEST(DriverTest, ANextOnAGeneratorReturningAClassIsRefused) {
             std::string::npos)
       << result.diagnostics;
 }
+
+// What: a WASI program with a JavaScript host imports the host's functions
+// from the `lython_js` module and exports the entry its callbacks call back
+// through, which is what the WASI loader (runtime/js/lython_wasi.js) wires.
+TEST(DriverTest, AWASIProgramWithAJsHostImportsLythonJs) {
+  lython::driver::DriverOptions options;
+  options.targetTriple = "wasm32-wasip1";
+  options.jsHost = true;
+  CompileResult result = compileSource(
+      "import js\n"
+      "from js import console\n\n\n"
+      "def later() -> None:\n"
+      "    console.log(2)\n\n\n"
+      "js.queueMicrotask(later)\n"
+      "console.log(1)\n",
+      options);
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Module &module = *result.verified.llvmModule;
+  unsigned imports = 0;
+  for (const llvm::Function &function : module)
+    if (function.isDeclaration() && function.getName().starts_with("LyJs_")) {
+      ++imports;
+      EXPECT_EQ(function.getFnAttribute("wasm-import-module")
+                    .getValueAsString(),
+                "lython_js")
+          << function.getName().str();
+    }
+  EXPECT_GT(imports, 0u);
+  const llvm::Function *dispatch = module.getFunction("LyJs_Dispatch");
+  ASSERT_NE(dispatch, nullptr);
+  EXPECT_EQ(dispatch->getFnAttribute("wasm-export-name").getValueAsString(),
+            "LyJs_Dispatch");
+}

@@ -215,6 +215,8 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
     if (std::optional<Value> constant =
             emitStaticStringConstant(*expr, binding))
       return *constant;
+    if (std::optional<Value> constant = emitStaticBoolConstant(*expr, binding))
+      return *constant;
     if (std::optional<Value> constant = emitStaticIntConstant(*expr, binding))
       return *constant;
     if (std::optional<Value> constant =
@@ -332,6 +334,9 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       // known symbol (inference already typed them as target literals).
       if (std::optional<Value> constant =
               emitStaticStringConstant(*expr, binding))
+        return *constant;
+      if (std::optional<Value> constant =
+              emitStaticBoolConstant(*expr, binding))
         return *constant;
       if (auto symbol = types.lookupSymbol(qualified)) {
         if (std::optional<Value> constant =
@@ -4598,6 +4603,16 @@ std::optional<Value> ModuleEmitter::emitManifestStrConstant(
   mlir::Type type = types.literal("\"" + *value + "\"");
   auto op = py::StrConstantOp::create(builder, loc(anchor), type,
                                       builder.getStringAttr(*value));
+  return Value{op.getResult(), type};
+}
+
+std::optional<Value> ModuleEmitter::emitStaticBoolConstant(
+    const parser::Node &anchor, llvm::StringRef binding) {
+  if (binding != py::kJsHostBinding)
+    return std::nullopt;
+  mlir::Type type = types.literal(options.jsHost ? "True" : "False");
+  auto op = py::BoolConstantOp::create(builder, loc(anchor), type,
+                                       builder.getBoolAttr(options.jsHost));
   return Value{op.getResult(), type};
 }
 

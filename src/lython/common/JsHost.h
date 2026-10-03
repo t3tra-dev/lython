@@ -20,4 +20,11 @@ inline constexpr llvm::StringLiteral kJsProxyContract = "_js.JsProxy";
 // The module whose contracts are the stub's classes.
 inline constexpr llvm::StringLiteral kJsHostModule = "js";
 
+// True where the program runs with a JavaScript host -- every Emscripten
+// target, and WASI linked with `--js-host` -- and folded statically, so a
+// module can import `js` in a branch it guards with it. Lython's: CPython has
+// no such attribute, and `sys.platform` cannot say it, since a WASI program
+// may or may not have a host.
+inline constexpr llvm::StringLiteral kJsHostBinding = "sys._js_host";
+
 } // namespace py

@@ -2270,7 +2270,8 @@ namespace {
 
 // The driver's emit entry point for one main source on `triple`, which is
 // where `js` exists and where module-level platform branches are decided.
-ImportedModuleEmit emitMainFor(llvm::StringRef source, llvm::StringRef triple) {
+ImportedModuleEmit emitMainFor(llvm::StringRef source, llvm::StringRef triple,
+                               bool jsHost = false) {
   ImportedModuleEmit result;
   mlir::MLIRContext context(testRegistry());
   mlir::OwningOpRef<mlir::ModuleOp> module;
@@ -2278,6 +2279,7 @@ ImportedModuleEmit emitMainFor(llvm::StringRef source, llvm::StringRef triple) {
   lython::driver::DriverOptions options;
   options.targetTriple =
       triple.empty() ? llvm::sys::getDefaultTargetTriple() : triple.str();
+  options.jsHost = jsHost;
   result.succeeded = mlir::succeeded(lython::driver::emitMLIRFromSource(
       source, "main.py", "<lython-no-import-dir>", options, context, module,
       diag));
@@ -2359,4 +2361,41 @@ TEST(EmitterTest, AParameterShadowsAModuleOfItsName) {
       "print(f([1, 2, 1]), t.monotonic() > 0)\n",
       {});
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
+}
+
+// What: WASI has a JavaScript host only when it is asked for, and
+// `sys._js_host` says which, statically: a branch on it imports `js` only
+// where there is a host.
+TEST(EmitterTest, AWASIProgramHasAJsHostOnlyWhenAskedFor) {
+  const char *program = "from js import console\nconsole.log(1)\n";
+  ImportedModuleEmit without = emitMainFor(program, "wasm32-wasip1");
+  EXPECT_FALSE(without.succeeded);
+  EXPECT_NE(without.diagnostics.find("wasm32-wasip1 with --js-host"),
+            std::string::npos)
+      << without.diagnostics;
+  ImportedModuleEmit with =
+      emitMainFor(program, "wasm32-wasip1", /*jsHost=*/true);
+  EXPECT_TRUE(with.succeeded) << with.diagnostics;
+  const char *guarded = "import sys\n\n"
+                        "if sys._js_host:\n"
+                        "    from js import console\n\n"
+                        "    def say() -> None:\n"
+                        "        console.log(\"host\")\n"
+                        "else:\n\n"
+                        "    def say() -> None:\n"
+                        "        print(\"no host\")\n";
+  for (auto [triple, jsHost] :
+       {std::pair<const char *, bool>{"", false},
+        {"wasm32-wasip1", false},
+        {"wasm32-wasip1", true},
+        {"wasm32-unknown-emscripten", false}}) {
+    ImportedModuleEmit emitted = emitWithImportedModule(
+        "guarded", guarded, "import guarded\nguarded.say()\n", ".py", triple);
+    if (jsHost)
+      emitted = [&] {
+        // The helper takes no host flag; the main-source form does.
+        return emitMainFor(std::string(guarded) + "say()\n", triple, true);
+      }();
+    EXPECT_TRUE(emitted.succeeded) << triple << " " << emitted.diagnostics;
+  }
 }

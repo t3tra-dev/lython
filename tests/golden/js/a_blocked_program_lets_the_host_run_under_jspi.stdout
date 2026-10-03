@@ -1,0 +1,4 @@
+slept
+run: the event loop waits on the JavaScript host, which cannot run while the loop blocks it (no JSPI here); schedule the coroutine with asyncio.create_task() instead of asyncio.run()
+main body done
+host timer

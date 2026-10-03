@@ -40,6 +40,16 @@ file(READ "${LYTHON_JS_CORE_SOURCE}" LYTHON_JS_CORE)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/LythonJsCore.inc"
     "// Generated from src/lython/runtime/js/lython_js.js. Do not edit.\n"
     "static const char kLythonJsCore[] = R\"LYJS(${LYTHON_JS_CORE})LYJS\";\n")
+# The loader of a WASI program run under a JavaScript host
+# (`--target wasm32-wasip1 --js-host`), written beside it with the core.
+set(LYTHON_WASI_LOADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/js/lython_wasi.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${LYTHON_WASI_LOADER_SOURCE}")
+file(READ "${LYTHON_WASI_LOADER_SOURCE}" LYTHON_WASI_LOADER)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/LythonWasiLoader.inc"
+    "// Generated from src/lython/runtime/js/lython_wasi.js. Do not edit.\n"
+    "static const char kLythonWasiLoader[] = R\"LYJS(${LYTHON_WASI_LOADER})LYJS\";\n")
 target_include_directories(lyc PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 target_compile_definitions(lyc

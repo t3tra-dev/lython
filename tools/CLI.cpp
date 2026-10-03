@@ -529,6 +529,44 @@ void appendWASILinkArgs(std::vector<std::string> &args,
 }
 
 #include "LythonJsCore.inc"
+#include "LythonWasiLoader.inc"
+
+// A WASI program under a JavaScript host is two files: the module, linked
+// beside the loader as `<stem>.wasm`, and the loader at the path asked for --
+// the host's half of `js` and the WASI calls (runtime/js/lython_wasi.js).
+//
+// ⛔ CommonJS, not an ES module: the loader finds the module beside itself
+// through `__dirname`, which an ES module does not have, and `node prog.js`
+// runs it either way.
+LogicalResult checkWASIJsHostOutput(StringRef outputPath) {
+  if (outputPath.ends_with(".js") || outputPath.ends_with(".cjs"))
+    return success();
+  llvm::errs() << "error: with --js-host the output is the loader the host "
+                  "runs; name it with a .js extension (the module is written "
+                  "beside it as .wasm)\n";
+  return failure();
+}
+
+std::string wasiJsHostModulePath(StringRef outputPath) {
+  llvm::SmallString<256> path(outputPath);
+  llvm::sys::path::replace_extension(path, ".wasm");
+  return path.str().str();
+}
+
+LogicalResult writeWASIJsHostLoader(StringRef outputPath) {
+  std::error_code ec;
+  llvm::raw_fd_ostream out(outputPath, ec);
+  if (ec) {
+    llvm::errs() << "error: failed to write " << outputPath << ": "
+                 << ec.message() << "\n";
+    return failure();
+  }
+  std::string module =
+      llvm::sys::path::filename(wasiJsHostModulePath(outputPath)).str();
+  out << "\"use strict\";\n" << kLythonJsCore << "\n" << kLythonWasiLoader
+      << "\nLythonWasi.main(\"" << module << "\");\n";
+  return success();
+}
 
 // The host functions the program imports from JavaScript (`LyJs_*`, declared
 // by runtime/modules/_js.mlir), by the names its object will import.
@@ -651,6 +689,16 @@ LogicalResult linkExecutable(StringRef objectPath,
   } else if (linker->flavor == LinkerDriverFlavor::WASI) {
     appendWASILinkArgs(argStorage,
                        codeGenTripleForTarget(tensorTarget, Options));
+    if (Options.jsHost) {
+      if (failed(checkWASIJsHostOutput(outputPath)))
+        return failure();
+      argStorage.emplace_back("-o");
+      argStorage.emplace_back(wasiJsHostModulePath(outputPath));
+      if (failed(runLinkerCommand(linker->program, argStorage,
+                                  "error: linking failed")))
+        return failure();
+      return writeWASIJsHostLoader(outputPath);
+    }
   } else {
     // Parallel kernel dispatch calls pthread_create; Darwin ships it in
     // libSystem, but Linux toolchains still want the explicit flag.
@@ -1013,6 +1061,12 @@ static llvm::cl::opt<std::string>
                  llvm::cl::desc("Generate code for the given target triple"),
                  llvm::cl::value_desc("triple"), llvm::cl::init(""),
                  llvm::cl::cat(LythonCategory));
+static llvm::cl::opt<bool> JsHostOption(
+    "js-host",
+    llvm::cl::desc("Run a wasm32-wasip1 program under a JavaScript host: it "
+                   "may import `js`, and -o names the loader written beside "
+                   "the .wasm"),
+    llvm::cl::init(false), llvm::cl::cat(LythonCategory));
 static llvm::cl::opt<std::string>
     TargetCPUOption("mcpu", llvm::cl::desc("Target a specific CPU name"),
                     llvm::cl::value_desc("cpu-name"), llvm::cl::init(""),
@@ -1130,6 +1184,15 @@ int main(int argc, char **argv) {
                             LibraryPathOptions.end());
   Options.releaseMode = releaseModeFromArgv || ReleaseModeOption;
   Options.auditRuntimeManifest = AuditRuntimeManifest;
+  Options.jsHost = JsHostOption;
+  if (Options.jsHost &&
+      !llvm::Triple(llvm::Triple::normalize(Options.targetTriple))
+           .isOSWASI()) {
+    llvm::errs() << "error: --js-host runs a WASI program under a JavaScript "
+                    "host and needs --target wasm32-wasip1; an Emscripten "
+                    "target always has one\n";
+    return 1;
+  }
   py::IRDumpConfig irDump = py::IRDumpConfig::fromEnv();
 
   const bool jitMode = static_cast<bool>(JitCommand);

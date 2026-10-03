@@ -124,7 +124,8 @@ void internalizePythonFunctions(llvm::Module &module);
 // LyJs_Dispatch and LyJs_Release, each calling the Python function of
 // runtime/lib/_js_bridge.py that does the work. Nothing when the program has
 // no bridge.
-void installJsHostEntryPoints(llvm::Module &module);
+void installJsHostEntryPoints(llvm::Module &module,
+                              const llvm::Triple &triple);
 // Rewrites every landingpad as a catch-all funclet left at once, and every
 // resume as a throw of the same carrier, for a target whose pads are funclets
 // (UnwindABI.h). The last step before codegen.

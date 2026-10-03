@@ -82,6 +82,23 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
   だけになる。本体を `lython_js` などの import モジュールとして渡す自前の
   loader を書けばよい。
 
+## WASI のローダ (`--js-host`)
+
+`lyc --target wasm32-wasip1 --js-host -o prog.js` は、Emscripten を使わずに
+`js` を持つプログラムを作る。出力は `prog.wasm` とローダ `prog.js` の 2 つ。
+
+- ローダは `lython_js.js` (本体はそのまま) と `runtime/js/lython_wasi.js`
+  (WASI preview-1 の shim と起動) から成る。`node prog.js` でも、ブラウザの
+  `<script>` でも動く。
+- プログラムは、ホストの関数を `lython_js` から import し、`LyJs_Dispatch` /
+  `LyJs_Release` を export する (LLVM の段で付ける属性による)。
+- shim が答えるのは、ファイルシステムを持たないプログラムが使う呼び出しだけ。
+  preopen がないので、ファイルを開くと ENOENT になる。
+- JSPI がある所では、`time.sleep` と、asyncio がホストを待つ点で、プログラムを
+  中断する。その間も JS のイベントループが進む (docs/async-design.md の
+  段階 7)。
+- `sys._js_host` は、Emscripten と `--js-host` 付きの WASI で True。
+
 ## コールバック
 
 スタブが callback を受け取ると宣言している引数に Python の callable (関数、
@@ -119,7 +136,8 @@ Pyodide の `from js import ...` に相当する機能の設計メモ。対象�
 - `await` による Promise の待機は実装済み (docs/async-design.md の段階 6)。
   asyncio のループがホストのループで進む (WebLoop) ので、待つ間は wasm から
   JS に戻る。`asyncio.run()` のようにブロックしたまま Promise を待つことは、
-  JSPI (段階 7) まで RuntimeError になる。
+  Emscripten では RuntimeError になる。WASI のローダ (下記) では JSPI で
+  中断して待つ。
 - `to_js` / `to_py` (list、dict、TypedDict の変換)。
 - グローバルへの代入と、union 型のグローバルの読み出し。今は lowering が
   拒否する。

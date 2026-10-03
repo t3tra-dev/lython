@@ -15,6 +15,12 @@ directory and the case's directory preopened (WASI_SDK_PATH must name a
 wasi-sdk). Each is --aot with a different target and a different way to start
 the program, and checks the same sidecars.
 
+--js-host, with --wasm-node and --wasm-target wasm32-wasip1, links the WASI
+program to run under its JavaScript loader (`lyc --js-host`), which suspends
+it with JSPI where node has it. A case whose answer there differs -- it can
+wait on a promise where Emscripten cannot -- keeps it in <case>.jspi.stdout,
+which is compared instead of <case>.stdout.
+
 --aot builds an executable and runs it instead of JIT-ing, and --release passes
 `--release` to lyc. Both are checked against the SAME sidecars by the SAME code
 below: what they pin is that the other output mode and the release
@@ -102,17 +108,20 @@ class CrossRun:
     the output's name, and the command that starts it."""
 
     def __init__(self, target: str, output: str,
-                 launch: "typing.Callable[[pathlib.Path, pathlib.Path], list[str]]"):
+                 launch: "typing.Callable[[pathlib.Path, pathlib.Path], list[str]]",
+                 flags: "list[str] | None" = None):
         self.target = target
         self.output = output
         self.launch = launch
+        self.flags = flags or []
 
 
 def cross_run_from(args: argparse.Namespace) -> "CrossRun | None":
     if args.wasm_node:
         node = str(args.wasm_node)
         return CrossRun(args.wasm_target, "prog.js",
-                        lambda binary, case: [node, str(binary)])
+                        lambda binary, case: [node, str(binary)],
+                        ["--js-host"] if args.js_host else [])
     if args.wasmtime:
         wasmtime = str(args.wasmtime)
         return CrossRun(
@@ -139,7 +148,7 @@ def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
         if release:
             command.append("--release")
         if cross:
-            command += ["--target", cross.target]
+            command += ["--target", cross.target, *cross.flags]
         command += ["-o", str(binary)]
         launch = cross.launch(binary, case) if cross else [str(binary)]
         try:
@@ -257,6 +266,7 @@ def main() -> int:
     parser.add_argument("--wasm-node", type=pathlib.Path, default=None)
     parser.add_argument("--wasm-target", default="wasm64-unknown-emscripten")
     parser.add_argument("--wasmtime", type=pathlib.Path, default=None)
+    parser.add_argument("--js-host", action="store_true")
     parser.add_argument("case", type=pathlib.Path)
     args = parser.parse_args()
     cross = cross_run_from(args)
@@ -306,6 +316,8 @@ def main() -> int:
                       f"expected {expected_exit}")
 
     stdout_file = args.case.with_suffix(".stdout")
+    if args.js_host and args.case.with_suffix(".jspi.stdout").exists():
+        stdout_file = args.case.with_suffix(".jspi.stdout")
     if stdout_file.exists():
         expected_stdout = stdout_file.read_text()
         if stdout != expected_stdout:

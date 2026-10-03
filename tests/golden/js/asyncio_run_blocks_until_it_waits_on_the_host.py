@@ -1,7 +1,9 @@
-# What: `asyncio.run()` on a JavaScript host still blocks: a coroutine that
-# waits only on Python (here a timer) runs to its result, and one that waits
-# on a Promise -- which the host cannot settle while the loop blocks it --
-# raises RuntimeError rather than spinning forever.
+# What: `asyncio.run()` on a JavaScript host blocks: a coroutine that waits
+# only on Python (here a timer) runs to its result. One that waits on a
+# Promise needs the host to run meanwhile: under JSPI (the WASI loader,
+# .jspi.stdout) the loop suspends until it has, and the result arrives; under
+# Emscripten, which cannot suspend, it raises RuntimeError rather than
+# spinning forever.
 #
 # Why run: the refusal is a run-time state of the loop, not a static fact.
 import asyncio
@@ -19,6 +21,6 @@ async def hosted() -> int:
 
 print("pure", asyncio.run(pure()))
 try:
-    asyncio.run(hosted())
+    print("hosted", asyncio.run(hosted()))
 except RuntimeError as e:
     print("hosted:", e)
