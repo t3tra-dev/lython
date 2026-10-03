@@ -1100,7 +1100,10 @@ RuntimeBundleLowerer::lowerSourceGeneratorNext(
   RuntimeBundle iteratorState = iterator;
   auto resumeInfo = generatorResumeClones.find(iterator.generatorTarget);
   mlir::FailureOr<SourceGeneratorResumeResult> yieldedOr =
-      resumeInfo != generatorResumeClones.end()
+      iterator.generatorTarget.empty()
+          ? RuntimeBundleLowerer::emitDispatchedGeneratorResume(
+                op.getOperation(), iterator, op.getElement().getType())
+      : resumeInfo != generatorResumeClones.end()
           ? RuntimeBundleLowerer::emitStateMachineGeneratorResume(
                 op.getOperation(), iterator, resumeInfo->second)
           : RuntimeBundleLowerer::emitSourceGeneratorResumeDispatch(
@@ -1274,16 +1277,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorAdvance(
     return op.emitError() << "source generator resume expects one result";
 
   auto sendResumeInfo = generatorResumeClones.find(receiver.generatorTarget);
-  if (sendResumeInfo != generatorResumeClones.end()) {
+  if (receiver.generatorTarget.empty() ||
+      sendResumeInfo != generatorResumeClones.end()) {
     // The synthesized advance driver raises StopIteration itself, so the
     // unwind originates at a call — the shape the ownership inserter models
     // when it places compensating releases at catch entries (an scf.if that
     // raises after the caller's releases would double-release).
     mlir::FailureOr<SourceGeneratorResumeResult> yieldedOr =
-        RuntimeBundleLowerer::emitStateMachineGeneratorResume(
-            op.getOperation(), receiver, sendResumeInfo->second,
-            /*useCurrentInsertionPoint=*/false, sentI64Evidence,
-            /*raiseWhenExhausted=*/true);
+        receiver.generatorTarget.empty()
+            ? RuntimeBundleLowerer::emitDispatchedGeneratorResume(
+                  op.getOperation(), receiver, op.getResult(0).getType(),
+                  /*raiseWhenExhausted=*/true, sentI64Evidence)
+            : RuntimeBundleLowerer::emitStateMachineGeneratorResume(
+                  op.getOperation(), receiver, sendResumeInfo->second,
+                  /*useCurrentInsertionPoint=*/false, sentI64Evidence,
+                  /*raiseWhenExhausted=*/true);
     if (mlir::failed(yieldedOr))
       return mlir::failure();
     RuntimeBundle result;
@@ -1346,10 +1354,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSourceGeneratorThrow(
                           << exception.contractName()
                           << " has no raise primitive";
 
+  if (receiver.generatorTarget.empty())
+    return RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
+        op, receiver, nullptr, sources);
   auto throwResumeInfo = generatorResumeClones.find(receiver.generatorTarget);
   if (throwResumeInfo != generatorResumeClones.end())
     return RuntimeBundleLowerer::lowerStateMachineGeneratorThrow(
-        op, receiver, throwResumeInfo->second, sources);
+        op, receiver, &throwResumeInfo->second, sources);
 
   // Inline-dispatch generators have straight-line bodies without handlers,
   // so the exception can never be caught inside the body: closing the

@@ -1133,6 +1133,27 @@ private:
     std::string finalizeName;
   };
   llvm::StringMap<GeneratorResumeInfo> generatorResumeClones;
+  // Every generator function, state machine or not: the candidates a resume
+  // by frame dispatches over.
+  llvm::StringSet<> generatorBodies;
+  mlir::LogicalResult
+  appendStoredGeneratorArgumentOperands(mlir::Operation *op,
+                                        GeneratorResumeInfo &info,
+                                        mlir::Value storage,
+                                        llvm::SmallVectorImpl<mlir::Value> &operands);
+  enum class GeneratorDriverKind : unsigned { Step, Advance, Throw, Close };
+  static mlir::Type generatorYieldType(mlir::Type generator);
+  static bool isGeneratorProtocol(mlir::Type type);
+  mlir::LogicalResult refuseProtocolGeneratorResume(mlir::Operation *op,
+                                                    mlir::Type staticType);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateStoredGeneratorDriver(mlir::Operation *op, GeneratorResumeInfo &info,
+                                   GeneratorDriverKind kind);
+  void copyGeneratorDriverContract(mlir::func::FuncOp from,
+                                   mlir::func::FuncOp to, unsigned dropped);
+  mlir::FailureOr<mlir::func::FuncOp>
+  getOrCreateGeneratorDispatch(mlir::Operation *op, mlir::Type elementType,
+                               GeneratorDriverKind kind);
   // Why the state machine DECLINED a generator, keyed by the source function.
   // The tier below refuses for its own reason, which is never the reason the
   // program landed there -- see the note at `declineStateMachineGenerator`.
@@ -1273,13 +1294,17 @@ private:
       GeneratorResumeInfo &info, bool useCurrentInsertionPoint = false,
       std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence = std::nullopt,
       bool raiseWhenExhausted = false);
+  mlir::FailureOr<SourceGeneratorResumeResult> emitDispatchedGeneratorResume(
+      mlir::Operation *op, const RuntimeBundle &iterator, mlir::Type elementType,
+      bool raiseWhenExhausted = false,
+      std::optional<RuntimePrimitiveI64Evidence> sentI64Evidence = std::nullopt);
   mlir::LogicalResult
   lowerStateMachineGeneratorThrow(py::CallOp op, const RuntimeBundle &receiver,
-                                  GeneratorResumeInfo &info,
+                                  GeneratorResumeInfo *info,
                                   llvm::ArrayRef<const RuntimeBundle *> sources);
   mlir::LogicalResult
   lowerStateMachineGeneratorClose(py::CallOp op, const RuntimeBundle &receiver,
-                                  GeneratorResumeInfo &info);
+                                  GeneratorResumeInfo *info);
   mlir::LogicalResult lowerListRuntimeNext(py::NextOp op,
                                            RuntimeBundle iterator);
   mlir::FailureOr<bool> lowerRuntimeSequenceGetItem(py::GetItemOp op,
