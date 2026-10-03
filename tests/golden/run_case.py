@@ -12,8 +12,9 @@ it to smoke-run examples/ without adding expectation files there.
 (`lyc --js-host`) and runs the loader under NODE (24 or later, for JSPI and
 exnref); --wasmtime WASMTIME builds for wasm32-wasip1 and runs it under
 WASMTIME, the working directory and the case's directory preopened. Both need
-WASI_SDK_PATH to name a wasi-sdk. Each is --aot with a different target and a
-different way to start the program, and checks the same sidecars.
+a wasi-libc lyc can find (a wasi-sdk at WASI_SDK_PATH, /opt/wasi-sdk or
+~/.local/wasi-sdk*). Each is --aot with a different target and a different
+way to start the program, and checks the same sidecars.
 
 --aot builds an executable and runs it instead of JIT-ing, and --release passes
 `--release` to lyc. Both are checked against the SAME sidecars by the SAME code

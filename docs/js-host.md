@@ -85,6 +85,10 @@ Emscripten は使わない (2026-10-04 に外した)。JS との境界は最初�
 `lyc --target wasm32-wasip1 --js-host -o prog.js` は、`js` を持つプログラムを
 作る。出力は `prog.wasm` とローダ `prog.js` (CommonJS) の 2 つ。
 
+- リンクは、lyc がリンクしている LLVM の clang と wasm-ld で行う。LLVM に
+  含まれない wasi-libc と wasm32 の compiler-rt は、wasi-sdk などから探す
+  (`findWASIRuntime`)。`--js-host` なしで `-o prog.wasm` とすれば、同じ
+  プログラムが wasmtime でそのまま動く WASI モジュールになる。
 - ローダは `lython_js.js` (本体はそのまま) と `runtime/js/lython_wasi.js`
   (WASI preview-1 の shim と起動) から成る。`node prog.js` でも、ブラウザの
   `<script>` でも動くように書いてある (確かめているのは node)。
