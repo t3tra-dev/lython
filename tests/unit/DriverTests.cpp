@@ -2400,3 +2400,34 @@ TEST(DriverTest, AWASIProgramWithAJsHostImportsLythonJs) {
   EXPECT_EQ(dispatch->getFnAttribute("wasm-export-name").getValueAsString(),
             "LyJs_Dispatch");
 }
+
+// What: a wasm module raises through `_Unwind_RaiseException` and carries its
+// own definition of it -- one `throw` under the `__cpp_exception` tag, which
+// the module's assembly defines -- so a WASI program links against a
+// wasi-libc that ships no libunwind.
+TEST(DriverTest, AWasmModuleDefinesTheUnwinderItUses) {
+  lython::driver::VerifiedLLVMModule wasm = compileAndLinkFor(
+      "def fail() -> None:\n"
+      "    raise ValueError(\"x\")\n\n\n"
+      "try:\n"
+      "    fail()\n"
+      "except ValueError:\n"
+      "    print(\"caught\")\n",
+      "wasm32-wasip1");
+  ASSERT_TRUE(wasm.llvmModule);
+  llvm::Module &module = *wasm.llvmModule;
+  py::convertLandingPadsToWasmFunclets(module);
+  py::installWasmUnwinder(module);
+  const llvm::Function *raise = module.getFunction("_Unwind_RaiseException");
+  ASSERT_NE(raise, nullptr);
+  EXPECT_FALSE(raise->isDeclaration());
+  std::string assembly;
+  for (const llvm::Module::GlobalAsmFragment &fragment :
+       module.getModuleInlineAsm())
+    assembly += fragment.Asm;
+  EXPECT_NE(assembly.find(".tagtype\t__cpp_exception i32"), std::string::npos)
+      << assembly;
+  std::string broken;
+  llvm::raw_string_ostream brokenStream(broken);
+  EXPECT_FALSE(llvm::verifyModule(module, &brokenStream)) << broken;
+}

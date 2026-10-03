@@ -1119,13 +1119,66 @@ void convertLandingPadToCatchAll(llvm::LandingPadInst *pad,
 // rules (no nesting, a "funclet" bundle on every call inside one) bind nothing
 // but the instructions written here.
 //
-// `resume` becomes a fresh `throw` of the same carrier. wasi-sdk's libunwind
-// raises the same way (`_Unwind_RaiseException` is `__builtin_wasm_throw(0,
-// carrier)`), so the raise side needs no change at all.
+// `resume` becomes a fresh `throw` of the same carrier, as the raise itself
+// is (installWasmUnwinder below).
 //
 // ⛔ Run LAST, after the LLVM optimization pipeline: every pass of this
 // compiler before it reads the landingpad shape, and that shape is the one the
 // native targets are tested in.
+// ⭐ THE PART OF LIBUNWIND A WASM PROGRAM USES, AND NO MORE. On WebAssembly
+// the engine unwinds: `_Unwind_RaiseException` is one `throw` of the carrier
+// under the tag `__cpp_exception`, and `_Unwind_DeleteException` calls the
+// carrier's cleanup. Those three are every libunwind symbol a program here
+// reaches -- the pads are catch-alls, so no personality routine is ever
+// called -- and defining them here is what lets a WASI program link against a
+// wasi-libc that ships no libunwind (Homebrew's wasi-libc and wasi-runtimes),
+// with the LLVM lyc is linked against and nothing of wasi-sdk.
+//
+// ⛔ Defined only where the module declares them, so a program that never
+// raises carries none; the tag always, since a `catch` names it too.
+void installWasmUnwinder(llvm::Module &module) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Triple triple(module.getTargetTriple());
+  module.appendModuleInlineAsm(
+      (llvm::Twine("\t.tagtype\t__cpp_exception ") +
+       (triple.isArch64Bit() ? "i64" : "i32") +
+       "\n\t.globl\t__cpp_exception\n__cpp_exception:\n")
+          .str());
+  if (llvm::Function *raise = module.getFunction("_Unwind_RaiseException");
+      raise && raise->isDeclaration() && raise->arg_size() == 1) {
+    llvm::IRBuilder<> builder(
+        llvm::BasicBlock::Create(context, "entry", raise));
+    builder.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                           &module, llvm::Intrinsic::wasm_throw),
+                       {builder.getInt32(0), raise->getArg(0)});
+    builder.CreateUnreachable();
+  }
+  // struct _Unwind_Exception { uint64_t class; void (*cleanup)(int, struct
+  // _Unwind_Exception *); ... }: the cleanup sits after the 8-byte class.
+  if (llvm::Function *remove = module.getFunction("_Unwind_DeleteException");
+      remove && remove->isDeclaration() && remove->arg_size() == 1) {
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", remove);
+    llvm::BasicBlock *call = llvm::BasicBlock::Create(context, "call", remove);
+    llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", remove);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *exception = remove->getArg(0);
+    llvm::Type *ptr = builder.getPtrTy();
+    llvm::Value *slot = builder.CreateConstInBoundsGEP1_64(
+        builder.getInt8Ty(), exception, 8);
+    llvm::Value *cleanup = builder.CreateLoad(ptr, slot);
+    builder.CreateCondBr(builder.CreateIsNull(cleanup), done, call);
+    builder.SetInsertPoint(call);
+    builder.CreateCall(
+        llvm::FunctionType::get(builder.getVoidTy(),
+                                {builder.getInt32Ty(), ptr}, false),
+        cleanup, {builder.getInt32(1), exception});
+    builder.CreateBr(done);
+    builder.SetInsertPoint(done);
+    builder.CreateRetVoid();
+  }
+}
+
 bool convertLandingPadsToWasmFunclets(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
   llvm::Function *getException = llvm::Intrinsic::getOrInsertDeclaration(

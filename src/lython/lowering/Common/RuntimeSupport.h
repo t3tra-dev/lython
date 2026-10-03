@@ -130,6 +130,7 @@ void installJsHostEntryPoints(llvm::Module &module,
 // resume as a throw of the same carrier, for a target whose pads are funclets
 // (UnwindABI.h). The last step before codegen.
 bool convertLandingPadsToWasmFunclets(llvm::Module &module);
+void installWasmUnwinder(llvm::Module &module);
 // Makes every frame walkable from x29, which is what lets a raise read the
 // image's compact unwind table instead of its DWARF.
 void forceFramePointers(llvm::Module &module);
