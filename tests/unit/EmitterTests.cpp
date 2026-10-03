@@ -2298,3 +2298,21 @@ TEST(EmitterTest, AParameterShadowsAModuleOfItsName) {
       {});
   EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
 }
+
+// What: a module-level `if sys.platform == ...` branch for another platform
+// imports nothing, so a module may import `js` where there is a host and
+// still compile where there is none.
+TEST(EmitterTest, ABranchForAnotherPlatformImportsNothing) {
+  ImportedModuleEmit emitted = emitWithImportedModule(
+      "hosted",
+      "import sys\n\n"
+      "if sys.platform == \"emscripten\":\n"
+      "    import js\n\n"
+      "    def where() -> str:\n"
+      "        return \"host\"\n"
+      "else:\n\n"
+      "    def where() -> str:\n"
+      "        return \"native\"\n",
+      "import hosted\nprint(hosted.where())\n");
+  EXPECT_TRUE(emitted.succeeded) << emitted.diagnostics;
+}
