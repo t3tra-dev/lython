@@ -1,3 +1,5 @@
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
@@ -2268,4 +2270,54 @@ TEST(DriverTest, AnUntabledCtypesSymbolsAddressLinksOnWasi) {
   EXPECT_TRUE(cos->getReturnType()->isDoubleTy());
   EXPECT_TRUE(
       cos->hasFnAttribute(py::runtime_library::kCtypesForeignSymbolAttr));
+}
+
+// Compiles `mainSource` to LLVM IR with `modules` (name -> source) written
+// beside it, where its imports find them.
+static CompileResult compileWithModules(
+    llvm::ArrayRef<std::pair<llvm::StringRef, llvm::StringRef>> modules,
+    llvm::StringRef mainSource) {
+  CompileResult result;
+  llvm::SmallString<128> dir;
+  if (llvm::sys::fs::createUniqueDirectory("lython-driver-import", dir)) {
+    result.diagnostics = "could not create a temporary import directory";
+    return result;
+  }
+  for (auto [name, source] : modules) {
+    llvm::SmallString<128> path(dir);
+    llvm::sys::path::append(path, llvm::Twine(name) + ".py");
+    std::error_code error;
+    llvm::raw_fd_ostream out(path, error);
+    out << source;
+  }
+  llvm::SmallString<128> mainPath(dir);
+  llvm::sys::path::append(mainPath, "main.py");
+  mlir::MLIRContext context(testRegistry());
+  llvm::raw_string_ostream diag(result.diagnostics);
+  mlir::ScopedDiagnosticHandler capture(&context,
+                                        [&](mlir::Diagnostic &diagnostic) {
+                                          diag << diagnostic.str() << "\n";
+                                          return mlir::failure();
+                                        });
+  result.succeeded =
+      mlir::succeeded(lython::driver::compilePythonSourceToLLVMIR(
+          mainSource, mainPath, dir, lython::driver::DriverOptions{}, context,
+          result.verified, diag));
+  llvm::sys::fs::remove_directories(dir);
+  return result;
+}
+
+// What: a function of an imported module that returns a class its module
+// imports is typed, at the call, with that class -- not with a contract
+// spelled from the bare name, whose fields nothing declares.
+TEST(DriverTest, AnImportedFunctionReturnsTheClassItsModuleImports) {
+  CompileResult result =
+      compileWithModules({{"things", "class Thing:\n"
+                                     "    def __init__(self, n: int) -> None:\n"
+                                     "        self.n = n\n"},
+                          {"maker", "from things import Thing\n\n\n"
+                                    "def make(n: int) -> Thing:\n"
+                                    "    return Thing(n)\n"}},
+                         "import maker\nprint(maker.make(3).n)\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }

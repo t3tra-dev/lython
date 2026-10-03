@@ -10,6 +10,7 @@
 #include "JsHost.h"
 #include "PyProtocols.h"
 
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 #include <optional>
@@ -556,8 +557,8 @@ bool ModuleEmitter::bindSourceModuleNamespace(llvm::StringRef module,
       types.bindCanonicalSymbol(local, canonical, moduleGlobals[canonical]);
       continue;
     }
-    FunctionSignature sig = sourceModuleFunctionSignature(
-        types, module, *body, *statement, source->isStub);
+    FunctionSignature sig =
+        importedFunctionSignature(*source, *body, *statement);
     types.bindCanonicalSymbol(local, canonical, sig.publicCallable);
     continue;
   }
@@ -896,8 +897,8 @@ bool ModuleEmitter::bindSourceModuleName(llvm::StringRef module,
       types.bindCanonicalSymbol(localName, canonical, moduleGlobals[canonical]);
       return true;
     }
-    FunctionSignature sig = sourceModuleFunctionSignature(
-        types, module, *body, *statement, source->isStub);
+    FunctionSignature sig =
+        importedFunctionSignature(*source, *body, *statement);
     types.bindCanonicalSymbol(localName, canonical, sig.publicCallable);
     return true;
   }
@@ -2380,6 +2381,33 @@ Value ModuleEmitter::adaptJsHostResult(const parser::Node &anchor,
                             [&] { return emitArm(index + 1); });
   };
   return Value{emitArm(0), declared.type};
+}
+
+// An imported function's signature as its importer sees it: read in the
+// module's OWN scope -- its classes and the names it imports -- which is the
+// scope its definition is emitted in.
+//
+// ⛔ Not the classes alone, which is what it was: `def make() -> Thing` in a
+// module that imports Thing typed the call as returning `builtins.Thing`, a
+// contract nothing declares, while the definition said `b.Thing` -- so
+// `a.make(3).n` read a field of nothing ("attr.get object type has no class
+// schema").
+//
+// ⛔ A module already being read here falls back to the classes alone: two
+// modules that import each other would otherwise read each other forever.
+FunctionSignature ModuleEmitter::importedFunctionSignature(
+    const EmitOptions::SourceModule &source,
+    const std::vector<parser::NodePtr> &body, const parser::Node &function) {
+  if (!importedSignatureScopes.insert(source.moduleName).second)
+    return sourceModuleFunctionSignature(types, source.moduleName, body,
+                                         function, source.isStub);
+  auto done = llvm::make_scope_exit(
+      [&] { importedSignatureScopes.erase(source.moduleName); });
+  TypeSystem::ScopeIsolation isolation = types.isolateScopes();
+  auto moduleScope = types.pushScope();
+  bindModuleImportScope(*source.moduleNode, /*diagnoseUnsupported=*/false);
+  return sourceModuleFunctionSignature(types, source.moduleName, body, function,
+                                       source.isStub);
 }
 
 } // namespace lython::emitter

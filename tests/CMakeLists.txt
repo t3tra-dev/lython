@@ -234,7 +234,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWasiProgramIsRefusedOnlyWhereItReachesWhatWasiLacks"
     "DriverTest.APythonFunctionIsNotAnExternalSymbol"
     "DriverTest.ACtypesLibraryOtherThanTheProgramIsRefused"
-    "DriverTest.AnUntabledCtypesSymbolsAddressLinksOnWasi")
+    "DriverTest.AnUntabledCtypesSymbolsAddressLinksOnWasi"
+    "DriverTest.AnImportedFunctionReturnsTheClassItsModuleImports")
 
 set(LYTHON_UNIT_LABELS_parse  "parse;unit;fast")
 set(LYTHON_UNIT_LABELS_emit   "emit;unit;fast")

@@ -62,6 +62,11 @@ private:
   void predeclareTopLevel();
   void predeclareSourceModules();
   void declareJsHostModule();
+  FunctionSignature
+  importedFunctionSignature(const EmitOptions::SourceModule &source,
+                            const std::vector<parser::NodePtr> &body,
+                            const parser::Node &function);
+  llvm::StringSet<> importedSignatureScopes;
   // A value of one of the host's `js` contracts (EmitterImports.cpp).
   bool isJsHostValueType(mlir::Type type) const;
   // A host member read or call whose declared type is a union: the host's
