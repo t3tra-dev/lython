@@ -616,7 +616,7 @@ constexpr std::int64_t kObjectAllocatorArenaBytes = 1 << 20;
 // pointer beside the allocated one; the object model later rebuilds a header
 // from that aligned address alone (allocated == aligned) and frees it. That is
 // right only while the two never differ -- while the block was 16-aligned to
-// begin with. Native mallocs promise 16; Emscripten's promises 8, and there
+// begin with. LP64 mallocs promise 16; 32-bit glibc's promises 8, and there
 // every other string freed the interior of its block. So where `malloc` falls
 // short the arenas and large blocks come from `aligned_alloc` instead.
 void buildObjectAllocator(SupportBuilder &b) {
@@ -2733,6 +2733,43 @@ void buildGlobalViewFunction(SupportBuilder &b, llvm::StringRef name,
                                   entry->getArgument(1), b.iconst(1)}));
 }
 
+// A WASI program starts in `/`: wasi-libc keeps the working directory itself
+// and has nothing to start it from. Where the host says where the program
+// runs -- `PWD`, which the JavaScript loader passes -- it moves there, so a
+// relative path names what it does natively. Where that directory is not
+// reachable (wasmtime preopens `.` but not its own working directory) the
+// `chdir` fails and the program stays where it was.
+//
+// ⛔ A select and not a branch: with no PWD it changes to `/`, where it
+// already is, and the entry block stays one block.
+static void enterHostWorkingDirectory(SupportBuilder &b) {
+  // The os support's declarations of the two, which this module shares.
+  b.declareExternal("getenv", b.builder.getFunctionType({b.ptr()}, {b.ptr()}));
+  b.declareExternal("chdir", b.builder.getFunctionType({b.ptr()}, {b.i32()}));
+  auto cString = [&](llvm::StringRef name, llvm::StringRef text) {
+    if (!b.module.lookupSymbol(name)) {
+      mlir::OpBuilder::InsertionGuard guard(b.builder);
+      b.builder.setInsertionPointToEnd(b.module.getBody());
+      std::string bytes = text.str();
+      bytes.push_back('\0');
+      mlir::LLVM::GlobalOp::create(
+          b.builder, b.loc,
+          mlir::LLVM::LLVMArrayType::get(b.builder.getI8Type(), bytes.size()),
+          /*isConstant=*/true, mlir::LLVM::Linkage::Internal, name,
+          b.builder.getStringAttr(bytes));
+    }
+    return b.addrOf(name);
+  };
+  mlir::Value pwd =
+      b.call("getenv", b.ptr(),
+             mlir::ValueRange{cString("__ly_pwd_name", "PWD")})
+          .front();
+  mlir::Value directory = mlir::LLVM::SelectOp::create(
+      b.builder, b.loc, b.ptrEq(pwd, b.nullPtr()),
+      cString("__ly_root_directory", "/"), pwd);
+  b.call("chdir", b.i32(), mlir::ValueRange{directory});
+}
+
 // i32 LyRunPythonMain(ptr entry): installs the stack guard, invokes the
 // program body, and prints the Python traceback (or the native-exception
 // notice) for anything that unwinds out.
@@ -2765,6 +2802,8 @@ void buildRunPythonMain(SupportBuilder &b) {
   mlir::Block *exitWithMessage = b.builder.createBlock(&body);
 
   b.builder.setInsertionPointToEnd(entry);
+  if (b.triple.isOSWASI())
+    enterHostWorkingDirectory(b);
   mlir::LLVM::CallOp::create(b.builder, b.loc, mlir::TypeRange{},
                              "LyRt_InstallStackGuard", mlir::ValueRange{});
   mlir::Value entryNull = b.ptrEq(entry->getArgument(0), b.nullPtr());

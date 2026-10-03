@@ -30,17 +30,17 @@ Deviations from CPython:
     class specialized before its base class is declared misses the base's
     fields, and the loop is declared before the futures it would make.
 
-On a JavaScript host (`sys._js_host`: Emscripten, or WASI with `--js-host`)
+On a JavaScript host (`sys._js_host`: WASI with `--js-host`)
 the loop is also the host's, as Pyodide's WebLoop is: whenever it has work
 and nothing is running it, it asks the host to call it back (`setTimeout`).
 It counts as always running, so `create_task` works at module level and
 those tasks run after the program's main body returns. `await` on a
 JavaScript Promise waits on a Future the promise's settlement resolves; a
 rejection raises RuntimeError("<name>: <message>"), as other JavaScript errors
-do. `run()` blocks: where the host can suspend the program (JSPI, under the
-WASI loader) the loop waits on the host whenever only the host can make
-progress, so it can await promises; elsewhere it raises RuntimeError at that
-point instead of hanging.
+do. `run()` blocks: where the host can suspend the program (JSPI) the loop
+waits on the host whenever only the host can make progress, so it can await
+promises; in a host without JSPI, and inside a callback the host is running,
+it raises RuntimeError at that point instead of hanging.
 """
 
 import sys
@@ -192,7 +192,8 @@ class AbstractEventLoop:
                 return
             raise RuntimeError(
                 "the event loop waits on the JavaScript host, which cannot "
-                "run while the loop blocks it (no JSPI here); schedule the "
+                "run while the loop blocks it (no JSPI here, or inside a host "
+                "callback); schedule the "
                 "coroutine with asyncio.create_task() instead of "
                 "asyncio.run()")
 

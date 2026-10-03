@@ -72,7 +72,7 @@ struct HostTargetLayout {
   llvm::StringRef clockRealtimeGlobal;
 
   // What `malloc` guarantees: alignof(max_align_t). 16 on the LP64 targets;
-  // 8 on Emscripten's dlmalloc (static_asserted) and 32-bit glibc (measured).
+  // 8 on 32-bit glibc (measured).
   int mallocAlignment = 16;
 
   // `struct timespec`'s tv_nsec, a C long after the 64-bit tv_sec, and
@@ -87,9 +87,8 @@ struct HostTargetLayout {
 // non-POSIX target (`posix == false` makes every entry point fail loudly).
 inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
   HostTargetLayout layout;
-  // ILP32, measured on armv7 glibc 2.36 (time64), wasm32 Emscripten and
-  // wasi-libc: the longs are 4 bytes, and malloc keeps to 8 (wasi-libc's to
-  // 16, below).
+  // ILP32, measured on armv7 glibc 2.36 (time64) and wasi-libc: the longs are
+  // 4 bytes, and malloc keeps to 8 (wasi-libc's to 16, below).
   if (triple.isArch32Bit()) {
     layout.mallocAlignment = 8;
     layout.timespecNsec[1] = -4;
@@ -124,9 +123,6 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
     layout.clockMonotonic = 6; // CLOCK_MONOTONIC
     return layout;
   }
-  // Emscripten's musl, measured on wasm64 (offsetof under `emcc -m64`): dev_t
-  // and mode_t are 32-bit and lead the struct, st_ino sits LAST, and errno
-  // follows WASI's numbering rather than Linux's.
   // wasi-libc (wasi-sdk 34), measured under wasmtime: x86_64 Linux's
   // `struct stat`, a dirent whose name follows a u64 inode and a u8 type,
   // a 16-byte malloc, and clockid_t a pointer to `_CLOCK_*`.
@@ -136,38 +132,6 @@ inline HostTargetLayout hostTargetLayout(const llvm::Triple &triple) {
     layout.direntNameOffset = 9;
     layout.clockMonotonicGlobal = "_CLOCK_MONOTONIC";
     layout.clockRealtimeGlobal = "_CLOCK_REALTIME";
-    return layout;
-  }
-  if (triple.isOSEmscripten() && triple.isArch32Bit()) {
-    // wasm32: as wasm64 except that nlink_t is 32-bit, which moves everything
-    // after st_mode up.
-    layout.errnoNumbering = py::exceptions::ErrnoNumbering::WASI;
-    layout.statDev[1] = 4;
-    layout.statMode[0] = 4;
-    layout.statNlink[0] = 8;
-    layout.statNlink[1] = 4;
-    layout.statUid[0] = 12;
-    layout.statGid[0] = 16;
-    layout.statSize[0] = 24;
-    layout.statAtime[0] = 40;
-    layout.statMtime[0] = 56;
-    layout.statCtime[0] = 72;
-    layout.statIno[0] = 88;
-    return layout;
-  }
-  if (triple.isOSEmscripten()) {
-    layout.errnoNumbering = py::exceptions::ErrnoNumbering::WASI;
-    layout.mallocAlignment = 8;
-    layout.statDev[1] = 4;
-    layout.statMode[0] = 4;
-    layout.statNlink[0] = 8;
-    layout.statUid[0] = 16;
-    layout.statGid[0] = 20;
-    layout.statSize[0] = 32;
-    layout.statAtime[0] = 48;
-    layout.statMtime[0] = 64;
-    layout.statCtime[0] = 80;
-    layout.statIno[0] = 96;
     return layout;
   }
   // 32-bit glibc: the `struct stat` `__stat64_time64` fills (LibcPrototypes

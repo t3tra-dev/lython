@@ -21,7 +21,7 @@ Layout notes (mirrors the retired hand-written native modules):
     SA_ONSTACK|SA_SIGINFO = 0x08000004.
   - windows SetUnhandledExceptionFilter; EXCEPTION_STACK_OVERFLOW =
     0xC00000FD (-1073741571 signed).
-  - emscripten and wasi install nothing. WebAssembly has no signals to catch a guard
+  - wasi installs nothing. WebAssembly has no signals to catch a guard
     page with, and linear memory has no guard page to fault on. The link puts
     the stack first in memory (tools/CLI.cpp), so running past its bottom
     wraps below address 0 and traps as an out-of-bounds access instead of
@@ -255,7 +255,7 @@ def LyRt_InstallStackGuard() -> None:
     if g_installed != 0:
         return
     g_installed = 1
-    if sys.platform == "emscripten" or sys.platform == "wasi":
+    if sys.platform == "wasi":
         return
     libc = ctypes.CDLL(None)
 

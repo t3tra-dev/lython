@@ -32,12 +32,12 @@ struct DriverOptions {
   bool releaseMode = false;
   bool auditRuntimeManifest = false;
   // A WASI program linked to run under a JavaScript host (`--js-host`): it
-  // may import `js`, and the host's loader runs it. Emscripten always has one.
+  // may import `js`, and the host's loader runs it.
   bool jsHost = false;
 };
 
-// Whether the program has a JavaScript host on `triple`: every Emscripten
-// target, and WASI when it was asked for.
+// Whether the program has a JavaScript host on `triple`: WASI, when it was
+// asked for.
 bool targetHasJsHost(const llvm::Triple &triple, const DriverOptions &options);
 
 // Registers every dialect, external model, translation interface, and pass

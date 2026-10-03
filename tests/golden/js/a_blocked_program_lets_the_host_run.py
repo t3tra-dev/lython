@@ -1,12 +1,10 @@
-# What: a program that blocks -- `asyncio.run()` awaiting Promises, and
-# `time.sleep` -- lets the host's event loop run while it waits, under JSPI
-# (the WASI loader, .jspi.stdout): the host timer fires during the sleep and
-# the gathered promises settle inside `run`. Emscripten cannot suspend the
-# program, so there the timer fires only after the main body returns and
-# `run` raises at the first Promise.
+# What: `asyncio.run()` blocks the program and still lets the host's event
+# loop run, because the loader suspends it (JSPI) whenever the loop waits:
+# the gathered promises settle inside `run`, and a host timer set before it
+# fires during its waits. `time.sleep` does not suspend -- it blocks the host
+# like a sleep on its thread -- so the timer has not fired by "slept".
 #
-# Why run: what fires when, and whether the program could wait at all, is
-# the host's run-time behaviour.
+# Why run: what fires when is the host's run-time behaviour.
 import asyncio
 import time
 from js import Promise, setTimeout

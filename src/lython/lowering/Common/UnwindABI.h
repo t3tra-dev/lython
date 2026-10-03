@@ -98,20 +98,12 @@ inline EHDataRegisters ehDataRegisters(const llvm::Triple &triple) {
 // unwinder walking frames: an exception is an instruction the engine unwinds
 // (`throw` / `catch`), and LLVM reaches it only through `catchswitch` /
 // `catchpad`, never a `landingpad`. The raise is the same on both shapes --
-// Emscripten's libunwind spells `_Unwind_RaiseException` as a wasm `throw` of
+// wasi-sdk's libunwind spells `_Unwind_RaiseException` as a wasm `throw` of
 // the carrier -- so everything this compiler builds stays landingpad-shaped
 // and `convertLandingPadsToWasmFunclets` (Passes/Runtime/Cleanup/EH.cpp)
 // rewrites the pads as the last step before codegen.
 inline bool padsAreFunclets(const llvm::Triple &triple) {
   return triple.isWasm();
-}
-
-// Which encoding of wasm exceptions the module uses. Emscripten links its
-// libunwind built for the legacy one (try/catch/delegate) unless told
-// otherwise; wasmtime runs only the standard one (try_table/exnref), and
-// wasi-sdk's libunwind is built for that.
-inline bool useLegacyWasmExceptions(const llvm::Triple &triple) {
-  return triple.isOSEmscripten();
 }
 
 inline constexpr llvm::StringRef kWasmPersonalityName =

@@ -216,10 +216,11 @@ std::string codeGenFeaturesForTarget(py::TensorLoweringTarget target,
 // as from TargetOptions, and refuses `ExceptionModel == Wasm` unless
 // `-wasm-enable-eh` is set too ("-exception-model=wasm only allowed with at
 // least one of -wasm-enable-eh or -wasm-enable-sjlj"); the encoding is
-// `-wasm-use-legacy-eh`. Both are process-wide and only reach the WebAssembly
-// backend, so they are set for the target each time one of its machines is
-// made.
-static void enableWasmExceptionsInBackend(const llvm::Triple &triple) {
+// `-wasm-use-legacy-eh`, off: wasmtime and node run the standard one
+// (try_table/exnref), and wasi-sdk's libunwind is built for it. Both are
+// process-wide and only reach the WebAssembly backend, so they are set each
+// time one of its machines is made.
+static void enableWasmExceptionsInBackend() {
   auto &registered = llvm::cl::getRegisteredOptions();
   auto set = [&](llvm::StringRef name, bool value) {
     auto found = registered.find(name);
@@ -227,8 +228,7 @@ static void enableWasmExceptionsInBackend(const llvm::Triple &triple) {
       static_cast<llvm::cl::opt<bool> *>(found->second)->setValue(value);
   };
   set("wasm-enable-eh", true);
-  set("wasm-use-legacy-eh",
-      py::runtime_library::useLegacyWasmExceptions(triple));
+  set("wasm-use-legacy-eh", false);
 }
 
 llvm::ExceptionHandling
@@ -299,7 +299,7 @@ createCodeGenTargetMachine(py::TensorLoweringTarget target,
   llvm::TargetOptions opt;
   applyExceptionUnwindOptions(opt, triple);
   if (opt.ExceptionModel == llvm::ExceptionHandling::Wasm)
-    enableWasmExceptionsInBackend(triple);
+    enableWasmExceptionsInBackend();
   if (!parseConfiguredFloatABI(opt.FloatABIType, options, diag))
     return nullptr;
   std::unique_ptr<llvm::TargetMachine> targetMachine(

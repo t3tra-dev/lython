@@ -100,9 +100,10 @@ module attributes {
   func.func private @LyJs_MakeFunction(i32) -> i32
   func.func private @LyJs_CurrentSlot() -> i32
   func.func private @LyJs_SetCallbackError()
-  // Suspends the program until the host has called it back or `ms` have
-  // passed (negative: no limit), and says whether it did suspend: 0 where it
-  // cannot -- no JSPI, or inside a callback the host is running.
+  // Whether the program can be suspended here (JSPI, and not inside a
+  // callback the host is running); then suspends it until the host has
+  // called it back or `ms` have passed (negative: no limit).
+  func.func private @LyJs_CanWaitForHost() -> i32
   func.func private @LyJs_WaitForHost(f64) -> i32
 
   // ===== from builtins =====
@@ -426,10 +427,18 @@ module attributes {
   }
 
   func.func @LyJs_WaitForHostBuiltin(%timeout_ms: i64) -> i1 attributes {ly.runtime.builtin = "_js.wait_for_host", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "wait_for_host", ly.runtime.result_contract = "builtins.bool"} {
-    %ms = arith.sitofp %timeout_ms : i64 to f64
-    %waited = func.call @LyJs_WaitForHost(%ms) : (f64) -> i32
     %zero = arith.constant 0 : i32
-    %did = arith.cmpi ne, %waited, %zero : i32
+    %can = func.call @LyJs_CanWaitForHost() : () -> i32
+    %able = arith.cmpi ne, %can, %zero : i32
+    %did = scf.if %able -> (i1) {
+      %ms = arith.sitofp %timeout_ms : i64 to f64
+      %waited = func.call @LyJs_WaitForHost(%ms) : (f64) -> i32
+      %woke = arith.cmpi ne, %waited, %zero : i32
+      scf.yield %woke : i1
+    } else {
+      %false = arith.constant false
+      scf.yield %false : i1
+    }
     func.return %did : i1
   }
 

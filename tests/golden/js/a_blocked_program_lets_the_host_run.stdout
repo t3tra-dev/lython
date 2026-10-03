@@ -1,6 +1,6 @@
-host timer
 slept
 first 1
+host timer
 [30, 10, 20]
 total 60
 main body done

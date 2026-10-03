@@ -31,8 +31,8 @@ if(LYTHON_CLANG_FOR_RESOURCE_DIR)
     )
 endif()
 
-# The JavaScript host's half of `js` (runtime/js/lython_js.js), handed to emcc
-# with every program that imports it.
+# The JavaScript host's half of `js` (runtime/js/lython_js.js), at the head of
+# the loader `--js-host` writes.
 set(LYTHON_JS_CORE_SOURCE "${CMAKE_SOURCE_DIR}/src/lython/runtime/js/lython_js.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${LYTHON_JS_CORE_SOURCE}")
