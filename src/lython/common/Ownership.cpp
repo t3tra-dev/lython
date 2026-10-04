@@ -633,6 +633,62 @@ static bool isInteriorWordCall(mlir::Operation *op,
   return callee && callee->hasAttr(contracts::kManifestInteriorWordAttr);
 }
 
+llvm::SmallVector<unsigned, 32> numberStronglyConnectedComponents(
+    unsigned count,
+    llvm::function_ref<void(unsigned, llvm::SmallVectorImpl<unsigned> &)>
+        successors) {
+  constexpr unsigned unvisited = ~0u;
+  llvm::SmallVector<unsigned, 32> component(count, unvisited);
+  llvm::SmallVector<unsigned, 32> order(count, unvisited), low(count, 0);
+  llvm::SmallVector<unsigned, 32> stack;
+  llvm::BitVector onStack(count);
+  unsigned next = 0, components = 0;
+  struct Frame {
+    unsigned at;
+    llvm::SmallVector<unsigned, 4> successors;
+    unsigned next = 0;
+  };
+  for (unsigned root = 0; root < count; ++root) {
+    if (order[root] != unvisited)
+      continue;
+    llvm::SmallVector<Frame, 32> frames;
+    auto open = [&](unsigned at) {
+      order[at] = low[at] = next++;
+      stack.push_back(at);
+      onStack.set(at);
+      frames.push_back({at, {}});
+      successors(at, frames.back().successors);
+    };
+    open(root);
+    while (!frames.empty()) {
+      Frame &frame = frames.back();
+      if (frame.next < frame.successors.size()) {
+        unsigned successor = frame.successors[frame.next++];
+        if (order[successor] == unvisited)
+          open(successor);
+        else if (onStack.test(successor))
+          low[frame.at] = std::min(low[frame.at], order[successor]);
+        continue;
+      }
+      unsigned at = frame.at;
+      frames.pop_back();
+      if (!frames.empty())
+        low[frames.back().at] = std::min(low[frames.back().at], low[at]);
+      if (low[at] != order[at])
+        continue;
+      while (true) {
+        unsigned member = stack.pop_back_val();
+        onStack.reset(member);
+        component[member] = components;
+        if (member == at)
+          break;
+      }
+      ++components;
+    }
+  }
+  return component;
+}
+
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
                                 llvm::SmallVectorImpl<mlir::Value> &views,
                                 FuncContractCache *contracts) {
