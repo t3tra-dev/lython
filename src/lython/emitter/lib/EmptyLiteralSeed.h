@@ -8,6 +8,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <vector>
 
@@ -19,6 +20,17 @@ namespace lython::emitter {
 struct SuiteCursor {
   const std::vector<parser::NodePtr> *suite = nullptr;
   std::size_t from = 0;
+  // One past the last statement the scan reads; the whole rest by default.
+  std::size_t to = static_cast<std::size_t>(-1);
+  // Which statements of [from, to) the scan reads, by index; all when empty.
+  std::vector<bool> keep;
+
+  std::size_t end() const {
+    return suite ? std::min(to, suite->size()) : 0;
+  }
+  bool keeps(std::size_t index) const {
+    return keep.empty() || (index < keep.size() && keep[index]);
+  }
 };
 
 // The element type an empty container literal bound to `name` takes from the

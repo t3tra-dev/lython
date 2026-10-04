@@ -128,6 +128,16 @@ struct YieldFromInferenceResult {
   }
 };
 
+// The names one statement spells and the names it binds, anywhere inside it:
+// what the empty-literal seed scan reads to find the last statement that can
+// matter to it (EmptyLiteralSeed.cpp). `node` is the statement it was read
+// from, compared on every use.
+struct StatementNames {
+  const parser::Node *node = nullptr;
+  llvm::StringSet<> mentioned;
+  llvm::StringSet<> stored;
+};
+
 class TypeSystem {
 public:
   class Scope {
@@ -456,6 +466,10 @@ public:
                     mlir::Type selfType = {}, bool monomorphize = false) const;
   void refreshCallable(FunctionSignature &sig) const;
 
+  // Each statement of `suite`, read once per suite.
+  const std::vector<StatementNames> &
+  statementNamesOf(const std::vector<parser::NodePtr> &suite) const;
+
 private:
   mlir::Type inferExprImpl(const parser::Node *node,
                            const ExprInferenceContext *ctx) const;
@@ -476,6 +490,9 @@ private:
   // body right now. A cycle -- direct or mutual recursion -- takes the
   // annotation and stops, which is what the annotation is for.
   mutable llvm::DenseSet<const parser::Node *> returnRungWalks;
+  mutable llvm::DenseMap<const std::vector<parser::NodePtr> *,
+                         std::vector<StatementNames>>
+      suiteStatementNames;
   // ⭐ A DECORATOR IS A CALL THE SOURCE DOES NOT SPELL. `@d def f` is
   // `f = d(f)`, and the parameter fixpoint below reads its constraints off
   // CALL NODES -- so `def d(fn)` with no annotation was refused under the
