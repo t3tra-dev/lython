@@ -617,35 +617,40 @@ RuntimeBundleLowerer::runtimeClassIdForClass(py::ClassOp classOp) const {
           classOp->getAttrOfType<mlir::IntegerAttr>(kManifestClassIdAttr))
     return attr.getValue().getSExtValue();
 
-  constexpr std::int64_t kSourceClassIdBase = 1LL << 32;
-  mlir::ModuleOp mutableModule =
-      const_cast<RuntimeBundleLowerer *>(this)->module;
-  std::optional<std::int64_t> result;
-  std::int64_t ordinal = 0;
-  mutableModule.walk([&](py::ClassOp current) {
-    if (result)
-      return;
-    bool hasDeclaredRuntimeId = current->getAttrOfType<mlir::IntegerAttr>(
-                                    kManifestClassIdAttr) != nullptr;
-    // Same question as above, asked while NUMBERING: a source class never
-    // counts as having a manifest id, or the ordinals would shift under it.
-    if (!current->hasAttr("ly.class.source"))
-      for (const std::string &candidate :
-           classContractCandidates(current.getSymName())) {
-        if (manifest.classId(candidate)) {
-          hasDeclaredRuntimeId = true;
-          break;
+  // Numbered once, by the same walk in the same order: no class op is made
+  // or erased, and no class's id attribute or source mark changes, while the
+  // lowering runs (the class ops are erased after it).
+  // ⛔ Not walked per question: the walk visits every operation in the
+  // module, and the question is asked for every instance a program makes.
+  if (!sourceClassIds) {
+    constexpr std::int64_t kSourceClassIdBase = 1LL << 32;
+    sourceClassIds.emplace();
+    mlir::ModuleOp mutableModule =
+        const_cast<RuntimeBundleLowerer *>(this)->module;
+    std::int64_t ordinal = 0;
+    mutableModule.walk([&](py::ClassOp current) {
+      bool hasDeclaredRuntimeId = current->getAttrOfType<mlir::IntegerAttr>(
+                                      kManifestClassIdAttr) != nullptr;
+      // Same question as above, asked while NUMBERING: a source class never
+      // counts as having a manifest id, or the ordinals would shift under it.
+      if (!current->hasAttr("ly.class.source"))
+        for (const std::string &candidate :
+             classContractCandidates(current.getSymName())) {
+          if (manifest.classId(candidate)) {
+            hasDeclaredRuntimeId = true;
+            break;
+          }
         }
-      }
-
-    if (current.getOperation() == classOp.getOperation()) {
-      result = kSourceClassIdBase + ordinal;
-      return;
-    }
-    if (!hasDeclaredRuntimeId)
-      ++ordinal;
-  });
-  return result;
+      sourceClassIds->try_emplace(current.getOperation(),
+                                  kSourceClassIdBase + ordinal);
+      if (!hasDeclaredRuntimeId)
+        ++ordinal;
+    });
+  }
+  auto found = sourceClassIds->find(classOp.getOperation());
+  if (found == sourceClassIds->end())
+    return std::nullopt;
+  return found->second;
 }
 
 std::optional<std::int64_t>

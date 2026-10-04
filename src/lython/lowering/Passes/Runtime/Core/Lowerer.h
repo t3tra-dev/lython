@@ -1894,6 +1894,16 @@ private:
       settledDeallocators;
   // findRetainFunction's answer once it has one.
   mutable mlir::func::FuncOp retainFunctionMemo;
+  // The ids runtimeClassIdForClass numbers source classes with, by class op;
+  // built on the first question.
+  mutable std::optional<llvm::DenseMap<mlir::Operation *, std::int64_t>>
+      sourceClassIds;
+  // The module's class ops by name, for classForContract; built on the first
+  // question.
+  mutable std::optional<llvm::StringMap<py::ClassOp>> classesByName;
+  // collectIndirectCallableTargets' assignability answers, by (candidate's
+  // callable type, the call's expected one).
+  llvm::DenseMap<std::pair<mlir::Type, mlir::Type>, bool> callableAssignable;
   llvm::SmallVector<CallableLogicalEntryArgs, 8> callableLogicalEntryArgCounts;
   // Insertion-ordered: the drop/erase passes below walk it, and both a
   // membership test and a stable order are needed. Two containers held this
