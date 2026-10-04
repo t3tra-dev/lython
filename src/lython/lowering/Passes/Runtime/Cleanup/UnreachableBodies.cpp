@@ -46,12 +46,15 @@ unsigned stripUnreachableManifestBodies(mlir::ModuleOp module) {
         reachable.insert(function.getOperation()).second)
       pending.push_back(function);
 
+  // ⛔ Not `module.lookupSymbol`: that scans the module per name, and this
+  // asks for every symbol every reachable body names.
+  mlir::SymbolTable symbols(module);
   while (!pending.empty()) {
     mlir::func::FuncOp current = pending.pop_back_val();
     llvm::StringSet<> named;
     collectSymbolUses(current.getOperation(), named);
     for (const auto &entry : named) {
-      auto callee = module.lookupSymbol<mlir::func::FuncOp>(entry.getKey());
+      auto callee = symbols.lookup<mlir::func::FuncOp>(entry.getKey());
       if (callee && reachable.insert(callee.getOperation()).second)
         pending.push_back(callee);
     }

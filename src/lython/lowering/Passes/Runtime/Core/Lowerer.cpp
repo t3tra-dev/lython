@@ -31,6 +31,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(synthesizeSourceClassDeallocators()))
     return mlir::failure();
+  // Nothing after this makes a deallocator, so the py-op lowering reads one
+  // list instead of walking the module for every slot it releases.
+  settledDeallocators = ownership::collectRuntimeDeallocators(module);
   if (mlir::failed(synthesizeUserExceptionHooks()))
     return mlir::failure();
   if (mlir::failed(synthesizeSourceClassNameHook()))

@@ -62,23 +62,164 @@ void preBindSuiteConstants(const TypeSystem &types, const SuiteCursor &cursor) {
             recurse(*child, recurse);
     }
   };
-  for (std::size_t index = cursor.from; index < cursor.suite->size(); ++index)
-    if ((*cursor.suite)[index])
+  for (std::size_t index = cursor.from; index < cursor.end(); ++index)
+    if (cursor.keeps(index) && (*cursor.suite)[index])
       walk(*(*cursor.suite)[index], walk);
+}
+
+void collectStatementNames(const parser::Node &node, StatementNames &names) {
+  if (node.kind == "Name") {
+    llvm::StringRef spelling = ast::nameSpelling(node);
+    names.mentioned.insert(spelling);
+    if (const parser::Node *context = ast::node(node, "ctx");
+        context && context->kind == "Store")
+      names.stored.insert(spelling);
+  } else if (node.kind == "Attribute") {
+    if (std::optional<std::string_view> attr = ast::string(node, "attr"))
+      names.mentioned.insert(*attr);
+  } else if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+             node.kind == "ClassDef" || node.kind == "ExceptHandler") {
+    // A binding the AST spells as a string rather than a Name.
+    if (std::optional<std::string_view> bound = ast::string(node, "name"))
+      names.stored.insert(*bound);
+  } else if (node.kind == "alias") {
+    std::optional<std::string_view> bound = ast::string(node, "asname");
+    if (!bound)
+      bound = ast::string(node, "name");
+    if (bound)
+      names.stored.insert(llvm::StringRef(*bound).split('.').first);
+  }
+  for (const parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+      if (*child)
+        collectStatementNames(**child, names);
+      continue;
+    }
+    if (const auto *children =
+            std::get_if<std::vector<parser::NodePtr>>(&field.value))
+      for (const parser::NodePtr &child : *children)
+        if (child)
+          collectStatementNames(*child, names);
+  }
+}
+
+// The statements of the cursors that can matter to a scan for `name`, as a
+// mask on each cursor. One RELEVANT to it spells it, or spells a name bound by
+// a statement that does -- the locals `derivedFromName` and `subscriptAliases`
+// follow, through which a later statement may fill the container without
+// spelling it. One it NEEDS binds a name a kept statement reads, read
+// backwards from the last relevant one. Nothing else seeds anything or leaves
+// a binding a seed reads.
+//
+// ⛔ Every scan read every statement in its cursors. A module of N statements
+// with M empty literals cost N x M tree walks -- 39 s of a 64-case golden
+// batch -- and a module global is scanned from the module's FIRST statement,
+// so cutting only the tail left the head of every scan in place.
+llvm::SmallVector<SuiteCursor, 4>
+slicedCursors(const TypeSystem &types, llvm::StringRef name,
+              llvm::ArrayRef<SuiteCursor> suites) {
+  llvm::SmallVector<SuiteCursor, 4> sliced(suites.begin(), suites.end());
+  struct Position {
+    std::size_t cursor;
+    std::size_t index;
+    const StatementNames *names;
+  };
+  // The statements in the order the scan reads them: innermost cursor first.
+  llvm::SmallVector<Position, 64> order;
+  for (auto [position, cursor] : llvm::enumerate(sliced)) {
+    if (!cursor.suite)
+      continue;
+    const std::vector<StatementNames> &statements =
+        types.statementNamesOf(*cursor.suite);
+    for (std::size_t index = cursor.from; index < cursor.end(); ++index)
+      order.push_back({position, index, &statements[index]});
+  }
+  auto meets = [](const llvm::StringSet<> &names,
+                  const llvm::StringSet<> &wanted) {
+    const llvm::StringSet<> &small = names.size() < wanted.size() ? names : wanted;
+    const llvm::StringSet<> &large = &small == &names ? wanted : names;
+    for (const auto &entry : small)
+      if (large.contains(entry.getKey()))
+        return true;
+    return false;
+  };
+  // Relevant: forwards, to a fixpoint; four rounds, then the whole sequence.
+  llvm::StringSet<> relevantNames;
+  relevantNames.insert(name);
+  std::vector<bool> relevant(order.size(), false);
+  bool converged = false;
+  for (unsigned round = 0; round < 4 && !converged; ++round) {
+    std::size_t before = relevantNames.size();
+    for (auto [at, position] : llvm::enumerate(order)) {
+      if (!meets(position.names->mentioned, relevantNames))
+        continue;
+      relevant[at] = true;
+      for (const auto &stored : position.names->stored)
+        relevantNames.insert(stored.getKey());
+    }
+    converged = relevantNames.size() == before;
+  }
+  if (!converged)
+    return llvm::SmallVector<SuiteCursor, 4>(suites.begin(), suites.end());
+  // Needed: backwards from the last relevant statement.
+  std::vector<bool> kept(order.size(), false);
+  llvm::StringSet<> needed;
+  for (std::size_t at = order.size(); at-- > 0;) {
+    const StatementNames &names = *order[at].names;
+    if (!relevant[at] && !meets(names.stored, needed))
+      continue;
+    kept[at] = true;
+    for (const auto &mentioned : names.mentioned)
+      needed.insert(mentioned.getKey());
+  }
+  for (SuiteCursor &cursor : sliced) {
+    cursor.keep.assign(cursor.suite ? cursor.suite->size() : 0, false);
+    cursor.to = cursor.from;
+  }
+  for (auto [at, position] : llvm::enumerate(order)) {
+    if (!kept[at])
+      continue;
+    SuiteCursor &cursor = sliced[position.cursor];
+    cursor.keep[position.index] = true;
+    cursor.to = std::max(cursor.to, position.index + 1);
+  }
+  return sliced;
 }
 
 } // namespace
 
+const std::vector<StatementNames> &
+TypeSystem::statementNamesOf(const std::vector<parser::NodePtr> &suite) const {
+  std::vector<StatementNames> &statements = suiteStatementNames[&suite];
+  bool current = statements.size() == suite.size();
+  for (std::size_t index = 0; current && index < suite.size(); ++index)
+    current = statements[index].node == suite[index].get();
+  if (current)
+    return statements;
+  // ⛔ Checked, not trusted: the key is an address, and a suite freed and
+  // another allocated there would otherwise read the first one's names.
+  statements.assign(suite.size(), StatementNames{});
+  for (std::size_t index = 0; index < suite.size(); ++index) {
+    statements[index].node = suite[index].get();
+    if (suite[index])
+      collectStatementNames(*suite[index], statements[index]);
+  }
+  return statements;
+}
+
 mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                                   llvm::StringRef name,
                                   llvm::StringRef literalKind,
-                                  llvm::ArrayRef<SuiteCursor> suites,
+                                  llvm::ArrayRef<SuiteCursor> allSuites,
                                   const llvm::StringMap<mlir::Type> *localSymbols,
                                   unsigned depth, unsigned subscriptDepth,
                                   llvm::StringRef receiver) {
-  if (suites.empty() || !suites.front().suite ||
-      suites.front().from > suites.front().suite->size())
+  if (allSuites.empty() || !allSuites.front().suite ||
+      allSuites.front().from > allSuites.front().suite->size())
     return {};
+  llvm::SmallVector<SuiteCursor, 4> boundedSuites =
+      slicedCursors(types, name, allSuites);
+  llvm::ArrayRef<SuiteCursor> suites = boundedSuites;
   // ⛔ The walk's names go through a CONTEXT rather than into the scope this
   // pushes: `bindLocalSymbol` would make them visible to everything the scan
   // calls, and the signature walk's bindings are provisional -- it is reading a
@@ -269,7 +410,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
                                 auto &&noteType) {
     if (expr && depth < 3 && isEmptyContainerExpression(expr)) {
       if (mlir::Type inner = emptyLiteralSeedTypeIn(
-              types, name, literalKindOf(*expr), suites, localSymbols,
+              types, name, literalKindOf(*expr), allSuites, localSymbols,
               depth + 1, subscriptDepth + 1)) {
         noteType(slot, inner);
         return;
@@ -418,7 +559,9 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
               assignedName != name) {
             llvm::SmallVector<SuiteCursor, 4> nested;
             nested.push_back(SuiteCursor{suite, index + 1});
-            nested.append(suites.begin(), suites.end());
+            // The whole sequence: `line` is filled where `name` is not
+            // spelled, and the asked scan cuts its own.
+            nested.append(allSuites.begin(), allSuites.end());
             bound = emptyLiteralSeedTypeIn(types, assignedName,
                                            literalKindOf(*assigned), nested,
                                            localSymbols, depth + 1);
@@ -733,12 +876,12 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   // ⛔ Disagreement still decides: two seeds one suite apart that say
   // different things leave the element erased, which is where it started.
   std::optional<TypeSystem::Scope> remainderScope;
-  auto scanRemainder = [&](const std::vector<parser::NodePtr> *suite,
-                           std::size_t from) {
+  auto scanRemainder = [&](const SuiteCursor &cursor) {
+    const std::vector<parser::NodePtr> *suite = cursor.suite;
     if (!suite)
       return;
-    for (std::size_t index = from; index < suite->size(); ++index)
-      if ((*suite)[index]) {
+    for (std::size_t index = cursor.from; index < cursor.end(); ++index)
+      if (cursor.keeps(index) && (*suite)[index]) {
         visit(*(*suite)[index], visit);
         bindWhatItLeaves(suite, index, remainderScope);
       }
@@ -796,9 +939,9 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
     for (const SuiteCursor &cursor : suites) {
       if (!cursor.suite)
         continue;
-      for (std::size_t index = cursor.from; index < cursor.suite->size();
+      for (std::size_t index = cursor.from; index < cursor.end();
            ++index)
-        if ((*cursor.suite)[index])
+        if (cursor.keeps(index) && (*cursor.suite)[index])
           collectAliases(*(*cursor.suite)[index]);
     }
   }
@@ -834,9 +977,9 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
       for (const SuiteCursor &cursor : suites) {
         if (!cursor.suite)
           continue;
-        for (std::size_t index = cursor.from; index < cursor.suite->size();
+        for (std::size_t index = cursor.from; index < cursor.end();
              ++index)
-          if ((*cursor.suite)[index])
+          if (cursor.keeps(index) && (*cursor.suite)[index])
             collect(*(*cursor.suite)[index]);
       }
       if (derivedFromName.size() == before)
@@ -845,7 +988,7 @@ mlir::Type emptyLiteralSeedTypeIn(const TypeSystem &types,
   }
 
   for (const SuiteCursor &cursor : suites)
-    scanRemainder(cursor.suite, cursor.from);
+    scanRemainder(cursor);
 
   // The provisional seed answers only when nothing else did: a store that does
   // not mention the name is better evidence, and two of those that disagree is

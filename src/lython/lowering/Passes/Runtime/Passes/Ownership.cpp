@@ -1088,7 +1088,7 @@ findReleaseInsertion(FuncContractCache &contracts, mlir::Operation *owner,
       groupEquivalents.append(equivalentValues.begin(),
                               equivalentValues.end());
     }
-    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews);
+    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews, &contracts);
   }
 
   mlir::Operation *lastUser = nullptr;
@@ -1426,7 +1426,7 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
       aliases.namesOf(result, equivalents);
       groupEquivalents.append(equivalents.begin(), equivalents.end());
     }
-    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews);
+    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews, &contracts);
   }
   for (mlir::Value view : pinnedViews) {
     for (mlir::Operation *user : view.getUsers()) {
@@ -2206,7 +2206,7 @@ bool releaseOwnedGroupByLiveness(
         groupEquivalents.push_back(equivalent);
       }
     }
-    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews);
+    own::collectBoxWordDerivedViews(groupEquivalents, pinnedViews, &contracts);
   }
   for (mlir::Value view : pinnedViews) {
     for (mlir::OpOperand &use : view.getUses()) {
@@ -3507,9 +3507,18 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
   // body's uses of its own new incarnation do not keep the previous
   // iteration's value alive across the back edge). The forwarded block
   // argument replaces the value for all merged uses.
-  llvm::DenseMap<mlir::Operation *,
-                 llvm::DenseMap<mlir::Block *, llvm::DenseSet<mlir::Value>>>
-      functionLiveIns;
+  //
+  // Answered per VALUE: v is live-in at a block exactly when a use of v
+  // (in a top-level block other than v's own) is reachable from it without
+  // entering v's block, along successors and exception edges. So the blocks
+  // where it is live-in are a backward walk from its uses that stops at its
+  // block -- the same sets the whole-function dataflow computed, for the
+  // values asked about only.
+  //
+  // ⛔ Not the whole-function sets: every block held every value live across
+  // it, rebuilt each round to a fixpoint, which is blocks x live values -- in
+  // a long module body, most of this phase. Nothing in the loop below mutates
+  // the IR, so answering lazily reads the IR the sets were built from.
   auto functionLevelBlock = [](mlir::Value v) -> mlir::Block * {
     mlir::Block *block = v.getParentBlock();
     while (block && block->getParentOp() &&
@@ -3517,56 +3526,61 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
       block = block->getParentOp()->getBlock();
     return block;
   };
-  auto liveInsFor = [&](mlir::func::FuncOp fn)
-      -> llvm::DenseMap<mlir::Block *, llvm::DenseSet<mlir::Value>> & {
-    auto existing = functionLiveIns.find(fn.getOperation());
-    if (existing != functionLiveIns.end())
+  auto functionLevelBlockOf = [](mlir::Operation *op) -> mlir::Block * {
+    mlir::Block *block = op->getBlock();
+    while (block && block->getParentOp() &&
+           !mlir::isa<mlir::func::FuncOp>(block->getParentOp()))
+      block = block->getParentOp()->getBlock();
+    return block;
+  };
+  llvm::DenseMap<mlir::Operation *,
+                 llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>>
+      functionExceptionPreds;
+  auto exceptionPredsFor = [&](mlir::func::FuncOp fn)
+      -> llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> & {
+    auto existing = functionExceptionPreds.find(fn.getOperation());
+    if (existing != functionExceptionPreds.end())
       return existing->second;
-    auto &liveIns = functionLiveIns[fn.getOperation()];
-    llvm::DenseMap<mlir::Block *, llvm::DenseSet<mlir::Value>> blockUses;
-    for (mlir::Block &block : fn.getBody()) {
-      llvm::DenseSet<mlir::Value> &uses = blockUses[&block];
-      for (mlir::Operation &op : block)
-        op.walk([&](mlir::Operation *inner) {
-          for (mlir::Value operand : inner->getOperands())
-            if (functionLevelBlock(operand) != &block)
-              uses.insert(operand);
-        });
+    auto &preds = functionExceptionPreds[fn.getOperation()];
+    for (auto &[block, successors] : own::collectExceptionEdges(fn.getBody()))
+      for (mlir::Block *successor : successors)
+        preds[successor].push_back(block);
+    return preds;
+  };
+  llvm::DenseMap<mlir::Value, llvm::DenseSet<mlir::Block *>> liveInBlocks;
+  auto liveInBlocksOf = [&](mlir::Value v, mlir::func::FuncOp fn)
+      -> const llvm::DenseSet<mlir::Block *> & {
+    auto existing = liveInBlocks.find(v);
+    if (existing != liveInBlocks.end())
+      return existing->second;
+    llvm::DenseSet<mlir::Block *> &live = liveInBlocks[v];
+    mlir::Block *home = functionLevelBlock(v);
+    mlir::Region *body = &fn.getBody();
+    auto &exceptionPreds = exceptionPredsFor(fn);
+    llvm::SmallVector<mlir::Block *, 16> worklist;
+    auto enter = [&](mlir::Block *block) {
+      if (block && block != home && block->getParent() == body &&
+          live.insert(block).second)
+        worklist.push_back(block);
+    };
+    for (mlir::Operation *user : v.getUsers())
+      enter(functionLevelBlockOf(user));
+    while (!worklist.empty()) {
+      mlir::Block *block = worklist.pop_back_val();
+      for (mlir::Block *pred : block->getPredecessors())
+        enter(pred);
+      if (auto found = exceptionPreds.find(block); found != exceptionPreds.end())
+        for (mlir::Block *pred : found->second)
+          enter(pred);
     }
-    llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
-        exceptionEdges = own::collectExceptionEdges(fn.getBody());
-    bool converged = false;
-    while (!converged) {
-      converged = true;
-      for (mlir::Block &block : llvm::reverse(fn.getBody())) {
-        llvm::DenseSet<mlir::Value> live = blockUses[&block];
-        for (mlir::Block *successor : block.getSuccessors())
-          for (mlir::Value v : liveIns[successor])
-            if (functionLevelBlock(v) != &block)
-              live.insert(v);
-        if (auto found = exceptionEdges.find(&block);
-            found != exceptionEdges.end())
-          for (mlir::Block *successor : found->second)
-            for (mlir::Value v : liveIns[successor])
-              if (functionLevelBlock(v) != &block)
-                live.insert(v);
-        llvm::DenseSet<mlir::Value> &slot = liveIns[&block];
-        if (live.size() != slot.size()) {
-          slot = std::move(live);
-          converged = false;
-        }
-      }
-    }
-    return liveIns;
+    return live;
   };
   auto diesOnEdge = [&](mlir::Value v, mlir::Operation *terminator,
                         mlir::Block *dest) {
     auto fn = terminator->getParentOfType<mlir::func::FuncOp>();
     if (!fn)
       return false;
-    auto &liveIns = liveInsFor(fn);
-    auto found = liveIns.find(dest);
-    return found == liveIns.end() || !found->second.contains(v);
+    return !liveInBlocksOf(v, fn).contains(dest);
   };
   mlir::func::FuncOp retainFunction =
       module.lookupSymbol<mlir::func::FuncOp>("Ly_IncRef");
@@ -4976,7 +4990,7 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
       aliases.namesOf(value, aliasValues);
       equivalents.append(aliasValues.begin(), aliasValues.end());
     }
-    own::collectBoxWordDerivedViews(equivalents, tracked);
+    own::collectBoxWordDerivedViews(equivalents, tracked, &contracts);
   }
 
   llvm::SmallPtrSet<mlir::Operation *, 16> seenUses;
@@ -5350,6 +5364,17 @@ mlir::LogicalResult insertUnwindCleanupReleases(
     const own::ReferenceMap &references,
     mlir::SymbolTable *symbols,
     llvm::ArrayRef<own::ResourceGroup> blockArgGroups) {
+  // A callee by name: from the table, which answers without scanning the
+  // module, and otherwise from the module.
+  // ⛔ Not the table alone: this pass creates functions as it goes (the EH
+  // markers, `LyEH_RethrowCurrent`) and the table was built before it ran,
+  // so a callee it made itself is only in the module.
+  auto calleeOf = [&](mlir::func::CallOp call) -> mlir::func::FuncOp {
+    if (symbols)
+      if (auto found = symbols->lookup<mlir::func::FuncOp>(call.getCallee()))
+        return found;
+    return module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+  };
   std::int64_t nextHandlerId = nextUnusedExceptionHandlerId(module);
   auto anchorFn = module.lookupSymbol<mlir::func::FuncOp>("LyEH_TryCatchAnchor");
   auto catchMarkerFn =
@@ -5430,7 +5455,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
             markers.push_back({call, handler->second});
           continue;
         }
-        auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+        auto callee = calleeOf(call);
         if (own::isRaiseLikeFunction(callee)) {
           if (!own::precedingTryCallSiteMarker(call) && !cleanupBlock)
             unguardedRaises.push_back(call);
@@ -5463,7 +5488,7 @@ mlir::LogicalResult insertUnwindCleanupReleases(
             nestedMarkers.push_back({call, handler->second});
           return;
         }
-        auto callee = module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+        auto callee = calleeOf(call);
         if (own::isRaiseLikeFunction(callee)) {
           // Raise-like: inline releases before the raise stay valid inside
           // a region, so the top-level shape below handles them (a nested

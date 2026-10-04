@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -20,15 +21,13 @@ bool sameHeaderOperand(own::AliasAnalysis &aliases, mlir::func::CallOp retain,
   return aliases.same(retain.getOperand(0), release.getOperand(0));
 }
 
-bool isRetainCall(mlir::ModuleOp module, mlir::func::CallOp call) {
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+bool isRetainCall(mlir::SymbolTable &symbols, mlir::func::CallOp call) {
+  auto callee = symbols.lookup<mlir::func::FuncOp>(call.getCallee());
   return callee && own::functionRetainsOperandAt(callee, 0);
 }
 
-bool isReleaseCall(mlir::ModuleOp module, mlir::func::CallOp call) {
-  mlir::func::FuncOp callee =
-      module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+bool isReleaseCall(mlir::SymbolTable &symbols, mlir::func::CallOp call) {
+  auto callee = symbols.lookup<mlir::func::FuncOp>(call.getCallee());
   return callee && callee->hasAttr(kManifestDeallocatorAttr) &&
          own::functionReleasesOperandAt(callee, 0);
 }
@@ -41,6 +40,9 @@ bool hasAggregateOwnershipMarker(mlir::func::CallOp call) {
 void elideAdjacentRefcountPairs(mlir::ModuleOp module) {
   own::AliasAnalysis aliases;
   aliases.build(module);
+  // ⛔ Not `module.lookupSymbol`: it scans the module, and this asks once per
+  // call in the program.
+  mlir::SymbolTable symbols(module);
 
   llvm::SmallVector<mlir::Operation *, 8> erase;
   module.walk([&](mlir::func::FuncOp function) {
@@ -48,13 +50,13 @@ void elideAdjacentRefcountPairs(mlir::ModuleOp module) {
       for (auto it = block.begin(), e = block.end(); it != e;) {
         mlir::Operation *current = &*it++;
         auto retain = mlir::dyn_cast<mlir::func::CallOp>(current);
-        if (!retain || !isRetainCall(module, retain) || it == e)
+        if (!retain || !isRetainCall(symbols, retain) || it == e)
           continue;
         if (hasAggregateOwnershipMarker(retain))
           continue;
         mlir::Operation *next = &*it;
         auto release = mlir::dyn_cast<mlir::func::CallOp>(next);
-        if (!release || !isReleaseCall(module, release))
+        if (!release || !isReleaseCall(symbols, release))
           continue;
         if (hasAggregateOwnershipMarker(release))
           continue;

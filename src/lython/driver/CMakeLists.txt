@@ -280,3 +280,20 @@ target_link_libraries(LythonDriver
 )
 
 target_compile_options(LythonDriver PRIVATE -frtti)
+
+# --- Precompiled native runtime ---------------------------------------------
+# The native runtime lowered and linked once, at build time, for the machine
+# the build runs on (LythonNativeRuntimeBitcode). lyc embeds it and links it
+# instead of lowering the runtime on every compile; any other target lowers it
+# as before. The tool links this driver library, so the embedding goes into
+# lyc itself (tools/CMakeLists.txt), not here.
+add_executable(LythonNativeRuntimeBitcode
+    ${CMAKE_SOURCE_DIR}/src/lython/lowering/Tools/NativeRuntimeBitcode.cpp
+)
+add_dependencies(LythonNativeRuntimeBitcode PyDialectIncGen)
+target_link_libraries(LythonNativeRuntimeBitcode PRIVATE LythonDriver)
+target_compile_options(LythonNativeRuntimeBitcode PRIVATE -frtti)
+if(APPLE)
+    target_link_options(LythonNativeRuntimeBitcode
+        PRIVATE "-Wl,-no_warn_duplicate_libraries")
+endif()

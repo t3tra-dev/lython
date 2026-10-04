@@ -553,8 +553,13 @@ bool groupMatchesOwnedReturnRange(
 // be a use-after-free). Primitives the manifest marks kManifestInteriorWordAttr
 // reach the same storage through a call rather than a load, and their results
 // join the walk on the same footing.
+//
+// `contracts`, when given, names the callees: without it each call is resolved
+// by scanning the module's symbols.
+class FuncContractCache;
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
-                                llvm::SmallVectorImpl<mlir::Value> &views);
+                                llvm::SmallVectorImpl<mlir::Value> &views,
+                                FuncContractCache *contracts = nullptr);
 
 llvm::SmallVector<ResourceGroup, 8>
 collectRuntimeResourceGroups(mlir::ValueRange values,
@@ -646,6 +651,12 @@ public:
     CachedFuncContract entry{function->second, *contract};
     auto inserted = contracts.insert({name, std::move(entry)});
     return &inserted.first->second;
+  }
+
+  // The function named `name` when this cache was built, or null.
+  mlir::func::FuncOp function(llvm::StringRef name) const {
+    auto found = functions.find(name);
+    return found == functions.end() ? mlir::func::FuncOp() : found->second;
   }
 
   mlir::FailureOr<const CachedFuncContract *>

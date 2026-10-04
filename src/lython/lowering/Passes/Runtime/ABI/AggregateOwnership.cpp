@@ -95,6 +95,10 @@ mlir::FailureOr<mlir::Value> buildHeaderView(mlir::Operation *op,
 } // namespace
 
 mlir::func::FuncOp RuntimeBundleLowerer::findRetainFunction() const {
+  // ⛔ Only a found answer is kept: the walk costs the whole module and is
+  // asked once per slot retained, while "none yet" could still change.
+  if (retainFunctionMemo)
+    return retainFunctionMemo;
   mlir::ModuleOp moduleOp = module;
   mlir::func::FuncOp retained;
   moduleOp.walk([&](mlir::func::FuncOp function) {
@@ -103,6 +107,7 @@ mlir::func::FuncOp RuntimeBundleLowerer::findRetainFunction() const {
     if (primitive && primitive.getValue() == "retain")
       retained = function;
   });
+  retainFunctionMemo = retained;
   return retained;
 }
 
@@ -198,6 +203,9 @@ RuntimeBundleLowerer::retainAggregateSlot(mlir::Operation *op,
 mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
     mlir::Operation *op, mlir::Type slotType, mlir::ValueRange values,
     llvm::StringRef slotName) {
+  if (settledDeallocators)
+    return RuntimeBundleLowerer::releaseAggregateSlot(
+        op, slotType, values, slotName, *settledDeallocators, /*depth=*/0);
   llvm::SmallVector<own::RuntimeDeallocator, 8> deallocators =
       own::collectRuntimeDeallocators(module);
   return RuntimeBundleLowerer::releaseAggregateSlot(op, slotType, values,
