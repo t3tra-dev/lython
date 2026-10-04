@@ -1888,6 +1888,12 @@ private:
   llvm::DenseMap<mlir::Operation *, mlir::Value> primitiveI64CloneDecisionFlags;
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
+  // The module's deallocators once synthesizeSourceClassDeallocators has
+  // made the last of them; empty before.
+  std::optional<llvm::SmallVector<ownership::RuntimeDeallocator, 8>>
+      settledDeallocators;
+  // findRetainFunction's answer once it has one.
+  mutable mlir::func::FuncOp retainFunctionMemo;
   llvm::SmallVector<CallableLogicalEntryArgs, 8> callableLogicalEntryArgCounts;
   // Insertion-ordered: the drop/erase passes below walk it, and both a
   // membership test and a stable order are needed. Two containers held this

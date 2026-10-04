@@ -618,22 +618,28 @@ static void appendEntityViews(ResourceGroup &group, mlir::ValueRange values,
 
 // A call to a manifest primitive declared as returning interior words of the
 // entity its operands reach (see kManifestInteriorWordAttr).
-static bool isInteriorWordCall(mlir::Operation *op) {
+static bool isInteriorWordCall(mlir::Operation *op,
+                               FuncContractCache *contracts) {
   auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
   if (!call)
     return false;
-  auto callee =
-      mlir::SymbolTable::lookupNearestSymbolFrom<mlir::func::FuncOp>(
-          call, call.getCalleeAttr());
+  // ⛔ The cache only as a first answer: it holds the functions there were
+  // when it was built, and a pass may have made the callee since.
+  mlir::func::FuncOp callee =
+      contracts ? contracts->function(call.getCallee()) : mlir::func::FuncOp();
+  if (!callee)
+    callee = mlir::SymbolTable::lookupNearestSymbolFrom<mlir::func::FuncOp>(
+        call, call.getCalleeAttr());
   return callee && callee->hasAttr(contracts::kManifestInteriorWordAttr);
 }
 
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
-                                llvm::SmallVectorImpl<mlir::Value> &views) {
+                                llvm::SmallVectorImpl<mlir::Value> &views,
+                                FuncContractCache *contracts) {
   llvm::SmallDenseSet<mlir::Value, 8> known(views.begin(), views.end());
   llvm::SmallVector<mlir::Value, 8> worklist;
   auto seedInteriorResults = [&](mlir::Operation *user) {
-    if (!isInteriorWordCall(user))
+    if (!isInteriorWordCall(user, contracts))
       return false;
     for (mlir::Value result : user->getResults()) {
       worklist.push_back(result);
