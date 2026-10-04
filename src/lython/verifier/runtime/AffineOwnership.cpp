@@ -90,6 +90,25 @@ bool ownershipPathTraceEnabled() {
 // "before" side from the SAME binary as its "after" side, so a GREEN verdict
 // cannot come from a build pointed at the wrong tree. Not a supported
 // configuration -- with it set, an ordinary rebind inside a loop is refused.
+// LYTHON_ABLATE_VERIFIER_FAST_FORWARD=1 walks every operation of a block
+// again instead of jumping to the next one that can matter to the state.
+// ⛔ Kept: the jump claims to change no verdict, and the claim is checked by
+// running the corpus both ways with one binary.
+bool verifierFastForwardDisabled() {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_VERIFIER_FAST_FORWARD") != nullptr;
+  return disabled;
+}
+
+// LYTHON_ABLATE_VERIFIER_CHAIN_SUMMARY=1 walks a chain of blocks one state
+// per block again instead of summarizing the run a state names nothing in.
+// ⛔ Kept for the same reason as the fast-forward's switch.
+bool verifierChainSummaryDisabled() {
+  static const bool disabled =
+      std::getenv("LYTHON_ABLATE_VERIFIER_CHAIN_SUMMARY") != nullptr;
+  return disabled;
+}
+
 bool staleRebindDropDisabled() {
   static const bool disabled =
       std::getenv("LYTHON_ABLATE_STALE_REBIND") != nullptr;
@@ -933,6 +952,162 @@ private:
     });
   }
 
+public:
+  // ---- Chains ------------------------------------------------------------
+  //
+  // A chain is a run of blocks of the function's own body, each entered only
+  // from the one before it: B is linked to its LAST successor C when C has no
+  // other predecessor (an exception edge counts as one) and B is plain -- no
+  // return, no operation with regions, no call that always raises, and a
+  // branch for a terminator. A module body is mostly one: a call is guarded
+  // by a marker and ends its block in an anchor whose false edge is the next
+  // statement.
+  //
+  // In a plain block that names nothing a state tracks, the walk's effect on
+  // a state holding the token is fixed by the block alone: the marker
+  // handlers it pushes, the successors its terminator pushes, and -- through
+  // the last successor -- the same state one block on. Every test that could
+  // change the state is gated on a mention. So a run of such blocks is
+  // summarized: the pushes of each block that differs from the next in what
+  // it pushes, and the state that leaves the run.
+  struct ChainPosition {
+    int chain = -1;
+    unsigned position = 0;
+  };
+
+  ChainPosition chainPositionOf(mlir::Block *block) {
+    buildChains();
+    std::optional<unsigned> index = blockIndexOf(block);
+    if (!index)
+      return {};
+    return chainOf[*index];
+  }
+
+  mlir::Block *chainBlock(int chain, unsigned position) {
+    return blockOrder[chains[chain].blocks[position]];
+  }
+
+  llvm::ArrayRef<mlir::Operation *> markersOf(mlir::Block *block) {
+    buildChains();
+    return plans[*blockIndexOf(block)].markers;
+  }
+
+  // The first position at or after `from` on `chain` the summary must stop
+  // before for `state`: a block that names something it tracks, defines a
+  // value it tracks, owns a block argument it tracks (the walk drops such
+  // names entering it), is not plain, or -- when an unwind there would be an
+  // error for this state -- holds an unguarded call that may raise. The
+  // chain's last block always stops it.
+  unsigned chainStop(const AffinePathState &state, int chain, unsigned from,
+                     bool unguardedCallsMatter) {
+    const Chain &line = chains[chain];
+    unsigned stop = static_cast<unsigned>(line.blocks.size()) - 1;
+    auto atOrAfter = [&](llvm::ArrayRef<unsigned> positions, unsigned at) {
+      auto next = std::lower_bound(positions.begin(), positions.end(), at);
+      if (next != positions.end())
+        stop = std::min(stop, *next);
+    };
+    atOrAfter(line.barriers, from);
+    if (unguardedCallsMatter)
+      atOrAfter(line.unguarded, from);
+    for (llvm::ArrayRef<mlir::Value> names :
+         {llvm::ArrayRef<mlir::Value>(state.group),
+          llvm::ArrayRef<mlir::Value>(state.views),
+          llvm::ArrayRef<mlir::Value>(state.stale),
+          llvm::ArrayRef<mlir::Value>(state.previous)})
+      for (mlir::Value value : names) {
+        if (!value)
+          continue;
+        atOrAfter(chainUserPositions(aliases.find(value), chain), from);
+        mlir::Block *owner = nullptr;
+        if (mlir::Operation *definition = value.getDefiningOp())
+          owner = topLevelBlock(definition->getBlock());
+        else
+          owner = topLevelBlock(
+              mlir::cast<mlir::BlockArgument>(value).getOwner());
+        if (!owner)
+          continue;
+        ChainPosition at = chainPositionOf(owner);
+        if (at.chain == chain && at.position >= from)
+          stop = std::min(stop, at.position);
+      }
+    return stop;
+  }
+
+  // The states the walk would have made stepping through positions
+  // [from, to) of `chain` past the one it was in: one per block entered and
+  // one per region op stepped over.
+  unsigned summarizedStateCount(int chain, unsigned from, unsigned to) {
+    const Chain &line = chains[chain];
+    return (to - from - 1) + line.regionPrefix[to] - line.regionPrefix[from];
+  }
+
+  // The last position of each run of identically-pushing blocks within
+  // [from, to), in order.
+  void runEnds(int chain, unsigned from, unsigned to,
+               llvm::SmallVectorImpl<unsigned> &ends) {
+    const Chain &line = chains[chain];
+    auto next = std::upper_bound(line.runStarts.begin(), line.runStarts.end(),
+                                 from);
+    while (next != line.runStarts.end() && *next < to) {
+      ends.push_back(*next - 1);
+      ++next;
+    }
+    ends.push_back(to - 1);
+  }
+
+  // The next operation, from `op` on in its block, that can change what the
+  // resource walk does in a state holding (Owned) or past (Released) the
+  // token. Between two such operations the walk only steps forward:
+  //  - an operation that names nothing the state tracks makes every
+  //    mention-gated test false and the state's token, counts and names stay
+  //    as they are;
+  //  - except at the operations listed in `events`: a return, an EH marker,
+  //    a call whose contract may raise or always raises, an operation with
+  //    regions, and the terminator, which the walk handles whether or not
+  //    they name anything;
+  //  - and at an operation defining a stale name, which drops that name.
+  // ⛔ Not for a Conditional state (its tag test is not a mention) nor an
+  // empty group (every operation counts as a mention of one).
+  mlir::Operation *nextStop(const AffinePathState &state, mlir::Operation *op) {
+    mlir::Block *block = op->getBlock();
+    if (!block || block->getParent() != &function.getBody())
+      return op;
+    BlockLayout &layout = layoutOf(block);
+    auto at = layout.position.find(op);
+    if (at == layout.position.end())
+      return op;
+    unsigned from = at->second;
+    unsigned stop = static_cast<unsigned>(layout.ops.size()) - 1;
+    auto event =
+        std::lower_bound(layout.events.begin(), layout.events.end(), from);
+    if (event != layout.events.end())
+      stop = std::min(stop, *event);
+    auto consider = [&](mlir::Value value) {
+      if (!value)
+        return;
+      const llvm::SmallVector<unsigned, 4> &positions =
+          userPositions(aliases.find(value), block, layout);
+      auto next = std::lower_bound(positions.begin(), positions.end(), from);
+      if (next != positions.end())
+        stop = std::min(stop, *next);
+    };
+    for (llvm::ArrayRef<mlir::Value> names :
+         {llvm::ArrayRef<mlir::Value>(state.group),
+          llvm::ArrayRef<mlir::Value>(state.views),
+          llvm::ArrayRef<mlir::Value>(state.stale),
+          llvm::ArrayRef<mlir::Value>(state.previous)})
+      for (mlir::Value value : names)
+        consider(value);
+    for (mlir::Value value : state.stale)
+      if (mlir::Operation *definition = value ? value.getDefiningOp() : nullptr)
+        if (auto found = layout.position.find(definition);
+            found != layout.position.end() && found->second >= from)
+          stop = std::min(stop, found->second);
+    return layout.ops[stop];
+  }
+
+private:
   // The block of `function`'s own region that contains `block` (itself, when
   // `block` already belongs to that region).
   mlir::Block *topLevelBlock(mlir::Block *block) {
@@ -1021,6 +1196,199 @@ private:
           addEdge(&source, successor);
     }
   }
+
+  struct BlockPlan {
+    bool plain = false;
+    bool unguardedMayRaise = false;
+    llvm::SmallVector<mlir::Operation *, 2> markers;
+    // What the block pushes besides its last successor's state: the handler
+    // of each marker and the other successors, and whether its branch is an
+    // anchor. Two blocks with equal pushes hand a state the same states.
+    llvm::SmallVector<mlir::Block *, 4> pushes;
+    bool anchor = false;
+    // States the walk makes inside the block to step over its region ops.
+    unsigned regionStates = 0;
+  };
+  struct Chain {
+    llvm::SmallVector<unsigned, 16> blocks;
+    llvm::SmallVector<unsigned, 4> barriers;
+    llvm::SmallVector<unsigned, 4> unguarded;
+    llvm::SmallVector<unsigned, 4> runStarts;
+    // regionStates summed over the positions before each one.
+    llvm::SmallVector<unsigned, 17> regionPrefix{0};
+  };
+
+  void buildChains() {
+    if (chainsBuilt)
+      return;
+    chainsBuilt = true;
+    buildBlockGraph();
+    unsigned count = static_cast<unsigned>(blockOrder.size());
+    plans.assign(count, {});
+    chainOf.assign(count, {});
+    llvm::SmallVector<int, 32> link(count, -1);
+    llvm::BitVector linkedInto(count);
+    for (unsigned index = 0; index < count; ++index) {
+      mlir::Block *block = blockOrder[index];
+      BlockPlan &plan = plans[index];
+      plan.plain = !block->empty();
+      for (mlir::Operation &op : *block) {
+        if (mlir::isa<mlir::func::ReturnOp>(op))
+          plan.plain = false;
+        // An operation with regions none of which names what a state tracks
+        // is stepped over: the walk does not enter them and goes on at the
+        // next operation -- as a new state, when the operation is a region
+        // branch with somewhere to enter, which the summary counts.
+        if (op.getNumRegions() != 0)
+          if (auto branch = mlir::dyn_cast<mlir::RegionBranchOpInterface>(op)) {
+            llvm::SmallVector<mlir::RegionSuccessor, 4> entries;
+            llvm::SmallVector<mlir::Attribute, 8> unknown(op.getNumOperands(),
+                                                          mlir::Attribute());
+            branch.getEntrySuccessorRegions(unknown, entries);
+            if (!entries.empty())
+              ++plan.regionStates;
+          }
+        auto call = mlir::dyn_cast<mlir::func::CallOp>(op);
+        if (!call)
+          continue;
+        if (call.getCallee() == "LyEH_TryCallSiteMarker") {
+          plan.markers.push_back(&op);
+          if (mlir::Block *handler = markerHandler(call))
+            plan.pushes.push_back(handler);
+          continue;
+        }
+        const RaiseFacts &raise = raiseFacts(call);
+        if (raise.raiseLike)
+          plan.plain = false;
+        if (raise.mayRaise && !guardedByCallSiteMarker(call))
+          plan.unguardedMayRaise = true;
+      }
+      if (!plan.plain)
+        continue;
+      mlir::Operation *terminator = block->getTerminator();
+      unsigned successors = terminator->getNumSuccessors();
+      if (!mlir::isa<mlir::BranchOpInterface>(terminator) || successors == 0) {
+        plan.plain = false;
+        continue;
+      }
+      for (unsigned edge = 0; edge + 1 < successors; ++edge)
+        plan.pushes.push_back(terminator->getSuccessor(edge));
+      if (auto cond = mlir::dyn_cast<mlir::cf::CondBranchOp>(terminator))
+        if (auto anchorCall =
+                cond.getCondition().getDefiningOp<mlir::func::CallOp>())
+          plan.anchor = anchorCall.getCallee() == "LyEH_TryCatchAnchor";
+      mlir::Block *next = terminator->getSuccessor(successors - 1);
+      std::optional<unsigned> nextIndex = blockIndexOf(next);
+      if (!nextIndex || *nextIndex == index || next->isEntryBlock() ||
+          predecessors[*nextIndex].size() != 1)
+        continue;
+      link[index] = static_cast<int>(*nextIndex);
+      linkedInto.set(*nextIndex);
+    }
+    for (unsigned head = 0; head < count; ++head) {
+      if (linkedInto.test(head) || link[head] < 0)
+        continue;
+      int chain = static_cast<int>(chains.size());
+      Chain &line = chains.emplace_back();
+      for (int at = static_cast<int>(head); at >= 0; at = link[at]) {
+        unsigned position = static_cast<unsigned>(line.blocks.size());
+        line.blocks.push_back(static_cast<unsigned>(at));
+        chainOf[at] = {chain, position};
+        const BlockPlan &plan = plans[at];
+        if (!plan.plain)
+          line.barriers.push_back(position);
+        if (plan.unguardedMayRaise)
+          line.unguarded.push_back(position);
+        line.regionPrefix.push_back(line.regionPrefix.back() +
+                                    plan.regionStates);
+        if (position == 0 ||
+            plan.pushes != plans[line.blocks[position - 1]].pushes ||
+            plan.anchor != plans[line.blocks[position - 1]].anchor)
+          line.runStarts.push_back(position);
+      }
+    }
+  }
+
+  // Where on `chain` the users of `root` sit (the blocks holding them).
+  llvm::ArrayRef<unsigned> chainUserPositions(mlir::Value root, int chain) {
+    auto &byChain = chainUsers[root];
+    if (!byChain) {
+      byChain.emplace();
+      if (auto users = classUsers.find(root); users != classUsers.end())
+        for (mlir::Operation *user : users->second) {
+          mlir::Block *block = topLevelBlock(user->getBlock());
+          if (!block)
+            continue;
+          ChainPosition at = chainPositionOf(block);
+          if (at.chain >= 0)
+            (*byChain)[at.chain].push_back(at.position);
+        }
+      for (auto &entry : *byChain)
+        llvm::sort(entry.second);
+    }
+    auto found = byChain->find(chain);
+    if (found == byChain->end())
+      return {};
+    return found->second;
+  }
+
+  bool chainsBuilt = false;
+  llvm::SmallVector<BlockPlan, 16> plans;
+  llvm::SmallVector<ChainPosition, 16> chainOf;
+  llvm::SmallVector<Chain, 4> chains;
+  llvm::DenseMap<
+      mlir::Value,
+      std::optional<llvm::DenseMap<int, llvm::SmallVector<unsigned, 4>>>>
+      chainUsers;
+
+  struct BlockLayout {
+    llvm::SmallVector<mlir::Operation *, 16> ops;
+    llvm::DenseMap<mlir::Operation *, unsigned> position;
+    llvm::SmallVector<unsigned, 8> events;
+    // Per alias root: where in this block its users (or the operations
+    // holding them) sit, in order.
+    llvm::DenseMap<mlir::Value, llvm::SmallVector<unsigned, 4>> users;
+  };
+
+  BlockLayout &layoutOf(mlir::Block *block) {
+    auto [entry, inserted] = layouts.try_emplace(block);
+    BlockLayout &layout = entry->second;
+    if (!inserted)
+      return layout;
+    for (mlir::Operation &op : *block) {
+      unsigned index = static_cast<unsigned>(layout.ops.size());
+      layout.ops.push_back(&op);
+      layout.position[&op] = index;
+      bool event = mlir::isa<mlir::func::ReturnOp>(op) ||
+                   op.getNumRegions() != 0 ||
+                   op.hasTrait<mlir::OpTrait::IsTerminator>();
+      if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+        const RaiseFacts &raise = raiseFacts(call);
+        event = event || call.getCallee() == "LyEH_TryCallSiteMarker" ||
+                raise.raiseLike || raise.mayRaise;
+      }
+      if (event)
+        layout.events.push_back(index);
+    }
+    return layout;
+  }
+
+  const llvm::SmallVector<unsigned, 4> &
+  userPositions(mlir::Value root, mlir::Block *block, BlockLayout &layout) {
+    auto [entry, inserted] = layout.users.try_emplace(root);
+    if (!inserted)
+      return entry->second;
+    if (auto users = classUsers.find(root); users != classUsers.end())
+      for (mlir::Operation *user : users->second)
+        if (mlir::Operation *top = block->findAncestorOpInBlock(*user))
+          if (auto found = layout.position.find(top);
+              found != layout.position.end())
+            entry->second.push_back(found->second);
+    llvm::sort(entry->second);
+    return entry->second;
+  }
+
+  llvm::DenseMap<mlir::Block *, BlockLayout> layouts;
 
   bool mentionsAny(mlir::Operation *op, llvm::ArrayRef<mlir::Value> values) {
     for (mlir::Value value : values) {
@@ -2465,7 +2833,175 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
   // today -- it does not know the difference between "too big" and "diverging"
   // -- but a reader arriving here from the message should know it is the
   // second one.
+  // The exceptional state a call-site marker hands its handler, as the walk
+  // builds it at the marker.
+  auto pushMarkerHandler = [&](mlir::Operation *op,
+                               const AffinePathState &state) {
+    mlir::Block *handler =
+        walk.markerHandler(mlir::cast<mlir::func::CallOp>(op));
+    if (!handler)
+      return;
+    AffinePathState next = state;
+    auto applyEdgeConsume = [&](mlir::func::CallOp consumer) {
+      if (!callConsumesGroup(contracts, consumer, next.group, aliases))
+        return;
+      if (next.token == AffineTokenState::Owned ||
+          next.token == AffineTokenState::Conditional)
+        next.token = AffineTokenState::Released;
+      else if (next.retained > 0)
+        --next.retained;
+      else if (!next.slotParents.empty())
+        next.slotParents.pop_back();
+    };
+    // ⭐ AND A RETAIN THERE RUNS BEFORE THE UNWIND TOO. The argument
+    // for applying consumes on this edge is that everything between
+    // the marker and the guarded call has already executed when the
+    // unwind happens, and it does not distinguish direction: the
+    // retain a frame takes back before giving its exception away
+    //
+    //     held = ValueError("m")
+    //     try:
+    //         raise held
+    //     except ValueError as e: ...
+    //     print(str(held))
+    //
+    // sits exactly there, and dropping it made the handler path see a
+    // release with no token -- "released or transferred more than once
+    // on one CFG path" over a program whose refcounts balance.
+    auto applyEdgeRetain = [&](mlir::func::CallOp retainer) {
+      if (!callRetainsGroup(contracts, retainer, next.group, aliases))
+        return;
+      // A slot-absorption retain is parked against its container
+      // rather than counted here; only a plain token is credited.
+      if (retainer->hasAttr(own::kAggregateRetainAttr) &&
+          !isBlockArgMergeBorrowRetain(retainer))
+        return;
+      // The same ceiling the borrowed walk uses, spelled here because
+      // this walk has no constant of its own.
+      if (next.retained < 64)
+        ++next.retained;
+    };
+    // Release helpers scheduled between the marker and the guarded
+    // call (a raise statement's dying locals) run BEFORE any unwind,
+    // so their consume effects apply on the exceptional edge just
+    // like the guarded call's own transfer.
+    mlir::func::CallOp guarded = walk.guardedCallAfterMarker(op);
+    for (mlir::Operation *between = op->getNextNode();
+         between && guarded && between != guarded.getOperation();
+         between = between->getNextNode())
+      if (auto betweenCall =
+              mlir::dyn_cast<mlir::func::CallOp>(between)) {
+        applyEdgeRetain(betweenCall);
+        applyEdgeConsume(betweenCall);
+      }
+    if (guarded)
+      applyEdgeConsume(guarded);
+    next.block = handler;
+    next.start = firstOperation(handler);
+    next.exceptional = true;
+    worklist.push_back(std::move(next));
+  };
+  // The states a terminator hands its first `limit` successors, as the walk
+  // builds them at the terminator.
+  auto pushSuccessors = [&](mlir::Operation *op, const AffinePathState &state,
+                            unsigned limit) {
+    AnchorTrueEdge anchor =
+        anchorTrueEdgeOf(walk, contracts, op, state, aliases);
+    for (unsigned index = 0; index < limit; ++index) {
+      mlir::Block *successor = op->getSuccessor(index);
+      AffineTokenState nextToken = state.token;
+      unsigned nextRetained = state.retained;
+      llvm::SmallVector<std::int64_t, 2> nextSlotParents = state.slotParents;
+      bool nextExceptional =
+          state.exceptional || (anchor.isVirtualUnwind && index == 0);
+      if (index == 0 && anchor.retainsBefore && nextRetained < 64)
+        nextRetained += anchor.retainsBefore;
+      if (anchor.consumesGroup && index == 0) {
+        if (nextToken == AffineTokenState::Owned ||
+            nextToken == AffineTokenState::Conditional)
+          nextToken = AffineTokenState::Released;
+        else if (nextRetained > 0)
+          --nextRetained;
+        else if (!nextSlotParents.empty())
+          nextSlotParents.pop_back();
+      }
+      llvm::SmallVector<bool, 4> mappedMask;
+      llvm::SmallVector<mlir::Value, 4> mappedGroup = remapGroupForSuccessor(
+          op, index, successor, state.group, aliases, &mappedMask);
+      bool fullyMapped =
+          llvm::all_of(mappedMask, [](bool mapped) { return mapped; });
+      if (!fullyMapped && nextToken == AffineTokenState::Released &&
+          groupContainsArgumentFromBlock(state.group, successor))
+        continue;
+      // Entering the successor redefines its block arguments: stale/previous
+      // entries naming them refer to the PREVIOUS iteration's token and drop.
+      llvm::SmallVector<mlir::Value, 4> mappedStale;
+      for (mlir::Value value : state.stale) {
+        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
+        if (!argument || argument.getOwner() != successor)
+          mappedStale.push_back(value);
+      }
+      bool renamed = llvm::any_of(mappedMask, [](bool m) { return m; });
+      llvm::SmallVector<mlir::Value, 4> mappedPrevious;
+      auto keepPreviousName = [&](mlir::Value value) {
+        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
+        if (argument && argument.getOwner() == successor)
+          return; // re-entering the block redefines this name
+        if (!llvm::is_contained(mappedPrevious, value))
+          mappedPrevious.push_back(value);
+      };
+      for (mlir::Value value : state.previous)
+        keepPreviousName(value);
+      if (renamed)
+        for (mlir::Value value : state.group)
+          keepPreviousName(value);
+      // Views name the same object as the group, so they follow the same
+      // rename: a view left under its pre-edge name would be read as the
+      // previous iteration's token on the next trip round a loop. A view the
+      // edge does not forward has no name in the successor once the group was
+      // renamed, so it drops rather than lingering as a stale alias.
+      llvm::SmallVector<bool, 4> viewMask;
+      llvm::SmallVector<mlir::Value, 4> remappedViews = remapGroupForSuccessor(
+          op, index, successor, state.views, aliases, &viewMask);
+      llvm::SmallVector<mlir::Value, 4> mappedViews;
+      for (auto [viewIndex, view] : llvm::enumerate(remappedViews)) {
+        if (renamed && viewIndex < viewMask.size() && !viewMask[viewIndex])
+          continue;
+        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(view);
+        if (argument && argument.getOwner() == successor &&
+            (viewIndex >= viewMask.size() || !viewMask[viewIndex]))
+          continue;
+        mappedViews.push_back(view);
+      }
+      AffinePathState next{successor,   firstOperation(successor),
+                           nextToken,   nextRetained,
+                           std::move(mappedGroup),
+                           std::move(mappedStale),
+                           std::move(mappedPrevious),
+                           std::move(mappedViews),
+                           state.borrowedRetains,
+                           nextExceptional};
+      // Parked slot retains are keyed by the HOLDER's identity, so unlike
+      // group/stale/previous/views they need no rename across the edge: the
+      // container is the same allocation on both sides of it.
+      next.slotParents = std::move(nextSlotParents);
+      // Same reasoning as slotParents: the holder is the same allocation on
+      // both sides of the edge, so the charge crosses it unrenamed.
+      next.parkedUnnamed = std::min(state.parkedUnnamed, nextRetained);
+      // Follows `parkedUnnamed`: the ops it names are the charges that number
+      // counts, so an edge that keeps the charge must keep its provenance or
+      // the same retain would be charged again on the far side.
+      next.parkedOps = state.parkedOps;
+      next.conditionTag = remapGroupForSuccessor(op, index, successor,
+                                                 state.conditionTag, aliases);
+      next.trail = state.trail;
+      worklist.push_back(std::move(next));
+    }
+  };
   constexpr unsigned kMaxAffineStates = 20000;
+  // States the chain summary stood for without making them, counted against
+  // the same budget as the ones it made.
+  unsigned summarizedStates = 0;
   while (!worklist.empty()) {
     AffinePathState state = worklist.pop_back_val();
     if (visited.contains(state))
@@ -2509,7 +3045,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
     // finding, and any claim of the form "the affine verifier is green on X"
     // requires that X did not hit this cap.
     // tests/probe/seqlit_slot_retain_in_loop_str.py is the program that did.
-    if (visited.size() > kMaxAffineStates)
+    if (visited.size() + summarizedStates > kMaxAffineStates)
       return resource.producer->emitError()
              << "ownership CFG exploration exceeded " << kMaxAffineStates
              << " states (last: retained=" << state.retained
@@ -2553,8 +3089,47 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
                 "release, transfer, or owned return";
     }
 
+    // A run of a chain this state names nothing in: summarized (see
+    // OwnershipWalkCache's chains).
+    if (!verifierChainSummaryDisabled() && !ownershipPathTraceEnabled() &&
+        state.token == AffineTokenState::Owned && !state.group.empty() &&
+        state.start == firstOperation(state.block)) {
+      OwnershipWalkCache::ChainPosition at =
+          walk.chainPositionOf(state.block);
+      if (at.chain >= 0) {
+        bool unguardedCallsMatter =
+            modelMayRaiseUnwindExits && !resource.condition &&
+            !walk.aliasesAnyRoot(state.group, ambiguousRetainRoots);
+        unsigned end = walk.chainStop(state, at.chain, at.position,
+                                      unguardedCallsMatter);
+        if (end > at.position) {
+          llvm::SmallVector<unsigned, 8> runEnds;
+          walk.runEnds(at.chain, at.position, end, runEnds);
+          for (unsigned position : runEnds) {
+            mlir::Block *block = walk.chainBlock(at.chain, position);
+            for (mlir::Operation *marker : walk.markersOf(block))
+              pushMarkerHandler(marker, state);
+            mlir::Operation *terminator = block->getTerminator();
+            unsigned successors = terminator->getNumSuccessors();
+            // The run's last block hands on its last successor too: the
+            // state that leaves the summary, pushed last so the walk takes
+            // it next, as it would have.
+            pushSuccessors(terminator, state,
+                           position + 1 == end ? successors : successors - 1);
+          }
+          summarizedStates +=
+              walk.summarizedStateCount(at.chain, at.position, end);
+          continue;
+        }
+      }
+    }
+
     mlir::Operation *op = state.start;
     while (op) {
+      if (!verifierFastForwardDisabled() && !state.group.empty() &&
+          (state.token == AffineTokenState::Owned ||
+           state.token == AffineTokenState::Released))
+        op = walk.nextStop(state, op);
       // Executing an op REBINDS its results. A stale name among them was the
       // previous execution's moved token; this execution's value is a fresh
       // resource carrying a token of its own, so the name stops being stale
@@ -2786,67 +3361,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
           // that the unwind happens DURING the guarded call -- consume
           // effects of the guarded call apply on the edge, and its results
           // never materialize (a transfer is a plain release here).
-          if (mlir::Block *handler = walk.markerHandler(call)) {
-            AffinePathState next = state;
-            auto applyEdgeConsume = [&](mlir::func::CallOp consumer) {
-              if (!callConsumesGroup(contracts, consumer, next.group, aliases))
-                return;
-              if (next.token == AffineTokenState::Owned ||
-                  next.token == AffineTokenState::Conditional)
-                next.token = AffineTokenState::Released;
-              else if (next.retained > 0)
-                --next.retained;
-              else if (!next.slotParents.empty())
-                next.slotParents.pop_back();
-            };
-            // ⭐ AND A RETAIN THERE RUNS BEFORE THE UNWIND TOO. The argument
-            // for applying consumes on this edge is that everything between
-            // the marker and the guarded call has already executed when the
-            // unwind happens, and it does not distinguish direction: the
-            // retain a frame takes back before giving its exception away
-            //
-            //     held = ValueError("m")
-            //     try:
-            //         raise held
-            //     except ValueError as e: ...
-            //     print(str(held))
-            //
-            // sits exactly there, and dropping it made the handler path see a
-            // release with no token -- "released or transferred more than once
-            // on one CFG path" over a program whose refcounts balance.
-            auto applyEdgeRetain = [&](mlir::func::CallOp retainer) {
-              if (!callRetainsGroup(contracts, retainer, next.group, aliases))
-                return;
-              // A slot-absorption retain is parked against its container
-              // rather than counted here; only a plain token is credited.
-              if (retainer->hasAttr(own::kAggregateRetainAttr) &&
-                  !isBlockArgMergeBorrowRetain(retainer))
-                return;
-              // The same ceiling the borrowed walk uses, spelled here because
-              // this walk has no constant of its own.
-              if (next.retained < 64)
-                ++next.retained;
-            };
-            // Release helpers scheduled between the marker and the guarded
-            // call (a raise statement's dying locals) run BEFORE any unwind,
-            // so their consume effects apply on the exceptional edge just
-            // like the guarded call's own transfer.
-            mlir::func::CallOp guarded = walk.guardedCallAfterMarker(op);
-            for (mlir::Operation *between = op->getNextNode();
-                 between && guarded && between != guarded.getOperation();
-                 between = between->getNextNode())
-              if (auto betweenCall =
-                      mlir::dyn_cast<mlir::func::CallOp>(between)) {
-                applyEdgeRetain(betweenCall);
-                applyEdgeConsume(betweenCall);
-              }
-            if (guarded)
-              applyEdgeConsume(guarded);
-            next.block = handler;
-            next.start = firstOperation(handler);
-            next.exceptional = true;
-            worklist.push_back(std::move(next));
-          }
+          pushMarkerHandler(op, state);
           op = op->getNextNode();
           continue;
         }
@@ -3281,98 +3796,7 @@ mlir::LogicalResult verifyResourceOnCFGPaths(
       continue;
     }
 
-    AnchorTrueEdge anchor =
-        anchorTrueEdgeOf(walk, contracts, op, state, aliases);
-    for (unsigned index = 0; index < successors; ++index) {
-      mlir::Block *successor = op->getSuccessor(index);
-      AffineTokenState nextToken = state.token;
-      unsigned nextRetained = state.retained;
-      llvm::SmallVector<std::int64_t, 2> nextSlotParents = state.slotParents;
-      bool nextExceptional =
-          state.exceptional || (anchor.isVirtualUnwind && index == 0);
-      if (index == 0 && anchor.retainsBefore && nextRetained < 64)
-        nextRetained += anchor.retainsBefore;
-      if (anchor.consumesGroup && index == 0) {
-        if (nextToken == AffineTokenState::Owned ||
-            nextToken == AffineTokenState::Conditional)
-          nextToken = AffineTokenState::Released;
-        else if (nextRetained > 0)
-          --nextRetained;
-        else if (!nextSlotParents.empty())
-          nextSlotParents.pop_back();
-      }
-      llvm::SmallVector<bool, 4> mappedMask;
-      llvm::SmallVector<mlir::Value, 4> mappedGroup = remapGroupForSuccessor(
-          op, index, successor, state.group, aliases, &mappedMask);
-      bool fullyMapped =
-          llvm::all_of(mappedMask, [](bool mapped) { return mapped; });
-      if (!fullyMapped && nextToken == AffineTokenState::Released &&
-          groupContainsArgumentFromBlock(state.group, successor))
-        continue;
-      // Entering the successor redefines its block arguments: stale/previous
-      // entries naming them refer to the PREVIOUS iteration's token and drop.
-      llvm::SmallVector<mlir::Value, 4> mappedStale;
-      for (mlir::Value value : state.stale) {
-        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
-        if (!argument || argument.getOwner() != successor)
-          mappedStale.push_back(value);
-      }
-      bool renamed = llvm::any_of(mappedMask, [](bool m) { return m; });
-      llvm::SmallVector<mlir::Value, 4> mappedPrevious;
-      auto keepPreviousName = [&](mlir::Value value) {
-        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(value);
-        if (argument && argument.getOwner() == successor)
-          return; // re-entering the block redefines this name
-        if (!llvm::is_contained(mappedPrevious, value))
-          mappedPrevious.push_back(value);
-      };
-      for (mlir::Value value : state.previous)
-        keepPreviousName(value);
-      if (renamed)
-        for (mlir::Value value : state.group)
-          keepPreviousName(value);
-      // Views name the same object as the group, so they follow the same
-      // rename: a view left under its pre-edge name would be read as the
-      // previous iteration's token on the next trip round a loop. A view the
-      // edge does not forward has no name in the successor once the group was
-      // renamed, so it drops rather than lingering as a stale alias.
-      llvm::SmallVector<bool, 4> viewMask;
-      llvm::SmallVector<mlir::Value, 4> remappedViews = remapGroupForSuccessor(
-          op, index, successor, state.views, aliases, &viewMask);
-      llvm::SmallVector<mlir::Value, 4> mappedViews;
-      for (auto [viewIndex, view] : llvm::enumerate(remappedViews)) {
-        if (renamed && viewIndex < viewMask.size() && !viewMask[viewIndex])
-          continue;
-        auto argument = mlir::dyn_cast_if_present<mlir::BlockArgument>(view);
-        if (argument && argument.getOwner() == successor &&
-            (viewIndex >= viewMask.size() || !viewMask[viewIndex]))
-          continue;
-        mappedViews.push_back(view);
-      }
-      AffinePathState next{successor,   firstOperation(successor),
-                           nextToken,   nextRetained,
-                           std::move(mappedGroup),
-                           std::move(mappedStale),
-                           std::move(mappedPrevious),
-                           std::move(mappedViews),
-                           state.borrowedRetains,
-                           nextExceptional};
-      // Parked slot retains are keyed by the HOLDER's identity, so unlike
-      // group/stale/previous/views they need no rename across the edge: the
-      // container is the same allocation on both sides of it.
-      next.slotParents = std::move(nextSlotParents);
-      // Same reasoning as slotParents: the holder is the same allocation on
-      // both sides of the edge, so the charge crosses it unrenamed.
-      next.parkedUnnamed = std::min(state.parkedUnnamed, nextRetained);
-      // Follows `parkedUnnamed`: the ops it names are the charges that number
-      // counts, so an edge that keeps the charge must keep its provenance or
-      // the same retain would be charged again on the far side.
-      next.parkedOps = state.parkedOps;
-      next.conditionTag = remapGroupForSuccessor(op, index, successor,
-                                                 state.conditionTag, aliases);
-      next.trail = state.trail;
-      worklist.push_back(std::move(next));
-    }
+    pushSuccessors(op, state, successors);
   }
 
   return mlir::success();
