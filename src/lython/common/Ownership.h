@@ -557,6 +557,17 @@ bool groupMatchesOwnedReturnRange(
 // `contracts`, when given, names the callees: without it each call is resolved
 // by scanning the module's symbols.
 class FuncContractCache;
+
+// The strongly connected components of a graph on nodes 0..count-1, numbered
+// in the order Tarjan's walk completes them: every edge goes from a component
+// to itself or to a lower-numbered one, so `to` is reachable from `from` only
+// if component[from] >= component[to]. Iterative; `successors` appends a
+// node's successors to its vector argument.
+llvm::SmallVector<unsigned, 32> numberStronglyConnectedComponents(
+    unsigned count,
+    llvm::function_ref<void(unsigned, llvm::SmallVectorImpl<unsigned> &)>
+        successors);
+
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
                                 llvm::SmallVectorImpl<mlir::Value> &views,
                                 FuncContractCache *contracts = nullptr);

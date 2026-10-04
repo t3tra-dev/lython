@@ -84,11 +84,21 @@ py::ClassOp RuntimeBundleLowerer::classForContract(mlir::Type type) const {
   std::string contract = runtimeContractName(type);
   if (contract.empty())
     return {};
-  mlir::ModuleOp mutableModule =
-      const_cast<RuntimeBundleLowerer *>(this)->module;
+  // The module's own class ops, read once: none is made or erased while the
+  // lowering runs, and symbol names are unique, so a name that is not a class
+  // now is not one later.
+  // ⛔ Not SymbolTable::lookupSymbolIn per question: it scans the module's
+  // thousands of symbols, once for every value whose class is asked about.
+  if (!classesByName) {
+    classesByName.emplace();
+    mlir::ModuleOp mutableModule =
+        const_cast<RuntimeBundleLowerer *>(this)->module;
+    for (py::ClassOp classOp : mutableModule.getOps<py::ClassOp>())
+      classesByName->try_emplace(classOp.getSymName(), classOp);
+  }
   auto lookup = [&](llvm::StringRef name) -> py::ClassOp {
-    return mlir::dyn_cast_or_null<py::ClassOp>(
-        mlir::SymbolTable::lookupSymbolIn(mutableModule.getOperation(), name));
+    auto found = classesByName->find(name);
+    return found == classesByName->end() ? py::ClassOp() : found->second;
   };
   if (py::ClassOp classOp = lookup(contract))
     return classOp;

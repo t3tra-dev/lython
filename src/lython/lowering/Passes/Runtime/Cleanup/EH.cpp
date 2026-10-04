@@ -244,9 +244,38 @@ llvm::Constant *globalCStringPtr(llvm::IRBuilder<> &builder,
                                                       global, indices);
 }
 
+// The call-site ranges by caller, callee and line, each list in the order the
+// ranges were collected.
+// ⛔ Not the flat list: every converted call scanned all of it, calls x sites,
+// which made translation the fastest-growing phase of a long module body.
+class CallSiteIndex {
+public:
+  explicit CallSiteIndex(llvm::ArrayRef<PythonCallSiteRange> callSites) {
+    for (const PythonCallSiteRange &site : callSites)
+      sites[key(site.caller, site.callee, site.line)].push_back(&site);
+  }
+
+  llvm::ArrayRef<const PythonCallSiteRange *>
+  at(llvm::StringRef caller, llvm::StringRef callee, std::int32_t line) const {
+    auto found = sites.find(key(caller, callee, line));
+    if (found == sites.end())
+      return {};
+    return found->second;
+  }
+
+private:
+  static std::string key(llvm::StringRef caller, llvm::StringRef callee,
+                         std::int32_t line) {
+    return (caller + llvm::Twine('\0') + callee + llvm::Twine('\0') +
+            llvm::Twine(line))
+        .str();
+  }
+
+  llvm::StringMap<llvm::SmallVector<const PythonCallSiteRange *, 1>> sites;
+};
+
 const PythonCallSiteRange *
-matchCallSiteRange(llvm::CallInst &call,
-                   llvm::ArrayRef<PythonCallSiteRange> callSites,
+matchCallSiteRange(llvm::CallInst &call, const CallSiteIndex &callSites,
                    const llvm::DILocation &debugLoc) {
   llvm::Function *callee = call.getCalledFunction();
   if (!callee)
@@ -255,15 +284,13 @@ matchCallSiteRange(llvm::CallInst &call,
   llvm::StringRef callerName = call.getFunction()->getName();
   llvm::StringRef calleeName = callee->getName();
   const PythonCallSiteRange *lineMatch = nullptr;
-  for (const PythonCallSiteRange &site : callSites) {
-    if (callerName != site.caller || calleeName != site.callee)
-      continue;
-    if (site.line != static_cast<std::int32_t>(debugLoc.getLine()))
-      continue;
-    if (site.column == static_cast<std::int32_t>(debugLoc.getColumn()))
-      return &site;
+  for (const PythonCallSiteRange *site :
+       callSites.at(callerName, calleeName,
+                    static_cast<std::int32_t>(debugLoc.getLine()))) {
+    if (site->column == static_cast<std::int32_t>(debugLoc.getColumn()))
+      return site;
     if (!lineMatch)
-      lineMatch = &site;
+      lineMatch = site;
   }
   return lineMatch;
 }
@@ -545,7 +572,7 @@ llvm::BasicBlock *buildPythonCatchDispatchBlock(llvm::CallInst &call,
 // try's catch dispatch.
 bool convertCallToPythonInvoke(
     llvm::CallInst &call, const llvm::Triple &triple,
-    llvm::ArrayRef<PythonCallSiteRange> callSites,
+    const CallSiteIndex &callSites,
     llvm::function_ref<llvm::BasicBlock *(llvm::BasicBlock *,
                                           llvm::DILocation &)>
         buildUnwindDest) {
@@ -590,7 +617,7 @@ bool convertCallToPythonInvoke(
 
 bool convertCallToPythonInvoke(llvm::CallInst &call,
                                const llvm::Triple &triple,
-                               llvm::ArrayRef<PythonCallSiteRange> callSites) {
+                               const CallSiteIndex &callSites) {
   return convertCallToPythonInvoke(
       call, triple, callSites,
       [&](llvm::BasicBlock *normalDest, llvm::DILocation &debugLoc) {
@@ -635,8 +662,7 @@ bool rewriteTryCatchAnchor(llvm::CallInst &call) {
 
 bool convertCallToPythonTryInvoke(
     llvm::CallInst &call, const llvm::Triple &triple,
-    const PythonTryCallMarker &marker,
-    llvm::ArrayRef<PythonCallSiteRange> callSites) {
+    const PythonTryCallMarker &marker, const CallSiteIndex &callSites) {
   return convertCallToPythonInvoke(
       call, triple, callSites,
       [&](llvm::BasicBlock *, llvm::DILocation &debugLoc) {
@@ -918,7 +944,8 @@ void collectPythonCallSiteRanges(
 
 bool installPythonExceptionCleanupFrames(
     llvm::Module &module, const llvm::Triple &triple,
-    llvm::ArrayRef<PythonCallSiteRange> callSites) {
+    llvm::ArrayRef<PythonCallSiteRange> callSiteList) {
+  const CallSiteIndex callSites(callSiteList);
   llvm::SmallVector<llvm::CallInst *, 16> calls;
   llvm::SmallVector<llvm::CallInst *, 8> anchors;
   llvm::SmallVector<llvm::CallInst *, 16> callSiteMarkers;

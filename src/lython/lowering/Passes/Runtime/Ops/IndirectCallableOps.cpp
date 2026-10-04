@@ -30,7 +30,7 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
   if (!expected)
     return targets;
 
-  module.walk([&](mlir::func::FuncOp function) {
+  auto visitCandidate = [&](mlir::func::FuncOp function) {
     if (function.isDeclaration() || !function->hasAttr("callable_type"))
       return;
     if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
@@ -67,7 +67,15 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
         !findCallableAlternative(callableBundle, functionName))
       return;
 
-    if (!py::isAssignableTo(callable, expected, op.getOperation()))
+    // Asked once per pair of types: the answer reads the two types and the
+    // module's class hierarchy, which the lowering does not change, and the
+    // same function types meet the same expected type at every call site.
+    auto [assignable, fresh] =
+        callableAssignable.try_emplace({callable, expected}, false);
+    if (fresh)
+      assignable->second =
+          py::isAssignableTo(callable, expected, op.getOperation());
+    if (!assignable->second)
       return;
     if (!RuntimeBundleLowerer::collectCallableArgumentPlan(
             op, callable, /*emitErrors=*/false))
@@ -105,6 +113,18 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
     }
 
     targets.push_back(function);
+  };
+  // Every function, in module order, without entering their bodies: no
+  // function holds another, so this meets the functions module.walk did, in
+  // the same order.
+  // ⛔ Not module.walk: it visits every operation of every body, once per
+  // indirect call.
+  module->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation *op) {
+    if (auto function = mlir::dyn_cast<mlir::func::FuncOp>(op)) {
+      visitCandidate(function);
+      return mlir::WalkResult::skip();
+    }
+    return mlir::WalkResult::advance();
   });
 
   return targets;

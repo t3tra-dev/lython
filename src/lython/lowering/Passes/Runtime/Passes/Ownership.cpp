@@ -1554,6 +1554,54 @@ bool insertImmediateSuccessorReleases(FuncContractCache &contracts,
 // #succIndex. For cf.br the release is emitted before the branch (the branch's
 // only edge); for cf.cond_br the edge is split with a dedicated release block.
 // Returns false for unsupported terminators.
+// A region's exception edges and handler entries, collected once while a
+// phase runs that cannot change them. They are the blocks the EH markers sit
+// in, and the release phases only insert releases, retains and edge blocks --
+// never a marker, never a split of a block that holds one.
+// ⛔ Scoped to those phases, not kept for the pass: the unwind cleanup after
+// them adds markers and splits blocks, and a memo still live there would hand
+// it the edges of a CFG that no longer exists.
+struct RegionExceptionEdges {
+  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>> edges;
+  llvm::SmallPtrSet<mlir::Block *, 4> handlerEntries;
+};
+
+class ExceptionEdgeMemo {
+public:
+  ExceptionEdgeMemo() : previous(active) { active = this; }
+  ~ExceptionEdgeMemo() { active = previous; }
+  ExceptionEdgeMemo(const ExceptionEdgeMemo &) = delete;
+  ExceptionEdgeMemo &operator=(const ExceptionEdgeMemo &) = delete;
+
+  // The edges of `region`: from the memo when a phase holds one, otherwise
+  // collected into `local`.
+  static const RegionExceptionEdges &
+  of(mlir::Region *region, std::optional<RegionExceptionEdges> &local) {
+    if (active) {
+      auto found = active->regions.find(region);
+      if (found != active->regions.end())
+        return found->second;
+      return active->regions.insert({region, collect(region)}).first->second;
+    }
+    local.emplace(collect(region));
+    return *local;
+  }
+
+private:
+  static RegionExceptionEdges collect(mlir::Region *region) {
+    RegionExceptionEdges result;
+    result.edges = own::collectExceptionEdges(*region);
+    for (auto &entry : own::collectExceptionHandlerEntries(*region))
+      result.handlerEntries.insert(entry.second);
+    return result;
+  }
+
+  static thread_local ExceptionEdgeMemo *active;
+  ExceptionEdgeMemo *previous;
+  llvm::DenseMap<mlir::Region *, RegionExceptionEdges> regions;
+};
+thread_local ExceptionEdgeMemo *ExceptionEdgeMemo::active = nullptr;
+
 bool releaseOnTerminatorEdge(mlir::Operation *terminator, unsigned succIndex,
                              const own::ResourceGroup &group, mlir::Location loc,
                              bool ownsReference) {
@@ -2410,8 +2458,10 @@ bool releaseOwnedGroupByLiveness(
     liveIn[&block] = 0;
     liveOut[&block] = 0;
   }
-  llvm::DenseMap<mlir::Block *, llvm::SmallVector<mlir::Block *, 2>>
-      exceptionEdges = own::collectExceptionEdges(*region);
+  std::optional<RegionExceptionEdges> localExceptionEdges;
+  const RegionExceptionEdges &regionEdges =
+      ExceptionEdgeMemo::of(region, localExceptionEdges);
+  const auto &exceptionEdges = regionEdges.edges;
 
   // ⭐ A HANDLER THAT DOES NOT MATCH HANDS THE EXCEPTION FURTHER OUT, and the
   // handler it hands it to releases the same group on ITS OWN entry edge. Both
@@ -2438,9 +2488,8 @@ bool releaseOwnedGroupByLiveness(
   // but not live-out takes its release before its TERMINATOR, and a handler's
   // terminator is the kind test -- so the release would sit on the re-raising
   // arm as well, which is the same double free one block later.
-  llvm::SmallPtrSet<mlir::Block *, 4> handlerEntries;
-  for (auto &entry : own::collectExceptionHandlerEntries(*region))
-    handlerEntries.insert(entry.second);
+  const llvm::SmallPtrSet<mlir::Block *, 4> &handlerEntries =
+      regionEdges.handlerEntries;
   llvm::SmallPtrSet<mlir::Block *, 4> chainEndEntries;
   auto augmentedSuccessors = [&](mlir::Block *block,
                                  llvm::SmallVectorImpl<mlir::Block *> &out) {
@@ -4504,6 +4553,7 @@ struct UnwindCleanupAnalysis {
     for (auto &[block, successors] : exceptionEdges)
       for (mlir::Block *successor : successors)
         exceptionPreds[successor].push_back(block);
+    numberComponents();
 
     llvm::DenseMap<std::int64_t, mlir::Block *> handlers =
         own::collectExceptionHandlerEntries(fn.getBody());
@@ -4537,6 +4587,35 @@ struct UnwindCleanupAnalysis {
     if (found == blockIndex.end())
       return std::nullopt;
     return found->second;
+  }
+
+  // The strongly connected components of the numbered blocks, over successors
+  // and exception edges (own::numberStronglyConnectedComponents).
+  llvm::SmallVector<unsigned, 32> component;
+
+  void numberComponents() {
+    component = own::numberStronglyConnectedComponents(
+        static_cast<unsigned>(blocks.size()),
+        [&](unsigned at, llvm::SmallVectorImpl<unsigned> &out) {
+          mlir::Block *block = blocks[at];
+          for (mlir::Block *successor : block->getSuccessors())
+            if (std::optional<unsigned> index = indexOf(successor))
+              out.push_back(*index);
+          if (auto found = exceptionEdges.find(block);
+              found != exceptionEdges.end())
+            for (mlir::Block *successor : found->second)
+              if (std::optional<unsigned> index = indexOf(successor))
+                out.push_back(*index);
+        });
+  }
+
+  // No path at all from `from` to `to`, read off the component numbering:
+  // an edge never climbs to a higher component, so neither does a path.
+  // Avoiding a block and restricting the first hop only remove paths, so the
+  // answer holds for every reachability question below.
+  bool cannotReach(mlir::Block *from, mlir::Block *to) const {
+    std::optional<unsigned> source = indexOf(from), target = indexOf(to);
+    return source && target && component[*source] < component[*target];
   }
 
   // In `verify` mode: does the memoised answer match the walk's? Returns the
@@ -4597,6 +4676,15 @@ struct UnwindCleanupAnalysis {
                        mlir::Operation *fromAfter = nullptr) {
     if (mode == UnwindReachMode::Walk)
       return walkReachesAvoiding(from, to, avoid, fromAfter);
+    // ⛔ Not left to the set below: building it walks everything `from`
+    // reaches, and a point EARLIER in a long body asks that of every consume
+    // after it -- groups x blocks, most of a long module's unwind phase.
+    if (cannotReach(from, to)) {
+      if (mode == UnwindReachMode::Verify)
+        return agree(false, walkReachesAvoiding(from, to, avoid, fromAfter),
+                     "reaches-avoiding-component");
+      return false;
+    }
     std::optional<unsigned> target = indexOf(to);
     if (target && indexOf(from)) {
       const ReachSet &set = reachSetAvoiding(from, avoid, fromAfter);
@@ -4901,6 +4989,23 @@ TokenAtPoint groupTokenAtPoint(UnwindCleanupAnalysis &analysis,
     // the point without re-arming at defBlock carries the consumed state
     // (an unwind at a marker BEFORE the consume happens before it ran, so
     // those edges do not carry it).
+    //
+    // When the consume properly dominates the point and the definition
+    // dominates the consume, such a path exists: a simple path from the
+    // consume to the point that entered defBlock would, from there, need the
+    // consume again to reach the point (the consume dominates it, and
+    // defBlock is reached from the entry without the consume) -- a repeated
+    // block. Its first edge is a successor, which the first hop always takes.
+    // So the answer below is NotHeld, without the walk.
+    // ⛔ Only for a point the entry reaches: an unreachable block is
+    // dominated by everything and reached by nothing.
+    if (analysis.mode != UnwindReachMode::Walk &&
+        consume->getBlock() != pointBlock &&
+        analysis.indexOf(consume->getBlock()) && analysis.indexOf(pointBlock) &&
+        analysis.dominance.isReachableFromEntry(pointBlock) &&
+        analysis.dominance.dominates(defBlock, consume->getBlock()) &&
+        analysis.dominance.properlyDominates(consume, point))
+      return TokenAtPoint::NotHeld;
     if (!analysis.reachesAvoiding(consume->getBlock(), pointBlock, defBlock,
                                   consume))
       continue;
@@ -6084,11 +6189,86 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       // refused for a cleanup this pass declined to place.
       static const bool traceUnwindHold =
           std::getenv("LYTHON_TRACE_UNWIND_HOLD") != nullptr;
+      // Which groups cannot be held at a call, from block-level dominance
+      // alone: the definition's block does not properly dominate the call's,
+      // or a consume does the way groupTokenAtPoint's shortcut reads it. Both
+      // are answers it would give; this reads them off dominator-tree DFS
+      // intervals instead of asking per (call, group).
+      // ⛔ Not the whole test: the same-block cases need operation order and
+      // the rest need reachability, and those pairs still go to it.
+      struct DFSInterval {
+        unsigned in = 0, out = 0;
+      };
+      llvm::DominatorTreeBase<mlir::Block, false> *callTree = nullptr;
+      if (!region->hasOneBlock() && analysis.mode != UnwindReachMode::Walk) {
+        callTree = &analysis.dominance.getDomTree(region);
+        callTree->updateDFSNumbers();
+      }
+      auto intervalOf = [&](mlir::Block *block) -> std::optional<DFSInterval> {
+        if (!callTree || !analysis.indexOf(block))
+          return std::nullopt;
+        if (auto *node = callTree->getNode(block))
+          return DFSInterval{node->getDFSNumIn(), node->getDFSNumOut()};
+        return std::nullopt;
+      };
+      auto contains = [](DFSInterval outer, DFSInterval inner) {
+        return outer.in <= inner.in && inner.out <= outer.out;
+      };
+      struct CallPrefilter {
+        mlir::Block *defBlock = nullptr;
+        std::optional<DFSInterval> def;
+        llvm::SmallVector<std::pair<mlir::Block *, DFSInterval>, 2> killers;
+      };
+      llvm::SmallVector<CallPrefilter, 8> prefilters(groups.size());
+      if (callTree)
+        for (auto [at, group] : llvm::enumerate(groups)) {
+          if (group.skip || group.values.empty())
+            continue;
+          mlir::Value root = group.values.front();
+          mlir::Operation *producer = root.getDefiningOp();
+          CallPrefilter &filter = prefilters[at];
+          filter.defBlock =
+              producer ? producer->getBlock()
+                       : mlir::cast<mlir::BlockArgument>(root).getOwner();
+          filter.def = intervalOf(filter.defBlock);
+          if (!filter.def)
+            continue;
+          for (mlir::Operation *consume : group.consumeSites) {
+            if (consume->hasTrait<mlir::OpTrait::IsTerminator>() &&
+                consume->getNumSuccessors() != 0)
+              continue;
+            std::optional<DFSInterval> at = intervalOf(consume->getBlock());
+            if (at && contains(*filter.def, *at))
+              filter.killers.push_back({consume->getBlock(), *at});
+          }
+        }
+      auto cannotBeHeldAt = [&](unsigned at, mlir::Block *pointBlock) {
+        const CallPrefilter &filter = prefilters[at];
+        if (!filter.def)
+          return false;
+        std::optional<DFSInterval> point = intervalOf(pointBlock);
+        if (!point)
+          return false;
+        if (filter.defBlock != pointBlock && !contains(*filter.def, *point))
+          return true;
+        for (auto &[block, killer] : filter.killers)
+          if (block != pointBlock && contains(killer, *point))
+            return true;
+        return false;
+      };
       for (mlir::func::CallOp call : unguardedMayRaiseCalls) {
         UnwindCleanup cleanup{call, /*handler=*/nullptr, call.getOperation(),
                               {}};
-        for (const UnwindTrackedGroup &group : groups) {
+        for (auto [groupAt, group] : llvm::enumerate(groups)) {
           if (group.skip || !group.deallocator)
+            continue;
+          // A token not held at the call needs no cleanup whether or not the
+          // call consumes it, and the held test is the cheaper of the two.
+          // ⛔ Not reordered under the trace, which prints both in this order.
+          if (!traceUnwindHold &&
+              (cannotBeHeldAt(groupAt, call->getBlock()) ||
+               groupTokenAtPoint(analysis, group, call.getOperation(),
+                                 aliases) != TokenAtPoint::Held))
             continue;
           if (callConsumesGroup(contracts, call, group.values, aliases)) {
             if (traceUnwindHold)
@@ -6730,6 +6910,7 @@ public:
 
     {
       py::PerfScope perf("refcount-insertion.owned-result-releases");
+      ExceptionEdgeMemo exceptionEdges;
       for (mlir::func::CallOp call : calls) {
         if (mlir::failed(insertOwnedResultReleases(
                 module, call, contracts, deallocators, aliases, references,
@@ -6750,6 +6931,7 @@ public:
     }
     {
       py::PerfScope perf("refcount-insertion.local-object-releases");
+      ExceptionEdgeMemo exceptionEdges;
       for (mlir::Operation *op : localObjects) {
         if (mlir::failed(insertOwnedLocalObjectReleases(
                 module, op, contracts, deallocators, aliases,
@@ -6763,6 +6945,7 @@ public:
     llvm::SmallVector<own::ResourceGroup, 8> blockArgGroups;
     {
       py::PerfScope perf("refcount-insertion.block-argument-releases");
+      ExceptionEdgeMemo exceptionEdges;
       if (mlir::failed(insertOwnedBlockArgumentReleases(
               module, contracts, deallocators, aliases, references,
               symbolTable, &blockArgGroups))) {
