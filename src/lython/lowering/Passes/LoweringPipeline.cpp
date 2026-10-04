@@ -25,7 +25,13 @@
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
@@ -265,6 +271,80 @@ struct EHSafeCanonicalizer
 std::unique_ptr<Pass> createEHSafeCanonicalizerPass() {
   return std::make_unique<EHSafeCanonicalizer>();
 }
+
+namespace {
+
+// MLIR's convert-to-llvm in its static mode -- the patterns every loaded
+// dialect's ConvertToLLVMPatternInterface contributes, built once and
+// applied in one partial conversion -- except that the func dialect's are
+// handed a symbol table.
+//
+// ⛔ Not upstream's pass: its func patterns get none, so each call resolved
+// its callee by scanning the module, which after the runtime import holds
+// thousands of symbols -- calls x symbols, 1.3 s of a 128-case batch.
+// ⛔ And not convert-func-to-llvm ahead of it, which does take a table: a
+// second conversion orders the argument materializations differently and
+// gives them the function's location instead of their first use's.
+class SymbolTableConvertToLLVM
+    : public PassWrapper<SymbolTableConvertToLLVM, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SymbolTableConvertToLLVM)
+
+  StringRef getArgument() const final { return "lython-convert-to-llvm"; }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<LLVM::LLVMDialect>();
+    registerConvertToLLVMDependentDialectLoading(registry);
+  }
+
+  LogicalResult initialize(MLIRContext *context) override {
+    symbolTables = std::make_shared<SymbolTableCollection>();
+    target = std::make_shared<ConversionTarget>(*context);
+    typeConverter = std::make_shared<LLVMTypeConverter>(context);
+    target->addLegalDialect<LLVM::LLVMDialect>();
+    RewritePatternSet collected(context);
+    for (Dialect *dialect : context->getLoadedDialects()) {
+      // A dialect that promised the interface and was never given it has
+      // none, which is what upstream's release build reads it as.
+      // ⛔ Not left to dyn_cast: a build with assertions treats asking about
+      // an unfulfilled promise as a fatal error.
+      if (dialect->hasPromisedInterface(
+              dialect->getTypeID(),
+              ConvertToLLVMPatternInterface::getInterfaceID()))
+        continue;
+      auto *iface = dyn_cast<ConvertToLLVMPatternInterface>(dialect);
+      if (!iface)
+        continue;
+      if (isa<func::FuncDialect>(dialect)) {
+        populateFuncToLLVMConversionPatterns(*typeConverter, collected,
+                                             symbolTables.get());
+        continue;
+      }
+      iface->populateConvertToLLVMConversionPatterns(*target, *typeConverter,
+                                                     collected);
+    }
+    patterns = std::make_shared<FrozenRewritePatternSet>(std::move(collected));
+    return success();
+  }
+
+  void runOnOperation() override {
+    // Built for this module: the collection fills itself on first use.
+    symbolTables->invalidateSymbolTable(getOperation());
+    ConversionConfig config;
+    config.allowPatternRollback = true;
+    if (failed(applyPartialConversion(getOperation(), *target, *patterns,
+                                      config)))
+      signalPassFailure();
+  }
+
+private:
+  std::shared_ptr<SymbolTableCollection> symbolTables;
+  std::shared_ptr<ConversionTarget> target;
+  std::shared_ptr<LLVMTypeConverter> typeConverter;
+  std::shared_ptr<FrozenRewritePatternSet> patterns;
+};
+
+} // namespace
 
 LogicalResult requireNoAsyncDialectOps(ModuleOp module) {
   LogicalResult result = success();
@@ -571,7 +651,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
           pm.addPass(mlir::createArithToLLVMConversionPass());
           pm.addPass(mlir::createUBToLLVMConversionPass());
           pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-          pm.addPass(mlir::createConvertToLLVMPass());
+          pm.addPass(std::make_unique<SymbolTableConvertToLLVM>());
           pm.addPass(mlir::createReconcileUnrealizedCastsPass());
           pm.addNestedPass<mlir::func::FuncOp>(
               mlir::createReconcileUnrealizedCastsPass());

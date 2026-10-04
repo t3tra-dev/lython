@@ -7,6 +7,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ArmSME/IR/ArmSME.h"
 #include "mlir/Dialect/ArmSME/Transforms/Passes.h"
+#include "mlir/Dialect/ArmSME/Utils/Utils.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -62,9 +65,71 @@ void addSMEPreControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   pipeline.addPass(mlir::createCSEPass());
 }
 
+namespace {
+
+// convert-arm-sme-to-llvm, run on the functions that have something for it.
+// It allocates tiles first, which builds a Liveness of the whole function,
+// and everything it then rewrites is an ArmSME op or a value of a tile type
+// (its own TODO says as much: "return early if the function contains no
+// ArmSME ops").
+//
+// ⛔ Not run on every function: that is every runtime body and the whole
+// module function of the program, each paying a liveness analysis for
+// nothing -- 0.6 s of a 128-case batch.
+class ConvertArmSMEToLLVMWhereUsed
+    : public mlir::PassWrapper<ConvertArmSMEToLLVMWhereUsed,
+                               mlir::OperationPass<mlir::func::FuncOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertArmSMEToLLVMWhereUsed)
+
+  llvm::StringRef getArgument() const final {
+    return "lython-convert-arm-sme-to-llvm-where-used";
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    pipeline.getDependentDialects(registry);
+  }
+
+  ConvertArmSMEToLLVMWhereUsed() : pipeline("func.func") {
+    pipeline.addPass(mlir::createConvertArmSMEToLLVMPass());
+  }
+  ConvertArmSMEToLLVMWhereUsed(const ConvertArmSMEToLLVMWhereUsed &other)
+      : mlir::PassWrapper<ConvertArmSMEToLLVMWhereUsed,
+                          mlir::OperationPass<mlir::func::FuncOp>>(other),
+        pipeline(other.pipeline) {}
+
+  void runOnOperation() override {
+    mlir::func::FuncOp function = getOperation();
+    auto isTile = [](mlir::Type type) {
+      return mlir::arm_sme::isValidSMETileVectorType(type);
+    };
+    bool used = function
+                    .walk([&](mlir::Operation *op) {
+                      if (mlir::isa<mlir::arm_sme::ArmSMEDialect>(
+                              op->getDialect()) ||
+                          llvm::any_of(op->getResultTypes(), isTile) ||
+                          llvm::any_of(op->getOperandTypes(), isTile))
+                        return mlir::WalkResult::interrupt();
+                      for (mlir::Region &region : op->getRegions())
+                        for (mlir::Block &block : region)
+                          if (llvm::any_of(block.getArgumentTypes(), isTile))
+                            return mlir::WalkResult::interrupt();
+                      return mlir::WalkResult::advance();
+                    })
+                    .wasInterrupted();
+    if (used && mlir::failed(runPipeline(pipeline, function)))
+      signalPassFailure();
+  }
+
+private:
+  mlir::OpPassManager pipeline;
+};
+
+} // namespace
+
 void addSMEPostControlFlowLLVMPrepPipeline(mlir::OpPassManager &pipeline) {
   pipeline.addNestedPass<mlir::func::FuncOp>(
-      mlir::createConvertArmSMEToLLVMPass());
+      std::make_unique<ConvertArmSMEToLLVMWhereUsed>());
   pipeline.addPass(mlir::createCanonicalizerPass());
   pipeline.addPass(mlir::createCSEPass());
 }
