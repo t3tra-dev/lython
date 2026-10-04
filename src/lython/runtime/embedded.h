@@ -36,6 +36,21 @@ std::size_t extraModuleCount();
 // calls registerExtraModules with the pre-lowered runtime/lib artifacts.
 void registerPyRuntimeEmbeddedModules();
 
+// The native runtime already lowered and linked for one target at build time
+// (LythonNativeRuntimeBitcode): LLVM bitcode, and the triple and data layout
+// it was built for. lyc registers the one for its host; a compile for any
+// other target and data layout lowers the runtime itself, as it always did.
+struct PrecompiledNativeRuntime {
+  const char *triple;
+  const char *dataLayout;
+  const unsigned char *data;
+  std::size_t size;
+};
+void registerPrecompiledNativeRuntime(const PrecompiledNativeRuntime *runtime);
+const PrecompiledNativeRuntime *precompiledNativeRuntime();
+// Defined by the generated embedded_native_runtime.cpp linked into lyc only.
+void registerHostPrecompiledNativeRuntime();
+
 // Python stdlib modules shipped as SOURCE (runtime/lib/*.py, CPython's Lib/
 // counterpart). The import search resolves them after user files and before
 // module manifests; they compile with the user program like any source

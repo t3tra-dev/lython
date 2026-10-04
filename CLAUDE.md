@@ -37,7 +37,7 @@ uv run pyright
 ctest スイート (`LYTHON_BUILD_TESTS`, デフォルト ON)。CI (`.github/workflows/ci.yml`) も `ctest` を実行する:
 
 ```bash
-ctest --test-dir build -j8 --output-on-failure   # 全件 (767 件、91 s / RelWithDebInfo, -j14)
+ctest --test-dir build -j8 --output-on-failure   # 全件 (768 件、74 s / RelWithDebInfo, -j14)
 ctest --test-dir build -L fast                   # lowering を通らない層 (100 件、1.0 s)
 ctest --test-dir build -L emit                   # emitter を触ったとき
 ctest --test-dir build -LE bench                 # 実行律速のベンチを除く
@@ -107,6 +107,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_DUMP_ON_FAILURE=1` — lowering フェーズが失敗したとき、そのフェーズ終了時点のモジュールを stderr にダンプする (`LYTHON_IR_DUMP` は成功したフェーズの後にしか出力しないので、壊れた IR を作ったフェーズ自身の出力はこれでしか見えない)
 - `LYTHON_DUMP_LOCS=1` — `LYTHON_DUMP_ON_FAILURE` のダンプに各 op の source location を付ける (location しか持たない診断が、どの op を指しているかを探すため)
 - `LYTHON_PERF=1` — フェーズごとの wall time を出力
+- `LYTHON_ABLATE_PRECOMPILED_RUNTIME=1` — ビルド時にホスト向けに事前コンパイルして lyc に埋め込んだネイティブランタイム (`LythonNativeRuntimeBitcode`) を使わず、コンパイルのたびに下げる。両者が同じモジュールであることを `lyc.precompiled_runtime_is_the_lowered_runtime` が検査する
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ

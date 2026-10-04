@@ -1,5 +1,7 @@
 #include "Common/RuntimeLibrary.h"
 
+#include "Common/Instrumentation.h"
+
 #include "Common/LibcPrototypes.h"
 
 #include "Common/RuntimeSupport.h"
@@ -43,6 +45,8 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
@@ -53,6 +57,7 @@
 #define GET_OP_CLASSES
 #include "PyOps.h.inc"
 
+#include <cstdlib>
 #include <memory>
 
 namespace py::runtime_library {
@@ -62,6 +67,15 @@ namespace {
 const Module *g_extraModules = nullptr;
 std::size_t g_extraModuleCount = 0;
 } // namespace
+
+const PrecompiledNativeRuntime *g_precompiledNativeRuntime = nullptr;
+
+void registerPrecompiledNativeRuntime(const PrecompiledNativeRuntime *runtime) {
+  g_precompiledNativeRuntime = runtime;
+}
+const PrecompiledNativeRuntime *precompiledNativeRuntime() {
+  return g_precompiledNativeRuntime;
+}
 
 void registerExtraModules(const Module *extra, std::size_t count) {
   g_extraModules = extra;
@@ -325,7 +339,12 @@ mlir::LogicalResult lowerNativeRuntimeModule(mlir::ModuleOp module) {
 
 } // namespace
 
-mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
+// The ctypes symbols the runtime declares, carried from the build of the
+// runtime module to the program's link.
+constexpr llvm::StringLiteral kCtypesSymbolsMetadata{
+    "lython.native_runtime.ctypes_symbols"};
+
+mlir::LogicalResult buildNativeRuntimeModule(llvm::Module &llvmModule) {
   llvm::Triple targetTriple(llvmModule.getTargetTriple());
   bool sawPlatformNativeSupport = false;
   bool linkedPlatformNativeSupport = false;
@@ -418,18 +437,82 @@ mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
     if (mlir::failed(linkEntry(embedded::extraModules()[index])))
       return mlir::failure();
 
+  if (sawPlatformNativeSupport && !linkedPlatformNativeSupport) {
+    llvm::errs() << "error: no embedded native runtime support module matches "
+                 << targetTriple.str() << "\n";
+    return mlir::failure();
+  }
+  llvm::NamedMDNode *carried =
+      llvmModule.getOrInsertNamedMetadata(kCtypesSymbolsMetadata);
+  for (const std::string &symbol : ctypesSymbols)
+    carried->addOperand(llvm::MDNode::get(
+        llvmModule.getContext(),
+        llvm::MDString::get(llvmModule.getContext(), symbol)));
+  return mlir::success();
+}
+
+mlir::LogicalResult linkEmbeddedNativeRuntime(llvm::Module &llvmModule) {
+  llvm::Triple targetTriple(llvmModule.getTargetTriple());
+  std::unique_ptr<llvm::Module> runtime;
+  // The build's, when it was made for exactly this target and layout.
+  //
+  // LYTHON_ABLATE_PRECOMPILED_RUNTIME=1 lowers the runtime here instead.
+  // ⛔ Not left out: both arms link the same module built the same way, so
+  // their IR must be identical byte for byte, and that is only evidence when
+  // one binary produces both -- a separate build re-proves the build.
+  static const bool ablated = [] {
+    const char *value = std::getenv("LYTHON_ABLATE_PRECOMPILED_RUNTIME");
+    return value && *value && llvm::StringRef(value) != "0";
+  }();
+  if (const embedded::PrecompiledNativeRuntime *precompiled =
+          embedded::precompiledNativeRuntime();
+      !ablated && precompiled &&
+      llvmModule.getTargetTriple().str() == precompiled->triple &&
+      llvmModule.getDataLayoutStr() == precompiled->dataLayout) {
+    PerfScope perf("link-runtime.precompiled");
+    llvm::Expected<std::unique_ptr<llvm::Module>> parsed =
+        llvm::parseBitcodeFile(
+            llvm::MemoryBufferRef(
+                llvm::StringRef(
+                    reinterpret_cast<const char *>(precompiled->data),
+                    precompiled->size),
+                "lython-native-runtime"),
+            llvmModule.getContext());
+    if (!parsed) {
+      llvm::errs() << "error: the precompiled native runtime does not parse: "
+                   << llvm::toString(parsed.takeError()) << "\n";
+      return mlir::failure();
+    }
+    runtime = std::move(*parsed);
+  } else {
+    PerfScope perf("link-runtime.lowered");
+    runtime = std::make_unique<llvm::Module>("lython-native-runtime",
+                                             llvmModule.getContext());
+    runtime->setTargetTriple(llvmModule.getTargetTriple());
+    runtime->setDataLayout(llvmModule.getDataLayout());
+    if (mlir::failed(buildNativeRuntimeModule(*runtime)))
+      return mlir::failure();
+  }
+
+  llvm::SmallVector<std::string, 8> ctypesSymbols;
+  if (llvm::NamedMDNode *carried =
+          runtime->getNamedMetadata(kCtypesSymbolsMetadata)) {
+    for (llvm::MDNode *entry : carried->operands())
+      ctypesSymbols.push_back(
+          llvm::cast<llvm::MDString>(entry->getOperand(0))->getString().str());
+    runtime->eraseNamedMetadata(carried);
+  }
+  if (llvm::Linker::linkModules(llvmModule, std::move(runtime))) {
+    llvm::errs() << "error: failed to link the native runtime\n";
+    return mlir::failure();
+  }
+
   py::branchLocalRaisesToTheirHandler(llvmModule);
   for (const std::string &symbol : ctypesSymbols)
     if (llvm::Function *function = llvmModule.getFunction(symbol))
       function->addFnAttr(kCtypesForeignSymbolAttr);
   if (py::runtime_library::framePointersEnableCompactUnwind(targetTriple))
     py::forceFramePointers(llvmModule);
-
-  if (sawPlatformNativeSupport && !linkedPlatformNativeSupport) {
-    llvm::errs() << "error: no embedded native runtime support module matches "
-                 << targetTriple.str() << "\n";
-    return mlir::failure();
-  }
   return mlir::success();
 }
 

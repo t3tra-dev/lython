@@ -442,9 +442,12 @@ file(GLOB LYTHON_GOLDEN_CASES CONFIGURE_DEPENDS
 # below as before. Measured on a Debug build, 518 eligible cases: 1560 s of
 # test time alone, 749 s in batches of six.
 #
-# Why six: the batch is one module-level function, and the ownership phases
-# grow faster than linearly in its size. Per case: 1.07 s at two, 0.64 s at
-# four, 0.68 s at eight, 0.99 s at twenty-five.
+# Why six: the batch is one module-level function, and the compile still grows
+# faster than linearly in its size -- LLVM's code generation of that one
+# function, and the ownership phases' per-group work. Per case on a Debug
+# build: 0.49 s at four, 0.47 at eight, 0.39 at sixteen, 0.63 at thirty-two;
+# release is flat between eight and sixteen. The whole suite measured 147 s at
+# six and 163 s at twelve (Debug), 74 s and 71 s (RelWithDebInfo).
 #
 # OFF registers every case alone, the way to rerun one by name; a failing
 # batch also prints the command that runs the failing case alone.
@@ -528,6 +531,25 @@ add_test(NAME "abi.handle_width_reservations"
         "${CMAKE_SOURCE_DIR}")
 set_tests_properties("abi.handle_width_reservations" PROPERTIES
     TIMEOUT 60 LABELS "abi;fast")
+
+# --- Precompiled native runtime ----------------------------------------------
+#
+# lyc links a native runtime precompiled for the build machine instead of
+# lowering it on every compile (tools/CMakeLists.txt). This compiles programs
+# with it and with it ablated, and requires the same module both ways and the
+# precompiled path actually taken -- the fallback is silent by design, so a
+# stale or mismatched embedding would otherwise only show as a slower lyc.
+# One program per surface the runtime link carries: plain, ctypes symbols, and
+# the exception handling the link rewires.
+add_test(NAME "lyc.precompiled_runtime_is_the_lowered_runtime"
+    COMMAND Python3::Interpreter
+        "${CMAKE_CURRENT_SOURCE_DIR}/precompiled_runtime_check.py"
+        $<TARGET_FILE:lyc>
+        "${CMAKE_SOURCE_DIR}/examples/hello.py"
+        "${CMAKE_SOURCE_DIR}/examples/ctypes_struct.py"
+        "${CMAKE_SOURCE_DIR}/examples/try_finally.py")
+set_tests_properties("lyc.precompiled_runtime_is_the_lowered_runtime"
+    PROPERTIES TIMEOUT 600 LABELS "lower")
 
 # --- Leak gate ---------------------------------------------------------------
 #

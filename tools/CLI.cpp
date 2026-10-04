@@ -1191,6 +1191,7 @@ int main(int argc, char **argv) {
   // Pre-lowered runtime-internal lib modules (generated
   // embedded_lib_internal.cpp) join the native runtime link set.
   py::runtime_library::embedded::registerPyRuntimeEmbeddedModules();
+  py::runtime_library::embedded::registerHostPrecompiledNativeRuntime();
   llvm::cl::SetVersionPrinter(
       [](llvm::raw_ostream &os) { os << "Lython CLI based on MLIR\n"; });
   bool releaseModeFromArgv = false;
