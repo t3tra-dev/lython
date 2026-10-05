@@ -200,6 +200,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWasmModuleDefinesTheUnwinderItUses"
     "DriverTest.AnErasedGeneratorBodyLeavesNoTryIdBehind"
     "DriverTest.IndirectCallsOfOneShapeShareOneDispatcher"
+    "DriverTest.AnExecutableKeepsOnlyItsEntryExternal"
+    "DriverTest.AJsHostExecutableKeepsItsExportsExternal"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"
@@ -1042,8 +1044,23 @@ function(lython_add_agreement_case kind case_name)
         TIMEOUT 360 LABELS "e2e;${suite}")
 endfunction()
 
+# `oz` builds the executable with -Oz: every function minsize and optsize, the
+# goal that changes the most code. Members by mechanism again: the floor,
+# invokes and landing pads, the coroutine lowering, method symbols, and a
+# traceback printed through frames -- what an inliner that now prefers calls,
+# and an outliner, could reorder or merge.
+set(LYTHON_OZ_AGREEMENT_CASES
+    hello
+    dict_iteration_views
+    generator_close_finally
+    class_protocol
+    errors/traceback_nested_call)
+
 foreach(case_name IN LISTS LYTHON_AOT_AGREEMENT_CASES)
     lython_add_agreement_case(aot "${case_name}" --aot)
+endforeach()
+foreach(case_name IN LISTS LYTHON_OZ_AGREEMENT_CASES)
+    lython_add_agreement_case(oz "${case_name}" --goal Oz)
 endforeach()
 foreach(case_name IN LISTS LYTHON_RELEASE_AGREEMENT_CASES)
     lython_add_agreement_case(release "${case_name}" --release)
@@ -1141,6 +1158,12 @@ if(LYTHON_WASMTIME AND LYTHON_WASI_SYSROOT)
     foreach(case_name IN LISTS LYTHON_WASI_AGREEMENT_CASES)
         lython_add_agreement_case(wasi "${case_name}"
             --wasmtime "${LYTHON_WASMTIME}")
+    endforeach()
+    # The size goal is for this target above all; -Oz under wasmtime too.
+    foreach(case_name IN ITEMS hello errors/traceback_nested_call
+            errors/an_indirect_call_keeps_its_frames_through_a_dispatcher)
+        lython_add_agreement_case(wasi-oz "${case_name}"
+            --wasmtime "${LYTHON_WASMTIME}" --goal Oz)
     endforeach()
 else()
     message(STATUS "Lython: wasi agreement stage skipped (wasmtime: "

@@ -10,6 +10,7 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/IPO/Internalize.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -210,6 +211,23 @@ LogicalResult installAOTEntryPoint(llvm::Module &llvmModule,
   builder.CreateCall(initArgs, {main->getArg(0), main->getArg(1)});
   llvm::CallInst *status = builder.CreateCall(runner, {entryThunk});
   builder.CreateRet(status);
+
+  // The executable is this module plus the C library, and the library calls
+  // into it only through the C entry; a JavaScript host calls the functions
+  // marked for export. Everything else becomes internal, which is what lets
+  // the optimizer drop a runtime function nothing calls and specialize one
+  // called from a single place, instead of keeping every definition for a
+  // caller that cannot exist.
+  // ⛔ Not left to the linker's --gc-sections: it drops what is unreachable,
+  // but only after code generation, and it cannot inline, propagate
+  // constants into, or delete the arms of a function it must keep callable
+  // from outside.
+  llvm::internalizeModule(llvmModule, [&](const llvm::GlobalValue &value) {
+    if (value.getName() == entryName)
+      return true;
+    auto *function = llvm::dyn_cast<llvm::Function>(&value);
+    return function && function->hasFnAttribute("wasm-export-name");
+  });
   return success();
 }
 
