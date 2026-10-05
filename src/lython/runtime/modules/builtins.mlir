@@ -10938,8 +10938,8 @@ module attributes {
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
-  // Printability query implemented beside the UCD tables
-  // (runtime/modules/unicodedata.mlir).
+  // Printability query generated beside the UCD tables
+  // (runtime/modules/_ucd.mlir).
   func.func private @__ly_ucd_is_printable(%cp: i64) -> i1
 
   // Repr expansion width in characters for a code point that is neither the
