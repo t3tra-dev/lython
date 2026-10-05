@@ -131,7 +131,7 @@ def cross_run_from(args: argparse.Namespace) -> "CrossRun | None":
 
 def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
             env: "dict[str, str]", release: bool,
-            cross: "CrossRun | None" = None
+            cross: "CrossRun | None" = None, goal: "str | None" = None
             ) -> "subprocess.CompletedProcess[str] | None":
     """Build an executable, then run it. Failure to BUILD is returned as the
     result, so the caller reports it as this case failing rather than as a
@@ -142,6 +142,8 @@ def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
         command = [str(lyc), str(case)]
         if release:
             command.append("--release")
+        if goal:
+            command.append(f"-{goal}")
         if cross:
             command += ["--target", cross.target, *cross.flags]
         command += ["-o", str(binary)]
@@ -164,7 +166,7 @@ def run_aot(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
 
 def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
             perf: bool, aot: bool = False, release: bool = False,
-            cross: "CrossRun | None" = None
+            cross: "CrossRun | None" = None, goal: "str | None" = None
             ) -> "subprocess.CompletedProcess[str] | None":
     env = dict(os.environ)
     if perf:
@@ -172,7 +174,7 @@ def run_lyc(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
     else:
         env.pop("LYTHON_PERF", None)
     if aot or cross:
-        return run_aot(lyc, case, timeout, env, release, cross)
+        return run_aot(lyc, case, timeout, env, release, cross, goal)
     try:
         # stdin=DEVNULL, not inherited: a case calling input() blocks until its
         # stdin reaches EOF, and whether the ambient stdin ever does is a
@@ -224,14 +226,15 @@ def fail(message: str, stdout: str, stderr: str, where: str = "") -> int:
 
 def report_reached_layer(lyc: pathlib.Path, case: pathlib.Path, timeout: float,
                          aot: bool = False, release: bool = False,
-                         cross: "CrossRun | None" = None) -> None:
+                         cross: "CrossRun | None" = None,
+                         goal: "str | None" = None) -> None:
     """Say which stage the compiler reached, so a red test localizes itself.
 
     The re-run repeats the MODE as well as the case: a JIT re-run of an --aot
     failure would report a stage the failing run never went through.
     """
     result = run_lyc(lyc, case, timeout, perf=True, aot=aot, release=release,
-                     cross=cross)
+                     cross=cross, goal=goal)
     if result is None:
         print("--- reached layer: unknown, the LYTHON_PERF re-run timed out",
               file=sys.stderr)
@@ -258,6 +261,8 @@ def main() -> int:
                         default=None)
     parser.add_argument("--aot", action="store_true")
     parser.add_argument("--release", action="store_true")
+    # What the executable is optimized for (lyc -O2/-Os/-Oz); implies --aot.
+    parser.add_argument("--goal", choices=["O2", "Os", "Oz"], default=None)
     parser.add_argument("--wasm-node", type=pathlib.Path, default=None)
     parser.add_argument("--wasmtime", type=pathlib.Path, default=None)
     parser.add_argument("case", type=pathlib.Path)
@@ -268,8 +273,9 @@ def main() -> int:
     # nonzero, so ctest labels the run "Failed" exactly like a wrong-output
     # case and the report gives no hint that the budget was the cause.
     result = run_lyc(args.lyc, args.case, args.timeout,
-                     perf=args.expect_layer is not None, aot=args.aot,
-                     release=args.release, cross=cross)
+                     perf=args.expect_layer is not None,
+                     aot=args.aot or args.goal is not None,
+                     release=args.release, cross=cross, goal=args.goal)
     if result is None:
         # Why no layer report here: the re-run would spend the same budget
         # over again and end the same way.
@@ -288,8 +294,9 @@ def main() -> int:
         code = fail(message, stdout, stderr, where)
         if args.expect_layer is None:
             report_reached_layer(args.lyc, args.case, args.timeout,
-                                 aot=args.aot, release=args.release,
-                                 cross=cross)
+                                 aot=args.aot or args.goal is not None,
+                                 release=args.release, cross=cross,
+                                 goal=args.goal)
         else:
             print(f"--- reached layer: {reached}", file=sys.stderr)
         return code

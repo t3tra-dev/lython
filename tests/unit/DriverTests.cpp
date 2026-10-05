@@ -176,6 +176,60 @@ TEST(DriverTest, InstallsAOTEntryPointBesideAPythonMain) {
   EXPECT_FALSE(pythonMain->use_empty());
 }
 
+// What: once the AOT entry point is installed, the C entry is the only
+// definition the module still shows to the linker; every other function and
+// global is internal to the module.
+TEST(DriverTest, AnExecutableKeepsOnlyItsEntryExternal) {
+  CompileResult result = compileSource("def twice(x: int) -> int:\n"
+                                       "    return x * 2\n"
+                                       "\n"
+                                       "print(twice(21))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Module &module = *result.verified.llvmModule;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(
+      lython::driver::installAOTEntryPoint(module, diag)))
+      << diagnostics;
+  for (const llvm::GlobalValue &value : module.global_values())
+    if (!value.isDeclaration() && value.getName() != "main")
+      EXPECT_TRUE(value.hasLocalLinkage()) << value.getName().str();
+  const llvm::Function *entry = module.getFunction("main");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_FALSE(entry->hasLocalLinkage());
+}
+
+// What: a function the JavaScript host calls by its export name stays
+// external when the executable's other definitions become internal, and the
+// wasm C entry keeps the name wasi-libc's startup calls.
+TEST(DriverTest, AJsHostExecutableKeepsItsExportsExternal) {
+  lython::driver::DriverOptions options;
+  options.targetTriple = "wasm32-wasip1";
+  options.jsHost = true;
+  CompileResult result = compileSource(
+      "import js\n"
+      "from js import console\n\n\n"
+      "def later() -> None:\n"
+      "    console.log(2)\n\n\n"
+      "js.queueMicrotask(later)\n",
+      options);
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  llvm::Module &module = *result.verified.llvmModule;
+  // lyc sets the target before it installs the entry, which names it by it.
+  module.setTargetTriple(llvm::Triple("wasm32-unknown-wasip1"));
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  ASSERT_TRUE(mlir::succeeded(
+      lython::driver::installAOTEntryPoint(module, diag)))
+      << diagnostics;
+  for (llvm::StringRef name : {"LyJs_Dispatch", "__main_argc_argv"}) {
+    const llvm::Function *function = module.getFunction(name);
+    ASSERT_NE(function, nullptr) << name.str();
+    EXPECT_FALSE(function->isDeclaration()) << name.str();
+    EXPECT_FALSE(function->hasLocalLinkage()) << name.str();
+  }
+}
+
 TEST(DriverTest, ReportsParseErrorDiagnostics) {
   CompileResult result = compileSource("def broken(:\n");
   EXPECT_FALSE(result.succeeded);

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,40 @@ TEST(UnicodeTablesTest, CategoriesMatchCPython) {
   EXPECT_EQ(categoryOf(0x1F600), "So");  // emoji
   EXPECT_EQ(categoryOf(0x0378), "Cn");   // unassigned
   EXPECT_EQ(categoryOf(0x110000), "Cn"); // out of range -> default record
+}
+
+// The bound search __ly_ucd_is_printable runs, over the same table.
+bool printableByBounds(std::int64_t cp) {
+  std::size_t lo = 0;
+  std::size_t hi = std::size(kPrintableBounds);
+  while (lo < hi) {
+    std::size_t mid = (lo + hi) / 2;
+    if (kPrintableBounds[mid] <= cp)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo % 2 == 1;
+}
+
+// What: for every code point, and on both sides of the range, the printable
+// bounds str's repr reads say what the category table says -- CPython's
+// Py_UNICODE_ISPRINTABLE: not Cn, Zs, Zl, Zp, Cc, Cf, Cs or Co, except SPACE.
+TEST(UnicodeTablesTest, PrintableBoundsAgreeWithCategories) {
+  for (char32_t cp = 0; cp < 0x110000; ++cp) {
+    const std::string category = categoryOf(cp);
+    const bool expected =
+        cp == U' ' || !(category == "Cn" || category == "Zs" ||
+                        category == "Zl" || category == "Zp" ||
+                        category == "Cc" || category == "Cf" ||
+                        category == "Cs" || category == "Co");
+    ASSERT_EQ(printableByBounds(cp), expected)
+        << "U+" << std::hex << static_cast<std::uint32_t>(cp);
+  }
+  EXPECT_FALSE(printableByBounds(0x110000));
+  EXPECT_FALSE(printableByBounds(-1));
+  EXPECT_TRUE(printableByBounds(0x3042));   // HIRAGANA LETTER A
+  EXPECT_FALSE(printableByBounds(0x00A0)); // NO-BREAK SPACE, Zs
 }
 
 TEST(UnicodeTablesTest, NumericPropertiesMatchCPython) {

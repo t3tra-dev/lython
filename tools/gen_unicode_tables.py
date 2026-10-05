@@ -43,6 +43,12 @@ Flag bits (keep in sync with unicodedata.mlir and UnicodeTablesTests.cpp):
 
 Category enum order matches CPython's _PyUnicode_CategoryNames so indices
 stay recognizable: Cn=0 ... Co=29.
+
+  * printable bounds: the code points where str.isprintable flips, ascending,
+    starting with the first printable one. A code point is printable when an
+    odd number of bounds are <= it. This is the one property str's repr
+    reads, so it is a table of its own: a repr that needs nothing else from
+    the database links 5.9 KB instead of the 87 KB of the info tables.
 """
 
 from __future__ import annotations
@@ -369,6 +375,20 @@ def build() -> dict:
     assert ctype_records[default_ctype] == (0, 0, 0, 0, -1, -1, 0)
     assert info_records[default_info] == (0, -1)
 
+    # CPython's Py_UNICODE_ISPRINTABLE: every category but Cn, Zs, Zl, Zp,
+    # Cc, Cf, Cs and Co, with U+0020 SPACE printable besides.
+    unprintable = {"Cn", "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co"}
+    printable_bounds: list[int] = []
+    state = False
+    for cp, entry in enumerate(table):
+        printable = cp == 0x20 or entry.category not in unprintable
+        if printable != state:
+            printable_bounds.append(cp)
+            state = printable
+    # Ends unprintable (U+10FFFF is a noncharacter), so a code point past the
+    # last bound, or past the range, counts an even number and is refused.
+    assert not state and len(printable_bounds) % 2 == 0
+
     ctype_index1, ctype_index2 = two_stage(ctype_ids)
     info_index1, info_index2 = two_stage(info_ids)
     assert len(ctype_records) < (1 << 16) and len(info_records) < (1 << 16)
@@ -385,6 +405,7 @@ def build() -> dict:
         "ext_case": pool.values,
         "default_ctype": default_ctype,
         "default_info": default_info,
+        "printable_bounds": printable_bounds,
     }
 
 
@@ -473,6 +494,52 @@ def two_stage_accessor(
     return "".join(lines)
 
 
+def printable_accessor(bounds: int) -> str:
+    """str.isprintable for one code point: ASCII by its range, the rest by
+    binary search for how many printable bounds are <= it."""
+    ty = f"memref<{bounds}xi32>"
+    return "".join([
+        "  // Printability per CPython str.isprintable / repr.\n",
+        "  func.func private @__ly_ucd_is_printable(%cp: i64) -> i1 {\n",
+        "    %c0 = arith.constant 0 : i64\n",
+        "    %c1 = arith.constant 1 : i64\n",
+        "    %space = arith.constant 32 : i64\n",
+        "    %del = arith.constant 127 : i64\n",
+        "    %ascii_limit = arith.constant 128 : i64\n",
+        "    %ascii = arith.cmpi ult, %cp, %ascii_limit : i64\n",
+        "    %printable = scf.if %ascii -> (i1) {\n",
+        "      %ge_space = arith.cmpi uge, %cp, %space : i64\n",
+        "      %lt_del = arith.cmpi ult, %cp, %del : i64\n",
+        "      %visible = arith.andi %ge_space, %lt_del : i1\n",
+        "      scf.yield %visible : i1\n",
+        "    } else {\n",
+        f"      %count = arith.constant {bounds} : i64\n",
+        f"      %table = memref.get_global @__ly_ucd_printable_bounds : {ty}\n",
+        "      %found:2 = scf.while (%lo = %c0, %hi = %count) : (i64, i64) -> (i64, i64) {\n",
+        "        %more = arith.cmpi slt, %lo, %hi : i64\n",
+        "        scf.condition(%more) %lo, %hi : i64, i64\n",
+        "      } do {\n",
+        "      ^bb0(%l: i64, %h: i64):\n",
+        "        %sum = arith.addi %l, %h : i64\n",
+        "        %mid = arith.shrui %sum, %c1 : i64\n",
+        "        %mid_index = arith.index_cast %mid : i64 to index\n",
+        f"        %raw = memref.load %table[%mid_index] : {ty}\n",
+        "        %bound = arith.extui %raw : i32 to i64\n",
+        "        %at_or_below = arith.cmpi sle, %bound, %cp : i64\n",
+        "        %after = arith.addi %mid, %c1 : i64\n",
+        "        %next_lo = arith.select %at_or_below, %after, %l : i64\n",
+        "        %next_hi = arith.select %at_or_below, %h, %mid : i64\n",
+        "        scf.yield %next_lo, %next_hi : i64, i64\n",
+        "      }\n",
+        "      %parity = arith.andi %found#0, %c1 : i64\n",
+        "      %odd = arith.cmpi ne, %parity, %c0 : i64\n",
+        "      scf.yield %odd : i1\n",
+        "    }\n",
+        "    func.return %printable : i1\n",
+        "  }\n",
+    ])
+
+
 def emit_mlir(data: dict, path: Path) -> None:
     ctype_flat = [value for record in data["ctype_records"] for value in record]
     info_flat = [value for record in data["info_records"] for value in record]
@@ -497,6 +564,8 @@ def emit_mlir(data: dict, path: Path) -> None:
         mlir_global("__ly_ucd_ext_case", ext_values, "i32"),
         mlir_f64_global("__ly_ucd_numeric_values", numeric_values),
         mlir_global("__ly_ucd_category_names", category_chars, "i8"),
+        mlir_global("__ly_ucd_printable_bounds", data["printable_bounds"],
+                    "i32"),
         "\n",
         "  // (upper, lower, fold, title, decimal, digit, flags) for a code\n",
         "  // point; out-of-range values resolve to the unassigned (Cn)\n",
@@ -546,6 +615,8 @@ def emit_mlir(data: dict, path: Path) -> None:
         "    %value = arith.extui %raw : i8 to i64\n",
         "    func.return %value : i64\n",
         "  }\n",
+        "\n",
+        printable_accessor(len(data["printable_bounds"])),
         "\n",
         "  func.func private @__ly_ucd_numeric_value(%idx: i64) -> f64 {\n",
         "    %idx_index = arith.index_cast %idx : i64 to index\n",
@@ -611,6 +682,8 @@ def emit_cpp(data: dict, path: Path) -> None:
         cpp_array("kInfoRecords", "std::int32_t", info_flat),
         cpp_array("kExtCase", "std::int32_t", data["ext_case"]),
         cpp_array("kNumericValues", "double", data["numeric_values"]),
+        cpp_array("kPrintableBounds", "std::int32_t",
+                  data["printable_bounds"]),
         "\n",
         "} // namespace lython_ucd\n",
     ]

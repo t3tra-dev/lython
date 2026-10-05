@@ -43,6 +43,7 @@ module attributes {
   func.func private @__ly_unicode_width_for(%cp: i64) -> i64
   func.func private @__ly_ucd_ctype(%cp: i64) -> (i64, i64, i64, i64, i64, i64, i64)
   func.func private @__ly_ucd_info(%cp: i64) -> (i64, i64)
+  func.func private @__ly_ucd_is_printable(%cp: i64) -> i1
   func.func private @__ly_ucd_ext_cp(%packed: i64, %j: i64) -> i64
   func.func private @__ly_ucd_numeric_value(%idx: i64) -> f64
   func.func private @__ly_ucd_category_char(%cat: i64, %j: i64) -> i64
@@ -738,26 +739,6 @@ module attributes {
     %want_mask = arith.constant 2 : i64   // LOWER
     %result = func.call @__ly_unicode_case_predicate(%header, %bytes, %fail_mask, %want_mask) : (memref<2xi64>, memref<?xi8>, i64, i64) -> i1
     func.return %result : i1
-  }
-
-  // Printability per CPython str.isprintable / repr: everything except
-  // categories Cn, Zs, Zl, Zp, Cc, Cf, Cs, Co -- with U+0020 SPACE as the
-  // sole Zs exception. The mask packs those category-enum bits
-  // (Cn=0, Zs=23, Zl=24, Zp=25, Cc=26, Cf=27, Cs=28, Co=29).
-  func.func private @__ly_ucd_is_printable(%cp: i64) -> i1 {
-    %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
-    %space = arith.constant 32 : i64
-    %mask = arith.constant 1065353217 : i64
-    %cat, %numeric = func.call @__ly_ucd_info(%cp) : (i64) -> (i64, i64)
-    %shifted = arith.shrui %mask, %cat : i64
-    %bit = arith.andi %shifted, %one : i64
-    %unprintable = arith.cmpi ne, %bit, %zero : i64
-    %true_bit = arith.constant true
-    %printable_cat = arith.xori %unprintable, %true_bit : i1
-    %is_space = arith.cmpi eq, %cp, %space : i64
-    %printable = arith.ori %printable_cat, %is_space : i1
-    func.return %printable : i1
   }
 
   func.func @LyUnicode_IsPrintable(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "isprintable"} {

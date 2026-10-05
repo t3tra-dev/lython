@@ -173,6 +173,37 @@ llvm::cl::opt<unsigned> JitOptOption(
                    "for seconds"),
     llvm::cl::init(0), llvm::cl::cat(LythonCategory));
 
+// What a compiled executable is optimized for. Speed by default: measured on a
+// dict-and-str workload, optsize ran 1.3-1.45x and minsize 2x slower, for a
+// third less code. Size is for a program shipped where its bytes are paid
+// for, such as a wasm module (examples/genexpr.py: 268 KB -> 186 KB at -Oz).
+enum class ExecutableOptimization { Speed, Size, MinSize };
+llvm::cl::opt<ExecutableOptimization> ExecutableOptOption(
+    llvm::cl::desc("Optimization goal for a compiled executable:"),
+    llvm::cl::values(
+        clEnumValN(ExecutableOptimization::Speed, "O2",
+                   "Optimize for speed (default)"),
+        clEnumValN(ExecutableOptimization::Size, "Os",
+                   "Optimize for size where it costs little speed"),
+        clEnumValN(ExecutableOptimization::MinSize, "Oz",
+                   "Optimize for the smallest code, whatever the speed")),
+    llvm::cl::init(ExecutableOptimization::Speed),
+    llvm::cl::cat(LythonCategory));
+
+// Size is asked of every function through its attributes: the module pipeline
+// stays the O2 one, which is how LLVM 23 spells -Os and -Oz.
+void applyExecutableOptimizationGoal(llvm::Module &llvmModule) {
+  if (ExecutableOptOption == ExecutableOptimization::Speed)
+    return;
+  for (llvm::Function &function : llvmModule) {
+    if (function.isDeclaration())
+      continue;
+    function.addFnAttr(llvm::Attribute::OptimizeForSize);
+    if (ExecutableOptOption == ExecutableOptimization::MinSize)
+      function.addFnAttr(llvm::Attribute::MinSize);
+  }
+}
+
 llvm::OptimizationLevel jitOptimizationLevel() {
   switch (JitOptOption) {
   case 0:
@@ -280,6 +311,7 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
     return failure();
   llvmModule.setTargetTriple(llvm::Triple(targetTriple));
   llvmModule.setDataLayout(targetMachine->createDataLayout());
+  applyExecutableOptimizationGoal(llvmModule);
   if (failed(finalizeLoweredLLVMModule(llvmModule, safetyProfile,
                                        targetMachine.get(),
                                        llvm::OptimizationLevel::O2,
@@ -1233,6 +1265,13 @@ int main(int argc, char **argv) {
 
   const bool jitMode = static_cast<bool>(JitCommand);
   const bool parseMode = static_cast<bool>(ParseCommand);
+  if (jitMode &&
+      ExecutableOptOption.getNumOccurrences() != 0) {
+    llvm::errs() << "error: -O2/-Os/-Oz choose what a compiled executable is "
+                    "optimized for; the JIT's levels are -jit-opt and "
+                    "-jit-codegen-opt\n";
+    return 1;
+  }
   std::string inputPath;
   std::string outputPath = OutputFilename;
 
@@ -1378,6 +1417,7 @@ int main(int argc, char **argv) {
     } else {
       shapeExceptionPadsForTarget(llvmModule);
     }
+    applyExecutableOptimizationGoal(llvmModule);
     return failed(writeLLVMIR(llvmModule, outputPath, llvm::errs())) ? 1 : 0;
   }
 
