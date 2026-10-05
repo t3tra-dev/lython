@@ -1,0 +1,4 @@
+(?s)\A(?:(?!never retrieved).)*Future\ exception\ was\ never\ retrieved\
+future:\ <Future\ finished\ exception=ValueError\('bad'\)>\
+ValueError:\ bad\
+(?!.*never retrieved)

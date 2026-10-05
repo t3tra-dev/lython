@@ -425,3 +425,31 @@ def format_exc(limit: Optional[int] = None) -> str:
 def print_exc(limit: Optional[int] = None) -> None:
     """Write `format_exc` to stderr."""
     sys.stderr.write(format_exc(limit))
+
+
+class _Address:
+    """Nothing but an object with an address, for the report below."""
+
+
+def _print_unraisable(qualname: str, exc: BaseException) -> None:
+    """What sys.unraisablehook writes for an exception a finalizer raised:
+    the deallocator it was calling, then its traceback, from the finalizer's
+    frame on. Called from the handler of the hidden method that runs
+    `__del__` (driver/lib/Frontend.cpp), whose own frame is the first entry
+    of the traceback and is left out, as CPython's starts in `__del__`.
+
+    The address is the function object's in CPython; this runtime has no
+    such object, so it is a fresh object's, which is as stable as CPython's
+    is -- not at all.
+    """
+    shown = repr(_Address())
+    address = shown[shown.rfind(" at ") + 4:len(shown) - 1]
+    sys.stderr.write("Exception ignored while calling deallocator <function "
+                     + qualname + " at " + address + ">:\n")
+    frames = format_tb(_current_tb())
+    if len(frames) > 1:
+        sys.stderr.write("Traceback (most recent call last):\n")
+        for text in frames[1:]:
+            sys.stderr.write(text)
+    for text in format_exception_only(exc):
+        sys.stderr.write(text)

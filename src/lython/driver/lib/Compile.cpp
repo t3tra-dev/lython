@@ -31,6 +31,8 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
     collectLLVMSafetyContracts(module, safetyProfile);
   llvm::SmallVector<py::PythonCallSiteRange, 16> pythonCallSites;
   py::collectPythonCallSiteRanges(module, pythonCallSites);
+  llvm::DenseMap<std::int64_t, unsigned> tryInlineDepths;
+  py::collectPythonTryInlineDepths(module, tryInlineDepths);
   llvm::SmallVector<std::string, 4> ctypesSymbols;
   py::collectCtypesForeignSymbols(module, ctypesSymbols);
   attachPythonDebugInfo(module);
@@ -52,7 +54,7 @@ LogicalResult translateToVerifiedLLVMIR(ModuleOp module,
   py::markCLibraryDeclarationsNonUnwinding(*llvmModule, ctypesSymbols);
   py::installPythonExceptionCleanupFrames(
       *llvmModule, codeGenTripleForTarget(py::TensorLoweringTarget{}, options),
-      pythonCallSites);
+      pythonCallSites, tryInlineDepths);
   py::installArmStreamingCompatibleMemoryRoutines(*llvmModule);
   dumpLLVMForPass(irDump, "llvm-translation", *llvmModule);
   if (!options.releaseMode &&

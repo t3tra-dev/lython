@@ -105,14 +105,31 @@ struct PythonCallSiteRange {
   // empty for an ordinary call.
   std::string innerFunctionName;
   std::vector<PythonInlineFrame> inlinedAt;
+  // Nonzero when another call in the same function has the same caller,
+  // callee, line and column and different frames: the number its LLVM
+  // location's discriminator carries (kCallSiteDiscriminatorAttr).
+  unsigned discriminator = 0;
 };
+// Set by collectPythonCallSiteRanges on an llvm.call whose site needs a
+// discriminator; attachPythonDebugInfo moves it into the call's location.
+inline constexpr llvm::StringLiteral kCallSiteDiscriminatorAttr{
+    "ly.eh.site_discriminator"};
 
 void collectPythonCallSiteRanges(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<PythonCallSiteRange> &callSites);
+// The inlined depth of each try the runtime lowering wrote, by handler id, as
+// (id, depth) pairs on the module: what a catching landing pad's traceback
+// push stops at (EH.cpp).
+inline constexpr llvm::StringLiteral kTryInlineDepthsAttr{
+    "ly.try.inline_depths"};
+void collectPythonTryInlineDepths(
+    mlir::ModuleOp module, llvm::DenseMap<std::int64_t, unsigned> &depths);
 bool installPythonExceptionCleanupFrames(
     llvm::Module &module, const llvm::Triple &triple,
-    llvm::ArrayRef<PythonCallSiteRange> callSites);
+    llvm::ArrayRef<PythonCallSiteRange> callSites,
+    const llvm::DenseMap<std::int64_t, unsigned> &tryInlineDepths =
+        llvm::DenseMap<std::int64_t, unsigned>());
 void installArmStreamingCompatibleMemoryRoutines(llvm::Module &module);
 
 // The foreign symbols ctypes declared: the only declarations in a compiled

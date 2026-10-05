@@ -1642,6 +1642,8 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
               : emitNone(statement);
       if (!inlineReturnContexts.empty()) {
         InlineReturnContext &ctx = inlineReturnContexts.back();
+        if (ctx.endsFrame)
+          emitFrameExitKeepAlives(statement);
         if (ctx.carryResult) {
           Value result = ctx.resultType
                              ? coerceValue(returned, ctx.resultType, statement)
@@ -1652,6 +1654,7 @@ void ModuleEmitter::emitTry(const parser::Node &statement) {
           mlir::cf::BranchOp::create(builder, loc(statement), ctx.target);
         }
       } else {
+        emitFrameExitKeepAlives(statement);
         Value result = coerceValue(returned, currentReturnType, statement);
         mlir::func::ReturnOp::create(builder, loc(statement), result.value);
       }

@@ -26,6 +26,7 @@ namespace {
 // `$` cannot appear in an identifier a program writes.
 constexpr llvm::StringLiteral kJsBridgeModule = "_js_bridge";
 constexpr llvm::StringLiteral kJsBridgeName = "__ly_js_bridge$";
+constexpr llvm::StringLiteral kFinalizerTracebackName = "__ly_traceback";
 constexpr llvm::StringLiteral kJsFrameName = "__ly_js_frame$";
 constexpr llvm::StringLiteral kJsGlobalObjectName = "__ly_js_global$";
 
@@ -1496,6 +1497,14 @@ void ModuleEmitter::predeclareSourceModules() {
   declareJsHostModule();
   if (lookupSourceModule(kJsBridgeModule))
     bindSourceModuleNamespace(kJsBridgeModule, kJsBridgeName);
+  // What a finalizer's hidden method reports through (driver/lib/
+  // Frontend.cpp, addFinalizerWrappers), bound once for every module.
+  // ⛔ Not an `import traceback` added to the finalizer's module: every method
+  // body inlined from it re-binds its imports, and binding traceback reads the
+  // signatures of all it imports -- `import asyncio`, whose futures have
+  // finalizers, took 24 s to compile that way.
+  if (options.keepLocalsAlive && lookupSourceModule("traceback"))
+    bindSourceModuleNamespace("traceback", kFinalizerTracebackName);
   // `await` on a host Promise reaches asyncio by this name, whatever the
   // program calls it (emitAwaitValue).
   if (lookupSourceModule("asyncio") && lookupSourceModule(py::kJsHostModule))

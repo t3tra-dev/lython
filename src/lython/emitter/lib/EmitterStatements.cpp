@@ -1504,6 +1504,8 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
     }
     if (!inlineReturnContexts.empty()) {
       InlineReturnContext &ctx = inlineReturnContexts.back();
+      if (ctx.endsFrame)
+        emitFrameExitKeepAlives(statement);
       if (ctx.carryResult) {
         Value result = ctx.resultType
                            ? coerceValue(value, ctx.resultType, statement)
@@ -1516,6 +1518,7 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       return;
     }
     if (currentReturnType) {
+      emitFrameExitKeepAlives(statement);
       Value result = coerceValue(value, currentReturnType, statement);
       mlir::func::ReturnOp::create(builder, loc(statement), result.value);
     }
@@ -1648,6 +1651,123 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
 // static SSA scopes (released at scope exit), and instance attributes are
 // fixed storage slots, so both are rejected with an explanation instead of a
 // generic unsupported-statement error.
+// ⭐ A LOCAL IS LET GO WHERE CPYTHON'S FRAME LETS IT GO. The release
+// placement ends a reference at its last use, which no program can tell from
+// CPython's frame-end release -- until an object runs code when it is
+// released. In a program with a __del__, each local is used once more where
+// CPython would drop it: at the frame's exit, last bound first, and just
+// before the name is rebound.
+// ⛔ Not for an int, str, float or the like: nothing such a value holds can
+// observe its release, and the use would only lengthen its life.
+void ModuleEmitter::emitKeepAlive(const parser::Node &at, Value value) {
+  if (!options.keepLocalsAlive || !value.value || !value.type)
+    return;
+  mlir::Type type = types.widenLiteral(value.type);
+  if (!type || type.getDialect().getNamespace() != "py" ||
+      py::isPyNoneType(type))
+    return;
+  if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+    llvm::StringRef name = contract.getContractName();
+    if (name == "builtins.int" || name == "builtins.float" ||
+        name == "builtins.bool" || name == "builtins.str" ||
+        name == "builtins.bytes" || name == "builtins.complex")
+      return;
+  }
+  py::KeepAliveOp::create(builder, loc(at), value.value);
+}
+
+void ModuleEmitter::emitGlobalClear(const parser::Node &at,
+                                    llvm::StringRef name) {
+  mlir::Type type = moduleGlobals.lookup(name);
+  if (!type || type.getDialect().getNamespace() != "py" ||
+      py::isPyNoneType(type))
+    return;
+  auto op = py::GlobalClearOp::create(builder, loc(at),
+                                      builder.getStringAttr(name),
+                                      mlir::TypeAttr::get(type));
+  markBoxedModuleGlobal(op);
+}
+
+void ModuleEmitter::emitFrameExitKeepAlives(const parser::Node &at) {
+  if (!options.keepLocalsAlive)
+    return;
+  for (auto name = currentFrameLocals.rbegin();
+       name != currentFrameLocals.rend(); ++name) {
+    auto bound = values.find(*name);
+    if (bound != values.end())
+      emitKeepAlive(at, bound->second);
+  }
+}
+
+std::vector<std::string>
+ModuleEmitter::frameLocalOrder(const parser::Node &callable) {
+  std::vector<std::string> order;
+  llvm::StringSet<> seen;
+  auto add = [&](llvm::StringRef name) {
+    if (!name.empty() && seen.insert(name).second)
+      order.push_back(name.str());
+  };
+  if (const parser::Node *arguments = ast::node(callable, "args")) {
+    for (const char *field : {"posonlyargs", "args"})
+      if (const auto *list = ast::nodeList(*arguments, field))
+        for (const parser::NodePtr &argument : *list)
+          if (argument)
+            if (auto name = ast::string(*argument, "arg"))
+              add(*name);
+    if (const parser::Node *vararg = ast::node(*arguments, "vararg"))
+      if (auto name = ast::string(*vararg, "arg"))
+        add(*name);
+    if (const auto *list = ast::nodeList(*arguments, "kwonlyargs"))
+      for (const parser::NodePtr &argument : *list)
+        if (argument)
+          if (auto name = ast::string(*argument, "arg"))
+            add(*name);
+    if (const parser::Node *kwarg = ast::node(*arguments, "kwarg"))
+      if (auto name = ast::string(*kwarg, "arg"))
+        add(*name);
+  }
+  std::function<void(const parser::Node &)> walk =
+      [&](const parser::Node &node) {
+        if (node.kind == "Name") {
+          if (const parser::Node *ctx = ast::node(node, "ctx");
+              ctx && ctx->kind == "Store")
+            add(ast::nameSpelling(node));
+          return;
+        }
+        if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+            node.kind == "ClassDef") {
+          if (auto name = ast::string(node, "name"))
+            add(*name);
+          return;
+        }
+        if (node.kind == "Lambda" || node.kind == "ListComp" ||
+            node.kind == "SetComp" || node.kind == "DictComp" ||
+            node.kind == "GeneratorExp")
+          return;
+        if (node.kind == "ExceptHandler")
+          if (auto name = ast::string(node, "name"))
+            add(*name);
+        for (const parser::Field &field : node.fields) {
+          if (const auto *child =
+                  std::get_if<parser::NodePtr>(&field.value)) {
+            if (*child)
+              walk(**child);
+          } else if (const auto *children =
+                         std::get_if<std::vector<parser::NodePtr>>(
+                             &field.value)) {
+            for (const parser::NodePtr &item : *children)
+              if (item)
+                walk(*item);
+          }
+        }
+      };
+  if (const auto *body = ast::nodeList(callable, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        walk(*statement);
+  return order;
+}
+
 void ModuleEmitter::emitDelete(const parser::Node &statement) {
   const auto *targets = ast::nodeList(statement, "targets");
   if (!targets)
@@ -1903,6 +2023,8 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       types.bindSymbol(name, cellContentType(cell.type));
       return;
     }
+    if (bound != values.end())
+      emitKeepAlive(target, bound->second);
     value = pinLoopCarriedTensor(name, value, target);
     values[name] = value;
     types.bindSymbol(name, value.type);

@@ -138,11 +138,16 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
   // inlined here; see EmitterCore.h's `inlineFrames`.
   llvm::SmallVector<PythonInlineFrame, 2> inlinedAt;
   std::string innerFunction;
-  if (!mlir::isa<py::RaiseOp, py::RaiseCurrentOp>(op)) {
-    if (std::optional<PythonSourceRange> range =
-            pythonSourceRange(op->getLoc())) {
-      innerFunction = range->functionName;
-      inlinedAt.assign(range->inlinedAt.begin(), range->inlinedAt.end());
+  // ⛔ The raise statement opts out of the ANCHORS only. It used to skip the
+  // whole range, and with it the inlined levels and the name its frame goes
+  // under: `raise` in a method written into its caller printed one frame,
+  // named after the caller, with the method's line -- `class B: def boom(self):
+  // raise ValueError()` called as `B().boom()` read "line 3, in <module>".
+  if (std::optional<PythonSourceRange> range =
+          pythonSourceRange(op->getLoc())) {
+    innerFunction = range->functionName;
+    inlinedAt.assign(range->inlinedAt.begin(), range->inlinedAt.end());
+    if (!mlir::isa<py::RaiseOp, py::RaiseCurrentOp>(op)) {
       if (range->endLine == range->line && range->endColumn > range->column) {
         endLine = range->endLine;
         endColumn = range->endColumn;
@@ -191,12 +196,67 @@ RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
   };
   push(innerFunction.empty() ? enclosing : llvm::StringRef(innerFunction), line,
        column, endLine, endColumn, hasMarker);
-  for (const PythonInlineFrame &frame : inlinedAt)
-    push(frame.functionName.empty() ? enclosing
-                                    : llvm::StringRef(frame.functionName),
-         frame.line, frame.column, frame.endLine, frame.endColumn,
-         frame.noAnchor ? 0 : 1);
+  pushInlinedTracebackFrames(op, filename, inlinedAt,
+                             enclosingTryInlineDepth(op->getBlock()));
   return mlir::success();
+}
+
+// ⭐ AN INLINED LEVEL IS A FRAME THE EXCEPTION HAS LEFT, and only the levels it
+// has left belong in its traceback. A raise caught by a `try` in a body that
+// was itself written into its caller never reaches the caller, and CPython's
+// traceback stops at the frame of the `try`. Pushing every level put the
+// caller's frame in front of it:
+//
+//     class B:
+//         def boom(self) -> int: return 1 // 0
+//         def wrap(self) -> None:
+//             try: self.boom()
+//             except ZeroDivisionError: print(traceback.format_exc())
+//     B().wrap()       # listed `<module>` above `wrap`
+//
+// The levels past the `try` are pushed when the exception leaves it -- an
+// unmatched handler re-raises through here, a `finally` through the lowering
+// of its re-raise (TryOps.cpp) -- each up to the next `try` out.
+void RuntimeBundleLowerer::pushInlinedTracebackFrames(
+    mlir::Operation *anchor, llvm::StringRef filename,
+    llvm::ArrayRef<PythonInlineFrame> inlinedAt, unsigned depth) {
+  if (inlinedAt.size() <= depth)
+    return;
+  mlir::Location loc = anchor->getLoc();
+  llvm::StringRef enclosing = currentCallableName(anchor);
+  mlir::func::FuncOp tracebackPush = getOrCreateTracebackPush(module, builder);
+  mlir::Value file = materializeByteBuffer(loc, filename);
+  auto i32Const = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, loc, value, 32)
+        .getResult();
+  };
+  for (const PythonInlineFrame &frame :
+       inlinedAt.take_front(inlinedAt.size() - depth)) {
+    llvm::StringRef name = frame.functionName.empty()
+                               ? enclosing
+                               : llvm::StringRef(frame.functionName);
+    mlir::Value function = materializeByteBuffer(loc, name);
+    mlir::func::CallOp::create(
+        builder, loc, tracebackPush,
+        mlir::ValueRange{file, function, i32Const(frame.line),
+                         i32Const(frame.column), i32Const(frame.endLine),
+                         i32Const(frame.endColumn),
+                         i32Const(frame.noAnchor ? 0 : 1)});
+  }
+}
+
+unsigned
+RuntimeBundleLowerer::enclosingTryInlineDepth(mlir::Block *block) const {
+  for (; block;) {
+    auto found = tryHandlerIds.find(block);
+    if (found != tryHandlerIds.end()) {
+      auto depth = tryInlineDepths.find(found->second);
+      return depth == tryInlineDepths.end() ? 0 : depth->second;
+    }
+    mlir::Operation *parent = block->getParentOp();
+    block = parent ? parent->getBlock() : nullptr;
+  }
+  return 0;
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::emitRuntimeException(
@@ -441,6 +501,13 @@ mlir::LogicalResult
 RuntimeBundleLowerer::lowerRaiseCurrent(py::RaiseCurrentOp op) {
   mlir::func::FuncOp rethrow = getOrCreateRethrowCurrent(module, builder);
   builder.setInsertionPoint(op);
+  // The exception leaves the handler it was not matched by, and with it the
+  // inlined levels up to the next `try` out (pushInlinedTracebackFrames). The
+  // frame it leaves from is already in its traceback.
+  if (std::optional<PythonSourceRange> range = pythonSourceRange(op.getLoc()))
+    pushInlinedTracebackFrames(op.getOperation(), range->filename,
+                               range->inlinedAt,
+                               enclosingTryInlineDepth(op->getBlock()));
   emitTryCallSiteMarkerIfNeeded(op.getLoc());
   mlir::func::CallOp::create(builder, op.getLoc(), rethrow, mlir::ValueRange{});
   createDeadContinuation(builder, op.getOperation());

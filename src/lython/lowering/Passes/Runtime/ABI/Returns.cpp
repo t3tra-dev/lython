@@ -40,9 +40,25 @@ bool isPrimitiveOnlyCallableFunction(mlir::func::FuncOp function) {
 // for slots and edges, and what is needed here is only "is this the value that
 // other lane carries", on a CFG whose suspend block is reached by branches
 // that forward it directly.
-mlir::Value resolveLaneEntity(mlir::Value value,
-                              llvm::SmallPtrSetImpl<mlir::Value> &visiting) {
-  value = ownership::underlyingObjectValue(value);
+// What one query has already resolved, and how many times it stopped at a
+// back edge.
+// ⛔ Not the walk alone: a value reached by two paths was resolved once per
+// path, and a chain of diamonds made that exponential -- a generator body
+// that keeps its locals alive to its end (a program with a finalizer) has a
+// block argument per local at every join, and `asyncio`'s task step took 45 s
+// here. An answer that stopped at a back edge is conservative for the path
+// that met the edge, so only the ones that met none are remembered.
+struct LaneEntityQuery {
+  llvm::SmallPtrSet<mlir::Value, 8> visiting;
+  llvm::DenseMap<mlir::Value, mlir::Value> resolved;
+  unsigned backEdges = 0;
+};
+
+mlir::Value resolveLaneEntity(mlir::Value value, LaneEntityQuery &query);
+
+mlir::Value resolveLaneEntityUncached(mlir::Value value,
+                                      LaneEntityQuery &query) {
+  llvm::SmallPtrSetImpl<mlir::Value> &visiting = query.visiting;
   auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
   if (!argument)
     return value;
@@ -51,8 +67,10 @@ mlir::Value resolveLaneEntity(mlir::Value value,
     return value;
   // A back edge reaches the argument it defines; stopping keeps the answer
   // conservative rather than making it up.
-  if (!visiting.insert(value).second)
+  if (!visiting.insert(value).second) {
+    ++query.backEdges;
     return value;
+  }
   mlir::Value common;
   for (mlir::Block *predecessor : block->getPredecessors()) {
     auto branch =
@@ -80,7 +98,7 @@ mlir::Value resolveLaneEntity(mlir::Value value,
       visiting.erase(value);
       return value;
     }
-    mlir::Value resolved = resolveLaneEntity(forwarded, visiting);
+    mlir::Value resolved = resolveLaneEntity(forwarded, query);
     if (!common)
       common = resolved;
     else if (common != resolved) {
@@ -90,6 +108,17 @@ mlir::Value resolveLaneEntity(mlir::Value value,
   }
   visiting.erase(value);
   return common ? common : value;
+}
+
+mlir::Value resolveLaneEntity(mlir::Value value, LaneEntityQuery &query) {
+  value = ownership::underlyingObjectValue(value);
+  if (auto known = query.resolved.find(value); known != query.resolved.end())
+    return known->second;
+  unsigned backEdgesBefore = query.backEdges;
+  mlir::Value result = resolveLaneEntityUncached(value, query);
+  if (query.backEdges == backEdgesBefore)
+    query.resolved.try_emplace(value, result);
+  return result;
 }
 
 bool isErasedObjectResult(mlir::Type type) {
@@ -270,9 +299,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           // both lanes resolved to `memref<9xi64>` block argument 6.
           bool duplicate = !laneCarriedValues.insert(operand).second;
           if (!bundle->physicalValues().empty()) {
-            llvm::SmallPtrSet<mlir::Value, 8> visiting;
+            LaneEntityQuery visiting;
             if (std::getenv("LYTHON_TRACE_LANES")) {
-              llvm::SmallPtrSet<mlir::Value, 8> probe;
+              LaneEntityQuery probe;
               llvm::errs() << "[lane] idx=" << operandIndex << " phys="
                            << bundle->physicalValues().front() << "\n    -> "
                            << resolveLaneEntity(

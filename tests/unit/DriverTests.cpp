@@ -2639,3 +2639,73 @@ TEST(DriverTest, AWasmModuleDefinesTheUnwinderItUses) {
   llvm::raw_string_ostream brokenStream(broken);
   EXPECT_FALSE(llvm::verifyModule(module, &brokenStream)) << broken;
 }
+
+namespace {
+
+bool callsFunctionNamed(llvm::Module &module, llvm::StringRef callee) {
+  for (llvm::Function &function : module)
+    for (llvm::BasicBlock &block : function)
+      for (llvm::Instruction &instruction : block)
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          if (llvm::Function *target = call->getCalledFunction())
+            if (target->getName() == callee)
+              return true;
+  return false;
+}
+
+} // namespace
+
+// What: a program with no `__del__` keeps nothing alive past its last use --
+// no keep-alive call anywhere -- and one with a `__del__` keeps its locals
+// alive to the end of their frame and has its deallocator call the method
+// that runs the finalizer.
+TEST(DriverTest, OnlyAProgramWithAFinalizerKeepsItsLocalsAlive) {
+  const char *body = "    def __init__(self, n: int) -> None:\n"
+                     "        self.n = n\n";
+  std::string plain = std::string("class A:\n") + body +
+                      "\n\ndef f() -> None:\n"
+                      "    a = A(1)\n"
+                      "    print(a.n)\n\n\nf()\n";
+  std::string finalized = std::string("class A:\n") + body +
+                          "    def __del__(self) -> None:\n"
+                          "        print(\"del\")\n"
+                          "\n\ndef f() -> None:\n"
+                          "    a = A(1)\n"
+                          "    print(a.n)\n\n\nf()\n";
+  CompileResult without = compileSource(plain);
+  ASSERT_TRUE(without.succeeded) << without.diagnostics;
+  EXPECT_FALSE(
+      callsFunctionNamed(*without.verified.llvmModule, "LyObject_KeepAlive"));
+
+  CompileResult with = compileSource(finalized);
+  ASSERT_TRUE(with.succeeded) << with.diagnostics;
+  EXPECT_TRUE(
+      callsFunctionNamed(*with.verified.llvmModule, "LyObject_KeepAlive"));
+  llvm::Function *dealloc =
+      with.verified.llvmModule->getFunction("__ly_dealloc_A");
+  ASSERT_NE(dealloc, nullptr);
+  bool callsFinalizer = false;
+  for (llvm::BasicBlock &block : *dealloc)
+    for (llvm::Instruction &instruction : block)
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (llvm::Function *target = call->getCalledFunction())
+          callsFinalizer |= target->getName().contains("__ly_finalize__");
+  EXPECT_TRUE(callsFinalizer);
+}
+
+// What: `__del__` on an exception class is refused, naming the class: its
+// instances are released by the runtime's shared exception deallocator, which
+// has no finalizer to call.
+TEST(DriverTest, AFinalizerOnAnExceptionClassIsRefused) {
+  CompileResult result = compileSource("class E(Exception):\n"
+                                       "    def __del__(self) -> None:\n"
+                                       "        pass\n\n\n"
+                                       "try:\n"
+                                       "    raise E()\n"
+                                       "except E:\n"
+                                       "    pass\n");
+  EXPECT_FALSE(result.succeeded);
+  EXPECT_NE(result.diagnostics.find("__del__ is not supported on E"),
+            std::string::npos)
+      << result.diagnostics;
+}

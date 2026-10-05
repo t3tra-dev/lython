@@ -2561,7 +2561,15 @@ bool releaseOwnedGroupByLiveness(
       for (unsigned index = 0, end = terminator->getNumSuccessors();
            index < end; ++index) {
         mlir::Block *successor = terminator->getSuccessor(index);
-        if (!liveIn[successor] && handlerEntries.count(successor))
+        // ⛔ Not an entry the token dies at when the edge HANDS it in: the
+        // handler's block argument is then its own group, and making this
+        // entry a use ran the liveness back through every block of the `try`
+        // -- past where the token had already been forwarded, and in a
+        // coroutine past its definition. `span = Span(); try: async with
+        // Span(): ... except ...: ...; print(span.name)` was "operand #0
+        // does not dominate this use", and with that hidden, a double free.
+        if (!liveIn[successor] && handlerEntries.count(successor) &&
+            !forwardsGroupToSuccessor(terminator, index))
           entryDeaths.insert(successor);
       }
     }
@@ -6382,6 +6390,34 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       created.handler = handler;
       created.groups.assign(cleanupGroups.begin(), cleanupGroups.end());
       created.id = nextHandlerId++;
+      // The new id stands for the handler it branches to, and so does that
+      // handler's inlined depth (TryOps.cpp): a catching landing pad stops
+      // its traceback push there (EH.cpp).
+      if (handler)
+        for (mlir::Operation &op : *handler) {
+          auto marker = mlir::dyn_cast<mlir::func::CallOp>(op);
+          if (!marker || marker.getCallee() != "LyEH_TryCatchMarker")
+            continue;
+          if (std::optional<std::int64_t> original =
+                  own::exceptionMarkerId(marker))
+            if (auto pairs = module->getAttrOfType<mlir::DenseI64ArrayAttr>(
+                    "ly.try.inline_depths")) {
+              llvm::SmallVector<std::int64_t, 16> words(
+                  pairs.asArrayRef().begin(), pairs.asArrayRef().end());
+              for (std::size_t index = 0; index + 1 < words.size();
+                   index += 2)
+                if (words[index] == *original) {
+                  words.push_back(created.id);
+                  words.push_back(words[index + 1]);
+                  module->setAttr(
+                      "ly.try.inline_depths",
+                      mlir::DenseI64ArrayAttr::get(module.getContext(),
+                                                   words));
+                  break;
+                }
+            }
+          break;
+        }
 
       mlir::func::FuncOp releaser = createOutlinedUnwindReleaser(
           module, loc, created.groups, nextReleaserIndex++);

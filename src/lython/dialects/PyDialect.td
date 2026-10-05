@@ -1222,6 +1222,21 @@ def Py_GlobalSetOp : Py_Op<"global.set", []> {
   let assemblyFormat = "$name `=` $value attr-dict `:` type($value)";
 }
 
+def Py_GlobalClearOp : Py_Op<"global.clear", []> {
+  let summary = "Release a module-level global at interpreter shutdown";
+  let description = [{
+    Releases the value the module-level global `name` (stored as `type`)
+    holds, if it is bound, and leaves it unbound: the main module's names are
+    cleared at shutdown, which is when a finalizer of what they hold runs.
+
+    Example:
+      py.global.clear "keep" : !py.class<"__main__.A">
+  }];
+
+  let arguments = (ins StrAttr:$name, TypeAttr:$type);
+  let assemblyFormat = "$name attr-dict `:` $type";
+}
+
 //===----------------------------------------------------------------------===//
 // Iteration protocol operations
 //===----------------------------------------------------------------------===//
@@ -1375,6 +1390,23 @@ def Py_IncRefOp : Py_Op<"incref", []> {
 
     Example:
       py.incref %obj : !py.protocol
+  }];
+
+  let arguments = (ins Py_ContractType:$object);
+  let assemblyFormat = "$object `:` type($object) attr-dict";
+}
+
+def Py_KeepAliveOp : Py_Op<"keep_alive", []> {
+  let summary = "Keep a Python object referenced up to this point";
+  let description = [{
+    A use of the object and nothing else: whatever reference keeps it alive
+    is released after this point, not before. The emitter places it where
+    CPython's reference would end -- a local's scope exit, its rebinding,
+    `del` -- in a program whose objects can observe their own release
+    (`__del__`).
+
+    Example:
+      py.keep_alive %obj : !py.contract<"A">
   }];
 
   let arguments = (ins Py_ContractType:$object);

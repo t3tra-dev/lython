@@ -531,6 +531,11 @@ def refusal(case: pathlib.Path, layers: "set[str]",
     found = CONTEXT.search(ast.unparse(tree))
     if found:
         return f"it can observe its context (`{found.group(0)}`)"
+    # A finalizer prints when its object dies, and a module global's dies at
+    # the end of the PROGRAM, after whatever the batch runs next.
+    if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+           and node.name == "__del__" for node in ast.walk(tree)):
+        return "it defines `__del__`, which also runs at the program's end"
     names = module_bindings(tree)
     if isinstance(names, str):
         return names

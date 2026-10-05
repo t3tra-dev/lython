@@ -23,6 +23,7 @@
 #include "llvm/Support/Path.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -40,6 +41,8 @@ struct PythonTryCallMarker {
   std::int64_t id = 0;
   llvm::CallInst *marker = nullptr;
   llvm::BasicBlock *catchBlock = nullptr;
+  // How many inlined levels deep the try was written (TryOps.cpp).
+  unsigned inlineDepth = 0;
 };
 
 struct PendingPythonTryCallMarker {
@@ -284,10 +287,12 @@ matchCallSiteRange(llvm::CallInst &call, const CallSiteIndex &callSites,
   llvm::StringRef callerName = call.getFunction()->getName();
   llvm::StringRef calleeName = callee->getName();
   const PythonCallSiteRange *lineMatch = nullptr;
+  unsigned discriminator = debugLoc.getDiscriminator();
   for (const PythonCallSiteRange *site :
        callSites.at(callerName, calleeName,
                     static_cast<std::int32_t>(debugLoc.getLine()))) {
-    if (site->column == static_cast<std::int32_t>(debugLoc.getColumn()))
+    if (site->column == static_cast<std::int32_t>(debugLoc.getColumn()) &&
+        site->discriminator == discriminator)
       return site;
     if (!lineMatch)
       lineMatch = site;
@@ -302,7 +307,7 @@ llvm::Value *i32Constant(llvm::IRBuilder<> &builder, std::int32_t value) {
 
 void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
                        const PythonCallSiteRange *site,
-                       llvm::DILocation &debugLoc) {
+                       llvm::DILocation &debugLoc, unsigned depth = 0) {
   // A dispatcher's frame is not one the program has: the caller's cleanup
   // records the call, as it did when the dispatch was written out there.
   if (builder.GetInsertBlock()->getParent()->getName().starts_with(
@@ -349,8 +354,12 @@ void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
           ? llvm::StringRef(site->innerFunctionName)
           : functionName;
   push(innerName, line, column, endLine, endColumn, marker);
-  if (site)
-    for (const PythonInlineFrame &frame : site->inlinedAt)
+  // Up to the level the exception is caught at, when a `try` written that
+  // deep catches it (ExceptionOps.cpp, pushInlinedTracebackFrames).
+  if (site && site->inlinedAt.size() > depth)
+    for (const PythonInlineFrame &frame : llvm::ArrayRef<PythonInlineFrame>(
+             site->inlinedAt)
+             .take_front(site->inlinedAt.size() - depth))
       push(frame.functionName.empty() ? functionName
                                       : llvm::StringRef(frame.functionName),
            frame.line, frame.column, frame.endLine, frame.endColumn,
@@ -450,12 +459,23 @@ handledClassIds(llvm::BasicBlock *dispatch) {
     // on. Re-raising FIRST is what proves the frame does nothing for an
     // exception outside the list -- a `finally` puts its body here instead, and
     // that frame really is entered for everything, so it stays a catch-all.
+    //
+    // The frames the re-raise records first do not count against that: they
+    // are the inlined levels it leaves (ExceptionOps.cpp, lowerRaiseCurrent),
+    // and an exception outside the list records the same levels on the
+    // pad's passing edge instead.
     llvm::Instruction *tail = nullptr;
-    for (llvm::Instruction &instruction : *block)
-      if (!instruction.isDebugOrPseudoInst() && !isErasedTryMarker(instruction)) {
-        tail = &instruction;
-        break;
-      }
+    for (llvm::Instruction &instruction : *block) {
+      if (instruction.isDebugOrPseudoInst() || isErasedTryMarker(instruction))
+        continue;
+      if (auto *push = llvm::dyn_cast<llvm::CallInst>(&instruction))
+        if (push->getCalledFunction() &&
+            push->getCalledFunction()->getName().starts_with(
+                "LyTraceback_Push"))
+          continue;
+      tail = &instruction;
+      break;
+    }
     auto *rethrow = llvm::dyn_cast_or_null<llvm::CallBase>(tail);
     if (rethrow && rethrow->getCalledFunction() &&
         rethrow->getCalledFunction()->getName() == "LyEH_RethrowCurrent")
@@ -523,7 +543,8 @@ llvm::BasicBlock *buildPythonCatchDispatchBlock(llvm::CallInst &call,
                                                 llvm::BasicBlock *catchDest,
                                                 llvm::DILocation &debugLoc,
                                                 const PythonCallSiteRange *site,
-                                                const llvm::Triple &triple) {
+                                                const llvm::Triple &triple,
+                                                unsigned tryDepth) {
   llvm::Function *function = call.getFunction();
   llvm::Module *module = function->getParent();
   llvm::LLVMContext &context = module->getContext();
@@ -561,7 +582,7 @@ llvm::BasicBlock *buildPythonCatchDispatchBlock(llvm::CallInst &call,
 
   builder.CreateCall(beginPythonCatch(*module), {exceptionObject});
   if (recordsFrame)
-    emitTracebackPush(builder, *module, site, debugLoc);
+    emitTracebackPush(builder, *module, site, debugLoc, tryDepth);
   builder.CreateBr(catchDest);
   // Marked so a later pass can find the pads that CATCH, once the runtime is
   // linked and the raise primitives have bodies to read.
@@ -673,7 +694,8 @@ bool convertCallToPythonTryInvoke(
       [&](llvm::BasicBlock *, llvm::DILocation &debugLoc) {
         return buildPythonCatchDispatchBlock(
             call, marker.catchBlock, debugLoc,
-            matchCallSiteRange(call, callSites, debugLoc), triple);
+            matchCallSiteRange(call, callSites, debugLoc), triple,
+            marker.inlineDepth);
       });
 }
 
@@ -915,9 +937,21 @@ void collectCtypesForeignSymbols(mlir::ModuleOp module,
   });
 }
 
+void collectPythonTryInlineDepths(
+    mlir::ModuleOp module, llvm::DenseMap<std::int64_t, unsigned> &depths) {
+  auto pairs =
+      module->getAttrOfType<mlir::DenseI64ArrayAttr>(kTryInlineDepthsAttr);
+  if (!pairs)
+    return;
+  llvm::ArrayRef<std::int64_t> words = pairs.asArrayRef();
+  for (std::size_t index = 0; index + 1 < words.size(); index += 2)
+    depths[words[index]] = static_cast<unsigned>(words[index + 1]);
+}
+
 void collectPythonCallSiteRanges(
     mlir::ModuleOp module,
     llvm::SmallVectorImpl<PythonCallSiteRange> &callSites) {
+  llvm::SmallVector<mlir::LLVM::CallOp, 16> calls;
   module.walk([&](mlir::LLVM::CallOp call) {
     std::optional<llvm::StringRef> calleeName = call.getCallee();
     if (!calleeName)
@@ -944,12 +978,58 @@ void collectPythonCallSiteRanges(
     site.innerFunctionName = source->functionName;
     site.inlinedAt = source->inlinedAt;
     callSites.push_back(std::move(site));
+    calls.push_back(call);
   });
+
+  // Two copies of one inlined body in one function make calls the line
+  // table cannot tell apart -- same caller, callee, line and column -- with
+  // different frames above them, and the lookup gave every copy the first
+  // one's. The copies are numbered, and the number rides to the LLVM call as
+  // its location's discriminator (attachPythonDebugInfo).
+  // ⛔ Not every call: a key with one set of frames needs no number, and a
+  // number changes the debug info of every program that has none of these.
+  llvm::StringMap<llvm::SmallVector<unsigned, 2>> byKey;
+  for (auto [index, site] : llvm::enumerate(callSites))
+    byKey[(site.caller + llvm::Twine('\0') + site.callee + llvm::Twine('\0') +
+           llvm::Twine(site.line) + llvm::Twine('\0') +
+           llvm::Twine(site.column))
+              .str()]
+        .push_back(index);
+  auto sameFrames = [](const PythonCallSiteRange &a,
+                       const PythonCallSiteRange &b) {
+    if (a.innerFunctionName != b.innerFunctionName ||
+        a.endLine != b.endLine || a.endColumn != b.endColumn ||
+        a.noAnchor != b.noAnchor || a.inlinedAt.size() != b.inlinedAt.size())
+      return false;
+    for (auto [x, y] : llvm::zip(a.inlinedAt, b.inlinedAt))
+      if (x.functionName != y.functionName || x.line != y.line ||
+          x.column != y.column || x.endLine != y.endLine ||
+          x.endColumn != y.endColumn || x.noAnchor != y.noAnchor)
+        return false;
+    return true;
+  };
+  for (auto &entry : byKey) {
+    llvm::ArrayRef<unsigned> indices = entry.second;
+    if (indices.size() < 2 ||
+        llvm::all_of(indices.drop_front(), [&](unsigned index) {
+          return sameFrames(callSites[indices.front()], callSites[index]);
+        }))
+      continue;
+    for (auto [number, index] : llvm::enumerate(indices)) {
+      callSites[index].discriminator = static_cast<unsigned>(number) + 1;
+      calls[index]->setAttr(
+          kCallSiteDiscriminatorAttr,
+          mlir::IntegerAttr::get(
+              mlir::IntegerType::get(module.getContext(), 32),
+              static_cast<std::int64_t>(number) + 1));
+    }
+  }
 }
 
 bool installPythonExceptionCleanupFrames(
     llvm::Module &module, const llvm::Triple &triple,
-    llvm::ArrayRef<PythonCallSiteRange> callSiteList) {
+    llvm::ArrayRef<PythonCallSiteRange> callSiteList,
+    const llvm::DenseMap<std::int64_t, unsigned> &tryInlineDepths) {
   const CallSiteIndex callSites(callSiteList);
   llvm::SmallVector<llvm::CallInst *, 16> calls;
   llvm::SmallVector<llvm::CallInst *, 8> anchors;
@@ -1016,6 +1096,7 @@ bool installPythonExceptionCleanupFrames(
         PythonTryCallMarker marker{markerInfo->second.id,
                                    markerInfo->second.marker,
                                    target->second.block};
+        marker.inlineDepth = tryInlineDepths.lookup(markerInfo->second.id);
         if (convertCallToPythonTryInvoke(*call, triple, marker, callSites)) {
           changed = true;
           continue;

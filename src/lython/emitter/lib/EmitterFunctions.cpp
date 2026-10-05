@@ -644,6 +644,10 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
 
   mlir::Block *entry = func.addEntryBlock();
   values.clear();
+  std::vector<std::string> savedFrameLocals =
+      std::exchange(currentFrameLocals, frameLocalOrder(callable));
+  llvm::scope_exit restoreFrameLocals(
+      [&] { currentFrameLocals = std::move(savedFrameLocals); });
   llvm::StringSet<> savedGlobalDecls = std::move(currentGlobalDecls);
   currentGlobalDecls.clear();
   llvm::StringSet<> savedBoxedLocals = std::move(currentBoxedLocals);
@@ -1038,6 +1042,7 @@ void ModuleEmitter::emitCallableFunction(const parser::Node &callable,
       return;
     }
     Value none = emitNone(callable);
+    emitFrameExitKeepAlives(callable);
     Value result = coerceValue(none, currentReturnType, callable);
     mlir::func::ReturnOp::create(builder, loc(callable), result.value);
   }

@@ -595,6 +595,53 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
 //   - so the exemption wants to be per-module, and `moduleName` cannot carry
 //     it: the runtime's own modules are emitted as `__main__` too, so the
 //     collector cannot tell them apart by name.
+mlir::LogicalResult
+RuntimeBundleLowerer::lowerGlobalClear(py::GlobalClearOp op) {
+  mlir::Type declared = op.getType();
+  // ⛔ The two native cells hold no reference: an address is a machine word
+  // and a runtime-internal int is its own value.
+  if (RuntimeBundleLowerer::isAddressGlobalType(declared) ||
+      (runtimeContractName(declared) == "builtins.int" &&
+       !op->hasAttr("ly.global.boxed"))) {
+    op.erase();
+    return mlir::success();
+  }
+  mlir::Type type = globalStorageContract(context, declared);
+  mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> valueTypes =
+      RuntimeBundleLowerer::runtimeValueTypesFor(op, type,
+                                                 "module global object ABI");
+  if (mlir::failed(valueTypes))
+    return mlir::failure();
+  mlir::Location loc = op.getLoc();
+  builder.setInsertionPoint(op);
+  mlir::Value bound = RuntimeBundleLowerer::loadObjectGlobalWord(
+      op, op.getName(), "init");
+  mlir::Value zero =
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 64).getResult();
+  mlir::Value wasBound = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::ne, bound, zero);
+  auto release = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                         wasBound,
+                                         /*withElseRegion=*/false);
+  {
+    mlir::OpBuilder::InsertionGuard insertionGuard(builder);
+    builder.setInsertionPointToStart(&release.getThenRegion().front());
+    // Unbound before the release, so a finalizer that reads the name sees
+    // it gone rather than a freed object.
+    RuntimeBundleLowerer::storeObjectGlobalWord(op, op.getName(), "init",
+                                                zero);
+    llvm::SmallVector<mlir::Value, 8> oldValues;
+    if (mlir::failed(RuntimeBundleLowerer::loadObjectGlobalValues(
+            op, op.getName(), *valueTypes, oldValues)))
+      return mlir::failure();
+    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op.getOperation(), type, oldValues, "module.global")))
+      return mlir::failure();
+  }
+  op.erase();
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerGlobalSet(py::GlobalSetOp op) {
   const RuntimeBundle *value = RuntimeBundleLowerer::bundleFor(op.getValue());
   if (!value)

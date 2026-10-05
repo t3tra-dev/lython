@@ -1,0 +1,53 @@
+Traceback (most recent call last):
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 44, in catches_raise
+    self.boom()
+    ~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 37, in boom
+    raise ValueError("raised")
+ValueError: raised
+----
+Traceback (most recent call last):
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 50, in catches_division
+    self.divide()
+    ~~~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 40, in divide
+    return 1 // 0
+           ~~^^~~
+ZeroDivisionError: division by zero
+----
+Traceback (most recent call last):
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 75, in outer
+    self.does_not_match()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 56, in does_not_match
+    return self.divide()
+           ~~~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 40, in divide
+    return 1 // 0
+           ~~^^~~
+ZeroDivisionError: division by zero
+----
+finally
+Traceback (most recent call last):
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 79, in outer
+    self.through_finally()
+    ~~~~~~~~~~~~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 62, in through_finally
+    self.boom()
+    ~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 37, in boom
+    raise ValueError("raised")
+ValueError: raised
+----
+handling
+Traceback (most recent call last):
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 83, in outer
+    self.reraises()
+    ~~~~~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 68, in reraises
+    self.boom()
+    ~~~~~~~~~^^
+  File "a_traceback_through_inlined_methods_ends_at_its_try.py", line 37, in boom
+    raise ValueError("raised")
+ValueError: raised
+----

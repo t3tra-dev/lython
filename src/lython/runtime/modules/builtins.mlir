@@ -1167,6 +1167,12 @@ module attributes {
   // Liveness pin: a no-op call whose operand keeps a box alive past calls
   // that consumed only its raw pointer words (the same device the container
   // paths use with __len__).
+  // py.keep_alive: a use of an object's storage and nothing else, so the
+  // reference that keeps it alive is released after the call site.
+  func.func @LyObject_KeepAlive(%storage: memref<?xi64>) attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "keep_alive"} {
+    func.return
+  }
+
   func.func @LyObject_Touch(%box: memref<5xi64>) attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "touch"} {
     func.return
   }

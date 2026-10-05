@@ -12,6 +12,7 @@
 // enforced by explicit earliest-boundary rejections and the inter-phase
 // verifiers instead of a ConversionTarget.
 
+#include "Common/PythonSourceRange.h"
 #include "ArithBuilders.h"
 #include "Ownership.h"
 #include "Runtime/Manifest/Index.h"
@@ -480,6 +481,7 @@ private:
                          llvm::ArrayRef<mlir::Type> valueTypes,
                          llvm::SmallVectorImpl<mlir::Value> &values);
   mlir::LogicalResult lowerGlobalSet(py::GlobalSetOp op);
+  mlir::LogicalResult lowerGlobalClear(py::GlobalClearOp op);
   // Process-lifetime i64 storage for a module-level int global, created on
   // first use. Reads/writes are plain load/store (async-signal-safe).
   mlir::LLVM::GlobalOp nativeGlobalCell(mlir::Operation *op,
@@ -1777,6 +1779,7 @@ private:
   mlir::LogicalResult lowerRound(py::RoundOp op);
   mlir::LogicalResult lowerIncRef(py::IncRefOp op);
   mlir::LogicalResult lowerDecRef(py::DecRefOp op);
+  mlir::LogicalResult lowerKeepAlive(py::KeepAliveOp op);
   mlir::LogicalResult lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
                                         llvm::StringRef methodName,
                                         mlir::Value resultValue);
@@ -1919,6 +1922,16 @@ private:
   llvm::DenseMap<mlir::Operation *, mlir::Value> primitiveI64CloneDecisionFlags;
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
+  // How many method bodies deep each try was written: the inlined levels a
+  // raise inside it reaches without leaving it.
+  llvm::DenseMap<std::int64_t, unsigned> tryInlineDepths;
+  unsigned enclosingTryInlineDepth(mlir::Block *block) const;
+  // Pushes the frames of `range`'s inlined levels from the innermost out to
+  // the one at `depth`, which the exception has not left.
+  void pushInlinedTracebackFrames(mlir::Operation *anchor,
+                                  llvm::StringRef filename,
+                                  llvm::ArrayRef<PythonInlineFrame> inlinedAt,
+                                  unsigned depth);
   // The module's deallocators once synthesizeSourceClassDeallocators has
   // made the last of them; empty before.
   std::optional<llvm::SmallVector<ownership::RuntimeDeallocator, 8>>

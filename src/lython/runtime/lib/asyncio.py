@@ -35,6 +35,17 @@ Deviations from CPython:
     container). repr() of a Task always names its coroutine's source
     location. Where the text cannot be CPython's, repr() raises
     NotImplementedError instead of printing a different one.
+  - A future whose exception nobody retrieved reports it when it dies, as
+    CPython's does, only when the exception was never raised: a raised one
+    has a traceback in CPython's report, and an exception does not carry its
+    traceback here. That report, and every Task's (whose second line is the
+    task's repr), raises NotImplementedError from `__del__` instead, which
+    prints as an exception ignored in a deallocator. The report goes to
+    stderr directly; there are no exception handlers or logging.
+  - The future dies when its last reference goes, with no cycle collector:
+    a future in a reference cycle (an exception's traceback holding the frame
+    that holds the future is one in CPython) is reported by CPython at
+    collection and never here.
 
 On a JavaScript host (`sys._js_host`: WASI with `--js-host`)
 the loop is also the host's, as Pyodide's WebLoop is: whenever it has work
@@ -49,6 +60,7 @@ promises; in a host without JSPI, and inside a callback the host is running,
 it raises RuntimeError at that point instead of hanging.
 """
 
+import _traceback
 import sys
 from time import monotonic as _monotonic, sleep as _sleep_blocking
 from types import CoroutineType
@@ -328,6 +340,15 @@ class _Waiter:
         # dispatch cannot enumerate the instantiations of.
         self._is_task = is_task
         self._must_cancel = False
+        # futures.Future.__log_traceback: an exception nobody asked for is
+        # reported when the future dies (Future.__del__).
+        self._log_traceback = False
+        # Whether the exception had been raised when it was set, which is
+        # whether CPython's report has a traceback section. ⛔ Not asked of the
+        # exception: an exception object here does not carry its traceback, so
+        # the one way to know is that it is the one being handled. That is
+        # read as "being handled at all", which errs toward the refusal.
+        self._exception_was_raised = False
 
     def done(self) -> bool:
         return self._state != "PENDING"
@@ -357,6 +378,7 @@ class _Waiter:
             raise CancelledError(self._cancel_message)
         if self._state != "FINISHED":
             raise InvalidStateError("Exception is not set.")
+        self._log_traceback = False
         return self._exception
 
     def set_exception(self, exception: BaseException) -> None:
@@ -364,6 +386,8 @@ class _Waiter:
             raise InvalidStateError("invalid state")
         self._exception = exception
         self._state = "FINISHED"
+        self._log_traceback = True
+        self._exception_was_raised = _traceback.exc_line() != ""
         self._schedule_callbacks()
 
     def _wake(self, callback: Callable[[], None]) -> None:
@@ -379,11 +403,32 @@ class _Waiter:
         for callback in callbacks:
             loop.call_soon(callback)
 
+    def _report_unretrieved(self, shown: str) -> None:
+        """base_events.default_exception_handler for the context
+        Future.__del__ hands it: the message, the future, the exception."""
+        exc = self._exception
+        if not self._log_traceback or exc is None:
+            return
+        if self._exception_was_raised:
+            raise NotImplementedError(
+                "reporting a never-retrieved exception that was raised: "
+                "CPython prints its traceback, which an exception does not "
+                "carry here")
+        sys.stderr.write(shown + " exception was never retrieved\nfuture: "
+                         + repr(self) + "\n")
+        label = type(exc).__name__
+        message = str(exc)
+        if message == "":
+            sys.stderr.write(label + "\n")
+        else:
+            sys.stderr.write(label + ": " + message + "\n")
+
     def _check_result(self) -> None:
         if self._state == "CANCELLED":
             raise CancelledError(self._cancel_message)
         if self._state != "FINISHED":
             raise InvalidStateError("Result is not ready.")
+        self._log_traceback = False
         exc = self._exception
         if exc is not None:
             raise exc
@@ -449,6 +494,9 @@ class Future[T](_Waiter):
             raise RuntimeError("await wasn't used with future")
         return self.result()
 
+    def __del__(self) -> None:
+        self._report_unretrieved(self.__class__.__name__)
+
 
 class Task[T](_Waiter):
     """A coroutine scheduled on the loop (tasks.Task).
@@ -475,6 +523,16 @@ class Task[T](_Waiter):
 
     def add_done_callback(self, fn: Callable[["Task[T]"], None]) -> None:
         self._wake(lambda: fn(self))
+
+    def __del__(self) -> None:
+        # ⛔ Not reported through _report_unretrieved: its second line is
+        # repr() of the task, which this runtime cannot write (below).
+        # Raising says so where CPython would have printed.
+        if self._log_traceback and self._exception is not None:
+            raise NotImplementedError(
+                "reporting a Task's never-retrieved exception: CPython names "
+                "the task's coroutine by its source location, which this "
+                "runtime does not keep")
 
     def __repr__(self) -> str:
         # tasks._task_repr_info names the coroutine with the file and line it
