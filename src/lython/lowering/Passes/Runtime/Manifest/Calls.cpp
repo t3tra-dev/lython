@@ -629,6 +629,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                                              instance->physicalValues().end());
     llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> updatedFieldBundles;
     updatedFieldBundles.resize(fieldTypes.size());
+    llvm::SmallDenseSet<unsigned, 8> wordStoredFields;
     for (unsigned index = 0; index < fieldTypes.size(); ++index) {
       const RuntimeBundle *fieldValue = fieldSources[index];
       if (!fieldValue) {
@@ -695,6 +696,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
                 op, slot->first, slot->second, *fieldValue, slotName);
         if (mlir::failed(stored))
           return mlir::failure();
+        // A value stored as its slot word leaves no evidence: the bundle
+        // names an object the slot does not hold (AttributeOps, field set).
+        if (stored->payloadSlotWord || stored->storeAsSlotWord) {
+          wordStoredFields.insert(index);
+          continue;
+        }
         updatedFieldBundles[index] =
             std::make_shared<RuntimeBundle>(std::move(*stored));
         continue;
@@ -768,7 +775,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         if (!name)
           return op.emitError() << "class field metadata is malformed for "
                                 << classOp.getSymName();
-        if (updatedFieldBundles[index])
+        if (wordStoredFields.contains(index))
+          updated.fieldBundles.erase(name.getValue());
+        else if (updatedFieldBundles[index])
           updated.fieldBundles[name.getValue()] = updatedFieldBundles[index];
         else
           updated.fieldBundles[name.getValue()] =
