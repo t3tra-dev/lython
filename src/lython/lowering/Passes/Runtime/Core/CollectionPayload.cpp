@@ -573,6 +573,29 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
            << "a type-erased `object` value cannot be stored in a runtime "
               "container slot yet; give the container a concrete element "
               "type annotation";
+  if (concrete->storeAsSlotWord && concrete->physicalValues().size() == 1)
+    if (std::optional<RuntimeSymbol> takingRef = manifest.primitive(
+            concrete->contractName(), "slot_word_taking_ref")) {
+      mlir::Value handle = concrete->physicalValues().front();
+      if (handle.getType() ==
+          takingRef->function.getFunctionType().getInput(0)) {
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            loc, *takingRef, mlir::ValueRange{handle});
+        llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
+        words[0] = one;
+        words[1] = constantI64(
+            builder, loc, concrete->contractName() == "builtins.int" ? 1 : 2);
+        words[box_abi::kEntityWord] = call.getResult(0);
+        return words;
+      }
+    }
+  if (concrete->payloadSlotWord) {
+    llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
+    words[0] = one;
+    words[1] = constantI64(builder, loc, 1);
+    words[box_abi::kEntityWord] = concrete->payloadSlotWord;
+    return words;
+  }
   if (concrete->physicalValues().empty())
     return op->emitError()
            << "collection payload element " << concrete->contract
@@ -641,7 +664,7 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
 
 mlir::FailureOr<RuntimeBundle>
 RuntimeBundleLowerer::materializePayloadObjectBundle(
-    mlir::Operation *op, const RuntimeBundle &valueRef) {
+    mlir::Operation *op, const RuntimeBundle &valueRef, bool slotWordOnly) {
   // Copies: this function inserts into `valueBundles` and then keeps reading its
   // operand bundles, and the caller's arguments are references INTO that
   // DenseMap -- an insertion that rehashes moves the entry and every later read
@@ -655,6 +678,37 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
     return op->emitError() << "collection payload requires an object bundle";
   if (concrete->contractName() == "types.NoneType")
     return *concrete;
+  // ⭐ AN INT THAT IS ONLY AN I64 GOES IN AS ITS SLOT WORD, with no object:
+  // the immediate when it fits in 63 bits, else a fresh object the slot takes.
+  //
+  // The i64 is the value whatever its validity flag says: a lazy bundle has
+  // no object for the flag to defer to, and `materializePrimitiveI64Object`
+  // reads the same word.
+  //
+  // ⛔ ONLY WHEN THE CALLER ONLY STORES IT (`slotWordOnly`). A literal or an
+  // evidence-backed append also keeps the bundle as the container's contents
+  // evidence, and every reader of that evidence wants an object.
+  if (slotWordOnly && RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete))
+    if (std::optional<RuntimeSymbol> slotWord =
+            manifest.primitive("builtins.int", "slot_word_from_i64")) {
+      builder.setInsertionPoint(op);
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op->getLoc(), *slotWord,
+          mlir::ValueRange{concrete->primitiveI64->value});
+      RuntimeBundle word = *concrete;
+      word.payloadSlotWord = call.getResult(0);
+      return word;
+    }
+  if (slotWordOnly &&
+      (concrete->contractName() == "builtins.int" ||
+       concrete->contractName() == "builtins.float") &&
+      concrete->physicalValues().size() == 1 &&
+      ownership::isObjectHeaderLikeType(
+          concrete->physicalValues().front().getType())) {
+    RuntimeBundle marked = *concrete;
+    marked.storeAsSlotWord = true;
+    return marked;
+  }
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete)) {
     builder.setInsertionPoint(op);
     mlir::FailureOr<RuntimeValue> object =

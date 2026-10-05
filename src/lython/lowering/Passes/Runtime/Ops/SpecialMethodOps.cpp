@@ -931,7 +931,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
       if (mlir::failed(raw))
         return mlir::failure();
       mlir::FailureOr<RuntimeBundle> payload =
-          RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
+          RuntimeBundleLowerer::materializePayloadObjectBundle(
+              op, value, /*slotWordOnly=*/true);
       if (mlir::failed(payload))
         return mlir::failure();
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
@@ -1004,11 +1005,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerSetItem(py::SetItemOp op) {
     builder.setInsertionPoint(op);
     mlir::Location loc = op.getLoc();
     mlir::FailureOr<RuntimeBundle> payloadKey =
-        RuntimeBundleLowerer::materializePayloadObjectBundle(op, index);
+        RuntimeBundleLowerer::materializePayloadObjectBundle(
+            op, index, /*slotWordOnly=*/true);
     if (mlir::failed(payloadKey))
       return mlir::failure();
     mlir::FailureOr<RuntimeBundle> payloadValue =
-        RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
+        RuntimeBundleLowerer::materializePayloadObjectBundle(
+            op, value, /*slotWordOnly=*/true);
     if (mlir::failed(payloadValue))
       return mlir::failure();
     if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(

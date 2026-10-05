@@ -1,0 +1,5 @@
+b'\x00A\xff'
+ValueError: bytes must be in range(0, 256)
+ValueError: bytes must be in range(0, 256)
+ValueError: bytes must be in range(0, 256)
+ValueError: bytes must be in range(0, 256)

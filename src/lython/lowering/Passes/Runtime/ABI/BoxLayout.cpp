@@ -87,7 +87,8 @@ RuntimeBundleLowerer::lanesFromBoxEntity(mlir::OpBuilder &builder,
                                          mlir::Value entityWord,
                                          llvm::ArrayRef<mlir::Type> laneTypes,
                                          llvm::StringRef contract,
-                                         mlir::Operation *reporter) {
+                                         mlir::Operation *reporter,
+                                         bool ownedRead) {
   llvm::SmallVector<mlir::Value, 4> lanes;
   if (laneTypes.empty())
     return lanes;
@@ -96,6 +97,39 @@ RuntimeBundleLowerer::lanesFromBoxEntity(mlir::OpBuilder &builder,
     return reporter->emitError()
            << contract << " has no statically sized entity lane to rebuild a "
            << "box from, got " << laneTypes.front();
+  // ⭐ AN INT OR FLOAT ENTITY MAY BE THE VALUE ITSELF (bit 0 set; see
+  // `__ly_slot_word_is_immediate`), and then the view built here points at
+  // nothing. A caller that goes on to RETAIN the view is fine: its retain goes
+  // through the contract's `from_slot_word` (`retainEvidenceElement`), which
+  // makes the object. A caller that BORROWS the view and hands it to code
+  // asks for `ownedRead`, and gets that owned object here instead -- released
+  // by the frame like any call result.
+  //
+  // ⛔ Not always owned: a read guarded by an `scf.if` yields the view and
+  // retains after the merge, and an owned result there would be retained twice.
+  // And not for the release hook, which is reached only for an address and
+  // must drop the SLOT's reference.
+  if (ownedRead && laneTypes.size() == 1 &&
+      (contract == "builtins.int" || contract == "builtins.float")) {
+    std::optional<RuntimeSymbol> fromSlotWord =
+        manifest.primitive(contract, "from_slot_word");
+    if (!fromSlotWord)
+      return reporter->emitError()
+             << contract << " has no `from_slot_word` primitive, so a slot "
+                "holding it immediately cannot be read";
+    mlir::Value size = mlir::arith::ConstantIntOp::create(
+                           builder, loc, head.getDimSize(0), 64)
+                           .getResult();
+    mlir::Value slotView = RuntimeBundleLowerer::memrefFromBoxWords(
+        builder, loc, entityWord, size, head);
+    mlir::func::CallOp call = mlir::func::CallOp::create(
+        builder, loc, fromSlotWord->function, mlir::ValueRange{slotView});
+    if (call.getNumResults() != 1 || call.getResult(0).getType() != head)
+      return fromSlotWord->function.emitError()
+             << "`from_slot_word` must answer with one " << head;
+    lanes.push_back(call.getResult(0));
+    return lanes;
+  }
   mlir::Value headSize = mlir::arith::ConstantIntOp::create(
                              builder, loc, head.getDimSize(0), 64)
                              .getResult();

@@ -1,16 +1,18 @@
 #pragma once
 
-// Physical layout of a payload box slot: 12 i64 words per element. Words
-// [4, 7) hold the pointer word of each physical memref (position i at
-// kPointerWordBase + i), words [7, 10) the matching size words. The runtime
-// support module (RuntimeSupportBuilder) and every lower* TU that probes or
-// rebuilds boxed payloads must agree on these offsets; they are defined only
-// here.
+// Physical layout of a payload box slot: three i64 words per element -- an
+// unused refcount word, the class id, and the entity. The entity is the
+// address of the value's object, or 0, or -- for class int and float only --
+// the value itself with bit 0 set (an "immediate"; `__ly_slot_word_is_immediate`
+// in builtins.mlir has the encodings). A slot owns a reference exactly when its
+// entity is an address. The runtime support module (RuntimeSupportBuilder) and
+// every lower* TU that probes or rebuilds boxed payloads must agree on these
+// offsets; they are defined only here.
 //
 // ⛔ WHY THE POINTER WORDS ARE WORDS, since two other slots in this tree were
 // changed to hold real pointers and this one cannot be.
 //
-// A box is a `memref<12xi64>`, and a memref's element type cannot be a pointer:
+// A box is a `memref<Nxi64>`, and a memref's element type cannot be a pointer:
 // MLIR rejects `memref<4x!llvm.ptr>` with "invalid memref element type"
 // (checked with mlir-opt, not assumed). `memref<4xindex>` is accepted and is
 // the same thing -- an integer. So an object graph cannot be built inside the

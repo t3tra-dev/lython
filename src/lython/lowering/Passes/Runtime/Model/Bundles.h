@@ -186,6 +186,16 @@ struct RuntimeBundle {
   llvm::SmallVector<RuntimeValue, 8> generatorSources;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> generatorSourceBundles;
   std::optional<RuntimePrimitiveI64Evidence> primitiveI64;
+  // An int payload already in the form a slot's entity word takes (an
+  // immediate, or the address of an object whose one reference the slot
+  // takes): set by `materializePayloadObjectBundle` for an int that exists
+  // only as an i64, so storing it allocates nothing. Such a bundle has no
+  // physical values, so the aggregate retain has nothing to count.
+  mlir::Value payloadSlotWord;
+  // An int or float OBJECT a caller only stores: its slot word is computed by
+  // the contract's `slot_word_taking_ref` when the handle words are built,
+  // which comes after the aggregate retain (see that primitive).
+  bool storeAsSlotWord = false;
   std::optional<RuntimeBufferEvidence> buffer;
   std::optional<RuntimeCtypesEvidence> ctypes;
   RuntimeObjectEvidence objectEvidence;
