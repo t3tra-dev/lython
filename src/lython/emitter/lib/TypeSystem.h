@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string_view>
 #include "Ast.h"
 #include "Diagnostics.h"
 #include "PyDialectTypes.h"
@@ -16,6 +17,18 @@
 #include <string>
 
 namespace lython::emitter {
+
+// The io function open() with a literal binary MODE stands for: the
+// Buffered* class CPython's open() returns for it -- BufferedRandom for '+',
+// BufferedReader for 'r', BufferedWriter for 'w', 'a' and 'x'
+// (runtime/lib/io.py, _open_buffered_*).
+inline const char *binaryOpenFunction(std::string_view mode) {
+  if (mode.find('+') != std::string_view::npos)
+    return "io._open_buffered_random";
+  if (mode.find('r') != std::string_view::npos)
+    return "io._open_buffered_reader";
+  return "io._open_buffered_writer";
+}
 
 struct FunctionSignature {
   py::CallableType callable;

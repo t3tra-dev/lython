@@ -4426,8 +4426,15 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
         if (const auto *args = ast::nodeList(*node, "args"))
           if (args->size() >= 2 && (*args)[1]) {
             auto mode = ast::string(*(*args)[1], "value");
-            if (mode && mode->find('b') != std::string_view::npos)
+            if (mode && mode->find('b') != std::string_view::npos) {
+              if (std::optional<mlir::Type> opener =
+                      lookupSymbol(binaryOpenFunction(*mode)))
+                if (auto callable =
+                        mlir::dyn_cast<py::CallableType>(*opener);
+                    callable && callable.getResultTypes().size() == 1)
+                  return callable.getResultTypes().front();
               return contract("_io.FileIO");
+            }
           }
         return contract("_io.TextIOWrapper");
       }

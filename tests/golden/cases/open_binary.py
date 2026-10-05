@@ -1,6 +1,5 @@
 # open() with a str-literal 'b' mode statically selects the binary arm and
-# returns the raw FileIO (CPython returns a Buffered* wrapper; the Lib/io.py
-# port's wrappers delegate to FileIO 1:1).
+# returns the Buffered* wrapper CPython does, over the raw FileIO.
 f = open("open_binary_case.tmp", "wb")
 print(f.write(b"binary\x00mode"))
 f.close()

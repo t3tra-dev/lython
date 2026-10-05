@@ -63,7 +63,9 @@ module attributes {
   //   [6] closed     [7] reserved
   py.class @TextIOWrapper attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["write", "read", "readline", "flush", "close", "fileno", "readable", "writable", "seek", "tell", "seekable", "__enter__", "__exit__"],
+    field_names = ["name", "mode"],
+    field_contract_types = [!py.contract<"builtins.str">, !py.contract<"builtins.str">],
+    method_names = ["write", "read", "readline", "flush", "close", "fileno", "readable", "writable", "seek", "tell", "seekable", "__enter__", "__exit__", "__repr__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
       !py.callable<[!py.contract<"_io.TextIOWrapper">, !py.contract<"builtins.int">], arg_names = ["self", "size"], arg_defaults = [false, true], returns = [!py.contract<"builtins.str">]>,
@@ -77,9 +79,10 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"_io.TextIOWrapper">]>,
-      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.literal<None>>, !py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">, !py.union<!py.type<!py.contract<"builtins.BaseException">>, !py.literal<None>>, !py.union<!py.contract<"builtins.BaseException">, !py.literal<None>>, !py.union<!py.contract<"types.TracebackType">, !py.literal<None>>] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_io.TextIOWrapper">] -> [!py.contract<"builtins.str">]>
     ],
-    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @UnsupportedOperation attributes {base_names = ["OSError"]} {}
@@ -127,7 +130,9 @@ module attributes {
 
   py.class @FileIO attributes {
     base_names = ["object"], ly.typing.final,
-    method_names = ["__init__", "read", "write", "seek", "tell", "truncate", "seekable", "flush", "close", "fileno", "readable", "writable"],
+    field_names = ["name", "mode"],
+    field_contract_types = [!py.contract<"builtins.str">, !py.contract<"builtins.str">],
+    method_names = ["__init__", "read", "write", "seek", "tell", "truncate", "seekable", "flush", "close", "fileno", "readable", "writable", "__repr__"],
     method_contracts = [
       !py.callable<[!py.contract<"_io.FileIO">, !py.contract<"builtins.str">, !py.contract<"builtins.str">], arg_names = ["self", "file", "mode"], arg_defaults = [false, false, true], returns = [!py.literal<None>]>,
       !py.callable<[!py.contract<"_io.FileIO">, !py.contract<"builtins.int">], arg_names = ["self", "size"], arg_defaults = [false, true], returns = [!py.contract<"builtins.bytes">]>,
@@ -140,9 +145,10 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"_io.FileIO">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"_io.FileIO">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"_io.FileIO">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"_io.FileIO">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"_io.FileIO">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"_io.FileIO">] -> [!py.contract<"builtins.str">]>
     ],
-    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+    method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   // ===== shared runtime declarations (defined in builtins.mlir / support) =====
@@ -350,7 +356,11 @@ module attributes {
   }
 
   // ===== impls: TextIOWrapper =====
-  func.func private @LyTextIO_Shape() -> memref<8xi64> attributes {ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.shape}
+  // The class id is declared here because no constructor carries it: open()
+  // builds the object, and a manifest class id comes from the function that
+  // says which class it makes. Without one, a file in a container was boxed
+  // with class 0 and printed as `<object object at 0x...>`.
+  func.func private @LyTextIO_Shape() -> memref<8xi64> attributes {ly.runtime.class_id = 65 : i64, ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.shape}
 
   func.func private @__ly_textio_check_open(%self: memref<8xi64>) {
     %closed_slot = arith.constant 6 : index
@@ -756,6 +766,7 @@ module attributes {
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
     scf.if %became_zero {
       func.call @LyTextIO_Close(%self) : (memref<8xi64>) -> ()
+      func.call @__ly_io_meta_release(%self) : (memref<8xi64>) -> ()
       memref.dealloc %self : memref<8xi64>
     }
     func.return
@@ -1308,6 +1319,10 @@ module attributes {
     memref.store %handle, %self[%handle_slot] : memref<8xi64>
     memref.store %readable, %self[%readable_slot] : memref<8xi64>
     memref.store %writable, %self[%writable_slot] : memref<8xi64>
+    func.call @__ly_io_meta_release(%self) : (memref<8xi64>) -> ()
+    %meta = func.call @__ly_io_fileio_meta(%path_header, %base, %plus) : (memref<2xi64>, i64, i64) -> i64
+    %meta_slot = arith.constant 7 : index
+    memref.store %meta, %self[%meta_slot] : memref<8xi64>
     func.return %self : memref<8xi64>
   }
 
@@ -1537,6 +1552,7 @@ module attributes {
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
     scf.if %became_zero {
       func.call @LyFileIO_Close(%self) : (memref<8xi64>) -> ()
+      func.call @__ly_io_meta_release(%self) : (memref<8xi64>) -> ()
       memref.dealloc %self : memref<8xi64>
     }
     func.return
@@ -1818,6 +1834,7 @@ module attributes {
     %closed_slot = arith.constant 6 : index
     %reserved_slot = arith.constant 7 : index
     %class_id = arith.constant 65 : i64
+    %meta = func.call @__ly_io_meta_new(%path_header, %mode_header) : (memref<2xi64>, memref<2xi64>) -> i64
     memref.store %one, %wrapper[%refcount_slot] : memref<8xi64>
     memref.store %class_id, %wrapper[%class_slot] : memref<8xi64>
     memref.store %handle, %wrapper[%handle_slot] : memref<8xi64>
@@ -1825,15 +1842,14 @@ module attributes {
     memref.store %readable, %wrapper[%readable_slot] : memref<8xi64>
     memref.store %writable, %wrapper[%writable_slot] : memref<8xi64>
     memref.store %zero, %wrapper[%closed_slot] : memref<8xi64>
-    memref.store %zero, %wrapper[%reserved_slot] : memref<8xi64>
+    memref.store %meta, %wrapper[%reserved_slot] : memref<8xi64>
     func.return %wrapper : memref<8xi64>
   }
 
-  // open(file, mode) with a 'b' mode: the binary arm the emitter selects
-  // STATICALLY when the mode is a str literal containing 'b' (the return
-  // type depends on the mode, which a runtime value cannot express in the
-  // static surface). Returns the raw FileIO; CPython returns a Buffered*
-  // wrapper, whose Lib/io.py port delegates to FileIO 1:1 here.
+  // open(file, mode) with a 'b' mode, as the raw FileIO. The emitter calls
+  // io's Buffered* openers instead when the program has io, which the driver
+  // arranges for every literal binary open (runtime/lib/io.py); this is the
+  // arm left for a program that shadows io with a module of its own.
   func.func @LyIO_OpenBinary(%path_header: memref<2xi64> {ly.ownership.object_header}, %path_bytes: memref<?xi8>, %mode_header: memref<2xi64> {ly.ownership.object_header}, %mode_bytes: memref<?xi8>) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["_io.FileIO"], ly.ownership.owned_results = [0], ly.runtime.builtin = "_io.open_binary", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.str", ly.runtime.primitive = "io_open_binary", ly.runtime.result_contract = "_io.FileIO"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -1869,6 +1885,7 @@ module attributes {
     %closed_slot = arith.constant 6 : index
     %reserved_slot = arith.constant 7 : index
     %class_id = arith.constant 72 : i64
+    %meta = func.call @__ly_io_fileio_meta(%path_header, %base, %plus) : (memref<2xi64>, i64, i64) -> i64
     memref.store %one, %wrapper[%refcount_slot] : memref<8xi64>
     memref.store %class_id, %wrapper[%class_slot] : memref<8xi64>
     memref.store %handle, %wrapper[%handle_slot] : memref<8xi64>
@@ -1876,7 +1893,362 @@ module attributes {
     memref.store %readable, %wrapper[%readable_slot] : memref<8xi64>
     memref.store %writable, %wrapper[%writable_slot] : memref<8xi64>
     memref.store %zero, %wrapper[%closed_slot] : memref<8xi64>
-    memref.store %zero, %wrapper[%reserved_slot] : memref<8xi64>
+    memref.store %meta, %wrapper[%reserved_slot] : memref<8xi64>
     func.return %wrapper : memref<8xi64>
+  }
+
+  // ===== name and mode: what repr and the `name`/`mode` attributes read =====
+  // Word 7 of a TextIOWrapper or FileIO holds the address of a two-word block,
+  // [name header, mode header], each str retained for the object and released
+  // with it; 0 for the standard streams, whose name and mode follow from the
+  // descriptor. CPython keeps the name on the raw FileIO and the mode on the
+  // wrapper; one block serves both here because there is no stack to keep
+  // them on.
+  memref.global "private" constant @__ly_io_lit_stdin : memref<7xi8> = dense<[60, 115, 116, 100, 105, 110, 62]>
+  memref.global "private" constant @__ly_io_lit_stdout : memref<8xi8> = dense<[60, 115, 116, 100, 111, 117, 116, 62]>
+  memref.global "private" constant @__ly_io_lit_stderr : memref<8xi8> = dense<[60, 115, 116, 100, 101, 114, 114, 62]>
+  memref.global "private" constant @__ly_io_lit_r : memref<1xi8> = dense<[114]>
+  memref.global "private" constant @__ly_io_lit_w : memref<1xi8> = dense<[119]>
+  memref.global "private" constant @__ly_io_lit_rb : memref<2xi8> = dense<[114, 98]>
+  memref.global "private" constant @__ly_io_lit_wb : memref<2xi8> = dense<[119, 98]>
+  memref.global "private" constant @__ly_io_lit_rbp : memref<3xi8> = dense<[114, 98, 43]>
+  memref.global "private" constant @__ly_io_lit_ab : memref<2xi8> = dense<[97, 98]>
+  memref.global "private" constant @__ly_io_lit_abp : memref<3xi8> = dense<[97, 98, 43]>
+  memref.global "private" constant @__ly_io_lit_xb : memref<2xi8> = dense<[120, 98]>
+  memref.global "private" constant @__ly_io_lit_xbp : memref<3xi8> = dense<[120, 98, 43]>
+  memref.global "private" constant @__ly_io_lit_textio : memref<24xi8> = dense<[60, 95, 105, 111, 46, 84, 101, 120, 116, 73, 79, 87, 114, 97, 112, 112, 101, 114, 32, 110, 97, 109, 101, 61]>
+  memref.global "private" constant @__ly_io_lit_mode : memref<6xi8> = dense<[32, 109, 111, 100, 101, 61]>
+  memref.global "private" constant @__ly_io_lit_enc_file : memref<18xi8> = dense<[32, 101, 110, 99, 111, 100, 105, 110, 103, 61, 39, 85, 84, 70, 45, 56, 39, 62]>
+  memref.global "private" constant @__ly_io_lit_enc_std : memref<18xi8> = dense<[32, 101, 110, 99, 111, 100, 105, 110, 103, 61, 39, 117, 116, 102, 45, 56, 39, 62]>
+  memref.global "private" constant @__ly_io_lit_fileio : memref<17xi8> = dense<[60, 95, 105, 111, 46, 70, 105, 108, 101, 73, 79, 32, 110, 97, 109, 101, 61]>
+  memref.global "private" constant @__ly_io_lit_closefd : memref<14xi8> = dense<[32, 99, 108, 111, 115, 101, 102, 100, 61, 84, 114, 117, 101, 62]>
+  memref.global "private" constant @__ly_io_lit_fileio_closed : memref<21xi8> = dense<[60, 95, 105, 111, 46, 70, 105, 108, 101, 73, 79, 32, 91, 99, 108, 111, 115, 101, 100, 93, 62]>
+
+  func.func private @__ly_handle_retain_raw(%entity: i64)
+  func.func private @release_unicode_raw(!llvm.ptr, !llvm.ptr)
+  func.func private @__ly_global_view_i64(%pointer: i64, %size: i64) -> memref<?xi64>
+  func.func private @__ly_global_view_i8(%pointer: i64, %size: i64) -> memref<?xi8>
+  func.func private @__ly_unicode_data_offset() -> i64
+  func.func private @__ly_unicode_raw_bytes(%hdr_ptr: i64) -> i64
+  func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
+  func.func private @LyUnicode_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+
+  func.func private @__ly_io_meta_new(%name_header: memref<2xi64>, %mode_header: memref<2xi64>) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %name_index = memref.extract_aligned_pointer_as_index %name_header : memref<2xi64> -> index
+    %name_word = arith.index_cast %name_index : index to i64
+    %mode_index = memref.extract_aligned_pointer_as_index %mode_header : memref<2xi64> -> index
+    %mode_word = arith.index_cast %mode_index : index to i64
+    func.call @__ly_handle_retain_raw(%name_word) : (i64) -> ()
+    func.call @__ly_handle_retain_raw(%mode_word) : (i64) -> ()
+    %block = memref.alloc() : memref<2xi64>
+    memref.store %name_word, %block[%c0] : memref<2xi64>
+    memref.store %mode_word, %block[%c1] : memref<2xi64>
+    %block_index = memref.extract_aligned_pointer_as_index %block : memref<2xi64> -> index
+    %block_word = arith.index_cast %block_index : index to i64
+    func.return %block_word : i64
+  }
+
+  func.func private @__ly_io_meta_release(%self: memref<8xi64>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %meta_slot = arith.constant 7 : index
+    %zero = arith.constant 0 : i64
+    %two = arith.constant 2 : i64
+    %meta = memref.load %self[%meta_slot] : memref<8xi64>
+    %has_meta = arith.cmpi ne, %meta, %zero : i64
+    scf.if %has_meta {
+      %block = func.call @__ly_global_view_i64(%meta, %two) : (i64, i64) -> memref<?xi64>
+      %name_word = memref.load %block[%c0] : memref<?xi64>
+      %mode_word = memref.load %block[%c1] : memref<?xi64>
+      %name_ptr = llvm.inttoptr %name_word : i64 to !llvm.ptr
+      %mode_ptr = llvm.inttoptr %mode_word : i64 to !llvm.ptr
+      func.call @release_unicode_raw(%name_ptr, %name_ptr) : (!llvm.ptr, !llvm.ptr) -> ()
+      func.call @release_unicode_raw(%mode_ptr, %mode_ptr) : (!llvm.ptr, !llvm.ptr) -> ()
+      memref.dealloc %block : memref<?xi64>
+      memref.store %zero, %self[%meta_slot] : memref<8xi64>
+    }
+    func.return
+  }
+
+  // The stored str %which (0 = name, 1 = mode), BORROWED from the block.
+  func.func private @__ly_io_meta_view(%meta: i64, %which: i64) -> (memref<2xi64>, memref<?xi8>) {
+    %two = arith.constant 2 : i64
+    %block = func.call @__ly_global_view_i64(%meta, %two) : (i64, i64) -> memref<?xi64>
+    %which_index = arith.index_cast %which : i64 to index
+    %header_word = memref.load %block[%which_index] : memref<?xi64>
+    %words = func.call @__ly_global_view_i64(%header_word, %two) : (i64, i64) -> memref<?xi64>
+    %header = memref.cast %words : memref<?xi64> to memref<2xi64>
+    %prefix = func.call @__ly_unicode_data_offset() : () -> i64
+    %bytes_word = arith.addi %header_word, %prefix : i64
+    %byte_length = func.call @__ly_unicode_raw_bytes(%header_word) : (i64) -> i64
+    %bytes = func.call @__ly_global_view_i8(%bytes_word, %byte_length) : (i64, i64) -> memref<?xi8>
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // name (0) or mode (1) of a stream, as a new reference. A standard stream
+  // keeps no block: its descriptor names it, `<stdin>` read, the others write.
+  func.func private @__ly_io_meta_str(%self: memref<8xi64>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %meta_slot = arith.constant 7 : index
+    %handle_slot = arith.constant 2 : index
+    %zero = arith.constant 0 : i64
+    %meta = memref.load %self[%meta_slot] : memref<8xi64>
+    %has_meta = arith.cmpi ne, %meta, %zero : i64
+    %result:2 = scf.if %has_meta -> (memref<2xi64>, memref<?xi8>) {
+      %h, %b = func.call @__ly_io_meta_view(%meta, %which) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+      %empty_g = memref.get_global @__ly_io_lit_r : memref<1xi8>
+      %empty_d = memref.cast %empty_g : memref<1xi8> to memref<?xi8>
+      %no_bytes = arith.constant 0 : i64
+      %empty_h, %empty_b = func.call @LyUnicode_FromBytes(%empty_d, %c0, %no_bytes) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %copy_h, %copy_b = func.call @LyUnicode_Concat(%empty_h, %empty_b, %h, %b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%empty_h) : (memref<2xi64>) -> ()
+      scf.yield %copy_h, %copy_b : memref<2xi64>, memref<?xi8>
+    } else {
+      %fd = memref.load %self[%handle_slot] : memref<8xi64>
+      %is_name = arith.cmpi eq, %which, %zero : i64
+      %is_stdin = arith.cmpi eq, %fd, %zero : i64
+      %named:2 = scf.if %is_name -> (memref<2xi64>, memref<?xi8>) {
+        %one = arith.constant 1 : i64
+        %is_stdout = arith.cmpi eq, %fd, %one : i64
+        %std:2 = scf.if %is_stdin -> (memref<2xi64>, memref<?xi8>) {
+    %in_h_g = memref.get_global @__ly_io_lit_stdin : memref<7xi8>
+    %in_h_d = memref.cast %in_h_g : memref<7xi8> to memref<?xi8>
+    %in_h_n = arith.constant 7 : i64
+    %in_h, %in_b = func.call @LyUnicode_FromBytes(%in_h_d, %c0, %in_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %in_h, %in_b : memref<2xi64>, memref<?xi8>
+        } else {
+          %out:2 = scf.if %is_stdout -> (memref<2xi64>, memref<?xi8>) {
+    %o_h_g = memref.get_global @__ly_io_lit_stdout : memref<8xi8>
+    %o_h_d = memref.cast %o_h_g : memref<8xi8> to memref<?xi8>
+    %o_h_n = arith.constant 8 : i64
+    %o_h, %o_b = func.call @LyUnicode_FromBytes(%o_h_d, %c0, %o_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+            scf.yield %o_h, %o_b : memref<2xi64>, memref<?xi8>
+          } else {
+    %e_h_g = memref.get_global @__ly_io_lit_stderr : memref<8xi8>
+    %e_h_d = memref.cast %e_h_g : memref<8xi8> to memref<?xi8>
+    %e_h_n = arith.constant 8 : i64
+    %e_h, %e_b = func.call @LyUnicode_FromBytes(%e_h_d, %c0, %e_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+            scf.yield %e_h, %e_b : memref<2xi64>, memref<?xi8>
+          }
+          scf.yield %out#0, %out#1 : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %std#0, %std#1 : memref<2xi64>, memref<?xi8>
+      } else {
+        %m:2 = scf.if %is_stdin -> (memref<2xi64>, memref<?xi8>) {
+    %r_h_g = memref.get_global @__ly_io_lit_r : memref<1xi8>
+    %r_h_d = memref.cast %r_h_g : memref<1xi8> to memref<?xi8>
+    %r_h_n = arith.constant 1 : i64
+    %r_h, %r_b = func.call @LyUnicode_FromBytes(%r_h_d, %c0, %r_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %r_h, %r_b : memref<2xi64>, memref<?xi8>
+        } else {
+    %w_h_g = memref.get_global @__ly_io_lit_w : memref<1xi8>
+    %w_h_d = memref.cast %w_h_g : memref<1xi8> to memref<?xi8>
+    %w_h_n = arith.constant 1 : i64
+    %w_h, %w_b = func.call @LyUnicode_FromBytes(%w_h_d, %c0, %w_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %w_h, %w_b : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %m#0, %m#1 : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %named#0, %named#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // `name` / `mode`: the field primitive the attribute reads call.
+  func.func @LyTextIO_Field(%self: memref<8xi64> {ly.ownership.object_header}, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.primitive = "field", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b = func.call @__ly_io_meta_str(%self, %which) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyFileIO_Field(%self: memref<8xi64> {ly.ownership.object_header}, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.primitive = "field", ly.runtime.result_contract = "builtins.str"} {
+    %h, %b = func.call @__ly_io_meta_str(%self, %which) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // textio.c textiowrapper_repr: name, mode, encoding. The encoding is the
+  // one this runtime decodes with, spelled as CPython spells the locale's
+  // for a file and as it spells its own for a standard stream.
+  func.func @LyTextIO_Repr(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.TextIOWrapper", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %meta_slot = arith.constant 7 : index
+    %p0_h_g = memref.get_global @__ly_io_lit_textio : memref<24xi8>
+    %p0_h_d = memref.cast %p0_h_g : memref<24xi8> to memref<?xi8>
+    %p0_h_n = arith.constant 24 : i64
+    %p0_h, %p0_b = func.call @LyUnicode_FromBytes(%p0_h_d, %c0, %p0_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %n_h, %n_b = func.call @__ly_io_meta_str(%self, %zero) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %nr_h, %nr_b = func.call @LyUnicode_Repr(%n_h, %n_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%n_h) : (memref<2xi64>) -> ()
+    %p1_h, %p1_b = func.call @LyUnicode_Concat(%p0_h, %p0_b, %nr_h, %nr_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p0_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%nr_h) : (memref<2xi64>) -> ()
+    %ml_h_g = memref.get_global @__ly_io_lit_mode : memref<6xi8>
+    %ml_h_d = memref.cast %ml_h_g : memref<6xi8> to memref<?xi8>
+    %ml_h_n = arith.constant 6 : i64
+    %ml_h, %ml_b = func.call @LyUnicode_FromBytes(%ml_h_d, %c0, %ml_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %p2_h, %p2_b = func.call @LyUnicode_Concat(%p1_h, %p1_b, %ml_h, %ml_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p1_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%ml_h) : (memref<2xi64>) -> ()
+    %m_h, %m_b = func.call @__ly_io_meta_str(%self, %one) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mr_h, %mr_b = func.call @LyUnicode_Repr(%m_h, %m_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%m_h) : (memref<2xi64>) -> ()
+    %p3_h, %p3_b = func.call @LyUnicode_Concat(%p2_h, %p2_b, %mr_h, %mr_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p2_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%mr_h) : (memref<2xi64>) -> ()
+    %meta = memref.load %self[%meta_slot] : memref<8xi64>
+    %is_std = arith.cmpi eq, %meta, %zero : i64
+    %enc:2 = scf.if %is_std -> (memref<2xi64>, memref<?xi8>) {
+    %s_h_g = memref.get_global @__ly_io_lit_enc_std : memref<18xi8>
+    %s_h_d = memref.cast %s_h_g : memref<18xi8> to memref<?xi8>
+    %s_h_n = arith.constant 18 : i64
+    %s_h, %s_b = func.call @LyUnicode_FromBytes(%s_h_d, %c0, %s_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %s_h, %s_b : memref<2xi64>, memref<?xi8>
+    } else {
+    %f_h_g = memref.get_global @__ly_io_lit_enc_file : memref<18xi8>
+    %f_h_d = memref.cast %f_h_g : memref<18xi8> to memref<?xi8>
+    %f_h_n = arith.constant 18 : i64
+    %f_h, %f_b = func.call @LyUnicode_FromBytes(%f_h_d, %c0, %f_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
+    }
+    %out_h, %out_b = func.call @LyUnicode_Concat(%p3_h, %p3_b, %enc#0, %enc#1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p3_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%enc#0) : (memref<2xi64>) -> ()
+    func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
+  }
+
+  // fileio.c fileio_repr: `[closed]` once closed, else name, the mode as
+  // FileIO spells it, and closefd -- always True, open() owns the descriptor.
+  func.func @LyFileIO_Repr(%self: memref<8xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_io.FileIO", ly.runtime.method = "__repr__", ly.runtime.result_contract = "builtins.str"} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %closed_slot = arith.constant 6 : index
+    %closed = memref.load %self[%closed_slot] : memref<8xi64>
+    %is_closed = arith.cmpi ne, %closed, %zero : i64
+    %result:2 = scf.if %is_closed -> (memref<2xi64>, memref<?xi8>) {
+    %c_h_g = memref.get_global @__ly_io_lit_fileio_closed : memref<21xi8>
+    %c_h_d = memref.cast %c_h_g : memref<21xi8> to memref<?xi8>
+    %c_h_n = arith.constant 21 : i64
+    %c_h, %c_b = func.call @LyUnicode_FromBytes(%c_h_d, %c0, %c_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      scf.yield %c_h, %c_b : memref<2xi64>, memref<?xi8>
+    } else {
+    %p0_h_g = memref.get_global @__ly_io_lit_fileio : memref<17xi8>
+    %p0_h_d = memref.cast %p0_h_g : memref<17xi8> to memref<?xi8>
+    %p0_h_n = arith.constant 17 : i64
+    %p0_h, %p0_b = func.call @LyUnicode_FromBytes(%p0_h_d, %c0, %p0_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %n_h, %n_b = func.call @__ly_io_meta_str(%self, %zero) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+      %nr_h, %nr_b = func.call @LyUnicode_Repr(%n_h, %n_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%n_h) : (memref<2xi64>) -> ()
+    %p1_h, %p1_b = func.call @LyUnicode_Concat(%p0_h, %p0_b, %nr_h, %nr_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p0_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%nr_h) : (memref<2xi64>) -> ()
+    %ml_h_g = memref.get_global @__ly_io_lit_mode : memref<6xi8>
+    %ml_h_d = memref.cast %ml_h_g : memref<6xi8> to memref<?xi8>
+    %ml_h_n = arith.constant 6 : i64
+    %ml_h, %ml_b = func.call @LyUnicode_FromBytes(%ml_h_d, %c0, %ml_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %p2_h, %p2_b = func.call @LyUnicode_Concat(%p1_h, %p1_b, %ml_h, %ml_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p1_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%ml_h) : (memref<2xi64>) -> ()
+      %m_h, %m_b = func.call @__ly_io_meta_str(%self, %one) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+      %mr_h, %mr_b = func.call @LyUnicode_Repr(%m_h, %m_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      func.call @LyUnicode_DecRef(%m_h) : (memref<2xi64>) -> ()
+    %p3_h, %p3_b = func.call @LyUnicode_Concat(%p2_h, %p2_b, %mr_h, %mr_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p2_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%mr_h) : (memref<2xi64>) -> ()
+    %cf_h_g = memref.get_global @__ly_io_lit_closefd : memref<14xi8>
+    %cf_h_d = memref.cast %cf_h_g : memref<14xi8> to memref<?xi8>
+    %cf_h_n = arith.constant 14 : i64
+    %cf_h, %cf_b = func.call @LyUnicode_FromBytes(%cf_h_d, %c0, %cf_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %p4_h, %p4_b = func.call @LyUnicode_Concat(%p3_h, %p3_b, %cf_h, %cf_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%p3_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%cf_h) : (memref<2xi64>) -> ()
+      scf.yield %p4_h, %p4_b : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // FileIO's own spelling of its mode (fileio.c mode_string): x and a keep
+  // their letter, a readable-and-writable stream is rb+ however it was
+  // opened, and 'b' is always there.
+  func.func private @__ly_io_fileio_mode(%base: i64, %plus: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %x_byte = arith.constant 120 : i64
+    %a_byte = arith.constant 97 : i64
+    %r_byte = arith.constant 114 : i64
+    %has_plus = arith.cmpi ne, %plus, %zero : i64
+    %is_x = arith.cmpi eq, %base, %x_byte : i64
+    %is_a = arith.cmpi eq, %base, %a_byte : i64
+    %is_r = arith.cmpi eq, %base, %r_byte : i64
+    %result:2 = scf.if %is_x -> (memref<2xi64>, memref<?xi8>) {
+      %x:2 = scf.if %has_plus -> (memref<2xi64>, memref<?xi8>) {
+    %h1_g = memref.get_global @__ly_io_lit_xbp : memref<3xi8>
+    %h1_d = memref.cast %h1_g : memref<3xi8> to memref<?xi8>
+    %h1_n = arith.constant 3 : i64
+    %h1, %b1 = func.call @LyUnicode_FromBytes(%h1_d, %c0, %h1_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %h1, %b1 : memref<2xi64>, memref<?xi8>
+      } else {
+    %h2_g = memref.get_global @__ly_io_lit_xb : memref<2xi8>
+    %h2_d = memref.cast %h2_g : memref<2xi8> to memref<?xi8>
+    %h2_n = arith.constant 2 : i64
+    %h2, %b2 = func.call @LyUnicode_FromBytes(%h2_d, %c0, %h2_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %h2, %b2 : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %x#0, %x#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      %rest:2 = scf.if %is_a -> (memref<2xi64>, memref<?xi8>) {
+        %a:2 = scf.if %has_plus -> (memref<2xi64>, memref<?xi8>) {
+    %h3_g = memref.get_global @__ly_io_lit_abp : memref<3xi8>
+    %h3_d = memref.cast %h3_g : memref<3xi8> to memref<?xi8>
+    %h3_n = arith.constant 3 : i64
+    %h3, %b3 = func.call @LyUnicode_FromBytes(%h3_d, %c0, %h3_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %h3, %b3 : memref<2xi64>, memref<?xi8>
+        } else {
+    %h4_g = memref.get_global @__ly_io_lit_ab : memref<2xi8>
+    %h4_d = memref.cast %h4_g : memref<2xi8> to memref<?xi8>
+    %h4_n = arith.constant 2 : i64
+    %h4, %b4 = func.call @LyUnicode_FromBytes(%h4_d, %c0, %h4_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %h4, %b4 : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %a#0, %a#1 : memref<2xi64>, memref<?xi8>
+      } else {
+        %rw:2 = scf.if %has_plus -> (memref<2xi64>, memref<?xi8>) {
+    %h5_g = memref.get_global @__ly_io_lit_rbp : memref<3xi8>
+    %h5_d = memref.cast %h5_g : memref<3xi8> to memref<?xi8>
+    %h5_n = arith.constant 3 : i64
+    %h5, %b5 = func.call @LyUnicode_FromBytes(%h5_d, %c0, %h5_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %h5, %b5 : memref<2xi64>, memref<?xi8>
+        } else {
+          %ro:2 = scf.if %is_r -> (memref<2xi64>, memref<?xi8>) {
+    %h6_g = memref.get_global @__ly_io_lit_rb : memref<2xi8>
+    %h6_d = memref.cast %h6_g : memref<2xi8> to memref<?xi8>
+    %h6_n = arith.constant 2 : i64
+    %h6, %b6 = func.call @LyUnicode_FromBytes(%h6_d, %c0, %h6_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+            scf.yield %h6, %b6 : memref<2xi64>, memref<?xi8>
+          } else {
+    %h7_g = memref.get_global @__ly_io_lit_wb : memref<2xi8>
+    %h7_d = memref.cast %h7_g : memref<2xi8> to memref<?xi8>
+    %h7_n = arith.constant 2 : i64
+    %h7, %b7 = func.call @LyUnicode_FromBytes(%h7_d, %c0, %h7_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+            scf.yield %h7, %b7 : memref<2xi64>, memref<?xi8>
+          }
+          scf.yield %ro#0, %ro#1 : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %rw#0, %rw#1 : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %rest#0, %rest#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_io_fileio_meta(%path_header: memref<2xi64>, %base: i64, %plus: i64) -> i64 {
+    %mode_h, %mode_b = func.call @__ly_io_fileio_mode(%base, %plus) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %meta = func.call @__ly_io_meta_new(%path_header, %mode_h) : (memref<2xi64>, memref<2xi64>) -> i64
+    func.call @LyUnicode_DecRef(%mode_h) : (memref<2xi64>) -> ()
+    func.return %meta : i64
   }
 }

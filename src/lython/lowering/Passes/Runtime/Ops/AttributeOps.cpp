@@ -1,3 +1,4 @@
+#include "PyProtocols.h"
 #include "PyTypeObject.h"
 #include "Runtime/Core/Lowerer.h"
 
@@ -1320,30 +1321,37 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     return mlir::success();
   }
 
-  // ⭐ range.start / .stop / .step read the words the object stores. Without
-  // this the attribute reached the failure below -- "has no class schema for
-  // attribute 'start'" -- for three reads CPython answers with the numbers the
-  // constructor was given, and `len(r)` and `r[i]` over the same object both
-  // worked.
-  if (object->kind == RuntimeBundle::Kind::Object &&
-      runtimeContractName(op.getObject().getType()) == "builtins.range") {
-    llvm::StringRef field = op.getName();
-    std::optional<std::int64_t> which =
-        field == "start" ? std::optional<std::int64_t>(0)
-        : field == "stop" ? std::optional<std::int64_t>(1)
-        : field == "step" ? std::optional<std::int64_t>(2)
-                          : std::nullopt;
+  // ⭐ A NATIVE CLASS'S DECLARED FIELD IS READ BY ITS `field` PRIMITIVE: the
+  // manifest class names the field, and its position in `field_names` is the
+  // index the primitive takes. range.start / .stop / .step answer this way, and
+  // a file's name and mode. Without it the attribute reached the failure below
+  // -- "has no class schema for attribute 'start'" -- for reads CPython answers
+  // with what the constructor was given.
+  // ⛔ Not one branch per class, which is what range had: the second class to
+  // need it would have been a second copy of the same three steps.
+  if (object->kind == RuntimeBundle::Kind::Object) {
+    std::string contract = runtimeContractName(op.getObject().getType());
+    std::optional<RuntimeSymbol> fieldPrimitive =
+        contract.empty() ? std::nullopt
+                         : manifest.primitive(contract, "field");
+    // Builtins are registered under their bare names, a module's classes
+    // under qualified ones.
+    const py::protocols::Table &table = py::protocols::Table::get(*context);
+    const py::protocols::ProtocolInfo *info =
+        fieldPrimitive ? table.lookup(contract) : nullptr;
+    if (fieldPrimitive && !info)
+      info = table.lookup(llvm::StringRef(contract).rsplit('.').second);
+    std::optional<unsigned> which;
+    if (info)
+      if (auto found = llvm::find(info->fieldOrder, op.getName().str());
+          found != info->fieldOrder.end())
+        which = static_cast<unsigned>(found - info->fieldOrder.begin());
     if (which) {
-      std::optional<RuntimeSymbol> fieldPrimitive =
-          manifest.primitive("builtins.range", "field");
-      if (!fieldPrimitive)
-        return op.emitError() << "runtime manifest has no range field "
-                                 "primitive";
       builder.setInsertionPoint(op);
       llvm::SmallVector<mlir::Value, 2> operands(
           object->physicalValues().begin(), object->physicalValues().end());
-      operands.push_back(
-          mlir::arith::ConstantIntOp::create(builder, op.getLoc(), *which, 64));
+      operands.push_back(mlir::arith::ConstantIntOp::create(
+          builder, op.getLoc(), static_cast<std::int64_t>(*which), 64));
       mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
           op.getLoc(), *fieldPrimitive, operands);
       RuntimeBundle result;

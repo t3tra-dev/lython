@@ -15,12 +15,12 @@ Deviations from CPython, pending language surface:
     (Lib/_pyio.py's shape): the wrapped FileIO sits on a libc FILE*, which
     already provides the buffering, so they delegate rather than re-buffer.
     Constructors take no buffer_size argument, peek()/read1() are absent,
-    and open(file, 'rb') does not construct them implicitly (binary opens
-    go through FileIO / BufferedReader directly).
+    and open(file, 'rb') builds them through the _open_buffered_* functions
+    at the end of this file.
   - open(file, mode='r') returns TextIOWrapper for text modes; a mode that
     is a str LITERAL containing 'b' statically selects the binary arm and
-    returns the raw FileIO (CPython returns a Buffered* wrapper; the
-    wrappers below delegate to FileIO 1:1). A non-literal binary mode
+    returns the Buffered* wrapper CPython returns -- BufferedRandom for '+',
+    BufferedReader for 'r', BufferedWriter otherwise. A non-literal binary mode
     cannot be typed statically and raises ValueError at runtime. TextIOWrapper.seek()/tell() follow
     the cookie discipline (relative seeks only accept offset 0), and the
     cookie degenerates to the byte offset because this wrapper keeps no
@@ -60,6 +60,28 @@ class BufferedReader:
     def __init__(self, raw: FileIO) -> None:
         self.raw: FileIO = raw
 
+    def __repr__(self) -> str:
+        # bufferedio.c buffered_repr: the raw stream's name.
+        return "<_io.BufferedReader name=" + repr(self.raw.name) + ">"
+
+    @property
+    def name(self) -> str:
+        return self.raw.name
+
+    @property
+    def mode(self) -> str:
+        return self.raw.mode
+
+    def __enter__(self) -> "BufferedReader":
+        return self
+
+    def __exit__(self, kind: object, value: object, tb: object) -> bool:
+        self.close()
+        return False
+
+    def flush(self) -> None:
+        self.raw.flush()
+
     def read(self, size: int = -1) -> bytes:
         return self.raw.read(size)
 
@@ -90,6 +112,25 @@ class BufferedWriter:
 
     def __init__(self, raw: FileIO) -> None:
         self.raw: FileIO = raw
+
+    def __repr__(self) -> str:
+        # bufferedio.c buffered_repr: the raw stream's name.
+        return "<_io.BufferedWriter name=" + repr(self.raw.name) + ">"
+
+    @property
+    def name(self) -> str:
+        return self.raw.name
+
+    @property
+    def mode(self) -> str:
+        return self.raw.mode
+
+    def __enter__(self) -> "BufferedWriter":
+        return self
+
+    def __exit__(self, kind: object, value: object, tb: object) -> bool:
+        self.close()
+        return False
 
     def write(self, b: bytes) -> int:
         return self.raw.write(b)
@@ -129,6 +170,25 @@ class BufferedRandom:
 
     def __init__(self, raw: FileIO) -> None:
         self.raw: FileIO = raw
+
+    def __repr__(self) -> str:
+        # bufferedio.c buffered_repr: the raw stream's name.
+        return "<_io.BufferedRandom name=" + repr(self.raw.name) + ">"
+
+    @property
+    def name(self) -> str:
+        return self.raw.name
+
+    @property
+    def mode(self) -> str:
+        return self.raw.mode
+
+    def __enter__(self) -> "BufferedRandom":
+        return self
+
+    def __exit__(self, kind: object, value: object, tb: object) -> bool:
+        self.close()
+        return False
 
     def read(self, size: int = -1) -> bytes:
         return self.raw.read(size)
@@ -191,3 +251,19 @@ class BufferedRWPair:
     def close(self) -> None:
         self.writer.close()
         self.reader.close()
+
+
+# open(file, mode) with a binary mode, as CPython's open() builds it: the raw
+# FileIO under the Buffered* class the mode asks for. The emitter calls these
+# when the mode is a str literal with 'b' in it (EmitterCalls.cpp), which is
+# what lets the result have the class the mode selects.
+def _open_buffered_reader(file: str, mode: str) -> BufferedReader:
+    return BufferedReader(FileIO(file, mode))
+
+
+def _open_buffered_writer(file: str, mode: str) -> BufferedWriter:
+    return BufferedWriter(FileIO(file, mode))
+
+
+def _open_buffered_random(file: str, mode: str) -> BufferedRandom:
+    return BufferedRandom(FileIO(file, mode))
