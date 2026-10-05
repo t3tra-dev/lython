@@ -240,6 +240,11 @@ private:
   // slot is a box16 written IN PLACE (never spliced into new SSA lanes), so
   // every frame sharing the cell instance observes one mutable slot.
   static bool isCellClassOp(py::ClassOp classOp);
+  // The `object` a field or cell slot holds, as a fresh owned box: the slot
+  // keeps the payload's own handle, and an `object` value is a box AROUND one.
+  mlir::FailureOr<mlir::Value> objectBoxFromFieldSlot(mlir::Operation *op,
+                                                      mlir::Value body,
+                                                      mlir::Value boxWord);
   mlir::LogicalResult lowerCellAttrGet(py::AttrGetOp op,
                                        const RuntimeBundle &object,
                                        py::ClassOp classOp,
