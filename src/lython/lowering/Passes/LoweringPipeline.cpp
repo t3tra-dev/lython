@@ -300,7 +300,15 @@ public:
   LogicalResult initialize(MLIRContext *context) override {
     symbolTables = std::make_shared<SymbolTableCollection>();
     target = std::make_shared<ConversionTarget>(*context);
-    typeConverter = std::make_shared<LLVMTypeConverter>(context);
+    // `memref.alloc` lowers to `aligned_alloc(alignment, size)`, which the
+    // object allocator answers with an already-aligned block.
+    // ⛔ Not the default `malloc` lowering, which pads every request by the
+    // alignment and hands on an aligned pointer inside the block: 16 bytes on
+    // every object that asked for `{alignment = 16}`, and every block this
+    // allocator returns is 16-aligned already (docs/object-abi.md 6.2).
+    LowerToLLVMOptions options(context);
+    options.allocLowering = LowerToLLVMOptions::AllocLowering::AlignedAlloc;
+    typeConverter = std::make_shared<LLVMTypeConverter>(context, options);
     target->addLegalDialect<LLVM::LLVMDialect>();
     RewritePatternSet collected(context);
     for (Dialect *dialect : context->getLoadedDialects()) {

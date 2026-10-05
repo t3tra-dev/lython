@@ -237,6 +237,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.PutsIsDeclaredWithItsCPrototype"
     "DriverTest.A32BitTargetCompilesOnlyWhereItsLibcWasMeasured"
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot"
+    "DriverTest.OnlyDarwinMapsBigBlocksAndPooledBlocksHaveNoHeader"
     "DriverTest.ACtypesSymbolAddressIsDeclaredWithItsPrototype"
     "DriverTest.AnUntypedCtypesSymbolAddressIsRefusedOnWasm"
     "DriverTest.AnArmv7RuntimeIsBuiltForArmv7"

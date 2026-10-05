@@ -2106,17 +2106,56 @@ TEST(DriverTest, TheObjectAllocatorAlignsWhereMallocDoesNot) {
     return false;
   };
 
+  // The two places the allocator asks the system: a large block, and a chunk
+  // of arenas.
   lython::driver::VerifiedLLVMModule arm =
       compileAndLinkFor("print('hi')\n", "armv7-unknown-linux-gnueabihf");
   ASSERT_TRUE(arm.llvmModule);
-  EXPECT_TRUE(callsFrom(*arm.llvmModule, "LyMem_Alloc", "aligned_alloc"));
-  EXPECT_FALSE(callsFrom(*arm.llvmModule, "LyMem_Alloc", "malloc"));
+  for (const char *caller : {"LyMem_LargeAlloc", "LyMem_Refill"}) {
+    EXPECT_TRUE(callsFrom(*arm.llvmModule, caller, "aligned_alloc")) << caller;
+    EXPECT_FALSE(callsFrom(*arm.llvmModule, caller, "malloc")) << caller;
+  }
 
   lython::driver::VerifiedLLVMModule host =
       compileAndLinkFor("print('hi')\n", llvm::sys::getDefaultTargetTriple());
   ASSERT_TRUE(host.llvmModule);
-  EXPECT_TRUE(callsFrom(*host.llvmModule, "LyMem_Alloc", "malloc"));
-  EXPECT_FALSE(callsFrom(*host.llvmModule, "LyMem_Alloc", "aligned_alloc"));
+  for (const char *caller : {"LyMem_LargeAlloc", "LyMem_Refill"}) {
+    EXPECT_TRUE(callsFrom(*host.llvmModule, caller, "malloc")) << caller;
+    EXPECT_FALSE(callsFrom(*host.llvmModule, caller, "aligned_alloc"))
+        << caller;
+  }
+}
+
+// What: on Darwin a block of a megabyte or more is mapped and grown by copying
+// pages, and elsewhere it stays with the system allocator; and a pooled block
+// carries no header, so freeing one asks the arena map rather than reading
+// before the block.
+TEST(DriverTest, OnlyDarwinMapsBigBlocksAndPooledBlocksHaveNoHeader) {
+  auto callsFrom = [](const llvm::Module &module, llvm::StringRef caller,
+                      llvm::StringRef callee) {
+    const llvm::Function *fn = module.getFunction(caller);
+    if (!fn)
+      return false;
+    for (const llvm::BasicBlock &block : *fn)
+      for (const llvm::Instruction &instruction : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          if (const llvm::Function *target = call->getCalledFunction())
+            if (target->getName() == callee)
+              return true;
+    return false;
+  };
+  lython::driver::VerifiedLLVMModule darwin =
+      compileAndLinkFor("print('hi')\n", "arm64-apple-macosx14.0.0");
+  ASSERT_TRUE(darwin.llvmModule);
+  EXPECT_TRUE(callsFrom(*darwin.llvmModule, "LyMem_MapAlloc", "mmap"));
+  EXPECT_TRUE(callsFrom(*darwin.llvmModule, "LyMem_Realloc", "vm_copy"));
+
+  lython::driver::VerifiedLLVMModule gnu =
+      compileAndLinkFor("print('hi')\n", "aarch64-unknown-linux-gnu");
+  ASSERT_TRUE(gnu.llvmModule);
+  EXPECT_EQ(gnu.llvmModule->getFunction("LyMem_MapAlloc"), nullptr);
+  EXPECT_FALSE(callsFrom(*gnu.llvmModule, "LyMem_Realloc", "vm_copy"));
+  EXPECT_TRUE(callsFrom(*gnu.llvmModule, "LyMem_Free", "LyMem_Owns"));
 }
 
 namespace {

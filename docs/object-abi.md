@@ -67,6 +67,24 @@ append ループの時間の大半は合計側の `LyLong_Add`: 要素がヒー�
 {alignment = 16}` は位置合わせのため要求に 16 B を足す。CPython の pymalloc は
 サイズクラスをプール (4 KiB) の見出しに持ち、ブロックに前置きを付けない。
 
+### 1.4 フェーズごとの推移 (要素あたり、100 万要素、macOS、ピーク RSS)
+
+| | 開始時 | P0 後 | CPython |
+|---|---|---|---|
+| `list[int]` | 117 B | 85 B | 40 B |
+| `list[float]` | 102 B | 70 B | 40 B |
+| `list[str]` | 117 B | 85 B | 56 B |
+| `list[tuple[int, int]]` | 333 B | 269 B | 101 B |
+| 2 int フィールドのインスタンス | 271 B | 224 B | 132 B |
+| `dict[int, int]` | 312 B | 205 B | 110 B |
+| `set[int]` | 264 B | 127 B | 93 B |
+
+速度 (最良 5 回): append と合計 0.21 → 0.23 s、float 0.13 → 0.13 s、dict
+0.11 → 0.11 s、インスタンス 0.07 → 0.08 s。確保器の遅い経路
+(`LyMem_LargeAlloc` / `LyMem_MapAlloc` / `LyMem_Refill`) を out-of-line に
+保ち、`aligned_alloc(16, n)` を `LyMem_Alloc(n)` に直接書き換えて、ここまで
+戻した。
+
 ## 2. 不変条件 (新 ABI が守るもの)
 
 S1〜S6 はどのフェーズでも成り立たなければならない。破るフェーズは差し戻す。
@@ -228,25 +246,35 @@ value types is an implementation detail")。`id()` は無い。したがって�
 プールのブロックは最初から 16 B 境界にある。`memref.alloc {alignment = 16}` を
 `LyMem_Alloc` に直接下げ、要求に 16 B を足す一般の下げ方を通さない。
 
-### 6.3 空いたアリーナを返す、大きなブロックを抱えない
+### 6.3 大きなブロックを抱えない
 
-- アリーナ (1 MiB) ごとに使用中ブロック数を持ち、0 になったら OS に返す。今は
-  返さない (`RuntimeSupportBuilder.cpp:563-590`)。
-- macOS では、1 MiB 以上の伸びるバッファ (list の items、dict、set の表) を
-  mmap で確保し、伸長は新しい領域へのページ単位の `vm_copy`、解放は munmap に
-  する。libmalloc は realloc 途中の大きなブロックを解放後も抱えるため。C で
-  再現した測定: 20 万要素を 100 回作り直すループで 503 MB → 11 MB、2000 万要素
-  1 本で 2294 MB → 766 MB (最終サイズ 800 MB)、伸長自体は 25〜30% 遅くなる。
-  Linux の glibc は同じ測定で 8 MB / 763 MB なので、この経路は macOS だけ。
-  `malloc_zone_pressure_relief` は効果が無かった。
+- macOS では、1 MiB 以上のブロック (list の items、dict、set の表など) を mmap で
+  確保し、伸長は新しい領域へのページ単位の `vm_copy`、解放は munmap にする。
+  libmalloc は realloc 途中の大きなブロックを解放後も抱えるため。C で再現した
+  測定: 20 万要素を 100 回作り直すループで 503 MB → 11 MB、2000 万要素 1 本で
+  2294 MB → 766 MB (最終サイズ 800 MB)。Linux の glibc は同じ測定で 8 MB /
+  763 MB なので、この経路は macOS だけ。`malloc_zone_pressure_relief` は効果が
+  無かった。
+- 512 B を超えるブロックだけが前置き 16 B (種別と容量) を持つ。プールの
+  ブロックかどうかはアリーナの地図で先に判定するので、前置きを読むのは前置き
+  のあるブロックだけ。
 
-### 6.4 refcount の原子性は変えない
+### 6.4 空いたアリーナは返さない (P0 の時点)
 
-スレッド安全性の verifier (`verifier/runtime/ThreadSafeModel.h`) は refcount
-の増減を原子操作として扱っている。測定 (M 系、競合なし) では、比較交換の
-ループ 0.84 ns、`ldadd` 0.68 ns、原子でない加算 0.67 ns で、差は確保と間接参照
-に比べて小さい。今の比較交換ループ (不死の判定を中に含むため) を「不死なら
-飛ばす、そうでなければ `ldadd`」にするだけにとどめる。
+プールを返すにはプールごとの使用数を確保の経路で数える必要があり、以前の
+計測ではそれだけでコンテナのベンチが 10〜30% 遅く、返せたのは 0.5 MB だった
+(`RuntimeSupportBuilder.cpp` の確保器のコメント)。当時は要素 box が 512 B の
+上限を超えてプールに入らなかったのが返せない理由で、P1 / P2 でスロットが
+縮むと事情が変わる。プールの見出しはそのための土台として既にある。P2 の後で
+測り直して決める。
+
+### 6.5 refcount の原子性は変えない
+
+スレッド安全性の verifier (`verifier/runtime/ThreadSafe.cpp`) は refcount の
+増減を `generic_atomic_rmw` の形 (本体の中の正値検査を含めて) で照合している。
+測定 (M 系、競合なし) では、比較交換のループ 0.84 ns、`ldadd` 0.68 ns、原子で
+ない加算 0.67 ns で、確保と間接参照に比べて小さい。verifier の照合を書き換え
+てまで `ldadd` にする利得は無いので、今の形のままにする。
 
 ## 7. 移行計画
 
@@ -255,7 +283,7 @@ value types is an implementation detail")。`id()` は無い。したがって�
 
 | フェーズ | 内容 | 主な触る場所 | 期待効果 |
 |---|---|---|---|
-| P0 | 確保器 (§6.1〜6.3)、refcount の `ldadd` 化 (§6.4) | `RuntimeSupportBuilder.cpp`、`LLVMFinalize.cpp` | 全オブジェクト −32 B、macOS の大きな list |
+| P0 | 確保器 (§6.1〜6.3) | `RuntimeSupportBuilder.cpp`、`LLVMFinalize.cpp`、`memref.alloc` の下げ方 | 全オブジェクト −32 B、macOS の大きな list |
 | P1 | スロットを `Value` (16 B) に統一。所有フラグ・死んだ refcount ワード・ハッシュワードを廃止し、即値の int / float / bool / None をスロットに置く | `BoxLayout.h` と box ワードの直書き箇所 (§8)、`__ly_box_*`、dict / set の表 | スロット 40 → 16 B、int と float の要素の確保が 0 |
 | P2 | 静的型の分かるコンテナに 8 B 種別 (`Int` / `Float` / `Ref` / `OptRef`) と `Bool` 1 B。ヘッダに要素種別バイト。f64 evidence を lowering に追加 | コンテナ lowering、manifest の要素操作の種別ごとの版 | スロット 16 → 8 B |
 | P3 | インスタンスのフィールドを種別ごとにヘッダ直後へ | `AttributeOps.cpp`、`RuntimeABI.cpp` の合成 deallocator | 2 int フィールドで 160 + 160 → 32 B |

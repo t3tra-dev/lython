@@ -552,80 +552,79 @@ void buildBoxedLoadI64(SupportBuilder &b) {
 
 // ⭐ CPython's PyObject_Malloc (Objects/obmalloc.c), which is what every Python
 // object goes through there and what this runtime did NOT have: `memref.alloc`
-// lowers to a bare `malloc`, so a loop that boxes an int paid the system
-// allocator twice per iteration. Measured before writing this: 55-70% of the
+// lowers to a bare allocation call, so a loop that boxes an int paid the system
+// allocator twice per iteration. Measured before the first port: 55-70% of the
 // time in the container benchmarks was malloc, free and the zeroing they do.
 //
-// The port keeps obmalloc's shape -- a size class per 16 bytes up to a small
-// threshold, a free list per class, blocks carved from arenas taken from the
-// system allocator in bulk -- and drops two things it does not need:
+// Obmalloc's shape: a size class per 16 bytes up to 512, a free list per
+// class, and POOLS -- 16 KB spans of one class each, carved from 1 MB arenas
+// taken from the system in bulk. A pool's first 16 bytes say its class, so a
+// block carries no header of its own and its class is found by masking its
+// address (docs/object-abi.md section 6.1).
 //
-// ⛔ NO ARENA RELEASE. CPython returns an empty arena to the system; this does
-// not, so peak RSS is a high-water mark.
+// ⛔ NOT A 16-BYTE PREFIX PER BLOCK, which is what this was. Every object paid
+// it, and `memref.alloc {alignment = 16}` added 16 more padding bytes on top
+// (since lowered to `aligned_alloc`, which this answers without padding): an
+// int below 2^62 took an 80-byte block for 44 bytes of object. The prefix was
+// chosen over masking because obmalloc's `address_in_range` probes an arena
+// table that may not be mapped. Here the question "is this ours" is answered
+// first, by a two-level bitmap of the arenas this allocator owns (`LyMem_Owns`)
+// that is only ever read where it was written, so the pool header is read only
+// for addresses already known to be inside an arena. Prototyped in C against
+// the prefix version on a million mixed-size objects: equal in allocation
+// order (0.10 s each), 25% faster freed in random order (0.83 s vs 1.09 s),
+// because the blocks are 16 bytes smaller.
 //
-// It was built and measured before being left out. The shape that returns
-// memory is obmalloc's pool -- an aligned span carved into blocks of ONE size
-// class, holding its own free list and a live count, released the moment its
-// last block dies -- because a free list spanning every pool can return none of
-// them. Ported here (16 KB pools, `aligned_alloc`, the free head's null doing
-// double duty as the "off the class list" flag, the cold paths outlined so
-// `LyMem_Alloc` still inlines) it cost 10-30% on the container benchmarks
-// (b_class 37.0 -> 48.0 ms, b_tuple2 49.6 -> 61.0, b_smalllist 52.1 -> 62.0,
-// 2M-list 112.8 -> 125.9) for the live count alone: three memory ops on a path
-// that is five, and this allocator is fast enough that three is a third of it.
+// ⛔ NO ARENA RELEASE, still. A pool that returns memory needs a live count on
+// the allocation path, measured at 10-30% on the container benchmarks for
+// 0.5 MB returned when the 5-word element boxes put container payloads above
+// the class ceiling. That calculus changes when the payloads shrink (P1/P2 of
+// docs/object-abi.md); the pools are what it would be built on.
 //
-// ⭐ AND IT RETURNED ALMOST NOTHING, which is the actual reason. Measured on a
-// program that builds 20,000 two-key dicts, drops them, and keeps running:
-// resident memory afterwards was 66.5 MB without pools and 67.0 MB with them.
-// The bytes are not in pooled blocks. A container's payload is an array of
-// 16-word element boxes, so a dict at PyDict_MINSIZE is 8 x 16 x 8 = 1 KB per
-// array -- past the 512-byte class ceiling and already going straight to the
-// system allocator, which is 94% of that program's heap. Only a two-phase
-// workload whose objects all fit the classes showed anything, and that was 10%
-// of peak.
-//
-// So the ordering is: shrink the element box first (`box_abi::kWordsPerBox` is
-// 16 for a maximum of 3 lanes across every contract), which puts container
-// payloads back under the ceiling, and then the pool layer has something to
-// give back. Doing it in the other order buys a 10-30% regression for 0.5 MB.
-//
-// One thing the port found that outlives it: `redirectAllocationsToObjectAllocator`
-// skips functions named `LyMem_*`, so an allocator helper spelled any other way
-// has its `free(pool)` rewritten into `LyMem_Free(pool)` -- which reads the
-// pool's own header as a block prefix and pushes the pool onto its own free
-// chain. It reaches a program as a hang, not as a crash.
-//
-// ⛔ NO `address_in_range`. CPython derives the pool (and so the size class)
-// from the address by masking, which lets it keep zero per-object overhead but
-// costs it a probe into the arena table on every free. This carries a 16-byte
-// prefix holding the class instead: one store per allocation, one load per
-// free, and no read of memory that may not be ours.
+// Blocks above 512 bytes come from the system with a 16-byte prefix (kind,
+// capacity), which the free and the realloc read once `LyMem_Owns` has said
+// the block is not pooled. On Darwin a block of 1 MB or more is mapped instead
+// and grown by copying pages (`vm_copy`), because libmalloc keeps the large
+// blocks a realloc sequence leaves behind resident after they are freed: a
+// loop rebuilding a 200k-element list peaked at 520 MB, and one 20M-element
+// list at 2.3 GB for 0.8 MB of data per element. Glibc returns them
+// (measured: 8 MB and 763 MB), so other targets keep `realloc`.
 //
 // ⛔ NOT THREAD-SAFE, exactly like `g_current_parts` beside it: the free lists
-// and the bump pointer are plain globals. The runtime's object model is
+// and the bump pointers are plain globals. The runtime's object model is
 // single-threaded (the fork-join used by matmul allocates nothing), and
 // `--fsanitize=address|leak|thread` bypasses this allocator entirely, which is
 // CPython's PYTHONMALLOC=malloc.
-constexpr std::int64_t kObjectAllocatorPrefixBytes = 16;
+//
+// One thing an earlier port found that still holds: `redirectAllocationsToObjectAllocator`
+// skips functions named `LyMem_*`, so an allocator helper spelled any other way
+// has its system calls rewritten into calls of the allocator it is part of.
 constexpr std::int64_t kObjectAllocatorGranularity = 16;
-constexpr std::int64_t kObjectAllocatorClasses = 32;   // 16..512 bytes
-constexpr std::int64_t kObjectAllocatorArenaBytes = 1 << 20;
+constexpr std::int64_t kObjectAllocatorClasses = 32; // 16..512 bytes
+constexpr std::int64_t kObjectAllocatorPoolBytes = 1 << 14;
+constexpr std::int64_t kObjectAllocatorArenaShift = 20;
+constexpr std::int64_t kObjectAllocatorArenaBytes =
+    std::int64_t(1) << kObjectAllocatorArenaShift;
+// The arena map: arena index (address >> 20) split 14 + 14 bits, a 2 KB leaf
+// bitmap per 16 GB of address space. Addresses at or above 2^48 are never
+// treated as an arena's.
+constexpr std::int64_t kObjectAllocatorMapBits = 14;
+// Above this a Darwin block is mapped rather than malloc'd (see above).
+constexpr std::int64_t kObjectAllocatorMapThreshold = 1 << 20;
+// Large-block prefix kinds.
+constexpr std::int64_t kLargeMalloc = 1;
+constexpr std::int64_t kLargeMapped = 2;
+constexpr std::int64_t kLargeOverAligned = 3;
 
-// ⛔ EVERY BLOCK THIS HANDS OUT IS 16-ALIGNED, and not as a nicety. A
-// `memref.alloc {alignment = 16}` pads the block and hands on an aligned
-// pointer beside the allocated one; the object model later rebuilds a header
-// from that aligned address alone (allocated == aligned) and frees it. That is
-// right only while the two never differ -- while the block was 16-aligned to
-// begin with. LP64 mallocs promise 16; 32-bit glibc's promises 8, and there
-// every other string freed the interior of its block. So where `malloc` falls
-// short the arenas and large blocks come from `aligned_alloc` instead.
 void buildObjectAllocator(SupportBuilder &b) {
   const bool mallocIsAligned =
       b.host.mallocAlignment >= kObjectAllocatorGranularity;
+  const bool mapsLargeBlocks = b.triple.isOSDarwin();
+  const std::int64_t pageBytes =
+      b.triple.getArch() == llvm::Triple::aarch64 ? 16384 : 4096;
   b.declareExternal("malloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
-  if (!mallocIsAligned)
-    b.declareExternal("aligned_alloc",
-                      b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
+  b.declareExternal("aligned_alloc",
+                    b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
   b.declareExternal("calloc",
                     b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
   b.declareExternal("free", b.builder.getFunctionType({b.ptr()}, {}));
@@ -634,6 +633,17 @@ void buildObjectAllocator(SupportBuilder &b) {
   b.declareExternal(
       "memcpy", b.builder.getFunctionType({b.ptr(), b.ptr(), b.i64()},
                                           {b.ptr()}));
+  if (mapsLargeBlocks) {
+    b.declareExternal("mmap",
+                      b.builder.getFunctionType(
+                          {b.ptr(), b.i64(), b.i32(), b.i32(), b.i32(), b.i64()},
+                          {b.ptr()}));
+    b.declareExternal("munmap",
+                      b.builder.getFunctionType({b.ptr(), b.i64()}, {b.i32()}));
+    b.declareExternal("vm_copy",
+                      b.builder.getFunctionType(
+                          {b.i32(), b.i64(), b.i64(), b.i64()}, {b.i32()}));
+  }
 
   auto zeroInitGlobal = [&](llvm::StringRef name, mlir::Type type) {
     if (b.module.lookupSymbol(name))
@@ -654,196 +664,389 @@ void buildObjectAllocator(SupportBuilder &b) {
   zeroInitGlobal("g_lymem_class_heads",
                  mlir::LLVM::LLVMArrayType::get(
                      b.ptr(), kObjectAllocatorClasses + 1));
-  // [next address, bytes remaining] of the arena being carved.
+  // [next, end] of each class's current pool, as addresses; class c at 2c.
+  zeroInitGlobal("g_lymem_class_bump",
+                 mlir::LLVM::LLVMArrayType::get(
+                     b.i64(), 2 * (kObjectAllocatorClasses + 1)));
+  // [next address, bytes remaining] of the arena pools are cut from.
   zeroInitGlobal("g_lymem_arena",
                  mlir::LLVM::LLVMArrayType::get(b.i64(), 2));
+  // Top level of the arena map: one leaf bitmap pointer per 2^14 arenas.
+  zeroInitGlobal("g_lymem_map",
+                 mlir::LLVM::LLVMArrayType::get(
+                     b.ptr(), std::int64_t(1) << kObjectAllocatorMapBits));
+  if (mapsLargeBlocks && !b.module.lookupSymbol("mach_task_self_")) {
+    mlir::OpBuilder::InsertionGuard guard(b.builder);
+    b.builder.setInsertionPointToEnd(b.module.getBody());
+    mlir::LLVM::GlobalOp::create(b.builder, b.loc, b.i32(),
+                                 /*isConstant=*/false,
+                                 mlir::LLVM::Linkage::External,
+                                 "mach_task_self_", mlir::Attribute());
+  }
 
+  using Pred = mlir::arith::CmpIPredicate;
+  auto add = [&](mlir::Value x, mlir::Value y) -> mlir::Value {
+    return mlir::arith::AddIOp::create(b.builder, b.loc, x, y);
+  };
+  auto sub = [&](mlir::Value x, mlir::Value y) -> mlir::Value {
+    return mlir::arith::SubIOp::create(b.builder, b.loc, x, y);
+  };
+  auto mul = [&](mlir::Value x, mlir::Value y) -> mlir::Value {
+    return mlir::arith::MulIOp::create(b.builder, b.loc, x, y);
+  };
+  auto andI = [&](mlir::Value x, mlir::Value y) -> mlir::Value {
+    return mlir::arith::AndIOp::create(b.builder, b.loc, x, y);
+  };
+  auto shr = [&](mlir::Value x, std::int64_t by) -> mlir::Value {
+    return mlir::arith::ShRUIOp::create(b.builder, b.loc, x, b.iconst(by));
+  };
+  auto roundUp = [&](mlir::Value x, std::int64_t to) -> mlir::Value {
+    return andI(add(x, b.iconst(to - 1)), b.iconst(-to));
+  };
   auto storeI64At = [&](mlir::Value value, mlir::Value pointer) {
     mlir::LLVM::StoreOp::create(b.builder, b.loc, value, pointer,
                                 /*alignment=*/8);
   };
   auto storePtrAt = [&](mlir::Value value, mlir::Value pointer) {
-    mlir::LLVM::StoreOp::create(b.builder, b.loc, value, pointer,
-                                /*alignment=*/8);
+    mlir::LLVM::StoreOp::create(b.builder, b.loc, value, pointer);
   };
-  auto classSlot = [&](mlir::Value classIndex) {
-    return mlir::LLVM::GEPOp::create(b.builder, b.loc, b.ptr(), b.ptr(),
-                                     b.addrOf("g_lymem_class_heads"),
-                                     mlir::ValueRange{classIndex});
+  auto classHead = [&](mlir::Value classIndex) {
+    return b.gepPtr(b.addrOf("g_lymem_class_heads"), classIndex);
   };
-  // A system block of at least `bytes`, 16-aligned. aligned_alloc wants a
-  // size that is a multiple of the alignment.
+  auto classBump = [&](mlir::Value classIndex, std::int64_t which) {
+    return b.gepI64(b.addrOf("g_lymem_class_bump"),
+                    add(mul(classIndex, b.iconst(2)), b.iconst(which)));
+  };
+  auto ret = [&](mlir::ValueRange values) {
+    mlir::func::ReturnOp::create(b.builder, b.loc, values);
+  };
+  // if (cond) { then(); } in a function body, with `then` ending in a return.
+  // The rest of the function continues in the fall-through block.
+  auto guardReturn = [&](mlir::Value cond, auto then) {
+    mlir::Block *current = b.builder.getInsertionBlock();
+    mlir::Region *region = current->getParent();
+    mlir::Block *taken = b.builder.createBlock(region);
+    mlir::Block *rest = b.builder.createBlock(region);
+    b.builder.setInsertionPointToEnd(current);
+    mlir::cf::CondBranchOp::create(b.builder, b.loc, cond, taken,
+                                   mlir::ValueRange{}, rest,
+                                   mlir::ValueRange{});
+    b.builder.setInsertionPointToEnd(taken);
+    then();
+    b.builder.setInsertionPointToEnd(rest);
+  };
+  // A system block of at least `bytes`, 16-aligned.
   auto systemAlloc = [&](mlir::Value bytes) -> mlir::Value {
     if (mallocIsAligned)
       return b.call("malloc", b.ptr(), mlir::ValueRange{bytes}).front();
-    mlir::Value rounded = mlir::arith::AndIOp::create(
-        b.builder, b.loc,
-        mlir::arith::AddIOp::create(b.builder, b.loc, bytes,
-                                    b.iconst(kObjectAllocatorGranularity - 1)),
-        b.iconst(-kObjectAllocatorGranularity));
     return b
         .call("aligned_alloc", b.ptr(),
-              mlir::ValueRange{b.iconst(kObjectAllocatorGranularity), rounded})
+              mlir::ValueRange{b.iconst(kObjectAllocatorGranularity),
+                               roundUp(bytes, kObjectAllocatorGranularity)})
         .front();
   };
+
+  // ---- i1 LyMem_Owns(ptr block) --------------------------------------------
+  // Whether `block` lies in an arena this allocator carved pools from.
+  {
+    auto fn = b.beginFunction("LyMem_Owns",
+                              b.builder.getFunctionType({b.ptr()}, {b.i1()}),
+                              /*isPrivate=*/true);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value arena =
+        shr(b.ptrToInt(fn.getArgument(0)), kObjectAllocatorArenaShift);
+    guardReturn(b.cmpi(Pred::uge, arena,
+                       b.iconst(std::int64_t(1) << (2 * kObjectAllocatorMapBits))),
+                [&] { ret(b.iconst1(false)); });
+    mlir::Value leaf = b.loadPtrVal(
+        b.gepPtr(b.addrOf("g_lymem_map"), shr(arena, kObjectAllocatorMapBits)));
+    guardReturn(b.ptrEq(leaf, b.nullPtr()), [&] { ret(b.iconst1(false)); });
+    mlir::Value bit = andI(arena, b.iconst((1 << kObjectAllocatorMapBits) - 1));
+    mlir::Value byte = mlir::arith::ExtUIOp::create(
+        b.builder, b.loc, b.i64(), b.loadI8(b.gepI8(leaf, shr(bit, 3))));
+    mlir::Value set = andI(
+        mlir::arith::ShRUIOp::create(b.builder, b.loc, byte,
+                                     andI(bit, b.iconst(7))),
+        b.iconst(1));
+    ret(b.cmpi(Pred::ne, set, b.iconst(0)));
+  }
+
+  // ---- ptr LyMem_LargeAlloc(i64 size) --------------------------------------
+  // A block from the system, behind a (kind, capacity) prefix.
+  {
+    auto fn = b.beginFunction(
+        "LyMem_LargeAlloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}),
+        /*isPrivate=*/true);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value size = fn.getArgument(0);
+    if (mapsLargeBlocks)
+      guardReturn(b.cmpi(Pred::sge, size,
+                         b.iconst(kObjectAllocatorMapThreshold)),
+                  [&] {
+                    ret(b.call("LyMem_MapAlloc", b.ptr(),
+                               mlir::ValueRange{size}));
+                  });
+    mlir::Value base = systemAlloc(add(size, b.iconst(16)));
+    guardReturn(b.ptrEq(base, b.nullPtr()), [&] { ret(b.nullPtr()); });
+    storeI64At(b.iconst(kLargeMalloc), base);
+    storeI64At(size, b.gepI64(base, b.iconst(1)));
+    ret(b.gepI8(base, b.iconst(16)));
+  }
+
+  // ---- ptr LyMem_MapAlloc(i64 size) (Darwin) -------------------------------
+  if (mapsLargeBlocks) {
+    auto fn = b.beginFunction(
+        "LyMem_MapAlloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}),
+        /*isPrivate=*/true);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value length = roundUp(add(fn.getArgument(0), b.iconst(16)),
+                                 pageBytes);
+    // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON (Darwin's values).
+    mlir::Value base =
+        b.call("mmap", b.ptr(),
+               mlir::ValueRange{b.nullPtr(), length, b.iconst32(3),
+                                b.iconst32(0x1002), b.iconst32(-1),
+                                b.iconst(0)})
+            .front();
+    guardReturn(b.cmpi(Pred::eq, b.ptrToInt(base), b.iconst(-1)),
+                [&] { ret(b.nullPtr()); });
+    storeI64At(b.iconst(kLargeMapped), base);
+    storeI64At(sub(length, b.iconst(16)), b.gepI64(base, b.iconst(1)));
+    ret(b.gepI8(base, b.iconst(16)));
+  }
+
+  // ---- ptr LyMem_Refill(i64 class) -----------------------------------------
+  // A fresh pool for `class`, its first block returned and the rest left to
+  // the bump pointer. Null when no arena could be had or placed in the map;
+  // the caller then takes a large block, which frees correctly whatever its
+  // size because it is not in an arena.
+  {
+    auto fn = b.beginFunction(
+        "LyMem_Refill", b.builder.getFunctionType({b.i64()}, {b.ptr()}),
+        /*isPrivate=*/true);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value classIndex = fn.getArgument(0);
+    mlir::Value arenaState = b.addrOf("g_lymem_arena");
+    mlir::Value remaining = b.loadI64(b.gepI64(arenaState, b.iconst(1)));
+    mlir::Block *entry = b.builder.getInsertionBlock();
+    mlir::Region *region = entry->getParent();
+    mlir::Block *haveArena = b.builder.createBlock(region);
+    mlir::Block *needArena = b.builder.createBlock(region);
+    b.builder.setInsertionPointToEnd(entry);
+    mlir::cf::CondBranchOp::create(
+        b.builder, b.loc,
+        b.cmpi(Pred::sge, remaining, b.iconst(kObjectAllocatorPoolBytes)),
+        haveArena, mlir::ValueRange{}, needArena, mlir::ValueRange{});
+
+    // Arenas come eight at a time from one system block, aligned inside it
+    // by hand: the map marks whole 1 MB arenas, so each must start on a 1 MB
+    // boundary. ⛔ Not `aligned_alloc(1 MB, 1 MB)`: the Windows CRT has no
+    // `aligned_alloc`, and the block is never freed, so the up-to-1 MB it
+    // skips is address space, not memory anything touches.
+    b.builder.setInsertionPointToEnd(needArena);
+    constexpr std::int64_t kArenasPerChunk = 8;
+    mlir::Value raw = systemAlloc(
+        b.iconst((kArenasPerChunk + 1) * kObjectAllocatorArenaBytes));
+    guardReturn(b.ptrEq(raw, b.nullPtr()), [&] { ret(b.nullPtr()); });
+    mlir::Value first = roundUp(b.ptrToInt(raw), kObjectAllocatorArenaBytes);
+    mlir::Value firstIndex = shr(first, kObjectAllocatorArenaShift);
+    // ⛔ Above 2^48 the map cannot name it: the block is dropped (it is
+    // leaked rather than freed, since nothing else will be handed out of it,
+    // and this does not happen on any target this runs on).
+    guardReturn(
+        b.cmpi(Pred::uge, add(firstIndex, b.iconst(kArenasPerChunk)),
+               b.iconst(std::int64_t(1) << (2 * kObjectAllocatorMapBits))),
+        [&] { ret(b.nullPtr()); });
+    {
+      auto loop = mlir::scf::ForOp::create(
+          b.builder, b.loc, b.iconst(0), b.iconst(kArenasPerChunk),
+          b.iconst(1));
+      mlir::OpBuilder::InsertionGuard guard(b.builder);
+      b.builder.setInsertionPointToStart(loop.getBody());
+      mlir::Value index = add(firstIndex, loop.getInductionVar());
+      mlir::Value leafSlot = b.gepPtr(b.addrOf("g_lymem_map"),
+                                      shr(index, kObjectAllocatorMapBits));
+      mlir::Value existing = b.loadPtrVal(leafSlot);
+      auto leafIf = mlir::scf::IfOp::create(
+          b.builder, b.loc, mlir::TypeRange{b.ptr()},
+          b.ptrEq(existing, b.nullPtr()), /*withElse=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard inner(b.builder);
+        b.builder.setInsertionPointToStart(&leafIf.getThenRegion().front());
+        mlir::Value fresh =
+            b.call("calloc", b.ptr(),
+                   mlir::ValueRange{
+                       b.iconst((std::int64_t(1) << kObjectAllocatorMapBits) /
+                                8),
+                       b.iconst(1)})
+                .front();
+        storePtrAt(fresh, leafSlot);
+        mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{fresh});
+        b.builder.setInsertionPointToStart(&leafIf.getElseRegion().front());
+        mlir::scf::YieldOp::create(b.builder, b.loc,
+                                   mlir::ValueRange{existing});
+      }
+      mlir::Value leaf = leafIf.getResult(0);
+      // A leaf calloc that failed leaves the arena unmarked; its pools are
+      // never handed out because `remaining` below is only set after the
+      // loop, and the next call tries again.
+      auto mark = mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{},
+                                          b.ptrNe(leaf, b.nullPtr()),
+                                          /*withElse=*/false);
+      {
+        mlir::OpBuilder::InsertionGuard inner(b.builder);
+        b.builder.setInsertionPointToStart(&mark.getThenRegion().front());
+        mlir::Value bit =
+            andI(index, b.iconst((1 << kObjectAllocatorMapBits) - 1));
+        mlir::Value bytePtr = b.gepI8(leaf, shr(bit, 3));
+        mlir::Value maskBit = mlir::arith::TruncIOp::create(
+            b.builder, b.loc, b.i8(),
+            mlir::arith::ShLIOp::create(b.builder, b.loc, b.iconst(1),
+                                        andI(bit, b.iconst(7))));
+        b.storeI8(mlir::arith::OrIOp::create(b.builder, b.loc,
+                                             b.loadI8(bytePtr), maskBit),
+                  bytePtr);
+      }
+    }
+    // Every arena in the chunk must be in the map before any pool of it is
+    // handed out, or a block from an unmarked one would be freed as a large
+    // block. Checked once, after the loop.
+    mlir::Value lastArena =
+        add(first, b.iconst((kArenasPerChunk - 1) * kObjectAllocatorArenaBytes));
+    mlir::Value allMarked = b.call("LyMem_Owns", b.i1(),
+                                   mlir::ValueRange{b.intToPtr(first)})
+                                .front();
+    allMarked = mlir::arith::AndIOp::create(
+        b.builder, b.loc, allMarked,
+        b.call("LyMem_Owns", b.i1(), mlir::ValueRange{b.intToPtr(lastArena)})
+            .front());
+    guardReturn(mlir::arith::XOrIOp::create(b.builder, b.loc, allMarked,
+                                            b.iconst1(true)),
+                [&] { ret(b.nullPtr()); });
+    storeI64At(first, arenaState);
+    storeI64At(b.iconst(kArenasPerChunk * kObjectAllocatorArenaBytes),
+               b.gepI64(arenaState, b.iconst(1)));
+    mlir::cf::BranchOp::create(b.builder, b.loc, haveArena, mlir::ValueRange{});
+
+    b.builder.setInsertionPointToEnd(haveArena);
+    mlir::Value pool = b.loadI64(arenaState);
+    storeI64At(add(pool, b.iconst(kObjectAllocatorPoolBytes)), arenaState);
+    storeI64At(sub(b.loadI64(b.gepI64(arenaState, b.iconst(1))),
+                   b.iconst(kObjectAllocatorPoolBytes)),
+               b.gepI64(arenaState, b.iconst(1)));
+    storeI64At(classIndex, b.intToPtr(pool));
+    mlir::Value bytes = mul(classIndex, b.iconst(kObjectAllocatorGranularity));
+    mlir::Value firstBlock = add(pool, b.iconst(16));
+    storeI64At(add(firstBlock, bytes), classBump(classIndex, 0));
+    storeI64At(add(pool, b.iconst(kObjectAllocatorPoolBytes)),
+               classBump(classIndex, 1));
+    ret(b.intToPtr(firstBlock));
+  }
 
   // ---- ptr LyMem_Alloc(i64 size) -------------------------------------------
   {
     auto fn = b.beginFunction(
         "LyMem_Alloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
-    mlir::Block *entry = fn.addEntryBlock();
-    mlir::Region &body = fn.getBody();
-    mlir::Block *large = b.builder.createBlock(&body);
-    mlir::Block *small = b.builder.createBlock(&body);
-    mlir::Block *pop = b.builder.createBlock(&body);
-    mlir::Block *carve = b.builder.createBlock(&body);
-    mlir::Block *fresh = b.builder.createBlock(&body);
-    mlir::Block *take = b.builder.createBlock(&body, {}, {b.i64(), b.ptr()},
-                                              {b.loc, b.loc});
-    mlir::Block *publish = b.builder.createBlock(&body);
-    mlir::Block *fromArena = b.builder.createBlock(&body);
-    mlir::Block *stamp = b.builder.createBlock(&body, {}, {b.ptr()}, {b.loc});
-    mlir::Block *fail = b.builder.createBlock(&body);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value size = fn.getArgument(0);
+    guardReturn(b.cmpi(Pred::sgt, size,
+                       b.iconst(kObjectAllocatorGranularity *
+                                kObjectAllocatorClasses)),
+                [&] {
+                  ret(b.call("LyMem_LargeAlloc", b.ptr(),
+                             mlir::ValueRange{size}));
+                });
+    mlir::Value rounded = shr(add(size, b.iconst(15)), 4);
+    mlir::Value classIndex = mlir::arith::MaxUIOp::create(
+        b.builder, b.loc, rounded, b.iconst(1));
+    mlir::Value headSlot = classHead(classIndex);
+    mlir::Value head = b.loadPtrVal(headSlot);
+    guardReturn(b.ptrNe(head, b.nullPtr()), [&] {
+      // A free block's first word links the list.
+      storePtrAt(b.loadPtrVal(head), headSlot);
+      ret(head);
+    });
+    mlir::Value next = b.loadI64(classBump(classIndex, 0));
+    mlir::Value bytes = mul(classIndex, b.iconst(kObjectAllocatorGranularity));
+    mlir::Value after = add(next, bytes);
+    mlir::Value fits = mlir::arith::AndIOp::create(
+        b.builder, b.loc, b.cmpi(Pred::ne, next, b.iconst(0)),
+        b.cmpi(Pred::ule, after, b.loadI64(classBump(classIndex, 1))));
+    guardReturn(fits, [&] {
+      storeI64At(after, classBump(classIndex, 0));
+      ret(b.intToPtr(next));
+    });
+    mlir::Value fresh =
+        b.call("LyMem_Refill", b.ptr(), mlir::ValueRange{classIndex}).front();
+    guardReturn(b.ptrNe(fresh, b.nullPtr()), [&] { ret(fresh); });
+    ret(b.call("LyMem_LargeAlloc", b.ptr(), mlir::ValueRange{size}));
+  }
 
-    b.builder.setInsertionPointToEnd(entry);
-    mlir::Value total = mlir::arith::AddIOp::create(
-        b.builder, b.loc, entry->getArgument(0),
-        b.iconst(kObjectAllocatorPrefixBytes));
-    mlir::Value isLarge =
-        b.cmpi(mlir::arith::CmpIPredicate::sgt, total,
-               b.iconst(kObjectAllocatorGranularity * kObjectAllocatorClasses));
-    mlir::cf::CondBranchOp::create(b.builder, b.loc, isLarge, large,
-                                   mlir::ValueRange{}, small,
-                                   mlir::ValueRange{});
-
-    // Above the threshold the system allocator answers directly; the prefix
-    // records that so the free knows which way to go back.
-    b.builder.setInsertionPointToEnd(large);
-    mlir::Value block = systemAlloc(total);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc, b.ptrEq(block, b.nullPtr()), fail,
-        mlir::ValueRange{}, take, mlir::ValueRange{b.iconst(-1), block});
-
-    b.builder.setInsertionPointToEnd(small);
-    mlir::Value rounded = mlir::arith::AddIOp::create(
-        b.builder, b.loc, total, b.iconst(kObjectAllocatorGranularity - 1));
-    mlir::Value classIndex =
-        mlir::arith::ShRSIOp::create(b.builder, b.loc, rounded, b.iconst(4));
-    mlir::Value head = b.loadPtrVal(classSlot(classIndex));
-    mlir::cf::CondBranchOp::create(b.builder, b.loc,
-                                   b.ptrEq(head, b.nullPtr()), carve,
-                                   mlir::ValueRange{}, pop, mlir::ValueRange{});
-
-    // The free list holds the NEXT pointer in the prefix's second word; the
-    // first is the class, rewritten below because the pop overwrites nothing.
-    b.builder.setInsertionPointToEnd(pop);
-    mlir::Value poppedHead = b.loadPtrVal(classSlot(classIndex));
-    mlir::Value next = b.loadPtrVal(b.gepI64(poppedHead, b.iconst(1)));
-    storePtrAt(next, classSlot(classIndex));
-    storeI64At(classIndex, poppedHead);
-    mlir::func::ReturnOp::create(
-        b.builder, b.loc,
-        mlir::ValueRange{b.gepI8(poppedHead,
-                                 b.iconst(kObjectAllocatorPrefixBytes))});
-
-    b.builder.setInsertionPointToEnd(carve);
-    mlir::Value bytes = mlir::arith::MulIOp::create(
-        b.builder, b.loc, classIndex, b.iconst(kObjectAllocatorGranularity));
-    mlir::Value arena = b.addrOf("g_lymem_arena");
-    mlir::Value remaining = b.loadI64(b.gepI64(arena, b.iconst(1)));
-    mlir::Value fits =
-        b.cmpi(mlir::arith::CmpIPredicate::sge, remaining, bytes);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc, fits, take,
-        mlir::ValueRange{classIndex, b.nullPtr()}, fresh, mlir::ValueRange{});
-
-    // A new arena. The remainder of the old one is abandoned -- at most one
-    // class width, which is why the classes are the granularity.
-    b.builder.setInsertionPointToEnd(fresh);
-    mlir::Value chunk = systemAlloc(b.iconst(kObjectAllocatorArenaBytes));
-    mlir::cf::CondBranchOp::create(b.builder, b.loc,
-                                   b.ptrEq(chunk, b.nullPtr()), fail,
-                                   mlir::ValueRange{}, publish,
-                                   mlir::ValueRange{});
-    b.builder.setInsertionPointToEnd(publish);
-    storeI64At(b.ptrToInt(chunk), arena);
-    storeI64At(b.iconst(kObjectAllocatorArenaBytes),
-               b.gepI64(arena, b.iconst(1)));
-    mlir::cf::BranchOp::create(b.builder, b.loc, take,
-                               mlir::ValueRange{classIndex, b.nullPtr()});
-
-    // `take` serves both the carve and the large path: a negative class means
-    // the block is already in hand (the `malloc` above) and only needs its
-    // prefix stamped.
-    b.builder.setInsertionPointToEnd(take);
-    mlir::Value takenClass = take->getArgument(0);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc,
-        b.cmpi(mlir::arith::CmpIPredicate::slt, takenClass, b.iconst(0)), stamp,
-        mlir::ValueRange{take->getArgument(1)}, fromArena,
-        mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(fromArena);
-    mlir::Value takeBytes = mlir::arith::MulIOp::create(
-        b.builder, b.loc, takenClass, b.iconst(kObjectAllocatorGranularity));
-    mlir::Value cursor = b.loadI64(arena);
-    mlir::Value left = b.loadI64(b.gepI64(arena, b.iconst(1)));
-    storeI64At(mlir::arith::AddIOp::create(b.builder, b.loc, cursor, takeBytes),
-               arena);
-    storeI64At(mlir::arith::SubIOp::create(b.builder, b.loc, left, takeBytes),
-               b.gepI64(arena, b.iconst(1)));
-    mlir::cf::BranchOp::create(b.builder, b.loc, stamp,
-                               mlir::ValueRange{b.intToPtr(cursor)});
-
-    b.builder.setInsertionPointToEnd(stamp);
-    storeI64At(takenClass, stamp->getArgument(0));
-    mlir::func::ReturnOp::create(
-        b.builder, b.loc,
-        mlir::ValueRange{b.gepI8(stamp->getArgument(0),
-                                 b.iconst(kObjectAllocatorPrefixBytes))});
-
-    b.builder.setInsertionPointToEnd(fail);
-    mlir::func::ReturnOp::create(b.builder, b.loc,
-                                 mlir::ValueRange{b.nullPtr()});
+  // ---- ptr LyMem_AlignedAlloc(i64 alignment, i64 size) ----------------------
+  // What `memref.alloc` lowers to. Every pooled and large block is already
+  // 16-aligned; a stricter alignment gets an over-allocated system block whose
+  // payload is moved up to it, with (alignment, size) below the prefix.
+  {
+    auto fn = b.beginFunction(
+        "LyMem_AlignedAlloc",
+        b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value alignment = fn.getArgument(0);
+    mlir::Value size = fn.getArgument(1);
+    guardReturn(b.cmpi(Pred::ule, alignment,
+                       b.iconst(kObjectAllocatorGranularity)),
+                [&] {
+                  ret(b.call("LyMem_Alloc", b.ptr(), mlir::ValueRange{size}));
+                });
+    mlir::Value base = systemAlloc(add(add(size, alignment), b.iconst(32)));
+    guardReturn(b.ptrEq(base, b.nullPtr()), [&] { ret(b.nullPtr()); });
+    mlir::Value payload = andI(
+        add(add(b.ptrToInt(base), b.iconst(32)), sub(alignment, b.iconst(1))),
+        sub(b.iconst(0), alignment));
+    mlir::Value payloadPtr = b.intToPtr(payload);
+    storeI64At(b.iconst(kLargeOverAligned),
+               b.gepI64(payloadPtr, b.iconst(-2)));
+    storeI64At(b.ptrToInt(base), b.gepI64(payloadPtr, b.iconst(-1)));
+    storeI64At(size, b.gepI64(payloadPtr, b.iconst(-3)));
+    storeI64At(alignment, b.gepI64(payloadPtr, b.iconst(-4)));
+    ret(payloadPtr);
   }
 
   // ---- void LyMem_Free(ptr block) ------------------------------------------
   {
     auto fn = b.beginFunction("LyMem_Free",
                               b.builder.getFunctionType({b.ptr()}, {}));
-    mlir::Block *entry = fn.addEntryBlock();
-    mlir::Region &body = fn.getBody();
-    mlir::Block *live = b.builder.createBlock(&body);
-    mlir::Block *large = b.builder.createBlock(&body);
-    mlir::Block *small = b.builder.createBlock(&body);
-    mlir::Block *done = b.builder.createBlock(&body);
-
-    b.builder.setInsertionPointToEnd(entry);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc, b.ptrEq(entry->getArgument(0), b.nullPtr()), done,
-        mlir::ValueRange{}, live, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(live);
-    mlir::Value prefix =
-        b.gepI8(entry->getArgument(0), b.iconst(-kObjectAllocatorPrefixBytes));
-    mlir::Value classIndex = b.loadI64(prefix);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc,
-        b.cmpi(mlir::arith::CmpIPredicate::slt, classIndex, b.iconst(0)), large,
-        mlir::ValueRange{}, small, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(large);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value block = fn.getArgument(0);
+    guardReturn(b.ptrEq(block, b.nullPtr()), [&] { ret({}); });
+    mlir::Value owned =
+        b.call("LyMem_Owns", b.i1(), mlir::ValueRange{block}).front();
+    guardReturn(owned, [&] {
+      mlir::Value pool = b.intToPtr(
+          andI(b.ptrToInt(block), b.iconst(-kObjectAllocatorPoolBytes)));
+      mlir::Value headSlot = classHead(b.loadI64(pool));
+      storePtrAt(b.loadPtrVal(headSlot), block);
+      storePtrAt(block, headSlot);
+      ret({});
+    });
+    mlir::Value prefix = b.gepI8(block, b.iconst(-16));
+    mlir::Value kind = b.loadI64(prefix);
+    if (mapsLargeBlocks)
+      guardReturn(b.cmpi(Pred::eq, kind, b.iconst(kLargeMapped)), [&] {
+        b.call("munmap", b.i32(),
+               mlir::ValueRange{prefix,
+                                add(b.loadI64(b.gepI64(prefix, b.iconst(1))),
+                                    b.iconst(16))});
+        ret({});
+      });
+    guardReturn(b.cmpi(Pred::eq, kind, b.iconst(kLargeOverAligned)), [&] {
+      b.call("free", mlir::TypeRange{},
+             mlir::ValueRange{
+                 b.intToPtr(b.loadI64(b.gepI64(prefix, b.iconst(1))))});
+      ret({});
+    });
     b.call("free", mlir::TypeRange{}, mlir::ValueRange{prefix});
-    mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(small);
-    mlir::Value slot = classSlot(classIndex);
-    storePtrAt(b.loadPtrVal(slot), b.gepI64(prefix, b.iconst(1)));
-    storePtrAt(prefix, slot);
-    mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(done);
-    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
+    ret({});
   }
 
   // ---- ptr LyMem_Realloc(ptr block, i64 size) ------------------------------
@@ -851,61 +1054,103 @@ void buildObjectAllocator(SupportBuilder &b) {
     auto fn = b.beginFunction(
         "LyMem_Realloc",
         b.builder.getFunctionType({b.ptr(), b.i64()}, {b.ptr()}));
-    mlir::Block *entry = fn.addEntryBlock();
-    mlir::Region &body = fn.getBody();
-    mlir::Block *fresh = b.builder.createBlock(&body);
-    mlir::Block *held = b.builder.createBlock(&body);
-    mlir::Block *large = b.builder.createBlock(&body);
-    mlir::Block *small = b.builder.createBlock(&body);
-    mlir::Block *keep = b.builder.createBlock(&body);
-    mlir::Block *move = b.builder.createBlock(&body);
-
-    b.builder.setInsertionPointToEnd(entry);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc, b.ptrEq(entry->getArgument(0), b.nullPtr()), fresh,
-        mlir::ValueRange{}, held, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(fresh);
-    mlir::func::ReturnOp::create(
-        b.builder, b.loc,
-        b.call("LyMem_Alloc", b.ptr(),
-               mlir::ValueRange{entry->getArgument(1)}));
-
-    b.builder.setInsertionPointToEnd(held);
-    mlir::Value prefix =
-        b.gepI8(entry->getArgument(0), b.iconst(-kObjectAllocatorPrefixBytes));
-    mlir::Value classIndex = b.loadI64(prefix);
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc,
-        b.cmpi(mlir::arith::CmpIPredicate::slt, classIndex, b.iconst(0)), large,
-        mlir::ValueRange{}, small, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(large);
-    mlir::Value grownBytes =
-        mlir::arith::AddIOp::create(b.builder, b.loc, entry->getArgument(1),
-                                    b.iconst(kObjectAllocatorPrefixBytes));
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value block = fn.getArgument(0);
+    mlir::Value size = fn.getArgument(1);
+    guardReturn(b.ptrEq(block, b.nullPtr()), [&] {
+      ret(b.call("LyMem_Alloc", b.ptr(), mlir::ValueRange{size}));
+    });
+    // Moves `block` (of `capacity` usable bytes) into a fresh allocation.
+    auto moveTo = [&](mlir::Value fresh, mlir::Value capacity) {
+      guardReturn(b.ptrEq(fresh, b.nullPtr()), [&] { ret(b.nullPtr()); });
+      mlir::Value count = mlir::arith::MinUIOp::create(b.builder, b.loc,
+                                                       capacity, size);
+      b.call("memcpy", b.ptr(), mlir::ValueRange{fresh, block, count});
+      b.call("LyMem_Free", mlir::TypeRange{}, mlir::ValueRange{block});
+      ret(fresh);
+    };
+    mlir::Value owned =
+        b.call("LyMem_Owns", b.i1(), mlir::ValueRange{block}).front();
+    // A pooled block cannot grow where it lies: its neighbours belong to other
+    // objects. It keeps its block while the request still fits its class,
+    // which is what makes an appending loop amortise.
+    guardReturn(owned, [&] {
+      mlir::Value pool = b.intToPtr(
+          andI(b.ptrToInt(block), b.iconst(-kObjectAllocatorPoolBytes)));
+      mlir::Value capacity =
+          mul(b.loadI64(pool), b.iconst(kObjectAllocatorGranularity));
+      guardReturn(b.cmpi(Pred::ule, size, capacity), [&] { ret(block); });
+      moveTo(b.call("LyMem_Alloc", b.ptr(), mlir::ValueRange{size}).front(),
+             capacity);
+    });
+    mlir::Value prefix = b.gepI8(block, b.iconst(-16));
+    mlir::Value kind = b.loadI64(prefix);
+    guardReturn(b.cmpi(Pred::eq, kind, b.iconst(kLargeOverAligned)), [&] {
+      mlir::Value alignment = b.loadI64(b.gepI64(prefix, b.iconst(-2)));
+      mlir::Value oldSize = b.loadI64(b.gepI64(prefix, b.iconst(-1)));
+      moveTo(b.call("LyMem_AlignedAlloc", b.ptr(),
+                    mlir::ValueRange{alignment, size})
+                 .front(),
+             oldSize);
+    });
+    mlir::Value capacity = b.loadI64(b.gepI64(prefix, b.iconst(1)));
+    guardReturn(b.cmpi(Pred::ule, size, capacity), [&] { ret(block); });
+    if (mapsLargeBlocks) {
+      // A mapped block grows into a new mapping: the whole pages are copied
+      // by remapping them, the tail and the prefix by hand.
+      guardReturn(b.cmpi(Pred::eq, kind, b.iconst(kLargeMapped)), [&] {
+        mlir::Value fresh =
+            b.call("LyMem_MapAlloc", b.ptr(), mlir::ValueRange{size}).front();
+        guardReturn(b.ptrEq(fresh, b.nullPtr()), [&] { ret(b.nullPtr()); });
+        mlir::Value freshPrefix = b.gepI8(fresh, b.iconst(-16));
+        mlir::Value freshCapacity =
+            b.loadI64(b.gepI64(freshPrefix, b.iconst(1)));
+        mlir::Value used = add(capacity, b.iconst(16));
+        mlir::Value pages = andI(used, b.iconst(-pageBytes));
+        mlir::Value task = mlir::LLVM::LoadOp::create(
+            b.builder, b.loc, b.i32(), b.addrOf("mach_task_self_"));
+        b.call("vm_copy", b.i32(),
+               mlir::ValueRange{task, b.ptrToInt(prefix), pages,
+                                b.ptrToInt(freshPrefix)});
+        b.call("memcpy", b.ptr(),
+               mlir::ValueRange{b.gepI8(freshPrefix, pages),
+                                b.gepI8(prefix, pages), sub(used, pages)});
+        storeI64At(b.iconst(kLargeMapped), freshPrefix);
+        storeI64At(freshCapacity, b.gepI64(freshPrefix, b.iconst(1)));
+        b.call("munmap", b.i32(), mlir::ValueRange{prefix, used});
+        ret(fresh);
+      });
+      // A malloc'd block that grows past the threshold moves to a mapping.
+      guardReturn(b.cmpi(Pred::sge, size,
+                         b.iconst(kObjectAllocatorMapThreshold)),
+                  [&] {
+                    moveTo(b.call("LyMem_MapAlloc", b.ptr(),
+                                  mlir::ValueRange{size})
+                               .front(),
+                           capacity);
+                  });
+    }
     mlir::Value grown =
-        b.call("realloc", b.ptr(), mlir::ValueRange{prefix, grownBytes})
+        b.call("realloc", b.ptr(),
+               mlir::ValueRange{prefix, add(size, b.iconst(16))})
             .front();
+    guardReturn(b.ptrEq(grown, b.nullPtr()), [&] { ret(b.nullPtr()); });
     if (!mallocIsAligned) {
       // realloc keeps only malloc's alignment. A block it moved off the
-      // 16-byte grid is copied onto it: all `grownBytes` of the new block are
-      // readable, and the ones past the old size are copied as garbage that
-      // nothing reads.
-      mlir::Value misaligned =
-          b.cmpi(mlir::arith::CmpIPredicate::ne,
-                 mlir::arith::AndIOp::create(
-                     b.builder, b.loc, b.ptrToInt(grown),
-                     b.iconst(kObjectAllocatorGranularity - 1)),
-                 b.iconst(0));
+      // 16-byte grid is copied onto it.
+      mlir::Value misaligned = b.cmpi(
+          Pred::ne,
+          andI(b.ptrToInt(grown), b.iconst(kObjectAllocatorGranularity - 1)),
+          b.iconst(0));
       auto realign =
           mlir::scf::IfOp::create(b.builder, b.loc, mlir::TypeRange{b.ptr()},
                                   misaligned, /*withElse=*/true);
       {
         mlir::OpBuilder::InsertionGuard guard(b.builder);
         b.builder.setInsertionPointToStart(&realign.getThenRegion().front());
-        mlir::Value fixed = systemAlloc(grownBytes);
-        b.call("memcpy", b.ptr(), mlir::ValueRange{fixed, grown, grownBytes});
+        mlir::Value bytes = add(size, b.iconst(16));
+        mlir::Value fixed = systemAlloc(bytes);
+        b.call("memcpy", b.ptr(), mlir::ValueRange{fixed, grown, bytes});
         b.call("free", mlir::TypeRange{}, mlir::ValueRange{grown});
         mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{fixed});
         b.builder.setInsertionPointToStart(&realign.getElseRegion().front());
@@ -913,40 +1158,8 @@ void buildObjectAllocator(SupportBuilder &b) {
       }
       grown = realign.getResult(0);
     }
-    mlir::func::ReturnOp::create(
-        b.builder, b.loc,
-        mlir::ValueRange{
-            b.gepI8(grown, b.iconst(kObjectAllocatorPrefixBytes))});
-
-    // A pooled block cannot grow where it lies: its neighbours belong to other
-    // objects. It keeps its block while the request still fits the class it is
-    // already in, which is what makes an appending loop amortise.
-    b.builder.setInsertionPointToEnd(small);
-    mlir::Value capacity = mlir::arith::SubIOp::create(
-        b.builder, b.loc,
-        mlir::arith::MulIOp::create(b.builder, b.loc, classIndex,
-                                    b.iconst(kObjectAllocatorGranularity)),
-        b.iconst(kObjectAllocatorPrefixBytes));
-    mlir::cf::CondBranchOp::create(
-        b.builder, b.loc,
-        b.cmpi(mlir::arith::CmpIPredicate::sle, entry->getArgument(1),
-               capacity),
-        keep, mlir::ValueRange{}, move, mlir::ValueRange{});
-
-    b.builder.setInsertionPointToEnd(keep);
-    mlir::func::ReturnOp::create(b.builder, b.loc,
-                                 mlir::ValueRange{entry->getArgument(0)});
-
-    b.builder.setInsertionPointToEnd(move);
-    mlir::Value moved =
-        b.call("LyMem_Alloc", b.ptr(),
-               mlir::ValueRange{entry->getArgument(1)})
-            .front();
-    b.call("memcpy", b.ptr(),
-           mlir::ValueRange{moved, entry->getArgument(0), capacity});
-    b.call("LyMem_Free", mlir::TypeRange{},
-           mlir::ValueRange{entry->getArgument(0)});
-    mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{moved});
+    storeI64At(size, b.gepI64(grown, b.iconst(1)));
+    ret(b.gepI8(grown, b.iconst(16)));
   }
 }
 
