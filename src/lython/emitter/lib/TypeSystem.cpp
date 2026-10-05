@@ -1748,7 +1748,8 @@ TypeSystem::ScopeIsolation::ScopeIsolation(ScopeIsolation &&other) noexcept
     : owner(other.owner), savedScopes(std::move(other.savedScopes)),
       savedCanonicalBindings(std::move(other.savedCanonicalBindings)),
       savedClasses(std::move(other.savedClasses)),
-      savedTypeParameters(std::move(other.savedTypeParameters)) {
+      savedTypeParameters(std::move(other.savedTypeParameters)),
+      savedModuleNames(std::move(other.savedModuleNames)) {
   other.owner = nullptr;
 }
 
@@ -1762,6 +1763,7 @@ TypeSystem::ScopeIsolation::operator=(ScopeIsolation &&other) noexcept {
   savedCanonicalBindings = std::move(other.savedCanonicalBindings);
   savedClasses = std::move(other.savedClasses);
   savedTypeParameters = std::move(other.savedTypeParameters);
+  savedModuleNames = std::move(other.savedModuleNames);
   other.owner = nullptr;
   return *this;
 }
@@ -1775,6 +1777,7 @@ void TypeSystem::ScopeIsolation::reset() {
   owner->scopedCanonicalBindings = std::move(savedCanonicalBindings);
   owner->scopedClasses = std::move(savedClasses);
   owner->scopedTypeParameters = std::move(savedTypeParameters);
+  owner->scopedModuleNames = std::move(savedModuleNames);
   owner = nullptr;
 }
 
@@ -1810,6 +1813,8 @@ TypeSystem::ScopeIsolation TypeSystem::isolateScopes() const {
   isolation.savedCanonicalBindings = std::move(scopedCanonicalBindings);
   isolation.savedClasses = std::move(scopedClasses);
   isolation.savedTypeParameters = std::move(scopedTypeParameters);
+  isolation.savedModuleNames = std::move(scopedModuleNames);
+  scopedModuleNames.clear();
   scopes.clear();
   scopedCanonicalBindings.clear();
   scopedClasses.clear();
@@ -2330,6 +2335,7 @@ TypeSystem::Scope TypeSystem::pushScope() const {
   scopedCanonicalBindings.emplace_back();
   scopedClasses.emplace_back();
   scopedTypeParameters.emplace_back();
+  scopedModuleNames.emplace_back();
   return Scope(*this);
 }
 
@@ -2339,6 +2345,7 @@ void TypeSystem::popScope() const {
     scopedCanonicalBindings.pop_back();
     scopedClasses.pop_back();
     scopedTypeParameters.pop_back();
+    scopedModuleNames.pop_back();
   }
 }
 
@@ -2353,6 +2360,7 @@ void TypeSystem::bindLocalSymbol(llvm::StringRef name, mlir::Type type) const {
   if (scopes.empty())
     return;
   scopes.back()[name] = type ? type : object();
+  forgetModuleNameInScope(name);
 }
 
 void TypeSystem::bindLocalTypeParameter(llvm::StringRef name,
@@ -2363,6 +2371,7 @@ void TypeSystem::bindLocalTypeParameter(llvm::StringRef name,
 }
 
 void TypeSystem::bindSymbol(llvm::StringRef name, mlir::Type type) {
+  forgetModuleNameInScope(name);
   if (!scopes.empty()) {
     scopes.back()[name] = type ? type : object();
     scopedCanonicalBindings.back().erase(name);
@@ -2373,6 +2382,7 @@ void TypeSystem::bindSymbol(llvm::StringRef name, mlir::Type type) {
 }
 
 void TypeSystem::bindRootSymbol(llvm::StringRef name, mlir::Type type) {
+  importedModuleLocalNames.erase(name);
   symbols[name] = type ? type : object();
   canonicalBindings.erase(name);
 }
@@ -2677,12 +2687,33 @@ TypeSystem::lookupClassStaticMethod(llvm::StringRef className,
   return found->second;
 }
 
+// The innermost scope that binds the name decides, as lookupSymbol does.
 bool TypeSystem::isImportedModuleName(llvm::StringRef name) const {
+  for (std::size_t level = scopes.size(); level-- > 0;) {
+    if (scopedModuleNames[level].contains(name))
+      return true;
+    if (scopes[level].count(name) || scopedCanonicalBindings[level].count(name))
+      return false;
+  }
   return importedModuleLocalNames.contains(name);
 }
 
 void TypeSystem::noteImportedModuleName(llvm::StringRef name) {
-  importedModuleLocalNames.insert(name);
+  noteModuleNameInScope(name);
+}
+
+void TypeSystem::noteModuleNameInScope(llvm::StringRef name) {
+  if (scopedModuleNames.empty())
+    importedModuleLocalNames.insert(name);
+  else
+    scopedModuleNames.back().insert(name);
+}
+
+void TypeSystem::forgetModuleNameInScope(llvm::StringRef name) const {
+  if (scopedModuleNames.empty())
+    const_cast<TypeSystem *>(this)->importedModuleLocalNames.erase(name);
+  else
+    scopedModuleNames.back().erase(name);
 }
 
 bool TypeSystem::bindImportedModule(llvm::StringRef module,
@@ -2697,7 +2728,7 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
   auto bindModuleObject = [&] {
     if (!handled) {
       bindSymbol(localName, object());
-      importedModuleLocalNames.insert(localName);
+      noteModuleNameInScope(localName);
     }
     handled = true;
   };
@@ -2796,7 +2827,7 @@ bool TypeSystem::bindImportedModule(llvm::StringRef module,
   // here as well -- it is what tells an unresolvable attribute on it apart
   // from one on an ordinary object.
   if (handled)
-    importedModuleLocalNames.insert(localName);
+    noteModuleNameInScope(localName);
   return handled;
 }
 

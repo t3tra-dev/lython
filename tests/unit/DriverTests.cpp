@@ -2741,3 +2741,21 @@ TEST(DriverTest, AFinalizerOnAnExceptionClassIsRefused) {
             std::string::npos)
       << result.diagnostics;
 }
+
+// What: a name a library module binds for itself -- `os` imports posixpath as
+// `path` -- is not a module in the program that imports the library. A
+// function the program calls `path` is called; a bare `path` the program
+// never bound is still unresolved.
+TEST(DriverTest, ALibrarysModuleAliasIsNotTheProgramsName) {
+  CompileResult own = compileSource("import os\n\n\n"
+                                    "def path() -> str:\n"
+                                    "    return os.sep\n\n\n"
+                                    "print(path())\n");
+  EXPECT_TRUE(own.succeeded) << own.diagnostics;
+
+  CompileResult unbound = compileSource("import os\n\nprint(path)\n");
+  EXPECT_FALSE(unbound.succeeded);
+  EXPECT_NE(unbound.diagnostics.find("unresolved name 'path'"),
+            std::string::npos)
+      << unbound.diagnostics;
+}
