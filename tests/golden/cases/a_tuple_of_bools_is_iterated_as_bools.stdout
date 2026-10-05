@@ -1,0 +1,5 @@
+True False
+StopIteration(5)
+False True
+StopIteration('five')
+2 [True, False, False] True False

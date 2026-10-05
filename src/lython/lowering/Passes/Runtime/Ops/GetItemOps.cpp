@@ -949,11 +949,23 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
               op, first.contract, label, DeadObjectStorage::StaticNonOwning);
       if (mlir::failed(dead))
         return mlir::failure();
-      if (dead->values.size() != resultTypes.size())
-        return op->emitError()
-               << label << " static miss placeholder ABI mismatch";
+      llvm::SmallVector<mlir::Value, 4> deadValues(dead->values.begin(),
+                                                   dead->values.end());
+      // ⛔ Not the contract's dead value when the candidates do not have the
+      // contract's lanes: a tuple holds its bools boxed, so the candidates
+      // are boxes while bool's own value is its truth bit, and the arms
+      // yielded a box and an i1 -- `for f in (True, False)` failed MLIR
+      // verification. The lanes the arms yield decide the placeholder.
+      if (!llvm::equal(mlir::ValueRange(deadValues).getTypes(), resultTypes)) {
+        mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> byType =
+            RuntimeBundleLowerer::materializeStaticDeadPhysicalValues(
+                op, resultTypes);
+        if (mlir::failed(byType))
+          return mlir::failure();
+        deadValues = std::move(*byType);
+      }
       if (needsYields)
-        mlir::scf::YieldOp::create(builder, loc, dead->values);
+        mlir::scf::YieldOp::create(builder, loc, deadValues);
     }
 
     builder.setInsertionPointAfter(ifOp);
@@ -965,6 +977,22 @@ RuntimeBundleLowerer::selectEvidenceObjectByMatch(
       emitChain(emitChain, 0);
   if (mlir::failed(selected))
     return mlir::failure();
+  // The candidates may be in their slot form -- a tuple's bools are boxes --
+  // and the value handed on has the contract's own lanes, as a container
+  // read's does. A box passed on as a bool reached a generator's i1 argument.
+  if (mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> canonicalTypes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(op, first.contract,
+                                                     label);
+      mlir::succeeded(canonicalTypes) &&
+      !llvm::equal(mlir::ValueRange(*selected).getTypes(), *canonicalTypes)) {
+    builder.setInsertionPointAfter(selected->front().getDefiningOp());
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> canonical =
+        RuntimeBundleLowerer::unboxSlotElementValues(op, first.contract,
+                                                     *selected);
+    if (mlir::failed(canonical))
+      return mlir::failure();
+    selected = std::move(*canonical);
+  }
 
   mlir::Type bundleContract = first.contract;
   std::string resultContract = runtimeContractName(resultValue.getType());

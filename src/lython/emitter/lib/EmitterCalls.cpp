@@ -1211,12 +1211,21 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
                                            /*allowCallable=*/true))
             return *constant;
         // open() with a literal 'b' mode dispatches to the binary arm
-        // (FileIO result); see the matching special case in inferExpr.
+        // (a Buffered* result); see the matching special case in inferExpr.
         if (*canonical == "_io.open") {
           const auto *openArgs = ast::nodeList(expr, "args");
           if (openArgs && openArgs->size() >= 2 && (*openArgs)[1]) {
             auto mode = ast::string(*(*openArgs)[1], "value");
             if (mode && mode->find('b') != std::string_view::npos) {
+              // The Buffered* opener when io is part of the program (the
+              // driver adds it for exactly these calls); the raw FileIO
+              // otherwise, which is what this was before io could be asked.
+              const char *opener = binaryOpenFunction(*mode);
+              if (std::optional<mlir::Type> symbol =
+                      types.lookupSymbol(opener))
+                return emitCallableDispatch(
+                    expr, emitBindingRef(*calleeNode, opener, *symbol),
+                    emitCallOperands(expr));
               const py::protocols::Table &table =
                   py::protocols::Table::get(context);
               mlir::Type calleeType =

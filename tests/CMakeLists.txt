@@ -204,6 +204,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AJsHostExecutableKeepsItsExportsExternal"
     "DriverTest.TheReprHookArmsOnlyTheClassesTheProgramHolds"
     "DriverTest.AnObjectValueKeepsEveryReprArm"
+    "DriverTest.IteratingATupleOfBoolsCompiles"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"

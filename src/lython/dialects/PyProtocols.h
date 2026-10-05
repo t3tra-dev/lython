@@ -88,6 +88,9 @@ struct ProtocolInfo {
   std::vector<ProtocolShortForm> shortForms;
   std::vector<ProtocolBase> bases;
   std::map<std::string, mlir::Type> fields;
+  // The same names in declaration order: a native class's `field` primitive
+  // takes a field's position, which the map above does not keep.
+  std::vector<std::string> fieldOrder;
   std::map<std::string, std::vector<ProtocolMethod>> methods;
   // Methods declared via `ly.typing.structural_mutators` that structurally
   // mutate the receiver (may reallocate its storage). Calls to these are

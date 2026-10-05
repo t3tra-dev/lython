@@ -909,8 +909,10 @@ const Table &Table::get(mlir::MLIRContext &context) {
           for (auto [nameAttr, typeAttr] : llvm::zip(fieldNames, fieldTypes)) {
             auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
             auto type = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
-            if (name && type)
+            if (name && type) {
               classInfo.fields[name.getValue().str()] = type.getValue();
+              classInfo.fieldOrder.push_back(name.getValue().str());
+            }
           }
         }
       }

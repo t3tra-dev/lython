@@ -1,0 +1,12 @@
+<_io.TextIOWrapper name='<path>' mode='r' encoding='UTF-8'> <path> r
+[<_io.TextIOWrapper name='<path>' mode='r' encoding='UTF-8'>]
+<_io.TextIOWrapper name='<path>' mode='r' encoding='UTF-8'>
+<_io.TextIOWrapper name='<path>' mode='rt' encoding='UTF-8'>
+<_io.BufferedReader name='<path>'> BufferedReader rb
+<_io.FileIO name='<path>' mode='rb' closefd=True>
+<_io.FileIO [closed]>
+<_io.BufferedRandom name='<path>'> BufferedRandom
+<_io.FileIO name='<path>' mode='rb' closefd=True> rb
+<_io.FileIO [closed]>
+<_io.TextIOWrapper name='<stdout>' mode='w' encoding='utf-8'>
+<_io.TextIOWrapper name='<stderr>' mode='w' encoding='utf-8'>

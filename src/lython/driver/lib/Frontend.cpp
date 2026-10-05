@@ -83,6 +83,37 @@ static const lython::parser::Node *nodeField(const lython::parser::Node &node,
 // true or false, or nullopt for any other test, whose branches are both
 // collected. The emitter folds the same comparison the same way
 // (`staticModuleStatements`), so a module it binds was collected here.
+// Whether `node` holds a call `open(file, "<mode with b>")`: the shape the
+// emitter turns into an io Buffered* constructor (binaryOpenFunction).
+static bool callsBinaryOpen(const lython::parser::Node &node) {
+  if (node.kind == "Call") {
+    const lython::parser::Node *func = nodeField(node, "func");
+    std::optional<std::string> name =
+        func && func->kind == "Name" ? stringField(*func, "id") : std::nullopt;
+    const auto *args = nodeListField(node, "args");
+    if (name && *name == "open" && args && args->size() >= 2 &&
+        (*args)[1] && (*args)[1]->kind == "Constant")
+      if (const lython::parser::Field *value =
+              lython::parser::findField(*(*args)[1], "value"))
+        if (const auto *text = std::get_if<std::string>(&value->value);
+            text && text->find('b') != std::string::npos)
+          return true;
+  }
+  for (const lython::parser::Field &field : node.fields) {
+    if (const auto *child = std::get_if<lython::parser::NodePtr>(&field.value)) {
+      if (*child && callsBinaryOpen(**child))
+        return true;
+    } else if (const auto *children =
+                   std::get_if<std::vector<lython::parser::NodePtr>>(
+                       &field.value)) {
+      for (const lython::parser::NodePtr &item : *children)
+        if (item && callsBinaryOpen(*item))
+          return true;
+    }
+  }
+  return false;
+}
+
 static std::optional<bool> staticPlatformTest(const lython::parser::Node &test,
                                               const llvm::Triple &triple,
                                               bool hasJsHost) {
@@ -615,6 +646,27 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
           driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
           hasJsHost, diag)))
     return failure();
+  // open() with a literal binary mode returns the Buffered* class io builds
+  // (emitter, binaryOpenFunction), so a program making such a call is
+  // compiled with io as if it had imported it.
+  // ⛔ Not for every program: io and what it imports would be compiled into
+  // each one for the few that open a file in binary.
+  if (std::any_of(localSources.begin(), localSources.end(),
+                  [](const ParsedLocalSourceModule &source) {
+                    return !source.isEmbedded &&
+                           callsBinaryOpen(*source.parsed.tree);
+                  }) ||
+      callsBinaryOpen(*parsed.tree)) {
+    lython::parser::ParseResult ioImport =
+        lython::parser::parse("import io\n", sourcePath.str(), options);
+    if (!ioImport.ok() ||
+        failed(collectLocalSourceModules(
+            *ioImport.tree, importBaseDir, mainPackageName, sourcePath,
+            localSources, seenSourceModules, visitingSourceModules,
+            driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
+            hasJsHost, diag)))
+      return failure();
+  }
   // A program that reaches the host's `js` can hand it callbacks, and the
   // callbacks' table and entry point are Python (runtime/lib/_js_bridge.py):
   // compiled with the program as if it had imported them.

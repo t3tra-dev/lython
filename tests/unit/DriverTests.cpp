@@ -285,6 +285,23 @@ TEST(DriverTest, AnObjectValueKeepsEveryReprArm) {
   EXPECT_TRUE(llvm::is_contained(callees, "LyRange_Repr"));
 }
 
+// What: iterating a tuple of bools compiles, both where the element is
+// printed and where it is handed to a generator taking a bool; a tuple keeps
+// its bools boxed and each read hands on the bool itself.
+TEST(DriverTest, IteratingATupleOfBoolsCompiles) {
+  CompileResult printed = compileSource("for f in (True, False):\n"
+                                        "    print(f)\n");
+  EXPECT_TRUE(printed.succeeded) << printed.diagnostics;
+  CompileResult passed = compileSource(
+      "from typing import Generator\n\n\n"
+      "def gen(flag: bool) -> Generator[int, None, int]:\n"
+      "    yield 1\n"
+      "    return 2 if flag else 3\n\n\n"
+      "for f in (True, False):\n"
+      "    print(next(gen(f)))\n");
+  EXPECT_TRUE(passed.succeeded) << passed.diagnostics;
+}
+
 TEST(DriverTest, ReportsParseErrorDiagnostics) {
   CompileResult result = compileSource("def broken(:\n");
   EXPECT_FALSE(result.succeeded);
