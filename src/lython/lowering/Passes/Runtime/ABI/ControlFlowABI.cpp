@@ -212,6 +212,47 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureValueBundle(mlir::Operation *op,
     return mlir::success();
   if (llvm::is_contained(erase, definition))
     return mlir::success();
+  // ⭐ WHAT RUNS BEFORE IT IN ITS BLOCK IS LOWERED BEFORE IT. This lowers a
+  // definition out of the walk's order -- a loop header asks for the value
+  // its back edge carries, which is computed at the end of the body -- and
+  // an op earlier in the definition's block may change what its operands'
+  // bundles say without producing any of them: `__init__` hands the fresh
+  // instance over and gives back the one to use. Lowered ahead of it, a
+  // method call in the loop body read the instance before `__init__`, and
+  // released the reference `__init__` had consumed -- `r = io.StringIO("x")`
+  // then `total += r.tell()` in a loop was refused by the ownership
+  // verifier, and is a use-after-free where nothing checks.
+  // ⛔ Not every op that dominates it, only its own block's: the walk lowers
+  // blocks in order, and the ones before this block have been, apart from
+  // the loop body this is lowering on behalf of.
+  if (!loweredAheadOfWalk.contains(definition)) {
+    llvm::SmallVector<mlir::Operation *, 8> earlier;
+    for (mlir::Operation &sibling : *definition->getBlock()) {
+      if (&sibling == definition)
+        break;
+      if (sibling.getDialect() &&
+          sibling.getDialect()->getNamespace() == "py" &&
+          !loweredAheadOfWalk.contains(&sibling) &&
+          !llvm::is_contained(erase, &sibling) &&
+          (sibling.getNumResults() == 0 ||
+           llvm::any_of(sibling.getResults(), [&](mlir::Value result) {
+             return !valueBundles.count(result);
+           })))
+        earlier.push_back(&sibling);
+    }
+    for (mlir::Operation *sibling : earlier) {
+      if (llvm::is_contained(erase, sibling))
+        continue;
+      loweredAheadOfWalk.insert(sibling);
+      if (mlir::failed(
+              RuntimeBundleLowerer::ensureOperationOperandBundles(sibling)))
+        return mlir::failure();
+      if (llvm::is_contained(erase, sibling))
+        continue;
+      if (mlir::failed(RuntimeBundleLowerer::lowerPyOp(sibling)))
+        return mlir::failure();
+    }
+  }
   if (mlir::failed(
           RuntimeBundleLowerer::ensureOperationOperandBundles(definition)))
     return mlir::failure();
