@@ -170,6 +170,8 @@ createRuntimeLoweringPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createPublicationPreparationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createObservableReleasePass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountInsertionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountPairElisionPass();

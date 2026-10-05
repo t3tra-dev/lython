@@ -412,6 +412,7 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   // Phase 2: publish high-level callable/runtime metadata before rewrites.
   if (failed(runPhase("publication-preparation", [&](PassManager &pm) {
         pm.addPass(createPublicationPreparationPass());
+        pm.addPass(createObservableReleasePass());
       })))
     return failure();
   dumpMLIRForPass(irDump, "publication-preparation", module);

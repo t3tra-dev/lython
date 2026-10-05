@@ -2655,34 +2655,66 @@ bool callsFunctionNamed(llvm::Module &module, llvm::StringRef callee) {
 
 } // namespace
 
-// What: a program with no `__del__` keeps nothing alive past its last use --
-// no keep-alive call anywhere -- and one with a `__del__` keeps its locals
-// alive to the end of their frame and has its deallocator call the method
-// that runs the finalizer.
-TEST(DriverTest, OnlyAProgramWithAFinalizerKeepsItsLocalsAlive) {
-  const char *body = "    def __init__(self, n: int) -> None:\n"
-                     "        self.n = n\n";
-  std::string plain = std::string("class A:\n") + body +
-                      "\n\ndef f() -> None:\n"
-                      "    a = A(1)\n"
-                      "    print(a.n)\n\n\nf()\n";
-  std::string finalized = std::string("class A:\n") + body +
-                          "    def __del__(self) -> None:\n"
-                          "        print(\"del\")\n"
-                          "\n\ndef f() -> None:\n"
-                          "    a = A(1)\n"
-                          "    print(a.n)\n\n\nf()\n";
-  CompileResult without = compileSource(plain);
-  ASSERT_TRUE(without.succeeded) << without.diagnostics;
-  EXPECT_FALSE(
-      callsFunctionNamed(*without.verified.llvmModule, "LyObject_KeepAlive"));
+// What: a value is kept referenced to the end of its frame only when its
+// release can be observed. A list of ints and a plain class instance are
+// released at their last use -- no keep-alive call anywhere. An instance of a
+// class with `__del__`, an instance of a class that merely holds a generator
+// in a field, and an instance of a base class one of whose subclasses has
+// `__del__` are each kept alive, and the finalizer's class has its
+// deallocator call the method that runs `__del__`.
+TEST(DriverTest, OnlyAValueWhoseReleaseIsObservableIsKeptAlive) {
+  auto keepsAlive = [](const std::string &source) {
+    CompileResult result = compileSource(source);
+    EXPECT_TRUE(result.succeeded) << result.diagnostics;
+    return result.succeeded &&
+           callsFunctionNamed(*result.verified.llvmModule,
+                              "LyObject_KeepAlive");
+  };
+  const std::string useIt = "\n\ndef f() -> None:\n"
+                            "    a = make()\n"
+                            "    print(a is None)\n"
+                            "    print(\"end\")\n\n\nf()\n";
+  EXPECT_FALSE(keepsAlive("def make() -> list[int]:\n"
+                          "    return [1, 2]\n" +
+                          useIt));
+  EXPECT_FALSE(keepsAlive("class A:\n"
+                          "    def __init__(self) -> None:\n"
+                          "        self.n = 1\n\n\n"
+                          "def make() -> A:\n"
+                          "    return A()\n" +
+                          useIt));
+  EXPECT_TRUE(keepsAlive("class A:\n"
+                         "    def __del__(self) -> None:\n"
+                         "        print(\"del\")\n\n\n"
+                         "def make() -> A:\n"
+                         "    return A()\n" +
+                         useIt));
+  EXPECT_TRUE(keepsAlive("from typing import Generator\n\n\n"
+                         "def gen() -> Generator[int, None, None]:\n"
+                         "    yield 1\n\n\n"
+                         "class Holder:\n"
+                         "    def __init__(self) -> None:\n"
+                         "        self.g = gen()\n\n\n"
+                         "def make() -> Holder:\n"
+                         "    return Holder()\n" +
+                         useIt));
+  EXPECT_TRUE(keepsAlive("class Base:\n"
+                         "    def __init__(self) -> None:\n"
+                         "        self.n = 1\n\n\n"
+                         "class Kid(Base):\n"
+                         "    def __del__(self) -> None:\n"
+                         "        print(\"del\")\n\n\n"
+                         "def make() -> Base:\n"
+                         "    return Kid()\n" +
+                         useIt));
 
-  CompileResult with = compileSource(finalized);
-  ASSERT_TRUE(with.succeeded) << with.diagnostics;
-  EXPECT_TRUE(
-      callsFunctionNamed(*with.verified.llvmModule, "LyObject_KeepAlive"));
+  CompileResult finalized = compileSource("class A:\n"
+                                          "    def __del__(self) -> None:\n"
+                                          "        print(\"del\")\n\n\n"
+                                          "A()\n");
+  ASSERT_TRUE(finalized.succeeded) << finalized.diagnostics;
   llvm::Function *dealloc =
-      with.verified.llvmModule->getFunction("__ly_dealloc_A");
+      finalized.verified.llvmModule->getFunction("__ly_dealloc_A");
   ASSERT_NE(dealloc, nullptr);
   bool callsFinalizer = false;
   for (llvm::BasicBlock &block : *dealloc)

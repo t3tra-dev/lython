@@ -766,7 +766,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
     emitOptions.targetTriple =
         codeGenTripleForTarget({}, driverOptions).normalize();
     emitOptions.jsHost = hasJsHost;
-    emitOptions.keepLocalsAlive = finalizers;
+    emitOptions.hasFinalizers = finalizers;
     emitOptions.sourceModules.reserve(localSources.size());
     for (const ParsedLocalSourceModule &source : localSources) {
       emitOptions.sourceModules.push_back(

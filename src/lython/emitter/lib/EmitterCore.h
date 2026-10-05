@@ -533,7 +533,8 @@ private:
   void emitDelete(const parser::Node &statement);
   // py.keep_alive for `value` when the program keeps locals alive and the
   // value can hold an object that observes its release.
-  void emitKeepAlive(const parser::Node &at, Value value);
+  void emitKeepAlive(const parser::Node &at, Value value,
+                     mlir::Type observedAs = {});
   // py.global.clear for a main-module global at the end of the program,
   // which is when CPython clears the module's names.
   void emitGlobalClear(const parser::Node &at, llvm::StringRef name);

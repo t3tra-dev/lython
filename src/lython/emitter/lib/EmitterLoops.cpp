@@ -1431,6 +1431,16 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   if (!requireStaticEvidence(statement, nextInference))
     return;
   mlir::Type elem = nextInference.resultType;
+  // A builtin container's iterator holds the container and nothing else, so
+  // releasing it can be watched exactly when releasing the container can.
+  // ⛔ Not judged by its own type: that is the `Iterator` protocol, which a
+  // generator also satisfies, and every `for` over a list kept its iterator.
+  mlir::Type iteratorObservedAs;
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+          types.widenLiteral(iterable.type)))
+    if (!sourceIterator && contract.getContractName().starts_with("builtins.") &&
+        contract.getContractName() != "builtins.object")
+      iteratorObservedAs = contract;
 
   mlir::Block *entry = builder.getInsertionBlock();
   mlir::Region *region = entry->getParent();
@@ -1491,6 +1501,8 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
     LoopControlContext loop{afterBlock, checkBlock};
     loop.carriedLocals.assign(carried.begin(), carried.end());
     loop.headerBlock = checkBlock;
+    loop.iterator = iteratorValue;
+    loop.iteratorObservedAs = iteratorObservedAs;
     loopControlContexts.push_back(loop);
     emitAssignTarget(*ast::node(statement, "target"),
                      Value{next.getElement(), elem});
@@ -1527,6 +1539,10 @@ void ModuleEmitter::emitFor(const parser::Node &statement) {
   builder.setInsertionPointToStart(afterBlock);
   bindCarriedLoopLocals(carried,
                         afterForwardsCarried ? afterBlock : checkBlock);
+  // Left by exhaustion or by `break`: either way CPython drops the iterator
+  // here, and not at its last `next`, which is where a loop that always
+  // breaks would otherwise let a generator go -- before its body ran.
+  emitKeepAlive(statement, iteratorValue, iteratorObservedAs);
 }
 
 void ModuleEmitter::emitWhile(const parser::Node &statement) {
