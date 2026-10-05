@@ -1173,250 +1173,258 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
       return mlir::WalkResult::advance();
     }
 
-    llvm::SmallVector<mlir::Type, 8> abiInputTypes = logicalInputTypes;
-    auto protocolEvidence =
-        callableProtocolArgumentABIs.find(function.getSymName());
-    if (protocolEvidence != callableProtocolArgumentABIs.end()) {
-      llvm::SmallVector<mlir::Type, 8> &evidence = protocolEvidence->second;
-      for (auto [index, type] : llvm::enumerate(evidence))
-        if (index < abiInputTypes.size() && type)
-          abiInputTypes[index] = type;
+    if (mlir::failed(RuntimeBundleLowerer::prepareCallableFunctionABI(
+            function, callable, logicalInputTypes, memberOwnsALane))) {
+      result = mlir::failure();
+      return mlir::WalkResult::interrupt();
     }
+    return mlir::WalkResult::advance();
+  });
+  return result;
+}
 
-    llvm::SmallVector<mlir::Type, 8> inputTypes;
-    for (mlir::Type inputType : abiInputTypes) {
+// The ABI of one callable function that is neither a primitive-i64 clone nor
+// a protocol template: its physical inputs and results, the ownership of
+// what it returns, and the bundles its entry arguments seed. Shared by the
+// module-wide preparation and the indirect-call dispatchers the lowering
+// makes later (IndirectCallableOps.cpp).
+mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABI(
+    mlir::func::FuncOp function, py::CallableType callable,
+    llvm::ArrayRef<mlir::Type> logicalInputTypes,
+    llvm::function_ref<bool(mlir::Type)> memberOwnsALane) {
+  llvm::SmallVector<mlir::Type, 8> abiInputTypes(logicalInputTypes.begin(),
+                                                 logicalInputTypes.end());
+  auto protocolEvidence =
+      callableProtocolArgumentABIs.find(function.getSymName());
+  if (protocolEvidence != callableProtocolArgumentABIs.end()) {
+    llvm::SmallVector<mlir::Type, 8> &evidence = protocolEvidence->second;
+    for (auto [index, type] : llvm::enumerate(evidence))
+      if (index < abiInputTypes.size() && type)
+        abiInputTypes[index] = type;
+  }
+
+  llvm::SmallVector<mlir::Type, 8> inputTypes;
+  for (mlir::Type inputType : abiInputTypes) {
+    if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+            function, inputType, inputTypes))) {
+      return mlir::failure();
+    }
+    RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
+                                                          inputTypes);
+  }
+  const CallableArgumentEvidenceABI *argumentEvidence = nullptr;
+  auto argumentEvidenceIt =
+      callableArgumentEvidenceABIs.find(function.getSymName());
+  if (argumentEvidenceIt != callableArgumentEvidenceABIs.end()) {
+    argumentEvidence = &argumentEvidenceIt->second;
+    for (const RuntimeArgumentEvidenceSet &evidenceSet :
+         argumentEvidence->logicalArguments) {
+      for (const RuntimeArgumentEvidence &evidence :
+           evidenceSet.alternatives) {
+        for (mlir::Type inputType : evidence.closureValueTypes) {
+          if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+                  function, inputType, inputTypes))) {
+            return mlir::failure();
+          }
+          RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
+                                                                inputTypes);
+        }
+      }
+    }
+  }
+  const CallableAggregateEvidenceABI *aggregateEvidence = nullptr;
+  auto evidence = callableAggregateEvidenceABIs.find(function.getSymName());
+  if (evidence != callableAggregateEvidenceABIs.end()) {
+    aggregateEvidence = &evidence->second;
+    for (mlir::Type inputType : aggregateEvidence->varargElementTypes) {
       if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
               function, inputType, inputTypes))) {
-        result = mlir::failure();
-        return mlir::WalkResult::interrupt();
+        return mlir::failure();
       }
       RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
                                                             inputTypes);
     }
-    const CallableArgumentEvidenceABI *argumentEvidence = nullptr;
-    auto argumentEvidenceIt =
-        callableArgumentEvidenceABIs.find(function.getSymName());
-    if (argumentEvidenceIt != callableArgumentEvidenceABIs.end()) {
-      argumentEvidence = &argumentEvidenceIt->second;
-      for (const RuntimeArgumentEvidenceSet &evidenceSet :
-           argumentEvidence->logicalArguments) {
-        for (const RuntimeArgumentEvidence &evidence :
-             evidenceSet.alternatives) {
-          for (mlir::Type inputType : evidence.closureValueTypes) {
-            if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                    function, inputType, inputTypes))) {
-              result = mlir::failure();
-              return mlir::WalkResult::interrupt();
-            }
-            RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
-                                                                  inputTypes);
-          }
-        }
-      }
-    }
-    const CallableAggregateEvidenceABI *aggregateEvidence = nullptr;
-    auto evidence = callableAggregateEvidenceABIs.find(function.getSymName());
-    if (evidence != callableAggregateEvidenceABIs.end()) {
-      aggregateEvidence = &evidence->second;
-      for (mlir::Type inputType : aggregateEvidence->varargElementTypes) {
-        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                function, inputType, inputTypes))) {
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
-                                                              inputTypes);
-      }
-      for (mlir::Type inputType : aggregateEvidence->kwargValueTypes) {
-        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                function, inputType, inputTypes))) {
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
-                                                              inputTypes);
-        if (aggregateEvidence->kwargIsFull)
-          inputTypes.push_back(builder.getI1Type());
-      }
-    }
-
-    llvm::SmallVector<mlir::Type, 8> resultTypes;
-    llvm::SmallVector<std::int64_t, 4> ownedResultOffsets;
-    llvm::SmallVector<mlir::Attribute, 4> ownedResultContracts;
-    auto returnedStaticObject =
-        returnedStaticObjectSummaries.find(function.getSymName());
-    for (auto [logicalResultIndex, resultType] :
-         llvm::enumerate(callable.getResultTypes())) {
-      bool protocolPrimaryOwnsResult = false;
-      if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
-              resultType))
-        protocolPrimaryOwnsResult =
-            runtimeShapeContractName(resultType) == "builtins.object" &&
-            ((returnedStaticObject != returnedStaticObjectSummaries.end() &&
-              returnedStaticObject->second.resultIndex == logicalResultIndex) ||
-             protocol.getProtocolName() == "Generator");
-      if (protocolPrimaryOwnsResult) {
-        ownedResultOffsets.push_back(
-            static_cast<std::int64_t>(resultTypes.size()));
-        ownedResultContracts.push_back(builder.getStringAttr("builtins.object"));
-      }
-      // ⭐ A UNION OWNS ITS OWN MEMBER LANES, HOWEVER MANY OWN ONE. The layout
-      // already lays each member out after the tag, so the lanes to name are
-      // there -- what was missing was naming them.
-      //
-      // ⛔ Why NOT extend the static-object summary to a list of contracts
-      // instead, which is the shape the attribute already takes: that appends
-      // a DUPLICATE lane per member, and the caller would then need one
-      // conditionally owned bundle per duplicate while `RuntimeBundle` has a
-      // single `boxedObject` slot. The union's own lanes need no second bundle
-      // -- `collectTypedResourceGroups` already walks them and already stamps
-      // each with its `OwnershipCondition{tag, memberIndex}`, so the whole
-      // conditional machinery is reached by declaring the offsets.
-      //
-      // ⛔ AND ONE OWNING MEMBER IS NOT A DIFFERENT CASE. It used to be: with
-      // one, this was skipped and the static-object summary below appended a
-      // second copy of that member and marked THAT owned -- unconditionally,
-      // because the summary has no tag. `T | None` has exactly one owning
-      // member, so EVERY optional took that path: `pick() -> "Node | None"`
-      // came out as three lanes with the owned one at offset 2, which is the
-      // duplicate rather than the union's own, and the tag never reached the
-      // resource. That is why an optional carried across a loop's back edge
-      // reported "owned resource ... without release" where a two-member union
-      // reported "conditionally owned ... without tag-conditioned release":
-      // one obligation was being tracked as if it could not be absent.
-      if (auto unionResult =
-              mlir::dyn_cast_if_present<py::UnionType>(resultType)) {
-        llvm::SmallVector<std::pair<std::int64_t, std::string>, 2> memberLanes;
-        std::int64_t memberOffset =
-            static_cast<std::int64_t>(resultTypes.size()) + 1;
-        bool laid = true;
-        for (mlir::Type member : unionResult.getMemberTypes()) {
-          mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
-              RuntimeBundleLowerer::runtimeValueTypesFor(
-                  function, member, "union result member lane");
-          if (mlir::failed(memberTypes)) {
-            laid = false;
-            break;
-          }
-          // ⭐ A LANE IS OWNED ONLY IF IT IS A POINTER. `memberOwnsALane`
-          // asks the manifest whether the contract has a deallocator, and
-          // `builtins.bool` registers one -- but a bool member lowers to a
-          // bare i1, so the offset named an integer word and the ownership
-          // verifier refused the function it was put on:
-          //
-          //     def g(flag: bool):
-          //         return 1 if flag else False
-          //     # ly.ownership.owned_results result 1 must start an
-          //     # object-header-like result group
-          //
-          // ⛔ Not by naming bool: the condition the verifier enforces is
-          // about the PHYSICAL lane, so asking the lane directly also covers
-          // every future member whose contract has a deallocator it never
-          // reaches through a pointer.
-          if (memberOwnsALane(member) && !memberTypes->empty() &&
-              ownership::isObjectHeaderLikeType(memberTypes->front()))
-            memberLanes.emplace_back(memberOffset, runtimeContractName(member));
-          memberOffset += static_cast<std::int64_t>(memberTypes->size());
-        }
-        if (laid && !memberLanes.empty()) {
-          for (const auto &[offset, contract] : memberLanes) {
-            ownedResultOffsets.push_back(offset);
-            ownedResultContracts.push_back(builder.getStringAttr(contract));
-          }
-        }
-      }
+    for (mlir::Type inputType : aggregateEvidence->kwargValueTypes) {
       if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-              function, resultType, resultTypes))) {
-        result = mlir::failure();
-        return mlir::WalkResult::interrupt();
+              function, inputType, inputTypes))) {
+        return mlir::failure();
       }
-      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
+      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(inputType,
+                                                            inputTypes);
+      if (aggregateEvidence->kwargIsFull)
+        inputTypes.push_back(builder.getI1Type());
+    }
+  }
+
+  llvm::SmallVector<mlir::Type, 8> resultTypes;
+  llvm::SmallVector<std::int64_t, 4> ownedResultOffsets;
+  llvm::SmallVector<mlir::Attribute, 4> ownedResultContracts;
+  auto returnedStaticObject =
+      returnedStaticObjectSummaries.find(function.getSymName());
+  for (auto [logicalResultIndex, resultType] :
+       llvm::enumerate(callable.getResultTypes())) {
+    bool protocolPrimaryOwnsResult = false;
+    if (auto protocol = mlir::dyn_cast_if_present<py::ProtocolType>(
+            resultType))
+      protocolPrimaryOwnsResult =
+          runtimeShapeContractName(resultType) == "builtins.object" &&
+          ((returnedStaticObject != returnedStaticObjectSummaries.end() &&
+            returnedStaticObject->second.resultIndex == logicalResultIndex) ||
+           protocol.getProtocolName() == "Generator");
+    if (protocolPrimaryOwnsResult) {
+      ownedResultOffsets.push_back(
+          static_cast<std::int64_t>(resultTypes.size()));
+      ownedResultContracts.push_back(builder.getStringAttr("builtins.object"));
+    }
+    // ⭐ A UNION OWNS ITS OWN MEMBER LANES, HOWEVER MANY OWN ONE. The layout
+    // already lays each member out after the tag, so the lanes to name are
+    // there -- what was missing was naming them.
+    //
+    // ⛔ Why NOT extend the static-object summary to a list of contracts
+    // instead, which is the shape the attribute already takes: that appends
+    // a DUPLICATE lane per member, and the caller would then need one
+    // conditionally owned bundle per duplicate while `RuntimeBundle` has a
+    // single `boxedObject` slot. The union's own lanes need no second bundle
+    // -- `collectTypedResourceGroups` already walks them and already stamps
+    // each with its `OwnershipCondition{tag, memberIndex}`, so the whole
+    // conditional machinery is reached by declaring the offsets.
+    //
+    // ⛔ AND ONE OWNING MEMBER IS NOT A DIFFERENT CASE. It used to be: with
+    // one, this was skipped and the static-object summary below appended a
+    // second copy of that member and marked THAT owned -- unconditionally,
+    // because the summary has no tag. `T | None` has exactly one owning
+    // member, so EVERY optional took that path: `pick() -> "Node | None"`
+    // came out as three lanes with the owned one at offset 2, which is the
+    // duplicate rather than the union's own, and the tag never reached the
+    // resource. That is why an optional carried across a loop's back edge
+    // reported "owned resource ... without release" where a two-member union
+    // reported "conditionally owned ... without tag-conditioned release":
+    // one obligation was being tracked as if it could not be absent.
+    if (auto unionResult =
+            mlir::dyn_cast_if_present<py::UnionType>(resultType)) {
+      llvm::SmallVector<std::pair<std::int64_t, std::string>, 2> memberLanes;
+      std::int64_t memberOffset =
+          static_cast<std::int64_t>(resultTypes.size()) + 1;
+      bool laid = true;
+      for (mlir::Type member : unionResult.getMemberTypes()) {
+        mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> memberTypes =
+            RuntimeBundleLowerer::runtimeValueTypesFor(
+                function, member, "union result member lane");
+        if (mlir::failed(memberTypes)) {
+          laid = false;
+          break;
+        }
+        // ⭐ A LANE IS OWNED ONLY IF IT IS A POINTER. `memberOwnsALane`
+        // asks the manifest whether the contract has a deallocator, and
+        // `builtins.bool` registers one -- but a bool member lowers to a
+        // bare i1, so the offset named an integer word and the ownership
+        // verifier refused the function it was put on:
+        //
+        //     def g(flag: bool):
+        //         return 1 if flag else False
+        //     # ly.ownership.owned_results result 1 must start an
+        //     # object-header-like result group
+        //
+        // ⛔ Not by naming bool: the condition the verifier enforces is
+        // about the PHYSICAL lane, so asking the lane directly also covers
+        // every future member whose contract has a deallocator it never
+        // reaches through a pointer.
+        if (memberOwnsALane(member) && !memberTypes->empty() &&
+            ownership::isObjectHeaderLikeType(memberTypes->front()))
+          memberLanes.emplace_back(memberOffset, runtimeContractName(member));
+        memberOffset += static_cast<std::int64_t>(memberTypes->size());
+      }
+      if (laid && !memberLanes.empty()) {
+        for (const auto &[offset, contract] : memberLanes) {
+          ownedResultOffsets.push_back(offset);
+          ownedResultContracts.push_back(builder.getStringAttr(contract));
+        }
+      }
+    }
+    if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+            function, resultType, resultTypes))) {
+      return mlir::failure();
+    }
+    RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
+                                                          resultTypes);
+    if (returnedStaticObject != returnedStaticObjectSummaries.end() &&
+        returnedStaticObject->second.resultIndex == logicalResultIndex) {
+      mlir::Type objectContract =
+          returnedStaticObject->second.objectContract;
+      std::string objectContractName = runtimeContractName(objectContract);
+      if (objectContractName.empty()) {
+        return function.emitError()
+                 << "static returned object evidence has no runtime "
+                    "contract: "
+                 << objectContract;
+      }
+      ownedResultOffsets.push_back(
+          static_cast<std::int64_t>(resultTypes.size()));
+      ownedResultContracts.push_back(
+          builder.getStringAttr(objectContractName));
+      if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+              function, objectContract, resultTypes))) {
+        return mlir::failure();
+      }
+      RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(objectContract,
                                                             resultTypes);
-      if (returnedStaticObject != returnedStaticObjectSummaries.end() &&
-          returnedStaticObject->second.resultIndex == logicalResultIndex) {
-        mlir::Type objectContract =
-            returnedStaticObject->second.objectContract;
-        std::string objectContractName = runtimeContractName(objectContract);
-        if (objectContractName.empty()) {
-          result = function.emitError()
-                   << "static returned object evidence has no runtime "
-                      "contract: "
-                   << objectContract;
-          return mlir::WalkResult::interrupt();
-        }
-        ownedResultOffsets.push_back(
-            static_cast<std::int64_t>(resultTypes.size()));
+    }
+  }
+  // Returned-closure LOCAL captures ride out as trailing owned result
+  // lanes (the nonlocal cell escaping with its closure). Their layout is
+  // fixed per function, which the summary pass guarantees by requiring a
+  // single alternative for lane captures.
+  if (auto returnedCallable =
+          returnedCallableSummaries.find(function.getSymName());
+      returnedCallable != returnedCallableSummaries.end() &&
+      returnedCallable->second.alternatives.size() == 1 &&
+      returnedCallable->second.alternatives.front().hasLaneCaptures()) {
+    for (const ReturnedCallableCapture &capture :
+         returnedCallable->second.alternatives.front().captures) {
+      if (!capture.laneContract)
+        continue;
+      std::string laneContractName =
+          runtimeContractName(capture.laneContract);
+      if (laneContractName.empty()) {
+        function.emitError() << "returned closure capture lane has no "
+                                "runtime contract";
+        return mlir::failure();
+      }
+      std::size_t laneBegin = resultTypes.size();
+      if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
+              function, capture.laneContract, resultTypes))) {
+        return mlir::failure();
+      }
+      // ⭐ A LANE WITH NO RESULTS OWNS NOTHING AND HAS NO OFFSET. The offset
+      // was recorded before the types were known, so a capture that expands
+      // to nothing named a result index past the end: returning a closure
+      // over a local bound to `None` was refused with
+      // "ly.ownership.owned_results index 1 is out of range [0, 1)".
+      // Capturing the same `None` without returning the closure works, and
+      // so does returning one over an int or a str.
+      if (resultTypes.size() > laneBegin) {
+        ownedResultOffsets.push_back(static_cast<std::int64_t>(laneBegin));
         ownedResultContracts.push_back(
-            builder.getStringAttr(objectContractName));
-        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                function, objectContract, resultTypes))) {
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(objectContract,
-                                                              resultTypes);
+            builder.getStringAttr(laneContractName));
       }
     }
-    // Returned-closure LOCAL captures ride out as trailing owned result
-    // lanes (the nonlocal cell escaping with its closure). Their layout is
-    // fixed per function, which the summary pass guarantees by requiring a
-    // single alternative for lane captures.
-    if (auto returnedCallable =
-            returnedCallableSummaries.find(function.getSymName());
-        returnedCallable != returnedCallableSummaries.end() &&
-        returnedCallable->second.alternatives.size() == 1 &&
-        returnedCallable->second.alternatives.front().hasLaneCaptures()) {
-      for (const ReturnedCallableCapture &capture :
-           returnedCallable->second.alternatives.front().captures) {
-        if (!capture.laneContract)
-          continue;
-        std::string laneContractName =
-            runtimeContractName(capture.laneContract);
-        if (laneContractName.empty()) {
-          function.emitError() << "returned closure capture lane has no "
-                                  "runtime contract";
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        std::size_t laneBegin = resultTypes.size();
-        if (mlir::failed(RuntimeBundleLowerer::appendRuntimeValueTypes(
-                function, capture.laneContract, resultTypes))) {
-          result = mlir::failure();
-          return mlir::WalkResult::interrupt();
-        }
-        // ⭐ A LANE WITH NO RESULTS OWNS NOTHING AND HAS NO OFFSET. The offset
-        // was recorded before the types were known, so a capture that expands
-        // to nothing named a result index past the end: returning a closure
-        // over a local bound to `None` was refused with
-        // "ly.ownership.owned_results index 1 is out of range [0, 1)".
-        // Capturing the same `None` without returning the closure works, and
-        // so does returning one over an int or a str.
-        if (resultTypes.size() > laneBegin) {
-          ownedResultOffsets.push_back(static_cast<std::int64_t>(laneBegin));
-          ownedResultContracts.push_back(
-              builder.getStringAttr(laneContractName));
-        }
-      }
+  }
+  if (!function.isDeclaration()) {
+    if (mlir::failed(seedCallableEntryArgumentBundles(
+            function, logicalInputTypes, abiInputTypes, aggregateEvidence))) {
+      return mlir::failure();
     }
-    if (!function.isDeclaration()) {
-      if (mlir::failed(seedCallableEntryArgumentBundles(
-              function, logicalInputTypes, abiInputTypes, aggregateEvidence))) {
-        result = mlir::failure();
-        return mlir::WalkResult::interrupt();
-      }
-    }
-    function.setFunctionType(
-        mlir::FunctionType::get(context, inputTypes, resultTypes));
-    if (!ownedResultOffsets.empty())
-      function->setAttr(
-          ownership::kOwnedResultsAttr,
-          mlir::DenseI64ArrayAttr::get(context, ownedResultOffsets));
-    if (!ownedResultContracts.empty())
-      function->setAttr(ownership::kOwnedResultContractsAttr,
-                        builder.getArrayAttr(ownedResultContracts));
-    return mlir::WalkResult::advance();
-  });
-  return result;
+  }
+  function.setFunctionType(
+      mlir::FunctionType::get(context, inputTypes, resultTypes));
+  if (!ownedResultOffsets.empty())
+    function->setAttr(
+        ownership::kOwnedResultsAttr,
+        mlir::DenseI64ArrayAttr::get(context, ownedResultOffsets));
+  if (!ownedResultContracts.empty())
+    function->setAttr(ownership::kOwnedResultContractsAttr,
+                      builder.getArrayAttr(ownedResultContracts));
+  return mlir::success();
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::seedCallableEntryArgumentBundles(

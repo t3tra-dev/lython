@@ -1,0 +1,9 @@
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*an_indirect_call_keeps_its_frames_through_a_dispatcher\.py",\ line\ 89,\ in\ <module>\
+\ \ \ \ print\(apply\(picky,\ \-5\)\)\
+\ \ \ \ \ \ \ \ \ \ \~\~\~\~\~\^\^\^\^\^\^\^\^\^\^\^\
+\ \ File\ ".*an_indirect_call_keeps_its_frames_through_a_dispatcher\.py",\ line\ 45,\ in\ apply\
+\ \ \ \ return\ f\(x\)\
+\ \ File\ ".*an_indirect_call_keeps_its_frames_through_a_dispatcher\.py",\ line\ 30,\ in\ picky\
+\ \ \ \ raise\ ValueError\("negative:\ "\ \+\ str\(x\)\)\
+ValueError:\ negative:\ \-5

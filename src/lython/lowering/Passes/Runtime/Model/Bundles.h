@@ -269,6 +269,9 @@ inline constexpr llvm::StringLiteral kPrimitiveI64CloneAttr{
 // foldUnprovenPrimitiveI64Speculations.
 inline constexpr llvm::StringLiteral kPrimitiveI64SpeculationAttr{
     "ly.primitive_i64_speculation"};
+// Marks a dispatcher indirectCallDispatcher made.
+inline constexpr llvm::StringLiteral kIndirectCallDispatcherAttr{
+    "ly.indirect_call_dispatcher"};
 inline constexpr llvm::StringLiteral kProtocolTemplateAttr{
     "ly.protocol_template"};
 inline constexpr llvm::StringLiteral kProtocolSpecializationAttr{

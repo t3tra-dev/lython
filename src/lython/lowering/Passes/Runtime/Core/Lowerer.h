@@ -322,6 +322,11 @@ private:
   mlir::LogicalResult buildCallableAggregateEvidenceABIs();
   mlir::LogicalResult buildPrimitiveI64CallableClones();
   mlir::LogicalResult prepareCallableFunctionABIs();
+  mlir::LogicalResult
+  prepareCallableFunctionABI(mlir::func::FuncOp function,
+                             py::CallableType callable,
+                             llvm::ArrayRef<mlir::Type> logicalInputTypes,
+                             llvm::function_ref<bool(mlir::Type)> memberOwnsALane);
   bool isCallableProtocolTemplate(mlir::func::FuncOp function) const;
   std::optional<std::string> callableProtocolSpecializationFor(
       llvm::StringRef target,
@@ -1616,6 +1621,12 @@ private:
       RuntimeBundle &result);
   mlir::LogicalResult
   lowerIndirectFunctionObjectCall(py::CallOp op, const RuntimeBundle &callable);
+  // The shared dispatcher an indirect call goes through, made on first use;
+  // a null function when the call is not one a dispatcher can serve.
+  mlir::FailureOr<mlir::func::FuncOp>
+  indirectCallDispatcher(py::CallOp op, const RuntimeBundle &callable,
+                         llvm::ArrayRef<mlir::func::FuncOp> targets);
+  bool isIndirectCallDispatcher(mlir::func::FuncOp function) const;
   llvm::SmallVector<mlir::func::FuncOp, 8>
   collectIndirectCallableTargets(py::CallOp op, const RuntimeBundle &callable);
   // The captures a runtime function VALUE carries, read back off its object.
@@ -1901,6 +1912,8 @@ private:
   // The module's class ops by name, for classForContract; built on the first
   // question.
   mutable std::optional<llvm::StringMap<py::ClassOp>> classesByName;
+  // indirectCallDispatcher's functions, by the shape of the call they serve.
+  llvm::StringMap<mlir::func::FuncOp> indirectCallDispatchers;
   // collectIndirectCallableTargets' assignability answers, by (candidate's
   // callable type, the call's expected one).
   llvm::DenseMap<std::pair<mlir::Type, mlir::Type>, bool> callableAssignable;

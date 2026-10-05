@@ -1,8 +1,13 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Common/RuntimeSupport.h"
 #include "Runtime/ABI/BoxLayout.h"
 
+#include "mlir/IR/IRMapping.h"
+
 #include <cstddef>
+#include <cstdlib>
+#include <string>
 
 namespace py::lowering {
 namespace {
@@ -34,6 +39,9 @@ RuntimeBundleLowerer::collectIndirectCallableTargets(
     if (function.isDeclaration() || !function->hasAttr("callable_type"))
       return;
     if (RuntimeBundleLowerer::isCallableProtocolTemplate(function))
+      return;
+    // Nor is a dispatcher: nothing makes a function object of one.
+    if (RuntimeBundleLowerer::isIndirectCallDispatcher(function))
       return;
     // ⭐ A primitive-i64 clone is not a callable VALUE. It is an internal
     // specialization that takes its int arguments unboxed and returns its int
@@ -308,6 +316,152 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
   return values;
 }
 
+bool RuntimeBundleLowerer::isIndirectCallDispatcher(
+    mlir::func::FuncOp function) const {
+  return function && function->hasAttr(kIndirectCallDispatcherAttr);
+}
+
+// An indirect call whose target only the function object knows dispatches
+// over every function of a matching type in the program. Written out at the
+// call site, that is a test and an argument-adapting arm per candidate, at
+// every such call: a program with C of these calls and F candidates carried
+// C x F arms, every one of them lowered, verified and compiled, and the call
+// compared target ids one candidate at a time.
+//
+// So a call that needs no more than its argument types to dispatch goes
+// through a dispatcher instead: a function per call shape (callable type,
+// argument types, result type), taking the function object and the
+// arguments, whose body is that same call -- written out once, as a switch on
+// the target id -- and whose ABI is a Python function's, owned result and
+// unboxed int lanes included. Its body lowers by the same code, from a call
+// with nothing known about the callable, which is what this call had.
+//
+// ⛔ Not for a call that knows more: one with closure evidence or a named
+// target, a candidate that takes argument or aggregate evidence the call
+// site supplies, or keyword arguments -- the dispatcher's parameters carry
+// types and nothing else. Those keep their arms where they are.
+// ⛔ Not under kMinimumDispatcherTargets candidates. A few arms grow neither
+// the program nor its compile, and the extra call is not free: at four
+// candidates the dispatcher ran 1.5% slower than the arms, at 128 3.5% faster.
+// ⛔ Not from a generator's body or resume clone, or a primitive-i64 clone:
+// the state machine and the clone re-read those bodies, and no case has shown
+// that a call to a function made mid-lowering survives that. They keep the
+// arms, which do.
+mlir::FailureOr<mlir::func::FuncOp> RuntimeBundleLowerer::indirectCallDispatcher(
+    py::CallOp op, const RuntimeBundle &callable,
+    llvm::ArrayRef<mlir::func::FuncOp> targets) {
+  constexpr std::size_t kMinimumDispatcherTargets = 4;
+  // LYTHON_ABLATE_INDIRECT_DISPATCHERS=1 writes every dispatch out at its
+  // call again, for comparing the two with one binary.
+  static const bool ablated =
+      std::getenv("LYTHON_ABLATE_INDIRECT_DISPATCHERS") != nullptr;
+  if (ablated || targets.size() < kMinimumDispatcherTargets ||
+      !callable.functionTarget.empty() ||
+      !callable.callableAlternatives.empty() ||
+      !callable.closureValues.empty() || op.getNumResults() != 1)
+    return mlir::func::FuncOp();
+  auto enclosing = op->getParentOfType<mlir::func::FuncOp>();
+  if (!enclosing || RuntimeBundleLowerer::isIndirectCallDispatcher(enclosing) ||
+      RuntimeBundleLowerer::isPrimitiveI64CallableClone(enclosing) ||
+      enclosing->hasAttr("ly.generator.resume") ||
+      enclosing->hasAttr("ly.generator.body_result") ||
+      RuntimeBundleLowerer::isCallableProtocolTemplate(enclosing))
+    return mlir::func::FuncOp();
+  auto posargs = op.getPosargs().getDefiningOp<py::PackOp>();
+  auto kwnames = op.getKwnames().getDefiningOp<py::PackOp>();
+  auto kwvalues = op.getKwvalues().getDefiningOp<py::PackOp>();
+  if (!posargs || !kwnames || !kwvalues || !kwnames.getValues().empty() ||
+      !kwvalues.getValues().empty())
+    return mlir::func::FuncOp();
+  for (mlir::func::FuncOp target : targets)
+    if (callableArgumentEvidenceABIs.count(target.getSymName()) ||
+        callableAggregateEvidenceABIs.count(target.getSymName()))
+      return mlir::func::FuncOp();
+
+  llvm::SmallVector<mlir::Type, 8> inputs{op.getCallable().getType()};
+  for (mlir::Value argument : posargs.getValues())
+    inputs.push_back(argument.getType());
+  mlir::Type resultType = op.getResult(0).getType();
+  std::string key;
+  {
+    llvm::raw_string_ostream stream(key);
+    stream << op.getCallContract();
+    for (mlir::Type input : inputs)
+      stream << "|" << input;
+    stream << "->" << resultType;
+  }
+  if (auto found = indirectCallDispatchers.find(key);
+      found != indirectCallDispatchers.end())
+    return found->second;
+
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  // The call's own location: it makes the dispatcher a function of the
+  // program, whose calls unwind through cleanups like any other's. Its frame
+  // is the one thing it does not add (EH.cpp, emitTracebackFrame).
+  mlir::Location loc = op.getLoc();
+  builder.setInsertionPointToEnd(module.getBody());
+  std::string name = (kIndirectCallDispatcherPrefix +
+                      llvm::Twine(indirectCallDispatchers.size()))
+                         .str();
+  auto dispatcher = mlir::func::FuncOp::create(
+      builder, loc, name, builder.getFunctionType(inputs, {resultType}));
+  dispatcher.setPrivate();
+  llvm::SmallVector<mlir::StringAttr, 8> names;
+  llvm::SmallVector<mlir::BoolAttr, 8> defaults;
+  llvm::SmallVector<mlir::Attribute, 8> defaultValues;
+  for (unsigned index = 0; index < inputs.size(); ++index) {
+    names.push_back(builder.getStringAttr("a" + std::to_string(index)));
+    defaults.push_back(builder.getBoolAttr(false));
+    defaultValues.push_back(builder.getUnitAttr());
+  }
+  py::CallableType callableType = py::CallableType::get(
+      context, inputs, {}, mlir::Type(), mlir::Type(), {resultType}, names, {},
+      defaults, {});
+  dispatcher->setAttr("callable_type", mlir::TypeAttr::get(callableType));
+  dispatcher->setAttr("callable_default_values",
+                      builder.getArrayAttr(defaultValues));
+  dispatcher->setAttr(kIndirectCallDispatcherAttr, builder.getUnitAttr());
+  indirectCallDispatchers[key] = dispatcher;
+
+  mlir::Block *entry = dispatcher.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+  mlir::IRMapping mapping;
+  mapping.map(op.getCallable(), entry->getArgument(0));
+  for (auto [index, argument] : llvm::enumerate(posargs.getValues()))
+    mapping.map(argument, entry->getArgument(index + 1));
+  llvm::SmallVector<mlir::Operation *, 4> body;
+  body.push_back(builder.clone(*posargs.getOperation(), mapping));
+  body.push_back(builder.clone(*kwnames.getOperation(), mapping));
+  body.push_back(builder.clone(*kwvalues.getOperation(), mapping));
+  body.push_back(builder.clone(*op.getOperation(), mapping));
+  mlir::func::ReturnOp::create(builder, loc, body.back()->getResult(0));
+
+  llvm::ArrayRef<ownership::RuntimeDeallocator> deallocators =
+      *settledDeallocators;
+  auto memberOwnsALane = [&](mlir::Type member) {
+    if (py::isPyNoneType(member))
+      return false;
+    std::string contract = runtimeContractName(member);
+    return !contract.empty() &&
+           llvm::any_of(deallocators,
+                        [&](const ownership::RuntimeDeallocator &candidate) {
+                          return candidate.contractName == contract;
+                        });
+  };
+  if (mlir::failed(RuntimeBundleLowerer::prepareCallableFunctionABI(
+          dispatcher, callableType,
+          RuntimeBundleLowerer::callableLogicalInputTypes(dispatcher,
+                                                          callableType),
+          memberOwnsALane)))
+    return mlir::failure();
+  for (mlir::Operation *inner : body) {
+    if (mlir::failed(ensureOperationOperandBundles(inner)) ||
+        mlir::failed(lowerPyOp(inner)))
+      return mlir::failure();
+  }
+  return dispatcher;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     py::CallOp op, const RuntimeBundle &callableRef) {
   // ⛔ A COPY, because the dispatch below WRITES `valueBundles` -- once per
@@ -398,6 +552,36 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
     valueBundles[op.getResult(0)] = std::move(result);
     // See lowerFunctionTargetCall: the callee may mutate borrowed container
     // arguments in place.
+    demoteMutableContainerArgumentEvidence(op);
+    erase.push_back(op);
+    return mlir::success();
+  }
+
+  mlir::FailureOr<mlir::func::FuncOp> dispatcher =
+      RuntimeBundleLowerer::indirectCallDispatcher(op, callable, targets);
+  if (mlir::failed(dispatcher))
+    return mlir::failure();
+  if (*dispatcher) {
+    builder.setInsertionPoint(op);
+    llvm::StringRef dispatcherName = dispatcher->getSymName();
+    llvm::SmallVector<const RuntimeBundle *, 8> sources{&callable};
+    for (mlir::Value argument :
+         op.getPosargs().getDefiningOp<py::PackOp>().getValues()) {
+      auto bundle = valueBundles.find(argument);
+      if (bundle == valueBundles.end())
+        return op.emitError() << "indirect call argument has no runtime value";
+      sources.push_back(&bundle->second);
+    }
+    mlir::FailureOr<mlir::func::CallOp> call =
+        RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
+            op, *dispatcher, dispatcherName, sources);
+    if (mlir::failed(call))
+      return mlir::failure();
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::bundleFunctionTargetCallResult(
+            op, *dispatcher, dispatcherName, *call, sources, result)))
+      return mlir::failure();
+    valueBundles[op.getResult(0)] = std::move(result);
     demoteMutableContainerArgumentEvidence(op);
     erase.push_back(op);
     return mlir::success();
@@ -623,9 +807,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIndirectFunctionObjectCall(
   }
   mlir::cf::BranchOp::create(builder, op.getLoc(), continuation, deadValues);
 
+  auto enclosingFunction = op->getParentOfType<mlir::func::FuncOp>();
   if (targets.empty()) {
     builder.setInsertionPointToEnd(entry);
     mlir::cf::BranchOp::create(builder, op.getLoc(), defaultBlock);
+  } else if (RuntimeBundleLowerer::isIndirectCallDispatcher(enclosingFunction)) {
+    // A dispatcher's arms are many by construction: one switch on the id,
+    // which the target ids -- dense, numbered as functions are first named --
+    // let LLVM turn into a table.
+    // ⛔ Not the chain below: a call would compare ids one candidate at a time.
+    builder.setInsertionPointToEnd(entry);
+    llvm::SmallVector<llvm::APInt, 8> caseValues;
+    llvm::SmallVector<mlir::ValueRange, 8> caseOperands(targets.size(),
+                                                         mlir::ValueRange{});
+    for (mlir::func::FuncOp target : targets)
+      caseValues.push_back(llvm::APInt(
+          64, static_cast<std::uint64_t>(RuntimeBundleLowerer::functionTargetId(
+                  target.getSymName())),
+          /*isSigned=*/true));
+    mlir::cf::SwitchOp::create(builder, op.getLoc(), targetId, defaultBlock,
+                               mlir::ValueRange{}, caseValues, targetBlocks,
+                               caseOperands);
+    for (mlir::Block *unused : testBlocks)
+      unused->erase();
   } else {
     mlir::Block *testBlock = entry;
     for (auto [index, target] : llvm::enumerate(targets)) {
