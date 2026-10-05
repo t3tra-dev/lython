@@ -20877,7 +20877,9 @@ module attributes {
     //   [capacity*W, 2*capacity*W)       values
     //   [2*capacity*W, +capacity)        present flags
     //   [.., +capacity)                  key hashes, 0 = not computed yet
-    //   [.., +4*capacity + 1)            index table, word 0 = built-for length
+    //   [.., +2*capacity + 1)            index table, word 0 = built-for length;
+    //                                    one state word per slot (the entry's
+    //                                    hash is in the hashes array)
     //
     // ⛔ The hashes are not in the key's box: a box is the value's handle,
     // the same in a list as in a dict, and a list never reads a hash. CPython
@@ -20889,7 +20891,7 @@ module attributes {
     %pair_words = arith.muli %payload_words, %two : i64
     %flag_words = arith.muli %capacity, %two : i64
     %through_present = arith.addi %pair_words, %flag_words : i64
-    %table_words = arith.muli %capacity, %four : i64
+    %table_words = arith.muli %capacity, %two : i64
     %table_alloc_i64 = arith.addi %table_words, %one : i64
     %block_words = arith.addi %through_present, %table_alloc_i64 : i64
     %block_words_index = arith.index_cast %block_words : i64 to index
@@ -21277,7 +21279,8 @@ module attributes {
     %four = arith.constant 4 : i64
     %eight = arith.constant 8 : i64
     %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
-    %words = arith.muli %capacity, %four : i64
+    %two = arith.constant 2 : i64
+    %words = arith.muli %capacity, %two : i64
     %base = memref.load %self[%table_slot] : memref<8xi64>
     %slots = arith.addi %base, %eight : i64
     %view = func.call @__ly_global_view_i64(%slots, %words) : (i64, i64) -> memref<?xi64>
@@ -21343,14 +21346,10 @@ module attributes {
         } else {
           scf.yield %cached : i64
         }
-        %slot = func.call @__ly_set_table_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
-        %state_off = arith.muli %slot, %two : i64
-        %state_index = arith.index_cast %state_off : i64 to index
+        %slot = func.call @__ly_dict_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
+        %state_index = arith.index_cast %slot : i64 to index
         %state = arith.addi %ii, %two : i64
         memref.store %state, %table[%state_index] : memref<?xi64>
-        %entry_hash_off = arith.addi %state_off, %one : i64
-        %entry_hash_index = arith.index_cast %entry_hash_off : i64 to index
-        memref.store %hash, %table[%entry_hash_index] : memref<?xi64>
       }
     }
     %stamp = func.call @__ly_dict_table_stamp(%self) : (memref<8xi64>) -> memref<?xi64>
@@ -21428,8 +21427,7 @@ module attributes {
     %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
     %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
     %slots = arith.addi %mask, %one : i64
-    %words = arith.muli %slots, %two : i64
-    %words_index = arith.index_cast %words : i64 to index
+    %words_index = arith.index_cast %slots : i64 to index
     scf.for %w = %c0 to %words_index step %c1 {
       memref.store %zero, %table[%w] : memref<?xi64>
     }
@@ -21836,7 +21834,8 @@ module attributes {
       %new_pair_words = arith.muli %new_words, %two : i64
       %new_flag_words = arith.muli %new_capacity, %two : i64
       %new_through_present = arith.addi %new_pair_words, %new_flag_words : i64
-      %new_table_words_g = arith.muli %new_capacity, %four_g : i64
+      %two_t = arith.constant 2 : i64
+      %new_table_words_g = arith.muli %new_capacity, %two_t : i64
       %new_table_alloc_g = arith.addi %new_table_words_g, %one_g : i64
       %new_block_words = arith.addi %new_through_present, %new_table_alloc_g : i64
       %new_block_words_index = arith.index_cast %new_block_words : i64 to index
@@ -21909,7 +21908,8 @@ module attributes {
     %keys_ptr = llvm.inttoptr %keys_i64 : i64 to !llvm.ptr
     %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
     %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
-    %found = func.call @__ly_table_lookup(%table, %mask, %keys_ptr, %key_box, %key_hash) : (memref<?xi64>, i64, !llvm.ptr, !llvm.ptr, i64) -> i64
+    %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
+    %found = func.call @__ly_dict_lookup(%table, %mask, %keys_ptr, %hashes, %key_box, %key_hash) : (memref<?xi64>, i64, !llvm.ptr, memref<?xi64>, !llvm.ptr, i64) -> i64
     func.return %found : i64
   }
 
@@ -22136,14 +22136,10 @@ module attributes {
       %two_i64 = arith.constant 2 : i64
       %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
       %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
-      %tslot = func.call @__ly_set_table_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
-      %state_off = arith.muli %tslot, %two_i64 : i64
-      %state_index = arith.index_cast %state_off : i64 to index
+      %tslot = func.call @__ly_dict_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
+      %state_index = arith.index_cast %tslot : i64 to index
       %state = arith.addi %len, %two_i64 : i64
       memref.store %state, %table[%state_index] : memref<?xi64>
-      %entry_hash_off = arith.addi %state_off, %one : i64
-      %entry_hash_index = arith.index_cast %entry_hash_off : i64 to index
-      memref.store %hash, %table[%entry_hash_index] : memref<?xi64>
       %stamp = func.call @__ly_dict_table_stamp(%self) : (memref<8xi64>) -> memref<?xi64>
       memref.store %required, %stamp[%c0] : memref<?xi64>
     } else {
@@ -23190,6 +23186,132 @@ module attributes {
     func.return %found : i64
   }
 
+  // The dict's own table walk: one state word per slot (0 unused, 1 dummy,
+  // dense index + 2), the hash read from the dict's hashes array. The probe
+  // sequence is `__ly_table_lookup`'s, which the set keeps with the hash
+  // beside each state; ⛔ the dict does not, because its hashes array already
+  // holds them and a second copy was 16 bytes per slot of table.
+  func.func private @__ly_dict_lookup(%table: memref<?xi64>, %mask: i64, %items_ptr: !llvm.ptr, %hashes: memref<?xi64>, %elem_box: !llvm.ptr, %hash: i64) -> i64 {
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %probe_scale = arith.constant 5 : i64
+    %nine = arith.constant 9 : i64
+    %c16 = func.call @__ly_box_word_count() : () -> i64
+    %shift = arith.constant 5 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %i0 = arith.andi %hash, %mask : i64
+    %walk:4 = scf.while (%i = %i0, %p = %hash, %ans = %minus_one, %done = %false)
+        : (i64, i64, i64, i1) -> (i64, i64, i64, i1) {
+      %again = arith.xori %done, %true : i1
+      scf.condition(%again) %i, %p, %ans, %done : i64, i64, i64, i1
+    } do {
+    ^body(%i: i64, %p: i64, %ans: i64, %done: i1):
+      %limit = arith.addi %i, %nine : i64
+      %linear = arith.cmpi ule, %limit, %mask : i64
+      %probes = arith.select %linear, %nine, %zero : i1, i64
+      %count = arith.addi %probes, %one : i64
+      %count_index = arith.index_cast %count : i64 to index
+      %run:2 = scf.for %k = %c0 to %count_index step %c1
+          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
+        %step:2 = scf.if %d -> (i64, i1) {
+          scf.yield %a, %d : i64, i1
+        } else {
+          %kk = arith.index_cast %k : index to i64
+          %s = arith.addi %i, %kk : i64
+          %state_index = arith.index_cast %s : i64 to index
+          %state = memref.load %table[%state_index] : memref<?xi64>
+          %unused = arith.cmpi eq, %state, %zero : i64
+          %seen:2 = scf.if %unused -> (i64, i1) {
+            scf.yield %minus_one, %true : i64, i1
+          } else {
+            %live = arith.cmpi sge, %state, %two : i64
+            %hit:2 = scf.if %live -> (i64, i1) {
+              %dense_h = arith.subi %state, %two : i64
+              %hash_index = arith.index_cast %dense_h : i64 to index
+              %entry_hash = memref.load %hashes[%hash_index] : memref<?xi64>
+              %same_hash = arith.cmpi eq, %entry_hash, %hash : i64
+              %cmp:2 = scf.if %same_hash -> (i64, i1) {
+                %dense = arith.subi %state, %two : i64
+                %off = arith.muli %dense, %c16 : i64
+                %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+                %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
+                %found = arith.select %eq, %dense, %a : i1, i64
+                scf.yield %found, %eq : i64, i1
+              } else {
+                scf.yield %a, %false : i64, i1
+              }
+              scf.yield %cmp#0, %cmp#1 : i64, i1
+            } else {
+              scf.yield %a, %false : i64, i1
+            }
+            scf.yield %hit#0, %hit#1 : i64, i1
+          }
+          scf.yield %seen#0, %seen#1 : i64, i1
+        }
+        scf.yield %step#0, %step#1 : i64, i1
+      }
+      %np = arith.shrui %p, %shift : i64
+      %i5 = arith.muli %i, %probe_scale : i64
+      %i51 = arith.addi %i5, %one : i64
+      %i5p = arith.addi %i51, %np : i64
+      %ni = arith.andi %i5p, %mask : i64
+      scf.yield %ni, %np, %run#0, %run#1 : i64, i64, i64, i1
+    }
+    func.return %walk#2 : i64
+  }
+  func.func private @__ly_dict_clean_slot(%table: memref<?xi64>, %mask: i64, %hash: i64) -> i64 {
+    %minus_one = arith.constant -1 : i64
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %probe_scale = arith.constant 5 : i64
+    %nine = arith.constant 9 : i64
+    %shift = arith.constant 5 : i64
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %i0 = arith.andi %hash, %mask : i64
+    %walk:4 = scf.while (%i = %i0, %p = %hash, %ans = %minus_one, %done = %false)
+        : (i64, i64, i64, i1) -> (i64, i64, i64, i1) {
+      %again = arith.xori %done, %true : i1
+      scf.condition(%again) %i, %p, %ans, %done : i64, i64, i64, i1
+    } do {
+    ^body(%i: i64, %p: i64, %ans: i64, %done: i1):
+      %limit = arith.addi %i, %nine : i64
+      %linear = arith.cmpi ule, %limit, %mask : i64
+      %probes = arith.select %linear, %nine, %zero : i1, i64
+      %count = arith.addi %probes, %one : i64
+      %count_index = arith.index_cast %count : i64 to index
+      %run:2 = scf.for %k = %c0 to %count_index step %c1
+          iter_args(%a = %ans, %d = %done) -> (i64, i1) {
+        %step:2 = scf.if %d -> (i64, i1) {
+          scf.yield %a, %d : i64, i1
+        } else {
+          %kk = arith.index_cast %k : index to i64
+          %s = arith.addi %i, %kk : i64
+          %state_index = arith.index_cast %s : i64 to index
+          %state = memref.load %table[%state_index] : memref<?xi64>
+          %unused = arith.cmpi eq, %state, %zero : i64
+          %pick = arith.select %unused, %s, %a : i1, i64
+          scf.yield %pick, %unused : i64, i1
+        }
+        scf.yield %step#0, %step#1 : i64, i1
+      }
+      %np = arith.shrui %p, %shift : i64
+      %i5 = arith.muli %i, %probe_scale : i64
+      %i51 = arith.addi %i5, %one : i64
+      %i5p = arith.addi %i51, %np : i64
+      %ni = arith.andi %i5p, %mask : i64
+      scf.yield %ni, %np, %run#0, %run#1 : i64, i64, i64, i1
+    }
+    func.return %walk#2 : i64
+  }
   // set_lookkey over a table and an items array named directly, so the dict can
   // use it too: the two carry the table in different handle words and the dict
   // derives its mask instead of storing it, and neither difference reaches the
