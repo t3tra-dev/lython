@@ -1910,7 +1910,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     llvm::StringRef hookName,
     llvm::function_ref<bool(mlir::func::FuncOp)> selects,
     mlir::TypeRange calleeResultTypes, bool shareExceptionSubclasses,
-    llvm::StringRef sourceClassMethodName) {
+    llvm::StringRef sourceClassMethodName,
+    llvm::function_ref<bool(llvm::StringRef)> keepsContract) {
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName)) {
     // A definition already exists (idempotent); an external declaration (from a
     // merged manifest caller) is replaced by the generated body below.
@@ -1929,6 +1930,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::SmallDenseSet<std::int64_t, 16> seenIds;
+  // Classes keepsContract says no value of the program can have: no arm, and
+  // a trap rather than a miss if one turns up anyway (below).
+  llvm::SmallVector<std::int64_t, 16> prunedIds;
   // The callee's arguments are reconstructed uniformly from the box word
   // layout (slot words (4+i, 9+i) hold physical value i), so every selected
   // function must take only rank-1 memrefs and share the hook's callee result
@@ -1992,6 +1996,10 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     }
     if (!seenIds.insert(*classId).second)
       return;
+    if (keepsContract && !keepsContract(contractAttr.getValue())) {
+      prunedIds.push_back(*classId);
+      return;
+    }
     entries.push_back(
         HookEntry{*classId, function, contractAttr.getValue().str()});
   });
@@ -2184,6 +2192,38 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     }
     check = next;
   }
+  if (!prunedIds.empty()) {
+    // ⛔ A pruned class does not MISS. A miss is an answer -- its caller
+    // prints the default `<X object at 0x...>` -- and for a class that has a
+    // __repr__ it is the wrong one. Reaching here means the closure the
+    // pruning trusted was wrong: stop, saying so.
+    mlir::Block *trap = hook.addBlock();
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(trap);
+      mlir::Value never =
+          mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
+      mlir::cf::AssertOp::create(
+          builder, loc, never,
+          (hookName + ": a class judged unreachable by this program's types "
+                      "reached it")
+              .str());
+      mlir::cf::BranchOp::create(builder, loc, miss);
+    }
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(check);
+    llvm::SmallVector<llvm::APInt, 16> cases;
+    for (std::int64_t id : prunedIds)
+      cases.push_back(llvm::APInt(64, static_cast<std::uint64_t>(id),
+                                  /*isSigned=*/true));
+    llvm::SmallVector<mlir::Block *, 16> destinations(prunedIds.size(), trap);
+    llvm::SmallVector<mlir::ValueRange, 16> operands(prunedIds.size(),
+                                                     mlir::ValueRange{});
+    mlir::cf::SwitchOp::create(builder, loc, classValue, miss,
+                               mlir::ValueRange{}, cases, destinations,
+                               operands);
+    return mlir::success();
+  }
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(check);
@@ -2253,6 +2293,187 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
                                        calleeResultTypes, methodName);
 }
 
+// ⭐ WHAT A BOX IN THIS PROGRAM CAN HOLD, ASKED OF ITS TYPES. The repr and str
+// hooks dispatch on a box's class id, and written for every class the
+// manifest knows they carry float's shortest-digit printer, range's, dict's,
+// complex's and every exception's into a program that prints a list[str] --
+// half of a small wasm module. A value of class K exists only where the
+// program holds a value whose type admits K: K itself, or a class K derives
+// from. Every value the program holds has a py type in the module before the
+// lowering erases them, including what the runtime hands back (its result
+// contract) and what a container holds (its type arguments).
+//
+// The types read are the ones values are MADE with: every op's results.
+// ⛔ Not a callable's parameters, a block's arguments or an op's attributes:
+// those say what a value is received as -- `print` takes a tuple of object --
+// and the value received was made by some op, which is read. Reading them
+// opened every program that calls print.
+// ⛔ Not a `py.pack`'s type arguments: what it holds is its operands, made
+// and read elsewhere, and the pack with nothing in it -- the keyword names of
+// every call without keywords -- is typed tuple[object].
+//
+// ⛔ Open -- every class kept -- at the first type that admits classes it
+// does not name: object, a type variable, an in-flight exception.
+// A protocol names its classes by the conformance rule the emitter admitted
+// them by (reprMayReachContract). An exception names itself and what the
+// runtime puts in the args of one it raises -- str, int, bytes, None; what a
+// program puts there is an op's result and read like any other.
+// A callable value is a function object; what it returns is made by the call,
+// whose result is read.
+// ⛔ Read from the types, not from the calls that reach the hook: the
+// container reprs that call it are runtime functions, which receive memrefs
+// and say nothing about what their elements are.
+void RuntimeBundleLowerer::collectReprReachableContracts() {
+  // LYTHON_ABLATE_REPR_CLOSURE=1 keeps every arm, for comparing the two with
+  // one binary.
+  if (std::getenv("LYTHON_ABLATE_REPR_CLOSURE")) {
+    reprReachableContracts.reset();
+    reprClosureOpenReason = "ablated";
+    return;
+  }
+  llvm::StringSet<> contracts;
+  std::string open;
+  llvm::DenseSet<mlir::Type> seen;
+  const py::protocols::Table &table = py::protocols::Table::get(*context);
+  auto describe = [](mlir::Type type) {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    stream << type;
+    return text;
+  };
+  std::function<void(mlir::Type)> visit = [&](mlir::Type type) {
+    if (!open.empty() || !type || !seen.insert(type).second)
+      return;
+    if (type.getDialect().getNamespace() != "py")
+      return;
+    auto opens = [&](llvm::StringRef why) {
+      open = (why + ": " + describe(type)).str();
+    };
+    if (py::isPyNoneType(type)) {
+      contracts.insert("types.NoneType");
+      return;
+    }
+    if (auto contract = mlir::dyn_cast<py::ContractType>(type)) {
+      llvm::StringRef name = contract.getContractName();
+      if (name == "builtins.object" || name == "typing.Any")
+        return opens("admits every class");
+      py::ClassOp classOp = RuntimeBundleLowerer::classForContract(type);
+      if (name == "builtins.BaseException" ||
+          table.isManifestSubclassOf(type, "builtins.BaseException") ||
+          (classOp && RuntimeBundleLowerer::exceptionAncestorContract(classOp)))
+        for (llvm::StringRef argument :
+             {"builtins.str", "builtins.int", "builtins.bytes",
+              "types.NoneType"})
+          contracts.insert(argument);
+      contracts.insert(name);
+      for (mlir::Type argument : contract.getArguments())
+        visit(argument);
+      return;
+    }
+    if (auto unionType = mlir::dyn_cast<py::UnionType>(type)) {
+      for (mlir::Type member : unionType.getMemberTypes())
+        visit(member);
+      return;
+    }
+    if (mlir::isa<py::CallableType, py::OverloadType>(type)) {
+      contracts.insert("builtins.function");
+      return;
+    }
+    if (auto protocol = mlir::dyn_cast<py::ProtocolType>(type)) {
+      if (protocol.getProtocolName() == "Callable") {
+        contracts.insert("builtins.function");
+        return;
+      }
+      reprReachableProtocols.push_back(protocol);
+      for (mlir::Type argument : protocol.getArguments())
+        visit(argument);
+      return;
+    }
+    if (mlir::isa<py::LiteralType>(type)) {
+      std::string name = runtimeContractName(type);
+      if (name.empty())
+        return opens("a literal of no known class");
+      contracts.insert(name);
+      return;
+    }
+    if (auto typeType = mlir::dyn_cast<py::TypeType>(type)) {
+      contracts.insert("builtins.type");
+      visit(typeType.getInstanceType());
+      return;
+    }
+    if (auto unpack = mlir::dyn_cast<py::UnpackType>(type)) {
+      visit(unpack.getPackedType());
+      return;
+    }
+    // Bookkeeping the lowering threads through a function, never a value a
+    // program can store.
+    if (mlir::isa<py::ExceptionCellType, py::TracebackType, py::LocationType,
+                  py::ExceptStarFrameType>(type))
+      return;
+    opens("admits classes it does not name");
+  };
+  mlir::Operation *where = nullptr;
+  module.walk([&](mlir::Operation *op) {
+    if (!open.empty())
+      return mlir::WalkResult::interrupt();
+    where = op;
+    if (auto pack = mlir::dyn_cast<py::PackOp>(op)) {
+      std::string name = runtimeContractName(pack.getResult().getType());
+      if (name.empty())
+        visit(pack.getResult().getType());
+      else
+        contracts.insert(name);
+      return mlir::WalkResult::advance();
+    }
+    for (mlir::Type type : op->getResultTypes())
+      visit(type);
+    return mlir::WalkResult::advance();
+  });
+  if (!open.empty()) {
+    reprClosureOpenReason = open;
+    if (where) {
+      std::string place;
+      llvm::raw_string_ostream stream(place);
+      stream << " (" << where->getName().getStringRef();
+      if (auto function = where->getParentOfType<mlir::func::FuncOp>())
+        stream << " in " << function.getSymName();
+      stream << " at " << where->getLoc() << ")";
+      reprClosureOpenReason += place;
+    }
+    reprReachableContracts.reset();
+  } else {
+    reprReachableContracts = std::move(contracts);
+  }
+  if (std::getenv("LYTHON_TRACE_REPR_CLOSURE")) {
+    if (reprReachableContracts) {
+      llvm::errs() << "repr closure:";
+      for (const auto &entry : *reprReachableContracts)
+        llvm::errs() << " " << entry.getKey();
+      for (py::ProtocolType protocol : reprReachableProtocols)
+        llvm::errs() << " " << protocol;
+      llvm::errs() << "\n";
+    } else {
+      llvm::errs() << "repr closure open: " << reprClosureOpenReason << "\n";
+    }
+  }
+}
+
+bool RuntimeBundleLowerer::reprMayReachContract(
+    llvm::StringRef contract) const {
+  if (!reprReachableContracts || reprReachableContracts->contains(contract))
+    return true;
+  const py::protocols::Table &table = py::protocols::Table::get(*context);
+  mlir::Type type = runtimeContractType(context, contract);
+  for (const auto &entry : *reprReachableContracts)
+    if (table.isManifestSubclassOf(type, entry.getKey()))
+      return true;
+  for (py::ProtocolType protocol : reprReachableProtocols)
+    if (table.structurallyAccepts(type, protocol.getProtocolName(),
+                                  protocol.getArguments()))
+      return true;
+  return false;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
   // Each type carries its own `__repr__`, so no subclass sharing. A
   // non-conforming one (bool's i1 receiver) is skipped by the memref-input
@@ -2261,9 +2482,14 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
   mlir::Type i8 = mlir::IntegerType::get(context, 8);
   auto strHeader = mlir::MemRefType::get({2}, i64);
   auto strBytes = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
-  if (mlir::failed(generateBoxedMethodHookFor("__ly_repr_boxed_by_contract",
-                                              "__repr__",
-                                              {strHeader, strBytes})))
+  llvm::StringRef hookName = "__ly_repr_boxed_by_contract";
+  if (boxedHookIsDemanded(hookName) &&
+      mlir::failed(generateBoxedMethodHook(
+          hookName, manifestMethodIs("__repr__"), {strHeader, strBytes},
+          /*shareExceptionSubclasses=*/false, "__repr__",
+          [&](llvm::StringRef contract) {
+            return RuntimeBundleLowerer::reprMayReachContract(contract);
+          })))
     return mlir::failure();
   stampBoxedStrHookResult("__ly_repr_boxed_by_contract");
   return mlir::success();
@@ -2274,9 +2500,14 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
   mlir::Type i8 = mlir::IntegerType::get(context, 8);
   auto strHeader = mlir::MemRefType::get({2}, i64);
   auto strBytes = mlir::MemRefType::get({mlir::ShapedType::kDynamic}, i8);
-  if (mlir::failed(generateBoxedMethodHookFor("__ly_str_boxed_by_contract",
-                                              "__str__",
-                                              {strHeader, strBytes})))
+  llvm::StringRef hookName = "__ly_str_boxed_by_contract";
+  if (boxedHookIsDemanded(hookName) &&
+      mlir::failed(generateBoxedMethodHook(
+          hookName, manifestMethodIs("__str__"), {strHeader, strBytes},
+          /*shareExceptionSubclasses=*/false, "__str__",
+          [&](llvm::StringRef contract) {
+            return RuntimeBundleLowerer::reprMayReachContract(contract);
+          })))
     return mlir::failure();
   stampBoxedStrHookResult("__ly_str_boxed_by_contract");
   return mlir::success();

@@ -202,6 +202,8 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.IndirectCallsOfOneShapeShareOneDispatcher"
     "DriverTest.AnExecutableKeepsOnlyItsEntryExternal"
     "DriverTest.AJsHostExecutableKeepsItsExportsExternal"
+    "DriverTest.TheReprHookArmsOnlyTheClassesTheProgramHolds"
+    "DriverTest.AnObjectValueKeepsEveryReprArm"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"

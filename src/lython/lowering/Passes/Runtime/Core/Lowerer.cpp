@@ -9,6 +9,7 @@ RuntimeBundleLowerer::RuntimeBundleLowerer(mlir::ModuleOp module)
 mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   if (mlir::failed(manifest.verify()))
     return mlir::failure();
+  RuntimeBundleLowerer::collectReprReachableContracts();
   if (mlir::failed(buildReturnedValueSummaries()))
     return mlir::failure();
   if (mlir::failed(buildReturnedCallableSummaries()))
