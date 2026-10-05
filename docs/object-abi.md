@@ -130,6 +130,20 @@ P5 は tuple を 1 回の確保にした段階。ハンドル (refcount、class�
 word 5..13 (解放関数を幅で選ぶための詰め物) は確保しない。要素は word 5 の位置
 から始まる。`(i, i)` の list は 1 要素 116 B (CPython 101 B)。リテラルの要素は
 evidence を兼ねるので即値にしない (残りの差の大半は要素の int オブジェクト)。
+
+P6 は当初「幅による解放関数の区別 (`HandleWidthRegistry`) を class id に置き換え、
+詰め物ワードを削除」だった。実施したのは後半だけ: list (9 ワード中 5)、set
+(11 中 9)、frozenset (13 中 9)、tuple (P5) のハンドルを、使うワードだけ確保する。
+型は詰め物込みの幅のまま残すので解放関数の選択は変わらず、詰め物は型の上にしか
+無い (読み書きされないことを確保箇所以外の全アクセスで確認した)。list 1 個は
+80 B から 48 B のブロックになり、`[[i] for i in range(10**6)]` は 117 MB
+(CPython の tracemalloc で 104 MB)。
+
+前半 (解放関数を幅でなく contract 名か class id で選ぶ) は行っていない。メモリ上の
+詰め物は無くなったので残る動機は「幅の割り当てが尽きている」ことだけで、それは
+所有権検証器のモデル (`HandleWidthRegistry.h` の GAP 1 / GAP 2: owned result の
+約 4 割が contract 名を持たない) を変える仕事であり、ABI の軽量化とは別の作業と
+して扱う。
 即値を読むたびにオブジェクトを作るので、`d[k]` の読み出しが多いループは P1α と
 同程度にとどまる (読み出しで evidence に直接載せるのは P2 の f64 / i64 evidence
 と合わせて扱う)。
@@ -357,7 +371,7 @@ value types is an implementation detail")。`id()` は無い。したがって�
 | P3 | (実施: フィールドを即値で格納、本体をハンドルの word 3 から) | `AttributeOps.cpp`、`Manifest/Calls.cpp`、`RuntimeABI.cpp` | 2 int フィールドのインスタンス 132 → 70 B |
 | P4 | (実施: dict の表を状態 1 ワードに。set は据え置き) | dict の manifest 実装 | `dict[int, int]` 137 → 97 B |
 | P5 | (実施: tuple を 1 回の確保に) | tuple の manifest 実装 | `list[tuple[int, int]]` 177 → 116 B |
-| P6 | 幅による解放関数の区別 (`HandleWidthRegistry`) を class id に置き換え、詰め物ワードを削除 | `HandleWidthRegistry.h`、ownership の解放関数選択 | ヘッダの縮小 |
+| P6 | (実施: 詰め物ワードを確保しない。解放関数の選択は幅のまま) | list / set / frozenset の確保 | list 1 個 80 → 48 B |
 
 P1 を P2 より先にするのは、P1 が型を問わず一様に効き、P2 の特殊化を後から
 足しても `Value` が汎用経路として残るため。P2 から始めると、型が消えた経路の

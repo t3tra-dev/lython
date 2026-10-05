@@ -21020,7 +21020,14 @@ module attributes {
     %reserved_slot = arith.constant 7 : index
     %pad_slot = arith.constant 8 : index
 
-    %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<9xi64>
+    // ⭐ ONLY THE WORDS THE HANDLE USES ARE ALLOCATED: 0..4. Its type
+    // stays memref<9xi64> because width selects the deallocator
+    // (ABI/HandleWidthRegistry.h); the rest is padding nothing reads or
+    // writes, and allocating it was 32 bytes on every object.
+    %handle_bytes = arith.constant 40 : index
+    %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %handle_at = arith.constant 0 : index
+    %self = memref.view %handle_block[%handle_at][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<9xi64>
     %capacity = arith.maxsi %length, %zero : i64
     %payload_words = arith.muli %capacity, %handle_words : i64
     %payload_words_index = arith.index_cast %payload_words : i64 to index
@@ -21036,10 +21043,6 @@ module attributes {
     memref.store %length, %self[%length_slot] : memref<9xi64>
     memref.store %capacity, %self[%capacity_slot] : memref<9xi64>
     memref.store %items_word, %self[%items_slot] : memref<9xi64>
-    memref.store %zero, %self[%unused_secondary_slot] : memref<9xi64>
-    memref.store %zero, %self[%unused_present_slot] : memref<9xi64>
-    memref.store %zero, %self[%reserved_slot] : memref<9xi64>
-    memref.store %zero, %self[%pad_slot] : memref<9xi64>
     func.return %self : memref<9xi64>
   }
 
@@ -24489,10 +24492,15 @@ module attributes {
     %pad0_slot = arith.constant 8 : index
     %pad1_slot = arith.constant 9 : index
     %pad2_slot = arith.constant 10 : index
-    %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<11xi64>
+    // ⭐ ONLY THE WORDS THE HANDLE USES ARE ALLOCATED: 0..8. Its type
+    // stays memref<11xi64> because width selects the deallocator
+    // (ABI/HandleWidthRegistry.h); the rest is padding nothing reads or
+    // writes, and allocating it was 16 bytes on every object.
+    %handle_bytes = arith.constant 72 : index
+    %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %handle_at = arith.constant 0 : index
+    %self = memref.view %handle_block[%handle_at][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<11xi64>
     memref.store %zero, %self[%pad0_slot] : memref<11xi64>
-    memref.store %zero, %self[%pad1_slot] : memref<11xi64>
-    memref.store %zero, %self[%pad2_slot] : memref<11xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
     func.call @__ly_set_raw_init(%raw, %class_id, %length) : (memref<?xi64>, i64, i64) -> ()
     func.return %self : memref<11xi64>
@@ -24895,12 +24903,15 @@ module attributes {
     %pad2_slot = arith.constant 10 : index
     %pad3_slot = arith.constant 11 : index
     %pad4_slot = arith.constant 12 : index
-    %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<13xi64>
+    // ⭐ ONLY THE WORDS THE HANDLE USES ARE ALLOCATED: 0..8. Its type
+    // stays memref<13xi64> because width selects the deallocator
+    // (ABI/HandleWidthRegistry.h); the rest is padding nothing reads or
+    // writes, and allocating it was 32 bytes on every object.
+    %handle_bytes = arith.constant 72 : index
+    %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %handle_at = arith.constant 0 : index
+    %self = memref.view %handle_block[%handle_at][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<13xi64>
     memref.store %zero, %self[%pad0_slot] : memref<13xi64>
-    memref.store %zero, %self[%pad1_slot] : memref<13xi64>
-    memref.store %zero, %self[%pad2_slot] : memref<13xi64>
-    memref.store %zero, %self[%pad3_slot] : memref<13xi64>
-    memref.store %zero, %self[%pad4_slot] : memref<13xi64>
     %raw = memref.cast %self : memref<13xi64> to memref<?xi64>
     func.call @__ly_set_raw_init(%raw, %class_id, %length) : (memref<?xi64>, i64, i64) -> ()
     func.return %self : memref<13xi64>
