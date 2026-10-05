@@ -302,6 +302,45 @@ TEST(DriverTest, IteratingATupleOfBoolsCompiles) {
   EXPECT_TRUE(passed.succeeded) << passed.diagnostics;
 }
 
+// What: in a loop whose header carries a value the body computes, an object
+// built by a constructor is used after its `__init__`, not before: the body
+// is lowered on the header's behalf, and the method call reads the instance
+// `__init__` handed back. The ownership verifier refused the program when
+// the call read the instance `__init__` had consumed.
+TEST(DriverTest, ALoopBodyLoweredEarlyKeepsItsInitOrder) {
+  CompileResult result = compileSource("import io\n\n\n"
+                                       "def f() -> int:\n"
+                                       "    total = 0\n"
+                                       "    for i in range(3):\n"
+                                       "        if i > 0:\n"
+                                       "            total += 1\n"
+                                       "        r = io.StringIO(\"x\")\n"
+                                       "        total += r.tell()\n"
+                                       "    return total\n\n\n"
+                                       "print(f())\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  // And the call reads `__init__`'s result, which is what makes it run.
+  const llvm::Function *f = result.verified.llvmModule->getFunction("f");
+  ASSERT_NE(f, nullptr);
+  const llvm::CallBase *init = nullptr;
+  const llvm::CallBase *tell = nullptr;
+  for (const llvm::BasicBlock &block : *f)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          if (callee->getName() == "LyStringIO_Init")
+            init = call;
+          if (callee->getName() == "LyStringIO_Tell")
+            tell = call;
+        }
+  ASSERT_NE(init, nullptr);
+  ASSERT_NE(tell, nullptr);
+  const llvm::Value *receiver = tell->getArgOperand(0);
+  while (const auto *extract = llvm::dyn_cast<llvm::ExtractValueInst>(receiver))
+    receiver = extract->getAggregateOperand();
+  EXPECT_EQ(receiver, init);
+}
+
 TEST(DriverTest, ReportsParseErrorDiagnostics) {
   CompileResult result = compileSource("def broken(:\n");
   EXPECT_FALSE(result.succeeded);

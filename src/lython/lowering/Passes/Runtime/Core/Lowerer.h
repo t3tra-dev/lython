@@ -1937,6 +1937,8 @@ private:
   // one of them may be behind it.
   llvm::SmallVector<py::ProtocolType, 4> reprReachableProtocols;
   std::string reprClosureOpenReason;
+  // py ops ensureValueBundle lowered ahead of the walk, which then skips them.
+  llvm::DenseSet<mlir::Operation *> loweredAheadOfWalk;
   // indirectCallDispatcher's functions, by the shape of the call they serve.
   llvm::StringMap<mlir::func::FuncOp> indirectCallDispatchers;
   // collectIndirectCallableTargets' assignability answers, by (candidate's
