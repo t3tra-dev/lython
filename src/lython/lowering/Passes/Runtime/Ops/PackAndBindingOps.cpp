@@ -561,7 +561,7 @@ mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::materializeClosureStore(
         mlir::arith::ConstantIntOp::create(builder, loc,
                                            box_abi::kWordsPerBox, 64)
             .getResult(),
-        box_abi::boxWordsType(builder));
+        box_abi::slotWordsType(builder));
     for (auto [word, value] : llvm::enumerate(*words))
       mlir::memref::StoreOp::create(
           builder, loc, value, slot,

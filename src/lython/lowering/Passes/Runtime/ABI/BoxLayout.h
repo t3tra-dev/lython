@@ -44,30 +44,29 @@
 
 namespace py::lowering::box_abi {
 
-// ⭐ FIVE, WHICH IS THE FLOOR. Word 0 is the refcount, word 1 the class id,
-// word 2 the entity, word 3 the owned flag the deallocators consult and word 4
-// the cached hash the dict and set keep. Nothing else is left: a value's other
-// physical lanes come from the entity's own block, which is what every contract
-// that has any answers with `lane_words`.
+// ⭐ THREE: word 0 is a refcount the slot never reads, word 1 the class id,
+// word 2 the entity. A STANDALONE box (an `object` value, `memref<5xi64>`)
+// keeps its own refcount in word 0 and the same class and entity words, so a
+// slot and a box are read by the same offsets; words 3 and 4 of a standalone
+// box are unused (docs/object-abi.md P1 removes the rest).
+//
+// ⛔ NO OWNED FLAG. A box owns its entity exactly when the entity is an
+// address -- not 0 (None) and not an immediate with bit 0 set -- and the
+// retain and release paths already asked that before they asked the flag,
+// which was 1 in every container slot. ⛔ NO HASH WORD. The dict and the set
+// keep their entries' hashes in their own parallel arrays, as CPython's keep
+// them in the entry beside the key; list and tuple never read one.
 //
 // ⛔ IT WAS SIXTEEN, AND SEVEN OF THOSE WORDS WERE A SECOND COPY. Words [4, 10)
-// cached a pointer and a size for each of five lanes -- 32 bytes per list slot,
-// per dict key AND value, per tuple element, per set member, describing storage
-// the entity's own block already describes. Every contract that is more than
-// one physical value now answers `lane_words` from its first lane's address:
-// `__ly_unicode_alloc` puts a str's code units at +24 of the header's block and
-// records their length in the shape word, the exception taxonomy records its
-// message in extended word 6, and the iterators record what they walk. Reading
-// the block instead of a copy is also the defect this removes rather than
-// re-finds: a cached lane goes stale when the payload reallocates.
+// cached a pointer and a size for each of five lanes, describing storage the
+// entity's own block already describes. Every contract that is more than one
+// physical value answers `lane_words` from its first lane's address instead.
 //
 // ⛔ AND THE LANE COUNT WAS A CLASS'S FIELD BUDGET, which is why narrowing used
-// to cost capability. A class expanded to one handle per field plus its own, so
-// three lanes took `class P: x, y, z: float` out of every container. Fields
-// live in the instance BODY now and a class is one lane however many it has;
-// what `objectPayloadHandleWords` still refuses is a class holding a union
-// with a `type[X]` member, the one member with no value to box.
-inline constexpr std::int64_t kWordsPerBox = 5;
+// to cost capability. Fields live in the instance BODY and a class is one lane
+// however many it has; what `objectPayloadHandleWords` still refuses is a class
+// holding a union with a `type[X]` member, the one member with no value to box.
+inline constexpr std::int64_t kWordsPerBox = 3;
 // Word 2 is the ENTITY: the address of the object's first physical value, and
 // the only one a box keeps. Everything else a contract expands to is reached
 // from it through that contract's `lane_words` primitive.
@@ -77,10 +76,15 @@ inline constexpr std::int64_t kWordsPerBox = 5;
 // classInstanceBody). That is the same reading: an instance's entity IS its
 // body, and a box holding the instance points at the header rather than at it.
 inline constexpr std::int64_t kEntityWord = 2;
-inline constexpr std::int64_t kOwnedFlagWord = 3;
-inline constexpr std::int64_t kHashWord = 4;
+// A standalone `object` box's width, which a slot is narrower than.
+inline constexpr std::int64_t kStandaloneBoxWords = 5;
 
 inline mlir::MemRefType boxWordsType(mlir::Builder &builder) {
+  return mlir::MemRefType::get({kStandaloneBoxWords}, builder.getI64Type());
+}
+
+// One slot of a payload array, viewed on its own.
+inline mlir::MemRefType slotWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());
 }
 

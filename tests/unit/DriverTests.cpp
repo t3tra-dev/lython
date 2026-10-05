@@ -1153,15 +1153,13 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
     EXPECT_EQ(constantIn("__ly_box_entity_word"),
               py::lowering::box_abi::kEntityWord)
         << "the manifest reads the one address a box holds from elsewhere";
-    EXPECT_EQ(constantIn("__ly_box_owned_word"),
-              py::lowering::box_abi::kOwnedFlagWord)
-        << "the manifest writes the owned flag elsewhere";
-    EXPECT_EQ(constantIn("__ly_box_hash_word"),
-              py::lowering::box_abi::kHashWord)
-        << "the manifest caches the hash in a different word";
-    EXPECT_EQ(py::lowering::box_abi::kHashWord,
-              py::lowering::box_abi::kWordsPerBox - 1)
-        << "the cached hash is the box's last word";
+    EXPECT_EQ(constantIn("__ly_box_standalone_word_count"),
+              py::lowering::box_abi::kStandaloneBoxWords)
+        << "the manifest sizes a standalone `object` box differently";
+    // A box has no owned flag and no hash word any more; a helper that names
+    // one would be a manifest still writing them.
+    EXPECT_EQ(text.find("@__ly_box_owned_word"), std::string::npos);
+    EXPECT_EQ(text.find("@__ly_box_hash_word"), std::string::npos);
 
     // ⭐ AND NO FUNCTION MAY STRIDE BY A LITERAL AGAIN. The helpers are only
     // worth having if nothing goes around them, and a stride that does is
@@ -1176,11 +1174,11 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
     // version passed with a stride put back by hand, which is the only reason
     // this one is written out.
     //
-    // Two exemptions, and neither is a box. `LyBytes_FromHex` multiplies an
-    // accumulator by sixteen per hex digit, and `%probe_scale` is the 5 in
-    // CPython's `i*5 + 1 + perturb` open-addressing walk -- which the box width
-    // happens to equal, so the exemption is the NAME rather than the functions,
-    // and a stride that spelled itself any other way still fails.
+    // The exemptions are not boxes. `LyBytes_FromHex` multiplies an
+    // accumulator by sixteen per hex digit, and the named multipliers below
+    // are constants that happen to equal a box width, so the exemption is the
+    // NAME rather than the functions, and a stride that spelled itself any
+    // other way still fails.
     {
       const std::string width =
           std::to_string(py::lowering::box_abi::kWordsPerBox);
@@ -1211,7 +1209,13 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
             const std::string bound =
                 body.substr(nameStart, declared - nameStart);
             declared += bind.size();
-            if (bound.empty() || bound == "%probe_scale")
+            // Named multipliers that are not a box width and happen to
+            // equal it: the open-addressing walk's 5, and -- since the box
+            // became three words -- CPython's dict GROWTH_RATE, the set's
+            // fill limit (fill*5 >= mask*3), and two int-arithmetic scales.
+            if (bound.empty() || bound == "%probe_scale" ||
+                bound == "%growth_rate" || bound == "%fill_limit_scale" ||
+                bound == "%triple_scale" || bound == "%digit_bits_scale")
               continue;
             std::size_t use = 0;
             while ((use = body.find("arith.muli ", use)) != std::string::npos) {

@@ -447,11 +447,9 @@ RuntimeBundleLowerer::clearBoxedFieldSlot(mlir::Operation *op, mlir::Value body,
   mlir::func::CallOp::create(builder, loc, releaseBoxed,
                              mlir::ValueRange{releaseStorage, releaseSlot});
   mlir::Value zero = constantI64(builder, loc, 0);
-  for (std::int64_t word : {box_abi::kEntityWord, box_abi::kOwnedFlagWord}) {
-    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, loc, static_cast<std::int64_t>(boxWord) + word);
-    mlir::memref::StoreOp::create(builder, loc, zero, body, slot);
-  }
+  mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+      builder, loc, static_cast<std::int64_t>(boxWord) + box_abi::kEntityWord);
+  mlir::memref::StoreOp::create(builder, loc, zero, body, slot);
   return mlir::success();
 }
 
@@ -529,8 +527,7 @@ RuntimeBundleLowerer::storeOptionalBoxedField(mlir::Operation *op,
   mlir::Value zero = constantI64(builder, loc, 0);
   for (auto [wordIndex, word] : llvm::enumerate(*words)) {
     mlir::Value stored = word;
-    if (static_cast<std::int64_t>(wordIndex) == box_abi::kEntityWord ||
-        static_cast<std::int64_t>(wordIndex) == box_abi::kOwnedFlagWord)
+    if (static_cast<std::int64_t>(wordIndex) == box_abi::kEntityWord)
       stored = mlir::arith::SelectOp::create(builder, loc, present, word, zero)
                    .getResult();
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
@@ -787,12 +784,10 @@ mlir::LogicalResult RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
   if (mlir::failed(words))
     return mlir::failure();
   mlir::Location loc = op->getLoc();
-  // Words 0 and 14 (refcount, owned flag) are the box's own bookkeeping and
-  // must survive: rewriting them would reset a reference count the program is
-  // still using. Everything from word 1 up describes the payload.
+  // Word 0 (the refcount) is the box's own bookkeeping and must survive:
+  // rewriting it would reset a reference count the program is still using.
+  // Everything from word 1 up describes the payload.
   for (unsigned index = 1; index < words->size(); ++index) {
-    if (index == static_cast<unsigned>(box_abi::kOwnedFlagWord))
-      continue;
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
         builder, loc, static_cast<std::int64_t>(boxWord + index));
     mlir::memref::StoreOp::create(builder, loc, (*words)[index], body, slot);

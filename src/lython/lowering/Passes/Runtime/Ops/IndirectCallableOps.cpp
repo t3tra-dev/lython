@@ -267,7 +267,7 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
         mlir::arith::ConstantIntOp::create(builder, loc,
                                            box_abi::kWordsPerBox, 64)
             .getResult(),
-        box_abi::boxWordsType(builder));
+        box_abi::slotWordsType(builder));
     mlir::Value entityWord =
         mlir::memref::LoadOp::create(
             builder, loc, slot,
