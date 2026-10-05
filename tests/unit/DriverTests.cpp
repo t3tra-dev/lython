@@ -230,6 +230,61 @@ TEST(DriverTest, AJsHostExecutableKeepsItsExportsExternal) {
   }
 }
 
+// The functions the generated repr hook calls directly, by name.
+std::vector<std::string> reprHookCallees(const llvm::Module &module) {
+  std::vector<std::string> names;
+  const llvm::Function *hook =
+      module.getFunction("__ly_repr_boxed_by_contract");
+  if (!hook)
+    return names;
+  for (const llvm::BasicBlock &block : *hook)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction())
+          names.push_back(callee->getName().str());
+  return names;
+}
+
+// What: a program whose values are strs and ints in lists gets a repr hook
+// with str's and int's arms and none for float, range or complex; a class it
+// cannot hold that reaches the hook anyway stops the program with a message
+// instead of printing a default repr.
+TEST(DriverTest, TheReprHookArmsOnlyTheClassesTheProgramHolds) {
+  CompileResult result = compileSource("words: list[str] = [\"a\"]\n"
+                                       "print(words, [1, 2])\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::vector<std::string> callees =
+      reprHookCallees(*result.verified.llvmModule);
+  ASSERT_FALSE(callees.empty());
+  auto calls = [&](llvm::StringRef name) {
+    return llvm::is_contained(callees, name.str());
+  };
+  EXPECT_TRUE(calls("LyUnicode_Repr"));
+  EXPECT_TRUE(calls("LyLong_Repr"));
+  EXPECT_FALSE(calls("LyFloat_Repr"));
+  EXPECT_FALSE(calls("LyRange_Repr"));
+  EXPECT_FALSE(calls("LyComplex_Repr"));
+  bool trap = false;
+  for (const llvm::GlobalVariable &global :
+       result.verified.llvmModule->globals())
+    if (const auto *data = llvm::dyn_cast_or_null<llvm::ConstantDataSequential>(
+            global.hasInitializer() ? global.getInitializer() : nullptr))
+      trap |= data->isString() &&
+              data->getAsString().contains("judged unreachable");
+  EXPECT_TRUE(trap);
+}
+
+// What: a program that holds an `object` keeps an arm for every class.
+TEST(DriverTest, AnObjectValueKeepsEveryReprArm) {
+  CompileResult result = compileSource("x: object = 1.5\n"
+                                       "print(repr(x), [\"a\"])\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  std::vector<std::string> callees =
+      reprHookCallees(*result.verified.llvmModule);
+  EXPECT_TRUE(llvm::is_contained(callees, "LyFloat_Repr"));
+  EXPECT_TRUE(llvm::is_contained(callees, "LyRange_Repr"));
+}
+
 TEST(DriverTest, ReportsParseErrorDiagnostics) {
   CompileResult result = compileSource("def broken(:\n");
   EXPECT_FALSE(result.succeeded);

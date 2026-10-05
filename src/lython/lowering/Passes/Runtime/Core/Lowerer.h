@@ -1001,7 +1001,13 @@ private:
       llvm::StringRef hookName,
       llvm::function_ref<bool(mlir::func::FuncOp)> selects,
       mlir::TypeRange calleeResultTypes, bool shareExceptionSubclasses,
-      llvm::StringRef sourceClassMethodName = "");
+      llvm::StringRef sourceClassMethodName = "",
+      llvm::function_ref<bool(llvm::StringRef)> keepsContract = nullptr);
+  // The manifest classes whose values the program can hold, read off every
+  // py type in the module before the lowering erases them; std::nullopt when
+  // some type admits any class (object, a protocol, an exception's args).
+  void collectReprReachableContracts();
+  bool reprMayReachContract(llvm::StringRef contract) const;
   // ⭐ ONE INSTANCE OF EITHER DISPATCH, BY METHOD NAME. Every instance below
   // is the same three steps -- generate only when the merged manifest left an
   // external declaration asking for it, select the manifest functions carrying
@@ -1912,6 +1918,11 @@ private:
   // The module's class ops by name, for classForContract; built on the first
   // question.
   mutable std::optional<llvm::StringMap<py::ClassOp>> classesByName;
+  std::optional<llvm::StringSet<>> reprReachableContracts;
+  // Protocol-typed values the closure met: any manifest class that satisfies
+  // one of them may be behind it.
+  llvm::SmallVector<py::ProtocolType, 4> reprReachableProtocols;
+  std::string reprClosureOpenReason;
   // indirectCallDispatcher's functions, by the shape of the call they serve.
   llvm::StringMap<mlir::func::FuncOp> indirectCallDispatchers;
   // collectIndirectCallableTargets' assignability answers, by (candidate's

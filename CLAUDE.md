@@ -30,7 +30,7 @@ cmake --build build -j$(nproc)
 uv run pyright
 ```
 
-主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`-O2` / `-Os` / `-Oz` (AOT 実行ファイルの最適化目標。既定 `-O2`。`-Os` / `-Oz` は全関数に optsize / minsize を付ける: `examples/genexpr.py` の wasm は 187 KB → 106 KB になるが、dict と str 中心の処理は 1.3〜2 倍遅くなる。JIT では拒否される。AOT は C の入口と JS ホスト向け export 以外をすべて internal にしてから最適化する)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質) と `-jit-opt=0..3` (JIT の LLVM IR 最適化レベル。AOT は常に O2)。どちらも既定は初回出力レイテンシ優先の最低値。実測の分岐点: `-jit-codegen-opt=less` は jit-build を約 180 ms 増やして実行を約半分にするので、実行が 360 ms を超えるプログラムから得になる (`examples/tarai.py` は合計 1.60 s → 1.11 s、`examples/hello.py` は 0.18 s → 0.35 s)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)、`--target wasm32-wasip1` (`-o prog.wasm` は wasmtime でそのまま動く WASI モジュール。リンクは lyc がリンクしている LLVM の clang と wasm-ld で行う。wasi-libc と wasm32 の compiler-rt は Homebrew の `wasi-libc` / `wasi-runtimes` か wasi-sdk から探す: `--sysroot`、`WASI_SDK_PATH`、LLVM の prefix、Homebrew の share、`/opt/wasi-sdk`、`~/.local/wasi-sdk*`)、`--js-host` (WASI のプログラムを JS ホストの下で動かす。`-o prog.js` がローダで、`prog.wasm` が隣に出る。docs/js-host.md)。
+主な `lyc` フラグ: `--emit-llvm` (LLVM IR で停止)、`--release` (verifier パス無効化)、`-O2` / `-Os` / `-Oz` (AOT 実行ファイルの最適化目標。既定 `-O2`。`-Os` / `-Oz` は全関数に optsize / minsize を付ける: `examples/genexpr.py` の wasm は 137 KB → 84 KB になるが、dict と str 中心の処理は 1.3〜2 倍遅くなる。JIT では拒否される。AOT は C の入口と JS ホスト向け export 以外をすべて internal にしてから最適化する)、`--target` / `-mcpu` / `-mfpu` (クロスコンパイル)、`--fsanitize=...`、`--audit-runtime-manifest`、`-jit-codegen-opt=none|less|default|aggressive` (JIT の命令選択品質) と `-jit-opt=0..3` (JIT の LLVM IR 最適化レベル。AOT は常に O2)。どちらも既定は初回出力レイテンシ優先の最低値。実測の分岐点: `-jit-codegen-opt=less` は jit-build を約 180 ms 増やして実行を約半分にするので、実行が 360 ms を超えるプログラムから得になる (`examples/tarai.py` は合計 1.60 s → 1.11 s、`examples/hello.py` は 0.18 s → 0.35 s)、`-mmatrix=auto|sme|amx|none` (行列エンジン選択。auto は公開 ISA の SME 優先、amx は Apple AMX を runtime probe 付きで強制)、`--target wasm32-wasip1` (`-o prog.wasm` は wasmtime でそのまま動く WASI モジュール。リンクは lyc がリンクしている LLVM の clang と wasm-ld で行う。wasi-libc と wasm32 の compiler-rt は Homebrew の `wasi-libc` / `wasi-runtimes` か wasi-sdk から探す: `--sysroot`、`WASI_SDK_PATH`、LLVM の prefix、Homebrew の share、`/opt/wasi-sdk`、`~/.local/wasi-sdk*`)、`--js-host` (WASI のプログラムを JS ホストの下で動かす。`-o prog.js` がローダで、`prog.wasm` が隣に出る。docs/js-host.md)。
 
 ### テスト
 
@@ -108,6 +108,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_DUMP_LOCS=1` — `LYTHON_DUMP_ON_FAILURE` のダンプに各 op の source location を付ける (location しか持たない診断が、どの op を指しているかを探すため)
 - `LYTHON_PERF=1` — フェーズごとの wall time を出力
 - `LYTHON_ABLATE_PRECOMPILED_RUNTIME=1` — ビルド時にホスト向けに事前コンパイルして lyc に埋め込んだネイティブランタイム (`LythonNativeRuntimeBitcode`) を使わず、コンパイルのたびに下げる。両者が同じモジュールであることを `lyc.precompiled_runtime_is_the_lowered_runtime` が検査する
+- `LYTHON_TRACE_REPR_CLOSURE=1` — repr / str フックの分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ
