@@ -12,6 +12,7 @@
 // enforced by explicit earliest-boundary rejections and the inter-phase
 // verifiers instead of a ConversionTarget.
 
+#include "Common/PythonSourceRange.h"
 #include "ArithBuilders.h"
 #include "Ownership.h"
 #include "Runtime/Manifest/Index.h"
@@ -1919,6 +1920,16 @@ private:
   llvm::DenseMap<mlir::Operation *, mlir::Value> primitiveI64CloneDecisionFlags;
   llvm::StringMap<std::int64_t> functionTargetIds;
   llvm::DenseMap<mlir::Block *, std::int64_t> tryHandlerIds;
+  // How many method bodies deep each try was written: the inlined levels a
+  // raise inside it reaches without leaving it.
+  llvm::DenseMap<std::int64_t, unsigned> tryInlineDepths;
+  unsigned enclosingTryInlineDepth(mlir::Block *block) const;
+  // Pushes the frames of `range`'s inlined levels from the innermost out to
+  // the one at `depth`, which the exception has not left.
+  void pushInlinedTracebackFrames(mlir::Operation *anchor,
+                                  llvm::StringRef filename,
+                                  llvm::ArrayRef<PythonInlineFrame> inlinedAt,
+                                  unsigned depth);
   // The module's deallocators once synthesizeSourceClassDeallocators has
   // made the last of them; empty before.
   std::optional<llvm::SmallVector<ownership::RuntimeDeallocator, 8>>

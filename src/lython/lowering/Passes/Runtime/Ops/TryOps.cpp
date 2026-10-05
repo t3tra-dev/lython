@@ -1,4 +1,5 @@
 #include "Runtime/Core/Lowerer.h"
+#include <cstdlib>
 #include "ArithBuilders.h"
 
 #include "Runtime/Model/Contracts.h"
@@ -348,6 +349,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
   std::optional<std::int64_t> finalHandlerId;
   if (hasFinally && hasExcept)
     finalHandlerId = nextTryHandlerId++;
+  std::optional<PythonSourceRange> tryRange = pythonSourceRange(loc);
+  unsigned tryDepth =
+      tryRange ? static_cast<unsigned>(tryRange->inlinedAt.size()) : 0;
+  tryInlineDepths[handlerId] = tryDepth;
+  if (finalHandlerId)
+    tryInlineDepths[*finalHandlerId] = tryDepth;
   mlir::func::FuncOp discardCurrentException;
   if (hasExcept)
     discardCurrentException =
@@ -443,6 +450,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
     {
       mlir::OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(finallyRethrow);
+      // Leaving the `try` after its finally: the frames between it and the
+      // next `try` out (ExceptionOps.cpp, pushInlinedTracebackFrames).
+      if (tryRange)
+        pushInlinedTracebackFrames(tryOperation, tryRange->filename,
+                                   tryRange->inlinedAt,
+                                   enclosingTryInlineDepth(parentBlock));
       emitTryCallSiteMarkerIfNeeded(loc);
       mlir::func::CallOp::create(builder, loc,
                                  getOrCreateRethrowCurrent(module, builder),

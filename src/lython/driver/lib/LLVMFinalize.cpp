@@ -368,6 +368,16 @@ void attachPythonDebugInfo(ModuleOp module) {
         return;
       if (!py::findPythonSourceLoc(op->getLoc()))
         return;
+      if (auto number = op->getAttrOfType<IntegerAttr>(
+              py::kCallSiteDiscriminatorAttr)) {
+        op->removeAttr(py::kCallSiteDiscriminatorAttr);
+        op->setLoc(FusedLoc::get(
+            op->getContext(), {op->getLoc()},
+            LLVM::DILexicalBlockFileAttr::get(
+                op->getContext(), subprogram, file,
+                static_cast<unsigned>(number.getInt()))));
+        return;
+      }
       op->setLoc(scopedPythonDebugLoc(op->getLoc(), subprogram));
     });
   });

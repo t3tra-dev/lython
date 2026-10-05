@@ -1,5 +1,7 @@
 #include "Runtime/Core/Lowerer.h"
 
+#include "Common/RuntimeSupport.h"
+
 namespace py::lowering {
 
 RuntimeBundleLowerer::RuntimeBundleLowerer(mlir::ModuleOp module)
@@ -80,6 +82,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::eraseCallableLogicalEntryArgs()))
     return mlir::failure();
+  if (!tryInlineDepths.empty()) {
+    llvm::SmallVector<std::int64_t, 16> pairs;
+    for (auto [id, depth] : tryInlineDepths)
+      if (depth != 0) {
+        pairs.push_back(id);
+        pairs.push_back(depth);
+      }
+    if (!pairs.empty())
+      module->setAttr(py::kTryInlineDepthsAttr,
+                      mlir::DenseI64ArrayAttr::get(context, pairs));
+  }
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedReprHook()))
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedStrHook()))

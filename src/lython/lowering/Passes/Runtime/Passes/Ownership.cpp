@@ -6390,6 +6390,34 @@ mlir::LogicalResult insertUnwindCleanupReleases(
       created.handler = handler;
       created.groups.assign(cleanupGroups.begin(), cleanupGroups.end());
       created.id = nextHandlerId++;
+      // The new id stands for the handler it branches to, and so does that
+      // handler's inlined depth (TryOps.cpp): a catching landing pad stops
+      // its traceback push there (EH.cpp).
+      if (handler)
+        for (mlir::Operation &op : *handler) {
+          auto marker = mlir::dyn_cast<mlir::func::CallOp>(op);
+          if (!marker || marker.getCallee() != "LyEH_TryCatchMarker")
+            continue;
+          if (std::optional<std::int64_t> original =
+                  own::exceptionMarkerId(marker))
+            if (auto pairs = module->getAttrOfType<mlir::DenseI64ArrayAttr>(
+                    "ly.try.inline_depths")) {
+              llvm::SmallVector<std::int64_t, 16> words(
+                  pairs.asArrayRef().begin(), pairs.asArrayRef().end());
+              for (std::size_t index = 0; index + 1 < words.size();
+                   index += 2)
+                if (words[index] == *original) {
+                  words.push_back(created.id);
+                  words.push_back(words[index + 1]);
+                  module->setAttr(
+                      "ly.try.inline_depths",
+                      mlir::DenseI64ArrayAttr::get(module.getContext(),
+                                                   words));
+                  break;
+                }
+            }
+          break;
+        }
 
       mlir::func::FuncOp releaser = createOutlinedUnwindReleaser(
           module, loc, created.groups, nextReleaserIndex++);
