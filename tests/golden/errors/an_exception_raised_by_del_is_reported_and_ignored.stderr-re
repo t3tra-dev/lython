@@ -1,0 +1,5 @@
+Exception\ ignored\ while\ calling\ deallocator\ <function\ Noisy\.__del__\ at\ 0x[0-9a-f]+>:\
+Traceback\ \(most\ recent\ call\ last\):\
+\ \ File\ ".*an_exception_raised_by_del_is_reported_and_ignored\.py",\ line\ 9,\ in\ __del__\
+\ \ \ \ raise\ ValueError\("in\ del"\)\
+ValueError:\ in\ del

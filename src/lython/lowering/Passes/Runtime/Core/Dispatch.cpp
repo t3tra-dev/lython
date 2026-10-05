@@ -51,6 +51,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::AttrSetOp>([&](auto attr) { return lowerAttrSet(attr); })
       .Case<py::GlobalGetOp>([&](auto get) { return lowerGlobalGet(get); })
       .Case<py::GlobalSetOp>([&](auto set) { return lowerGlobalSet(set); })
+      .Case<py::GlobalClearOp>(
+          [&](auto clear) { return lowerGlobalClear(clear); })
       .Case<py::PackOp>([&](auto pack) { return lowerPack(pack); })
       .Case<py::BindingRefOp>(
           [&](auto binding) { return lowerBindingRef(binding); })
@@ -102,6 +104,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
       .Case<py::RoundOp>([&](auto round) { return lowerRound(round); })
       .Case<py::IncRefOp>([&](auto incRef) { return lowerIncRef(incRef); })
       .Case<py::DecRefOp>([&](auto decRef) { return lowerDecRef(decRef); })
+      .Case<py::KeepAliveOp>(
+          [&](auto keepAlive) { return lowerKeepAlive(keepAlive); })
       .Case<py::NegOp, py::PosOp, py::InvertOp>(
           [&](auto unary) { return lowerUnaryMethodOp(unary); })
       .Case<py::AddOp, py::SubOp, py::MulOp, py::DivOp, py::FloorDivOp,

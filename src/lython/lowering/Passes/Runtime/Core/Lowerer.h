@@ -481,6 +481,7 @@ private:
                          llvm::ArrayRef<mlir::Type> valueTypes,
                          llvm::SmallVectorImpl<mlir::Value> &values);
   mlir::LogicalResult lowerGlobalSet(py::GlobalSetOp op);
+  mlir::LogicalResult lowerGlobalClear(py::GlobalClearOp op);
   // Process-lifetime i64 storage for a module-level int global, created on
   // first use. Reads/writes are plain load/store (async-signal-safe).
   mlir::LLVM::GlobalOp nativeGlobalCell(mlir::Operation *op,
@@ -1778,6 +1779,7 @@ private:
   mlir::LogicalResult lowerRound(py::RoundOp op);
   mlir::LogicalResult lowerIncRef(py::IncRefOp op);
   mlir::LogicalResult lowerDecRef(py::DecRefOp op);
+  mlir::LogicalResult lowerKeepAlive(py::KeepAliveOp op);
   mlir::LogicalResult lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
                                         llvm::StringRef methodName,
                                         mlir::Value resultValue);

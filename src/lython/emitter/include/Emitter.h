@@ -39,6 +39,11 @@ struct EmitOptions {
   std::string targetTriple;
   // The program runs with a JavaScript host (`sys._js_host`).
   bool jsHost = false;
+  // A class of the program defines __del__: locals are kept referenced until
+  // where CPython's frame would let them go (py.keep_alive), so finalizers
+  // run when CPython's do, and traceback is bound for the method that runs
+  // each one (predeclareSourceModules).
+  bool keepLocalsAlive = false;
   std::vector<SourceModule> sourceModules;
 };
 

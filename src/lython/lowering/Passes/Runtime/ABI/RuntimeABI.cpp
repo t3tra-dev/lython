@@ -1604,6 +1604,20 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
     std::string contract = classOp.getSymName().str();
     if (contract.empty())
       continue;
+    // ⛔ A class whose instances this does not deallocate cannot run a
+    // `__del__`: the exception taxonomy's shared deallocator and a manifest
+    // class's own know nothing of it, and a finalizer that never runs is the
+    // silent kind.
+    bool finalizes =
+        RuntimeBundleLowerer::classMethodSymbol(classOp, "__ly_finalize__")
+            .has_value();
+    if (finalizes &&
+        (RuntimeBundleLowerer::exceptionAncestorContract(classOp) ||
+         declaredRuntimeContractMatchesClass(module, contract)))
+      return classOp.emitError()
+             << "__del__ is not supported on " << contract
+             << ": its instances are released by a deallocator shared with "
+                "the runtime's own classes, which does not run finalizers";
     if (declaredRuntimeContractMatchesClass(module, contract))
       continue;
     if (moduleHasDeallocatorForContract(module, contract))
@@ -1691,8 +1705,53 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
       return mlir::failure();
     mlir::func::CallOp releaseHeader = mlir::func::CallOp::create(
         builder, loc, releaseToZero, mlir::ValueRange{*storage});
+
+    // ⭐ `__del__` RUNS ON THE OBJECT IT FINALIZES, as CPython's tp_finalize
+    // does: the count goes back to one for the call, so the method holds a
+    // live reference, and comes down again after it. Zero then means nothing
+    // kept it, and it is deallocated as any other.
+    // ⛔ A finalizer that stored its object somewhere is not supported, and
+    // says so at run time: CPython keeps the resurrected object and never
+    // finalizes it again, and an instance has no word left to remember that
+    // in (word 1 is the whole class id, 3 and 4 hold int fields).
+    mlir::Block *afterRelease = deallocBlock;
+    if (std::optional<std::string> finalizer =
+            RuntimeBundleLowerer::classMethodSymbol(plan.classOp,
+                                                    "__ly_finalize__")) {
+      auto finalize = module.lookupSymbol<mlir::func::FuncOp>(*finalizer);
+      if (!finalize || finalize.getFunctionType().getInputs() !=
+                           plan.function.getFunctionType().getInputs())
+        return plan.classOp.emitError()
+               << "the finalizer of " << plan.contract
+               << " does not take the instance as its deallocator does";
+      mlir::Block *finalizeBlock = plan.function.addBlock();
+      mlir::Block *resurrectedBlock = plan.function.addBlock();
+      afterRelease = finalizeBlock;
+      builder.setInsertionPointToStart(finalizeBlock);
+      mlir::Value refcountSlot =
+          mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+      mlir::Value one =
+          mlir::arith::ConstantIntOp::create(builder, loc, 1, 64).getResult();
+      mlir::memref::StoreOp::create(builder, loc, one, entry->getArgument(0),
+                                    refcountSlot);
+      mlir::func::CallOp::create(builder, loc, finalize,
+                                 entry->getArguments());
+      mlir::func::CallOp releaseAgain = mlir::func::CallOp::create(
+          builder, loc, releaseToZero, mlir::ValueRange{*storage});
+      mlir::cf::CondBranchOp::create(builder, loc, releaseAgain.getResult(0),
+                                     deallocBlock, resurrectedBlock);
+      builder.setInsertionPointToStart(resurrectedBlock);
+      mlir::Value never =
+          mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getResult();
+      mlir::cf::AssertOp::create(
+          builder, loc, never,
+          "__del__ of " + plan.contract +
+              " kept a reference to its object, which is not supported");
+      mlir::cf::BranchOp::create(builder, loc, doneBlock);
+      builder.setInsertionPointToEnd(entry);
+    }
     mlir::cf::CondBranchOp::create(builder, loc, releaseHeader.getResult(0),
-                                   deallocBlock, doneBlock);
+                                   afterRelease, doneBlock);
 
     // Every box-fronted field is a slot of the body, so the release is the
     // container's: hand the block and the slot to the shared helper, which

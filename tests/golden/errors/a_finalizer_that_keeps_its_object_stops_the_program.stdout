@@ -1,0 +1,1 @@
+__del__ of A kept a reference to its object, which is not supported

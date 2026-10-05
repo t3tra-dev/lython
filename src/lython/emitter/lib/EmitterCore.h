@@ -531,6 +531,19 @@ private:
   void emitStatement(const parser::Node &statement);
   void emitPendingDefaultCells(const parser::Node &statement);
   void emitDelete(const parser::Node &statement);
+  // py.keep_alive for `value` when the program keeps locals alive and the
+  // value can hold an object that observes its release.
+  void emitKeepAlive(const parser::Node &at, Value value);
+  // py.global.clear for a main-module global at the end of the program,
+  // which is when CPython clears the module's names.
+  void emitGlobalClear(const parser::Node &at, llvm::StringRef name);
+  // py.keep_alive for every local of the frame, last bound first: CPython
+  // clears a frame's locals in reverse slot order when it returns.
+  void emitFrameExitKeepAlives(const parser::Node &at);
+  // The frame's local names in CPython's slot order: parameters, then the
+  // names it binds in the order they first appear.
+  static std::vector<std::string> frameLocalOrder(const parser::Node &callable);
+  std::vector<std::string> currentFrameLocals;
   void emitAssignTarget(const parser::Node &target, Value value);
   void emitIf(const parser::Node &statement);
   void emitMatch(const parser::Node &statement);

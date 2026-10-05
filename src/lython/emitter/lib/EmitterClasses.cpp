@@ -2265,21 +2265,6 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       auto methodName = ast::string(*statement, "name");
       if (!methodName)
         continue;
-      // ⭐ A FINALIZER THAT NEVER RUNS IS THE SILENT KIND. Nothing calls
-      // `__del__` here -- not at scope exit, not when a container drops its
-      // last reference, not at module teardown -- and the program simply
-      // printed one line fewer than CPython's. Running it means the
-      // deallocator calling back into a source method, which is a mechanism
-      // this compiler does not have; until it does, the class is refused at
-      // the earliest boundary that can see the declaration.
-      if (*methodName == "__del__") {
-        diagnostics.push_back(parser::Diagnostic{
-            parser::Severity::Error, statement->range.start,
-            "__del__ is not supported: object finalizers are never run, and a "
-            "class that defines one would be finalized silently differently "
-            "from CPython"});
-        continue;
-      }
       checkDecorators(*statement, DecoratorRole::Method, &propertyNames);
       std::string kind = methodKind(*statement);
       std::string bindingName(*methodName);
@@ -5049,7 +5034,12 @@ Value ModuleEmitter::emitInlineMethodBody(
   builder.setInsertionPointToEnd(entryBlock);
   mlir::cf::BranchOp::create(builder, loc(anchor), bodyBlock);
   builder.setInsertionPointToStart(bodyBlock);
-  inlineReturnContexts.push_back(InlineReturnContext{continuation, resultType});
+  inlineReturnContexts.push_back(InlineReturnContext{
+      continuation, resultType, /*carryResult=*/true, /*endsFrame=*/true});
+  std::vector<std::string> savedFrameLocals =
+      std::exchange(currentFrameLocals, frameLocalOrder(*method.method));
+  llvm::scope_exit restoreFrameLocals(
+      [&] { currentFrameLocals = std::move(savedFrameLocals); });
   llvm::SaveAndRestore<std::optional<NotImplementedFallback>> savedFallback(
       notImplementedFallback,
       comparisonDunderFallback(ast::string(*method.method, "name").value_or(""),
@@ -5184,6 +5174,7 @@ Value ModuleEmitter::emitInlineMethodBody(
           "inlined class method can fall through without returning a value"});
     }
     Value none = emitNone(anchor);
+    emitFrameExitKeepAlives(anchor);
     Value result = coerceValue(none, resultType, anchor);
     mlir::cf::BranchOp::create(builder, loc(anchor), continuation,
                                result.value);

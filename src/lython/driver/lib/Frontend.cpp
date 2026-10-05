@@ -79,6 +79,62 @@ static const lython::parser::Node *nodeField(const lython::parser::Node &node,
   return nullptr;
 }
 
+// ⭐ A FINALIZER IS CALLED THROUGH A METHOD THAT CANNOT RAISE. CPython runs
+// `__del__` from the deallocator and reports what it raises as unraisable
+// ("Exception ignored while calling deallocator ..."), and the deallocator
+// here is synthesized code with nothing to catch an exception in. So each
+// class that defines `__del__` gains `__ly_finalize__`, which calls it inside
+// a `try` and hands what it catches to traceback._print_unraisable, by the
+// name the emitter binds traceback to when the program has a finalizer
+// (predeclareSourceModules); the deallocator calls the method (RuntimeABI.cpp,
+// synthesizeSourceClassDeallocators). Module-level classes only: the emitter
+// refuses a class anywhere else. Returns whether it added one, so the caller
+// compiles traceback with the program.
+static bool addFinalizerWrappers(lython::parser::Node &module,
+                                 const lython::parser::ParseOptions &options) {
+  lython::parser::Field *moduleBody = lython::parser::findField(module, "body");
+  auto *statements =
+      moduleBody ? std::get_if<std::vector<lython::parser::NodePtr>>(
+                       &moduleBody->value)
+                 : nullptr;
+  if (!statements)
+    return false;
+  bool added = false;
+  for (lython::parser::NodePtr &statement : *statements) {
+    std::optional<std::string> name =
+        statement ? stringField(*statement, "name") : std::nullopt;
+    if (!statement || statement->kind != "ClassDef" || !name)
+      continue;
+    lython::parser::Field *classBody =
+        lython::parser::findField(*statement, "body");
+    auto *members =
+        classBody ? std::get_if<std::vector<lython::parser::NodePtr>>(
+                        &classBody->value)
+                  : nullptr;
+    if (!members || llvm::none_of(*members, [](const auto &member) {
+          return member && member->kind == "FunctionDef" &&
+                 stringField(*member, "name") ==
+                     std::optional<std::string>("__del__");
+        }))
+      continue;
+    lython::parser::ParseResult wrapper = lython::parser::parse(
+        "def __ly_finalize__(self) -> None:\n"
+        "    try:\n"
+        "        self.__del__()\n"
+        "    except BaseException as __ly_error:\n"
+        "        __ly_traceback._print_unraisable(\"" +
+            *name + ".__del__\", __ly_error)\n",
+        "<finalizer>", options);
+    if (!wrapper.ok())
+      continue;
+    if (const auto *wrapperBody = nodeListField(*wrapper.tree, "body")) {
+      members->insert(members->end(), wrapperBody->begin(), wrapperBody->end());
+      added = true;
+    }
+  }
+  return added;
+}
+
 // A module-level `if sys.platform == "..."` (or `!=`) decided for the target:
 // true or false, or nullopt for any other test, whose branches are both
 // collected. The emitter folds the same comparison the same way
@@ -667,6 +723,23 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
             hasJsHost, diag)))
       return failure();
   }
+  // Classes that define __del__ run it through a hidden method, which reports
+  // through traceback (addFinalizerWrappers).
+  bool finalizers = addFinalizerWrappers(*parsed.tree, options);
+  for (ParsedLocalSourceModule &source : localSources)
+    if (!source.isStub)
+      finalizers |= addFinalizerWrappers(*source.parsed.tree, options);
+  if (finalizers) {
+    lython::parser::ParseResult tracebackImport =
+        lython::parser::parse("import traceback\n", sourcePath.str(), options);
+    if (!tracebackImport.ok() ||
+        failed(collectLocalSourceModules(
+            *tracebackImport.tree, importBaseDir, mainPackageName, sourcePath,
+            localSources, seenSourceModules, visitingSourceModules,
+            driverOptions.releaseMode, codeGenTripleForTarget({}, driverOptions),
+            hasJsHost, diag)))
+      return failure();
+  }
   // A program that reaches the host's `js` can hand it callbacks, and the
   // callbacks' table and entry point are Python (runtime/lib/_js_bridge.py):
   // compiled with the program as if it had imported them.
@@ -693,6 +766,7 @@ LogicalResult emitMLIRFromSource(StringRef source, StringRef sourcePath,
     emitOptions.targetTriple =
         codeGenTripleForTarget({}, driverOptions).normalize();
     emitOptions.jsHost = hasJsHost;
+    emitOptions.keepLocalsAlive = finalizers;
     emitOptions.sourceModules.reserve(localSources.size());
     for (const ParsedLocalSourceModule &source : localSources) {
       emitOptions.sourceModules.push_back(

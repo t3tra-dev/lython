@@ -53,6 +53,9 @@ struct InlineReturnContext {
   mlir::Block *target = nullptr;
   mlir::Type resultType;
   bool carryResult = true;
+  // The return leaves a frame (an inlined method's), not a `try`: the frame's
+  // locals are let go there.
+  bool endsFrame = false;
 };
 
 // One loop-carried local: a pre-existing local reassigned in a loop body,

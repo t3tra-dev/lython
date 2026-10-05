@@ -152,8 +152,19 @@ EmitResult ModuleEmitter::emit() {
   emitImportedClassAttrInitializers();
   emitStatements(ast::nodeList(moduleNode, "body"), /*skipDeclarations=*/true);
   atModuleScope = false;
-  if (!insertionBlockTerminated(builder))
+  if (!insertionBlockTerminated(builder)) {
+    // CPython clears the main module's names at shutdown in the order they
+    // were first bound -- not reversed, as a frame's are.
+    if (options.keepLocalsAlive)
+      for (const std::string &name : frameLocalOrder(moduleNode)) {
+        auto bound = values.find(name);
+        if (bound != values.end())
+          emitKeepAlive(moduleNode, bound->second);
+        if (moduleGlobals.count(name))
+          emitGlobalClear(moduleNode, name);
+      }
     mlir::func::ReturnOp::create(builder, loc(moduleNode));
+  }
 
   EmitResult result;
   // Annotation resolution runs from const contexts (TypeSystem), so its

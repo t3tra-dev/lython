@@ -1936,7 +1936,8 @@ bool isNonRaisingRuntimeSymbol(llvm::StringRef name) {
          name == "LyEH_StashCurrentAsContext" ||
          name == "LyEH_SetCurrentCause" || name == "LyEH_SetCurrentSuppress" ||
          name == "LyEH_TryCallSiteMarker" || name == "LyEH_TryCatchMarker" ||
-         name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_");
+         name == "LyEH_TryCatchAnchor" || name.starts_with("LyTraceback_") ||
+         name == "LyObject_KeepAlive";
 }
 
 bool mayRaisePythonException(mlir::func::FuncOp function) {
