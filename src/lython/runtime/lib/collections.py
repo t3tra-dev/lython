@@ -197,6 +197,19 @@ class Counter:
             result = result + self.data[key]
         return result
 
+    def __repr__(self) -> str:
+        # CPython: `Counter()` when empty, else the dict of most_common()
+        # in that order -- count descending, insertion order on ties.
+        if len(self.data) == 0:
+            return self.__class__.__name__ + "()"
+        parts: list[str] = []
+        for key, count in self.most_common():
+            entry = repr(key)
+            entry = entry + ": "
+            entry = entry + repr(count)
+            parts.append(entry)
+        return self.__class__.__name__ + "({" + ", ".join(parts) + "})"
+
     def elements(self) -> list[str]:
         # Why concat-rebind instead of an inner append loop: a nested
         # append loop over the dict-iteration key blows past the
@@ -275,7 +288,7 @@ class OrderedDict[K, V]:
 
     def __repr__(self) -> str:
         if len(self.data) == 0:
-            return "OrderedDict()"
+            return self.__class__.__name__ + "()"
         parts: list[str] = []
         for key in self.data:
             # Built by rebinding one local instead of a single concat
@@ -286,7 +299,7 @@ class OrderedDict[K, V]:
             entry = entry + ": "
             entry = entry + repr(self.data[key])
             parts.append(entry)
-        return "OrderedDict({" + ", ".join(parts) + "})"
+        return self.__class__.__name__ + "({" + ", ".join(parts) + "})"
 
     def keys(self) -> list[K]:
         result: list[K] = []

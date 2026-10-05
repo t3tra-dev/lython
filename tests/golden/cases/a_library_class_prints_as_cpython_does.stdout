@@ -1,0 +1,11 @@
+Counter({'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1})
+Counter({'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1}) Counter({'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1})
+[Counter({'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1})]
+Counter()
+[('a', 5), ('b', 2)]
+Tally({'a': 2, 'b': 1})
+OrderedDict({'b': 1, 'a': 2}) OrderedDict()
+Ordered({'k': 3})
+time.struct_time(tm_year=1970, tm_mon=1, tm_mday=1, tm_hour=0, tm_min=0, tm_sec=0, tm_wday=3, tm_yday=1, tm_isdst=0)
+[time.struct_time(tm_year=2023, tm_mon=11, tm_mday=14, tm_hour=22, tm_min=13, tm_sec=20, tm_wday=1, tm_yday=318, tm_isdst=0)]
+os.stat_result(st_mode=

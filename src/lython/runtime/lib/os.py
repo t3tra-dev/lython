@@ -107,6 +107,20 @@ class stat_result:
         self.st_mtime: int = _stat_or_raise(path, flag, 8)
         self.st_ctime: int = _stat_or_raise(path, flag, 9)
 
+    def __repr__(self) -> str:
+        # CPython's structseq repr: the ten fields the tuple indexes, the
+        # times as the whole seconds those positions hold.
+        return ("os.stat_result(st_mode=" + str(self.st_mode)
+                + ", st_ino=" + str(self.st_ino)
+                + ", st_dev=" + str(self.st_dev)
+                + ", st_nlink=" + str(self.st_nlink)
+                + ", st_uid=" + str(self.st_uid)
+                + ", st_gid=" + str(self.st_gid)
+                + ", st_size=" + str(self.st_size)
+                + ", st_atime=" + str(self.st_atime)
+                + ", st_mtime=" + str(self.st_mtime)
+                + ", st_ctime=" + str(self.st_ctime) + ")")
+
 
 def _stat_or_raise(path: str, follow: int, index: int) -> int:
     """One stat_result field, raising the mapped OSError on failure.
