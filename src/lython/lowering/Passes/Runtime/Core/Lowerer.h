@@ -608,6 +608,11 @@ private:
                                               mlir::Type parameterType,
                                               mlir::Attribute attr,
                                               RuntimeBundle &bundle);
+  // Immortal static placeholders for these physical types, lane 0 an object
+  // header: the dead value of a group known only by its lanes.
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+  materializeStaticDeadPhysicalValues(mlir::Operation *op,
+                                      mlir::TypeRange types);
   mlir::FailureOr<mlir::Value> materializeDeadPhysicalValue(mlir::Operation *op,
                                                             mlir::Type type);
   mlir::FailureOr<RuntimeValue>

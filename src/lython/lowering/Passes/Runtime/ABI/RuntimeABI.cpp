@@ -1424,6 +1424,20 @@ RuntimeBundleLowerer::materializeDeadObjectValueImpl(
           : own::logicalOwnershipKind(contract, /*ownsObject=*/true));
 }
 
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+RuntimeBundleLowerer::materializeStaticDeadPhysicalValues(
+    mlir::Operation *op, mlir::TypeRange types) {
+  llvm::SmallVector<mlir::Value, 4> values;
+  for (auto [index, type] : llvm::enumerate(types)) {
+    mlir::FailureOr<mlir::Value> value = materializeStaticDeadPhysicalValue(
+        module, builder, op, type, /*objectHeader=*/index == 0);
+    if (mlir::failed(value))
+      return mlir::failure();
+    values.push_back(*value);
+  }
+  return values;
+}
+
 mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeDeadObjectValue(
     mlir::Operation *op, mlir::Type contract, llvm::StringRef purpose) {
   return RuntimeBundleLowerer::materializeDeadObjectValueImpl(
