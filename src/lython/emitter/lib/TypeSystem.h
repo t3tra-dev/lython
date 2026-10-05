@@ -196,6 +196,7 @@ public:
         savedCanonicalBindings;
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedClasses;
     llvm::SmallVector<llvm::StringMap<mlir::Type>, 8> savedTypeParameters;
+    llvm::SmallVector<llvm::StringSet<>, 8> savedModuleNames;
   };
 
   explicit TypeSystem(mlir::MLIRContext &context);
@@ -494,6 +495,15 @@ private:
   mlir::MLIRContext &context;
   mutable InferenceContext inferenceState;
   llvm::StringSet<llvm::MallocAllocator> importedModuleLocalNames;
+  // The module names each pushed scope bound, beside `scopes`: a module name
+  // is a fact about one binding, and goes when its scope does.
+  // ⛔ Not the one set above for every scope: `import posixpath as path`
+  // inside os, read in os's own scope, made `path` a module in every module
+  // after it, and `def path(): ...; path()` in the program was refused as
+  // "module 'path' is not a value".
+  mutable llvm::SmallVector<llvm::StringSet<>, 8> scopedModuleNames;
+  void noteModuleNameInScope(llvm::StringRef name);
+  void forgetModuleNameInScope(llvm::StringRef name) const;
   // Signatures resolved by registerModule's pre-pass, keyed by function
   // node. Only module top-level functions are memoized: nested defs,
   // lambdas, and imported source modules run under caller-specific scope
