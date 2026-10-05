@@ -69,15 +69,15 @@ append ループの時間の大半は合計側の `LyLong_Add`: 要素がヒー�
 
 ### 1.4 フェーズごとの推移 (要素あたり、100 万要素、macOS、ピーク RSS)
 
-| | 開始時 | P0 後 | P1α 後 | P1β 後 | CPython |
-|---|---|---|---|---|---|
-| `list[int]` | 117 B | 85 B | 70 B | 24 B | 40 B |
-| `list[float]` | 102 B | 70 B | 55 B | 24 B | 40 B |
-| `list[str]` | 117 B | 85 B | 70 B | 70 B | 56 B |
-| `list[tuple[int, int]]` | 333 B | 269 B | 223 B | 223 B | 101 B |
-| 2 int フィールドのインスタンス | 271 B | 224 B | 177 B | 177 B | 132 B |
-| `dict[int, int]` | 312 B | 205 B | 193 B | 169 B | 110 B |
-| `set[int]` | 264 B | 127 B | 105 B | 72 B | 93 B |
+| | 開始時 | P0 後 | P1α 後 | P1β 後 | P2 後 | CPython |
+|---|---|---|---|---|---|---|
+| `list[int]` | 117 B | 85 B | 70 B | 24 B | 9 B | 40 B |
+| `list[float]` | 102 B | 70 B | 55 B | 24 B | 9 B | 40 B |
+| `list[str]` | 117 B | 85 B | 70 B | 70 B | 55 B | 56 B |
+| `list[tuple[int, int]]` | 333 B | 269 B | 223 B | 223 B | 177 B | 101 B |
+| 2 int フィールドのインスタンス | 271 B | 224 B | 177 B | 177 B | 132 B | 132 B |
+| `dict[int, int]` | 312 B | 205 B | 193 B | 169 B | 137 B | 110 B |
+| `set[int]` | 264 B | 127 B | 105 B | 72 B | 55 B | 93 B |
 
 P1α はスロットを 5 ワードから 3 ワード (使わない refcount、class、実体) にした
 段階: 所有フラグを廃し (実体がアドレスなら所有)、ハッシュを dict は並行配列に、
@@ -100,6 +100,13 @@ setitem / dict への格納 / set.add)。リテラルと evidence を持つ appe
 hash / eq は即値どうしを値で比べ、オブジェクトを作らない。
 
 速度は append と合計 0.19 s、float 0.11 s、dict 0.11 s、インスタンス 0.07 s。
+
+P2 はスロットを 1 ワードにした段階 (S4、§3 冒頭)。float の即値タグを `…10` に、
+「アドレスでない」の判定を下位 2 bit に移し、class はワードから導く
+(`__ly_slot_class`、lowering は `slotClassFromEntity`)。単独の `object` box は
+自身がオブジェクトなので 5 ワード (refcount、class、実体) のままで、その word 2
+へのポインタがスロットとして読める。速度は append と合計 0.18 s、float 0.11 s、
+dict 0.11 s、インスタンス 0.06 s。
 即値を読むたびにオブジェクトを作るので、`d[k]` の読み出しが多いループは P1α と
 同程度にとどまる (読み出しで evidence に直接載せるのは P2 の f64 / i64 evidence
 と合わせて扱う)。
@@ -130,10 +137,13 @@ list の items 配列、dict の entries と index 表、set の表は、ヘッ�
 `Object/Ops.agda:164-172`)。そこから作った memref や要素アドレスを、伸長をまた
 いで使わない。ヘッダ自体は動かない (`realloc-of-buffer-leaves-the-box`)。
 
-**S4. 格納種別はコンテナの静的型の関数。** `list[int]` の要素種別はコンパイル時
-に決まる。型が消えた経路 (`object` や protocol 型で受けたコンテナ、repr、
-sorted など汎用のランタイム関数) のために、ヘッダが要素種別を 1 バイトで記録
-する。ランタイム関数はそれで分岐する。
+**S4. スロットのワードは自分で種別を言う。** (P2 で改訂。当初は「格納種別は
+コンテナの静的型の関数で、型の消えた経路のためにヘッダが要素種別を 1 バイトで
+記録する」だった。) スロットは 8 B の 1 ワードで、下位 2 bit がそのワードの
+種別を決める: `00` かつ 0 なら None、`00` で 0 以外ならオブジェクトのアドレス
+(class id はそのヘッダの word 1)、`…1` は即値の int、`…10` は即値の float。
+型の消えた経路も静的型の分かる経路も同じ読み方をするので、種別バイトも静的種別
+ごとの関数の版も要らない。
 
 **S5. 値型の同一性は観測できない。** int・float・str・bytes・complex に対する
 `is` はすでに emit 時に拒否されている (`EmitterExpressions.cpp`、"identity of
@@ -147,8 +157,18 @@ value types is an implementation detail")。`id()` は無い。したがって�
 
 ## 3. 値の格納種別
 
+**実装された形 (P2)。** すべてのスロットは 8 B の 1 ワード (S4)。下の表と §3.1
+は P2 以前の提案で、静的型ごとに幅を変える代わりに、ワードの下位 2 bit で種別を
+自己記述する形に置き換えた。理由: (1) class ワードは常に「実体ヘッダの word 1」
+か「即値のタグ」の写しで、持つ必要がなかった、(2) 型の消えた経路のために種別
+バイトと汎用版の関数を別に持つより、全経路が同じワードを同じ規則で読むほうが
+食い違いの余地が無い、(3) `str` や インスタンスの要素も 8 B になる (静的種別案
+では `Ref` で同じ 8 B だが、union や `T | None` は 16 B だった)。`Bool` の 1 B は
+採らない (bool は不死の単一オブジェクトのアドレスで 8 B)。
+
 スロット (コンテナの要素、インスタンスのフィールド、クロージャのセル、generator
-の frame の退避先) に値を置く形式を、静的型ごとに 1 つ決める。レジスタ上の
+の frame の退避先) に値を置く形式を、静的型ごとに 1 つ決める (以下は P2 以前の
+提案)。レジスタ上の
 レーン (lowering の `RuntimeBundle`) はこの節の対象外で、格納と取り出しの境界
 で変換する。
 
@@ -310,7 +330,7 @@ value types is an implementation detail")。`id()` は無い。したがって�
 |---|---|---|---|
 | P0 | 確保器 (§6.1〜6.3) | `RuntimeSupportBuilder.cpp`、`LLVMFinalize.cpp`、`memref.alloc` の下げ方 | 全オブジェクト −32 B、macOS の大きな list |
 | P1 | スロットを `Value` (16 B) に統一。所有フラグ・死んだ refcount ワード・ハッシュワードを廃止し、即値の int / float / bool / None をスロットに置く | `BoxLayout.h` と box ワードの直書き箇所 (§8)、`__ly_box_*`、dict / set の表 | スロット 40 → 16 B、int と float の要素の確保が 0 |
-| P2 | 静的型の分かるコンテナに 8 B 種別 (`Int` / `Float` / `Ref` / `OptRef`) と `Bool` 1 B。ヘッダに要素種別バイト。f64 evidence を lowering に追加 | コンテナ lowering、manifest の要素操作の種別ごとの版 | スロット 16 → 8 B |
+| P2 | (実施: すべてのスロットを自己記述する 8 B の 1 ワードに。当初案の静的種別・種別バイト・`Bool` 1 B は不要になった) | `BoxLayout.h`、manifest の box 読み書き、class ワードの読み手 | スロット 24 → 8 B |
 | P3 | インスタンスのフィールドを種別ごとにヘッダ直後へ | `AttributeOps.cpp`、`RuntimeABI.cpp` の合成 deallocator | 2 int フィールドで 160 + 160 → 32 B |
 | P4 | dict と set を compact 形式に | dict / set の manifest 実装 | dict 1 件 約 40 B |
 | P5 | tuple を 1 回の確保に、位置ごとの種別で | tuple の manifest 実装 | `(int, int)` で 48 B |

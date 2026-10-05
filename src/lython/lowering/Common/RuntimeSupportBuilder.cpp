@@ -1242,8 +1242,11 @@ void buildReleaseStorageRawToZero(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(tagCheck);
-  mlir::Value tag = mlir::arith::AndIOp::create(b.builder, b.loc, address, one);
-  mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::eq, tag, one);
+  // An immediate has a nonzero low two bits (int ...1, float ...10); every
+  // object is at least four-byte aligned.
+  mlir::Value tag =
+      mlir::arith::AndIOp::create(b.builder, b.loc, address, b.iconst(3));
+  mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::ne, tag, zero);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isTagged, done,
                                  mlir::ValueRange{}, probe,
                                  mlir::ValueRange{});
@@ -1311,8 +1314,11 @@ void buildRetainStorageRaw(SupportBuilder &b) {
                                  mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(tagCheck);
-  mlir::Value tag = mlir::arith::AndIOp::create(b.builder, b.loc, address, one);
-  mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::eq, tag, one);
+  // An immediate has a nonzero low two bits (int ...1, float ...10); every
+  // object is at least four-byte aligned.
+  mlir::Value tag =
+      mlir::arith::AndIOp::create(b.builder, b.loc, address, b.iconst(3));
+  mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::ne, tag, zero);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, isTagged, done,
                                  mlir::ValueRange{}, probe,
                                  mlir::ValueRange{});
@@ -1768,7 +1774,7 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   mlir::Value entity = entityWord.getResult(0);
   mlir::Value isNull = b.cmpi(mlir::arith::CmpIPredicate::eq, entity, zero);
   mlir::Value tagBit =
-      mlir::arith::AndIOp::create(b.builder, b.loc, entity, b.iconst(1));
+      mlir::arith::AndIOp::create(b.builder, b.loc, entity, b.iconst(3));
   mlir::Value isTagged = b.cmpi(mlir::arith::CmpIPredicate::ne, tagBit, zero);
   mlir::Value skip = b.orBit(isNull, isTagged);
   mlir::cf::CondBranchOp::create(b.builder, b.loc, skip, done,
@@ -1805,12 +1811,12 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(dying);
-  auto classWord = mlir::func::CallOp::create(
-      b.builder, b.loc, "boxed_load_i64", b.i64(),
-      mlir::ValueRange{slot, b.iconst(1)});
+  // The class is the object's header word 1: a slot keeps no class word
+  // (BoxLayout.h), and this entity is an address.
+  mlir::Value classWord = b.loadI64(b.gepI64(entityPtr, b.iconst(1)));
   mlir::func::CallOp::create(
       b.builder, b.loc, "__ly_release_boxed_by_contract", b.i1(),
-      mlir::ValueRange{slot, classWord.getResult(0)});
+      mlir::ValueRange{slot, classWord});
   mlir::cf::BranchOp::create(b.builder, b.loc, done, mlir::ValueRange{});
   b.builder.setInsertionPointToEnd(done);
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
@@ -1848,7 +1854,7 @@ void buildRetainPayloadSlotPtr(SupportBuilder &b) {
   mlir::Value isNull =
       b.cmpi(mlir::arith::CmpIPredicate::eq, header, zero);
   mlir::Value tagBit = mlir::arith::AndIOp::create(b.builder, b.loc, header,
-                                                   b.iconst(1));
+                                                   b.iconst(3));
   mlir::Value isTagged =
       b.cmpi(mlir::arith::CmpIPredicate::ne, tagBit, zero);
   mlir::Value skip = b.orBit(isNull, isTagged);
@@ -1884,8 +1890,10 @@ void buildRetainPayloadSlotPtr(SupportBuilder &b) {
 // wrappers the lib manifests call to release a boxed slot (whole box, or the
 // index-th slot of an items array).
 void buildReleaseBoxedPayloadRaw(SupportBuilder &b) {
+  // ⛔ The transient box's TYPE, which is the standalone box's width: the
+  // manifest declares it `memref<5xi64>`. What it holds is a slot from word 0.
   auto boxType = mlir::MemRefType::get(
-      {py::lowering::box_abi::kWordsPerBox}, b.i64());
+      {py::lowering::box_abi::kStandaloneBoxWords}, b.i64());
   auto fn = b.beginFunction(
       "LyObject_ReleaseBoxedPayloadRaw",
       b.builder.getFunctionType({boxType}, {}));

@@ -1179,7 +1179,10 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
     // are constants that happen to equal a box width, so the exemption is the
     // NAME rather than the functions, and a stride that spelled itself any
     // other way still fails.
-    {
+    // ⛔ Vacuous at a width of one: a slot IS its entity word, every stride
+    // by a literal 1 is the identity, and the check would flag each `* %one`
+    // in the manifest. It comes back with any wider slot.
+    if (py::lowering::box_abi::kWordsPerBox > 1) {
       const std::string width =
           std::to_string(py::lowering::box_abi::kWordsPerBox);
       const std::string bindIndex = " = arith.constant " + width + " : index";

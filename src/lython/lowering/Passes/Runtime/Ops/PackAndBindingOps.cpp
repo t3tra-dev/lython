@@ -720,7 +720,7 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
                                               header)
                      .getResult();
       mlir::Value entityIndex = mlir::arith::ConstantIndexOp::create(
-          builder, loc, box_abi::kEntityWord);
+          builder, loc, box_abi::kBoxEntityWord);
       mlir::Value entityWord =
           mlir::memref::LoadOp::create(builder, loc, header, entityIndex)
               .getResult();
