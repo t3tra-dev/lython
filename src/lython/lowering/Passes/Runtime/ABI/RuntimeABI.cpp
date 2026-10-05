@@ -1518,11 +1518,20 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
   // Why NOT a second allocation for the body: it would be one malloc per
   // instance on top of the header's, where this is none -- and the boxes it
   // holds used to be a malloc EACH.
-  std::int64_t headerWords = headerType.getDimSize(0);
+  //
+  // ⭐ THE BODY STARTS AT WORD 3, inside the handle's type. An instance uses
+  // three of the `builtins.object` handle's five words -- refcount, class id,
+  // body address -- and the last two were 16 bytes of every instance that
+  // nothing reads. The handle keeps its type (it is the contract's shape, and
+  // P6 of docs/object-abi.md is where widths stop selecting deallocators), so
+  // the block is at least four words: `initializeObjectHeader` zeroes word 3.
+  std::int64_t headerWords = box_abi::kInstanceBodyWord + 1;
   unsigned bodyWords = RuntimeBundleLowerer::classInstanceBodyWords(classOp);
-  mlir::Value blockBytes = mlir::arith::ConstantIndexOp::create(
-      builder, loc, (headerWords + static_cast<std::int64_t>(bodyWords)) * 8)
-      .getResult();
+  std::int64_t blockWords = std::max<std::int64_t>(
+      headerWords + static_cast<std::int64_t>(bodyWords), headerWords + 1);
+  mlir::Value blockBytes =
+      mlir::arith::ConstantIndexOp::create(builder, loc, blockWords * 8)
+          .getResult();
   mlir::Value block =
       mlir::memref::AllocOp::create(
           builder, loc,

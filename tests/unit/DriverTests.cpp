@@ -2701,8 +2701,8 @@ bool callsFunctionNamed(llvm::Module &module, llvm::StringRef callee) {
 
 } // namespace
 
-// What: an int or float a container only stores goes into its slot as the
-// slot's own word -- an int known as an i64 through `slot_word_from_i64`
+// What: an int or float a container or an instance field only stores goes
+// into its slot as the slot's own word -- an int known as an i64 through `slot_word_from_i64`
 // (no object made), an int or float object through `slot_word_taking_ref`
 // (the object dropped again when the value is immediate) -- and a read of
 // such a slot goes through `from_slot_word`, which turns an immediate back
@@ -2747,6 +2747,13 @@ TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
                     "LyFloat_SlotWordTakingRef"));
   EXPECT_FALSE(calls("xs = [1000, 2000]\nprint(xs[0])\n",
                      "LyLong_SlotWordTakingRef"));
+  // An instance field is a slot like an element.
+  EXPECT_TRUE(calls("class P:\n"
+                    "    def __init__(self, x: int) -> None:\n"
+                    "        self.x = x\n\n\n"
+                    "ps = [P(i * 1000) for i in range(3)]\n"
+                    "print(ps[1].x)\n",
+                    "LyLong_SlotWordTakingRef"));
 }
 
 // What: a value is kept referenced to the end of its frame only when its

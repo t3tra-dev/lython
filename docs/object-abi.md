@@ -69,15 +69,15 @@ append ループの時間の大半は合計側の `LyLong_Add`: 要素がヒー�
 
 ### 1.4 フェーズごとの推移 (要素あたり、100 万要素、macOS、ピーク RSS)
 
-| | 開始時 | P0 後 | P1α 後 | P1β 後 | P2 後 | CPython |
-|---|---|---|---|---|---|---|
-| `list[int]` | 117 B | 85 B | 70 B | 24 B | 9 B | 40 B |
-| `list[float]` | 102 B | 70 B | 55 B | 24 B | 9 B | 40 B |
-| `list[str]` | 117 B | 85 B | 70 B | 70 B | 55 B | 56 B |
-| `list[tuple[int, int]]` | 333 B | 269 B | 223 B | 223 B | 177 B | 101 B |
-| 2 int フィールドのインスタンス | 271 B | 224 B | 177 B | 177 B | 132 B | 132 B |
-| `dict[int, int]` | 312 B | 205 B | 193 B | 169 B | 137 B | 110 B |
-| `set[int]` | 264 B | 127 B | 105 B | 72 B | 55 B | 93 B |
+| | 開始時 | P0 後 | P1α 後 | P1β 後 | P2 後 | P3 後 | CPython |
+|---|---|---|---|---|---|---|---|
+| `list[int]` | 117 B | 85 B | 70 B | 24 B | 9 B | 9 B | 40 B |
+| `list[float]` | 102 B | 70 B | 55 B | 24 B | 9 B | 9 B | 40 B |
+| `list[str]` | 117 B | 85 B | 70 B | 70 B | 55 B | 55 B | 56 B |
+| `list[tuple[int, int]]` | 333 B | 269 B | 223 B | 223 B | 177 B | 177 B | 101 B |
+| 2 int フィールドのインスタンス | 271 B | 224 B | 177 B | 177 B | 132 B | 70 B | 132 B |
+| `dict[int, int]` | 312 B | 205 B | 193 B | 169 B | 137 B | 137 B | 110 B |
+| `set[int]` | 264 B | 127 B | 105 B | 72 B | 55 B | 55 B | 93 B |
 
 P1α はスロットを 5 ワードから 3 ワード (使わない refcount、class、実体) にした
 段階: 所有フラグを廃し (実体がアドレスなら所有)、ハッシュを dict は並行配列に、
@@ -107,6 +107,15 @@ P2 はスロットを 1 ワードにした段階 (S4、§3 冒頭)。float の�
 自身がオブジェクトなので 5 ワード (refcount、class、実体) のままで、その word 2
 へのポインタがスロットとして読める。速度は append と合計 0.18 s、float 0.11 s、
 dict 0.11 s、インスタンス 0.06 s。
+
+P3 はインスタンスのフィールドを対象にした段階。フィールドへの格納も「格納する
+だけ」の経路に加え (int / float は即値で入り、その格納のフィールド evidence は
+残さない: evidence が名指すオブジェクトをスロットが持たなくなるため)、本体を
+ハンドルの word 3 から置いた (インスタンスが使うのは refcount、class、本体アド
+レスの 3 ワードで、`builtins.object` ハンドル型の残り 2 ワードは誰も読まない 16 B
+だった)。ハンドルの型を 3 ワードにするのは幅で解放関数を選ばなくなる P6 の後。
+2 int フィールドのインスタンスは 1 個 70 B (CPython 132 B)、インスタンスのループ
+は 0.05 s。
 即値を読むたびにオブジェクトを作るので、`d[k]` の読み出しが多いループは P1α と
 同程度にとどまる (読み出しで evidence に直接載せるのは P2 の f64 / i64 evidence
 と合わせて扱う)。
@@ -331,7 +340,7 @@ value types is an implementation detail")。`id()` は無い。したがって�
 | P0 | 確保器 (§6.1〜6.3) | `RuntimeSupportBuilder.cpp`、`LLVMFinalize.cpp`、`memref.alloc` の下げ方 | 全オブジェクト −32 B、macOS の大きな list |
 | P1 | スロットを `Value` (16 B) に統一。所有フラグ・死んだ refcount ワード・ハッシュワードを廃止し、即値の int / float / bool / None をスロットに置く | `BoxLayout.h` と box ワードの直書き箇所 (§8)、`__ly_box_*`、dict / set の表 | スロット 40 → 16 B、int と float の要素の確保が 0 |
 | P2 | (実施: すべてのスロットを自己記述する 8 B の 1 ワードに。当初案の静的種別・種別バイト・`Bool` 1 B は不要になった) | `BoxLayout.h`、manifest の box 読み書き、class ワードの読み手 | スロット 24 → 8 B |
-| P3 | インスタンスのフィールドを種別ごとにヘッダ直後へ | `AttributeOps.cpp`、`RuntimeABI.cpp` の合成 deallocator | 2 int フィールドで 160 + 160 → 32 B |
+| P3 | (実施: フィールドを即値で格納、本体をハンドルの word 3 から) | `AttributeOps.cpp`、`Manifest/Calls.cpp`、`RuntimeABI.cpp` | 2 int フィールドのインスタンス 132 → 70 B |
 | P4 | dict と set を compact 形式に | dict / set の manifest 実装 | dict 1 件 約 40 B |
 | P5 | tuple を 1 回の確保に、位置ごとの種別で | tuple の manifest 実装 | `(int, int)` で 48 B |
 | P6 | 幅による解放関数の区別 (`HandleWidthRegistry`) を class id に置き換え、詰め物ワードを削除 | `HandleWidthRegistry.h`、ownership の解放関数選択 | ヘッダの縮小 |

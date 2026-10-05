@@ -604,8 +604,12 @@ RuntimeBundleLowerer::storeBoxedFieldPayloadInPlace(mlir::Operation *op,
       return RuntimeBundleLowerer::storeOptionalBoxedField(op, body, boxWord,
                                                            value, unionType,
                                                            slotName);
+  // An int or float goes in as its slot word (`slotWordOnly`); the bundle
+  // this returns then says so, and the callers keep no field evidence for it
+  // -- the object it names may be gone once the slot holds the value.
   mlir::FailureOr<RuntimeBundle> payload =
-      RuntimeBundleLowerer::materializePayloadObjectBundle(op, value);
+      RuntimeBundleLowerer::materializePayloadObjectBundle(
+          op, value, /*slotWordOnly=*/true);
   if (mlir::failed(payload))
     return mlir::failure();
   // The slot holds a canonical payload handle, so the value needs a concrete
@@ -2938,7 +2942,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
     // class-word load and a compare without the cache, and is right whichever
     // member is there.
     auto unionField = mlir::dyn_cast<py::UnionType>(fieldTypes[*fieldIndex]);
-    if (receiverIsAMerge || (unionField && !unionField.isOptional()))
+    // ⛔ AND NOT FOR A VALUE STORED AS ITS SLOT WORD: the bundle names an
+    // object (or no object at all) that the slot no longer holds.
+    const bool storedAsWord = stored->payloadSlotWord || stored->storeAsSlotWord;
+    if (receiverIsAMerge || (unionField && !unionField.isOptional()) ||
+        storedAsWord)
       updated.fieldBundles.erase(op.getName());
     else
       updated.fieldBundles[op.getName()] =
