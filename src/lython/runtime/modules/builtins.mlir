@@ -1209,7 +1209,9 @@ module attributes {
   ^try_hook:
     %box_idx = memref.extract_aligned_pointer_as_index %box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
-    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %box_base_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    // The box's word 2 reads as a slot (BoxLayout.h).
+    %box_ptr = llvm.getelementptr %box_base_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
     %hooked:3 = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
     cf.cond_br %hooked#2, ^done(%hooked#0, %hooked#1 : memref<2xi64>, memref<?xi8>), ^default
 
@@ -1264,7 +1266,9 @@ module attributes {
   ^try_hook:
     %box_idx = memref.extract_aligned_pointer_as_index %box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
-    %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %box_base_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    // The box's word 2 reads as a slot (BoxLayout.h).
+    %box_ptr = llvm.getelementptr %box_base_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
     %hooked:3 = func.call @__ly_str_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
     cf.cond_br %hooked#2, ^done(%hooked#0, %hooked#1 : memref<2xi64>, memref<?xi8>), ^fallback
 
@@ -1300,10 +1304,12 @@ module attributes {
   func.func @LyObject_BoxedEq(%lhs: memref<5xi64>, %rhs: memref<5xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__eq__"} {
     %lhs_idx = memref.extract_aligned_pointer_as_index %lhs : memref<5xi64> -> index
     %lhs_word = arith.index_cast %lhs_idx : index to i64
-    %lhs_ptr = llvm.inttoptr %lhs_word : i64 to !llvm.ptr
+    %lhs_base = llvm.inttoptr %lhs_word : i64 to !llvm.ptr
+    %lhs_ptr = llvm.getelementptr %lhs_base[2] : (!llvm.ptr) -> !llvm.ptr, i64
     %rhs_idx = memref.extract_aligned_pointer_as_index %rhs : memref<5xi64> -> index
     %rhs_word = arith.index_cast %rhs_idx : index to i64
-    %rhs_ptr = llvm.inttoptr %rhs_word : i64 to !llvm.ptr
+    %rhs_base = llvm.inttoptr %rhs_word : i64 to !llvm.ptr
+    %rhs_ptr = llvm.getelementptr %rhs_base[2] : (!llvm.ptr) -> !llvm.ptr, i64
     %eq = func.call @__ly_box_equal(%lhs_ptr, %rhs_ptr) : (!llvm.ptr, !llvm.ptr) -> i1
     func.return %eq : i1
   }
@@ -1321,7 +1327,8 @@ module attributes {
   func.func @LyObject_BoxedHash(%box: memref<5xi64>) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.method = "__hash__"} {
     %idx = memref.extract_aligned_pointer_as_index %box : memref<5xi64> -> index
     %word = arith.index_cast %idx : index to i64
-    %ptr = llvm.inttoptr %word : i64 to !llvm.ptr
+    %base = llvm.inttoptr %word : i64 to !llvm.ptr
+    %ptr = llvm.getelementptr %base[2] : (!llvm.ptr) -> !llvm.ptr, i64
     %hashed = func.call @__ly_box_hash(%ptr) : (!llvm.ptr) -> i64
     func.return %hashed : i64
   }
@@ -1332,7 +1339,14 @@ module attributes {
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    func.call @LyObject_ReleaseBoxedPayloadRaw(%box) : (memref<5xi64>) -> ()
+    // The box's word 2 is the slot it holds (BoxLayout.h); a transient box
+    // is a slot from word 0, which is what LyObject_ReleaseBoxedPayloadRaw
+    // takes.
+    %box_idx = memref.extract_aligned_pointer_as_index %box : memref<5xi64> -> index
+    %box_word = arith.index_cast %box_idx : index to i64
+    %box_base = llvm.inttoptr %box_word : i64 to !llvm.ptr
+    %held_slot = llvm.getelementptr %box_base[2] : (!llvm.ptr) -> !llvm.ptr, i64
+    func.call @release_payload_slot_ptr(%held_slot) : (!llvm.ptr) -> ()
     memref.dealloc %box : memref<5xi64>
     cf.br ^done
 
@@ -1494,14 +1508,15 @@ module attributes {
     %slot = arith.constant 0 : index
     %zero = arith.constant 0 : i64
     %immortal = arith.constant 9223372036854775807 : i64
-    // Tagged fast path: a header whose aligned pointer has bit 0 set is an
-    // inline tagged long. It owns no memory and must
-    // not be dereferenced at all.
+    // Tagged fast path: a header whose aligned pointer has either low bit set
+    // is an immediate (`__ly_slot_word_is_immediate`). It owns no memory and
+    // must not be dereferenced at all.
     %ptr_index = memref.extract_aligned_pointer_as_index %header : memref<2xi64, strided<[1], offset: ?>> -> index
     %ptr_bits = arith.index_cast %ptr_index : index to i64
-    %tag_one = arith.constant 1 : i64
-    %tag_bit = arith.andi %ptr_bits, %tag_one : i64
-    %is_tagged = arith.cmpi eq, %tag_bit, %tag_one : i64
+    %tag_mask = arith.constant 3 : i64
+    %tag_zero = arith.constant 0 : i64
+    %tag_bit = arith.andi %ptr_bits, %tag_mask : i64
+    %is_tagged = arith.cmpi ne, %tag_bit, %tag_zero : i64
     cf.cond_br %is_tagged, ^done, ^probe
 
   ^probe:
@@ -1721,7 +1736,7 @@ module attributes {
     %zero = arith.constant 0 : i64
     // The message lanes are not written: `__ly_exc_lane_words` reads them out
     // of the exception the entity word names.
-    func.call @__ly_exc_payload_store_words(%block_word, %slot, %one, %layout, %eh_word) : (i64, i64, i64, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_words(%block_word, %slot, %eh_word) : (i64, i64, i64) -> ()
     func.call @__ly_handle_retain_raw(%eh_word) : (i64) -> ()
     func.return
   }
@@ -1736,7 +1751,7 @@ module attributes {
     %box_base = arith.addi %boxes_base, %one : i64
     %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     // The member's message comes from the member, not from the box beside it.
-    %entity_slot = arith.constant 2 : i64
+    %entity_slot = arith.constant 0 : i64
     %w2 = llvm.getelementptr %box_ptr[%entity_slot] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %eh_word = llvm.load %w2 : !llvm.ptr -> i64
     %mh_word, %mh_size, %mb_word, %mb_len = func.call @__ly_exc_lane_words(%eh_word) : (i64) -> (i64, i64, i64, i64)
@@ -1754,25 +1769,21 @@ module attributes {
   // payload box %slot -- the multi-value exception args path boxes arbitrary
   // contracts in the lowering and hands the words across.
   // ⛔ THE ONE PLACE THE WIDTH IS STILL SPELLED OUT, and the only one where that
-  // is safe: it takes the box's words as separate arguments, so the width is
+  // is safe: it takes the slot's words as separate arguments, so the width is
   // its ARITY -- and an arity that disagrees with `objectPayloadHandleWords` is
-  // a verifier error at build time, not a wrong word at run time. Its two
-  // callers pass the words positionally for the same reason.
-  func.func private @__ly_exc_payload_store_words(%block_word: i64, %slot: i64, %w0: i64, %w1: i64, %w2: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store_words"} {
+  // a verifier error at build time, not a wrong word at run time. A slot is
+  // one word now (BoxLayout.h).
+  func.func private @__ly_exc_payload_store_words(%block_word: i64, %slot: i64, %w0: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store_words"} {
     %words = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
     %boxes_base = arith.muli %slot, %words : i64
     %box_base = arith.addi %boxes_base, %one : i64
     %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %s0 = llvm.getelementptr %box_ptr[0] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %w0, %s0 : i64, !llvm.ptr
-    %s1 = llvm.getelementptr %box_ptr[1] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %w1, %s1 : i64, !llvm.ptr
-    %s2 = llvm.getelementptr %box_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %w2, %s2 : i64, !llvm.ptr
+    llvm.store %w0, %box_ptr : i64, !llvm.ptr
     func.return
   }
+
 
   // Store a str as boxed payload arg %slot: the same box layout
   // __ly_unicode_store_item writes into a tuple slot, aimed at the payload
@@ -1784,7 +1795,7 @@ module attributes {
     %str_class = arith.constant 4 : i64
     %hdr_idx = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_idx : index to i64
-    func.call @__ly_exc_payload_store_words(%block, %slot, %one, %str_class, %hdr_ptr) : (i64, i64, i64, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_words(%block, %slot, %hdr_ptr) : (i64, i64, i64) -> ()
     func.return
   }
 
@@ -1792,12 +1803,8 @@ module attributes {
   // and retain the entity, the same pairing LyBaseException_Args uses when it
   // copies a slot back out into a tuple.
   func.func private @__ly_exc_payload_store_box(%block: i64, %slot: i64, %box: !llvm.ptr) {
-    %w0 = llvm.load %box : !llvm.ptr -> i64
-    %g1 = llvm.getelementptr %box[1] : (!llvm.ptr) -> !llvm.ptr, i64
-    %v1 = llvm.load %g1 : !llvm.ptr -> i64
-    %g2 = llvm.getelementptr %box[2] : (!llvm.ptr) -> !llvm.ptr, i64
-    %v2 = llvm.load %g2 : !llvm.ptr -> i64
-    func.call @__ly_exc_payload_store_words(%block, %slot, %w0, %v1, %v2) : (i64, i64, i64, i64, i64) -> ()
+    %v2 = llvm.load %box : !llvm.ptr -> i64
+    func.call @__ly_exc_payload_store_words(%block, %slot, %v2) : (i64, i64, i64) -> ()
     func.call @__ly_handle_retain_raw(%v2) : (i64) -> ()
     func.return
   }
@@ -1830,8 +1837,8 @@ module attributes {
     %sout:2 = scf.if %ssingle -> (memref<2xi64>, memref<?xi8>) {
       %sblock_ptr = llvm.inttoptr %sblock : i64 to !llvm.ptr
       %sbox_ptr = llvm.getelementptr %sblock_ptr[%sc1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %sclass_gep = llvm.getelementptr %sbox_ptr[%sc1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %sclass_id = llvm.load %sclass_gep : !llvm.ptr -> i64
+      %sclass_word = llvm.load %sbox_ptr : !llvm.ptr -> i64
+      %sclass_id = func.call @__ly_slot_class(%sclass_word) : (i64) -> i64
       // ⛔ KeyError.__str__ IS repr(args[0]) IN CPYTHON, and it is inherited, so
       // the taxonomy walk decides rather than an equality test: routing a
       // non-str argument through the generic payload path would otherwise lose
@@ -1903,8 +1910,8 @@ module attributes {
       %box_off = arith.muli %i_i64, %sixteen : i64
       %box_base = arith.addi %box_off, %c1_i64 : i64
       %box_ptr = llvm.getelementptr %block_ptr[%box_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+      %class_word = llvm.load %box_ptr : !llvm.ptr -> i64
+      %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
       %erh, %erb, %ok = func.call @__ly_repr_boxed_by_contract(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
       cf.assert %ok, "exception args: boxed value has no conforming __repr__"
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
@@ -3096,8 +3103,8 @@ module attributes {
           %abox_off = arith.muli %ai_i64, %asixteen : i64
           %abox_base = arith.addi %abox_off, %ac1 : i64
           %abox_ptr = llvm.getelementptr %ablock_ptr[%abox_base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-          %aclass_gep = llvm.getelementptr %abox_ptr[%ac1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-          %aclass_id = llvm.load %aclass_gep : !llvm.ptr -> i64
+          %aclass_word = llvm.load %abox_ptr : !llvm.ptr -> i64
+          %aclass_id = func.call @__ly_slot_class(%aclass_word) : (i64) -> i64
           %aer_h, %aer_b, %aok = func.call @__ly_repr_boxed_by_contract(%abox_ptr, %aclass_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
           cf.assert %aok, "exception repr: boxed arg has no conforming __repr__"
           %anh, %anb = func.call @LyUnicode_Concat(%asep#0, %asep#1, %aer_h, %aer_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
@@ -5113,7 +5120,7 @@ module attributes {
     %true = arith.constant true
     %all_fit = scf.for %index = %c0 to %count step %c1 iter_args(%ok = %true) -> (i1) {
       %base = arith.muli %index, %handle_words_index : index
-      %entity_slot = arith.addi %base, %c2 : index
+      %entity_slot = arith.addi %base, %c0 : index
       %entity = memref.load %slots[%entity_slot] : memref<?xi64>
       %value, %fits = func.call @LyLong_SlotWordAsI64(%entity) : (i64) -> (i64, i1)
       %low = arith.cmpi sge, %value, %zero : i64
@@ -5131,7 +5138,7 @@ module attributes {
     %payload = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
     scf.for %index = %c0 to %count step %c1 {
       %base = arith.muli %index, %handle_words_index : index
-      %entity_slot = arith.addi %base, %c2 : index
+      %entity_slot = arith.addi %base, %c0 : index
       %entity = memref.load %slots[%entity_slot] : memref<?xi64>
       %value, %fits = func.call @LyLong_SlotWordAsI64(%entity) : (i64) -> (i64, i1)
       %byte = arith.trunci %value : i64 to i8
@@ -7451,10 +7458,41 @@ module attributes {
   // every int in an object; here only the ones past 2^62 are (2^30 on a
   // 32-bit target, `__ly_addresses_are_word_wide`).
   func.func private @__ly_slot_word_is_immediate(%word: i64) -> i1 {
-    %one = arith.constant 1 : i64
-    %tag = arith.andi %word, %one : i64
-    %is = arith.cmpi eq, %tag, %one : i64
+    %mask = arith.constant 3 : i64
+    %zero = arith.constant 0 : i64
+    %tag = arith.andi %word, %mask : i64
+    %is = arith.cmpi ne, %tag, %zero : i64
     func.return %is : i1
+  }
+
+  // The class a slot word names: 0 for None (the word 0), int or float for an
+  // immediate by its tag, and otherwise the class id every object keeps in
+  // its header's word 1.
+  func.func private @__ly_slot_class(%word: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %tag = arith.andi %word, %three : i64
+    %is_object = arith.cmpi eq, %tag, %zero : i64
+    %is_null = arith.cmpi eq, %word, %zero : i64
+    %int_tag = arith.andi %word, %one : i64
+    %is_int = arith.cmpi ne, %int_tag, %zero : i64
+    %immediate_class = arith.select %is_int, %one, %two : i1, i64
+    %class = scf.if %is_object -> (i64) {
+      %object_class = scf.if %is_null -> (i64) {
+        scf.yield %zero : i64
+      } else {
+        %ptr = llvm.inttoptr %word : i64 to !llvm.ptr
+        %class_gep = llvm.getelementptr %ptr[1] : (!llvm.ptr) -> !llvm.ptr, i64
+        %loaded = llvm.load %class_gep : !llvm.ptr -> i64
+        scf.yield %loaded : i64
+      }
+      scf.yield %object_class : i64
+    } else {
+      scf.yield %immediate_class : i64
+    }
+    func.return %class : i64
   }
 
   // True when an address is as wide as a slot word. On a 32-bit target
@@ -7517,21 +7555,24 @@ module attributes {
   // 100 -- magnitudes in [2^-255, 2^256), every float most programs make --
   // or when it is +0.0. Rotating left by three brings sign and the two high
   // exponent bits to the bottom; those two bits are recoverable from the
-  // third (bit 63 after the rotation), so they make room for the tag. +0.0 is
-  // the word 3, which no rotated float produces (they all have bit 1 clear).
-  // This is Ruby's flonum, with the tag in bit 0 instead of bit 1.
+  // third (bit 63 after the rotation), so they make room for the tag `10`.
+  // This is Ruby's flonum. +0.0 takes the word of 0x3000000000000000 (the
+  // one in-range pattern excluded), whose rotation is the word below.
   func.func private @__ly_float_immediate_fits(%bits: i64) -> i1 {
     %zero = arith.constant 0 : i64
     %sixty = arith.constant 60 : i64
     %seven = arith.constant 7 : i64
     %three_top = arith.constant 3 : i64
     %one = arith.constant 1 : i64
+    %excluded = arith.constant 3458764513820540928 : i64
     %top = arith.shrui %bits, %sixty : i64
     %exp_top = arith.andi %top, %seven : i64
     %rebased = arith.subi %exp_top, %three_top : i64
     %in_range = arith.cmpi ule, %rebased, %one : i64
+    %not_excluded = arith.cmpi ne, %bits, %excluded : i64
+    %ranged = arith.andi %in_range, %not_excluded : i1
     %is_zero = arith.cmpi eq, %bits, %zero : i64
-    %encodable = arith.ori %in_range, %is_zero : i1
+    %encodable = arith.ori %ranged, %is_zero : i1
     %wide = func.call @__ly_addresses_are_word_wide() : () -> i1
     %fits = arith.andi %encodable, %wide : i1
     func.return %fits : i1
@@ -7539,28 +7580,29 @@ module attributes {
 
   func.func private @__ly_float_to_immediate(%bits: i64) -> i64 {
     %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
     %three = arith.constant 3 : i64
     %sixty_one = arith.constant 61 : i64
     %low_clear = arith.constant -4 : i64
+    %zero_word = arith.constant -9223372036854775806 : i64
     %high = arith.shli %bits, %three : i64
     %low = arith.shrui %bits, %sixty_one : i64
     %rotated = arith.ori %high, %low : i64
     %cleared = arith.andi %rotated, %low_clear : i64
-    %tagged = arith.ori %cleared, %one : i64
+    %tagged = arith.ori %cleared, %two : i64
     %is_zero = arith.cmpi eq, %bits, %zero : i64
-    %word = arith.select %is_zero, %three, %tagged : i1, i64
+    %word = arith.select %is_zero, %zero_word, %tagged : i1, i64
     func.return %word : i64
   }
 
   func.func private @__ly_float_from_immediate(%word: i64) -> i64 {
     %zero = arith.constant 0 : i64
-    %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
     %three = arith.constant 3 : i64
     %sixty_one = arith.constant 61 : i64
     %sixty_three = arith.constant 63 : i64
     %low_clear = arith.constant -4 : i64
+    %zero_word = arith.constant -9223372036854775806 : i64
     %b63 = arith.shrui %word, %sixty_three : i64
     %restored_low = arith.subi %two, %b63 : i64
     %cleared = arith.andi %word, %low_clear : i64
@@ -7568,7 +7610,7 @@ module attributes {
     %low = arith.shrui %rotated, %three : i64
     %high = arith.shli %rotated, %sixty_one : i64
     %bits = arith.ori %low, %high : i64
-    %is_zero = arith.cmpi eq, %word, %three : i64
+    %is_zero = arith.cmpi eq, %word, %zero_word : i64
     %result = arith.select %is_zero, %zero, %bits : i1, i64
     func.return %result : i64
   }
@@ -13504,7 +13546,7 @@ module attributes {
   // which is the point of the conversion: a reallocation updates one place and
   // every reader sees it, instead of leaving a stale copy in each box.
   func.func private @__ly_bytes_item_words(%items: memref<?xi64>, %slot: index) -> (i64, i64, i64) {
-    %c2 = arith.constant 2 : index
+    %c2 = arith.constant 0 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
     %c2_i64 = arith.constant 2 : i64
@@ -13524,7 +13566,7 @@ module attributes {
   // The bytes come from the block the entity word names, the way
   // `__ly_bytes_item_words` reads a bytes element: the box holds one address.
   func.func private @__ly_unicode_item_words(%items: memref<?xi64>, %slot: index) -> (i64, i64, i64) {
-    %c2 = arith.constant 2 : index
+    %c2 = arith.constant 0 : index
     %base = func.call @__ly_box_slot_base_index(%slot) : (index) -> index
     %hdr_slot = arith.addi %base, %c2 : index
     %hdr = memref.load %items[%hdr_slot] : memref<?xi64>
@@ -18322,12 +18364,13 @@ module attributes {
   // The layout itself is ABI/BoxLayout.h, and `ManifestBoxLayoutTest` checks
   // that these five agree with it.
   func.func private @__ly_box_word_count() -> i64 {
-    %words = arith.constant 3 : i64
+    %words = arith.constant 1 : i64
     func.return %words : i64
   }
 
-  // A standalone `object` box: the slot's words plus two the box does not use
-  // (BoxLayout.h, kStandaloneBoxWords).
+  // A standalone `object` box: refcount, class id, entity, and two words the
+  // box does not use (BoxLayout.h, kStandaloneBoxWords). A pointer to its
+  // word 2 reads as a slot.
   func.func private @__ly_box_standalone_word_count() -> i64 {
     %words = arith.constant 5 : i64
     func.return %words : i64
@@ -18348,7 +18391,7 @@ module attributes {
 
   // The one address a box holds.
   func.func private @__ly_box_entity_word(%base: i64) -> i64 {
-    %entity = arith.constant 2 : i64
+    %entity = arith.constant 0 : i64
     %word = arith.addi %base, %entity : i64
     func.return %word : i64
   }
@@ -18359,18 +18402,12 @@ module attributes {
   // block they described.
   // The box owns its entity exactly when the entity is an address: not 0
   // (None) and not an immediate (bit 0 set). There is no flag to disagree.
+  // ⛔ %class_id is not stored: a slot's class is its entity's
+  // (`__ly_slot_class`). The callers name it so they read as what they store.
   func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_id: i64, %entity: i64) {
-    %one = arith.constant 1 : i64
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
     %base_i64 = func.call @__ly_box_slot_base(%slot) : (i64) -> i64
-    %base = arith.index_cast %base_i64 : i64 to index
     %entity_word = func.call @__ly_box_entity_word(%base_i64) : (i64) -> i64
-    %refcount_slot = arith.addi %base, %c0 : index
-    %class_slot = arith.addi %base, %c1 : index
     %entity_slot = arith.index_cast %entity_word : i64 to index
-    memref.store %one, %items[%refcount_slot] : memref<?xi64>
-    memref.store %class_id, %items[%class_slot] : memref<?xi64>
     memref.store %entity, %items[%entity_slot] : memref<?xi64>
     func.return
   }
@@ -18379,8 +18416,8 @@ module attributes {
     %zero = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
-    %class_gep = llvm.getelementptr %box[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+    %slot_word = llvm.load %box : !llvm.ptr -> i64
+    %class_id = func.call @__ly_slot_class(%slot_word) : (i64) -> i64
     %is_none = arith.cmpi eq, %class_id, %zero : i64
     %result = scf.if %is_none -> (i64) {
       // hash(None): the CPython 3.12+ constant.
@@ -18401,8 +18438,7 @@ module attributes {
       // ⭐ An immediate int hashes from its value, with no object made for
       // the hook to read: CPython's long_hash, v mod (2^61 - 1) with the sign
       // carried over, on a value that fits a word.
-      %entity_gep0 = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %entity0 = llvm.load %entity_gep0 : !llvm.ptr -> i64
+      %entity0 = llvm.load %box : !llvm.ptr -> i64
       %int_class = arith.constant 1 : i64
       %is_int = arith.cmpi eq, %class_id, %int_class : i64
       %is_immediate = func.call @__ly_slot_word_is_immediate(%entity0) : (i64) -> i1
@@ -18427,8 +18463,7 @@ module attributes {
         scf.yield %fixed : i64
       } else {
         // Identity hash: the CPython pointer hash (rotate right by 4).
-        %entity_gep = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %p = llvm.load %entity_gep : !llvm.ptr -> i64
+        %p = llvm.load %box : !llvm.ptr -> i64
         %c4 = arith.constant 4 : i64
         %c60 = arith.constant 60 : i64
         %lo = arith.shrui %p, %c4 : i64
@@ -18455,8 +18490,7 @@ module attributes {
     %c1 = arith.constant 1 : i64
     %c2 = arith.constant 2 : i64
     %c4 = arith.constant 4 : i64
-    %entity_gep = llvm.getelementptr %box[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %entity_word = llvm.load %entity_gep : !llvm.ptr -> i64
+    %entity_word = llvm.load %box : !llvm.ptr -> i64
     %immediate = func.call @__ly_slot_word_is_immediate(%entity_word) : (i64) -> i1
     %sign, %count, %digits_word = scf.if %immediate -> (i64, i64, i64) {
       %value = func.call @__ly_int_from_immediate(%entity_word) : (i64) -> i64
@@ -18667,14 +18701,10 @@ module attributes {
     %false = arith.constant false
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
-    %lhs_class_gep = llvm.getelementptr %lhs[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %rhs_class_gep = llvm.getelementptr %rhs[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %lhs_class = llvm.load %lhs_class_gep : !llvm.ptr -> i64
-    %rhs_class = llvm.load %rhs_class_gep : !llvm.ptr -> i64
-    %lhs_ptr_gep = llvm.getelementptr %lhs[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %rhs_ptr_gep = llvm.getelementptr %rhs[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %lhs_ptr = llvm.load %lhs_ptr_gep : !llvm.ptr -> i64
-    %rhs_ptr = llvm.load %rhs_ptr_gep : !llvm.ptr -> i64
+    %lhs_ptr = llvm.load %lhs : !llvm.ptr -> i64
+    %rhs_ptr = llvm.load %rhs : !llvm.ptr -> i64
+    %lhs_class = func.call @__ly_slot_class(%lhs_ptr) : (i64) -> i64
+    %rhs_class = func.call @__ly_slot_class(%rhs_ptr) : (i64) -> i64
     %same_ptr = arith.cmpi eq, %lhs_ptr, %rhs_ptr : i64
     %ptr_nonzero = arith.cmpi ne, %lhs_ptr, %zero : i64
     %same_class = arith.cmpi eq, %lhs_class, %rhs_class : i64
@@ -18759,8 +18789,7 @@ module attributes {
   // Boxed bool as an i64 value (0/1) via the singleton's value word.
   func.func private @__ly_boxed_bool_value(%box: !llvm.ptr) -> i64 {
     %c2_i64 = arith.constant 2 : i64
-    %entity_gep = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %entity_word = llvm.load %entity_gep : !llvm.ptr -> i64
+    %entity_word = llvm.load %box : !llvm.ptr -> i64
     %entity = llvm.inttoptr %entity_word : i64 to !llvm.ptr
     %value_gep = llvm.getelementptr %entity[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %value = llvm.load %value_gep : !llvm.ptr -> i64
@@ -18774,8 +18803,7 @@ module attributes {
   // lane 1, which one-laning float left uninitialised.
   func.func private @__ly_boxed_float_value(%box: !llvm.ptr) -> f64 {
     %c2_i64 = arith.constant 2 : i64
-    %entity_gep = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %entity_word = llvm.load %entity_gep : !llvm.ptr -> i64
+    %entity_word = llvm.load %box : !llvm.ptr -> i64
     %value = func.call @LyFloat_SlotWordAsF64(%entity_word) : (i64) -> f64
     func.return %value : f64
   }
@@ -19020,10 +19048,10 @@ module attributes {
   func.func private @__ly_box_less(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1 {
     %false = arith.constant false
     %c1_i64 = arith.constant 1 : i64
-    %lhs_class_gep = llvm.getelementptr %lhs[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %rhs_class_gep = llvm.getelementptr %rhs[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %lhs_class = llvm.load %lhs_class_gep : !llvm.ptr -> i64
-    %rhs_class = llvm.load %rhs_class_gep : !llvm.ptr -> i64
+    %lhs_word = llvm.load %lhs : !llvm.ptr -> i64
+    %rhs_word = llvm.load %rhs : !llvm.ptr -> i64
+    %lhs_class = func.call @__ly_slot_class(%lhs_word) : (i64) -> i64
+    %rhs_class = func.call @__ly_slot_class(%rhs_word) : (i64) -> i64
     %int_class = arith.constant 1 : i64
     %float_class = arith.constant 2 : i64
     %bool_class = arith.constant 22 : i64
@@ -19574,7 +19602,7 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
-    %c2_slot = arith.constant 2 : index
+    %c2_slot = arith.constant 0 : index
     %len_index = arith.index_cast %src_len : i64 to index
     scf.for %i = %c0 to %len_index step %c1 {
       %base = arith.muli %i, %c16 : index
@@ -20069,7 +20097,7 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
-    %c2_slot = arith.constant 2 : index
+    %c2_slot = arith.constant 0 : index
     %llen_index = arith.index_cast %llen : i64 to index
     %rlen_index = arith.index_cast %rlen : i64 to index
     scf.for %i = %c0 to %llen_index step %c1 {
@@ -20130,7 +20158,7 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
-    %c2_slot = arith.constant 2 : index
+    %c2_slot = arith.constant 0 : index
     %len_index = arith.index_cast %len : i64 to index
     %n_index = arith.index_cast %n : i64 to index
     scf.for %rep = %c0 to %n_index step %c1 {
@@ -20720,8 +20748,9 @@ module attributes {
     %one = arith.constant 1 : i64
     %immortal = arith.constant 9223372036854775807 : i64
     %is_null = arith.cmpi eq, %entity, %zero : i64
-    %tag = arith.andi %entity, %one : i64
-    %is_tagged = arith.cmpi eq, %tag, %one : i64
+    %tag_mask = arith.constant 3 : i64
+    %tag = arith.andi %entity, %tag_mask : i64
+    %is_tagged = arith.cmpi ne, %tag, %zero : i64
     %skip = arith.ori %is_null, %is_tagged : i1
     scf.if %skip {
     } else {
@@ -20745,42 +20774,43 @@ module attributes {
   func.func @LyObject_FromSlot(%items: memref<?xi64>, %slot: i64, %valid: i1) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "from_slot", ly.runtime.result_contract = "builtins.object"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %words = func.call @__ly_box_word_count() : () -> i64
-    %c16 = arith.index_cast %words : i64 to index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %box = memref.alloc() {alignment = 16 : i64, ly.ownership.object_header, ly.ownership.owned_local_object} : memref<5xi64>
+    %all_words_i64 = func.call @__ly_box_standalone_word_count() : () -> i64
+    %all_words = arith.index_cast %all_words_i64 : i64 to index
+    scf.for %w = %c0 to %all_words step %c1 {
+      memref.store %zero, %box[%w] : memref<5xi64>
+    }
+    %refcount_slot = arith.constant 0 : index
+    memref.store %one, %box[%refcount_slot] : memref<5xi64>
     scf.if %valid {
-      %slot_index = arith.index_cast %slot : i64 to index
-      %base = func.call @__ly_box_slot_base_index(%slot_index) : (index) -> index
-      scf.for %w = %c0 to %c16 step %c1 {
-        %src = arith.addi %base, %w : index
-        %word = memref.load %items[%src] : memref<?xi64>
-        memref.store %word, %box[%w] : memref<5xi64>
-      }
-      %refcount_slot = arith.constant 0 : index
-      memref.store %one, %box[%refcount_slot] : memref<5xi64>
-      // The standalone box is wider than a slot; the words past the slot's
-      // are not read, and are zeroed so a dump of one says so.
-      %box_words_i64 = func.call @__ly_box_standalone_word_count() : () -> i64
-      %box_words = arith.index_cast %box_words_i64 : i64 to index
-      scf.for %w = %c16 to %box_words step %c1 {
-        memref.store %zero, %box[%w] : memref<5xi64>
-      }
-      %entity_slot = arith.constant 2 : index
-      %entity = memref.load %box[%entity_slot] : memref<5xi64>
-      // Skips a null or tagged entity, which is exactly what the box then
+      %base_i64 = func.call @__ly_box_slot_base(%slot) : (i64) -> i64
+      %entity_word = func.call @__ly_box_entity_word(%base_i64) : (i64) -> i64
+      %entity_index = arith.index_cast %entity_word : i64 to index
+      %entity = memref.load %items[%entity_index] : memref<?xi64>
+      %class_id = func.call @__ly_slot_class(%entity) : (i64) -> i64
+      %class_slot = arith.constant 1 : index
+      %box_entity_slot = arith.constant 2 : index
+      memref.store %class_id, %box[%class_slot] : memref<5xi64>
+      memref.store %entity, %box[%box_entity_slot] : memref<5xi64>
+      // Skips a null or immediate entity, which is exactly what the box then
       // does not own (`release_payload_slot_ptr` asks the same question).
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
-    } else {
-      %all_words_i64 = func.call @__ly_box_standalone_word_count() : () -> i64
-      %all_words = arith.index_cast %all_words_i64 : i64 to index
-      scf.for %w = %c0 to %all_words step %c1 {
-        memref.store %zero, %box[%w] : memref<5xi64>
-      }
-      %refcount_slot = arith.constant 0 : index
-      memref.store %one, %box[%refcount_slot] : memref<5xi64>
     }
+    func.return %box : memref<5xi64>
+  }
+
+
+  // A standalone box of the value in the slot at %slot_word (an address),
+  // with a reference of its own: for a slot that is not in an items array,
+  // like an exception's field block.
+  func.func @LyObject_FromSlotPtr(%slot_word: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "from_slot_ptr", ly.runtime.result_contract = "builtins.object"} {
+    %one = arith.constant 1 : i64
+    %view = func.call @__ly_global_view_i64(%slot_word, %one) : (i64, i64) -> memref<?xi64>
+    %zero = arith.constant 0 : i64
+    %true = arith.constant true
+    %box = func.call @LyObject_FromSlot(%view, %zero, %true) : (memref<?xi64>, i64, i1) -> memref<5xi64>
     func.return %box : memref<5xi64>
   }
 
@@ -21887,8 +21917,8 @@ module attributes {
   // the repr of the key for a dict miss).
   func.func private @__ly_dict_raise_missing_key(%key_box: !llvm.ptr) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "raise_missing_key_ptr"} {
     %c1 = arith.constant 1 : i64
-    %class_gep = llvm.getelementptr %key_box[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+    %class_word = llvm.load %key_box : !llvm.ptr -> i64
+    %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
     %rh, %rb, %ok = func.call @__ly_repr_boxed_by_contract(%key_box, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>, i1)
     // A key class without a conforming __repr__ still gets a catchable
     // KeyError, CPython-style: fall back to the default object repr keyed on
@@ -22171,7 +22201,7 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
-    %c2_slot = arith.constant 2 : index
+    %c2_slot = arith.constant 0 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %length_slot = arith.constant 2 : index
@@ -22234,7 +22264,7 @@ module attributes {
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
-    %c2_slot = arith.constant 2 : index
+    %c2_slot = arith.constant 0 : index
     %src_idx = memref.extract_aligned_pointer_as_index %src_keys : memref<?xi64> -> index
     %src_i64 = arith.index_cast %src_idx : index to i64
     %src_ptr = llvm.inttoptr %src_i64 : i64 to !llvm.ptr
@@ -22565,8 +22595,8 @@ module attributes {
       }
       %off = arith.muli %i_i64, %c16_i64 : i64
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+      %class_word = llvm.load %box_ptr : !llvm.ptr -> i64
+      %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
       %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
@@ -22620,8 +22650,8 @@ module attributes {
       }
       %off = arith.muli %i_i64, %c16_i64 : i64
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+      %class_word = llvm.load %box_ptr : !llvm.ptr -> i64
+      %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
       %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
@@ -22728,8 +22758,8 @@ module attributes {
         %off = arith.muli %i_i64, %c16_i64 : i64
         // key repr
         %kbox = llvm.getelementptr %keys_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %kclass_gep = llvm.getelementptr %kbox[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %kclass = llvm.load %kclass_gep : !llvm.ptr -> i64
+        %kclass_word = llvm.load %kbox : !llvm.ptr -> i64
+        %kclass = func.call @__ly_slot_class(%kclass_word) : (i64) -> i64
         %krh, %krb = func.call @__ly_repr_boxed_or_default(%kbox, %kclass) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
         %k1h, %k1b = func.call @LyUnicode_Concat(%sep#0, %sep#1, %krh, %krb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
@@ -22743,8 +22773,8 @@ module attributes {
         func.call @LyUnicode_DecRef(%coh) : (memref<2xi64>) -> ()
         // value repr
         %vbox = llvm.getelementptr %values_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %vclass_gep = llvm.getelementptr %vbox[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %vclass = llvm.load %vclass_gep : !llvm.ptr -> i64
+        %vclass_word = llvm.load %vbox : !llvm.ptr -> i64
+        %vclass = func.call @__ly_slot_class(%vclass_word) : (i64) -> i64
         %vrh, %vrb = func.call @__ly_repr_boxed_or_default(%vbox, %vclass) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
         %k3h, %k3b = func.call @LyUnicode_Concat(%k2h, %k2b, %vrh, %vrb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%k2h) : (memref<2xi64>) -> ()
@@ -22801,8 +22831,8 @@ module attributes {
       }
       %off = arith.muli %i_i64, %c16_i64 : i64
       %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_gep = llvm.getelementptr %box_ptr[%c1_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %class_id = llvm.load %class_gep : !llvm.ptr -> i64
+      %class_word = llvm.load %box_ptr : !llvm.ptr -> i64
+      %class_id = func.call @__ly_slot_class(%class_word) : (i64) -> i64
       %erh, %erb = func.call @__ly_repr_boxed_or_default(%box_ptr, %class_id) : (!llvm.ptr, i64) -> (memref<2xi64>, memref<?xi8>)
       %nh, %nb = func.call @LyUnicode_Concat(%sep#0, %sep#1, %erh, %erb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%sep#0) : (memref<2xi64>) -> ()
@@ -23409,7 +23439,7 @@ module attributes {
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
-    %entity_slot = arith.constant 2 : index
+    %entity_slot = arith.constant 0 : index
     %length_slot = arith.constant 2 : index
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
@@ -23552,7 +23582,7 @@ module attributes {
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %big = arith.constant 50000 : i64
     %four = arith.constant 4 : i64
-    %entity_slot = arith.constant 2 : index
+    %entity_slot = arith.constant 0 : index
     %length_slot = arith.constant 2 : index
     %mask_slot = arith.constant 6 : index
     %fill_slot = arith.constant 7 : index
@@ -23963,7 +23993,7 @@ module attributes {
     %c16 = arith.index_cast %c16_words : i64 to index
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %true = arith.constant true
-    %entity_slot = arith.constant 2 : index
+    %entity_slot = arith.constant 0 : index
     %length_slot = arith.constant 2 : index
     %mask_slot = arith.constant 6 : index
     %fill_slot = arith.constant 7 : index

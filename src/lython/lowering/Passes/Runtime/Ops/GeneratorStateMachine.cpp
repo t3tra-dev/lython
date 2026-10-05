@@ -3342,12 +3342,12 @@ mlir::LogicalResult RuntimeBundleLowerer::raiseStopIterationCarrying(
     // A union returns boxed, and its box is already the handle a slot keeps.
     // The block takes its own reference to what the box holds; the box is
     // released with the span below.
+    // The slot is the box's entity word (BoxLayout.h).
     mlir::Value box = returnSpan.front();
-    for (std::int64_t word = 0; word < box_abi::kWordsPerBox; ++word)
-      words.push_back(mlir::memref::LoadOp::create(
-                          builder, loc, box, constantIndex(builder, loc, word))
-                          .getResult());
-    words[0] = constantI64(builder, loc, 1);
+    words.push_back(mlir::memref::LoadOp::create(
+                        builder, loc, box,
+                        constantIndex(builder, loc, box_abi::kBoxEntityWord))
+                        .getResult());
     auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
     mlir::func::FuncOp retainSlot = getOrCreatePrivateFunction(
         module, builder, "retain_payload_slot_ptr",
@@ -3356,10 +3356,15 @@ mlir::LogicalResult RuntimeBundleLowerer::raiseStopIterationCarrying(
         builder, loc, builder.getI64Type(),
         mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
                                                              box));
-    mlir::func::CallOp::create(
-        builder, loc, retainSlot,
-        mlir::ValueRange{
-            mlir::LLVM::IntToPtrOp::create(builder, loc, ptrType, address)});
+    mlir::Value boxBase =
+        mlir::LLVM::IntToPtrOp::create(builder, loc, ptrType, address);
+    mlir::Value heldSlot = mlir::LLVM::GEPOp::create(
+        builder, loc, ptrType, builder.getI64Type(), boxBase,
+        llvm::ArrayRef<mlir::LLVM::GEPArg>{
+            mlir::LLVM::GEPArg(static_cast<std::int32_t>(
+                box_abi::kBoxEntityWord))});
+    mlir::func::CallOp::create(builder, loc, retainSlot,
+                               mlir::ValueRange{heldSlot});
   } else {
     RuntimeBundle returned;
     if (lane.isControl()) {
@@ -3526,8 +3531,9 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   // knows; None's box has no class.
   if (info.returnLane.contract == "builtins.object") {
     mlir::Value classWord =
-        mlir::memref::LoadOp::create(builder, loc, returnSpan.front(),
-                                     constantIndex(builder, loc, 1))
+        mlir::memref::LoadOp::create(
+            builder, loc, returnSpan.front(),
+            constantIndex(builder, loc, box_abi::kBoxClassWord))
             .getResult();
     mlir::Value notNone = mlir::arith::CmpIOp::create(
         builder, loc, mlir::arith::CmpIPredicate::ne, classWord,
@@ -4108,7 +4114,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendStoredGeneratorArgumentOperands(
       };
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> values =
           RuntimeBundleLowerer::unionValuesFromBoxWords(
-              op, argumentLane->unionType, word(1), word(2));
+              op, argumentLane->unionType, word(box_abi::kBoxClassWord),
+              word(box_abi::kBoxEntityWord));
       if (mlir::failed(values))
         return mlir::failure();
       operands.append(values->begin(), values->end());
@@ -4953,8 +4960,9 @@ RuntimeBundleLowerer::unboxUnionFromLane(mlir::Operation *op,
         .getResult();
   };
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> values =
-      RuntimeBundleLowerer::unionValuesFromBoxWords(op, unionType, words(1),
-                                                    words(2));
+      RuntimeBundleLowerer::unionValuesFromBoxWords(
+          op, unionType, words(box_abi::kBoxClassWord),
+          words(box_abi::kBoxEntityWord));
   if (mlir::failed(values))
     return mlir::failure();
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =

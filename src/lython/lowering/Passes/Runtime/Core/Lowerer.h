@@ -734,6 +734,14 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadHandleWords(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
+  // {class id, entity word}: what a standalone `object` box holds.
+  static mlir::Value borrowedBoxOfSlotEntity(mlir::OpBuilder &builder,
+                                             mlir::Location loc,
+                                             mlir::Value entity,
+                                             mlir::MemRefType boxType);
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+  objectPayloadClassEntity(mlir::Operation *op, const RuntimeBundle &value,
+                           bool ownsPayload = true);
   // True when `op` is the ONLY user of `value` — i.e. the value is a
   // temporary this op consumes, not a binding that outlives it. Container
   // literals use it to decide whether storing an element may take over the

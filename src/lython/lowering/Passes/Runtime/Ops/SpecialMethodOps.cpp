@@ -2099,10 +2099,10 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
     // the element only where `valid` says there is one. An EMPTY payload's
     // slot 0 is zeroed, whose class id matches no member, so every lane takes
     // its dead arm and nothing is dereferenced.
-    mlir::Value classWord =
-        box_abi::loadContainerBoxWord(builder, loc, *itemsView, base, 1);
     mlir::Value entityWord = box_abi::loadContainerBoxWord(
         builder, loc, *itemsView, base, box_abi::kEntityWord);
+    mlir::Value classWord =
+        box_abi::slotClassFromEntity(builder, loc, entityWord);
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
         RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
                                                       classWord, entityWord);

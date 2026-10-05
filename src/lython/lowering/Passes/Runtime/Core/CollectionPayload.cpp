@@ -466,8 +466,10 @@ RuntimeBundleLowerer::collectionInitialCapacity(std::uint64_t arity) const {
   return arity;
 }
 
+// The class id and entity word a value is boxed with: a slot keeps only the
+// entity (BoxLayout.h); a standalone `object` box keeps both.
 mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
-RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
+RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
                                                const RuntimeBundle &value,
                                                bool ownsPayload) {
   builder.setInsertionPoint(op);
@@ -481,11 +483,8 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   // None aborted in Ly_DecRef without the body touching v. A slot does not read
   // word 0 at all, and LyObject_FromSlot overwrites it with 1 on the way out,
   // so the two uses agree on 1 and disagreed only on 0.
-  mlir::Value one = constantI64(builder, loc, 1);
   auto emptyHandle = [&]() {
-    llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
-    words[0] = one;
-    return words;
+    return llvm::SmallVector<mlir::Value, 4>{zero, zero};
   };
 
   const RuntimeBundle *concrete =
@@ -547,7 +546,7 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
       if (mlir::failed(normalizedMember))
         return mlir::failure();
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> memberWords =
-          RuntimeBundleLowerer::objectPayloadHandleWords(op, *normalizedMember,
+          RuntimeBundleLowerer::objectPayloadClassEntity(op, *normalizedMember,
                                                           ownsPayload);
       if (mlir::failed(memberWords))
         return mlir::failure();
@@ -581,21 +580,15 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
           takingRef->function.getFunctionType().getInput(0)) {
         mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
             loc, *takingRef, mlir::ValueRange{handle});
-        llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
-        words[0] = one;
-        words[1] = constantI64(
-            builder, loc, concrete->contractName() == "builtins.int" ? 1 : 2);
-        words[box_abi::kEntityWord] = call.getResult(0);
-        return words;
+        return llvm::SmallVector<mlir::Value, 4>{
+            constantI64(builder, loc,
+                        concrete->contractName() == "builtins.int" ? 1 : 2),
+            call.getResult(0)};
       }
     }
-  if (concrete->payloadSlotWord) {
-    llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
-    words[0] = one;
-    words[1] = constantI64(builder, loc, 1);
-    words[box_abi::kEntityWord] = concrete->payloadSlotWord;
-    return words;
-  }
+  if (concrete->payloadSlotWord)
+    return llvm::SmallVector<mlir::Value, 4>{constantI64(builder, loc, 1),
+                                             concrete->payloadSlotWord};
   if (concrete->physicalValues().empty())
     return op->emitError()
            << "collection payload element " << concrete->contract
@@ -650,16 +643,22 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
       mlir::arith::IndexCastOp::create(builder, loc, builder.getI64Type(),
                                        pointerIndex)
           .getResult();
-  mlir::Value refcount = constantI64(builder, loc, 1);
   // ⛔ THE LANES ARE NOT COPIED IN. They used to be, a pointer and a size word
-  // each, and every reader now rebuilds them from word 2 instead
+  // each, and every reader now rebuilds them from the entity instead
   // (`lanesFromBoxEntity`) -- so writing them would be maintaining a second
   // copy that nothing consults and that a reallocation can falsify.
-  llvm::SmallVector<mlir::Value, 4> words(kPayloadHandleWords, zero);
-  words[0] = refcount;
-  words[1] = payloadClass;
-  words[box_abi::kEntityWord] = payloadPointer;
-  return words;
+  return llvm::SmallVector<mlir::Value, 4>{payloadClass, payloadPointer};
+}
+
+mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
+RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
+                                               const RuntimeBundle &value,
+                                               bool ownsPayload) {
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> classEntity =
+      RuntimeBundleLowerer::objectPayloadClassEntity(op, value, ownsPayload);
+  if (mlir::failed(classEntity))
+    return mlir::failure();
+  return llvm::SmallVector<mlir::Value, 4>{(*classEntity)[1]};
 }
 
 mlir::FailureOr<RuntimeBundle>

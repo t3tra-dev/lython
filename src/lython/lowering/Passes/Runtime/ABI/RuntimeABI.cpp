@@ -1032,15 +1032,24 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
       mlir::memref::AllocOp::create(builder, loc, boxType).getResult();
   box.getDefiningOp()->setAttr(own::kObjectHeaderAttr, builder.getUnitAttr());
 
-  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> words =
-      RuntimeBundleLowerer::objectPayloadHandleWords(op, concrete,
+  mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> classEntity =
+      RuntimeBundleLowerer::objectPayloadClassEntity(op, concrete,
                                                      retainPayload);
-  if (mlir::failed(words))
+  if (mlir::failed(classEntity))
     return mlir::failure();
-  for (auto [index, word] : llvm::enumerate(*words)) {
-    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, loc, static_cast<std::int64_t>(index));
-    mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+  {
+    mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+    mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
+    llvm::SmallVector<mlir::Value, 5> boxWords(box_abi::kStandaloneBoxWords,
+                                                zero);
+    boxWords[0] = one;
+    boxWords[box_abi::kBoxClassWord] = (*classEntity)[0];
+    boxWords[box_abi::kBoxEntityWord] = (*classEntity)[1];
+    for (auto [index, word] : llvm::enumerate(boxWords)) {
+      mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+          builder, loc, static_cast<std::int64_t>(index));
+      mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+    }
   }
   if (retainPayload && mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
                            op, concrete, "boxed.object.payload")))
@@ -1069,6 +1078,30 @@ RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
       mlir::ValueRange{boxRoot});
   boxed.boxedObject = std::make_shared<RuntimeBundle>(std::move(concrete));
   return boxed;
+}
+
+// A standalone box on the stack around a slot's entity, for a callee that
+// takes `builtins.object`: refcount 1 that nothing releases (the slot keeps
+// its own reference), the class the entity names, the entity.
+mlir::Value RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
+    mlir::OpBuilder &builder, mlir::Location loc, mlir::Value entity,
+    mlir::MemRefType boxType) {
+  mlir::Value box = box_abi::allocaBoxWords(builder, loc);
+  if (box.getType() != boxType)
+    box = mlir::memref::CastOp::create(builder, loc, boxType, box).getResult();
+  mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+  mlir::Value one = mlir::arith::ConstantIntOp::create(builder, loc, 1, 64);
+  mlir::Value classId = box_abi::slotClassFromEntity(builder, loc, entity);
+  llvm::SmallVector<mlir::Value, 5> words(box_abi::kStandaloneBoxWords, zero);
+  words[0] = one;
+  words[box_abi::kBoxClassWord] = classId;
+  words[box_abi::kBoxEntityWord] = entity;
+  for (auto [index, word] : llvm::enumerate(words)) {
+    mlir::Value slot = mlir::arith::ConstantIndexOp::create(
+        builder, loc, static_cast<std::int64_t>(index));
+    mlir::memref::StoreOp::create(builder, loc, word, box, slot);
+  }
+  return box;
 }
 
 mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::erasedObjectStorageView(
@@ -1548,7 +1581,7 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::materializeClassObjectValue(
                    .getResult();
   }
   mlir::Value bodySlot = mlir::arith::ConstantIndexOp::create(
-                             builder, loc, box_abi::kEntityWord)
+                             builder, loc, box_abi::kInstanceBodyWord)
                              .getResult();
   mlir::memref::StoreOp::create(builder, loc, bodyWord, header, bodySlot);
 
@@ -1775,7 +1808,7 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
         return module.emitError() << "source class deallocators require "
                                      "LyObject_ReleaseBoxedPayloadArraySlotRaw";
       mlir::Value bodySlot = mlir::arith::ConstantIndexOp::create(
-                                 builder, loc, box_abi::kEntityWord)
+                                 builder, loc, box_abi::kInstanceBodyWord)
                                  .getResult();
       mlir::Value address = mlir::memref::LoadOp::create(
                                 builder, loc, entry->getArgument(0), bodySlot)
@@ -2252,10 +2285,14 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       builder.setInsertionPointToStart(handle);
       auto boxType = mlir::cast<mlir::MemRefType>(
           objectFallback.getFunctionType().getInput(0));
-      mlir::Value size = mlir::arith::ConstantIntOp::create(
-          builder, loc, boxType.getDimSize(0), 64);
-      mlir::Value box = RuntimeBundleLowerer::memrefFromBoxPointer(
-          builder, loc, hook.getArgument(0), size, boxType);
+      // Class 0 in a slot is None (its entity is 0), and the `builtins.object`
+      // method wants a standalone box: one is built on the stack around the
+      // slot's entity (see `borrowedBoxOfSlotEntity`).
+      mlir::Value entity =
+          mlir::LLVM::LoadOp::create(builder, loc, i64, hook.getArgument(0))
+              .getResult();
+      mlir::Value box = RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
+          builder, loc, entity, boxType);
       mlir::func::CallOp call =
           mlir::func::CallOp::create(builder, loc, objectFallback, box);
       llvm::SmallVector<mlir::Value, 4> hitResults(call.getResults().begin(),
@@ -2965,15 +3002,16 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
                     "builtins.object needs the "
                  << box_abi::kStandaloneBoxWords << "-word box as its second "
                  << "parameter, got " << type.getInput(1);
-        mlir::Value rhsWord =
-            mlir::LLVM::PtrToIntOp::create(builder, loc, i64, rhsSlot)
-                .getResult();
-        // ⛔ A slot, under the standalone box's type: the callee reads the
-        // class and entity words, which the two share, and nothing past them.
-        mlir::Value size = mlir::arith::ConstantIntOp::create(
-            builder, loc, box_abi::kStandaloneBoxWords, 64);
-        operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
-            builder, loc, rhsWord, size, boxType));
+        // ⭐ A BORROWED BOX ON THE STACK. The callee reads a standalone
+        // box's class and entity words, and a slot is the entity alone
+        // (BoxLayout.h), so the two words are written into a box the size of
+        // one: refcount 1 (never released -- the slot keeps the reference),
+        // class from the entity, entity copied.
+        mlir::Value entity = mlir::LLVM::LoadOp::create(
+                                 builder, loc, i64, rhsSlot)
+                                 .getResult();
+        operands.push_back(RuntimeBundleLowerer::borrowedBoxOfSlotEntity(
+            builder, loc, entity, boxType));
       } else if (mlir::failed(appendLanesFrom(rhsSlot))) {
         return mlir::failure();
       }

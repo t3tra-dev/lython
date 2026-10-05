@@ -283,10 +283,7 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
     // for a closure that captures an `Optional[int]`.
     if (auto captureUnion = mlir::dyn_cast<py::UnionType>(closureType)) {
       mlir::Value classWord =
-          mlir::memref::LoadOp::create(
-              builder, loc, slot,
-              mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult())
-              .getResult();
+          box_abi::slotClassFromEntity(builder, loc, entityWord);
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
           RuntimeBundleLowerer::unionValuesFromBoxWords(op, captureUnion,
                                                         classWord, entityWord);

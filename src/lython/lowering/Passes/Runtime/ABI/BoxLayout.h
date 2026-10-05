@@ -1,13 +1,12 @@
 #pragma once
 
-// Physical layout of a payload box slot: three i64 words per element -- an
-// unused refcount word, the class id, and the entity. The entity is the
-// address of the value's object, or 0, or -- for class int and float only --
-// the value itself with bit 0 set (an "immediate"; `__ly_slot_word_is_immediate`
-// in builtins.mlir has the encodings). A slot owns a reference exactly when its
-// entity is an address. The runtime support module (RuntimeSupportBuilder) and
-// every lower* TU that probes or rebuilds boxed payloads must agree on these
-// offsets; they are defined only here.
+// Physical layout of a payload slot: one i64 word per element, the entity --
+// the address of the value's object, or 0 for None, or for an int or float
+// the value itself with a nonzero low two bits (an "immediate";
+// `__ly_slot_word_is_immediate` in builtins.mlir has the encodings). A slot
+// owns a reference exactly when its entity is an address. The runtime support
+// module (RuntimeSupportBuilder) and every lower* TU that probes or rebuilds
+// boxed payloads must agree on this; it is defined only here.
 //
 // ⛔ WHY THE POINTER WORDS ARE WORDS, since two other slots in this tree were
 // changed to hold real pointers and this one cannot be.
@@ -36,6 +35,8 @@
 // to be something other than the pointer words.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -46,39 +47,32 @@
 
 namespace py::lowering::box_abi {
 
-// ⭐ THREE: word 0 is a refcount the slot never reads, word 1 the class id,
-// word 2 the entity. A STANDALONE box (an `object` value, `memref<5xi64>`)
-// keeps its own refcount in word 0 and the same class and entity words, so a
-// slot and a box are read by the same offsets; words 3 and 4 of a standalone
-// box are unused (docs/object-abi.md P1 removes the rest).
+// ⭐ ONE WORD: a slot is its entity alone. The entity is 0 for None, an
+// immediate for an int or float that has one (low two bits nonzero: int
+// `...1`, float `...10`; see `__ly_slot_word_is_immediate`), and otherwise the
+// address of the value's object -- whose header word 1 is its class id. So the
+// class is never stored beside the entity: `slotClassFromEntity` reads it the
+// way `__ly_slot_class` does in the manifest.
 //
-// ⛔ NO OWNED FLAG. A box owns its entity exactly when the entity is an
-// address -- not 0 (None) and not an immediate with bit 0 set -- and the
-// retain and release paths already asked that before they asked the flag,
-// which was 1 in every container slot. ⛔ NO HASH WORD. The dict and the set
-// keep their entries' hashes in their own parallel arrays, as CPython's keep
-// them in the entry beside the key; list and tuple never read one.
+// ⛔ NO CLASS WORD, and it was not a second copy of nothing: it was a second
+// copy of the object's header word 1, or of what the tag says. ⛔ NO REFCOUNT
+// WORD: a slot is not an object. ⛔ NO OWNED FLAG: a slot owns its entity
+// exactly when the entity is an address. ⛔ NO HASH WORD: the dict and the set
+// keep their entries' hashes in their own arrays, as CPython keeps them in the
+// entry beside the key.
 //
-// ⛔ IT WAS SIXTEEN, AND SEVEN OF THOSE WORDS WERE A SECOND COPY. Words [4, 10)
-// cached a pointer and a size for each of five lanes, describing storage the
-// entity's own block already describes. Every contract that is more than one
-// physical value answers `lane_words` from its first lane's address instead.
-//
-// ⛔ AND THE LANE COUNT WAS A CLASS'S FIELD BUDGET, which is why narrowing used
-// to cost capability. Fields live in the instance BODY and a class is one lane
-// however many it has; what `objectPayloadHandleWords` still refuses is a class
-// holding a union with a `type[X]` member, the one member with no value to box.
-inline constexpr std::int64_t kWordsPerBox = 3;
-// Word 2 is the ENTITY: the address of the object's first physical value, and
-// the only one a box keeps. Everything else a contract expands to is reached
-// from it through that contract's `lane_words` primitive.
-//
-// A SOURCE CLASS INSTANCE's own header is a block of these words and reads word
-// 2 as the address of its body -- the block its fields live in (Lowerer.h,
-// classInstanceBody). That is the same reading: an instance's entity IS its
-// body, and a box holding the instance points at the header rather than at it.
-inline constexpr std::int64_t kEntityWord = 2;
-// A standalone `object` box's width, which a slot is narrower than.
+// A STANDALONE box (an `object` value, `memref<5xi64>`) is an object of its
+// own: refcount in word 0, class id in word 1, entity in word 2 (kBoxClassWord,
+// kBoxEntityWord), words 3 and 4 unused. A pointer to its word 2 is a slot.
+inline constexpr std::int64_t kWordsPerBox = 1;
+inline constexpr std::int64_t kEntityWord = 0;
+inline constexpr std::int64_t kBoxClassWord = 1;
+inline constexpr std::int64_t kBoxEntityWord = 2;
+// A SOURCE CLASS INSTANCE's header keeps the address of its body -- the block
+// its fields live in (Lowerer.h, classInstanceBody) -- in word 2, as a
+// standalone box keeps its entity there.
+inline constexpr std::int64_t kInstanceBodyWord = 2;
+// A standalone `object` box's width.
 inline constexpr std::int64_t kStandaloneBoxWords = 5;
 
 inline mlir::MemRefType boxWordsType(mlir::Builder &builder) {
@@ -88,6 +82,58 @@ inline mlir::MemRefType boxWordsType(mlir::Builder &builder) {
 // One slot of a payload array, viewed on its own.
 inline mlir::MemRefType slotWordsType(mlir::Builder &builder) {
   return mlir::MemRefType::get({kWordsPerBox}, builder.getI64Type());
+}
+
+// The class id a slot's entity word names (`__ly_slot_class`): 0 for None,
+// int (1) or float (2) by an immediate's tag, else the object's header word 1.
+inline mlir::Value slotClassFromEntity(mlir::OpBuilder &builder,
+                                       mlir::Location loc, mlir::Value entity) {
+  mlir::Type i64 = builder.getI64Type();
+  auto constant = [&](std::int64_t value) {
+    return mlir::arith::ConstantIntOp::create(builder, loc, value, 64)
+        .getResult();
+  };
+  mlir::Value zero = constant(0);
+  mlir::Value tag =
+      mlir::arith::AndIOp::create(builder, loc, entity, constant(3));
+  mlir::Value isObject = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, tag, zero);
+  mlir::Value intTag =
+      mlir::arith::AndIOp::create(builder, loc, entity, constant(1));
+  mlir::Value isInt = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::ne, intTag, zero);
+  mlir::Value immediateClass = mlir::arith::SelectOp::create(
+      builder, loc, isInt, constant(1), constant(2));
+  mlir::Value isNull = mlir::arith::CmpIOp::create(
+      builder, loc, mlir::arith::CmpIPredicate::eq, entity, zero);
+  // ⛔ A branch, not a select: the load must not run for None or an
+  // immediate, whose word is no address.
+  mlir::Value readable =
+      mlir::arith::AndIOp::create(builder, loc, isObject,
+                                  mlir::arith::XOrIOp::create(
+                                      builder, loc, isNull,
+                                      mlir::arith::ConstantIntOp::create(
+                                          builder, loc, 1, 1)));
+  auto ifOp = mlir::scf::IfOp::create(
+      builder, loc, mlir::TypeRange{i64}, readable, /*withElseRegion=*/true);
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    mlir::Value ptr = mlir::LLVM::IntToPtrOp::create(
+        builder, loc, mlir::LLVM::LLVMPointerType::get(builder.getContext()),
+        entity);
+    mlir::Value classPtr = mlir::LLVM::GEPOp::create(
+        builder, loc, mlir::LLVM::LLVMPointerType::get(builder.getContext()),
+        i64, ptr, llvm::ArrayRef<mlir::LLVM::GEPArg>{mlir::LLVM::GEPArg(1)});
+    mlir::Value loaded =
+        mlir::LLVM::LoadOp::create(builder, loc, i64, classPtr).getResult();
+    mlir::scf::YieldOp::create(builder, loc, loaded);
+    builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    mlir::Value other = mlir::arith::SelectOp::create(
+        builder, loc, isObject, zero, immediateClass);
+    mlir::scf::YieldOp::create(builder, loc, other);
+  }
+  return ifOp.getResult(0);
 }
 
 // One word of the box at `slotBase` inside a container's payload array. Every

@@ -410,7 +410,7 @@ RuntimeBundleLowerer::classInstanceBody(mlir::Operation *op,
     return mlir::failure();
   mlir::Location loc = op->getLoc();
   mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-                         builder, loc, box_abi::kEntityWord)
+                         builder, loc, box_abi::kInstanceBodyWord)
                          .getResult();
   mlir::Value address =
       mlir::memref::LoadOp::create(builder, loc, *header, slot).getResult();
@@ -784,10 +784,9 @@ mlir::LogicalResult RuntimeBundleLowerer::updateBoxedFieldPayloadWords(
   if (mlir::failed(words))
     return mlir::failure();
   mlir::Location loc = op->getLoc();
-  // Word 0 (the refcount) is the box's own bookkeeping and must survive:
-  // rewriting it would reset a reference count the program is still using.
-  // Everything from word 1 up describes the payload.
-  for (unsigned index = 1; index < words->size(); ++index) {
+  // A slot is its entity word alone (BoxLayout.h); there is no bookkeeping
+  // word to preserve.
+  for (unsigned index = 0; index < words->size(); ++index) {
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
         builder, loc, static_cast<std::int64_t>(boxWord + index));
     mlir::memref::StoreOp::create(builder, loc, (*words)[index], body, slot);
@@ -1745,7 +1744,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                                   unsigned bodyWords) -> mlir::Value {
     builder.setInsertionPoint(op);
     mlir::Value slot = mlir::arith::ConstantIndexOp::create(
-        builder, op.getLoc(), box_abi::kEntityWord);
+        builder, op.getLoc(), box_abi::kInstanceBodyWord);
     mlir::Value address =
         mlir::memref::LoadOp::create(builder, op.getLoc(), handle, slot)
             .getResult();
@@ -2169,19 +2168,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
                    mlir::dyn_cast_if_present<py::UnionType>(loadedContract)) {
       (void)0;
       // ⭐ A UNION OF TWO REAL MEMBERS READS BACK THE WAY A CONTAINER ELEMENT
-      // DOES: the box's CLASS word names the live member, each member's lanes
+      // DOES: the class its entity names is the live member, each member's lanes
       // are rebuilt from the entity under that test, and the inactive ones get
       // the immortal dead placeholder every producer of a union gives them.
       // The optional arm above is the specialization whose tag is `entity != 0`
       // and needs no class id at all.
       builder.setInsertionPoint(op);
       mlir::Location loc = op.getLoc();
-      mlir::Value classIndex = mlir::arith::AddIOp::create(
-          builder, loc, boxWord,
-          mlir::arith::ConstantIndexOp::create(builder, loc, 1));
-      mlir::Value classWord =
-          mlir::memref::LoadOp::create(builder, loc, slot->first, classIndex)
-              .getResult();
       mlir::Value entityIndex = mlir::arith::AddIOp::create(
           builder, loc, boxWord,
           mlir::arith::ConstantIndexOp::create(builder, loc,
@@ -2189,6 +2182,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       mlir::Value entityWord =
           mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
               .getResult();
+      mlir::Value classWord =
+          box_abi::slotClassFromEntity(builder, loc, entityWord);
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
           RuntimeBundleLowerer::unionValuesFromBoxWords(op, unionField,
                                                         classWord, entityWord,
@@ -2217,12 +2212,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
       // Reading the words twice is free -- nothing between them can write the
       // box -- and this is the same device the optional arm above uses.
       builder.setInsertionPoint(op);
-      mlir::Value classWordAgain =
-          mlir::memref::LoadOp::create(builder, loc, slot->first, classIndex)
-              .getResult();
       mlir::Value entityWordAgain =
           mlir::memref::LoadOp::create(builder, loc, slot->first, entityIndex)
               .getResult();
+      mlir::Value classWordAgain =
+          box_abi::slotClassFromEntity(builder, loc, entityWordAgain);
       mlir::FailureOr<mlir::Value> liveTag =
           RuntimeBundleLowerer::unionTagFromBoxWords(op, unionField,
                                                      classWordAgain,
@@ -2384,7 +2378,7 @@ RuntimeBundleLowerer::exactRuntimeClassId(mlir::Operation *op,
       mlir::memref::LoadOp::create(
           builder, loc, storage,
           mlir::arith::ConstantIndexOp::create(builder, loc,
-                                               box_abi::kEntityWord)
+                                               box_abi::kBoxEntityWord)
               .getResult())
           .getResult();
   return RuntimeBundleLowerer::exactClassIdFromWords(op, classId, entityWord);
@@ -3313,11 +3307,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
     return op.emitError() << "attribute evidence " << fieldType
                           << " is not assignable to result "
                           << op.getResult().getType();
-  // An erased-`object` field's value IS the slot box (its words are the
-  // canonical object handle), so this read takes the box address instead of
-  // reconstructing a payload group from the box words. It stays a borrow: the
-  // box belongs to the exception's field block, and releasing it here would
-  // dispatch the payload's deallocator while the exception still owns it.
+  // An erased-`object` field's value is the slot's value, boxed.
   if (RuntimeBundleLowerer::isBuiltinsObjectContract(fieldType)) {
     std::optional<RuntimeSymbol> boxPtr =
         manifest.primitive("builtins.BaseException", "payload_box_ptr");
@@ -3345,13 +3335,23 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
         RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *boxPtr,
                                                mlir::ValueRange{*block, slot})
             .getResult(0);
-    mlir::Value size = mlir::arith::ConstantIntOp::create(
-        builder, op.getLoc(), box_abi::kWordsPerBox, 64);
-    mlir::Value box = RuntimeBundleLowerer::memrefFromBoxWords(
-        builder, op.getLoc(), boxWord, size, boxType);
+    // ⭐ A BOX OF ITS OWN. The slot is one word (BoxLayout.h), so it can no
+    // longer be read AS the box; `from_slot_ptr` makes one around its entity,
+    // with a reference the frame then owns and releases.
+    std::optional<RuntimeSymbol> fromSlotPtr =
+        manifest.primitive("builtins.object", "from_slot_ptr");
+    if (!fromSlotPtr)
+      return op.emitError()
+             << "runtime manifest has no object from_slot_ptr primitive";
+    mlir::Value box = RuntimeBundleLowerer::createRuntimeCall(
+                          op.getLoc(), *fromSlotPtr, mlir::ValueRange{boxWord})
+                          .getResult(0);
+    if (box.getType() != boxType)
+      return op.emitError() << "from_slot_ptr answers " << box.getType()
+                            << ", the field's box is " << boxType;
     RuntimeBundle result = RuntimeBundle::objectWithOwnership(
         fieldType, mlir::ValueRange{box},
-        ownership::logicalOwnershipKind(fieldType, /*ownsObject=*/false));
+        ownership::logicalOwnershipKind(fieldType, /*ownsObject=*/true));
     valueBundles[op.getResult()] = std::move(result);
     erase.push_back(op);
     return mlir::success();

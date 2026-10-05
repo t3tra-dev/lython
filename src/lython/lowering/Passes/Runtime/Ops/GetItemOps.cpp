@@ -1448,10 +1448,10 @@ mlir::FailureOr<RuntimeValue> RuntimeBundleLowerer::payloadElementAt(
   mlir::Value base =
       mlir::arith::MulIOp::create(builder, loc, slot, wordsPerSlot).getResult();
   if (auto elementUnion = mlir::dyn_cast<py::UnionType>(elementContract)) {
-    mlir::Value classWord =
-        box_abi::loadContainerBoxWord(builder, loc, *itemsView, base, 1);
     mlir::Value entityWord = box_abi::loadContainerBoxWord(
         builder, loc, *itemsView, base, box_abi::kEntityWord);
+    mlir::Value classWord =
+        box_abi::slotClassFromEntity(builder, loc, entityWord);
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
         RuntimeBundleLowerer::unionValuesFromBoxWords(op, elementUnion,
                                                       classWord, entityWord);
@@ -1782,10 +1782,10 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
     mlir::Value base =
         mlir::arith::MulIOp::create(builder, loc, safe, wordsPerSlot)
             .getResult();
-    mlir::Value classWord =
-        box_abi::loadContainerBoxWord(builder, loc, *valuesView, base, 1);
     mlir::Value entityWord = box_abi::loadContainerBoxWord(
         builder, loc, *valuesView, base, box_abi::kEntityWord);
+    mlir::Value classWord =
+        box_abi::slotClassFromEntity(builder, loc, entityWord);
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> unionValues =
         RuntimeBundleLowerer::unionValuesFromBoxWords(op, valueUnion, classWord,
                                                       entityWord);
