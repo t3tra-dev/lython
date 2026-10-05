@@ -1358,6 +1358,10 @@ private:
   mlir::FailureOr<mlir::func::FuncOp>
   getOrCreateGeneratorStepFullFunction(mlir::Operation *op,
                                        GeneratorResumeInfo &info);
+  mlir::LogicalResult raiseStopIterationCarrying(
+      mlir::Operation *op, const GeneratorResumeInfo &info,
+      mlir::func::CallOp step, unsigned retIndex,
+      llvm::ArrayRef<mlir::Value> returnSpan);
   mlir::LogicalResult releaseGeneratorReturnSpan(mlir::Operation *op,
                                                  const GeneratorResumeInfo &info,
                                                  llvm::ArrayRef<mlir::Value> span);
