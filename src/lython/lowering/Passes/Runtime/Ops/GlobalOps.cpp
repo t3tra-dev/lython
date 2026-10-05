@@ -443,12 +443,46 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
                                                ownership::OwnershipKind::Own);
     value = &boxed;
   }
+  // An `object` global holds a box, as an `object` parameter does
+  // (FunctionTargetCalls.cpp): a value that reached it still in its own
+  // class's lanes is boxed here, the box retaining it.
+  // ⛔ Not stored as it stands: a float's one lane is a header pointer like
+  // a box's, so the cell took it, and the read handed `LyObject_BoxedStr` a
+  // float to read a class id out of -- `x: object = 1.5; print(x)` was a
+  // SIGSEGV, and a str (two lanes) or None (none) was refused with a count.
+  if (isBuiltinsObjectContract(type)) {
+    const RuntimeBundle *concrete =
+        RuntimeBundleLowerer::concreteObjectForOwnership(*value);
+    if (concrete && concrete->kind == RuntimeBundle::Kind::Object &&
+        !isBuiltinsObjectContract(value->contract) &&
+        !isBuiltinsObjectContract(concrete->contract)) {
+      builder.setInsertionPoint(op);
+      mlir::FailureOr<RuntimeBundle> box =
+          RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
+              op, *value, /*retainPayload=*/true);
+      if (mlir::failed(box))
+        return mlir::failure();
+      boxed = std::move(*box);
+      value = &boxed;
+    }
+  }
   llvm::ArrayRef<mlir::Value> newValues = value->physicalValues();
-  if (newValues.size() != valueTypes->size())
-    return op.emitError() << "module global '" << op.getName()
-                          << "' assignment value group has "
-                          << newValues.size() << " values, expected "
-                          << valueTypes->size();
+  // ⛔ The types, not only how many: a value of another layout with the same
+  // number of lanes is what the cell above took for a box.
+  if (newValues.size() != valueTypes->size() ||
+      !llvm::all_of(llvm::zip(newValues, *valueTypes), [](auto pair) {
+        return std::get<0>(pair).getType() == std::get<1>(pair);
+      })) {
+    mlir::InFlightDiagnostic diagnostic = op.emitError()
+        << "module global '" << op.getName() << "' of " << type
+        << " cannot hold this value's runtime layout (";
+    llvm::interleaveComma(newValues, diagnostic,
+                          [&](mlir::Value v) { diagnostic << v.getType(); });
+    diagnostic << "; the global stores ";
+    llvm::interleaveComma(*valueTypes, diagnostic);
+    diagnostic << ")";
+    return diagnostic;
+  }
 
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();

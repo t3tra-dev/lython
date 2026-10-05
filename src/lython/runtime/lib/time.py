@@ -66,6 +66,19 @@ class struct_time:
         self.tm_isdst: int = _time.field(seconds, utc, 8)
         self.tm_gmtoff: int = _time.field(seconds, utc, 9)
 
+    def __repr__(self) -> str:
+        # CPython's structseq repr names the nine fields the tuple indexes;
+        # tm_gmtoff (and tm_zone) are attributes only and stay out of it.
+        return ("time.struct_time(tm_year=" + str(self.tm_year)
+                + ", tm_mon=" + str(self.tm_mon)
+                + ", tm_mday=" + str(self.tm_mday)
+                + ", tm_hour=" + str(self.tm_hour)
+                + ", tm_min=" + str(self.tm_min)
+                + ", tm_sec=" + str(self.tm_sec)
+                + ", tm_wday=" + str(self.tm_wday)
+                + ", tm_yday=" + str(self.tm_yday)
+                + ", tm_isdst=" + str(self.tm_isdst) + ")")
+
 
 # CPython's default is `seconds=None`. An Optional parameter is not accepted at
 # a call site here yet ("static type ... is not callable"), and a module-level

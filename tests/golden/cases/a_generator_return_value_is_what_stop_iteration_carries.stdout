@@ -1,0 +1,8 @@
+StopIteration(2.5) (2.5,) 2.5
+StopIteration([1, 2]) ([1, 2],) [1, 2]
+StopIteration(7) (7,) 7
+StopIteration(2.5) (2.5,) 2.5
+StopIteration() () 
+StopIteration(True) (True,)
+StopIteration(Box(3)) Box(3)
+StopIteration('sss') ('sss',)

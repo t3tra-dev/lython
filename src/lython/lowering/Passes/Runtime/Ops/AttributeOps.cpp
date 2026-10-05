@@ -2011,6 +2011,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     mlir::Value boxWord = mlir::arith::ConstantIndexOp::create(
         builder, op.getLoc(), static_cast<std::int64_t>(slot->second))
         .getResult();
+    if (isBuiltinsObjectContract(loadedContract)) {
+      mlir::FailureOr<mlir::Value> box =
+          RuntimeBundleLowerer::objectBoxFromFieldSlot(op, slot->first,
+                                                       boxWord);
+      if (mlir::failed(box))
+        return mlir::failure();
+      return bindOwnedEvidenceValue(
+          op, op.getResult(), "object field load",
+          RuntimeValue{loadedContract, {*box},
+                       ownership::logicalOwnershipKind(loadedContract,
+                                                       /*ownsObject=*/true)});
+    }
     llvm::SmallVector<mlir::Type, 8> laneTypes;
     if (cached) {
       for (mlir::Value lane : cached->physicalValues())
@@ -3116,6 +3128,42 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrSet(py::AttrSetOp op) {
   return mlir::success();
 }
 
+// ⭐ THE SLOT HOLDS THE PAYLOAD, NOT AN `object`. A store writes the value's own
+// handle -- its class word and its entity (objectPayloadHandleWords) -- so the
+// container dispatchers read every slot alike, and an `object` value is a box
+// around such a handle. A container read of an `object` element has always
+// built that box (`from_slot`, GetItemOps.cpp); the field and cell reads took
+// the generic road instead -- "lane 0 is the entity" -- and handed the float
+// the slot pointed at to `LyObject_BoxedStr` as if it were the box:
+// `h.o` read through a parameter, or a closure's `object` cell after a
+// rebinding, was a SIGSEGV on the float's bits.
+mlir::FailureOr<mlir::Value> RuntimeBundleLowerer::objectBoxFromFieldSlot(
+    mlir::Operation *op, mlir::Value body, mlir::Value boxWord) {
+  std::optional<RuntimeSymbol> fromSlot =
+      manifest.primitive("builtins.object", "from_slot");
+  if (!fromSlot)
+    return op->emitError()
+           << "runtime manifest has no object from_slot primitive";
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op->getLoc();
+  mlir::Type itemsType = fromSlot->function.getFunctionType().getInput(0);
+  mlir::Value items = body;
+  if (items.getType() != itemsType)
+    items = mlir::memref::CastOp::create(builder, loc, itemsType, items)
+                .getResult();
+  mlir::Value word = mlir::arith::IndexCastOp::create(
+                         builder, loc, builder.getI64Type(), boxWord)
+                         .getResult();
+  mlir::Value slot =
+      mlir::arith::DivUIOp::create(
+          builder, loc, word, constantI64(builder, loc, box_abi::kWordsPerBox))
+          .getResult();
+  mlir::Value valid = mlir::arith::ConstantIntOp::create(builder, loc, 1, 1);
+  return RuntimeBundleLowerer::createRuntimeCall(
+             loc, *fromSlot, mlir::ValueRange{items, slot, valid})
+      .getResult(0);
+}
+
 bool RuntimeBundleLowerer::isCellClassOp(py::ClassOp classOp) {
   return classOp && classOp.getSymName().starts_with("__ly_cell$");
 }
@@ -3146,6 +3194,20 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCellAttrGet(
       return op.emitError()
              << "nonlocal over " << content
              << " is not supported yet (content has no boxable value group)";
+  }
+  if (isBuiltinsObjectContract(content)) {
+    builder.setInsertionPoint(op);
+    mlir::Value boxWord = mlir::arith::ConstantIndexOp::create(
+        builder, op.getLoc(), static_cast<std::int64_t>(cell->second));
+    mlir::FailureOr<mlir::Value> box =
+        RuntimeBundleLowerer::objectBoxFromFieldSlot(op, cell->first, boxWord);
+    if (mlir::failed(box))
+      return mlir::failure();
+    return bindOwnedEvidenceValue(
+        op, op.getResult(), "nonlocal cell load",
+        RuntimeValue{content, {*box},
+                     ownership::logicalOwnershipKind(content,
+                                                     /*ownsObject=*/true)});
   }
   builder.setInsertionPoint(op);
   mlir::Location loc = op.getLoc();

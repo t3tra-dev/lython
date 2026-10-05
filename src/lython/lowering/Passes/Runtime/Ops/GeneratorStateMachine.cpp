@@ -3267,9 +3267,179 @@ RuntimeBundleLowerer::getOrCreateGeneratorStepFunction(
   return function;
 }
 
-// advance: step + the next()/send() exhaustion protocol — StopIteration
-// carrying str(return value) as its message (CPython's str(StopIteration(v))
-// is str(v); the typed .value attribute is not represented yet).
+// StopIteration(value) for a generator that returned `value`: the value
+// itself in args[0], as `StopIteration(value)` written in the program builds
+// it (Manifest/Calls.cpp, the exception init), so repr, str and args read it
+// as CPython does.
+//
+// ⛔ Not str(value) as the message, which is what this raised: str() of the
+// exception agreed, and everything else was a different value -- repr gave
+// `StopIteration('2.5')`, args[0] was a str -- and a return whose class had
+// no runtime __str__ was refused outright.
+mlir::LogicalResult RuntimeBundleLowerer::raiseStopIterationCarrying(
+    mlir::Operation *site, const GeneratorResumeInfo &info,
+    mlir::func::CallOp step, unsigned retIndex,
+    llvm::ArrayRef<mlir::Value> returnSpan) {
+  mlir::Location loc = site->getLoc();
+  // The helpers below place what they emit before the op they are handed.
+  // `site` is the resume that asked for this function, in another function
+  // altogether, so they are handed a marker at the builder's position here
+  // instead, erased once everything sits in front of it.
+  mlir::Operation *op =
+      mlir::arith::ConstantIntOp::create(builder, loc, 0, 1).getOperation();
+  builder.setInsertionPoint(op);
+  llvm::StringRef contract = "builtins.StopIteration";
+  mlir::Type exceptionType = runtimeContractType(context, contract);
+  std::optional<RuntimeSymbol> initializer =
+      manifest.initializer(contract, "__new__");
+  std::optional<RuntimeSymbol> membersAlloc =
+      manifest.primitive("builtins.BaseExceptionGroup", "members_alloc");
+  std::optional<RuntimeSymbol> storeWords =
+      manifest.primitive("builtins.BaseException", "payload_store_words");
+  std::optional<RuntimeSymbol> initPayloadMessage =
+      manifest.primitive("builtins.BaseException", "init_payload_message");
+  std::optional<RuntimeSymbol> raise = manifest.primitive(contract, "raise");
+  if (!initializer || !membersAlloc || !storeWords || !initPayloadMessage ||
+      !raise)
+    return op->emitError() << "runtime manifest cannot build StopIteration("
+                              "value) (__new__ or the payload primitives)";
+  RuntimeBundle classObject = RuntimeBundle::typeObject(
+      runtimeContractType(context, "builtins.type"), exceptionType);
+  llvm::SmallVector<mlir::Value, 8> newOperands;
+  if (mlir::failed(buildRuntimeCallOperands(op, *initializer, {}, newOperands,
+                                            /*allowUnusedSources=*/true,
+                                            &classObject)))
+    return mlir::failure();
+  mlir::func::CallOp newCall =
+      RuntimeBundleLowerer::createRuntimeCall(loc, *initializer, newOperands);
+  RuntimeBundle exception;
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op, exceptionType, newCall, exception)))
+    return mlir::failure();
+  if (exception.physicalValues().size() != 3)
+    return op->emitError() << "StopIteration does not have the 3-value "
+                              "exception ABI";
+  auto adapt = [&](mlir::Value value, mlir::Type want) -> mlir::Value {
+    if (value.getType() == want)
+      return value;
+    return mlir::memref::CastOp::create(builder, loc, want, value).getResult();
+  };
+  llvm::ArrayRef<mlir::Type> allocInputs =
+      membersAlloc->function.getFunctionType().getInputs();
+  llvm::SmallVector<mlir::Value, 4> allocOperands;
+  for (unsigned index = 0; index < 3; ++index)
+    allocOperands.push_back(
+        adapt(exception.physicalValues()[index], allocInputs[index]));
+  allocOperands.push_back(constantI64(builder, loc, 1));
+  mlir::Value blockWord =
+      RuntimeBundleLowerer::createRuntimeCall(loc, *membersAlloc,
+                                              allocOperands)
+          .getResult(0);
+
+  const GeneratorResumeLane &lane = info.returnLane;
+  llvm::SmallVector<mlir::Value, 5> words;
+  if (lane.contract == "builtins.object") {
+    // A union returns boxed, and its box is already the handle a slot keeps.
+    // The block takes its own reference to what the box holds; the box is
+    // released with the span below.
+    mlir::Value box = returnSpan.front();
+    for (std::int64_t word = 0; word < box_abi::kWordsPerBox; ++word)
+      words.push_back(mlir::memref::LoadOp::create(
+                          builder, loc, box, constantIndex(builder, loc, word))
+                          .getResult());
+    words[0] = constantI64(builder, loc, 1);
+    auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+    mlir::func::FuncOp retainSlot = getOrCreatePrivateFunction(
+        module, builder, "retain_payload_slot_ptr",
+        builder.getFunctionType({ptrType}, {}));
+    mlir::Value address = mlir::arith::IndexCastOp::create(
+        builder, loc, builder.getI64Type(),
+        mlir::memref::ExtractAlignedPointerAsIndexOp::create(builder, loc,
+                                                             box));
+    mlir::func::CallOp::create(
+        builder, loc, retainSlot,
+        mlir::ValueRange{
+            mlir::LLVM::IntToPtrOp::create(builder, loc, ptrType, address)});
+  } else {
+    RuntimeBundle returned;
+    if (lane.isControl()) {
+      // The int tier's bare (i64, i1) lane: boxed for the slot, the box a
+      // temporary this releases once the block holds its own reference.
+      std::optional<RuntimeSymbol> intNew =
+          manifest.initializer("builtins.int", "__new__");
+      if (!intNew)
+        return op->emitError() << "runtime manifest has no int __new__";
+      mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
+          loc, *intNew, mlir::ValueRange{step.getResult(retIndex)});
+      if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+              op, runtimeContractType(context, "builtins.int"),
+              boxed.getResults(), returned, /*ownsObject=*/true)))
+        return mlir::failure();
+    } else if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
+                   op, runtimeContractType(context, lane.contract),
+                   returnSpan.take_front(lane.physicalCount), returned,
+                   /*ownsObject=*/true))) {
+      return mlir::failure();
+    }
+    mlir::FailureOr<RuntimeBundle> payload =
+        RuntimeBundleLowerer::materializePayloadObjectBundle(op, returned);
+    if (mlir::failed(payload))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    mlir::Block *retainBlock = builder.getInsertionBlock();
+    mlir::Operation *retainAnchor = insertionAnchor(builder);
+    if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+            op, *payload, "exception.args")))
+      return mlir::failure();
+    chargeSlotRetainsToParent(builder, retainBlock, retainAnchor, exception);
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> handle =
+        RuntimeBundleLowerer::objectPayloadHandleWords(op, *payload);
+    if (mlir::failed(handle))
+      return mlir::failure();
+    words.assign(handle->begin(), handle->end());
+    if (lane.isControl() &&
+        mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+            op, returned, "generator return value boxing")))
+      return mlir::failure();
+  }
+  builder.setInsertionPoint(op);
+  llvm::SmallVector<mlir::Value, 8> storeOperands{blockWord,
+                                                  constantI64(builder, loc, 0)};
+  storeOperands.append(words.begin(), words.end());
+  RuntimeBundleLowerer::createRuntimeCall(loc, *storeWords, storeOperands);
+  if (mlir::failed(RuntimeBundleLowerer::releaseGeneratorReturnSpan(
+          op, info, returnSpan)))
+    return mlir::failure();
+
+  builder.setInsertionPoint(op);
+  llvm::ArrayRef<mlir::Type> messageInputs =
+      initPayloadMessage->function.getFunctionType().getInputs();
+  llvm::SmallVector<mlir::Value, 4> messageOperands;
+  for (unsigned index = 0; index < 3; ++index)
+    messageOperands.push_back(
+        adapt(exception.physicalValues()[index], messageInputs[index]));
+  mlir::func::CallOp messageCall = RuntimeBundleLowerer::createRuntimeCall(
+      loc, *initPayloadMessage, messageOperands);
+  RuntimeBundle initialized;
+  if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+          op, exceptionType, messageCall, initialized)))
+    return mlir::failure();
+  llvm::SmallVector<const RuntimeBundle *, 1> raiseSources{&initialized};
+  llvm::SmallVector<mlir::Value, 8> raiseOperands;
+  if (mlir::failed(buildRuntimeCallOperands(op, *raise, raiseSources,
+                                            raiseOperands,
+                                            /*allowUnusedSources=*/false)))
+    return mlir::failure();
+  builder.setInsertionPoint(op);
+  RuntimeBundleLowerer::createRuntimeCall(loc, *raise, raiseOperands);
+  mlir::Block *block = op->getBlock();
+  op->erase();
+  builder.setInsertionPointToEnd(block);
+  return mlir::success();
+}
+
+// advance: step + the next()/send() exhaustion protocol -- StopIteration
+// carrying the return value (raiseStopIterationCarrying).
 mlir::FailureOr<mlir::func::FuncOp>
 RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
     mlir::Operation *op, GeneratorResumeInfo &info) {
@@ -3288,21 +3458,6 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   llvm::SmallVector<mlir::Type, 6> valueLaneTypes =
       RuntimeBundleLowerer::generatorLanePhysicalTypes(info.valueLane);
   unsigned valueLaneWidth = static_cast<unsigned>(valueLaneTypes.size());
-  // ⛔ A returned object is rendered into the StopIteration only through a
-  // manifest `__str__`: a class of the program's own may print, or fail, in
-  // its `__str__`, and CPython runs that only when the exception is
-  // rendered -- never at the raise.
-  std::optional<RuntimeSymbol> returnStr;
-  if (!info.returnLane.isControl() && !info.returnLane.isNone) {
-    returnStr = manifest.method(info.returnLane.contract, "__str__");
-    if (!returnStr)
-      return op->emitError()
-             << "next() and send() raise StopIteration(value) when this "
-                "generator returns, and its '"
-             << info.returnLane.contract
-             << "' value has no runtime __str__ to carry in it; consume the "
-                "generator with `for` or `yield from` instead";
-  }
   std::string name = info.cloneName + "__advance";
   builder.setInsertionPointToEnd(module.getBody());
   auto function = mlir::func::FuncOp::create(
@@ -3384,7 +3539,7 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
                                  mlir::ValueRange{}, plainBlock,
                                  mlir::ValueRange{});
 
-  // return X → StopIteration whose message is str(X). Exhaustion can be
+  // return X → StopIteration(X). Exhaustion can be
   // observed while another exception is the pending current one (next()
   // inside an except handler); the single-token TLS slot requires the same
   // discard-before-raise that py.raise lowering performs.
@@ -3392,57 +3547,16 @@ RuntimeBundleLowerer::getOrCreateGeneratorAdvanceFunction(
   mlir::func::CallOp::create(
       builder, loc, getOrCreateDiscardCurrentException(module, builder),
       mlir::ValueRange{});
-  {
-    mlir::func::CallOp text;
-    if (returnStr) {
-      text = RuntimeBundleLowerer::createRuntimeCall(
-          loc, *returnStr,
-          llvm::ArrayRef<mlir::Value>(returnSpan)
-              .take_front(info.returnLane.physicalCount));
-      if (mlir::failed(RuntimeBundleLowerer::releaseGeneratorReturnSpan(
-              op, info, returnSpan)))
-        return mlir::failure();
-    } else {
-    std::optional<RuntimeSymbol> intNew =
-        manifest.initializer("builtins.int", "__new__");
-    std::optional<RuntimeSymbol> intStr =
-        manifest.method("builtins.int", "__str__");
-    if (!intNew || !intStr)
-      return op->emitError() << "runtime manifest cannot render the generator "
-                                "return value (builtins.int __new__/__str__)";
-    mlir::func::CallOp boxed = RuntimeBundleLowerer::createRuntimeCall(
-        loc, *intNew, mlir::ValueRange{call.getResult(retIndex)});
-    text = RuntimeBundleLowerer::createRuntimeCall(loc, *intStr,
-                                                   boxed.getResults());
-    // The boxed int is only a rendering temporary; drop it through the
-    // manifest deallocator rather than teaching this synthesized body the
-    // elision machinery.
-    RuntimeBundle boxedBundle;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, runtimeContractType(context, "builtins.int"),
-            boxed.getResults(), boxedBundle)))
-      return mlir::failure();
-    if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
-            op, boxedBundle, "generator return value rendering")))
-      return mlir::failure();
-    }
-    RuntimeBundle message;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, runtimeContractType(context, "builtins.str"),
-            text.getResults(), message)))
-      return mlir::failure();
-    // ⛔ NO FRAME FOR THIS RAISE. The body has already returned when the
-    // exhaustion StopIteration is raised, so CPython's traceback for
-    // `next(gen)` on a finished generator shows the CALLER's frame and
-    // nothing else -- and this function is built once, at whichever resume
-    // site materialized the clone, so the frame it pushed named that site
-    // forever. `next(a)` once and then `next(b)` to exhaustion reported a
-    // frame on A.
-    if (mlir::failed(RuntimeBundleLowerer::emitRuntimeExceptionFromMessageObject(
-            op, "builtins.StopIteration", message,
-            /*pushTracebackFrame=*/false)))
-      return mlir::failure();
-  }
+  // ⛔ NO FRAME FOR THIS RAISE. The body has already returned when the
+  // exhaustion StopIteration is raised, so CPython's traceback for
+  // `next(gen)` on a finished generator shows the CALLER's frame and
+  // nothing else -- and this function is built once, at whichever resume
+  // site materialized the clone, so a frame pushed here would name that site
+  // forever. `next(a)` once and then `next(b)` to exhaustion reported a
+  // frame on A.
+  if (mlir::failed(RuntimeBundleLowerer::raiseStopIterationCarrying(
+          op, info, call, retIndex, returnSpan)))
+    return mlir::failure();
   mlir::Block *deadBlock = builder.createBlock(&body);
   builder.setInsertionPointToEnd(valueBlock);
   mlir::cf::BranchOp::create(builder, loc, deadBlock);
