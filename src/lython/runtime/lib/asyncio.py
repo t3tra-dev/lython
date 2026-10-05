@@ -29,6 +29,12 @@ Deviations from CPython:
   - The loop has no `create_future()`: construct `Future[T]()`. A generic
     class specialized before its base class is declared misses the base's
     fields, and the loop is declared before the futures it would make.
+  - repr() of a Future is CPython's only where it can be: no done callbacks
+    (CPython names each by its source location) and a result or exception
+    whose repr `reprlib` would not abbreviate (30 characters at most, not a
+    container). repr() of a Task always names its coroutine's source
+    location. Where the text cannot be CPython's, repr() raises
+    NotImplementedError instead of printing a different one.
 
 On a JavaScript host (`sys._js_host`: WASI with `--js-host`)
 the loop is also the host's, as Pyodide's WebLoop is: whenever it has work
@@ -383,6 +389,20 @@ class _Waiter:
             raise exc
 
 
+def _short_repr(text: str) -> str:
+    """`text` when reprlib.repr would give the same: 30 characters or fewer,
+    and not a container, whose elements reprlib counts and abbreviates."""
+    if len(text) > 30:
+        raise NotImplementedError(
+            "repr() of a Future whose value reprlib would abbreviate")
+    for opener in ("[", "(", "{", "set(", "frozenset(", "deque(", "array("):
+        if text.startswith(opener):
+            raise NotImplementedError(
+                "repr() of a Future holding a container, whose elements "
+                "reprlib counts and abbreviates")
+    return text
+
+
 class Future[T](_Waiter):
     """A result that arrives later (futures.Future)."""
 
@@ -403,6 +423,24 @@ class Future[T](_Waiter):
 
     def add_done_callback(self, fn: Callable[["Future[T]"], None]) -> None:
         self._wake(lambda: fn(self))
+
+    def __repr__(self) -> str:
+        # futures._future_repr_info: the state, then the result or the
+        # exception through reprlib.repr.
+        if len(self._callbacks) != 0:
+            raise NotImplementedError(
+                "repr() of a Future with done callbacks: CPython names each "
+                "callback by its source location, which this runtime does "
+                "not keep")
+        name = self.__class__.__name__
+        if self._state == "PENDING":
+            return "<" + name + " pending>"
+        if self._state == "CANCELLED":
+            return "<" + name + " cancelled>"
+        exc = self._exception
+        if exc is not None:
+            return "<" + name + " finished exception=" + _short_repr(repr(exc)) + ">"
+        return "<" + name + " finished result=" + _short_repr(repr(self._result[0])) + ">"
 
     def __await__(self) -> Generator[object, None, T]:
         if not self.done():
@@ -437,6 +475,13 @@ class Task[T](_Waiter):
 
     def add_done_callback(self, fn: Callable[["Task[T]"], None]) -> None:
         self._wake(lambda: fn(self))
+
+    def __repr__(self) -> str:
+        # tasks._task_repr_info names the coroutine with the file and line it
+        # is running at or was defined at, which this runtime does not keep.
+        raise NotImplementedError(
+            "repr() of a Task: CPython names its coroutine's source location, "
+            "which this runtime does not keep")
 
     def _step(self) -> None:
         if self.done():

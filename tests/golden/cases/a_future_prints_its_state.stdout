@@ -1,0 +1,4 @@
+<Future pending>
+<Future finished result=3>
+[<Future finished exception=ValueError('bad')>]
+<Future cancelled>
