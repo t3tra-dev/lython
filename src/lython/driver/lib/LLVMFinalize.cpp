@@ -62,16 +62,30 @@ void markBoxLayoutHelpersAlwaysInline(llvm::Module &module) {
 unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
                                               bool bypass) {
   markBoxLayoutHelpersAlwaysInline(module);
+  // The allocator's slow paths stay out of line, so what the optimizer
+  // inlines into every allocation site is the free-list pop and the bump.
+  // ⛔ Set here rather than on the func.func the runtime builds: a
+  // `passthrough` attribute there does not survive to the LLVM function, and
+  // with these inlined `LyMem_Alloc` saved six register pairs on every call
+  // and was inlined nowhere.
+  for (const char *cold : {"LyMem_LargeAlloc", "LyMem_MapAlloc", "LyMem_Refill"})
+    if (llvm::Function *function = module.getFunction(cold)) {
+      function->addFnAttr(llvm::Attribute::NoInline);
+      function->addFnAttr(llvm::Attribute::Cold);
+    }
   if (bypass)
     return 0;
   struct Redirect {
     const char *from;
     const char *to;
   };
-  static constexpr Redirect kRedirects[] = {{"malloc", "LyMem_Alloc"},
-                                            {"free", "LyMem_Free"},
-                                            {"realloc", "LyMem_Realloc"}};
+  static constexpr Redirect kRedirects[] = {
+      {"malloc", "LyMem_Alloc"},
+      {"free", "LyMem_Free"},
+      {"realloc", "LyMem_Realloc"},
+      {"aligned_alloc", "LyMem_AlignedAlloc"}};
   unsigned moved = 0;
+  llvm::SmallVector<llvm::CallBase *, 16> retired;
   for (llvm::Function &function : module) {
     // The allocator itself keeps the system allocator: it is what it is built
     // on. Nothing else in the module may reach malloc directly, or a block
@@ -86,6 +100,24 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
         llvm::Function *callee = call->getCalledFunction();
         if (!callee)
           continue;
+        // `aligned_alloc(16, n)` -- every `memref.alloc` -- is `LyMem_Alloc(n)`:
+        // all of its blocks are 16-aligned. Rewritten here rather than left
+        // to `LyMem_AlignedAlloc`'s first test, so the allocation fast path is
+        // one call that inlines, not two.
+        if (callee->getName() == "aligned_alloc" && call->arg_size() == 2)
+          if (auto *alignment =
+                  llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0)))
+            if (alignment->getZExtValue() <= 16)
+              if (llvm::Function *alloc = module.getFunction("LyMem_Alloc")) {
+                llvm::IRBuilder<> rewrite(call);
+                llvm::CallInst *direct =
+                    rewrite.CreateCall(alloc, {call->getArgOperand(1)});
+                direct->setDebugLoc(call->getDebugLoc());
+                call->replaceAllUsesWith(direct);
+                retired.push_back(call);
+                ++moved;
+                continue;
+              }
         for (const Redirect &redirect : kRedirects) {
           if (callee->getName() != redirect.from)
             continue;
@@ -100,6 +132,8 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
       }
     }
   }
+  for (llvm::CallBase *call : retired)
+    call->eraseFromParent();
   return moved;
 }
 

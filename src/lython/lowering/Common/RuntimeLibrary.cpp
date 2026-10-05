@@ -326,7 +326,14 @@ mlir::LogicalResult lowerNativeRuntimeModule(mlir::ModuleOp module) {
   pm.addPass(mlir::createConvertFuncToLLVMPass());
   pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::memref::createExpandStridedMetadataPass());
-  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+  // Aligned, as the program's own lowering is (LoweringPipeline.cpp,
+  // SymbolTableConvertToLLVM): the runtime's objects go through the same
+  // allocator and must not be padded either.
+  {
+    mlir::FinalizeMemRefToLLVMConversionPassOptions memrefOptions;
+    memrefOptions.useAlignedAlloc = true;
+    pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass(memrefOptions));
+  }
   pm.addPass(mlir::createConvertMathToLLVMPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());
   pm.addPass(mlir::createConvertControlFlowToLLVMPass());
