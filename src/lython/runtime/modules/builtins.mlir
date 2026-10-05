@@ -21135,48 +21135,42 @@ module attributes {
     %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 11 : i64
     %zero = arith.constant 0 : i64
+    %eight = arith.constant 8 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %length_slot = arith.constant 2 : index
     %capacity_slot = arith.constant 3 : index
     %items_slot = arith.constant 4 : index
-
-    %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<14xi64>
+    // ⭐ ONE ALLOCATION, as CPython's PyTupleObject is one: the five handle
+    // words a tuple uses (refcount, class, length, capacity, items address)
+    // and then the items. The handle keeps its fourteen-word type -- the width
+    // is what selects its deallocator until P6 of docs/object-abi.md -- and
+    // words 5..13 are never read or written, so they are not allocated: the
+    // items start where word 5 would.
+    // ⛔ Not the separate items malloc this was: a pair took a 112-byte
+    // handle and a 16-byte array, two allocations, where it now takes 56 bytes.
+    %used_words = arith.constant 5 : i64
     %capacity = arith.maxsi %length, %zero : i64
     %payload_words = arith.muli %capacity, %handle_words : i64
-    %payload_words_index = arith.index_cast %payload_words : i64 to index
-    // Plain memref.alloc with no alignment attribute is a bare malloc, so the
-    // aligned pointer IS the allocated pointer and free_raw_i64_ptr can
-    // release it later (same convention as __ly_list_alloc).
-    %items = memref.alloc(%payload_words_index) : memref<?xi64>
-    %items_index = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
-    %items_word = arith.index_cast %items_index : index to i64
+    %block_words = arith.addi %used_words, %payload_words : i64
+    %block_bytes_i64 = arith.muli %block_words, %eight : i64
+    %block_bytes = arith.index_cast %block_bytes_i64 : i64 to index
+    %block = memref.alloc(%block_bytes) {alignment = 16 : i64} : memref<?xi8>
+    %c0 = arith.constant 0 : index
+    %self = memref.view %block[%c0][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<14xi64>
+    %self_index = memref.extract_aligned_pointer_as_index %self : memref<14xi64> -> index
+    %self_word = arith.index_cast %self_index : index to i64
+    %items_offset = arith.muli %used_words, %eight : i64
+    %items_word = arith.addi %self_word, %items_offset : i64
 
     memref.store %one, %self[%refcount_slot] : memref<14xi64>
     memref.store %class_id, %self[%layout_slot] : memref<14xi64>
     memref.store %length, %self[%length_slot] : memref<14xi64>
     memref.store %capacity, %self[%capacity_slot] : memref<14xi64>
     memref.store %items_word, %self[%items_slot] : memref<14xi64>
-    %c5 = arith.constant 5 : index
-    %c6 = arith.constant 6 : index
-    %c7 = arith.constant 7 : index
-    %c8 = arith.constant 8 : index
-    %c9 = arith.constant 9 : index
-    %c10 = arith.constant 10 : index
-    %c11 = arith.constant 11 : index
-    %c12 = arith.constant 12 : index
-    %c13 = arith.constant 13 : index
-    memref.store %zero, %self[%c5] : memref<14xi64>
-    memref.store %zero, %self[%c6] : memref<14xi64>
-    memref.store %zero, %self[%c7] : memref<14xi64>
-    memref.store %zero, %self[%c8] : memref<14xi64>
-    memref.store %zero, %self[%c9] : memref<14xi64>
-    memref.store %zero, %self[%c10] : memref<14xi64>
-    memref.store %zero, %self[%c11] : memref<14xi64>
-    memref.store %zero, %self[%c12] : memref<14xi64>
-    memref.store %zero, %self[%c13] : memref<14xi64>
     func.return %self : memref<14xi64>
   }
+
 
   // Borrowed view of the items array, derived at the point of use. The view's
   // SSA name is not an identity: identity is the handle, so two views of the
@@ -22695,12 +22689,8 @@ module attributes {
       %logical_index = arith.index_cast %i : index to i64
       func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%items, %logical_index) : (memref<?xi64>, i64) -> ()
     }
-    // The items array is a bare malloc reached through word 4, so it is freed
-    // by address rather than through the view: a memref.dealloc of a
-    // __ly_global_view_i64 descriptor would free the descriptor's base, not
-    // the allocation (same convention as LyList_DecRef).
-    %items_word = memref.load %self[%items_slot] : memref<14xi64>
-    func.call @free_raw_i64_ptr(%items_word) : (i64) -> ()
+    // The items live in the handle's own block (`__ly_tuple_alloc`), so
+    // freeing the handle frees them.
     memref.dealloc %self : memref<14xi64>
     cf.br ^done
 
