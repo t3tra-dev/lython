@@ -2958,17 +2958,19 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
       if (hookEntry.otherIsBox) {
         auto boxType = mlir::dyn_cast<mlir::MemRefType>(type.getInput(1));
         if (!boxType || !boxType.hasStaticShape() ||
-            boxType.getDimSize(0) != box_abi::kWordsPerBox)
+            boxType.getDimSize(0) != box_abi::kStandaloneBoxWords)
           return callee.emitError()
                  << "a boxed dispatch whose other operand is declared "
                     "builtins.object needs the "
-                 << box_abi::kWordsPerBox << "-word box as its second "
+                 << box_abi::kStandaloneBoxWords << "-word box as its second "
                  << "parameter, got " << type.getInput(1);
         mlir::Value rhsWord =
             mlir::LLVM::PtrToIntOp::create(builder, loc, i64, rhsSlot)
                 .getResult();
+        // ⛔ A slot, under the standalone box's type: the callee reads the
+        // class and entity words, which the two share, and nothing past them.
         mlir::Value size = mlir::arith::ConstantIntOp::create(
-            builder, loc, box_abi::kWordsPerBox, 64);
+            builder, loc, box_abi::kStandaloneBoxWords, 64);
         operands.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
             builder, loc, rhsWord, size, boxType));
       } else if (mlir::failed(appendLanesFrom(rhsSlot))) {

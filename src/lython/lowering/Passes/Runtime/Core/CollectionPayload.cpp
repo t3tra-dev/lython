@@ -366,8 +366,6 @@ namespace {
 
 constexpr unsigned kPayloadHandleWords =
     static_cast<unsigned>(box_abi::kWordsPerBox);
-constexpr unsigned kPayloadOwnedFlagSlot =
-    static_cast<unsigned>(box_abi::kOwnedFlagWord);
 // ⭐ CPython's `list_resize` (Objects/listobject.c), and it has to be exactly
 // that: this figure is what the LOWERING then believes the runtime allocated,
 // and a store below a capacity the runtime does not have writes past the
@@ -630,7 +628,6 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
                                        pointerIndex)
           .getResult();
   mlir::Value refcount = constantI64(builder, loc, 1);
-  mlir::Value owned = constantI64(builder, loc, ownsPayload ? 1 : 0);
   // ⛔ THE LANES ARE NOT COPIED IN. They used to be, a pointer and a size word
   // each, and every reader now rebuilds them from word 2 instead
   // (`lanesFromBoxEntity`) -- so writing them would be maintaining a second
@@ -639,7 +636,6 @@ RuntimeBundleLowerer::objectPayloadHandleWords(mlir::Operation *op,
   words[0] = refcount;
   words[1] = payloadClass;
   words[box_abi::kEntityWord] = payloadPointer;
-  words[kPayloadOwnedFlagSlot] = owned;
   return words;
 }
 

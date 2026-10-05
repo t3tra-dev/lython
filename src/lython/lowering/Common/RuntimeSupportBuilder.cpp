@@ -1757,14 +1757,9 @@ void buildReleasePayloadSlotPtr(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value slot = entry->getArgument(0);
   mlir::Value zero = b.iconst(0);
-  auto ownedWord = mlir::func::CallOp::create(
-      b.builder, b.loc, "boxed_load_i64", b.i64(),
-      mlir::ValueRange{slot, b.iconst(py::lowering::box_abi::kOwnedFlagWord)});
-  mlir::Value notOwned = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                ownedWord.getResult(0), zero);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, notOwned, done,
-                                 mlir::ValueRange{}, owned,
-                                 mlir::ValueRange{});
+  // A box owns its entity exactly when the entity is an address; the test
+  // below is the whole of it.
+  mlir::cf::BranchOp::create(b.builder, b.loc, owned, mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(owned);
   auto entityWord = mlir::func::CallOp::create(
@@ -1842,14 +1837,8 @@ void buildRetainPayloadSlotPtr(SupportBuilder &b) {
   b.builder.setInsertionPointToEnd(entry);
   mlir::Value slot = entry->getArgument(0);
   mlir::Value zero = b.iconst(0);
-  auto ownedWord = mlir::func::CallOp::create(
-      b.builder, b.loc, "boxed_load_i64", b.i64(),
-      mlir::ValueRange{slot, b.iconst(py::lowering::box_abi::kOwnedFlagWord)});
-  mlir::Value notOwned = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                ownedWord.getResult(0), zero);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, notOwned, done,
-                                 mlir::ValueRange{}, checkHeader,
-                                 mlir::ValueRange{});
+  mlir::cf::BranchOp::create(b.builder, b.loc, checkHeader,
+                             mlir::ValueRange{});
 
   b.builder.setInsertionPointToEnd(checkHeader);
   auto headerWord = mlir::func::CallOp::create(

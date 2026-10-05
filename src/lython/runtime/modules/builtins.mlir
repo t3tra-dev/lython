@@ -1721,7 +1721,7 @@ module attributes {
     %zero = arith.constant 0 : i64
     // The message lanes are not written: `__ly_exc_lane_words` reads them out
     // of the exception the entity word names.
-    func.call @__ly_exc_payload_store_words(%block_word, %slot, %one, %layout, %eh_word, %one, %zero) : (i64, i64, i64, i64, i64, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_words(%block_word, %slot, %one, %layout, %eh_word) : (i64, i64, i64, i64, i64) -> ()
     func.call @__ly_handle_retain_raw(%eh_word) : (i64) -> ()
     func.return
   }
@@ -1750,7 +1750,7 @@ module attributes {
     func.return %eh, %mh, %mb : memref<3xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  // Store one pre-built 16-word box (objectPayloadHandleWords layout) into
+  // Store one pre-built box (objectPayloadHandleWords layout) into
   // payload box %slot -- the multi-value exception args path boxes arbitrary
   // contracts in the lowering and hands the words across.
   // ⛔ THE ONE PLACE THE WIDTH IS STILL SPELLED OUT, and the only one where that
@@ -1758,7 +1758,7 @@ module attributes {
   // its ARITY -- and an arity that disagrees with `objectPayloadHandleWords` is
   // a verifier error at build time, not a wrong word at run time. Its two
   // callers pass the words positionally for the same reason.
-  func.func private @__ly_exc_payload_store_words(%block_word: i64, %slot: i64, %w0: i64, %w1: i64, %w2: i64, %w3: i64, %w4: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store_words"} {
+  func.func private @__ly_exc_payload_store_words(%block_word: i64, %slot: i64, %w0: i64, %w1: i64, %w2: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "payload_store_words"} {
     %words = func.call @__ly_box_word_count() : () -> i64
     %one = arith.constant 1 : i64
     %block_ptr = llvm.inttoptr %block_word : i64 to !llvm.ptr
@@ -1771,14 +1771,10 @@ module attributes {
     llvm.store %w1, %s1 : i64, !llvm.ptr
     %s2 = llvm.getelementptr %box_ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
     llvm.store %w2, %s2 : i64, !llvm.ptr
-    %s3 = llvm.getelementptr %box_ptr[3] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %w3, %s3 : i64, !llvm.ptr
-    %s4 = llvm.getelementptr %box_ptr[4] : (!llvm.ptr) -> !llvm.ptr, i64
-    llvm.store %w4, %s4 : i64, !llvm.ptr
     func.return
   }
 
-  // Store a str as boxed payload arg %slot: the same 16-word box layout
+  // Store a str as boxed payload arg %slot: the same box layout
   // __ly_unicode_store_item writes into a tuple slot, aimed at the payload
   // block. The block owns one reference per slot, so the str is retained
   // here rather than by the caller.
@@ -1788,7 +1784,7 @@ module attributes {
     %str_class = arith.constant 4 : i64
     %hdr_idx = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_idx : index to i64
-    func.call @__ly_exc_payload_store_words(%block, %slot, %one, %str_class, %hdr_ptr, %one, %zero) : (i64, i64, i64, i64, i64, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_words(%block, %slot, %one, %str_class, %hdr_ptr) : (i64, i64, i64, i64, i64) -> ()
     func.return
   }
 
@@ -1801,15 +1797,7 @@ module attributes {
     %v1 = llvm.load %g1 : !llvm.ptr -> i64
     %g2 = llvm.getelementptr %box[2] : (!llvm.ptr) -> !llvm.ptr, i64
     %v2 = llvm.load %g2 : !llvm.ptr -> i64
-    %g4 = llvm.getelementptr %box[4] : (!llvm.ptr) -> !llvm.ptr, i64
-    %v4 = llvm.load %g4 : !llvm.ptr -> i64
-    // The owned flag (word 3) is set rather than copied: the source box is the
-    // caller's (a dict lookup key is borrowed, flag 0), and copying it verbatim
-    // left the slot's retain below unmatched by release_payload_slot_ptr, which
-    // skips a slot it is told it does not own -- one leaked key reference per
-    // caught dict miss. Word 4, the cached hash, is copied.
-    %owned = arith.constant 1 : i64
-    func.call @__ly_exc_payload_store_words(%block, %slot, %w0, %v1, %v2, %owned, %v4) : (i64, i64, i64, i64, i64, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_words(%block, %slot, %w0, %v1, %v2) : (i64, i64, i64, i64, i64) -> ()
     func.call @__ly_handle_retain_raw(%v2) : (i64) -> ()
     func.return
   }
@@ -6439,7 +6427,7 @@ module attributes {
     %bytes_class = arith.constant 70 : i64
     %hdr_ptr_index = memref.extract_aligned_pointer_as_index %eh : memref<6xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_ptr_index : index to i64
-    func.call @__ly_box_store_entity(%items, %slot, %bytes_class, %hdr_ptr, %one) : (memref<?xi64>, i64, i64, i64, i64) -> ()
+    func.call @__ly_box_store_entity(%items, %slot, %bytes_class, %hdr_ptr) : (memref<?xi64>, i64, i64, i64) -> ()
     func.return
   }
 
@@ -8761,8 +8749,8 @@ module attributes {
     %low = arith.ori %val, %inexact_i64 : i64
     %two_const = arith.constant 2 : i64
     %neg_one_const = arith.constant -1 : i64
-    %three = arith.constant 3 : i64
-    %three_mask = arith.muli %mask, %three : i64
+    %triple_scale = arith.constant 3 : i64
+    %three_mask = arith.muli %mask, %triple_scale : i64
     %near_mask = arith.subi %three_mask, %one : i64
     %guard = arith.andi %low, %mask : i64
     %guard_set = arith.cmpi ne, %guard, %zero : i64
@@ -9344,9 +9332,9 @@ module attributes {
     cf.cond_br %huge_places, ^zero_result, ^check_three
 
   ^check_three:
-    %three = arith.constant 3 : i64
+    %digit_bits_scale = arith.constant 3 : i64
     %two = arith.constant 2 : i64
-    %three_places = arith.muli %places, %three : i64
+    %three_places = arith.muli %places, %digit_bits_scale : i64
     %bit_len_plus = arith.addi %bit_len, %two : i64
     %dominates = arith.cmpi sge, %three_places, %bit_len_plus : i64
     cf.cond_br %dominates, ^zero_result, ^general
@@ -12751,7 +12739,7 @@ module attributes {
     %str_class = arith.constant 4 : i64
     %hdr_ptr_index = memref.extract_aligned_pointer_as_index %eh : memref<2xi64> -> index
     %hdr_ptr = arith.index_cast %hdr_ptr_index : index to i64
-    func.call @__ly_box_store_entity(%items, %slot, %str_class, %hdr_ptr, %one) : (memref<?xi64>, i64, i64, i64, i64) -> ()
+    func.call @__ly_box_store_entity(%items, %slot, %str_class, %hdr_ptr) : (memref<?xi64>, i64, i64, i64) -> ()
     func.return
   }
 
@@ -18016,6 +18004,13 @@ module attributes {
   // The layout itself is ABI/BoxLayout.h, and `ManifestBoxLayoutTest` checks
   // that these five agree with it.
   func.func private @__ly_box_word_count() -> i64 {
+    %words = arith.constant 3 : i64
+    func.return %words : i64
+  }
+
+  // A standalone `object` box: the slot's words plus two the box does not use
+  // (BoxLayout.h, kStandaloneBoxWords).
+  func.func private @__ly_box_standalone_word_count() -> i64 {
     %words = arith.constant 5 : i64
     func.return %words : i64
   }
@@ -18040,43 +18035,25 @@ module attributes {
     func.return %word : i64
   }
 
-  // The flag the deallocators consult, and the hash the dict and set cache.
-  func.func private @__ly_box_owned_word(%base: i64) -> i64 {
-    %owned = arith.constant 3 : i64
-    %word = arith.addi %base, %owned : i64
-    func.return %word : i64
-  }
-
-  func.func private @__ly_box_hash_word(%base: i64) -> i64 {
-    %hash = arith.constant 4 : i64
-    %word = arith.addi %base, %hash : i64
-    func.return %word : i64
-  }
-
   // ⭐ THE WHOLE BOX, because a box IS an entity and its bookkeeping now. Four
   // writers used to spell this out and each of them zeroed the lanes first;
   // there are no lanes to zero and no lane words that can disagree with the
   // block they described.
-  func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_id: i64, %entity: i64, %owned: i64) {
-    %zero = arith.constant 0 : i64
+  // The box owns its entity exactly when the entity is an address: not 0
+  // (None) and not an immediate (bit 0 set). There is no flag to disagree.
+  func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_id: i64, %entity: i64) {
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %base_i64 = func.call @__ly_box_slot_base(%slot) : (i64) -> i64
     %base = arith.index_cast %base_i64 : i64 to index
     %entity_word = func.call @__ly_box_entity_word(%base_i64) : (i64) -> i64
-    %owned_word = func.call @__ly_box_owned_word(%base_i64) : (i64) -> i64
-    %hash_word = func.call @__ly_box_hash_word(%base_i64) : (i64) -> i64
     %refcount_slot = arith.addi %base, %c0 : index
     %class_slot = arith.addi %base, %c1 : index
     %entity_slot = arith.index_cast %entity_word : i64 to index
-    %owned_slot = arith.index_cast %owned_word : i64 to index
-    %hash_slot = arith.index_cast %hash_word : i64 to index
     memref.store %one, %items[%refcount_slot] : memref<?xi64>
     memref.store %class_id, %items[%class_slot] : memref<?xi64>
     memref.store %entity, %items[%entity_slot] : memref<?xi64>
-    memref.store %owned, %items[%owned_slot] : memref<?xi64>
-    memref.store %zero, %items[%hash_slot] : memref<?xi64>
     func.return
   }
 
@@ -19303,7 +19280,7 @@ module attributes {
     %slot_i64 = arith.index_cast %slot : index to i64
     %h_idx = memref.extract_aligned_pointer_as_index %h : memref<2xi64> -> index
     %h_ptr = arith.index_cast %h_idx : index to i64
-    func.call @__ly_box_store_entity(%items, %slot_i64, %int_class, %h_ptr, %one) : (memref<?xi64>, i64, i64, i64, i64) -> ()
+    func.call @__ly_box_store_entity(%items, %slot_i64, %int_class, %h_ptr) : (memref<?xi64>, i64, i64, i64) -> ()
     func.return
   }
 
@@ -20368,31 +20345,23 @@ module attributes {
         memref.store %word, %box[%w] : memref<5xi64>
       }
       %refcount_slot = arith.constant 0 : index
-      // The box this returns is a FRESH one, so its words are numbered from
-      // zero: the helpers take a base of zero rather than a slot base.
-      %owned_word = func.call @__ly_box_owned_word(%zero) : (i64) -> i64
-      %hash_word = func.call @__ly_box_hash_word(%zero) : (i64) -> i64
-      %owned_slot = arith.index_cast %owned_word : i64 to index
-      %hash_slot = arith.index_cast %hash_word : i64 to index
       memref.store %one, %box[%refcount_slot] : memref<5xi64>
-      memref.store %zero, %box[%hash_slot] : memref<5xi64>
+      // The standalone box is wider than a slot; the words past the slot's
+      // are not read, and are zeroed so a dump of one says so.
+      %box_words_i64 = func.call @__ly_box_standalone_word_count() : () -> i64
+      %box_words = arith.index_cast %box_words_i64 : i64 to index
+      scf.for %w = %c16 to %box_words step %c1 {
+        memref.store %zero, %box[%w] : memref<5xi64>
+      }
       %entity_slot = arith.constant 2 : index
       %entity = memref.load %box[%entity_slot] : memref<5xi64>
+      // Skips a null or tagged entity, which is exactly what the box then
+      // does not own (`release_payload_slot_ptr` asks the same question).
       func.call @__ly_handle_retain_raw(%entity) : (i64) -> ()
-      // ⛔ THE OWNED FLAG HAS TO SAY WHAT THE RETAIN ABOVE DID. It was stored
-      // as 1 unconditionally, and the retain skips a null or tagged entity, so
-      // a slot holding None -- sixteen zero words -- came back as a box that
-      // owed a release it had never taken. release_payload_slot_ptr then
-      // dispatched __ly_release_boxed_by_contract on class id 0 and
-      // `print(xs[0])` for `xs: list[object] = [None]` aborted in Ly_DecRef.
-      %null_entity = arith.cmpi eq, %entity, %zero : i64
-      %entity_tag = arith.andi %entity, %one : i64
-      %tagged_entity = arith.cmpi eq, %entity_tag, %one : i64
-      %retain_skipped = arith.ori %null_entity, %tagged_entity : i1
-      %owned_flag = arith.select %retain_skipped, %zero, %one : i64
-      memref.store %owned_flag, %box[%owned_slot] : memref<5xi64>
     } else {
-      scf.for %w = %c0 to %c16 step %c1 {
+      %all_words_i64 = func.call @__ly_box_standalone_word_count() : () -> i64
+      %all_words = arith.index_cast %all_words_i64 : i64 to index
+      scf.for %w = %c0 to %all_words step %c1 {
         memref.store %zero, %box[%w] : memref<5xi64>
       }
       %refcount_slot = arith.constant 0 : index
@@ -20463,13 +20432,19 @@ module attributes {
     //   [0, capacity*W)                  keys
     //   [capacity*W, 2*capacity*W)       values
     //   [2*capacity*W, +capacity)        present flags
+    //   [.., +capacity)                  key hashes, 0 = not computed yet
     //   [.., +4*capacity + 1)            index table, word 0 = built-for length
+    //
+    // ⛔ The hashes are not in the key's box: a box is the value's handle,
+    // the same in a list as in a dict, and a list never reads a hash. CPython
+    // keeps the hash in the dict entry beside the key, as this does.
     %four = arith.constant 4 : i64
     %eight = arith.constant 8 : i64
     %two = arith.constant 2 : i64
     %payload_words = arith.muli %capacity, %handle_words : i64
     %pair_words = arith.muli %payload_words, %two : i64
-    %through_present = arith.addi %pair_words, %capacity : i64
+    %flag_words = arith.muli %capacity, %two : i64
+    %through_present = arith.addi %pair_words, %flag_words : i64
     %table_words = arith.muli %capacity, %four : i64
     %table_alloc_i64 = arith.addi %table_words, %one : i64
     %block_words = arith.addi %through_present, %table_alloc_i64 : i64
@@ -20539,6 +20514,20 @@ module attributes {
     %present_slot = arith.constant 6 : index
     %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
     %base = memref.load %self[%present_slot] : memref<8xi64>
+    %view = func.call @__ly_global_view_i64(%base, %capacity) : (i64, i64) -> memref<?xi64>
+    func.return %view : memref<?xi64>
+  }
+
+  // The key hashes, one word per entry right after the present flags; 0 means
+  // not computed yet (a hash that IS 0 is recomputed, which is cheap).
+  func.func private @__ly_dict_hashes(%self: memref<8xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.interior_word, ly.runtime.primitive = "hashes_view"} {
+    %capacity_slot = arith.constant 3 : index
+    %present_slot = arith.constant 6 : index
+    %eight = arith.constant 8 : i64
+    %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
+    %present = memref.load %self[%present_slot] : memref<8xi64>
+    %offset = arith.muli %capacity, %eight : i64
+    %base = arith.addi %present, %offset : i64
     %view = func.call @__ly_global_view_i64(%base, %capacity) : (i64, i64) -> memref<?xi64>
     func.return %view : memref<?xi64>
   }
@@ -20881,10 +20870,9 @@ module attributes {
     %two = arith.constant 2 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %zero_base_h = arith.constant 0 : i64
-    %c15 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
     %c16 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
+    %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
     %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
     %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
     %from_index = arith.index_cast %from : i64 to index
@@ -20901,14 +20889,12 @@ module attributes {
       scf.if %is_present {
         %ii = arith.index_cast %i : index to i64
         %base = arith.muli %ii, %c16 : i64
-        %hash_off = arith.addi %base, %c15 : i64
-        %hash_index = arith.index_cast %hash_off : i64 to index
-        %cached = memref.load %keys[%hash_index] : memref<?xi64>
+        %cached = memref.load %hashes[%i] : memref<?xi64>
         %unknown = arith.cmpi eq, %cached, %zero : i64
         %hash = scf.if %unknown -> (i64) {
           %entry = llvm.getelementptr %keys_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
           %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
-          memref.store %computed, %keys[%hash_index] : memref<?xi64>
+          memref.store %computed, %hashes[%i] : memref<?xi64>
           scf.yield %computed : i64
         } else {
           scf.yield %cached : i64
@@ -21387,8 +21373,8 @@ module attributes {
       // of two at a time -- 8, 16, 32 for twenty entries -- and each step
       // copies every entry and rebuilds the table. Sizing from what is being
       // ASKED FOR reaches the same 32 in one step.
-      %three = arith.constant 3 : i64
-      %tripled = arith.muli %required, %three : i64
+      %growth_rate = arith.constant 3 : i64
+      %tripled = arith.muli %required, %growth_rate : i64
       %doubled = arith.muli %capacity, %two : i64
       %below_required = arith.cmpi slt, %tripled, %doubled : i64
       %wanted = arith.select %below_required, %doubled, %tripled : i1, i64
@@ -21404,7 +21390,8 @@ module attributes {
       %eight_g = arith.constant 8 : i64
       %one_g = arith.constant 1 : i64
       %new_pair_words = arith.muli %new_words, %two : i64
-      %new_through_present = arith.addi %new_pair_words, %new_capacity : i64
+      %new_flag_words = arith.muli %new_capacity, %two : i64
+      %new_through_present = arith.addi %new_pair_words, %new_flag_words : i64
       %new_table_words_g = arith.muli %new_capacity, %four_g : i64
       %new_table_alloc_g = arith.addi %new_table_words_g, %one_g : i64
       %new_block_words = arith.addi %new_through_present, %new_table_alloc_g : i64
@@ -21431,9 +21418,15 @@ module attributes {
         memref.store %key_word, %new_keys[%i] : memref<?xi64>
         memref.store %value_word, %new_values[%i] : memref<?xi64>
       }
+      %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
+      %new_hashes_off = arith.muli %new_capacity, %eight_g : i64
+      %new_hashes_base = arith.addi %new_present_base, %new_hashes_off : i64
+      %new_hashes = func.call @__ly_global_view_i64(%new_hashes_base, %new_capacity) : (i64, i64) -> memref<?xi64>
       scf.for %i = %lower to %old_capacity_index step %step {
         %present_word = memref.load %present[%i] : memref<?xi64>
         memref.store %present_word, %new_present[%i] : memref<?xi64>
+        %hash_word = memref.load %hashes[%i] : memref<?xi64>
+        memref.store %hash_word, %new_hashes[%i] : memref<?xi64>
       }
       // Publish capacity and the new bases together, then free the old
       // blocks: after these stores no view derived from the handle can reach
@@ -21613,6 +21606,7 @@ module attributes {
         memref.store %vw, %values[%dst] : memref<?xi64>
       }
     }
+    func.call @__ly_dict_shift_hashes(%self, %from, %len_index) : (memref<8xi64>, index, index) -> ()
     %new_len = arith.subi %len, %one : i64
     %last = arith.index_cast %new_len : i64 to index
     %last_base = arith.muli %last, %c16 : index
@@ -21626,10 +21620,27 @@ module attributes {
     func.return
   }
 
+  // The key hashes follow their entries when the dense tail shifts down over
+  // a removed one, or the table rebuilt from them would file every key after
+  // it under its neighbour's hash.
+  func.func private @__ly_dict_shift_hashes(%self: memref<8xi64>, %from: index, %len: index) {
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
+    scf.for %j = %from to %len step %c1 {
+      %dst = arith.subi %j, %c1 : index
+      %hash = memref.load %hashes[%j] : memref<?xi64>
+      memref.store %hash, %hashes[%dst] : memref<?xi64>
+    }
+    %last = arith.subi %len, %c1 : index
+    memref.store %zero, %hashes[%last] : memref<?xi64>
+    func.return
+  }
+
   // Runtime dict insert/replace with boxed key and value (any hashable key
   // class). The caller retained both boxes; on key replacement the duplicate
-  // key box is consumed here. The computed hash is cached in key box word 15
-  // before the copy so the stored entry carries it.
+  // key box is consumed here. The computed hash is kept in the hashes array
+  // beside the new entry.
   // Void and non-transfer, for the same reason as ensure_capacity: the growth
   // it may trigger updates the handle, and the entry it writes lands in an
   // array the handle points at. Nothing about the entity is renamed, so the
@@ -21642,16 +21653,12 @@ module attributes {
     %length_slot = arith.constant 2 : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %zero_base_h = arith.constant 0 : i64
-    %c15_i64_h = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
-    %c15 = arith.index_cast %c15_i64_h : i64 to index
 
     %len = memref.load %self[%length_slot] : memref<8xi64>
     %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
     %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
-    memref.store %hash, %key_box[%c15] : memref<5xi64>
     %found = func.call @__ly_dict_probe(%self, %box_ptr, %hash) : (memref<8xi64>, !llvm.ptr, i64) -> i64
 
     %missing = arith.cmpi eq, %found, %minus_one : i64
@@ -21676,6 +21683,8 @@ module attributes {
       }
       %len_slot_index = arith.index_cast %len : i64 to index
       memref.store %one, %present[%len_slot_index] : memref<?xi64>
+      %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
+      memref.store %hash, %hashes[%len_slot_index] : memref<?xi64>
       memref.store %required, %self[%length_slot] : memref<8xi64>
       // The one writer that keeps the table in step instead of leaving it to
       // the stamp: a rebuild per insert would put the quadratic straight back.
@@ -21760,6 +21769,8 @@ module attributes {
     %fresh_keys = func.call @__ly_dict_keys(%fresh) : (memref<8xi64>) -> memref<?xi64>
     %fresh_values = func.call @__ly_dict_values(%fresh) : (memref<8xi64>) -> memref<?xi64>
     %fresh_present = func.call @__ly_dict_present(%fresh) : (memref<8xi64>) -> memref<?xi64>
+    %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
+    %fresh_hashes = func.call @__ly_dict_hashes(%fresh) : (memref<8xi64>) -> memref<?xi64>
     %len_index = arith.index_cast %len : i64 to index
     // Source entries are dense in runtime mode but may be sparse for
     // evidence-written dicts: compact while copying.
@@ -21783,6 +21794,8 @@ module attributes {
         func.call @__ly_handle_retain_raw(%key_entity) : (i64) -> ()
         func.call @__ly_handle_retain_raw(%value_entity) : (i64) -> ()
         memref.store %one, %fresh_present[%next] : memref<?xi64>
+        %copied_hash = memref.load %hashes[%i] : memref<?xi64>
+        memref.store %copied_hash, %fresh_hashes[%next] : memref<?xi64>
         %incremented = arith.addi %next, %c1 : index
         scf.yield %incremented : index
       } else {
@@ -21798,7 +21811,7 @@ module attributes {
   // Insert-or-replace one entry (raw source boxes) into a dict; the source
   // key/value references are retained here. Returns the (possibly
   // reallocated) representation.
-  func.func private @__ly_dict_store_from_slot(%self: memref<8xi64> {ly.ownership.object_header}, %src_keys: memref<?xi64>, %src_values: memref<?xi64>, %src_slot: index) {
+  func.func private @__ly_dict_store_from_slot(%self: memref<8xi64> {ly.ownership.object_header}, %src_keys: memref<?xi64>, %src_values: memref<?xi64>, %src_hashes: memref<?xi64>, %src_slot: index) {
     %minus_one = arith.constant -1 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -21806,8 +21819,6 @@ module attributes {
     %c1 = arith.constant 1 : index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
-    %zero_base_h = arith.constant 0 : i64
-    %c15_i64 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %c2_slot = arith.constant 2 : index
     %src_idx = memref.extract_aligned_pointer_as_index %src_keys : memref<?xi64> -> index
@@ -21816,12 +21827,11 @@ module attributes {
     %slot_i64 = arith.index_cast %src_slot : index to i64
     %off = arith.muli %slot_i64, %c16_i64 : i64
     %key_entry = llvm.getelementptr %src_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %hash_gep = llvm.getelementptr %key_entry[%c15_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %cached = llvm.load %hash_gep : !llvm.ptr -> i64
+    %cached = memref.load %src_hashes[%src_slot] : memref<?xi64>
     %unknown = arith.cmpi eq, %cached, %zero : i64
     %hash = scf.if %unknown -> (i64) {
       %computed = func.call @__ly_box_hash(%key_entry) : (!llvm.ptr) -> i64
-      llvm.store %computed, %hash_gep : i64, !llvm.ptr
+      memref.store %computed, %src_hashes[%src_slot] : memref<?xi64>
       scf.yield %computed : i64
     } else {
       scf.yield %cached : i64
@@ -21855,6 +21865,8 @@ module attributes {
       func.call @__ly_handle_retain_raw(%key_entity) : (i64) -> ()
       func.call @__ly_handle_retain_raw(%value_entity) : (i64) -> ()
       memref.store %one, %grown_present[%dst_entry] : memref<?xi64>
+      %grown_hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
+      memref.store %hash, %grown_hashes[%dst_entry] : memref<?xi64>
       memref.store %required, %self[%len_slot] : memref<8xi64>
     } else {
       // Replace: release the old value, copy + retain the new one.
@@ -21891,13 +21903,14 @@ module attributes {
     %ok = func.call @__ly_dict_keys(%other) : (memref<8xi64>) -> memref<?xi64>
     %ov = func.call @__ly_dict_values(%other) : (memref<8xi64>) -> memref<?xi64>
     %op = func.call @__ly_dict_present(%other) : (memref<8xi64>) -> memref<?xi64>
+    %oh = func.call @__ly_dict_hashes(%other) : (memref<8xi64>) -> memref<?xi64>
     %olen = memref.load %other[%length_slot] : memref<8xi64>
     %olen_index = arith.index_cast %olen : i64 to index
     scf.for %i = %c0 to %olen_index step %c1 {
       %flag = memref.load %op[%i] : memref<?xi64>
       %is_present = arith.cmpi ne, %flag, %zero : i64
       scf.if %is_present {
-        func.call @__ly_dict_store_from_slot(%self, %ok, %ov, %i) : (memref<8xi64>, memref<?xi64>, memref<?xi64>, index) -> ()
+        func.call @__ly_dict_store_from_slot(%self, %ok, %ov, %oh, %i) : (memref<8xi64>, memref<?xi64>, memref<?xi64>, memref<?xi64>, index) -> ()
       }
     }
     func.return
@@ -22042,6 +22055,7 @@ module attributes {
           memref.store %vw, %values[%dst] : memref<?xi64>
         }
       }
+      func.call @__ly_dict_shift_hashes(%self, %from, %len_index) : (memref<8xi64>, index, index) -> ()
       scf.for %w = %c0 to %c16 step %c1 {
         %dst = arith.addi %park_base, %w : index
         %kw_zero = arith.constant 0 : i64
@@ -23115,13 +23129,10 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
-    %three = arith.constant 3 : i64
+    %fill_limit_scale = arith.constant 3 : i64
     %probe_scale = arith.constant 5 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %zero_base_h = arith.constant 0 : i64
-    %c15_i64_h = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
-    %c15 = arith.index_cast %c15_i64_h : i64 to index
     %c16_words = func.call @__ly_box_word_count() : () -> i64
     %c16 = arith.index_cast %c16_words : i64 to index
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
@@ -23165,8 +23176,6 @@ module attributes {
       %word = memref.load %src_items[%src] : memref<?xi64>
       memref.store %word, %items[%dst] : memref<?xi64>
     }
-    %hash_index = arith.addi %dst_base, %c15 : index
-    memref.store %hash, %items[%hash_index] : memref<?xi64>
     %entity_index = arith.addi %dst_base, %entity_slot : index
     %entity = memref.load %items[%entity_index] : memref<?xi64>
     %state = arith.addi %rank, %two : i64
@@ -23182,7 +23191,7 @@ module attributes {
       %new_fill = arith.addi %fill, %one : i64
       memref.store %new_fill, %self[%fill_slot] : memref<?xi64>
       %loaded = arith.muli %new_fill, %probe_scale : i64
-      %room = arith.muli %mask, %three : i64
+      %room = arith.muli %mask, %fill_limit_scale : i64
       %crowded = arith.cmpi sge, %loaded, %room : i64
       scf.if %crowded {
         %huge = arith.cmpi sgt, %required, %big : i64
@@ -23426,8 +23435,8 @@ module attributes {
     func.return
   }
 
-  // Hash-first probe among slots 0..len-1 (dense insertion order; the cached
-  // hash lives in box word 15 with lazy refill, same scheme as the dict).
+  // Hash-first probe among slots 0..len-1 (dense insertion order; each
+  // entry's hash is computed here -- a box carries none).
   // Returns the slot index or -1. Length BY VALUE and items by view: every
   // caller either holds a set that is not growing under it, or wants to probe
   // a bounded prefix (symmetric_difference_update does), and a length taken
@@ -23437,8 +23446,6 @@ module attributes {
     %zero = arith.constant 0 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %zero_base_h = arith.constant 0 : i64
-    %c15 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
     %c16 = func.call @__ly_box_word_count() : () -> i64
     %len_index = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
@@ -23450,17 +23457,7 @@ module attributes {
         %ii = arith.index_cast %i : index to i64
         %base = arith.muli %ii, %c16 : i64
         %entry = llvm.getelementptr %items_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %hash_slot_i64 = arith.addi %base, %c15 : i64
-        %hash_slot = arith.index_cast %hash_slot_i64 : i64 to index
-        %cached = memref.load %items[%hash_slot] : memref<?xi64>
-        %unknown = arith.cmpi eq, %cached, %zero : i64
-        %entry_hash = scf.if %unknown -> (i64) {
-          %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
-          memref.store %computed, %items[%hash_slot] : memref<?xi64>
-          scf.yield %computed : i64
-        } else {
-          scf.yield %cached : i64
-        }
+        %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
         %hash_matches = arith.cmpi eq, %entry_hash, %elem_hash : i64
         %matched = scf.if %hash_matches -> (i64) {
           %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
@@ -23491,21 +23488,12 @@ module attributes {
     func.return
   }
 
-  // The cached hash of a raw box, refilled lazily (word 15, 0 = not yet known).
+  // The hash of a raw box. ⛔ Recomputed, not cached in the box: a box is a
+  // value's handle and carries no hash (BoxLayout.h); the set's table keeps
+  // its own copy for the probes that matter, and the set algebra that asks
+  // here (union, difference, comparisons) hashes each element once per call.
   func.func private @__ly_set_entry_hash(%entry: !llvm.ptr) -> i64 {
-    %zero = arith.constant 0 : i64
-    %zero_base_h = arith.constant 0 : i64
-    %c15_i64 = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
-    %hash_gep = llvm.getelementptr %entry[%c15_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %cached = llvm.load %hash_gep : !llvm.ptr -> i64
-    %unknown = arith.cmpi eq, %cached, %zero : i64
-    %hash = scf.if %unknown -> (i64) {
-      %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
-      llvm.store %computed, %hash_gep : i64, !llvm.ptr
-      scf.yield %computed : i64
-    } else {
-      scf.yield %cached : i64
-    }
+    %hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
     func.return %hash : i64
   }
 
@@ -23553,7 +23541,7 @@ module attributes {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
-    %three = arith.constant 3 : i64
+    %fill_limit_scale = arith.constant 3 : i64
     %probe_scale = arith.constant 5 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
@@ -23573,7 +23561,7 @@ module attributes {
       %used0 = memref.load %self[%length_slot] : memref<?xi64>
       %after = arith.addi %fill0, %oused : i64
       %loaded = arith.muli %after, %probe_scale : i64
-      %room = arith.muli %mask0, %three : i64
+      %room = arith.muli %mask0, %fill_limit_scale : i64
       %crowded = arith.cmpi sge, %loaded, %room : i64
       scf.if %crowded {
         %total = arith.addi %used0, %oused : i64
@@ -24012,14 +24000,10 @@ module attributes {
   func.func @LySet_AddBox(%self: memref<11xi64> {ly.ownership.object_header}, %elem_box: memref<5xi64>) attributes {ly.runtime.contract = "builtins.set", ly.runtime.primitive = "add_box"} {
     %zero = arith.constant 0 : i64
     %minus_one = arith.constant -1 : i64
-    %zero_base_h = arith.constant 0 : i64
-    %c15_i64_h = func.call @__ly_box_hash_word(%zero_base_h) : (i64) -> i64
-    %c15 = arith.index_cast %c15_i64_h : i64 to index
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
     %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
-    memref.store %hash, %elem_box[%c15] : memref<5xi64>
     %raw = memref.cast %self : memref<11xi64> to memref<?xi64>
     %src = memref.cast %elem_box : memref<5xi64> to memref<?xi64>
     %probe:3 = func.call @__ly_set_table_add_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> (i64, i64, i1)
