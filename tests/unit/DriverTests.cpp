@@ -2698,6 +2698,54 @@ bool callsFunctionNamed(llvm::Module &module, llvm::StringRef callee) {
 
 } // namespace
 
+// What: an int or float a container only stores goes into its slot as the
+// slot's own word -- an int known as an i64 through `slot_word_from_i64`
+// (no object made), an int or float object through `slot_word_taking_ref`
+// (the object dropped again when the value is immediate) -- and a read of
+// such a slot goes through `from_slot_word`, which turns an immediate back
+// into an object. A literal keeps storing objects: its elements are also the
+// container's contents evidence, whose readers want one.
+TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
+  auto calls = [](const std::string &source, llvm::StringRef callee) {
+    CompileResult result = compileSource(source);
+    EXPECT_TRUE(result.succeeded) << result.diagnostics;
+    return result.succeeded &&
+           callsFunctionNamed(*result.verified.llvmModule, callee);
+  };
+  // The i64 clone that stores through `slot_word_from_i64` may be dropped
+  // from the final module when the boxed original is the one called, so
+  // either store spelling answers.
+  const std::string inFunction = "def run(n: int) -> int:\n"
+                                 "    xs: list[int] = []\n"
+                                 "    for i in range(n):\n"
+                                 "        xs.append(i)\n"
+                                 "    return xs[0]\n\n\nprint(run(3))\n";
+  EXPECT_TRUE(calls(inFunction, "LyLong_SlotWordFromI64") ||
+              calls(inFunction, "LyLong_SlotWordTakingRef"));
+  EXPECT_TRUE(calls("xs: list[int] = []\n"
+                    "for i in range(3):\n"
+                    "    xs.append(i * 1000)\n"
+                    "print(xs[1])\n",
+                    "LyLong_SlotWordTakingRef"));
+  EXPECT_TRUE(calls("xs: list[int] = []\n"
+                    "for i in range(3):\n"
+                    "    xs.append(i * 1000)\n"
+                    "print(xs[1])\n",
+                    "LyLong_FromSlotWord"));
+  EXPECT_TRUE(calls("fs: list[float] = []\n"
+                    "for i in range(3):\n"
+                    "    fs.append(i * 0.5)\n"
+                    "print(fs[1])\n",
+                    "LyFloat_SlotWordTakingRef"));
+  EXPECT_TRUE(calls("d: dict[int, float] = {}\n"
+                    "for i in range(3):\n"
+                    "    d[i * 1000] = i * 0.5\n"
+                    "print(d[1000])\n",
+                    "LyFloat_SlotWordTakingRef"));
+  EXPECT_FALSE(calls("xs = [1000, 2000]\nprint(xs[0])\n",
+                     "LyLong_SlotWordTakingRef"));
+}
+
 // What: a value is kept referenced to the end of its frame only when its
 // release can be observed. A list of ints and a plain class instance are
 // released at their last use -- no keep-alive call anywhere. An instance of a

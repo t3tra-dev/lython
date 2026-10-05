@@ -2206,7 +2206,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
           RuntimeBundleLowerer::lanesFromBoxEntity(
               builder, loc, entityWord, type.getInputs(), hookEntry.contract,
-              callee);
+              callee,
+              /*ownedRead=*/!callee->hasAttr(contracts::kManifestDeallocatorAttr));
       if (mlir::failed(lanes))
         return mlir::failure();
       llvm::SmallVector<mlir::Value, 6> operands(lanes->begin(), lanes->end());
@@ -2947,7 +2948,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
         mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
             RuntimeBundleLowerer::lanesFromBoxEntity(
                 builder, loc, entityWord, type.getInputs().take_front(half),
-                hookEntry.contract, callee);
+                hookEntry.contract, callee, /*ownedRead=*/true);
         if (mlir::failed(lanes))
           return mlir::failure();
         operands.append(lanes->begin(), lanes->end());

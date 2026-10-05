@@ -727,7 +727,8 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
       mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
           RuntimeBundleLowerer::lanesFromBoxEntity(
               builder, loc, entityWord, *expectedTypes,
-              runtimeContractName(resultValue.getType()), op);
+              runtimeContractName(resultValue.getType()), op,
+              /*ownedRead=*/true);
       if (mlir::failed(lanes))
         return mlir::failure();
       RuntimeBundle result;

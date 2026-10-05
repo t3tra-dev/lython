@@ -587,6 +587,22 @@ RuntimeBundleLowerer::retainEvidenceElement(mlir::Operation *op,
   else
     builder.setInsertionPointAfter(latest);
   mlir::Location loc = atOperation ? op->getLoc() : latest->getLoc();
+  // ⭐ AN INT OR FLOAT VIEW MAY HAVE BEEN BUILT FROM AN IMMEDIATE, so the
+  // retain is the contract's `from_slot_word`: an owned object either way,
+  // the view itself retained when it is one. See `lanesFromBoxEntity`.
+  if ((contract == "builtins.int" || contract == "builtins.float") &&
+      value.values.size() == 1)
+    if (std::optional<RuntimeSymbol> fromSlotWord =
+            manifest.primitive(contract, "from_slot_word"))
+      if (fromSlotWord->function.getFunctionType().getInput(0) ==
+          value.values.front().getType()) {
+        mlir::func::CallOp owned = mlir::func::CallOp::create(
+            builder, loc, fromSlotWord->function, value.values.front());
+        RuntimeValue fresh = value;
+        fresh.values.assign(owned.getResults().begin(),
+                            owned.getResults().end());
+        return rootAsOwnedLocal(builder, loc, fresh, contract);
+      }
   mlir::Type retainInput = retain.getFunctionType().getInput(0);
   mlir::Value header = ownership::spellHeaderPrefix(
       builder, loc, value.values.front(), retainInput);
@@ -1775,11 +1791,21 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::lowerRuntimeDictGetItem(
                                                       entityWord);
     if (mlir::failed(unionValues))
       return mlir::failure();
-    RuntimeBundle result;
-    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
-            op, valueContract, *unionValues, result)))
+    // ⭐ RETAINED, as the sequence read is. A member's view may have been built
+    // from an immediate (an int or float stored as its value), and the retain
+    // is what turns that into an object (`retainEvidenceElement`); a borrowed
+    // view of one was a read of whatever the value's bits pointed at.
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+        RuntimeBundleLowerer::retainUnionMemberValues(op, valueUnion,
+                                                       *unionValues);
+    if (mlir::failed(owned))
       return mlir::failure();
-    result.setObjectLogicalOwnership(/*ownsObject=*/false);
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
+            op, valueContract, *owned, result,
+            ownership::logicalOwnershipKind(valueContract,
+                                            /*ownsObject=*/true))))
+      return mlir::failure();
     valueBundles[op.getResult()] = std::move(result);
     if (mlir::failed(pinContainerLiveness(op, container,
                                           /*insertAfterOp=*/true)))

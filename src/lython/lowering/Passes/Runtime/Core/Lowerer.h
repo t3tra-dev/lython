@@ -729,7 +729,8 @@ private:
                         const RuntimeBundle &index);
   mlir::FailureOr<RuntimeBundle>
   materializePayloadObjectBundle(mlir::Operation *op,
-                                 const RuntimeBundle &value);
+                                 const RuntimeBundle &value,
+                                 bool slotWordOnly = false);
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadHandleWords(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);
@@ -993,7 +994,8 @@ private:
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   lanesFromBoxEntity(mlir::OpBuilder &builder, mlir::Location loc,
                      mlir::Value entityWord, llvm::ArrayRef<mlir::Type> laneTypes,
-                     llvm::StringRef contract, mlir::Operation *reporter);
+                     llvm::StringRef contract, mlir::Operation *reporter,
+                     bool ownedRead = false);
   std::optional<RuntimeSymbol> laneWordsPrimitiveFor(llvm::StringRef contract) const;
   // Per-program release hook: dispatches a boxed slot's class id to the
   // matching manifest deallocator (the single release implementation).

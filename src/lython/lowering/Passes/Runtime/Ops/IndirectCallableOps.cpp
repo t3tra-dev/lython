@@ -302,7 +302,7 @@ RuntimeBundleLowerer::closureValuesFromFunctionObject(
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> lanes =
         RuntimeBundleLowerer::lanesFromBoxEntity(
             builder, loc, entityWord, *laneTypes,
-            runtimeContractName(closureType), op);
+            runtimeContractName(closureType), op, /*ownedRead=*/true);
     if (mlir::failed(lanes))
       return mlir::failure();
     mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> unboxed =

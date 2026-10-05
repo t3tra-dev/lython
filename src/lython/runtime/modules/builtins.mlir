@@ -5096,10 +5096,11 @@ module attributes {
   // ⛔ A LIST, where CPython takes any iterable of ints: this port has no
   // runtime iteration protocol to consume here, and a list is what the
   // spelling is written with.
+  // bytes(list[int]): CPython's _PyBytes_FromList. Every element is checked
+  // for range(0, 256) BEFORE the block is allocated, so the ValueError strands
+  // nothing; the copy then truncates values already known to fit.
   func.func @LyBytes_NewFromList(%items: memref<9xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
     %length = func.call @LyList_Len(%items) : (memref<9xi64>) -> i64
-    %header = func.call @__ly_bytes_alloc(%length) : (i64) -> memref<6xi64>
-    %payload = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
     %slots = func.call @__ly_list_items(%items) : (memref<9xi64>) -> memref<?xi64>
     %handle_words = func.call @__ly_box_word_count() : () -> i64
     %handle_words_index = arith.index_cast %handle_words : i64 to index
@@ -5107,19 +5108,50 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
-    %two_words = arith.constant 2 : i64
+    %zero = arith.constant 0 : i64
+    %byte_end = arith.constant 256 : i64
+    %true = arith.constant true
+    %all_fit = scf.for %index = %c0 to %count step %c1 iter_args(%ok = %true) -> (i1) {
+      %base = arith.muli %index, %handle_words_index : index
+      %entity_slot = arith.addi %base, %c2 : index
+      %entity = memref.load %slots[%entity_slot] : memref<?xi64>
+      %value, %fits = func.call @LyLong_SlotWordAsI64(%entity) : (i64) -> (i64, i1)
+      %low = arith.cmpi sge, %value, %zero : i64
+      %high = arith.cmpi slt, %value, %byte_end : i64
+      %in_range = arith.andi %low, %high : i1
+      %this_ok = arith.andi %fits, %in_range : i1
+      %next = arith.andi %ok, %this_ok : i1
+      scf.yield %next : i1
+    }
+    scf.if %all_fit {
+    } else {
+      func.call @__ly_bytes_raise_bytes_range() : () -> ()
+    }
+    %header = func.call @__ly_bytes_alloc(%length) : (i64) -> memref<6xi64>
+    %payload = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
     scf.for %index = %c0 to %count step %c1 {
       %base = arith.muli %index, %handle_words_index : index
       %entity_slot = arith.addi %base, %c2 : index
       %entity = memref.load %slots[%entity_slot] : memref<?xi64>
-      %int_view = func.call @__ly_global_view_i64(%entity, %two_words) : (i64, i64) -> memref<?xi64>
-      %int_header = memref.cast %int_view : memref<?xi64> to memref<2xi64>
-      %value = func.call @LyLong_AsI64(%int_header) : (memref<2xi64>) -> i64
+      %value, %fits = func.call @LyLong_SlotWordAsI64(%entity) : (i64) -> (i64, i1)
       %byte = arith.trunci %value : i64 to i8
       memref.store %byte, %payload[%index] : memref<?xi8>
     }
     func.return %header : memref<6xi64>
   }
+
+  func.func private @__ly_bytes_raise_bytes_range() {
+    %message = memref.get_global @__ly_bytes_bytes_range_message : memref<30xi8>
+    %message_dyn = memref.cast %message : memref<30xi8> to memref<?xi8>
+    %len = arith.constant 30 : i64
+    %class_id = arith.constant 53 : i64
+    func.call @__ly_raise_static_message(%class_id, %message_dyn, %len) : (i64, memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // "bytes must be in range(0, 256)"
+  memref.global "private" constant @__ly_bytes_bytes_range_message : memref<30xi8> = dense<[98, 121, 116, 101, 115, 32, 109, 117, 115, 116, 32, 98, 101, 32, 105, 110, 32, 114, 97, 110, 103, 101, 40, 48, 44, 32, 50, 53, 54, 41]>
+
 
   func.func @LyBytes_InitFromList(%self: memref<6xi64> {ly.ownership.object_header}, %items: memref<9xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
     func.return
@@ -7404,6 +7436,217 @@ module attributes {
     %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
     %value = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
     func.return %value, %fits : i64, i1
+  }
+
+  // ===== immediates in a slot's entity word =====
+  //
+  // A slot (and a standalone `object` box) of class int or float may hold the
+  // value itself in its entity word instead of the address of an object: bit 0
+  // set says so, and every retain and release already skips such a word, so a
+  // slot that holds one owns nothing. Which decoding applies is the class
+  // word's: an int is `v << 1 | 1` for v in [-2^62, 2^62), a float is the
+  // rotated encoding below. Values outside those ranges stay objects.
+  //
+  // ⛔ Not every int: a 64-bit value needs a bit the tag takes. CPython puts
+  // every int in an object; here only the ones past 2^62 are (2^30 on a
+  // 32-bit target, `__ly_addresses_are_word_wide`).
+  func.func private @__ly_slot_word_is_immediate(%word: i64) -> i1 {
+    %one = arith.constant 1 : i64
+    %tag = arith.andi %word, %one : i64
+    %is = arith.cmpi eq, %tag, %one : i64
+    func.return %is : i1
+  }
+
+  // True when an address is as wide as a slot word. On a 32-bit target
+  // (wasm32, armv7) a word that becomes a view is cut to the address's width
+  // on the way, so an immediate has to survive that: there an int is
+  // immediate only within 31 bits and a float never is. Folds to a constant.
+  // ⛔ Asked of a POINTER, not of `index`: wasm32 lowers `index` to 64 bits
+  // and its pointers to 32, and it is the pointer the word passes through.
+  func.func private @__ly_addresses_are_word_wide() -> i1 {
+    %probe = arith.constant 1099511627776 : i64
+    %as_ptr = llvm.inttoptr %probe : i64 to !llvm.ptr
+    %back = llvm.ptrtoint %as_ptr : !llvm.ptr to i64
+    %wide = arith.cmpi eq, %back, %probe : i64
+    func.return %wide : i1
+  }
+
+  // The entity word a slot view was built from, read back off the view. On a
+  // 32-bit target the view kept the low half, zero-extended; an immediate
+  // there is a sign-extended 32-bit word, so the sign is put back.
+  func.func private @__ly_slot_word_from_view_address(%address: i64) -> i64 {
+    %wide = func.call @__ly_addresses_are_word_wide() : () -> i1
+    %thirty_two = arith.constant 32 : i64
+    %high = arith.shli %address, %thirty_two : i64
+    %narrowed = arith.shrsi %high, %thirty_two : i64
+    %one = arith.constant 1 : i64
+    %tag = arith.andi %address, %one : i64
+    %immediate = arith.cmpi eq, %tag, %one : i64
+    %true = arith.constant true
+    %narrow = arith.xori %wide, %true : i1
+    %narrow_imm = arith.andi %immediate, %narrow : i1
+    %word = arith.select %narrow_imm, %narrowed, %address : i1, i64
+    func.return %word : i64
+  }
+
+  func.func private @__ly_int_immediate_fits(%value: i64) -> i1 {
+    %wide = func.call @__ly_addresses_are_word_wide() : () -> i1
+    %one = arith.constant 1 : i64
+    %thirty_three = arith.constant 33 : i64
+    %shift = arith.select %wide, %one, %thirty_three : i1, i64
+    %shifted = arith.shli %value, %shift : i64
+    %back = arith.shrsi %shifted, %shift : i64
+    %fits = arith.cmpi eq, %back, %value : i64
+    func.return %fits : i1
+  }
+
+  func.func private @__ly_int_to_immediate(%value: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %shifted = arith.shli %value, %one : i64
+    %word = arith.ori %shifted, %one : i64
+    func.return %word : i64
+  }
+
+  func.func private @__ly_int_from_immediate(%word: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %value = arith.shrsi %word, %one : i64
+    func.return %value : i64
+  }
+
+  // A float is immediate when the top three bits of its exponent are 011 or
+  // 100 -- magnitudes in [2^-255, 2^256), every float most programs make --
+  // or when it is +0.0. Rotating left by three brings sign and the two high
+  // exponent bits to the bottom; those two bits are recoverable from the
+  // third (bit 63 after the rotation), so they make room for the tag. +0.0 is
+  // the word 3, which no rotated float produces (they all have bit 1 clear).
+  // This is Ruby's flonum, with the tag in bit 0 instead of bit 1.
+  func.func private @__ly_float_immediate_fits(%bits: i64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %sixty = arith.constant 60 : i64
+    %seven = arith.constant 7 : i64
+    %three_top = arith.constant 3 : i64
+    %one = arith.constant 1 : i64
+    %top = arith.shrui %bits, %sixty : i64
+    %exp_top = arith.andi %top, %seven : i64
+    %rebased = arith.subi %exp_top, %three_top : i64
+    %in_range = arith.cmpi ule, %rebased, %one : i64
+    %is_zero = arith.cmpi eq, %bits, %zero : i64
+    %encodable = arith.ori %in_range, %is_zero : i1
+    %wide = func.call @__ly_addresses_are_word_wide() : () -> i1
+    %fits = arith.andi %encodable, %wide : i1
+    func.return %fits : i1
+  }
+
+  func.func private @__ly_float_to_immediate(%bits: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %three = arith.constant 3 : i64
+    %sixty_one = arith.constant 61 : i64
+    %low_clear = arith.constant -4 : i64
+    %high = arith.shli %bits, %three : i64
+    %low = arith.shrui %bits, %sixty_one : i64
+    %rotated = arith.ori %high, %low : i64
+    %cleared = arith.andi %rotated, %low_clear : i64
+    %tagged = arith.ori %cleared, %one : i64
+    %is_zero = arith.cmpi eq, %bits, %zero : i64
+    %word = arith.select %is_zero, %three, %tagged : i1, i64
+    func.return %word : i64
+  }
+
+  func.func private @__ly_float_from_immediate(%word: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %sixty_one = arith.constant 61 : i64
+    %sixty_three = arith.constant 63 : i64
+    %low_clear = arith.constant -4 : i64
+    %b63 = arith.shrui %word, %sixty_three : i64
+    %restored_low = arith.subi %two, %b63 : i64
+    %cleared = arith.andi %word, %low_clear : i64
+    %rotated = arith.ori %cleared, %restored_low : i64
+    %low = arith.shrui %rotated, %three : i64
+    %high = arith.shli %rotated, %sixty_one : i64
+    %bits = arith.ori %low, %high : i64
+    %is_zero = arith.cmpi eq, %word, %three : i64
+    %result = arith.select %is_zero, %zero, %bits : i1, i64
+    func.return %result : i64
+  }
+
+  // The int a slot's entity word names, as an owned object: a fresh (or
+  // small-table) int for an immediate, the object itself retained otherwise.
+  // ⛔ It takes the word as the VIEW the lowering builds from it, not as an
+  // i64: that view is what tells ownership the read is inside the container,
+  // and a bare word let the container be released between the load and here.
+  // An immediate's view is never dereferenced.
+  func.func @LyLong_FromSlotWord(%slot_view: memref<2xi64>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "from_slot_word"} {
+    %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<2xi64> -> index
+    %address = arith.index_cast %word_idx : index to i64
+    %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %header = scf.if %immediate -> (memref<2xi64>) {
+      %value = func.call @__ly_int_from_immediate(%word) : (i64) -> i64
+      %fresh = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+      scf.yield %fresh : memref<2xi64>
+    } else {
+      func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+      %two = arith.constant 2 : i64
+      %view = func.call @__ly_global_view_i64(%word, %two) : (i64, i64) -> memref<?xi64>
+      %held = memref.cast %view : memref<?xi64> to memref<2xi64>
+      scf.yield %held : memref<2xi64>
+    }
+    func.return %header : memref<2xi64>
+  }
+
+  // The i64 a slot's entity word names when it has one: the immediate, or an
+  // object's value when it fits. `fits` false means the object is wider.
+  func.func @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"} {
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %true = arith.constant true
+    %value, %fits = scf.if %immediate -> (i64, i1) {
+      %v = func.call @__ly_int_from_immediate(%word) : (i64) -> i64
+      scf.yield %v, %true : i64, i1
+    } else {
+      %two = arith.constant 2 : i64
+      %view = func.call @__ly_global_view_i64(%word, %two) : (i64, i64) -> memref<?xi64>
+      %header = memref.cast %view : memref<?xi64> to memref<2xi64>
+      %v, %ok = func.call @LyLong_TryAsI64(%header) : (memref<2xi64>) -> (i64, i1)
+      scf.yield %v, %ok : i64, i1
+    }
+    func.return %value, %fits : i64, i1
+  }
+
+  // The entity word a slot stores for an int it is handed as an i64: the
+  // immediate when it fits, else a new object whose reference the slot takes.
+  func.func @LyLong_SlotWordFromI64(%value: i64) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_from_i64"} {
+    %fits = func.call @__ly_int_immediate_fits(%value) : (i64) -> i1
+    %word = scf.if %fits -> (i64) {
+      %w = func.call @__ly_int_to_immediate(%value) : (i64) -> i64
+      scf.yield %w : i64
+    } else {
+      %header = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+      %idx = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+      %w = arith.index_cast %idx : index to i64
+      scf.yield %w : i64
+    }
+    func.return %word : i64
+  }
+
+  // The int counterpart of `LyFloat_SlotWordTakingRef`.
+  func.func @LyLong_SlotWordTakingRef(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_taking_ref"} {
+    %value, %ok = func.call @LyLong_TryAsI64(%header) : (memref<2xi64>) -> (i64, i1)
+    %narrow = func.call @__ly_int_immediate_fits(%value) : (i64) -> i1
+    %fits = arith.andi %ok, %narrow : i1
+    %word = scf.if %fits -> (i64) {
+      func.call @LyLong_DecRef(%header) : (memref<2xi64>) -> ()
+      %w = func.call @__ly_int_to_immediate(%value) : (i64) -> i64
+      scf.yield %w : i64
+    } else {
+      %idx = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+      %w = arith.index_cast %idx : index to i64
+      scf.yield %w : i64
+    }
+    func.return %word : i64
   }
 
   func.func @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"} {
@@ -16813,6 +17056,81 @@ module attributes {
     func.return %value : f64
   }
 
+  // The float a slot's entity word names, as an owned object.
+  func.func @LyFloat_FromSlotWord(%slot_view: memref<3xi64>) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.primitive = "from_slot_word"} {
+    %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<3xi64> -> index
+    %address = arith.index_cast %word_idx : index to i64
+    %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %header = scf.if %immediate -> (memref<3xi64>) {
+      %bits = func.call @__ly_float_from_immediate(%word) : (i64) -> i64
+      %value = arith.bitcast %bits : i64 to f64
+      %fresh = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+      scf.yield %fresh : memref<3xi64>
+    } else {
+      func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+      %three = arith.constant 3 : i64
+      %view = func.call @__ly_global_view_i64(%word, %three) : (i64, i64) -> memref<?xi64>
+      %held = memref.cast %view : memref<?xi64> to memref<3xi64>
+      scf.yield %held : memref<3xi64>
+    }
+    func.return %header : memref<3xi64>
+  }
+
+  // The f64 a slot's entity word names.
+  func.func @LyFloat_SlotWordAsF64(%word: i64) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_as_f64"} {
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %bits = scf.if %immediate -> (i64) {
+      %b = func.call @__ly_float_from_immediate(%word) : (i64) -> i64
+      scf.yield %b : i64
+    } else {
+      %ptr = llvm.inttoptr %word : i64 to !llvm.ptr
+      %slot = llvm.getelementptr %ptr[2] : (!llvm.ptr) -> !llvm.ptr, i64
+      %b = llvm.load %slot : !llvm.ptr -> i64
+      scf.yield %b : i64
+    }
+    %value = arith.bitcast %bits : i64 to f64
+    func.return %value : f64
+  }
+
+  // The entity word a slot stores for a float it is handed as an f64.
+  func.func @LyFloat_SlotWordFromF64(%value: f64) -> i64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_from_f64"} {
+    %bits = arith.bitcast %value : f64 to i64
+    %fits = func.call @__ly_float_immediate_fits(%bits) : (i64) -> i1
+    %word = scf.if %fits -> (i64) {
+      %w = func.call @__ly_float_to_immediate(%bits) : (i64) -> i64
+      scf.yield %w : i64
+    } else {
+      %header = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+      %idx = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
+      %w = arith.index_cast %idx : index to i64
+      scf.yield %w : i64
+    }
+    func.return %word : i64
+  }
+
+  // The entity word a slot stores for a float OBJECT whose reference the
+  // slot has just been given (the lowering's aggregate retain): the immediate
+  // when the value has one -- and then that reference is dropped again, since
+  // the slot holds no object -- else the object's address.
+  // ⛔ Called only after the retain: before it, the drop could free an object
+  // the frame still holds.
+  func.func @LyFloat_SlotWordTakingRef(%header: memref<3xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_taking_ref"} {
+    %value_slot = arith.constant 2 : index
+    %bits = memref.load %header[%value_slot] : memref<3xi64>
+    %fits = func.call @__ly_float_immediate_fits(%bits) : (i64) -> i1
+    %word = scf.if %fits -> (i64) {
+      func.call @LyFloat_DecRef(%header) : (memref<3xi64>) -> ()
+      %w = func.call @__ly_float_to_immediate(%bits) : (i64) -> i64
+      scf.yield %w : i64
+    } else {
+      %idx = memref.extract_aligned_pointer_as_index %header : memref<3xi64> -> index
+      %w = arith.index_cast %idx : index to i64
+      scf.yield %w : i64
+    }
+    func.return %word : i64
+  }
+
   // ===== impls: complex (R6 value type, one 7-word handle) =====
 
   // Handle words: 0 refcount, 1 layout/destructor family id, 2 real bits,
@@ -18080,7 +18398,30 @@ module attributes {
       scf.if %unhashable {
         func.call @__ly_hash_raise_unhashable(%class_id) : (i64) -> ()
       }
-      %h, %handled = func.call @__ly_hash_boxed_by_contract(%box, %class_id) : (!llvm.ptr, i64) -> (i64, i1)
+      // ⭐ An immediate int hashes from its value, with no object made for
+      // the hook to read: CPython's long_hash, v mod (2^61 - 1) with the sign
+      // carried over, on a value that fits a word.
+      %entity_gep0 = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %entity0 = llvm.load %entity_gep0 : !llvm.ptr -> i64
+      %int_class = arith.constant 1 : i64
+      %is_int = arith.cmpi eq, %class_id, %int_class : i64
+      %is_immediate = func.call @__ly_slot_word_is_immediate(%entity0) : (i64) -> i1
+      %int_immediate = arith.andi %is_int, %is_immediate : i1
+      %h, %handled = scf.if %int_immediate -> (i64, i1) {
+        %v = func.call @__ly_int_from_immediate(%entity0) : (i64) -> i64
+        %modulus = arith.constant 2305843009213693951 : i64
+        %negative = arith.cmpi slt, %v, %zero : i64
+        %negated = arith.subi %zero, %v : i64
+        %magnitude = arith.select %negative, %negated, %v : i1, i64
+        %reduced = arith.remui %magnitude, %modulus : i64
+        %neg_reduced = arith.subi %zero, %reduced : i64
+        %signed = arith.select %negative, %neg_reduced, %reduced : i1, i64
+        %true_h = arith.constant true
+        scf.yield %signed, %true_h : i64, i1
+      } else {
+        %hh, %hd = func.call @__ly_hash_boxed_by_contract(%box, %class_id) : (!llvm.ptr, i64) -> (i64, i1)
+        scf.yield %hh, %hd : i64, i1
+      }
       %dispatched = scf.if %handled -> (i64) {
         %fixed = func.call @__ly_hash_fixup(%h) : (i64) -> i64
         scf.yield %fixed : i64
@@ -18106,19 +18447,63 @@ module attributes {
   // reason `__ly_boxed_float_value` gives: `builtins.int` is one lane (the
   // header), and meta/digits are interior at entity +16 and +32 of the same
   // block. Box words 5 and 6 were lanes 1 and 2, which no longer exist.
-  func.func private @__ly_boxed_long_view(%box: !llvm.ptr) -> (i64, i64, i64) {
+  //
+  // An immediate entity has no digits to point at, so its three 30-bit digits
+  // are written into %scratch (three i32s the caller owns, live as long as it
+  // reads the view) and the view points there.
+  func.func private @__ly_boxed_long_view(%box: !llvm.ptr, %scratch: memref<3xi32>) -> (i64, i64, i64) {
     %c1 = arith.constant 1 : i64
     %c2 = arith.constant 2 : i64
     %c4 = arith.constant 4 : i64
     %entity_gep = llvm.getelementptr %box[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %entity_word = llvm.load %entity_gep : !llvm.ptr -> i64
-    %entity = llvm.inttoptr %entity_word : i64 to !llvm.ptr
-    %meta_ptr = llvm.getelementptr %entity[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %digits_ptr = llvm.getelementptr %entity[%c4] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %sign = llvm.load %meta_ptr : !llvm.ptr -> i64
-    %count_gep = llvm.getelementptr %meta_ptr[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %count = llvm.load %count_gep : !llvm.ptr -> i64
-    %digits_word = llvm.ptrtoint %digits_ptr : !llvm.ptr to i64
+    %immediate = func.call @__ly_slot_word_is_immediate(%entity_word) : (i64) -> i1
+    %sign, %count, %digits_word = scf.if %immediate -> (i64, i64, i64) {
+      %value = func.call @__ly_int_from_immediate(%entity_word) : (i64) -> i64
+      %zero = arith.constant 0 : i64
+      %minus_one = arith.constant -1 : i64
+      %three = arith.constant 3 : i64
+      %negative = arith.cmpi slt, %value, %zero : i64
+      %is_zero = arith.cmpi eq, %value, %zero : i64
+      %signed = arith.select %negative, %minus_one, %c1 : i1, i64
+      %sign_v = arith.select %is_zero, %zero, %signed : i1, i64
+      // |v| < 2^62 for an immediate, so the negation cannot overflow.
+      %negated = arith.subi %zero, %value : i64
+      %magnitude = arith.select %negative, %negated, %value : i1, i64
+      %mask = arith.constant 1073741823 : i64
+      %thirty = arith.constant 30 : i64
+      %sixty = arith.constant 60 : i64
+      %d0 = arith.andi %magnitude, %mask : i64
+      %s1 = arith.shrui %magnitude, %thirty : i64
+      %d1 = arith.andi %s1, %mask : i64
+      %d2 = arith.shrui %magnitude, %sixty : i64
+      %i0 = arith.constant 0 : index
+      %i1 = arith.constant 1 : index
+      %i2 = arith.constant 2 : index
+      %d0_32 = arith.trunci %d0 : i64 to i32
+      %d1_32 = arith.trunci %d1 : i64 to i32
+      %d2_32 = arith.trunci %d2 : i64 to i32
+      memref.store %d0_32, %scratch[%i0] : memref<3xi32>
+      memref.store %d1_32, %scratch[%i1] : memref<3xi32>
+      memref.store %d2_32, %scratch[%i2] : memref<3xi32>
+      %has1 = arith.cmpi ne, %d1, %zero : i64
+      %has2 = arith.cmpi ne, %d2, %zero : i64
+      %one_or_two = arith.select %has1, %c2, %c1 : i1, i64
+      %nonzero_count = arith.select %has2, %three, %one_or_two : i1, i64
+      %count_v = arith.select %is_zero, %zero, %nonzero_count : i1, i64
+      %scratch_idx = memref.extract_aligned_pointer_as_index %scratch : memref<3xi32> -> index
+      %scratch_word = arith.index_cast %scratch_idx : index to i64
+      scf.yield %sign_v, %count_v, %scratch_word : i64, i64, i64
+    } else {
+      %entity = llvm.inttoptr %entity_word : i64 to !llvm.ptr
+      %meta_ptr = llvm.getelementptr %entity[%c2] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %digits_ptr = llvm.getelementptr %entity[%c4] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %sign_o = llvm.load %meta_ptr : !llvm.ptr -> i64
+      %count_gep = llvm.getelementptr %meta_ptr[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %count_o = llvm.load %count_gep : !llvm.ptr -> i64
+      %digits_o = llvm.ptrtoint %digits_ptr : !llvm.ptr to i64
+      scf.yield %sign_o, %count_o, %digits_o : i64, i64, i64
+    }
     func.return %sign, %count, %digits_word : i64, i64, i64
   }
 
@@ -18322,7 +18707,34 @@ module attributes {
         %mixed_class = arith.cmpi ne, %lhs_class, %rhs_class : i64
         %numeric_mixed = arith.andi %both_num, %mixed_class : i1
         %same = arith.cmpi eq, %lhs_class, %rhs_class : i64
-        %num_result = scf.if %numeric_mixed -> (i1) {
+        // ⭐ Two ints or two floats of which one is an immediate compare by
+        // value, with no object made for the hook to read. Equal immediates
+        // never get here (the identity test above answers them).
+        %lhs_imm = func.call @__ly_slot_word_is_immediate(%lhs_ptr) : (i64) -> i1
+        %rhs_imm = func.call @__ly_slot_word_is_immediate(%rhs_ptr) : (i64) -> i1
+        %any_imm = arith.ori %lhs_imm, %rhs_imm : i1
+        %both_int = arith.andi %lhs_int, %rhs_int : i1
+        %both_float = arith.andi %lhs_float, %rhs_float : i1
+        %int_by_value = arith.andi %both_int, %any_imm : i1
+        %float_by_value = arith.andi %both_float, %any_imm : i1
+        %by_value = arith.ori %int_by_value, %float_by_value : i1
+        %num_result = scf.if %by_value -> (i1) {
+          %r = scf.if %int_by_value -> (i1) {
+            %lv, %lfits = func.call @LyLong_SlotWordAsI64(%lhs_ptr) : (i64) -> (i64, i1)
+            %rv, %rfits = func.call @LyLong_SlotWordAsI64(%rhs_ptr) : (i64) -> (i64, i1)
+            %fit = arith.andi %lfits, %rfits : i1
+            %veq = arith.cmpi eq, %lv, %rv : i64
+            %ieq = arith.andi %fit, %veq : i1
+            scf.yield %ieq : i1
+          } else {
+            %lf = func.call @LyFloat_SlotWordAsF64(%lhs_ptr) : (i64) -> f64
+            %rf = func.call @LyFloat_SlotWordAsF64(%rhs_ptr) : (i64) -> f64
+            %feq = arith.cmpf oeq, %lf, %rf : f64
+            scf.yield %feq : i1
+          }
+          scf.yield %r : i1
+        } else {
+        %num_result_inner = scf.if %numeric_mixed -> (i1) {
           %r = func.call @__ly_box_equal_numeric(%lhs, %lhs_class, %rhs, %rhs_class) : (!llvm.ptr, i64, !llvm.ptr, i64) -> i1
           scf.yield %r : i1
         } else {
@@ -18334,6 +18746,8 @@ module attributes {
           %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
           %same_result = arith.andi %eq, %handled : i1
           scf.yield %same_result : i1
+        }
+        scf.yield %num_result_inner : i1
         }
         scf.yield %num_result : i1
       }
@@ -18362,14 +18776,13 @@ module attributes {
     %c2_i64 = arith.constant 2 : i64
     %entity_gep = llvm.getelementptr %box[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
     %entity_word = llvm.load %entity_gep : !llvm.ptr -> i64
-    %entity = llvm.inttoptr %entity_word : i64 to !llvm.ptr
-    %value_gep = llvm.getelementptr %entity[%c2_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-    %value = llvm.load %value_gep : !llvm.ptr -> f64
+    %value = func.call @LyFloat_SlotWordAsF64(%entity_word) : (i64) -> f64
     func.return %value : f64
   }
 
   // Mixed-class numeric equality across int/bool/float boxes.
   func.func private @__ly_box_equal_numeric(%lhs: !llvm.ptr, %lhs_class: i64, %rhs: !llvm.ptr, %rhs_class: i64) -> i1 {
+    %long_scratch = memref.alloca() : memref<3xi32>
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %false = arith.constant false
@@ -18406,7 +18819,7 @@ module attributes {
         %eq = arith.cmpf oeq, %bf, %fv : f64
         scf.yield %eq : i1
       } else {
-        %sign, %count, %digits = func.call @__ly_boxed_long_view(%other) : (!llvm.ptr) -> (i64, i64, i64)
+        %sign, %count, %digits = func.call @__ly_boxed_long_view(%other, %long_scratch) : (!llvm.ptr, memref<3xi32>) -> (i64, i64, i64)
         %eq = func.call @__ly_boxed_long_eq_f64(%sign, %count, %digits, %fv) : (i64, i64, i64, f64) -> i1
         scf.yield %eq : i1
       }
@@ -18417,7 +18830,7 @@ module attributes {
       %bool_box = arith.select %lhs_is_bool, %lhs, %rhs : i1, !llvm.ptr
       %int_box = arith.select %lhs_is_bool, %rhs, %lhs : i1, !llvm.ptr
       %bv = func.call @__ly_boxed_bool_value(%bool_box) : (!llvm.ptr) -> i64
-      %sign, %count, %digits = func.call @__ly_boxed_long_view(%int_box) : (!llvm.ptr) -> (i64, i64, i64)
+      %sign, %count, %digits = func.call @__ly_boxed_long_view(%int_box, %long_scratch) : (!llvm.ptr, memref<3xi32>) -> (i64, i64, i64)
       %bool_false = arith.cmpi eq, %bv, %zero : i64
       %cmp = scf.if %bool_false -> (i1) {
         %int_zero = arith.cmpi eq, %sign, %zero : i64
@@ -18556,6 +18969,7 @@ module attributes {
   // Boxed int as f64 (30-bit limb accumulation; values beyond 2^53 round,
   // matching a float(int) conversion for comparison purposes).
   func.func private @__ly_boxed_num_as_f64(%box: !llvm.ptr, %class_id: i64) -> f64 {
+    %long_scratch = memref.alloca() : memref<3xi32>
     %float_class = arith.constant 2 : i64
     %bool_class = arith.constant 22 : i64
     %is_float = arith.cmpi eq, %class_id, %float_class : i64
@@ -18569,7 +18983,7 @@ module attributes {
         %bf = arith.sitofp %bv : i64 to f64
         scf.yield %bf : f64
       } else {
-        %sign, %count, %digits_word = func.call @__ly_boxed_long_view(%box) : (!llvm.ptr) -> (i64, i64, i64)
+        %sign, %count, %digits_word = func.call @__ly_boxed_long_view(%box, %long_scratch) : (!llvm.ptr, memref<3xi32>) -> (i64, i64, i64)
         %zero = arith.constant 0 : i64
         %one = arith.constant 1 : i64
         %limb_scale = arith.constant 1073741824.0 : f64

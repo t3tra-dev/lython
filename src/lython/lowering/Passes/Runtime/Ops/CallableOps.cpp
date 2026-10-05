@@ -964,7 +964,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     builder.setInsertionPoint(op);
     mlir::Location loc = op.getLoc();
     mlir::FailureOr<RuntimeBundle> payload =
-        RuntimeBundleLowerer::materializePayloadObjectBundle(op, *sources[1]);
+        RuntimeBundleLowerer::materializePayloadObjectBundle(
+            op, *sources[1], /*slotWordOnly=*/true);
     if (mlir::failed(payload))
       return mlir::failure();
     // Any hashable class boxes: the runtime add hashes the box and raises
@@ -1117,8 +1118,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
       builder.setInsertionPoint(op);
       mlir::Location loc = op.getLoc();
       mlir::FailureOr<RuntimeBundle> payload =
-          RuntimeBundleLowerer::materializePayloadObjectBundle(op,
-                                                               *sources[1]);
+          RuntimeBundleLowerer::materializePayloadObjectBundle(
+              op, *sources[1], /*slotWordOnly=*/true);
       if (mlir::failed(payload))
         return mlir::failure();
       if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
