@@ -97,6 +97,11 @@ struct LoopControlContext {
   // argument, so break/continue/back edges must compare against (and release)
   // the post-condition value instead.
   llvm::SmallVector<mlir::Value, 4> baselineValues;
+  // The iterator a `for` walks, which CPython holds on its stack until the
+  // loop is left; empty for every other loop.
+  Value iterator;
+  // What the iterator's release is judged by (py.keep_alive observed_as).
+  mlir::Type iteratorObservedAs;
 };
 
 struct PrimitiveConstant {

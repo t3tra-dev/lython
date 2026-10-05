@@ -1401,15 +1401,19 @@ def Py_KeepAliveOp : Py_Op<"keep_alive", []> {
   let description = [{
     A use of the object and nothing else: whatever reference keeps it alive
     is released after this point, not before. The emitter places it where
-    CPython's reference would end -- a local's scope exit, its rebinding,
-    `del` -- in a program whose objects can observe their own release
-    (`__del__`).
+    CPython's reference would end -- a local's scope exit, its rebinding, a
+    `for` loop's exit for its iterator -- and the first lowering phase keeps
+    it only when the object's release can be observed. `observed_as`, when
+    present, is the type that question is asked of instead of the object's
+    own: a `for` over a list has a protocol-typed iterator that can only be
+    the list's.
 
     Example:
       py.keep_alive %obj : !py.contract<"A">
   }];
 
-  let arguments = (ins Py_ContractType:$object);
+  let arguments = (ins Py_ContractType:$object,
+                       OptionalAttr<TypeAttr>:$observed_as);
   let assemblyFormat = "$object `:` type($object) attr-dict";
 }
 

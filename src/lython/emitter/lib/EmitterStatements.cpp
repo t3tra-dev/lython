@@ -1659,8 +1659,9 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
 // before the name is rebound.
 // ⛔ Not for an int, str, float or the like: nothing such a value holds can
 // observe its release, and the use would only lengthen its life.
-void ModuleEmitter::emitKeepAlive(const parser::Node &at, Value value) {
-  if (!options.keepLocalsAlive || !value.value || !value.type)
+void ModuleEmitter::emitKeepAlive(const parser::Node &at, Value value,
+                                  mlir::Type observedAs) {
+  if (!value.value || !value.type)
     return;
   mlir::Type type = types.widenLiteral(value.type);
   if (!type || type.getDialect().getNamespace() != "py" ||
@@ -1673,7 +1674,9 @@ void ModuleEmitter::emitKeepAlive(const parser::Node &at, Value value) {
         name == "builtins.bytes" || name == "builtins.complex")
       return;
   }
-  py::KeepAliveOp::create(builder, loc(at), value.value);
+  py::KeepAliveOp::create(builder, loc(at), value.value,
+                          observedAs ? mlir::TypeAttr::get(observedAs)
+                                     : mlir::TypeAttr());
 }
 
 void ModuleEmitter::emitGlobalClear(const parser::Node &at,
@@ -1689,8 +1692,10 @@ void ModuleEmitter::emitGlobalClear(const parser::Node &at,
 }
 
 void ModuleEmitter::emitFrameExitKeepAlives(const parser::Node &at) {
-  if (!options.keepLocalsAlive)
-    return;
+  // A `return` inside a `for` leaves its iterator first.
+  for (auto loop = loopControlContexts.rbegin();
+       loop != loopControlContexts.rend(); ++loop)
+    emitKeepAlive(at, loop->iterator, loop->iteratorObservedAs);
   for (auto name = currentFrameLocals.rbegin();
        name != currentFrameLocals.rend(); ++name) {
     auto bound = values.find(*name);

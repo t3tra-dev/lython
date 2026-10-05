@@ -154,8 +154,9 @@ EmitResult ModuleEmitter::emit() {
   atModuleScope = false;
   if (!insertionBlockTerminated(builder)) {
     // CPython clears the main module's names at shutdown in the order they
-    // were first bound -- not reversed, as a frame's are.
-    if (options.keepLocalsAlive)
+    // were first bound -- not reversed, as a frame's are. A runtime-internal
+    // module has no shutdown: it runs no module-level code at all.
+    if (!options.runtimeInternal)
       for (const std::string &name : frameLocalOrder(moduleNode)) {
         auto bound = values.find(name);
         if (bound != values.end())

@@ -65,6 +65,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Passes/Lowering.cpp
     Passes/Runtime/Passes/Ownership.cpp
     Passes/Runtime/Passes/RefCountElision.cpp
+    Passes/Runtime/Passes/ObservableRelease.cpp
     Passes/Runtime/Passes/Stubs.cpp
     Passes/Runtime/Primitive/I64Calls.cpp
     Passes/Runtime/Primitive/TensorGemm.cpp

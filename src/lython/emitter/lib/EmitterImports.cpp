@@ -1503,7 +1503,7 @@ void ModuleEmitter::predeclareSourceModules() {
   // body inlined from it re-binds its imports, and binding traceback reads the
   // signatures of all it imports -- `import asyncio`, whose futures have
   // finalizers, took 24 s to compile that way.
-  if (options.keepLocalsAlive && lookupSourceModule("traceback"))
+  if (options.hasFinalizers && lookupSourceModule("traceback"))
     bindSourceModuleNamespace("traceback", kFinalizerTracebackName);
   // `await` on a host Promise reaches asyncio by this name, whatever the
   // program calls it (emitAwaitValue).
