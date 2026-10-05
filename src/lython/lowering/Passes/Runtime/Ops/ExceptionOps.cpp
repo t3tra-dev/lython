@@ -116,6 +116,11 @@ RuntimeBundleLowerer::handlerClassId(mlir::Operation *op,
 mlir::LogicalResult
 RuntimeBundleLowerer::emitTracebackFrame(mlir::Operation *op,
                                          bool stashCurrentException) {
+  // Not inside a dispatcher, for the reason EH.cpp's emitTracebackPush gives:
+  // the caller's frame is pushed where the exception leaves the call.
+  if (auto function = op->getParentOfType<mlir::func::FuncOp>();
+      function && RuntimeBundleLowerer::isIndirectCallDispatcher(function))
+    return mlir::success();
   llvm::StringRef filename;
   std::int64_t line = 0;
   std::int64_t column = 0;

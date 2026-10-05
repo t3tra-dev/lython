@@ -2427,6 +2427,43 @@ TEST(DriverTest, AnErasedGeneratorBodyLeavesNoTryIdBehind) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
+// What: two calls of one shape through a `Callable[[int], int]` whose target
+// only the function object knows, with four candidates of that type, go
+// through ONE dispatcher, defined once and called from both; and the
+// dispatcher picks its candidate with a switch on the target id, not a chain
+// of comparisons.
+TEST(DriverTest, IndirectCallsOfOneShapeShareOneDispatcher) {
+  CompileResult result = compileSource(
+      "from typing import Callable\n\n\n"
+      "def a(x: int) -> int:\n    return x + 1\n\n\n"
+      "def b(x: int) -> int:\n    return x + 2\n\n\n"
+      "def c(x: int) -> int:\n    return x + 3\n\n\n"
+      "def d(x: int) -> int:\n    return x + 4\n\n\n"
+      "def once(f: Callable[[int], int], x: int) -> int:\n"
+      "    return f(x)\n\n\n"
+      "def twice(f: Callable[[int], int], x: int) -> int:\n"
+      "    return f(f(x))\n\n\n"
+      "for g in [a, b, c, d]:\n"
+      "    print(once(g, 1), twice(g, 1))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  ASSERT_TRUE(result.verified.llvmModule);
+  llvm::SmallVector<llvm::Function *, 2> dispatchers;
+  for (llvm::Function &function : *result.verified.llvmModule)
+    if (!function.isDeclaration() &&
+        function.getName().starts_with("__ly_dispatch_"))
+      dispatchers.push_back(&function);
+  ASSERT_EQ(dispatchers.size(), 1u);
+  unsigned callers = 0;
+  for (llvm::User *user : dispatchers.front()->users())
+    if (llvm::isa<llvm::CallBase>(user))
+      ++callers;
+  EXPECT_EQ(callers, 3u);
+  bool switches = false;
+  for (llvm::BasicBlock &block : *dispatchers.front())
+    switches |= llvm::isa<llvm::SwitchInst>(block.getTerminator());
+  EXPECT_TRUE(switches);
+}
+
 // What: a wasm module raises through `_Unwind_RaiseException` and carries its
 // own definition of it -- one `throw` under the `__cpp_exception` tag, which
 // the module's assembly defines -- so a WASI program links against a

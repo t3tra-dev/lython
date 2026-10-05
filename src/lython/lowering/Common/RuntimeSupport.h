@@ -83,6 +83,13 @@ struct TensorLoweringTarget {
   }
 };
 
+// The functions the lowering makes to dispatch indirect calls
+// (IndirectCallableOps.cpp) are named with this prefix. They are compiled from
+// the call's location, so exceptions unwind through them with cleanups, but
+// they are not a frame of the program: no traceback entry names one.
+inline constexpr llvm::StringLiteral kIndirectCallDispatcherPrefix{
+    "__ly_dispatch_"};
+
 struct PythonCallSiteRange {
   std::string caller;
   std::string callee;

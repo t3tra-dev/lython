@@ -199,6 +199,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnEmscriptenTargetNamesWhatReplacedIt"
     "DriverTest.AWasmModuleDefinesTheUnwinderItUses"
     "DriverTest.AnErasedGeneratorBodyLeavesNoTryIdBehind"
+    "DriverTest.IndirectCallsOfOneShapeShareOneDispatcher"
     "DriverTest.ResolvesEmbeddedStdlibImports"
     "DriverTest.CompilesUnevenMatmulForEveryTensorTarget"
     "DriverTest.CompilesF64MatmulWithAndWithoutSMEF64"

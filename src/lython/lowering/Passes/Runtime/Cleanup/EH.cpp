@@ -303,6 +303,11 @@ llvm::Value *i32Constant(llvm::IRBuilder<> &builder, std::int32_t value) {
 void emitTracebackPush(llvm::IRBuilder<> &builder, llvm::Module &module,
                        const PythonCallSiteRange *site,
                        llvm::DILocation &debugLoc) {
+  // A dispatcher's frame is not one the program has: the caller's cleanup
+  // records the call, as it did when the dispatch was written out there.
+  if (builder.GetInsertBlock()->getParent()->getName().starts_with(
+          kIndirectCallDispatcherPrefix))
+    return;
   std::string fallbackFile = debugLocationPath(debugLoc);
   std::string fallbackFunction = debugLocationFunctionName(debugLoc);
   llvm::StringRef fileName =
