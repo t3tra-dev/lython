@@ -2561,7 +2561,15 @@ bool releaseOwnedGroupByLiveness(
       for (unsigned index = 0, end = terminator->getNumSuccessors();
            index < end; ++index) {
         mlir::Block *successor = terminator->getSuccessor(index);
-        if (!liveIn[successor] && handlerEntries.count(successor))
+        // ⛔ Not an entry the token dies at when the edge HANDS it in: the
+        // handler's block argument is then its own group, and making this
+        // entry a use ran the liveness back through every block of the `try`
+        // -- past where the token had already been forwarded, and in a
+        // coroutine past its definition. `span = Span(); try: async with
+        // Span(): ... except ...: ...; print(span.name)` was "operand #0
+        // does not dominate this use", and with that hidden, a double free.
+        if (!liveIn[successor] && handlerEntries.count(successor) &&
+            !forwardsGroupToSuccessor(terminator, index))
           entryDeaths.insert(successor);
       }
     }
