@@ -69,15 +69,15 @@ append ループの時間の大半は合計側の `LyLong_Add`: 要素がヒー�
 
 ### 1.4 フェーズごとの推移 (要素あたり、100 万要素、macOS、ピーク RSS)
 
-| | 開始時 | P0 後 | P1α 後 | P1β 後 | P2 後 | P3 後 | P4 後 | CPython |
-|---|---|---|---|---|---|---|---|---|
-| `list[int]` | 117 B | 85 B | 70 B | 24 B | 9 B | 9 B | 9 B | 40 B |
-| `list[float]` | 102 B | 70 B | 55 B | 24 B | 9 B | 9 B | 9 B | 40 B |
-| `list[str]` | 117 B | 85 B | 70 B | 70 B | 55 B | 55 B | 55 B | 56 B |
-| `list[tuple[int, int]]` | 333 B | 269 B | 223 B | 223 B | 177 B | 177 B | 177 B | 101 B |
-| 2 int フィールドのインスタンス | 271 B | 224 B | 177 B | 177 B | 132 B | 70 B | 70 B | 132 B |
-| `dict[int, int]` | 312 B | 205 B | 193 B | 169 B | 137 B | 137 B | 97 B | 110 B |
-| `set[int]` | 264 B | 127 B | 105 B | 72 B | 55 B | 55 B | 55 B | 93 B |
+| | 開始時 | P0 後 | P1α 後 | P1β 後 | P2 後 | P3 後 | P4 後 | P5 後 | CPython |
+|---|---|---|---|---|---|---|---|---|---|
+| `list[int]` | 117 B | 85 B | 70 B | 24 B | 9 B | 9 B | 9 B | 9 B | 40 B |
+| `list[float]` | 102 B | 70 B | 55 B | 24 B | 9 B | 9 B | 9 B | 9 B | 40 B |
+| `list[str]` | 117 B | 85 B | 70 B | 70 B | 55 B | 55 B | 55 B | 55 B | 56 B |
+| `list[tuple[int, int]]` | 333 B | 269 B | 223 B | 223 B | 177 B | 177 B | 177 B | 116 B | 101 B |
+| 2 int フィールドのインスタンス | 271 B | 224 B | 177 B | 177 B | 132 B | 70 B | 70 B | 70 B | 132 B |
+| `dict[int, int]` | 312 B | 205 B | 193 B | 169 B | 137 B | 137 B | 97 B | 97 B | 110 B |
+| `set[int]` | 264 B | 127 B | 105 B | 72 B | 55 B | 55 B | 55 B | 55 B | 93 B |
 
 P1α はスロットを 5 ワードから 3 ワード (使わない refcount、class、実体) にした
 段階: 所有フラグを廃し (実体がアドレスなら所有)、ハッシュを dict は並行配列に、
@@ -124,6 +124,12 @@ P4 は dict の表を詰めた段階。表の各スロットが (状態、ハッ
 変わらない。set の表は (状態、ハッシュ) のまま: set はエントリ側にハッシュ配列を
 持たず、表から外すとハッシュの事前比較を失う (要素あたり 55 B で CPython の
 93 B を下回っている)。
+
+P5 は tuple を 1 回の確保にした段階。ハンドル (refcount、class、長さ、容量、要素
+アドレス) と要素を同じブロックに置き、ハンドル型の 14 ワードのうち使わない
+word 5..13 (解放関数を幅で選ぶための詰め物) は確保しない。要素は word 5 の位置
+から始まる。`(i, i)` の list は 1 要素 116 B (CPython 101 B)。リテラルの要素は
+evidence を兼ねるので即値にしない (残りの差の大半は要素の int オブジェクト)。
 即値を読むたびにオブジェクトを作るので、`d[k]` の読み出しが多いループは P1α と
 同程度にとどまる (読み出しで evidence に直接載せるのは P2 の f64 / i64 evidence
 と合わせて扱う)。
@@ -350,7 +356,7 @@ value types is an implementation detail")。`id()` は無い。したがって�
 | P2 | (実施: すべてのスロットを自己記述する 8 B の 1 ワードに。当初案の静的種別・種別バイト・`Bool` 1 B は不要になった) | `BoxLayout.h`、manifest の box 読み書き、class ワードの読み手 | スロット 24 → 8 B |
 | P3 | (実施: フィールドを即値で格納、本体をハンドルの word 3 から) | `AttributeOps.cpp`、`Manifest/Calls.cpp`、`RuntimeABI.cpp` | 2 int フィールドのインスタンス 132 → 70 B |
 | P4 | (実施: dict の表を状態 1 ワードに。set は据え置き) | dict の manifest 実装 | `dict[int, int]` 137 → 97 B |
-| P5 | tuple を 1 回の確保に、位置ごとの種別で | tuple の manifest 実装 | `(int, int)` で 48 B |
+| P5 | (実施: tuple を 1 回の確保に) | tuple の manifest 実装 | `list[tuple[int, int]]` 177 → 116 B |
 | P6 | 幅による解放関数の区別 (`HandleWidthRegistry`) を class id に置き換え、詰め物ワードを削除 | `HandleWidthRegistry.h`、ownership の解放関数選択 | ヘッダの縮小 |
 
 P1 を P2 より先にするのは、P1 が型を問わず一様に効き、P2 の特殊化を後から
