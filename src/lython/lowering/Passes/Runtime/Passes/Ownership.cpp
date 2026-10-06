@@ -2971,7 +2971,7 @@ bool releaseOwnedGroupByLiveness(
 // What separates them is PROVENANCE, keyed over the four programs that pin the
 // two behaviours (one widened site each):
 //
-//     the retain that must exist ... memref<9xi64>  by func.call
+//     the retain that must exist ... a list handle  by func.call
 //     the three that must not ...... memref<16xi64> by memref.alloc
 //
 // A call result is an entity its callee finished. A `memref.alloc` result is raw

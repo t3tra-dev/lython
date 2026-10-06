@@ -36,32 +36,14 @@ inline constexpr std::int64_t kPresentArrayWord = 6;
 // table was built for; the rest is 2*capacity slots of (state, hash)). Unused
 // by a sequence, which is why it was the reserved word.
 inline constexpr std::int64_t kTableWord = 7;
-// The narrowest container handle, and therefore the minimum width at which a
-// rank-1 i64 memref can be one: `isContainerHandleType` uses it as a lower
-// bound, not as an equality, because a converted container may be WIDER than
-// its layout needs. `builtins.list` is nine words for that reason -- words 0..7
-// are this layout (5 and 6 unused by a sequence) and word 8 is dead space that
-// buys an untied single-input release interface (ABI/HandleWidthRegistry.h).
-// `set` and `frozenset` pay the same way, three and five dead words, and their
-// widths differ from each other on purpose: a shared width would leave the two
-// tied with each other on release interface, which is the situation
-// `range`/`range_iterator` is stuck in and the one thing a converter CAN avoid
-// when the two contracts are actually distinguishable.
-//
-// `builtins.tuple` is fourteen for the same reason and a worse rate: words
-// 8..13 are dead, because by the time it converted, 14 was the narrowest free
-// single-input interface left. That is the width-scarcity arithmetic in
-// HandleWidthRegistry.h showing up as bytes -- a 3-element tuple pays 48 B of
-// padding for identity alone -- and it is why the registry's free list is now
-// empty rather than merely short. Set and frozenset spent 11 and 13 on the way
-// there, so the four container conversions between them consumed every width
-// the free list had.
+// A handle is as wide as the words it uses: a sequence uses 0..4 (a tuple's
+// items follow in the same block), a mapping 0..7, a set or frozenset 0..8.
 inline constexpr std::int64_t kHandleWordCount = 8;
 inline constexpr std::int64_t kDictHandleWordCount = 8;
-inline constexpr std::int64_t kListHandleWordCount = 9;
-inline constexpr std::int64_t kSetHandleWordCount = 11;
-inline constexpr std::int64_t kFrozenSetHandleWordCount = 13;
-inline constexpr std::int64_t kTupleHandleWordCount = 14;
+inline constexpr std::int64_t kListHandleWordCount = 5;
+inline constexpr std::int64_t kSetHandleWordCount = 9;
+inline constexpr std::int64_t kFrozenSetHandleWordCount = 9;
+inline constexpr std::int64_t kTupleHandleWordCount = 5;
 
 // Slot indices inside the {length, capacity} pair, which a multi-lane
 // contract still carries as its own `meta` lane. Words 2/3 above are the same

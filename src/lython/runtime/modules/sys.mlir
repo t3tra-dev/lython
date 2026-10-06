@@ -72,9 +72,9 @@ module attributes {
   ]
 } {
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
-  func.func private @__ly_list_items(%self: memref<9xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
+  func.func private @__ly_list_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.list", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
   func.func private @__ly_unicode_store_item(%items: memref<?xi64>, %slot: i64, %eh: memref<2xi64> {ly.ownership.object_header}, %eb: memref<?xi8>) attributes {ly.ownership.transfer_args = [2]}
-  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
+  func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @LyHost_ArgvCount() -> i64
   func.func private @LyHost_ArgvLen(i64) -> i64
@@ -112,13 +112,13 @@ module attributes {
   // out does not move when the box narrows -- writing an element at the old
   // stride into a narrower array corrupts the NEXT element's refcount, which
   // is not a crash here but wherever that element is next released.
-  func.func @LySys_GetArgv() -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
+  func.func @LySys_GetArgv() -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
 
     %count = func.call @LyHost_ArgvCount() : () -> i64
-    %self = func.call @LyList_FromLength(%count) : (i64) -> memref<9xi64>
-    %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
+    %self = func.call @LyList_FromLength(%count) : (i64) -> memref<5xi64>
+    %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
     %count_index = arith.index_cast %count : i64 to index
     scf.for %i = %c0 to %count_index step %c1 {
       %i_i64 = arith.index_cast %i : index to i64
@@ -131,7 +131,7 @@ module attributes {
 
       func.call @__ly_unicode_store_item(%items, %i_i64, %str_header, %str_bytes) : (memref<?xi64>, i64, memref<2xi64>, memref<?xi8>) -> ()
     }
-    func.return %self : memref<9xi64>
+    func.return %self : memref<5xi64>
   }
 
   // sys.exit writes the status into the exception object's code slot and raises

@@ -22,14 +22,13 @@
 // `words[0] = refcount` and `words[1] = payloadClass`, exactly the prefix, at
 // exactly those indices. Both populations carry it, so no layout predicate --
 // this one or any other -- can tell them apart, and the widths cannot either
-// (`builtins.object` and the payload box are both 16 words:
-// ABI/HandleWidthRegistry.h).
+// (a handle is as wide as the words it uses, so contracts share widths).
 //
 // What actually separates them is the DEFINING OP, keyed over the four programs
 // that pin the two behaviours (denominator: four programs, exactly one widened
 // borrow-edge site each):
 //
-//     the retain that must exist ... memref<9xi64>  by func.call
+//     the retain that must exist ... a list handle  by func.call
 //     the three that must not ...... memref<16xi64> by memref.alloc
 //
 // A `func.call` result is an entity its callee finished initialising before

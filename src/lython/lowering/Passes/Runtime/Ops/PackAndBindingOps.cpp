@@ -743,7 +743,17 @@ RuntimeBundleLowerer::lowerAliasView(mlir::Operation *op, mlir::Value input,
       return mlir::success();
     }
 
-    if (expectedTypes->size() <= inputBundle->physicalValues().size()) {
+    // ⛔ NOT TO `object` FROM ANOTHER CLASS, whatever the types say. An
+    // `object` value is a box, and a handle as wide as a box (a list's, a
+    // range's) is not one: matching types aliased a list as its own box, the
+    // cell stored the list's handle, and the read took its length for an
+    // entity. The consumer that needs a box makes one from the concrete value.
+    bool upcastToObject =
+        runtimeContractName(resultValue.getType()) == "builtins.object" &&
+        runtimeContractName(inputBundle->objectValue.contract) !=
+            "builtins.object";
+    if (!upcastToObject &&
+        expectedTypes->size() <= inputBundle->physicalValues().size()) {
       bool prefixMatches = true;
       for (auto [index, expected] : llvm::enumerate(*expectedTypes)) {
         if (inputBundle->physicalValues()[index].getType() == expected)
