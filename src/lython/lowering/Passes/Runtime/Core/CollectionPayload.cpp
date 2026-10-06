@@ -825,6 +825,35 @@ mlir::LogicalResult RuntimeBundleLowerer::ensureDictPayloadCapacity(
 // execution (measured 2026-07-28 on both container kinds, unbounded, pre-dating
 // all of this work). That is a teardown-accounting defect, tracked separately;
 // do not read a correct move decision here as a balanced one.
+// True when a literal's elements may go in as slot words: an int or float
+// element then leaves the container's contents evidence a lie (it names an
+// object the slot does not hold), so the evidence is dropped -- and that is
+// only worth it where nothing reads the literal back through the evidence.
+// ⛔ Not for a literal that is subscripted, iterated, measured or searched:
+// there the evidence is what makes the read no code at all, and a literal
+// read where it is built is not the one whose memory lasts.
+bool RuntimeBundleLowerer::literalMayStoreWords(mlir::Operation *op) {
+  if (!op || op->getNumResults() != 1)
+    return false;
+  // ⛔ An allow-list: a literal that is an ELEMENT of another literal (the
+  // tuple `xs.append((i, j))` appends is one), or a value stored into a field
+  // or returned. A literal handed to a call directly is an argument pack, and
+  // the call lowering reads its evidence.
+  bool used = false;
+  for (mlir::OpOperand &use : op->getResult(0).getUses()) {
+    mlir::Operation *user = use.getOwner();
+    used = true;
+    // A pack that UNPACKS its operands is a starred call's: it reads the
+    // literal's elements back.
+    if (mlir::isa<py::PackOp>(user) && !user->hasAttr("ly.unpack_operands"))
+      continue;
+    if (mlir::isa<py::DecRefOp, py::KeepAliveOp, mlir::func::ReturnOp>(user))
+      continue;
+    return false;
+  }
+  return used;
+}
+
 bool RuntimeBundleLowerer::valueIsConsumedOnlyBy(mlir::Value value,
                                                  mlir::Operation *op) {
   if (!value || !op)
@@ -872,11 +901,17 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   // source hands over the ONE token it holds, so the move is deduped.
   llvm::SmallPtrSet<void *, 4> movedSources;
   bool declinedLoopLevelMove = false;
+  const bool mayStoreWords = literalMayStoreWords(op);
+  bool storedWords = false;
   for (auto [index, element] : llvm::enumerate(elements)) {
     if (!element)
       continue;
     mlir::FailureOr<RuntimeBundle> payload =
-        RuntimeBundleLowerer::materializePayloadObjectBundle(op, *element);
+        RuntimeBundleLowerer::materializePayloadObjectBundle(
+            op, *element, /*slotWordOnly=*/mayStoreWords);
+    if (mlir::succeeded(payload) &&
+        (payload->payloadSlotWord || payload->storeAsSlotWord))
+      storedWords = true;
     if (mlir::failed(payload))
       return mlir::failure();
     mlir::Block *retainBlock = builder.getInsertionBlock();
@@ -988,7 +1023,9 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeSequencePayload(
   // Why NOT drop it for every literal: the evidence is what turns a literal's
   // element access into no code at all, and the declined move is a rare shape (a
   // literal in a loop its element's source is defined outside of).
-  if (declinedLoopLevelMove) {
+  // ⭐ AND SO DOES AN ELEMENT STORED AS ITS SLOT WORD: the evidence names the
+  // object, the slot holds the value, and the object goes with the move.
+  if (declinedLoopLevelMove || storedWords) {
     container.sequenceElements.clear();
     container.sequenceElementBundles.clear();
     container.sequenceIndices.clear();
@@ -1090,18 +1127,24 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
   // one -- the same defect reached by a different spelling.
   llvm::SmallPtrSet<void *, 4> movedSources;
   bool declinedLoopLevelMove = false;
+  const bool mayStoreWords = literalMayStoreWords(op);
+  bool storedWords = false;
   for (auto [index, key] : llvm::enumerate(keys)) {
     if (!key || !values[index])
       return op->emitError() << "dict payload entry has no object evidence";
     mlir::FailureOr<RuntimeBundle> payloadKey =
-        RuntimeBundleLowerer::materializePayloadObjectBundle(op, *key);
+        RuntimeBundleLowerer::materializePayloadObjectBundle(
+            op, *key, /*slotWordOnly=*/mayStoreWords);
     if (mlir::failed(payloadKey))
       return mlir::failure();
     mlir::FailureOr<RuntimeBundle> payloadValue =
-        RuntimeBundleLowerer::materializePayloadObjectBundle(op,
-                                                             *values[index]);
+        RuntimeBundleLowerer::materializePayloadObjectBundle(
+            op, *values[index], /*slotWordOnly=*/mayStoreWords);
     if (mlir::failed(payloadValue))
       return mlir::failure();
+    for (const RuntimeBundle *stored : {&*payloadKey, &*payloadValue})
+      if (stored->payloadSlotWord || stored->storeAsSlotWord)
+        storedWords = true;
     mlir::Block *retainBlock = builder.getInsertionBlock();
     mlir::Operation *retainAnchor = insertionAnchor(builder);
     if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
@@ -1221,7 +1264,9 @@ mlir::LogicalResult RuntimeBundleLowerer::initializeDictPayload(
   static bool demotionEnabled =
       !llvm::sys::Process::GetEnv("LYTHON_ABLATE_DICT_EVIDENCE_DEMOTION")
            .has_value();
-  if (declinedLoopLevelMove && demotionEnabled) {
+  // An entry stored as its slot word drops the evidence for the reason the
+  // sequence side gives.
+  if ((declinedLoopLevelMove && demotionEnabled) || storedWords) {
     container.mappingKeys.clear();
     container.mappingKeyBundles.clear();
     container.mappingValues.clear();

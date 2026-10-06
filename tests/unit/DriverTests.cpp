@@ -2747,6 +2747,22 @@ TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
                     "LyFloat_SlotWordTakingRef"));
   EXPECT_FALSE(calls("xs = [1000, 2000]\nprint(xs[0])\n",
                      "LyLong_SlotWordTakingRef"));
+  // An int read whose every use is arithmetic decodes the word and makes no
+  // object (`LyLong_ReadSlotWord`); a read that is also stored does not.
+  EXPECT_TRUE(calls("def total(xs: list[int]) -> int:\n"
+                    "    t = 0\n"
+                    "    for x in xs:\n"
+                    "        t += x * 3\n"
+                    "    return t\n\n\n"
+                    "print(total([1, 2]))\n",
+                    "LyLong_ReadSlotWord"));
+  EXPECT_FALSE(calls("def keep(xs: list[int]) -> list[int]:\n"
+                     "    ys: list[int] = []\n"
+                     "    for x in xs:\n"
+                     "        ys.append(x)\n"
+                     "    return ys\n\n\n"
+                     "print(keep([1, 2]))\n",
+                     "LyLong_ReadSlotWord"));
   // An instance field is a slot like an element.
   EXPECT_TRUE(calls("class P:\n"
                     "    def __init__(self, x: int) -> None:\n"

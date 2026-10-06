@@ -739,6 +739,7 @@ private:
                                              mlir::Location loc,
                                              mlir::Value entity,
                                              mlir::MemRefType boxType);
+  static bool literalMayStoreWords(mlir::Operation *op);
   mlir::FailureOr<bool> bindDeferredIntRead(mlir::Operation *op,
                                             mlir::Value resultValue,
                                             const RuntimeValue &value);

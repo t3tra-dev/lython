@@ -855,6 +855,16 @@ RuntimeBundleLowerer::starredSequenceElements(mlir::Operation *op,
                                                label, arrivesOwned);
     if (mlir::failed(element))
       return mlir::failure();
+    // ⭐ AN INT OR FLOAT MEMBER IS TAKEN, NOT BORROWED: its slot may hold the
+    // value itself, and the view of that is no object to hand a callee. The
+    // retain turns it into one (`retainEvidenceElement`, `from_slot_word`).
+    std::string memberContract = runtimeContractName(member);
+    if (!arrivesOwned && (memberContract == "builtins.int" ||
+                          memberContract == "builtins.float"))
+      if (std::optional<RuntimeValue> owned =
+              RuntimeBundleLowerer::retainEvidenceElement(op, *element,
+                                                          /*atOperation=*/true))
+        element = *owned;
     elements.push_back(*element);
   }
   return elements;
