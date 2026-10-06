@@ -7640,6 +7640,60 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
+  // ⭐ A READ THAT MAKES NO OBJECT, for an int whose every use can take its
+  // i64 (`deferredObject` in the lowering's bundle): the value, whether it is
+  // the value (an immediate, or an object that fits 64 bits), and an owned
+  // object to fall back on when it is not. For an immediate the fallback is
+  // the immortal small int 0 -- never read, because `valid` is true -- so the
+  // read allocates nothing; for an object it is the object, retained, since
+  // the container may let it go before the fallback is taken.
+  func.func @LyLong_ReadSlotWord(%slot_view: memref<2xi64>) -> (memref<2xi64>, i64, i1) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_slot_word"} {
+    %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<2xi64> -> index
+    %address = arith.index_cast %word_idx : index to i64
+    %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %true = arith.constant true
+    %held, %value, %valid = scf.if %immediate -> (memref<2xi64>, i64, i1) {
+      %v = func.call @__ly_int_from_immediate(%word) : (i64) -> i64
+      %zero = arith.constant 0 : i64
+      func.call @__ly_long_small_ensure() : () -> ()
+      %stand_in = func.call @__ly_long_small_slot(%zero) : (i64) -> memref<2xi64>
+      scf.yield %stand_in, %v, %true : memref<2xi64>, i64, i1
+    } else {
+      func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+      %v, %ok = func.call @LyLong_TryAsI64(%slot_view) : (memref<2xi64>) -> (i64, i1)
+      scf.yield %slot_view, %v, %ok : memref<2xi64>, i64, i1
+    }
+    func.return %held, %value, %valid : memref<2xi64>, i64, i1
+  }
+
+  // The object a deferred read stands for, owned: a new int of the value when
+  // the value is valid, the held object (retained again) when it is not.
+  func.func @LyLong_MaterializeRead(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "materialize_read"} {
+    %header = scf.if %valid -> (memref<2xi64>) {
+      %fresh = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+      scf.yield %fresh : memref<2xi64>
+    } else {
+      %idx = memref.extract_aligned_pointer_as_index %held : memref<2xi64> -> index
+      %word = arith.index_cast %idx : index to i64
+      func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+      scf.yield %held : memref<2xi64>
+    }
+    func.return %header : memref<2xi64>
+  }
+
+  // The i64 a deferred read stands for, for a callee that takes one: raises
+  // as LyLong_AsI64 does when the value is wider.
+  func.func @LyLong_ReadValueChecked(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_value_checked"} {
+    %result = scf.if %valid -> (i64) {
+      scf.yield %value : i64
+    } else {
+      %v = func.call @LyLong_AsI64(%held) : (memref<2xi64>) -> i64
+      scf.yield %v : i64
+    }
+    func.return %result : i64
+  }
+
   // The i64 a slot's entity word names when it has one: the immediate, or an
   // object's value when it fits. `fits` false means the object is wider.
   func.func @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"} {

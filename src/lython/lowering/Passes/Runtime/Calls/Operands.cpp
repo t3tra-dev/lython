@@ -145,7 +145,18 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
 
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(source) &&
       expected.isInteger(64)) {
-    operands.push_back(source.primitiveI64->value);
+    mlir::Value word = source.primitiveI64->value;
+    // A deferred read's value is the value only where its flag says so.
+    if (source.deferredObject)
+      if (std::optional<RuntimeSymbol> checked =
+              manifest.primitive("builtins.int", "read_value_checked"))
+        word = RuntimeBundleLowerer::createRuntimeCall(
+                   op->getLoc(), *checked,
+                   mlir::ValueRange{source.primitiveI64->value,
+                                    source.primitiveI64->valid,
+                                    source.deferredObject})
+                   .getResult(0);
+    operands.push_back(word);
     ++inputIndex;
     return mlir::success();
   }

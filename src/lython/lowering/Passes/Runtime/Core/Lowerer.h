@@ -739,6 +739,9 @@ private:
                                              mlir::Location loc,
                                              mlir::Value entity,
                                              mlir::MemRefType boxType);
+  mlir::FailureOr<bool> bindDeferredIntRead(mlir::Operation *op,
+                                            mlir::Value resultValue,
+                                            const RuntimeValue &value);
   mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>>
   objectPayloadClassEntity(mlir::Operation *op, const RuntimeBundle &value,
                            bool ownsPayload = true);

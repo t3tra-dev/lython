@@ -196,6 +196,11 @@ struct RuntimeBundle {
   // the contract's `slot_word_taking_ref` when the handle words are built,
   // which comes after the aggregate retain (see that primitive).
   bool storeAsSlotWord = false;
+  // A lazy int read out of a slot without making an object
+  // (`LyLong_ReadSlotWord`): `primitiveI64` is the value when its flag is
+  // true, and this owned object is the int when it is not. Materializing the
+  // bundle goes through `LyLong_MaterializeRead`, never `int.__new__` alone.
+  mlir::Value deferredObject;
   std::optional<RuntimeBufferEvidence> buffer;
   std::optional<RuntimeCtypesEvidence> ctypes;
   RuntimeObjectEvidence objectEvidence;

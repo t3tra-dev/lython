@@ -687,7 +687,8 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
   // ⛔ ONLY WHEN THE CALLER ONLY STORES IT (`slotWordOnly`). A literal or an
   // evidence-backed append also keeps the bundle as the container's contents
   // evidence, and every reader of that evidence wants an object.
-  if (slotWordOnly && RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete))
+  if (slotWordOnly && RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete) &&
+      !concrete->deferredObject)
     if (std::optional<RuntimeSymbol> slotWord =
             manifest.primitive("builtins.int", "slot_word_from_i64")) {
       builder.setInsertionPoint(op);

@@ -721,9 +721,112 @@ RuntimeBundleLowerer::retainEvidenceElementWithFallback(
   return retained;
 }
 
+// True when every use of `result` can take a lazy int: the arithmetic and
+// comparison operators that have an i64 form (`primitiveI64ArithmeticKind`,
+// `primitiveI64ComparePredicate`) with an int on both sides, whose slow arm
+// materializes its lazy operands, and the reference drops the emitter writes.
+// ⛔ Not any use: a lazy int's value is only the value where its flag says,
+// and the other readers of `primitiveI64` were written for lanes that are.
+static bool deferrableIntRead(mlir::Value result) {
+  if (result.use_empty())
+    return false;
+  auto isInt = [](mlir::Type type) {
+    if (auto contract = mlir::dyn_cast<py::ContractType>(type))
+      return contract.getContractName() == "builtins.int" &&
+             contract.getArguments().empty();
+    if (auto literal = mlir::dyn_cast<py::LiteralType>(type)) {
+      llvm::StringRef digits = literal.getSpelling();
+      digits.consume_front("-");
+      return !digits.empty() && llvm::all_of(digits, llvm::isDigit);
+    }
+    return false;
+  };
+  for (mlir::Operation *user : result.getUsers()) {
+    if (mlir::isa<py::DecRefOp>(user))
+      continue;
+    if (!mlir::isa<py::AddOp, py::SubOp, py::MulOp, py::FloorDivOp, py::ModOp,
+                   py::LShiftOp, py::RShiftOp, py::BitAndOp, py::BitOrOp,
+                   py::BitXorOp, py::EqOp, py::NeOp, py::LtOp, py::LeOp,
+                   py::GtOp, py::GeOp>(user))
+      return false;
+    if (user->getNumOperands() < 2 || !isInt(user->getOperand(0).getType()) ||
+        !isInt(user->getOperand(1).getType()))
+      return false;
+  }
+  return true;
+}
+
+// The view a read built from a slot word, through the `scf.if` an
+// iteration guards its read with (the other arm is the dead stand-in, which
+// reads as the int 0 and is never consumed).
+static bool isSlotEntityView(mlir::Value view) {
+  mlir::Operation *def = view.getDefiningOp();
+  if (!def)
+    return false;
+  if (def->hasAttr("ly.runtime.slot_entity_view"))
+    return true;
+  if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(def)) {
+    unsigned index = mlir::cast<mlir::OpResult>(view).getResultNumber();
+    auto thenYield = mlir::cast<mlir::scf::YieldOp>(
+        ifOp.getThenRegion().front().getTerminator());
+    mlir::Operation *yielded = thenYield.getOperand(index).getDefiningOp();
+    return yielded && yielded->hasAttr("ly.runtime.slot_entity_view");
+  }
+  return false;
+}
+
+// ⭐ AN INT READ WHOSE EVERY USE IS ARITHMETIC MAKES NO OBJECT. The slot word
+// is decoded where it is read (`LyLong_ReadSlotWord`), and an object is made
+// only on the slow arm of an operator that cannot use the i64 -- an
+// immediate needs none.
+mlir::FailureOr<bool> RuntimeBundleLowerer::bindDeferredIntRead(
+    mlir::Operation *op, mlir::Value resultValue, const RuntimeValue &value) {
+  if (runtimeContractName(value.contract) != "builtins.int" ||
+      value.values.size() != 1 || !deferrableIntRead(resultValue) ||
+      !isSlotEntityView(value.values.front()))
+    return false;
+  // ⛔ Not in an i64 clone or a generator's resume: there an int lane whose
+  // flag is false is not a slow arm to take but a replay or a refusal
+  // ("int too large ..."), which an int wider than 64 bits in a list would
+  // reach on a program that ran.
+  if (auto function = op->getParentOfType<mlir::func::FuncOp>())
+    if (function->hasAttr(kPrimitiveI64CloneAttr) ||
+        function->hasAttr("ly.generator.resume"))
+      return false;
+  std::optional<RuntimeSymbol> read =
+      manifest.primitive("builtins.int", "read_slot_word");
+  if (!read || read->function.getFunctionType().getInput(0) !=
+                   value.values.front().getType())
+    return false;
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *read, mlir::ValueRange{value.values.front()});
+  RuntimeValue held = value;
+  held.values.assign({call.getResult(0)});
+  RuntimeValue rooted =
+      rootAsOwnedLocal(builder, op->getLoc(), held, "builtins.int");
+  RuntimeBundle lazy = RuntimeBundle::objectWithOwnership(
+      resultValue.getType(), mlir::ValueRange{},
+      ownership::logicalOwnershipKind(resultValue.getType(),
+                                      /*ownsObject=*/false));
+  lazy.primitiveI64 =
+      RuntimePrimitiveI64Evidence{call.getResult(1), call.getResult(2)};
+  lazy.deferredObject = rooted.values.front();
+  valueBundles[resultValue] = std::move(lazy);
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::bindRetainedEvidenceValue(
     mlir::Operation *op, mlir::Value resultValue, llvm::StringRef label,
     const RuntimeValue &value, const RuntimeBundle *container) {
+  mlir::FailureOr<bool> deferred =
+      RuntimeBundleLowerer::bindDeferredIntRead(op, resultValue, value);
+  if (mlir::failed(deferred))
+    return mlir::failure();
+  if (*deferred) {
+    erase.push_back(op);
+    return mlir::success();
+  }
   mlir::FailureOr<std::optional<RuntimeValue>> retained =
       retainEvidenceElementWithFallback(op, value, container);
   if (mlir::failed(retained))
