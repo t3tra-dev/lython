@@ -572,6 +572,18 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
            << "a type-erased `object` value cannot be stored in a runtime "
               "container slot yet; give the container a concrete element "
               "type annotation";
+  if (concrete->storeAsSlotWord && concrete->physicalValues().empty() &&
+      concrete->deferredObject && concrete->primitiveI64)
+    if (std::optional<RuntimeSymbol> taking = manifest.primitive(
+            "builtins.int", "slot_word_taking_deferred")) {
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          loc, *taking,
+          mlir::ValueRange{concrete->primitiveI64->value,
+                           concrete->primitiveI64->valid,
+                           concrete->deferredObject});
+      return llvm::SmallVector<mlir::Value, 4>{constantI64(builder, loc, 1),
+                                               call.getResult(0)};
+    }
   if (concrete->storeAsSlotWord && concrete->physicalValues().size() == 1)
     if (std::optional<RuntimeSymbol> takingRef = manifest.primitive(
             concrete->contractName(), "slot_word_taking_ref")) {
@@ -701,6 +713,17 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
       word.payloadSlotWord = call.getResult(0);
       return word;
     }
+  // A deferred int goes in as its slot word too, made where an int object's
+  // is: after the store's aggregate retain, whose reference the word takes
+  // (`slot_word_taking_deferred`). ⛔ Not here, before that retain: the
+  // primitive drops the reference it is given when the i64 is the word, and
+  // made here it dropped one the retain had not yet taken -- a freed int.
+  if (slotWordOnly && RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*concrete) &&
+      concrete->deferredObject) {
+    RuntimeBundle marked = *concrete;
+    marked.storeAsSlotWord = true;
+    return marked;
+  }
   // A float lane goes in the same way; one that is also kept as contents
   // evidence becomes an object first, like a lazy int below.
   if (RuntimeBundleLowerer::hasLazyPrimitiveF64Object(*concrete)) {

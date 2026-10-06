@@ -196,6 +196,12 @@ RuntimeBundleLowerer::retainAggregateSlot(mlir::Operation *op,
       RuntimeBundleLowerer::concreteObjectForOwnership(slotValue);
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
     return op->emitError() << "aggregate slot retain requires an object bundle";
+  // A deferred int's reference is the object it holds (the stand-in while
+  // its i64 is the value), counted as an object's would be.
+  if (concrete->physicalValues().empty() && concrete->deferredObject)
+    return RuntimeBundleLowerer::retainAggregateSlot(
+        op, concrete->objectValue.contract,
+        mlir::ValueRange{concrete->deferredObject}, slotName);
   return RuntimeBundleLowerer::retainAggregateSlot(
       op, concrete->objectValue.contract, concrete->physicalValues(), slotName);
 }
@@ -222,6 +228,10 @@ RuntimeBundleLowerer::releaseAggregateSlot(mlir::Operation *op,
   if (!concrete || concrete->kind != RuntimeBundle::Kind::Object)
     return op->emitError()
            << "aggregate slot release requires an object bundle";
+  if (concrete->physicalValues().empty() && concrete->deferredObject)
+    return RuntimeBundleLowerer::releaseAggregateSlot(
+        op, concrete->objectValue.contract,
+        mlir::ValueRange{concrete->deferredObject}, slotName);
   return RuntimeBundleLowerer::releaseAggregateSlot(
       op, concrete->objectValue.contract, concrete->physicalValues(), slotName);
 }

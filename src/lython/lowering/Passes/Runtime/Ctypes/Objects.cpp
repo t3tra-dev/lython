@@ -151,6 +151,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerStaticCtypesValueAttrSet(
              isKnownTrue(value->ctypes->scalarValid)) {
     evidence.scalarValue = value->ctypes->scalarValue;
     evidence.scalarValid = value->ctypes->scalarValid;
+  } else if (value->primitiveI64 && value->deferredObject &&
+             value->physicalValues().empty()) {
+    // A deferred int: its i64 where the flag says so, else its object's,
+    // raising as `unbox.i64` does when that is wider.
+    std::optional<RuntimeSymbol> checked =
+        manifest.primitive("builtins.int", "read_value_checked");
+    if (!checked)
+      return op.emitError() << "runtime manifest has no int read_value_checked";
+    evidence.scalarValue =
+        RuntimeBundleLowerer::createRuntimeCall(
+            op.getLoc(), *checked,
+            mlir::ValueRange{value->primitiveI64->value,
+                             value->primitiveI64->valid, value->deferredObject})
+            .getResult(0);
+    evidence.scalarValid = constantBool(builder, op.getLoc(), true);
   } else {
     // Runtime-computed ints (dynamic fits-i64 flag) normalize through the
     // manifest unbox primitive.

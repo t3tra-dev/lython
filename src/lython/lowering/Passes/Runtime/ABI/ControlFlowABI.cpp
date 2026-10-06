@@ -285,6 +285,22 @@ bool RuntimeBundleLowerer::hasPrecedingSiblingInFlight(
   return false;
 }
 
+// An int merging OUTSIDE a clone merges as a deferred int: its i64, whether
+// the i64 is the value, and the object it holds (the stand-in while the i64
+// is the value, the real object when it is not). A loop counter or an
+// accumulator then makes no object per trip; a reader that needs one makes it
+// (`materialize_read`), and the held object is the reference the edge moves,
+// as the int object was.
+// ⛔ Not inside a clone: there the lane is the whole value (the pair below),
+// and the clone answers "cannot say" instead of holding an object.
+static bool isDeferredIntMerge(mlir::BlockArgument argument) {
+  auto function = mlir::dyn_cast_if_present<mlir::func::FuncOp>(
+      argument.getOwner()->getParentOp());
+  return function &&
+         !function->hasAttr(kPrimitiveI64CloneAttr) &&
+         runtimeContractName(argument.getType()) == "builtins.int";
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
     mlir::Operation *op, mlir::BlockArgument argument) {
   if (valueBundles.find(argument) != valueBundles.end())
@@ -321,8 +337,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
       (inClone && runtimeContractName(argument.getType()) == "builtins.int") ||
       primitiveFloatLane;
 
+  bool deferredInt = isDeferredIntMerge(argument);
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> physicalTypes;
-  if (primitiveIntLane) {
+  if (deferredInt) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> objectTypes =
+        RuntimeBundleLowerer::runtimeValueTypesFor(
+            op, argument.getType(), "control-flow block argument ABI");
+    if (mlir::failed(objectTypes) || objectTypes->size() != 1)
+      return op->emitError() << "a deferred int merge needs a one-lane int";
+    llvm::SmallVector<mlir::Type, 8> tripleTypes{
+        mlir::IntegerType::get(context, 64), mlir::IntegerType::get(context, 1),
+        objectTypes->front()};
+    physicalTypes = std::move(tripleTypes);
+  } else if (primitiveIntLane) {
     llvm::SmallVector<mlir::Type, 8> pairTypes;
     pairTypes.push_back(primitiveFloatLane
                             ? mlir::Type(mlir::Float64Type::get(context))
@@ -350,7 +377,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   }
 
   RuntimeBundle provisionalBundle;
-  if (primitiveIntLane) {
+  if (deferredInt) {
+    provisionalBundle = RuntimeBundle::objectWithOwnership(
+        argument.getType(), mlir::ValueRange{},
+        ownership::logicalOwnershipKind(argument.getType(),
+                                        /*ownsObject=*/false));
+    provisionalBundle.primitiveI64 =
+        RuntimePrimitiveI64Evidence{physicalArguments[0], physicalArguments[1]};
+    provisionalBundle.deferredObject = physicalArguments[2];
+  } else if (primitiveIntLane) {
     provisionalBundle = RuntimeBundle::objectWithOwnership(
         argument.getType(), mlir::ValueRange{},
         ownership::logicalOwnershipKind(argument.getType(),
@@ -556,7 +591,51 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
              << "control-flow branch operand has no lowered runtime bundle";
 
     llvm::SmallVector<mlir::Value, 8> physicalOperands;
-    if (primitiveIntLane && physicalTypes.front().isF64()) {
+    if (isDeferredIntMerge(argument)) {
+      mlir::Location loc = anchor->getLoc();
+      if (source->primitiveI64 && source->physicalValues().empty() &&
+          source->deferredObject) {
+        physicalOperands.append({source->primitiveI64->value,
+                                 source->primitiveI64->valid,
+                                 source->deferredObject});
+      } else if (!source->physicalValues().empty()) {
+        // An int object: its i64 when it has one, read when it has not.
+        mlir::Value object = source->physicalValues().front();
+        if (source->primitiveI64) {
+          physicalOperands.append({source->primitiveI64->value,
+                                   source->primitiveI64->valid, object});
+        } else {
+          std::optional<RuntimeSymbol> tryUnbox =
+              manifest.primitive("builtins.int", "try_unbox.i64");
+          if (!tryUnbox)
+            return anchor->emitError()
+                   << "runtime manifest has no int try_unbox.i64";
+          mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
+              loc, *tryUnbox, mlir::ValueRange{object});
+          physicalOperands.append(
+              {read.getResult(0), read.getResult(1), object});
+        }
+      } else if (source->primitiveI64) {
+        // A lane with no object (a clone's result) holds a real one.
+        mlir::FailureOr<RuntimeValue> object =
+            RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+                anchor, *source);
+        if (mlir::failed(object))
+          return mlir::failure();
+        physicalOperands.append({source->primitiveI64->value,
+                                 constantInt(builder, loc,
+                                             builder.getI1Type(), 1),
+                                 object->values.front()});
+      } else {
+        return anchor->emitError()
+               << "deferred int merge source has neither an object nor an i64";
+      }
+      if (physicalOperands.size() != 3 ||
+          physicalOperands[2].getType() != physicalTypes[2])
+        return anchor->emitError()
+               << "deferred int merge source does not match "
+               << physicalTypes[2];
+    } else if (primitiveIntLane && physicalTypes.front().isF64()) {
       if (source->primitiveF64) {
         physicalOperands.push_back(source->primitiveF64->value);
         physicalOperands.push_back(source->primitiveF64->valid);
@@ -758,11 +837,14 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     std::optional<RuntimePrimitiveI64Evidence> ownLane = merged.primitiveI64;
     std::optional<RuntimePrimitiveI64Evidence> ownFloatLane =
         merged.primitiveF64;
+    mlir::Value ownDeferred = merged.deferredObject;
     merged.copyEvidenceFrom(sourceBundles.front());
     if (ownLane)
       merged.primitiveI64 = ownLane;
     if (ownFloatLane)
       merged.primitiveF64 = ownFloatLane;
+    if (ownDeferred)
+      merged.deferredObject = ownDeferred;
     // Same physical identity does not imply same compile-time knowledge: an
     // arm may have recorded element/field evidence whose SSA values the other
     // arm never defines. Keeping the first arm's version would answer that
