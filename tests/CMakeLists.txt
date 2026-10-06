@@ -198,6 +198,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AFloatLoopInAnOrdinaryFunctionMakesNoObjects"
     "DriverTest.AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue"
     "DriverTest.AnIntSlowArmIsOneDeferredCall"
+    "DriverTest.AGeneratorFrameKeepsAnIntAsItsWord"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"

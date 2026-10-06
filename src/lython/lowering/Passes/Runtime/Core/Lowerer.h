@@ -419,6 +419,12 @@ private:
   unsigned objectReadersOf(mlir::Value value);
   bool bindFloatSlotRead(mlir::Operation *op, mlir::Value resultValue,
                          const RuntimeValue &value);
+  // The deferred ints a generator suspend read into its value lanes, each
+  // released once after every lane has read it unless a frame lane took the
+  // object it holds (`suspendDeferredMoved`); see
+  // appendGeneratorLaneReturnOperands.
+  llvm::SmallVector<RuntimeBundle, 4> suspendDeferredReleases;
+  llvm::SmallPtrSet<mlir::Value, 4> suspendDeferredMoved;
   bool readsFloatLanes(mlir::Operation *op) const;
   // Primitive/F64Calls.cpp.
   bool floatLaneApplies(mlir::Operation *op, llvm::StringRef method,
@@ -1309,7 +1315,7 @@ private:
   mlir::LogicalResult appendGeneratorLaneReturnOperands(
       mlir::func::ReturnOp op, const GeneratorResumeLane &lane,
       const RuntimeBundle &bundle, llvm::SmallVectorImpl<mlir::Value> &operands,
-      bool forceRetain = false);
+      bool forceRetain = false, bool frameLane = false);
   // Frame words a lane occupies in the generator storage: (raw, valid) for
   // int lanes, then (pointer, size) per physical part.
   unsigned generatorLaneFrameWords(const GeneratorResumeLane &lane) const;

@@ -613,6 +613,35 @@ TEST(DriverTest, AnIntSlowArmIsOneDeferredCall) {
   EXPECT_EQ(compare, 1u);
 }
 
+// What: a generator's int locals -- an accumulator and the loop's counter --
+// cross each yield as their word and the object they hold, so the resume makes
+// one int object per trip: the one it yields.
+TEST(DriverTest, AGeneratorFrameKeepsAnIntAsItsWord) {
+  CompileResult result = compileSource(
+      "from typing import Iterator\n\n\n"
+      "def gen(n: int) -> Iterator[int]:\n"
+      "    a = 0\n"
+      "    for i in range(n):\n"
+      "        yield a\n"
+      "        a = (a + i) % 1000003\n\n\n"
+      "print(sum(gen(5)))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *function =
+      result.verified.llvmModule->getFunction("gen__lyrt_gen_resume");
+  ASSERT_NE(function, nullptr);
+  unsigned made = 0;
+  for (const llvm::BasicBlock &block : *function)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          llvm::StringRef name = callee->getName();
+          made += name == "LyLong_MaterializeRead" ||
+                  (name == "LyLong_FromI64" &&
+                   !llvm::isa<llvm::ConstantInt>(call->getArgOperand(0)));
+        }
+  EXPECT_EQ(made, 1u) << "only the yielded int should be made an object";
+}
+
 // What: in a function with no clone (it takes a list), a float read out of
 // the list, the arithmetic on it and the float the loop carries are f64
 // values: the body calls no float operator, reads no slot as an object, and

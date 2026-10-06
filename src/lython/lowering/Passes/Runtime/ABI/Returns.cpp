@@ -318,7 +318,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           if (mlir::failed(
                   RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
                       op, *suspendLane, *bundle, operands,
-                      /*forceRetain=*/duplicate))) {
+                      /*forceRetain=*/duplicate,
+                      /*frameLane=*/operandIndex >= 5))) {
             result = mlir::failure();
             return mlir::WalkResult::interrupt();
           }
@@ -446,6 +447,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
       // Operand bundling may lower block arguments, which rewrites (erases)
       // predecessor terminators and dangles the saved insertion iterator:
       // re-anchor at the return being replaced.
+      builder.setInsertionPoint(op);
+      for (const RuntimeBundle &read : suspendDeferredReleases)
+        if (!suspendDeferredMoved.contains(read.deferredObject) &&
+            mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
+                op, read, "generator yield lane"))) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+      suspendDeferredReleases.clear();
+      suspendDeferredMoved.clear();
       builder.setInsertionPoint(op);
       mlir::func::ReturnOp::create(builder, op.getLoc(), operands);
       op.erase();

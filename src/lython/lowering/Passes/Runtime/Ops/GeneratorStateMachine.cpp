@@ -183,6 +183,12 @@ bool isIntContract(mlir::Type type) {
   return runtimeContractName(type) == "builtins.int";
 }
 
+// An int ARGUMENT lane: an object lane (its span) whose contract is int.
+template <typename Lane> bool isIntObjectArgument(const Lane &lane) {
+  return !lane.isInt && !lane.isControl() && !lane.unionType &&
+         lane.contract == "builtins.int";
+}
+
 bool isNoneLike(mlir::Type type) {
   if (runtimeContractName(type) == "types.NoneType")
     return true;
@@ -371,7 +377,7 @@ RuntimeBundleLowerer::materializeGeneratorDeadLaneValues(
 mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
     mlir::func::ReturnOp op, const GeneratorResumeLane &lane,
     const RuntimeBundle &bundle, llvm::SmallVectorImpl<mlir::Value> &operands,
-    bool forceRetain) {
+    bool forceRetain, bool frameLane) {
   mlir::Location loc = op.getLoc();
   builder.setInsertionPoint(op);
   if (lane.isControl())
@@ -445,6 +451,62 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
     if (bundle.contractName() != "builtins.int")
       return op.emitError() << "generator yield lane expects builtins.int, got "
                             << bundle.contract;
+    // ⭐ A FRAME LANE TAKES A DEFERRED INT AS IT IS: its word, and the object
+    // it holds -- the stand-in while the word is the value -- whose reference
+    // moves into the frame. The resume binds the lane as a deferred int again
+    // (its continuation), so nothing there reads the stand-in as the value,
+    // and an object is made only where a reader needs one. A second lane
+    // carrying the same object takes a reference of its own.
+    // ⛔ Not an object per frame lane, as the value lane makes: `a = (a + 7)
+    // % m` across a yield made two ints a trip (the yielded one and the
+    // frame's), and the range counter two more -- 0.50 s became 0.80 s.
+    if (frameLane && bundle.physicalValues().empty() &&
+        bundle.deferredObject && bundle.primitiveI64) {
+      if (!suspendDeferredMoved.insert(bundle.deferredObject).second &&
+          mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
+              op, bundle, "generator frame lane")))
+        return mlir::failure();
+      operands.push_back(bundle.deferredObject);
+      operands.push_back(bundle.primitiveI64->value);
+      operands.push_back(bundle.primitiveI64->valid);
+      return mlir::success();
+    }
+    // ⭐ A VALUE LANE TAKES A DEFERRED INT AS ITS OBJECT: the one it holds
+    // when its word is not the value (an int past the word), or one made of
+    // the word -- a reference of the lane's own (`materialize_read`). The
+    // value's own reference is released once the suspend has read every lane
+    // (`suspendDeferredReleases`, drained in Returns.cpp) unless a frame lane
+    // took it. ⛔ Not here: two lanes carrying one deferred int (the loop
+    // counter and the yielded value) are two SSA values with one held object,
+    // and the first lane's release left the second reading a freed one.
+    // ⛔ Not the stand-in it holds while its word is the value: the resumer
+    // takes the box for the value. ⛔ Not one call that TAKES the held
+    // reference: a call that may raise and consumes it leaves the unwind
+    // edge with a reference the handler still forwards (released-then-used).
+    if (bundle.physicalValues().empty() && bundle.deferredObject &&
+        bundle.primitiveI64) {
+      std::optional<RuntimeSymbol> materialize =
+          manifest.primitive("builtins.int", "materialize_read");
+      if (!materialize)
+        return op.emitError() << "runtime manifest has no int materialize_read";
+      mlir::func::CallOp object = RuntimeBundleLowerer::createRuntimeCall(
+          loc, *materialize,
+          mlir::ValueRange{bundle.primitiveI64->value,
+                           bundle.primitiveI64->valid, bundle.deferredObject});
+      if (object.getNumResults() != lane.physicalCount)
+        return op.emitError() << "int materialize_read does not match the "
+                                 "generator int lane";
+      if (llvm::none_of(suspendDeferredReleases,
+                        [&](const RuntimeBundle &pending) {
+                          return pending.deferredObject ==
+                                 bundle.deferredObject;
+                        }))
+        suspendDeferredReleases.push_back(bundle);
+      operands.append(object.getResults().begin(), object.getResults().end());
+      operands.push_back(bundle.primitiveI64->value);
+      operands.push_back(bundle.primitiveI64->valid);
+      return mlir::success();
+    }
     if (!bundle.physicalValues().empty()) {
       if (bundle.physicalValues().size() != lane.physicalCount)
         return op.emitError()
@@ -619,6 +681,14 @@ RuntimeBundleLowerer::generatorArgumentPhysicalTypes(
     return types;
   }
   types.append(lane.physicalTypes.begin(), lane.physicalTypes.end());
+  // An int argument also hands the resume its word, read where the span is
+  // loaded (`getOrCreateGeneratorArgumentLoadFunction`). ⛔ Not read in the
+  // resume's entry: an op there does not dominate the blocks the resume
+  // dispatch reaches, as the bool argument's note says.
+  if (isIntObjectArgument(lane)) {
+    types.push_back(mlir::IntegerType::get(context, 64));
+    types.push_back(mlir::IntegerType::get(context, 1));
+  }
   return types;
 }
 
@@ -711,6 +781,37 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
     unsigned expected = lane->unionType
                             ? static_cast<unsigned>(lane->passTypes.size())
                             : lane->physicalCount;
+    // An int known only as its word (or a deferred one) is lent as an object
+    // made for this resume; an int argument's word follows its object.
+    auto appendWord = [&]() -> mlir::LogicalResult {
+      if (!isIntObjectArgument(*lane))
+        return mlir::success();
+      if (source->primitiveI64) {
+        operands.push_back(source->primitiveI64->value);
+        operands.push_back(source->primitiveI64->valid);
+        return mlir::success();
+      }
+      std::optional<RuntimeSymbol> tryUnbox =
+          manifest.primitive("builtins.int", "try_unbox.i64");
+      if (!tryUnbox || source->physicalValues().size() != 1)
+        return op->emitError() << "generator int argument " << index
+                               << " has neither a word nor an object";
+      builder.setInsertionPoint(op);
+      mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
+          op->getLoc(), *tryUnbox, source->physicalValues());
+      operands.append(read.getResults().begin(), read.getResults().end());
+      return mlir::success();
+    };
+    if (source->physicalValues().empty() &&
+        RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*source)) {
+      builder.setInsertionPoint(op);
+      if (mlir::failed(RuntimeBundleLowerer::appendBundlePhysicalOperands(
+              op, *source, lane->physicalTypes, operands)))
+        return mlir::failure();
+      if (mlir::failed(appendWord()))
+        return mlir::failure();
+      continue;
+    }
     if (source->physicalValues().size() != expected)
       return op->emitError()
              << "generator argument " << index << " (" << lane->contract
@@ -718,6 +819,8 @@ mlir::LogicalResult RuntimeBundleLowerer::appendGeneratorArgumentOperands(
              << source->physicalValues().size();
     operands.append(source->physicalValues().begin(),
                     source->physicalValues().end());
+    if (mlir::failed(appendWord()))
+      return mlir::failure();
   }
   return mlir::success();
 }
@@ -1123,6 +1226,15 @@ RuntimeBundleLowerer::getOrCreateGeneratorArgumentLoadFunction(
         mlir::cast<mlir::MemRefType>(laneTypes[part])));
     word += 2;
   }
+  if (isIntObjectArgument(lane) && results.size() == 1) {
+    std::optional<RuntimeSymbol> tryUnbox =
+        manifest.primitive("builtins.int", "try_unbox.i64");
+    if (!tryUnbox)
+      return op->emitError() << "runtime manifest has no int try_unbox.i64";
+    mlir::func::CallOp read = mlir::func::CallOp::create(
+        builder, loc, tryUnbox->function, mlir::ValueRange{results.front()});
+    results.append(read.getResults().begin(), read.getResults().end());
+  }
   mlir::func::ReturnOp::create(builder, loc, results);
   return function;
 }
@@ -1162,13 +1274,23 @@ mlir::LogicalResult RuntimeBundleLowerer::seedGeneratorResumeCloneEntry(
            RuntimeBundleLowerer::generatorArgumentPhysicalTypes(argumentLane))
         physicalArgs.push_back(
             entry.addArgument(laneType, logicalArg.getLoc()));
+      // An int argument is its object and, after it, the word the driver
+      // read out of it.
+      bool intArgument = isIntObjectArgument(argumentLane);
+      llvm::ArrayRef<mlir::Value> span(physicalArgs);
+      if (intArgument)
+        span = span.take_front(argumentLane.physicalCount);
       RuntimeBundle bundle;
       if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
               function,
               RuntimeBundleLowerer::concreteGeneratorType(logicalType),
-              physicalArgs, bundle,
+              span, bundle,
               /*ownsObject=*/false)))
         return mlir::failure();
+      if (intArgument && physicalArgs.size() == argumentLane.physicalCount + 2)
+        bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
+            physicalArgs[argumentLane.physicalCount],
+            physicalArgs[argumentLane.physicalCount + 1]};
       valueBundles[logicalArg] = std::move(bundle);
       continue;
     }
@@ -1351,7 +1473,13 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       }
       GeneratorResumeLane lane;
       lane.contract = contract;
-      lane.isInt = contract == "builtins.int";
+      // ⭐ AN INT ARGUMENT IS AN OBJECT LANE, as a str or a list one is: the
+      // frame keeps the int's object, retained at creation and released by the
+      // finalizer, and the driver hands the resume its word beside it
+      // (`generatorArgumentPhysicalTypes`). ⛔ Not the (i64, valid) pair it
+      // was: an int wider than the word had nowhere to go, and `g(10 ** 30)`
+      // raised "int too large to convert".
+      lane.isInt = false;
       // ⭐ A BOOL ARGUMENT IS ONE WORD. `builtins.bool`'s manifest value shape
       // is a bare `i1` (LyBool_Shape), and `generatorLaneParts` requires every
       // part to be a rank-1 memref because a frame slot holds (pointer, size)
@@ -1368,7 +1496,7 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeCloneSignatures() 
       // ("operand #0 does not dominate this use"). A bool live across a YIELD
       // still has no frame lane -- that path goes through
       // `laneEligibleContract`, which is left alone.
-      lane.isBool = !lane.isInt && contract == "builtins.bool";
+      lane.isBool = contract == "builtins.bool";
       if (lane.isBool) {
         lane.physicalCount = 1;
         lane.physicalTypes.assign(
@@ -2732,9 +2860,24 @@ mlir::LogicalResult RuntimeBundleLowerer::buildGeneratorResumeBodies() {
                   parts.take_front(lane.physicalCount), bundle,
                   /*ownsObject=*/true)))
             return mlir::failure();
-          if (lane.isInt)
+          // An int lane comes back as the deferred int it went in as: its
+          // word, and the object the frame held -- the stand-in while the
+          // word is the value (appendGeneratorLaneReturnOperands).
+          // ⛔ Not an object with the word as its evidence: a reader of that
+          // takes the object for the value, and the stand-in is 0.
+          if (lane.isInt && lane.physicalCount == 1) {
+            mlir::Type logicalType = cont->getArgument(position).getType();
+            bundle = RuntimeBundle::objectWithOwnership(
+                runtimeContractType(context, lane.contract), mlir::ValueRange{},
+                ownership::logicalOwnershipKind(logicalType,
+                                                /*ownsObject=*/false));
             bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
                 owned[lane.physicalCount], owned[lane.physicalCount + 1]};
+            bundle.deferredObject = owned.front();
+          } else if (lane.isInt) {
+            bundle.primitiveI64 = RuntimePrimitiveI64Evidence{
+                owned[lane.physicalCount], owned[lane.physicalCount + 1]};
+          }
           if (auto unionType = mlir::dyn_cast<py::UnionType>(
                   cont->getArgument(position).getType())) {
             // ⛔ The helpers insert BEFORE the op they are given, so it has
@@ -4285,7 +4428,8 @@ RuntimeBundleLowerer::getOrCreateGeneratorFinalizeFunction(
       RuntimeBundle heldBundle;
       if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
               op, runtimeContractType(context, argumentLane.contract),
-              loaded.getResults(), heldBundle, /*ownsObject=*/true)))
+              loaded.getResults().take_front(argumentLane.physicalCount),
+              heldBundle, /*ownsObject=*/true)))
         return mlir::failure();
       if (mlir::failed(RuntimeBundleLowerer::releaseAggregateSlot(
               op, heldBundle, "generator drop argument")))
