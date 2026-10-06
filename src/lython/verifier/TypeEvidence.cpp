@@ -426,8 +426,7 @@ bool isReflectedBinaryMethod(mlir::Operation *op) {
   auto method = op->getAttrOfType<mlir::StringAttr>("method_name");
   if (!method)
     return false;
-  llvm::StringRef name = method.getValue();
-  return name.starts_with("__r") && name != "__repr__";
+  return py::contracts::isReflectedBinaryMethodName(method.getValue());
 }
 
 std::optional<llvm::StringRef> methodNameFor(mlir::Operation *op) {

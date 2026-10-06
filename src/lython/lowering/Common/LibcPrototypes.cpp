@@ -93,6 +93,7 @@ constexpr LibcPrototype kLibc[] = {
     {"getppid", C::Int, {}, 0},
     {"getuid", C::UInt, {}, 0},
     {"gmtime_r", C::Ptr, {C::Ptr, C::Ptr}, 2},
+    {"hypot", C::Double, {C::Double, C::Double}, 2},
     {"localtime_r", C::Ptr, {C::Ptr, C::Ptr}, 2},
     {"lstat", C::Int, {C::Ptr, C::Ptr}, 2},
     {"malloc", C::Ptr, {C::SizeT}, 1},

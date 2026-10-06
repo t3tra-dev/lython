@@ -1,0 +1,16 @@
+1.414213562373095e+200 5e-200
+(1+0j)
+(1e+200+0j)
+(2-0j) (2-0j) (2-0j) (2-0j) (0.5-0j) (1.5+0j)
+(1+2j) (6+9j) (4.5+3j) (-1+3j) (1-3j)
+(-5+12j) (-46+9j) (-0.020937642239417388-0.004096495220755576j) (1+0j) (1+0j)
+2.0 3.0 -0.0 (2-3j)
+True True True True False
+True False False yes
+(inf+infj)
+0j
+ZeroDivisionError: division by zero
+ZeroDivisionError: division by zero
+ZeroDivisionError: zero to a negative or complex power
+OverflowError: complex exponentiation
+OverflowError: absolute value too large
