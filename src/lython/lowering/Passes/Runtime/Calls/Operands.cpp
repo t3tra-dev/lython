@@ -72,6 +72,26 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
     mlir::Operation *op, const RuntimeSymbol &symbol,
     mlir::FunctionType functionType, unsigned &inputIndex,
     const RuntimeBundle &source, llvm::SmallVectorImpl<mlir::Value> &operands) {
+  // A float lane reaching a runtime input: an f64 input takes the lane as it
+  // is; anything else takes the boxed float, made here for this call.
+  if (RuntimeBundleLowerer::hasLazyPrimitiveF64Object(source)) {
+    if (inputIndex < functionType.getNumInputs() &&
+        functionType.getInput(inputIndex).isF64()) {
+      operands.push_back(source.primitiveF64->value);
+      ++inputIndex;
+      return mlir::success();
+    }
+    mlir::FailureOr<RuntimeValue> object =
+        RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+            op, source);
+    if (mlir::failed(object))
+      return mlir::failure();
+    RuntimeBundle boxed =
+        RuntimeBundle::object(source.objectValue.contract, object->values);
+    boxed.copyEvidenceFrom(source);
+    return RuntimeBundleLowerer::appendRuntimeSource(
+        op, symbol, functionType, inputIndex, boxed, operands);
+  }
   llvm::ArrayRef<mlir::Value> sourceValues = source.physicalValues();
   if (canAppendExactValues(functionType, inputIndex, sourceValues) &&
       !RuntimeBundleLowerer::usesInheritedObjectDunder(symbol, source)) {

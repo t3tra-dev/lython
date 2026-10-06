@@ -17304,6 +17304,16 @@ module attributes {
   // the slot holds no object -- else the object's address.
   // ⛔ Called only after the retain: before it, the drop could free an object
   // the frame still holds.
+  // The f64 a slot names, read through the view a slot read builds (see
+  // `LyFloat_FromSlotWord`) -- the lane of a read that makes no object.
+  func.func @LyFloat_ReadSlotF64(%slot_view: memref<3xi64>) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "read_slot_f64"} {
+    %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<3xi64> -> index
+    %address = arith.index_cast %word_idx : index to i64
+    %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
+    %value = func.call @LyFloat_SlotWordAsF64(%word) : (i64) -> f64
+    func.return %value : f64
+  }
+
   func.func @LyFloat_SlotWordTakingRef(%header: memref<3xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_taking_ref"} {
     %value_slot = arith.constant 2 : index
     %bits = memref.load %header[%value_slot] : memref<3xi64>
@@ -18352,6 +18362,14 @@ module attributes {
   func.func @LyFloat_TrueDiv(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__truediv__"} {
     %lhs = func.call @LyFloat_AsF64(%lhs_header) : (memref<3xi64>) -> f64
     %rhs = func.call @LyFloat_AsF64(%rhs_header) : (memref<3xi64>) -> f64
+    %value = func.call @LyFloat_DivF64(%lhs, %rhs) : (f64, f64) -> f64
+    %out_header = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
+    func.return %out_header : memref<3xi64>
+  }
+
+  // float_div on two doubles: the lane's `/`, which needs no object for
+  // either operand to raise.
+  func.func @LyFloat_DivF64(%lhs: f64, %rhs: f64) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "truediv.f64"} {
     // Not arith.divf alone: IEEE would yield inf/nan for a zero divisor,
     // where CPython float_div raises. Returning inf is the one outcome the
     // project forbids -- a wrong value with no diagnostic.
@@ -18365,8 +18383,7 @@ module attributes {
 
   ^divide:
     %value = arith.divf %lhs, %rhs : f64
-    %out_header = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
-    func.return %out_header : memref<3xi64>
+    func.return %value : f64
   }
 
   // C fmod, the only piece of CPython's float_divmod that arith/math cannot

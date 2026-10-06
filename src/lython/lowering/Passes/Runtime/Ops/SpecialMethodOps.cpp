@@ -2266,6 +2266,9 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
     if (mlir::failed(bindEvidenceObjectResult(op, op.getElement(),
                                               "runtime list element", element)))
       return mlir::failure();
+  } else if (RuntimeBundleLowerer::bindFloatSlotRead(op, op.getElement(),
+                                                     element)) {
+    // The last trip reads the dead stand-in above, whose value is never used.
   } else if (mlir::FailureOr<bool> deferred =
                  RuntimeBundleLowerer::bindDeferredIntRead(
                      op, op.getElement(), element);

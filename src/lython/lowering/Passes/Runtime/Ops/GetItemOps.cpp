@@ -816,9 +816,43 @@ mlir::FailureOr<bool> RuntimeBundleLowerer::bindDeferredIntRead(
   return true;
 }
 
+// ⭐ A FLOAT READ OUT OF A SLOT IS ITS LANE: the word decoded or loaded where
+// it is read (`LyFloat_ReadSlotF64`), and no reference taken -- the f64 is a
+// copy, and a reader that needs an object boxes it where it reads.
+// ⛔ Not in a generator's resume, whose frame carries no float lane.
+bool RuntimeBundleLowerer::bindFloatSlotRead(mlir::Operation *op,
+                                             mlir::Value resultValue,
+                                             const RuntimeValue &value) {
+  if (runtimeContractName(value.contract) != "builtins.float" ||
+      runtimeContractName(resultValue.getType()) != "builtins.float" ||
+      value.values.size() != 1 || !isSlotEntityView(value.values.front()))
+    return false;
+  auto function = op->getParentOfType<mlir::func::FuncOp>();
+  if (!function || function->hasAttr("ly.generator.resume"))
+    return false;
+  std::optional<RuntimeSymbol> read =
+      manifest.primitive("builtins.float", "read_slot_f64");
+  if (!read || read->function.getFunctionType().getInput(0) !=
+                   value.values.front().getType())
+    return false;
+  builder.setInsertionPoint(op);
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *read, mlir::ValueRange{value.values.front()});
+  RuntimeBundle lazy;
+  RuntimeBundleLowerer::makePrimitiveF64Bundle(
+      resultValue.getType(), call.getResult(0),
+      constantBool(builder, op->getLoc(), true), lazy);
+  valueBundles[resultValue] = std::move(lazy);
+  return true;
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::bindRetainedEvidenceValue(
     mlir::Operation *op, mlir::Value resultValue, llvm::StringRef label,
     const RuntimeValue &value, const RuntimeBundle *container) {
+  if (RuntimeBundleLowerer::bindFloatSlotRead(op, resultValue, value)) {
+    erase.push_back(op);
+    return mlir::success();
+  }
   mlir::FailureOr<bool> deferred =
       RuntimeBundleLowerer::bindDeferredIntRead(op, resultValue, value);
   if (mlir::failed(deferred))

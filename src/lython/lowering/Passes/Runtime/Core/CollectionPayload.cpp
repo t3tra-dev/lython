@@ -587,8 +587,10 @@ RuntimeBundleLowerer::objectPayloadClassEntity(mlir::Operation *op,
       }
     }
   if (concrete->payloadSlotWord)
-    return llvm::SmallVector<mlir::Value, 4>{constantI64(builder, loc, 1),
-                                             concrete->payloadSlotWord};
+    return llvm::SmallVector<mlir::Value, 4>{
+        constantI64(builder, loc,
+                    concrete->contractName() == "builtins.float" ? 2 : 1),
+        concrete->payloadSlotWord};
   if (concrete->physicalValues().empty())
     return op->emitError()
            << "collection payload element " << concrete->contract
@@ -698,6 +700,31 @@ RuntimeBundleLowerer::materializePayloadObjectBundle(
       RuntimeBundle word = *concrete;
       word.payloadSlotWord = call.getResult(0);
       return word;
+    }
+  // A float lane goes in the same way; one that is also kept as contents
+  // evidence becomes an object first, like a lazy int below.
+  if (RuntimeBundleLowerer::hasLazyPrimitiveF64Object(*concrete)) {
+    builder.setInsertionPoint(op);
+    if (slotWordOnly)
+      if (std::optional<RuntimeSymbol> slotWord =
+              manifest.primitive("builtins.float", "slot_word_from_f64")) {
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            op->getLoc(), *slotWord,
+            mlir::ValueRange{concrete->primitiveF64->value});
+        RuntimeBundle word = *concrete;
+        word.payloadSlotWord = call.getResult(0);
+        return word;
+      }
+    mlir::FailureOr<RuntimeValue> object =
+        RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+            op, *concrete);
+    if (mlir::failed(object))
+      return mlir::failure();
+    RuntimeBundle materialized =
+        RuntimeBundle::object(concrete->objectValue.contract, object->values);
+    materialized.copyEvidenceFrom(*concrete);
+    return RuntimeBundleLowerer::materializePayloadObjectBundle(
+        op, materialized, slotWordOnly);
     }
   if (slotWordOnly &&
       (concrete->contractName() == "builtins.int" ||

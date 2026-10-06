@@ -549,6 +549,36 @@ TEST(DriverTest, StringAndBytesLiteralsInALoopStayOutOfTheFrame) {
          "written for";
 }
 
+// What: in a function with no clone (it takes a list), a float read out of
+// the list, the arithmetic on it and the float the loop carries are f64
+// values: the body calls no float operator, reads no slot as an object, and
+// makes one float object -- the one it returns.
+TEST(DriverTest, AFloatLoopInAnOrdinaryFunctionMakesNoObjects) {
+  CompileResult result = compileSource(
+      "def sumsq(xs: list[float]) -> float:\n"
+      "    s = 0.0\n"
+      "    for x in xs:\n"
+      "        s += x * x - 0.5\n"
+      "    return s\n\n\n"
+      "print(sumsq([1.0, 2.0]))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *function =
+      result.verified.llvmModule->getFunction("sumsq");
+  ASSERT_NE(function, nullptr);
+  unsigned boxes = 0;
+  for (const llvm::BasicBlock &block : *function)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          llvm::StringRef name = callee->getName();
+          EXPECT_FALSE(name == "LyFloat_Add" || name == "LyFloat_Sub" ||
+                       name == "LyFloat_Mul" || name == "LyFloat_FromSlotWord")
+              << "sumsq calls " << name.str();
+          boxes += name == "LyFloat_FromF64";
+        }
+  EXPECT_EQ(boxes, 1u) << "sumsq should box only the float it returns";
+}
+
 // What: a function of float and int parameters gets an unboxed clone whose
 // body calls no runtime function -- its float arithmetic, comparisons and
 // loop-carried floats are f64 values -- and its call site calls that clone.
@@ -2809,8 +2839,9 @@ bool callsFunctionNamed(llvm::Module &module, llvm::StringRef callee) {
 } // namespace
 
 // What: an int or float a container or an instance field only stores goes
-// into its slot as the slot's own word -- an int known as an i64 through `slot_word_from_i64`
-// (no object made), an int or float object through `slot_word_taking_ref`
+// into its slot as the slot's own word -- an int known as an i64 through
+// `slot_word_from_i64` and a float lane through `slot_word_from_f64` (no
+// object made), an int or float object through `slot_word_taking_ref`
 // (the object dropped again when the value is immediate) -- and a read of
 // such a slot goes through `from_slot_word`, which turns an immediate back
 // into an object. A literal keeps storing objects: its elements are also the
@@ -2846,12 +2877,12 @@ TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
                     "for i in range(3):\n"
                     "    fs.append(i * 0.5)\n"
                     "print(fs[1])\n",
-                    "LyFloat_SlotWordTakingRef"));
+                    "LyFloat_SlotWordFromF64"));
   EXPECT_TRUE(calls("d: dict[int, float] = {}\n"
                     "for i in range(3):\n"
                     "    d[i * 1000] = i * 0.5\n"
                     "print(d[1000])\n",
-                    "LyFloat_SlotWordTakingRef"));
+                    "LyFloat_SlotWordFromF64"));
   EXPECT_FALSE(calls("xs = [1000, 2000]\nprint(xs[0])\n",
                      "LyLong_SlotWordTakingRef"));
   // An int read whose every use is arithmetic decodes the word and makes no

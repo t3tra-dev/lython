@@ -187,33 +187,58 @@ RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
                               mlir::ValueRange{call.getResult(0)});
 }
 
-// ⭐ ONE PLACE TURNS A LANE INTO AN OBJECT, at the value's definition, so the
-// object dominates every later use whichever op asked first. ⛔ Not at the op
-// that asked: a use in another branch would then name an object made in this
-// one. And not at each of the two dozen readers that already handle a lazy
-// int: each would have to learn the float spelling, and one that did not would
-// read an f64 as an i64.
-mlir::LogicalResult
-RuntimeBundleLowerer::materializeLazyFloatOperands(mlir::Operation *op) {
+// ⭐ ONE PLACE TURNS A LANE INTO AN OBJECT for every py op, and the object is
+// that op's alone: made just before it, and the value is a lane again for the
+// next reader. A float loop whose total is read as an object only after the
+// loop then boxes once, at the read.
+// ⛔ Not at the value's definition, which dominates every use: a loop-carried
+// float is defined at the loop header, so that boxed every trip for a read
+// made once. ⛔ And not kept as the value's object after the op: a later use
+// in another branch would name an object made in this one.
+// ⛔ Not at each of the two dozen readers that already handle a lazy int: each
+// would have to learn the float spelling, and one that did not would read an
+// f64 as an i64.
+// Float identity is not kept by this (two reads of one lane are two objects);
+// it was not before either -- a float list slot is a raw word, boxed per read.
+mlir::LogicalResult RuntimeBundleLowerer::materializeLazyFloatOperands(
+    mlir::Operation *op,
+    llvm::SmallVectorImpl<std::pair<mlir::Value, RuntimeBundle>> &lazy) {
   if (RuntimeBundleLowerer::readsFloatLanes(op))
     return mlir::success();
-  for (mlir::Value operand : op->getOperands()) {
+  // Operands first: lowering one may lower an op that reads the same lane, and
+  // it must see the lane, not a box made after it.
+  if (mlir::failed(RuntimeBundleLowerer::ensureOperationOperandBundles(op)))
+    return mlir::failure();
+  // A call reads its arguments through the pack that only feeds it, at the
+  // call: those are this op's reads too.
+  llvm::SmallVector<mlir::Value, 8> reads(op->getOperands().begin(),
+                                          op->getOperands().end());
+  for (mlir::Value operand : op->getOperands())
+    if (auto pack = operand.getDefiningOp<py::PackOp>())
+      if (packIsOnlyCallArguments(pack))
+        reads.append(pack.getOperands().begin(), pack.getOperands().end());
+  for (mlir::Value operand : reads) {
+    if (llvm::any_of(lazy, [&](const auto &entry) {
+          return entry.first == operand;
+        }))
+      continue;
     auto found = valueBundles.find(operand);
     if (found == valueBundles.end() ||
         !RuntimeBundleLowerer::hasLazyPrimitiveF64Object(found->second))
       continue;
-    RuntimeBundle lazy = found->second;
+    RuntimeBundle lane = found->second;
     mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointAfterValue(lazy.primitiveF64->value);
+    builder.setInsertionPoint(op);
     mlir::FailureOr<RuntimeValue> object =
         RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
-            op, lazy);
+            op, lane);
     if (mlir::failed(object))
       return mlir::failure();
     RuntimeBundle materialized =
-        RuntimeBundle::object(lazy.objectValue.contract, object->values);
-    materialized.copyEvidenceFrom(lazy);
+        RuntimeBundle::object(lane.objectValue.contract, object->values);
+    materialized.copyEvidenceFrom(lane);
     valueBundles[operand] = std::move(materialized);
+    lazy.emplace_back(operand, std::move(lane));
   }
   return mlir::success();
 }
@@ -329,6 +354,15 @@ RuntimeBundleLowerer::materializeObjectBundleForStorage(
   if (RuntimeBundleLowerer::hasLazyPrimitiveI64Object(result)) {
     mlir::FailureOr<RuntimeValue> materialized =
         RuntimeBundleLowerer::materializePrimitiveI64Object(op, result);
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    result.objectValue = *materialized;
+  }
+  if (RuntimeBundleLowerer::hasLazyPrimitiveF64Object(result)) {
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<RuntimeValue> materialized =
+        RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+            op, result);
     if (mlir::failed(materialized))
       return mlir::failure();
     result.objectValue = *materialized;
