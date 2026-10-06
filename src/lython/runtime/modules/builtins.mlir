@@ -21633,16 +21633,77 @@ module attributes {
   // and in-place instead of "consume the entity and hand back a new tuple"
   // (rfc/memory-safety-proof.md, `Interior`). The word offsets are mirrored in
   // Passes/Runtime/ABI/ContainerLayout.h.
-  func.func private @__ly_dict_alloc(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.dict"], ly.ownership.owned_results = [0]} {
+  // The words of a table block: the stamp, then `__ly_dict_table_slots` slots
+  // of `__ly_dict_index_width` bytes, rounded up to whole words.
+  func.func private @__ly_dict_table_words(%capacity: i64) -> i64 {
     %one = arith.constant 1 : i64
-    // PyDict_MINSIZE.
-    //
-    // ⛔ NOT the 64 this was. An entry is a 16-word box in BOTH the keys and
-    // the values array, so a minimum of 64 made every dict 8 KB + 8 KB + 512 B
-    // = 16.9 KB before its first key -- `{}` in a loop allocated and freed that
-    // per iteration, where CPython's new dict shares `empty_keys_struct` and
-    // takes nothing at all until the first insert.
-    %minimum_capacity = arith.constant 8 : i64
+    %two = arith.constant 2 : i64
+    %seven = arith.constant 7 : i64
+    %three = arith.constant 3 : i64
+    %width = func.call @__ly_dict_index_width(%capacity) : (i64) -> i64
+    %slots = func.call @__ly_dict_table_slots(%capacity) : (i64) -> i64
+    %bytes = arith.muli %slots, %width : i64
+    %padded = arith.addi %bytes, %seven : i64
+    %slot_words = arith.shrui %padded, %three : i64
+    %words = arith.addi %slot_words, %one : i64
+    func.return %words : i64
+  }
+
+  // The stamp every empty dict's table word points at: an empty dict owns no
+  // block until its first insert, as CPython's shares `empty_keys_struct`.
+  // ⛔ Not a constant: the lowering re-stores the stamp it read whenever it
+  // writes a dict's length (`invalidateMappingTableOnShrink`), and an empty
+  // dict's length cannot shrink, so what it stores here is always the 0 it read.
+  memref.global "private" @__ly_dict_empty_stamp : memref<1xi64> = dense<0> {alignment = 8 : i64}
+  // ...and its arrays: one empty slot and one absent hash, read-only. A reader
+  // that loads slot 0 before deciding a miss (the lowering's d.get) reads an
+  // empty slot rather than address 0; a writer grows the dict first, so
+  // nothing writes here -- and one that did would fault, not corrupt.
+  memref.global "private" constant @__ly_dict_empty_slot : memref<1xi64> = dense<0> {alignment = 8 : i64}
+  memref.global "private" constant @__ly_dict_empty_hash : memref<1xi64> = dense<-1> {alignment = 8 : i64}
+
+  func.func private @__ly_dict_alloc(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.dict"], ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %is_empty = arith.cmpi sle, %length, %zero : i64
+    %r = scf.if %is_empty -> memref<8xi64> {
+      %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
+      %one = arith.constant 1 : i64
+      %class_id = arith.constant 12 : i64
+      %stamp = memref.get_global @__ly_dict_empty_stamp : memref<1xi64>
+      %stamp_index = memref.extract_aligned_pointer_as_index %stamp : memref<1xi64> -> index
+      %stamp_word = arith.index_cast %stamp_index : index to i64
+      %empty_slot = memref.get_global @__ly_dict_empty_slot : memref<1xi64>
+      %empty_slot_index = memref.extract_aligned_pointer_as_index %empty_slot : memref<1xi64> -> index
+      %slot_word = arith.index_cast %empty_slot_index : index to i64
+      %empty_hash = memref.get_global @__ly_dict_empty_hash : memref<1xi64>
+      %empty_hash_index = memref.extract_aligned_pointer_as_index %empty_hash : memref<1xi64> -> index
+      %hash_word = arith.index_cast %empty_hash_index : index to i64
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c3 = arith.constant 3 : index
+      %c4 = arith.constant 4 : index
+      %c5 = arith.constant 5 : index
+      %c6 = arith.constant 6 : index
+      %c7 = arith.constant 7 : index
+      memref.store %one, %self[%c0] : memref<8xi64>
+      memref.store %class_id, %self[%c1] : memref<8xi64>
+      memref.store %zero, %self[%c2] : memref<8xi64>
+      memref.store %zero, %self[%c3] : memref<8xi64>
+      memref.store %slot_word, %self[%c4] : memref<8xi64>
+      memref.store %slot_word, %self[%c5] : memref<8xi64>
+      memref.store %hash_word, %self[%c6] : memref<8xi64>
+      memref.store %stamp_word, %self[%c7] : memref<8xi64>
+      scf.yield %self : memref<8xi64>
+    } else {
+      %self = func.call @__ly_dict_alloc_block(%length) : (i64) -> memref<8xi64>
+      scf.yield %self : memref<8xi64>
+    }
+    func.return %r : memref<8xi64>
+  }
+
+  func.func private @__ly_dict_alloc_block(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.dict"], ly.ownership.owned_results = [0]} {
+    %one = arith.constant 1 : i64
     %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 12 : i64
     %zero = arith.constant 0 : i64
@@ -21658,7 +21719,10 @@ module attributes {
     %reserved_slot = arith.constant 7 : index
 
     %self = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<8xi64>
-    %capacity = func.call @__ly_dict_round_capacity(%length) : (i64) -> i64
+    // A dict made at a known size (a literal, a copy) holds exactly that many
+    // entries; one that grows takes the floor (`__ly_dict_round_capacity`).
+    %one_entry = arith.constant 1 : i64
+    %capacity = arith.maxsi %length, %one_entry : i64
     // ⭐ ONE BLOCK FOR ALL FOUR ARRAYS. Keys, values, the present flags and the
     // index table are all sized from the capacity and all live and die
     // together, and they used to be four allocations -- five with the handle,
@@ -21689,8 +21753,7 @@ module attributes {
     %pair_words = arith.muli %payload_words, %two : i64
     %flag_words = arith.addi %capacity, %zero : i64
     %through_present = arith.addi %pair_words, %flag_words : i64
-    %table_words = arith.muli %capacity, %two : i64
-    %table_alloc_i64 = arith.addi %table_words, %one : i64
+    %table_alloc_i64 = func.call @__ly_dict_table_words(%capacity) : (i64) -> i64
     %block_words = arith.addi %through_present, %table_alloc_i64 : i64
     %block_words_index = arith.index_cast %block_words : i64 to index
     // Plain memref.alloc with no alignment attribute is a bare malloc, so the
@@ -22051,49 +22114,155 @@ module attributes {
   // d[k] was O(n) and building a dict was O(n^2) -- 32,000 keys took 1.21 s
   // against CPython 3.14's 18 ms.
   //
-  // The table lives in ONE allocation of 4*capacity + 1 words: word 0 is the
-  // length it was last built for, and the rest is 2*capacity slots of
-  // (state, hash) with state 0 for unused and dense+2 for a live entry.
+  // The table is the tail of the dict's one block: word 0 is the length it
+  // was last built for, then `__ly_dict_table_slots` slots of
+  // `__ly_dict_index_width` bytes, each 0 unused, 1 dummy or dense index + 2
+  // (the entry's hash is in the hashes array, not the slot).
   //
   // ⛔ Why the size is derived from `capacity` rather than carried: the handle
-  // has eight words and every one is spoken for (ABI/ContainerLayout.h), and a
-  // ninth is `builtins.list`'s width -- handle widths are contract identity
-  // here, so a dict cannot simply get wider. Tying the table to the entries
-  // array is what CPython does anyway (dk_size against USABLE_FRACTION), and
-  // holding capacity to a power of two makes the mask 2*capacity-1 with no
-  // word of its own and the load factor at most a half.
+  // has eight words and every one is spoken for (ABI/ContainerLayout.h).
+  // Tying the table to the entries array is what CPython does anyway
+  // (dk_size against USABLE_FRACTION).
   func.func private @__ly_dict_round_capacity(%wanted: i64) -> i64 {
-    %eight = arith.constant 8 : i64
-    %two = arith.constant 2 : i64
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c62 = arith.constant 62 : index
-    %rounded = scf.for %k = %c0 to %c62 step %c1 iter_args(%c = %eight) -> (i64) {
-      %enough = arith.cmpi sge, %c, %wanted : i64
-      %next = scf.if %enough -> (i64) {
-        scf.yield %c : i64
-      } else {
-        %doubled = arith.muli %c, %two : i64
-        scf.yield %doubled : i64
-      }
-      scf.yield %next : i64
-    }
-    func.return %rounded : i64
+    // Five entries over an eight-slot table: CPython's PyDict_MINSIZE table
+    // and its USABLE_FRACTION. The dense capacity is any count: the table is
+    // what has to be a power of two (`__ly_dict_table_slots`).
+    %minimum = arith.constant 5 : i64
+    %capacity = arith.maxsi %wanted, %minimum : i64
+    func.return %capacity : i64
   }
 
-  func.func private @__ly_dict_table(%self: memref<8xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.interior_word, ly.runtime.primitive = "table_view"} {
+  // ⭐ The table's slot count: the smallest power of two that keeps the dense
+  // array within two thirds of it -- CPython's USABLE_FRACTION -- so a
+  // 5-entry dict holds 5 dense entries over 8 slots instead of 8 over 16.
+  func.func private @__ly_dict_table_slots(%capacity: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %three = arith.constant 3 : i64
+    %eight = arith.constant 8 : i64
+    %bits = arith.constant 64 : i64
+    %tripled = arith.muli %capacity, %three : i64
+    %plus = arith.addi %tripled, %one : i64
+    %needed = arith.shrui %plus, %one : i64
+    // The next power of two at or above `needed`, by its leading zeros; the
+    // eight-slot floor makes `needed - 1` positive wherever it matters.
+    %below = arith.subi %needed, %one : i64
+    %zeros = math.ctlz %below : i64
+    %exponent = arith.subi %bits, %zeros : i64
+    %power = arith.shli %one, %exponent : i64
+    %slots = arith.maxsi %power, %eight : i64
+    func.return %slots : i64
+  }
+
+
+
+  // The table's slots as BYTES: `__ly_dict_table_slots` slots of
+  // `__ly_dict_index_width` bytes each, after the stamp word. Read and written through
+  // `__ly_dict_slot_load` / `__ly_dict_slot_store`.
+  func.func private @__ly_dict_table(%self: memref<8xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.interior_word, ly.runtime.primitive = "table_view"} {
     %capacity_slot = arith.constant 3 : index
     %table_slot = arith.constant 7 : index
+    %eight = arith.constant 8 : i64
+    %two = arith.constant 2 : i64
+    %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
+    %width = func.call @__ly_dict_index_width(%capacity) : (i64) -> i64
+    %slots = func.call @__ly_dict_table_slots(%capacity) : (i64) -> i64
+    %bytes = arith.muli %slots, %width : i64
+    %base = memref.load %self[%table_slot] : memref<8xi64>
+    %first = arith.addi %base, %eight : i64
+    %view = func.call @__ly_global_view_i8(%first, %bytes) : (i64, i64) -> memref<?xi8>
+    func.return %view : memref<?xi8>
+  }
+
+  // ⭐ CPython's dk_indices width: a slot holds a dense index + 2 (0 unused, 1
+  // dummy), so the narrowest integer that holds capacity + 1 is enough -- one
+  // byte up to 128 entries, where every slot used to be eight.
+  func.func private @__ly_dict_index_width(%capacity: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
     %four = arith.constant 4 : i64
     %eight = arith.constant 8 : i64
-    %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
-    %two = arith.constant 2 : i64
-    %words = arith.muli %capacity, %two : i64
-    %base = memref.load %self[%table_slot] : memref<8xi64>
-    %slots = arith.addi %base, %eight : i64
-    %view = func.call @__ly_global_view_i64(%slots, %words) : (i64, i64) -> memref<?xi64>
-    func.return %view : memref<?xi64>
+    %byte_limit = arith.constant 128 : i64
+    %short_limit = arith.constant 32766 : i64
+    %int_limit = arith.constant 2147483645 : i64
+    %fits1 = arith.cmpi sle, %capacity, %byte_limit : i64
+    %fits2 = arith.cmpi sle, %capacity, %short_limit : i64
+    %fits4 = arith.cmpi sle, %capacity, %int_limit : i64
+    %w4 = arith.select %fits4, %four, %eight : i64
+    %w2 = arith.select %fits2, %two, %w4 : i64
+    %w = arith.select %fits1, %one, %w2 : i64
+    func.return %w : i64
   }
+
+  func.func private @__ly_dict_slot_load(%table: memref<?xi8>, %width: i64, %i: i64) -> i64 {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %four = arith.constant 4 : i64
+    %c0 = arith.constant 0 : index
+    %offset = arith.muli %i, %width : i64
+    %at = arith.index_cast %offset : i64 to index
+    %is1 = arith.cmpi eq, %width, %one : i64
+    %v = scf.if %is1 -> (i64) {
+      %b = memref.load %table[%at] : memref<?xi8>
+      %z = arith.extui %b : i8 to i64
+      scf.yield %z : i64
+    } else {
+      %is2 = arith.cmpi eq, %width, %two : i64
+      %w = scf.if %is2 -> (i64) {
+        %view = memref.view %table[%at][] : memref<?xi8> to memref<1xi16>
+        %h = memref.load %view[%c0] : memref<1xi16>
+        %z = arith.extui %h : i16 to i64
+        scf.yield %z : i64
+      } else {
+        %is4 = arith.cmpi eq, %width, %four : i64
+        %x = scf.if %is4 -> (i64) {
+          %view = memref.view %table[%at][] : memref<?xi8> to memref<1xi32>
+          %h = memref.load %view[%c0] : memref<1xi32>
+          %z = arith.extui %h : i32 to i64
+          scf.yield %z : i64
+        } else {
+          %view = memref.view %table[%at][] : memref<?xi8> to memref<1xi64>
+          %h = memref.load %view[%c0] : memref<1xi64>
+          scf.yield %h : i64
+        }
+        scf.yield %x : i64
+      }
+      scf.yield %w : i64
+    }
+    func.return %v : i64
+  }
+
+  func.func private @__ly_dict_slot_store(%table: memref<?xi8>, %width: i64, %i: i64, %value: i64) {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %four = arith.constant 4 : i64
+    %c0 = arith.constant 0 : index
+    %offset = arith.muli %i, %width : i64
+    %at = arith.index_cast %offset : i64 to index
+    %is1 = arith.cmpi eq, %width, %one : i64
+    scf.if %is1 {
+      %b = arith.trunci %value : i64 to i8
+      memref.store %b, %table[%at] : memref<?xi8>
+    } else {
+      %is2 = arith.cmpi eq, %width, %two : i64
+      scf.if %is2 {
+        %view = memref.view %table[%at][] : memref<?xi8> to memref<1xi16>
+        %h = arith.trunci %value : i64 to i16
+        memref.store %h, %view[%c0] : memref<1xi16>
+      } else {
+        %is4 = arith.cmpi eq, %width, %four : i64
+        scf.if %is4 {
+          %view = memref.view %table[%at][] : memref<?xi8> to memref<1xi32>
+          %h = arith.trunci %value : i64 to i32
+          memref.store %h, %view[%c0] : memref<1xi32>
+        } else {
+          %view = memref.view %table[%at][] : memref<?xi8> to memref<1xi64>
+          memref.store %value, %view[%c0] : memref<1xi64>
+        }
+      }
+    }
+    func.return
+  }
+
 
   // Word 0 of the table block: the length the table was built for.
   func.func private @__ly_dict_table_stamp(%self: memref<8xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.dict", ly.runtime.interior_word, ly.runtime.primitive = "table_stamp_view"} {
@@ -22104,15 +22273,22 @@ module attributes {
     func.return %view : memref<?xi64>
   }
 
+  func.func private @__ly_dict_self_index_width(%self: memref<8xi64>) -> i64 {
+    %capacity_slot = arith.constant 3 : index
+    %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
+    %width = func.call @__ly_dict_index_width(%capacity) : (i64) -> i64
+    func.return %width : i64
+  }
+
   func.func private @__ly_dict_mask(%self: memref<8xi64>) -> i64 {
     %capacity_slot = arith.constant 3 : index
     %one = arith.constant 1 : i64
-    %two = arith.constant 2 : i64
     %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
-    %slots = arith.muli %capacity, %two : i64
+    %slots = func.call @__ly_dict_table_slots(%capacity) : (i64) -> i64
     %mask = arith.subi %slots, %one : i64
     func.return %mask : i64
   }
+
 
   // Zero the table and re-insert every present entry, then stamp the length it
   // now describes. O(capacity), paid where CPython pays dictresize.
@@ -22129,7 +22305,8 @@ module attributes {
     %c16 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
-    %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
+    %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi8>
+    %width = func.call @__ly_dict_self_index_width(%self) : (memref<8xi64>) -> i64
     %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
     %from_index = arith.index_cast %from : i64 to index
     %keys = func.call @__ly_dict_keys(%self) : (memref<8xi64>) -> memref<?xi64>
@@ -22155,10 +22332,9 @@ module attributes {
         } else {
           scf.yield %cached : i64
         }
-        %slot = func.call @__ly_dict_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
-        %state_index = arith.index_cast %slot : i64 to index
+        %slot = func.call @__ly_dict_clean_slot(%table, %width, %mask, %hash) : (memref<?xi8>, i64, i64, i64) -> i64
         %state = arith.addi %ii, %two : i64
-        memref.store %state, %table[%state_index] : memref<?xi64>
+        func.call @__ly_dict_slot_store(%table, %width, %slot, %state) : (memref<?xi8>, i64, i64, i64) -> ()
       }
     }
     %stamp = func.call @__ly_dict_table_stamp(%self) : (memref<8xi64>) -> memref<?xi64>
@@ -22233,12 +22409,11 @@ module attributes {
     %two = arith.constant 2 : i64
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
-    %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
-    %slots = arith.addi %mask, %one : i64
-    %words_index = arith.index_cast %slots : i64 to index
-    scf.for %w = %c0 to %words_index step %c1 {
-      memref.store %zero, %table[%w] : memref<?xi64>
+    %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi8>
+    %bytes = memref.dim %table, %c0 : memref<?xi8>
+    %zero_byte = arith.constant 0 : i8
+    scf.for %b = %c0 to %bytes step %c1 {
+      memref.store %zero_byte, %table[%b] : memref<?xi8>
     }
     func.call @__ly_dict_table_fill(%self, %zero) : (memref<8xi64>, i64) -> ()
     func.return
@@ -22596,10 +22771,6 @@ module attributes {
   // five-lane spelling had to declare transfer_args = [0] + owned_results = [0]
   // because the array VALUES were the entity's identity.
   func.func @LyDict_EnsureCapacity(%self: memref<8xi64> {ly.ownership.object_header}, %required: i64) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "ensure_capacity"} {
-    // PyDict_MINSIZE, the same floor `__ly_dict_alloc` starts from; the growth
-    // above it doubles, so the floor only costs a dict that outgrows it three
-    // extra copies (8, 16, 32) and saves 14.8 KB on every one that does not.
-    %minimum_capacity = arith.constant 8 : i64
     %handle_words = func.call @__ly_box_word_count() : () -> i64
     %two = arith.constant 2 : i64
     %zero = arith.constant 0 : i64
@@ -22619,17 +22790,23 @@ module attributes {
       %old_keys_word = memref.load %self[%keys_slot] : memref<8xi64>
       %old_values_word = memref.load %self[%values_slot] : memref<8xi64>
       %old_present_word = memref.load %self[%present_slot] : memref<8xi64>
-      // ⭐ CPython's GROWTH_RATE, which is `used * 3` rather than a doubling of
-      // the CAPACITY. Doubling the capacity grows a dict being built one power
-      // of two at a time -- 8, 16, 32 for twenty entries -- and each step
-      // copies every entry and rebuilds the table. Sizing from what is being
-      // ASKED FOR reaches the same 32 in one step.
-      %growth_rate = arith.constant 3 : i64
-      %tripled = arith.muli %required, %growth_rate : i64
+      // ⭐ Half again what is asked for, and at least double: CPython's
+      // GROWTH_RATE (`used * 3`) sizes its TABLE, whose usable two thirds is
+      // twice the entries, and this table is already twice the dense array --
+      // so the dense headroom that matches is under 2x, not 3x. Three times
+      // the entries took a 5-entry dict to 16 dense slots (517 B where CPython
+      // spends 235). The doubling floor keeps an append amortised O(1).
+      %one_g0 = arith.constant 1 : i64
+      %half = arith.shrui %required, %one_g0 : i64
+      %grown_wanted = arith.addi %required, %half : i64
       %doubled = arith.muli %capacity, %two : i64
-      %below_required = arith.cmpi slt, %tripled, %doubled : i64
-      %wanted = arith.select %below_required, %doubled, %tripled : i1, i64
-      %new_capacity = func.call @__ly_dict_round_capacity(%wanted) : (i64) -> i64
+      %below_required = arith.cmpi slt, %grown_wanted, %doubled : i64
+      %wanted = arith.select %below_required, %doubled, %grown_wanted : i1, i64
+      %rounded = func.call @__ly_dict_round_capacity(%wanted) : (i64) -> i64
+      // A dict's FIRST block is exactly what is asked for: a literal reserves
+      // its size before it inserts, and `{k: v}` is then one entry, not five.
+      %first_block = arith.cmpi eq, %capacity, %zero : i64
+      %new_capacity = arith.select %first_block, %required, %rounded : i1, i64
       %old_words = arith.muli %capacity, %handle_words : i64
       %new_words = arith.muli %new_capacity, %handle_words : i64
       %old_words_index = arith.index_cast %old_words : i64 to index
@@ -22643,9 +22820,7 @@ module attributes {
       %new_pair_words = arith.muli %new_words, %two : i64
       %new_flag_words = arith.addi %new_capacity, %zero : i64
       %new_through_present = arith.addi %new_pair_words, %new_flag_words : i64
-      %two_t = arith.constant 2 : i64
-      %new_table_words_g = arith.muli %new_capacity, %two_t : i64
-      %new_table_alloc_g = arith.addi %new_table_words_g, %one_g : i64
+      %new_table_alloc_g = func.call @__ly_dict_table_words(%new_capacity) : (i64) -> i64
       %new_block_words = arith.addi %new_through_present, %new_table_alloc_g : i64
       %new_block_words_index = arith.index_cast %new_block_words : i64 to index
       %new_block = memref.alloc(%new_block_words_index) : memref<?xi64>
@@ -22695,8 +22870,12 @@ module attributes {
       memref.store %new_present_base, %self[%present_slot] : memref<8xi64>
       memref.store %new_table_base, %self[%table_slot] : memref<8xi64>
       func.call @__ly_dict_table_rebuild(%self) : (memref<8xi64>) -> ()
-      // Keys sit at offset zero of the block, so this frees all four arrays.
-      func.call @free_raw_i64_ptr(%old_keys_word) : (i64) -> ()
+      // Keys sit at offset zero of the block, so this frees all four arrays
+      // -- of a dict that had a block: an empty one's arrays are shared.
+      %had_block = arith.cmpi sgt, %capacity, %zero : i64
+      scf.if %had_block {
+        func.call @free_raw_i64_ptr(%old_keys_word) : (i64) -> ()
+      }
     }
     func.return
   }
@@ -22711,15 +22890,32 @@ module attributes {
   // The dense index of the entry whose key equals %key_box, or -1. One table
   // lookup, where this used to be a walk of every live entry.
   func.func private @__ly_dict_probe(%self: memref<8xi64>, %key_box: !llvm.ptr, %key_hash: i64) -> i64 {
+    // An empty dict has no table to walk (`__ly_dict_alloc` gives it none).
+    %capacity_slot = arith.constant 3 : index
+    %capacity = memref.load %self[%capacity_slot] : memref<8xi64>
+    %zero = arith.constant 0 : i64
+    %has_table = arith.cmpi sgt, %capacity, %zero : i64
+    %result = scf.if %has_table -> (i64) {
+      %found = func.call @__ly_dict_probe_table(%self, %key_box, %key_hash) : (memref<8xi64>, !llvm.ptr, i64) -> i64
+      scf.yield %found : i64
+    } else {
+      %missing = arith.constant -1 : i64
+      scf.yield %missing : i64
+    }
+    func.return %result : i64
+  }
+
+  func.func private @__ly_dict_probe_table(%self: memref<8xi64>, %key_box: !llvm.ptr, %key_hash: i64) -> i64 {
     func.call @__ly_dict_table_sync(%self) : (memref<8xi64>) -> ()
     %keys = func.call @__ly_dict_keys(%self) : (memref<8xi64>) -> memref<?xi64>
     %keys_idx = memref.extract_aligned_pointer_as_index %keys : memref<?xi64> -> index
     %keys_i64 = arith.index_cast %keys_idx : index to i64
     %keys_ptr = llvm.inttoptr %keys_i64 : i64 to !llvm.ptr
-    %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
+    %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi8>
+    %width = func.call @__ly_dict_self_index_width(%self) : (memref<8xi64>) -> i64
     %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
     %hashes = func.call @__ly_dict_hashes(%self) : (memref<8xi64>) -> memref<?xi64>
-    %found = func.call @__ly_dict_lookup(%table, %mask, %keys_ptr, %hashes, %key_box, %key_hash) : (memref<?xi64>, i64, !llvm.ptr, memref<?xi64>, !llvm.ptr, i64) -> i64
+    %found = func.call @__ly_dict_lookup(%table, %width, %mask, %keys_ptr, %hashes, %key_box, %key_hash) : (memref<?xi8>, i64, i64, !llvm.ptr, memref<?xi64>, !llvm.ptr, i64) -> i64
     func.return %found : i64
   }
 
@@ -22945,12 +23141,12 @@ module attributes {
       // the stamp: a rebuild per insert would put the quadratic straight back.
       // The key is known absent here, so the slot is a clean one.
       %two_i64 = arith.constant 2 : i64
-      %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi64>
+      %table = func.call @__ly_dict_table(%self) : (memref<8xi64>) -> memref<?xi8>
+      %width = func.call @__ly_dict_self_index_width(%self) : (memref<8xi64>) -> i64
       %mask = func.call @__ly_dict_mask(%self) : (memref<8xi64>) -> i64
-      %tslot = func.call @__ly_dict_clean_slot(%table, %mask, %hash) : (memref<?xi64>, i64, i64) -> i64
-      %state_index = arith.index_cast %tslot : i64 to index
+      %tslot = func.call @__ly_dict_clean_slot(%table, %width, %mask, %hash) : (memref<?xi8>, i64, i64, i64) -> i64
       %state = arith.addi %len, %two_i64 : i64
-      memref.store %state, %table[%state_index] : memref<?xi64>
+      func.call @__ly_dict_slot_store(%table, %width, %tslot, %state) : (memref<?xi8>, i64, i64, i64) -> ()
       %stamp = func.call @__ly_dict_table_stamp(%self) : (memref<8xi64>) -> memref<?xi64>
       memref.store %required, %stamp[%c0] : memref<?xi64>
     } else {
@@ -23812,9 +24008,13 @@ module attributes {
         func.call @LyObject_ReleaseBoxedPayloadArraySlotRaw(%values, %logical_index) : (memref<?xi64>, i64) -> ()
       }
     }
-    // Keys sit at offset zero of the one block the four arrays share.
+    // Keys sit at offset zero of the one block the four arrays share; an
+    // empty dict has none of its own.
     %keys_word = memref.load %self[%keys_slot] : memref<8xi64>
-    func.call @free_raw_i64_ptr(%keys_word) : (i64) -> ()
+    %had_block = arith.cmpi sgt, %capacity, %zero : i64
+    scf.if %had_block {
+      func.call @free_raw_i64_ptr(%keys_word) : (i64) -> ()
+    }
     memref.dealloc %self : memref<8xi64>
     cf.br ^done
 
@@ -24005,7 +24205,7 @@ module attributes {
   // sequence is `__ly_table_lookup`'s, which the set keeps with the hash
   // beside each state; ⛔ the dict does not, because its hashes array already
   // holds them and a second copy was 16 bytes per slot of table.
-  func.func private @__ly_dict_lookup(%table: memref<?xi64>, %mask: i64, %items_ptr: !llvm.ptr, %hashes: memref<?xi64>, %elem_box: !llvm.ptr, %hash: i64) -> i64 {
+  func.func private @__ly_dict_lookup(%table: memref<?xi8>, %width: i64, %mask: i64, %items_ptr: !llvm.ptr, %hashes: memref<?xi64>, %elem_box: !llvm.ptr, %hash: i64) -> i64 {
     %minus_one = arith.constant -1 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -24037,8 +24237,7 @@ module attributes {
         } else {
           %kk = arith.index_cast %k : index to i64
           %s = arith.addi %i, %kk : i64
-          %state_index = arith.index_cast %s : i64 to index
-          %state = memref.load %table[%state_index] : memref<?xi64>
+          %state = func.call @__ly_dict_slot_load(%table, %width, %s) : (memref<?xi8>, i64, i64) -> i64
           %unused = arith.cmpi eq, %state, %zero : i64
           %seen:2 = scf.if %unused -> (i64, i1) {
             scf.yield %minus_one, %true : i64, i1
@@ -24078,7 +24277,7 @@ module attributes {
     }
     func.return %walk#2 : i64
   }
-  func.func private @__ly_dict_clean_slot(%table: memref<?xi64>, %mask: i64, %hash: i64) -> i64 {
+  func.func private @__ly_dict_clean_slot(%table: memref<?xi8>, %width: i64, %mask: i64, %hash: i64) -> i64 {
     %minus_one = arith.constant -1 : i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -24109,8 +24308,7 @@ module attributes {
         } else {
           %kk = arith.index_cast %k : index to i64
           %s = arith.addi %i, %kk : i64
-          %state_index = arith.index_cast %s : i64 to index
-          %state = memref.load %table[%state_index] : memref<?xi64>
+          %state = func.call @__ly_dict_slot_load(%table, %width, %s) : (memref<?xi8>, i64, i64) -> i64
           %unused = arith.cmpi eq, %state, %zero : i64
           %pick = arith.select %unused, %s, %a : i1, i64
           scf.yield %pick, %unused : i64, i1

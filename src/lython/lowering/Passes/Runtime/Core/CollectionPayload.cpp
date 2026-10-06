@@ -781,8 +781,15 @@ mlir::LogicalResult RuntimeBundleLowerer::ensurePayloadCapacity(
   updated.copyEvidenceFrom(container);
   // An unknown old capacity is taken as 0: the growth then depends only on
   // what is required, which is the figure the runtime also computes from it.
+  // ⛔ EXCEPT A DICT'S, which grows by its own rule (LyDict_EnsureCapacity):
+  // the list formula over-promised it -- 8 after asking for 3, where the dict
+  // may hold 4 -- and a store the promise let skip its growth would run off
+  // the array. What was asked for is a floor the runtime always meets.
   updated.*capacity =
-      growCapacity(container.*capacity, static_cast<std::uint64_t>(index) + 1);
+      contractName == "builtins.dict"
+          ? static_cast<std::uint64_t>(index) + 1
+          : growCapacity(container.*capacity,
+                         static_cast<std::uint64_t>(index) + 1);
   container = std::move(updated);
   return mlir::success();
 }
