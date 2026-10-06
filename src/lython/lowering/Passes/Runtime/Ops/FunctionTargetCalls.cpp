@@ -339,12 +339,29 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
         continue;
       }
       if (lane && !lane->isInt && !lane->isControl() && !lane->isNone) {
-        if (!source || source->physicalValues().size() != lane->physicalCount)
+        // An int known only as its word (or a deferred one) persists as an
+        // object made of it.
+        const RuntimeBundle *persisted = source.get();
+        std::optional<RuntimeBundle> materialized;
+        if (persisted && persisted->physicalValues().empty() &&
+            RuntimeBundleLowerer::hasLazyPrimitiveI64Object(*persisted)) {
+          mlir::FailureOr<RuntimeValue> object =
+              RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
+                  op, *persisted);
+          if (mlir::failed(object))
+            return mlir::failure();
+          materialized = RuntimeBundle::object(
+              persisted->objectValue.contract, object->values);
+          materialized->copyEvidenceFrom(*persisted);
+          persisted = &*materialized;
+        }
+        if (!persisted ||
+            persisted->physicalValues().size() != lane->physicalCount)
           return op->emitError()
                  << "generator argument " << index << " (" << lane->contract
                  << ") has no matching physical span to persist";
         if (mlir::failed(RuntimeBundleLowerer::retainAggregateSlot(
-                op, *source, "generator argument")))
+                op, *persisted, "generator argument")))
           return mlir::failure();
         // Retaining store, not the frame-lane transferring one: the retain
         // above is this slot's reference, and the creation site's own handle
@@ -361,8 +378,8 @@ mlir::LogicalResult RuntimeBundleLowerer::emitGeneratorFunctionTargetCallResult(
             storage,
             mlir::arith::ConstantIntOp::create(builder, loc, base, 64)
                 .getResult()};
-        storeOperands.append(source->physicalValues().begin(),
-                             source->physicalValues().end());
+        storeOperands.append(persisted->physicalValues().begin(),
+                             persisted->physicalValues().end());
         mlir::func::CallOp::create(builder, loc, *store, storeOperands);
         continue;
       }

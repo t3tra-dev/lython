@@ -398,37 +398,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   // `s.area()` reaches a dispatcher whose Sq arm returns a boxed int with no
   // word, so the comparison's operands are not valid, the parked "cannot say"
   // is AND-ed into the answer, and the resume BRANCHES on the false it
-  // produced. Nothing re-ran anything. So a comparison whose validity is not
-  // pinned takes the guarded path in a resume, and the word fast path stays
-  // for the case it was written for.
+  // produced. Nothing re-ran anything.
+  // ⭐ SO A RESUME LOWERS ITS INTS AS AN ORDINARY FUNCTION DOES: as deferred
+  // ints, whose slow arm answers on the objects -- a comparison without a
+  // word, and an operator that leaves the word. ⛔ Not the clone's lane for
+  // the operators that keep a word either: their overflow is "cannot say"
+  // too, and the only answer a resume could give for it was a refusal -- a
+  // Fibonacci generator raised "int too large to convert" at its 93rd term.
   bool cloneCanFallBack =
       enclosingClone && !enclosingClone->hasAttr("ly.generator.resume");
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(enclosingClone) &&
-      (cloneCanFallBack || !compare || isPinnedTrueFlag(operandsValid))) {
-    // ⛔ The same holds for an operator that RAISES: a resume's "cannot say"
-    // reached `next` as an invalid word, and `7 // 0` in a generator raised
-    // "int too large to convert" instead of ZeroDivisionError. The raise is
-    // decided on the operand's i64 here, before the word is used.
-    if (!cloneCanFallBack && arithmetic) {
-      llvm::StringRef check =
-          *arithmetic == PrimitiveI64ArithmeticKind::FloorDiv ||
-                  *arithmetic == PrimitiveI64ArithmeticKind::Mod
-              ? "check_divisor.i64"
-          : *arithmetic == PrimitiveI64ArithmeticKind::LShift ||
-                  *arithmetic == PrimitiveI64ArithmeticKind::RShift
-              ? "check_shift.i64"
-              : "";
-      if (!check.empty()) {
-        std::optional<RuntimeSymbol> checker =
-            manifest.primitive("builtins.int", check);
-        if (!checker)
-          return op->emitError() << "runtime manifest has no int " << check;
-        RuntimeBundleLowerer::createRuntimeCall(
-            loc, *checker,
-            mlir::ValueRange{sources[1]->primitiveI64->value,
-                             sources[1]->primitiveI64->valid});
-      }
-    }
+      cloneCanFallBack) {
     if (unary || arithmetic) {
       mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
           unary ? RuntimeBundleLowerer::emitPrimitiveI64UnaryEvidence(

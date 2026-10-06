@@ -291,13 +291,16 @@ bool RuntimeBundleLowerer::hasPrecedingSiblingInFlight(
 // accumulator then makes no object per trip; a reader that needs one makes it
 // (`materialize_read`), and the held object is the reference the edge moves,
 // as the int object was.
-// ⛔ Not inside a clone: there the lane is the whole value (the pair below),
-// and the clone answers "cannot say" instead of holding an object.
+// ⛔ Not inside a clone that can fall back: there the lane is the whole value
+// (the pair below), and the clone answers "cannot say" instead of holding an
+// object. A generator resume has nothing to fall back to, so it merges as an
+// ordinary function does.
 static bool isDeferredIntMerge(mlir::BlockArgument argument) {
   auto function = mlir::dyn_cast_if_present<mlir::func::FuncOp>(
       argument.getOwner()->getParentOp());
   return function &&
-         !function->hasAttr(kPrimitiveI64CloneAttr) &&
+         (!function->hasAttr(kPrimitiveI64CloneAttr) ||
+          function->hasAttr("ly.generator.resume")) &&
          runtimeContractName(argument.getType()) == "builtins.int";
 }
 
