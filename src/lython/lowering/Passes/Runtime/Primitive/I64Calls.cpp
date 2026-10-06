@@ -610,6 +610,11 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
 mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
     mlir::Operation *op, mlir::Value lhs, mlir::Value rhs,
     llvm::StringRef methodName, mlir::Value resultValue) {
+  // A reflected method's receiver is the RIGHT operand -- the operands stay in
+  // source order (`1.0 + z` is `z.__radd__(1.0)`), as the evidence verifier
+  // reads them (`receiverTypeFor`).
+  if (py::contracts::isReflectedBinaryMethodName(methodName))
+    std::swap(lhs, rhs);
   llvm::SmallVector<mlir::Value, 2> inputs{lhs, rhs};
   llvm::SmallVector<const RuntimeBundle *, 2> sources;
   if (mlir::failed(collectObjectSources(

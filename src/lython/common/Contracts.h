@@ -119,4 +119,19 @@ inline std::string displayClassNameForContract(llvm::StringRef name) {
 
 std::string runtimeContractName(mlir::Type type);
 
+// The reflected binary special methods: the receiver is the RIGHT operand.
+// ⛔ Not "starts with `__r`": `__rshift__` is the forward right shift, and
+// `__repr__` / `__round__` are not binary at all.
+inline bool isReflectedBinaryMethodName(llvm::StringRef name) {
+  return llvm::is_contained(
+      {llvm::StringRef("__radd__"), llvm::StringRef("__rsub__"),
+       llvm::StringRef("__rmul__"), llvm::StringRef("__rmatmul__"),
+       llvm::StringRef("__rtruediv__"), llvm::StringRef("__rfloordiv__"),
+       llvm::StringRef("__rmod__"), llvm::StringRef("__rdivmod__"),
+       llvm::StringRef("__rpow__"), llvm::StringRef("__rlshift__"),
+       llvm::StringRef("__rrshift__"), llvm::StringRef("__rand__"),
+       llvm::StringRef("__ror__"), llvm::StringRef("__rxor__")},
+      name);
+}
+
 } // namespace py::contracts
