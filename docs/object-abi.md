@@ -158,8 +158,23 @@ P6 は当初「幅による解放関数の区別 (`HandleWidthRegistry`) を cla
   かった。
 
 幅を予約していた `HandleWidthRegistry.h` と、その検査 `abi.handle_width_reservations`
-は削除した。ハンドル型の幅は、名前で引く前の割り当てのまま残っている。使う
-ワードまで縮めるのは別の作業で、型の上の詰め物はメモリを消費していない。
+は削除した。
+
+その後、ハンドル型の幅も使うワードまで縮めた。list 9→5、tuple 14→5、set 11→9、
+frozenset 13→9、bytes 6→4、complex 7→4、`_js.JsProxy` 17→3。確保量が変わったの
+は bytes (先頭 48→32 B) と complex (56→32 B) で、`complex` 100 万個は 71→41 MB
+(CPython 38 MB)。他は以前から使うワードだけを確保していた。
+
+幅が揃ったことで、型の一致を表現の一致とみなしていた判定が表に出た:
+
+- container の判別 (`containerIsHandleFronted`) は「幅 8 以上」だったのを
+  contract 名にした。
+- `object` への upcast が、物理型の先頭一致で値をそのまま box として流していた。
+  list の handle は box と同じ memref<5xi64> なので、グローバルに list の handle
+  が入り、repr hook がその長さを entity として読んで落ちた。source class の
+  インスタンスは以前から幅 5 で、`g: object = A(7); print(g)` と `object` を返す
+  関数の戻り値は main でも SIGSEGV だった。upcast 先が `object` で元が別の class
+  なら、型が一致しても alias にしない (box は消費側が作る)。
 
 即値を読むたびにオブジェクトを作るので、`d[k]` の読み出しが多いループは P1α と
 同程度にとどまる (読み出しで evidence に直接載せるのは P2 の f64 / i64 evidence

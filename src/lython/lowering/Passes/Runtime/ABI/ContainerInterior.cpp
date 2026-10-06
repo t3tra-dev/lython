@@ -11,17 +11,15 @@
 namespace py::lowering {
 namespace {
 
-// A container handle is a rank-1 i64 memref wide enough for the layout in
-// ContainerLayout.h. Checked rather than assumed: `builtins.object` handles
-// and boxed slots are also rank-1 i64 memrefs, and width is not a proof of
-// kind (rfc/memory-safety-proof.md, `Provenance`) -- this only rules out
-// reading past the end of something that is not a container handle at all.
-bool isContainerHandleType(mlir::Type type) {
-  if (!ownership::isRankOneI64MemRef(type))
-    return false;
-  auto memref = mlir::cast<mlir::MemRefType>(type);
-  return memref.hasStaticShape() &&
-         memref.getDimSize(0) >= container_abi::kHandleWordCount;
+// The contracts whose one lane is a handle with the layout in
+// ContainerLayout.h. ⛔ Not "a rank-1 i64 memref at least as wide as the
+// layout": a handle is as wide as the words it uses, so a list's is the same
+// type as an `object` box's or a range's, and width is not a proof of kind
+// (rfc/memory-safety-proof.md, `Provenance`).
+bool isHandleFrontedContainer(llvm::StringRef contract) {
+  return contract == "builtins.list" || contract == "builtins.tuple" ||
+         contract == "builtins.dict" || contract == "builtins.set" ||
+         contract == "builtins.frozenset";
 }
 
 } // namespace
@@ -29,7 +27,9 @@ bool isContainerHandleType(mlir::Type type) {
 bool RuntimeBundleLowerer::containerIsHandleFronted(
     const RuntimeBundle &container) const {
   llvm::ArrayRef<mlir::Value> values = container.physicalValues();
-  return values.size() == 1 && isContainerHandleType(values.front().getType());
+  return values.size() == 1 &&
+         ownership::isRankOneI64MemRef(values.front().getType()) &&
+         isHandleFrontedContainer(container.contractName());
 }
 
 // True when `container` carries a runtime payload the lowering can read or

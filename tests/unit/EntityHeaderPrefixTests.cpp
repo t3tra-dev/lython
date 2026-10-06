@@ -14,9 +14,9 @@
 // (a one-lane container handle merged across two groups) only aborts when a loop
 // COMPLETES, and no golden covering it existed when this was written.
 //
-// The width columns are deliberate: 9 is `builtins.list` and 16 is both
-// `builtins.object` AND the transient payload box,
-// so the tests state that the answer does NOT come from the width.
+// The width columns are deliberate: 5 is `builtins.list` AND `builtins.object`
+// and 16 is the transient payload box, so the tests state that the answer
+// does NOT come from the width.
 
 #include "Runtime/ABI/EntityHeaderPrefix.h"
 
@@ -167,11 +167,11 @@ TEST(EntityHeaderPrefixTest, ABlockArgumentIsInitialized) {
 
 TEST(EntityHeaderPrefixTest, ACallResultIsInitialized) {
   HandleFixture fixture;
-  // memref<9xi64> is `builtins.list`: the header the shipped over-release needed
-  // and did not get, because it arrives as a call result rather than a block
-  // argument (rfc/stdlib-semantics.md, family D).
+  // memref<5xi64> is `builtins.list`'s handle: the header the shipped
+  // over-release needed and did not get, because it arrives as a call result
+  // rather than a block argument (rfc/stdlib-semantics.md, family D).
   EXPECT_TRUE(
-      entity_header::prefixIsInitializedAtDefinition(fixture.callResult(9)));
+      entity_header::prefixIsInitializedAtDefinition(fixture.callResult(5)));
 }
 
 TEST(EntityHeaderPrefixTest, RawStorageIsNotInitialized) {

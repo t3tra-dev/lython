@@ -120,38 +120,38 @@ module attributes {
   // Words: refcount, class id, handle. The width is the one it was given when
   // a release was chosen by shape; it is now chosen by contract name, so the
   // width no longer has to be this contract's alone.
-  func.func @LyJsProxy_New(%handle: i32) -> memref<17xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 151 : i64, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
+  func.func @LyJsProxy_New(%handle: i32) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 151 : i64, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %class_id = arith.constant 151 : i64
     %refcount_slot = arith.constant 0 : index
     %layout_slot = arith.constant 1 : index
     %handle_slot = arith.constant 2 : index
-    %proxy = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<17xi64>
-    memref.store %one, %proxy[%refcount_slot] : memref<17xi64>
-    memref.store %class_id, %proxy[%layout_slot] : memref<17xi64>
+    %proxy = memref.alloc() {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<3xi64>
+    memref.store %one, %proxy[%refcount_slot] : memref<3xi64>
+    memref.store %class_id, %proxy[%layout_slot] : memref<3xi64>
     %word = arith.extui %handle : i32 to i64
-    memref.store %word, %proxy[%handle_slot] : memref<17xi64>
-    func.return %proxy : memref<17xi64>
+    memref.store %word, %proxy[%handle_slot] : memref<3xi64>
+    func.return %proxy : memref<3xi64>
   }
 
-  func.func @LyJsProxy_DecRef(%proxy: memref<17xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_js.JsProxy", ly.runtime.deallocator} {
-    %storage = memref.cast %proxy : memref<17xi64> to memref<?xi64>
+  func.func @LyJsProxy_DecRef(%proxy: memref<3xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "_js.JsProxy", ly.runtime.deallocator} {
+    %storage = memref.cast %proxy : memref<3xi64> to memref<?xi64>
     %became_zero = func.call @LyObject_ReleaseStorageToZero(%storage) : (memref<?xi64>) -> i1
     cf.cond_br %became_zero, ^dealloc, ^done
 
   ^dealloc:
-    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     func.call @LyJs_Drop(%handle) : (i32) -> ()
-    memref.dealloc %proxy : memref<17xi64>
+    memref.dealloc %proxy : memref<3xi64>
     cf.br ^done
 
   ^done:
     func.return
   }
 
-  func.func @LyJsProxy_Handle(%proxy: memref<17xi64> {ly.ownership.object_header}) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "handle"} {
+  func.func @LyJsProxy_Handle(%proxy: memref<3xi64> {ly.ownership.object_header}) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "handle"} {
     %handle_slot = arith.constant 2 : index
-    %word = memref.load %proxy[%handle_slot] : memref<17xi64>
+    %word = memref.load %proxy[%handle_slot] : memref<3xi64>
     %handle = arith.trunci %word : i64 to i32
     func.return %handle : i32
   }
@@ -212,8 +212,8 @@ module attributes {
     func.return %handle : i32
   }
 
-  func.func @LyJsProxy_Get(%proxy: memref<17xi64> {ly.ownership.object_header}, %name: memref<?xi8>, %length: i64) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "get"} {
-    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_Get(%proxy: memref<3xi64> {ly.ownership.object_header}, %name: memref<?xi8>, %length: i64) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "get"} {
+    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     %address = func.call @__ly_js_address(%name) : (memref<?xi8>) -> index
     %count = arith.index_cast %length : i64 to index
     %raw = func.call @LyJs_Get(%object, %address, %count) : (i32, index, index) -> i32
@@ -222,8 +222,8 @@ module attributes {
   }
 
   // Sets the member to the one value pushed before it.
-  func.func @LyJsProxy_Set(%proxy: memref<17xi64> {ly.ownership.object_header}, %name: memref<?xi8>, %length: i64) attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "set"} {
-    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_Set(%proxy: memref<3xi64> {ly.ownership.object_header}, %name: memref<?xi8>, %length: i64) attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "set"} {
+    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     %address = func.call @__ly_js_address(%name) : (memref<?xi8>) -> index
     %count = arith.index_cast %length : i64 to index
     %raw = func.call @LyJs_Set(%object, %address, %count) : (i32, index, index) -> i32
@@ -232,8 +232,8 @@ module attributes {
   }
 
   // Calls the member with every value pushed since the last call.
-  func.func @LyJsProxy_CallMethod(%proxy: memref<17xi64> {ly.ownership.object_header}, %name: memref<?xi8>, %length: i64) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "call_method"} {
-    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_CallMethod(%proxy: memref<3xi64> {ly.ownership.object_header}, %name: memref<?xi8>, %length: i64) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "call_method"} {
+    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     %address = func.call @__ly_js_address(%name) : (memref<?xi8>) -> index
     %count = arith.index_cast %length : i64 to index
     %raw = func.call @LyJs_CallMethod(%object, %address, %count) : (i32, index, index) -> i32
@@ -241,8 +241,8 @@ module attributes {
     func.return %handle : i32
   }
 
-  func.func @LyJsProxy_Construct(%proxy: memref<17xi64> {ly.ownership.object_header}) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "construct"} {
-    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_Construct(%proxy: memref<3xi64> {ly.ownership.object_header}) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "construct"} {
+    %object = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     %raw = func.call @LyJs_Construct(%object) : (i32) -> i32
     %handle = func.call @__ly_js_checked(%raw) : (i32) -> i32
     func.return %handle : i32
@@ -251,8 +251,8 @@ module attributes {
   // ===== Python -> host =====
   // The host's stack holds the value itself, so the proxy may go once this
   // returns.
-  func.func @LyJsProxy_PushProxy(%proxy: memref<17xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "push.proxy"} {
-    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_PushProxy(%proxy: memref<3xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "push.proxy"} {
+    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     func.call @LyJs_PushHandle(%handle) : (i32) -> ()
     func.return
   }
@@ -385,8 +385,8 @@ module attributes {
   // ===== a union's dispatch =====
   // On the proxy, which keeps its handle; the conversions raise TypeError
   // like the reads they stand in for.
-  func.func @LyJsProxy_Is(%proxy: memref<17xi64> {ly.ownership.object_header}, %kind: i32) -> i1 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "is"} {
-    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_Is(%proxy: memref<3xi64> {ly.ownership.object_header}, %kind: i32) -> i1 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "is"} {
+    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     %raw = func.call @LyJs_Is(%handle, %kind) : (i32, i32) -> i32
     %zero = arith.constant 0 : i32
     %is = arith.cmpi ne, %raw, %zero : i32
@@ -395,15 +395,15 @@ module attributes {
 
   // A conversion reads from a second handle and lets `take.*` drop it, so
   // the proxy's own handle stays the proxy's.
-  func.func @LyJsProxy_Duplicate(%proxy: memref<17xi64> {ly.ownership.object_header}) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "duplicate"} {
-    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_Duplicate(%proxy: memref<3xi64> {ly.ownership.object_header}) -> i32 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "duplicate"} {
+    %handle = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
     %copy = func.call @LyJs_Dup(%handle) : (i32) -> i32
     func.return %copy : i32
   }
 
-  func.func @LyJsProxy_InstanceOf(%proxy: memref<17xi64> {ly.ownership.object_header}, %constructor: memref<17xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "instanceof"} {
-    %value = func.call @LyJsProxy_Handle(%proxy) : (memref<17xi64>) -> i32
-    %class = func.call @LyJsProxy_Handle(%constructor) : (memref<17xi64>) -> i32
+  func.func @LyJsProxy_InstanceOf(%proxy: memref<3xi64> {ly.ownership.object_header}, %constructor: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "instanceof"} {
+    %value = func.call @LyJsProxy_Handle(%proxy) : (memref<3xi64>) -> i32
+    %class = func.call @LyJsProxy_Handle(%constructor) : (memref<3xi64>) -> i32
     %raw = func.call @LyJs_InstanceOf(%value, %class) : (i32, i32) -> i32
     %answer = func.call @__ly_js_checked(%raw) : (i32) -> i32
     %zero = arith.constant 0 : i32
@@ -412,11 +412,11 @@ module attributes {
   }
 
   // ===== callbacks (runtime/lib/_js_bridge.py) =====
-  func.func @LyJs_FunctionFor(%slot: i64) -> memref<17xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_js.function_for", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "function_for", ly.runtime.result_contract = "_js.JsProxy"} {
+  func.func @LyJs_FunctionFor(%slot: i64) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_js.function_for", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "function_for", ly.runtime.result_contract = "_js.JsProxy"} {
     %slot32 = arith.trunci %slot : i64 to i32
     %handle = func.call @LyJs_MakeFunction(%slot32) : (i32) -> i32
-    %proxy = func.call @LyJsProxy_New(%handle) : (i32) -> memref<17xi64>
-    func.return %proxy : memref<17xi64>
+    %proxy = func.call @LyJsProxy_New(%handle) : (i32) -> memref<3xi64>
+    func.return %proxy : memref<3xi64>
   }
 
   func.func @LyJs_CallbackSlot() -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "_js.callback_slot", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "callback_slot", ly.runtime.result_contract = "builtins.int"} {
