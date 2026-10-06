@@ -416,6 +416,7 @@ private:
       mlir::Operation *op,
       llvm::SmallVectorImpl<std::pair<mlir::Value, RuntimeBundle>> &lazy);
   mlir::LogicalResult lowerPyOpRule(mlir::Operation *op);
+  unsigned objectReadersOf(mlir::Value value);
   bool bindFloatSlotRead(mlir::Operation *op, mlir::Value resultValue,
                          const RuntimeValue &value);
   bool readsFloatLanes(mlir::Operation *op) const;

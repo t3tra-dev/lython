@@ -198,8 +198,15 @@ RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
 // ⛔ Not at each of the two dozen readers that already handle a lazy int: each
 // would have to learn the float spelling, and one that did not would read an
 // f64 as an i64.
-// Float identity is not kept by this (two reads of one lane are two objects);
-// it was not before either -- a float list slot is a raw word, boxed per read.
+//
+// ⭐ UNLESS TWO READERS NEED THE OBJECT: then they would hold two objects of
+// one value, and a float with no immediate (a NaN, an infinity) keeps its
+// object in a slot or a box -- `xs = [nan]; nan in xs` compared two objects
+// and answered False where CPython's identity test says True. A value with
+// two such readers is boxed once, at its definition, and both read that box.
+// ⛔ Not a loop-carried value (a block argument): its definition is the loop
+// header, and boxing there allocates every trip for readers that may sit on
+// a path taken once; its identity is that of a value rebuilt every trip.
 mlir::LogicalResult RuntimeBundleLowerer::materializeLazyFloatOperands(
     mlir::Operation *op,
     llvm::SmallVectorImpl<std::pair<mlir::Value, RuntimeBundle>> &lazy) {
@@ -228,7 +235,12 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeLazyFloatOperands(
       continue;
     RuntimeBundle lane = found->second;
     mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPoint(op);
+    bool shared = !mlir::isa<mlir::BlockArgument>(operand) &&
+                  RuntimeBundleLowerer::objectReadersOf(operand) >= 2;
+    if (shared)
+      builder.setInsertionPointAfterValue(lane.primitiveF64->value);
+    else
+      builder.setInsertionPoint(op);
     mlir::FailureOr<RuntimeValue> object =
         RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
             op, lane);
@@ -238,9 +250,30 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeLazyFloatOperands(
         RuntimeBundle::object(lane.objectValue.contract, object->values);
     materialized.copyEvidenceFrom(lane);
     valueBundles[operand] = std::move(materialized);
-    lazy.emplace_back(operand, std::move(lane));
+    if (!shared)
+      lazy.emplace_back(operand, std::move(lane));
   }
   return mlir::success();
+}
+
+// How many ops read `value` as an object rather than as its lane: each user
+// that does not read float lanes, a call-argument pack counted as the calls
+// it feeds. A user whose other operands are not lowered yet counts (it cannot
+// be shown to read the lane).
+unsigned RuntimeBundleLowerer::objectReadersOf(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> readers;
+  for (mlir::Operation *user : value.getUsers()) {
+    if (auto pack = mlir::dyn_cast<py::PackOp>(user))
+      if (packIsOnlyCallArguments(pack)) {
+        for (mlir::Operation *call : pack.getResult().getUsers())
+          if (!RuntimeBundleLowerer::readsFloatLanes(call))
+            readers.insert(call);
+        continue;
+      }
+    if (!RuntimeBundleLowerer::readsFloatLanes(user))
+      readers.insert(user);
+  }
+  return readers.size();
 }
 
 bool RuntimeBundleLowerer::canMaterializePrimitiveI64Object(

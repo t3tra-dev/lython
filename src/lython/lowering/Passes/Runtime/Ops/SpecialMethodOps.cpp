@@ -1497,14 +1497,80 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerIs(py::IsOp op) {
     return mlir::isa<mlir::MemRefType>(first.getType()) ? first
                                                         : mlir::Value();
   };
+  builder.setInsertionPoint(op);
+  mlir::Location loc = op.getLoc();
+  // ⭐ AN `object` VALUE IS A BOX AROUND ITS ENTITY, and every value that
+  // becomes one -- each argument, each read -- gets a box of its own, so the
+  // box's address names the crossing, not the object: `def same(a: object, b:
+  // object): return a is b` answered False for `same(x, x)`, for an instance,
+  // a list, None and True alike. When either side is a box, identity is the
+  // ENTITY (box_abi::kBoxEntityWord), the word a box or a slot keeps for its
+  // value -- the object's address, an int's or float's immediate, 0 for None
+  // -- and the other side's is the word its box would keep.
+  auto isBox = [&](const RuntimeBundle &bundle) {
+    return RuntimeBundleLowerer::isBuiltinsObjectContract(bundle.contract) &&
+           bundle.physicalValues().size() == 1 &&
+           mlir::isa<mlir::MemRefType>(
+               bundle.physicalValues().front().getType());
+  };
+  if (isBox(*sources.front()) || isBox(*sources.back())) {
+    auto entityOf = [&](const RuntimeBundle &bundle)
+        -> mlir::FailureOr<mlir::Value> {
+      if (isBox(bundle)) {
+        mlir::Value box = bundle.physicalValues().front();
+        mlir::Type words = mlir::MemRefType::get({mlir::ShapedType::kDynamic},
+                                                 builder.getI64Type());
+        if (box.getType() != words)
+          box = mlir::memref::CastOp::create(builder, loc, words, box);
+        return mlir::memref::LoadOp::create(
+                   builder, loc, box,
+                   mlir::arith::ConstantIndexOp::create(
+                       builder, loc, box_abi::kBoxEntityWord)
+                       .getResult())
+            .getResult();
+      }
+      mlir::FailureOr<RuntimeBundle> normalized =
+          RuntimeBundleLowerer::normalizeBoxSource(op, bundle);
+      if (mlir::failed(normalized))
+        return mlir::failure();
+      mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> classEntity =
+          RuntimeBundleLowerer::objectPayloadClassEntity(op, *normalized,
+                                                         /*ownsPayload=*/false);
+      if (mlir::failed(classEntity) || classEntity->size() < 2)
+        return op.emitError() << "`is` operand has no entity to compare";
+      return (*classEntity)[1];
+    };
+    mlir::FailureOr<mlir::Value> lhs = entityOf(*sources.front());
+    if (mlir::failed(lhs))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    mlir::FailureOr<mlir::Value> rhs = entityOf(*sources.back());
+    if (mlir::failed(rhs))
+      return mlir::failure();
+    builder.setInsertionPoint(op);
+    // One int or float object reads as its immediate in a slot and as its
+    // address in a box; `identity_key` names both by the slot's word.
+    std::optional<RuntimeSymbol> identityKey =
+        manifest.primitive("builtins.object", "identity_key");
+    if (!identityKey)
+      return op.emitError() << "runtime manifest has no identity_key";
+    mlir::func::CallOp lhsKey = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *identityKey, mlir::ValueRange{*lhs});
+    mlir::func::CallOp rhsKey = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *identityKey, mlir::ValueRange{*rhs});
+    mlir::Value same = mlir::arith::CmpIOp::create(
+        builder, loc, mlir::arith::CmpIPredicate::eq, lhsKey.getResult(0),
+        rhsKey.getResult(0));
+    op.getResult().replaceAllUsesWith(same);
+    erase.push_back(op);
+    return mlir::success();
+  }
   mlir::Value lhsHeader = headerOf(*sources.front());
   mlir::Value rhsHeader = headerOf(*sources.back());
   if (!lhsHeader || !rhsHeader)
     return op.emitError()
            << "`is` operand has no runtime object header (evidence-only "
               "value); use `==` instead";
-  builder.setInsertionPoint(op);
-  mlir::Location loc = op.getLoc();
   mlir::Value lhsAddress = mlir::memref::ExtractAlignedPointerAsIndexOp::create(
       builder, loc, lhsHeader);
   mlir::Value rhsAddress = mlir::memref::ExtractAlignedPointerAsIndexOp::create(
