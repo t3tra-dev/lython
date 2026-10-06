@@ -186,6 +186,13 @@ struct RuntimeBundle {
   llvm::SmallVector<RuntimeValue, 8> generatorSources;
   llvm::SmallVector<std::shared_ptr<RuntimeBundle>, 8> generatorSourceBundles;
   std::optional<RuntimePrimitiveI64Evidence> primitiveI64;
+  // A float's value as an f64 lane, with the same validity contract as
+  // `primitiveI64`. A bundle carrying it and no physical values is a LAZY
+  // float: it becomes an object only where something needs one
+  // (`materializeLazyFloatOperands`).
+  // ⛔ Not `primitiveI64` with an f64 inside: two dozen readers of that field
+  // take its word to be an int's.
+  std::optional<RuntimePrimitiveI64Evidence> primitiveF64;
   // An int payload already in the form a slot's entity word takes (an
   // immediate, or the address of an object whose one reference the slot
   // takes): set by `materializePayloadObjectBundle` for an int that exists

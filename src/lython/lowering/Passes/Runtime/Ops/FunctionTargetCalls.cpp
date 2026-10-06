@@ -139,7 +139,18 @@ RuntimeBundleLowerer::lowerFunctionTargetCall(
 
   if (std::optional<std::string> cloneName =
           RuntimeBundleLowerer::primitiveI64CloneFor(targetName)) {
-    if (RuntimeBundleLowerer::allSourcesHavePrimitiveI64Evidence(sources)) {
+    // An int argument needs its lane (a boxed one may not fit the word, and
+    // then the boxed original must run); a float argument fits always, so a
+    // boxed one is read into the lane.
+    auto fits = [&](const RuntimeBundle *source) {
+      if (RuntimeBundleLowerer::hasPrimitiveI64Evidence(source) ||
+          RuntimeBundleLowerer::hasPrimitiveF64Evidence(source))
+        return true;
+      return source && source->kind == RuntimeBundle::Kind::Object &&
+             source->contractName() == "builtins.float" &&
+             !source->physicalValues().empty();
+    };
+    if (llvm::all_of(sources, fits)) {
       if (mlir::func::FuncOp clone =
               module.lookupSymbol<mlir::func::FuncOp>(*cloneName))
         return RuntimeBundleLowerer::lowerPrimitiveI64CloneFallbackCall(
@@ -408,20 +419,25 @@ RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(
   mlir::Location loc = op.getLoc();
   mlir::Value argumentsValid;
   for (const RuntimeBundle *source : sources) {
-    if (!source || !source->primitiveI64 || !source->primitiveI64->valid)
+    if (!source)
+      continue;
+    const std::optional<RuntimePrimitiveI64Evidence> &lane =
+        source->primitiveI64 ? source->primitiveI64 : source->primitiveF64;
+    if (!lane || !lane->valid)
       continue;
     argumentsValid = argumentsValid
-                         ? logicalAnd(builder, loc, argumentsValid,
-                                      source->primitiveI64->valid)
-                         : source->primitiveI64->valid;
+                         ? logicalAnd(builder, loc, argumentsValid, lane->valid)
+                         : lane->valid;
   }
 
   auto callResults =
       [&](mlir::func::CallOp call) -> mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> {
-    if (call.getNumResults() != 2 || !call.getResult(0).getType().isInteger(64) ||
+    if (call.getNumResults() != 2 ||
+        !(call.getResult(0).getType().isInteger(64) ||
+          call.getResult(0).getType().isF64()) ||
         !call.getResult(1).getType().isInteger(1))
       return op.emitError() << "primitive i64 callable clone '" << cloneName
-                            << "' must return (i64, i1)";
+                            << "' must return (i64 or f64, i1)";
     return std::make_pair(call.getResult(0), call.getResult(1));
   };
 
@@ -435,9 +451,12 @@ RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(
   }
 
   context->loadDialect<mlir::scf::SCFDialect>();
-  mlir::Type i64 = mlir::IntegerType::get(context, 64);
+  mlir::Type laneType = clone.getFunctionType().getNumResults() == 2
+                            ? clone.getFunctionType().getResult(0)
+                            : mlir::Type(mlir::IntegerType::get(context, 64));
   mlir::Type i1 = mlir::IntegerType::get(context, 1);
-  auto ifOp = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{i64, i1},
+  auto ifOp = mlir::scf::IfOp::create(builder, loc,
+                                      mlir::TypeRange{laneType, i1},
                                       argumentsValid, /*withElseRegion=*/true);
   builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
   mlir::FailureOr<mlir::func::CallOp> call =
@@ -456,10 +475,16 @@ RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(
   builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
   // No answer, and no attempt: the raw word is a placeholder the invalid bit
   // tells every reader to ignore.
+  mlir::Value placeholder =
+      laneType.isF64()
+          ? mlir::arith::ConstantFloatOp::create(builder, loc,
+                                                 builder.getF64Type(),
+                                                 llvm::APFloat(0.0))
+                .getResult()
+          : constantI64(builder, loc, 0);
   mlir::scf::YieldOp::create(
       builder, loc,
-      mlir::ValueRange{constantI64(builder, loc, 0),
-                       constantBool(builder, loc, false)});
+      mlir::ValueRange{placeholder, constantBool(builder, loc, false)});
   builder.setInsertionPointAfter(ifOp);
   return std::make_pair(ifOp.getResult(0), ifOp.getResult(1));
 }
@@ -475,9 +500,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64CloneCall(
     return mlir::failure();
 
   RuntimeBundle result;
-  if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
-          op, op.getResult(0).getType(), answer->first, answer->second,
-          result)))
+  if (answer->first.getType().isF64())
+    RuntimeBundleLowerer::makePrimitiveF64Bundle(
+        op.getResult(0).getType(), answer->first, answer->second, result);
+  else if (mlir::failed(RuntimeBundleLowerer::makePrimitiveI64Bundle(
+               op, op.getResult(0).getType(), answer->first, answer->second,
+               result)))
     return mlir::failure();
   valueBundles[op.getResult(0)] = std::move(result);
   erase.push_back(op);
@@ -506,10 +534,11 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
       if (callable.getResultTypes().size() == 1)
         resultType = callable.getResultTypes().front();
   }
-  if (runtimeContractName(resultType) != "builtins.int")
+  bool floatResult = runtimeContractName(resultType) == "builtins.float";
+  if (!floatResult && runtimeContractName(resultType) != "builtins.int")
     return op.emitError()
            << "primitive i64 callable clone fallback requires builtins.int "
-              "result";
+              "or builtins.float result";
 
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> objectTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(
@@ -517,9 +546,35 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   if (mlir::failed(objectTypes))
     return mlir::failure();
 
+  // ⭐ A boxed float argument is read into its lane HERE, before the guard
+  // the clone call sits in: a read made later, at the call, lands after the
+  // guard and does not dominate the use inside it.
+  llvm::SmallVector<RuntimeBundle, 8> laneCopies;
+  laneCopies.reserve(sources.size());
+  llvm::SmallVector<const RuntimeBundle *, 8> laneSources;
+  for (const RuntimeBundle *source : sources) {
+    if (source && source->contractName() == "builtins.float" &&
+        !source->primitiveF64 && !source->physicalValues().empty())
+      if (std::optional<RuntimeSymbol> unbox =
+              manifest.primitive("builtins.float", "unbox.f64");
+          unbox && unbox->function.getNumArguments() ==
+                       source->physicalValues().size()) {
+        RuntimeBundle copy = *source;
+        copy.primitiveF64 = RuntimePrimitiveI64Evidence{
+            RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), *unbox,
+                                                    source->physicalValues())
+                .getResult(0),
+            constantBool(builder, op.getLoc(), true)};
+        laneCopies.push_back(std::move(copy));
+        laneSources.push_back(&laneCopies.back());
+        continue;
+      }
+    laneSources.push_back(source);
+  }
+
   mlir::FailureOr<std::pair<mlir::Value, mlir::Value>> cloneAnswer =
       RuntimeBundleLowerer::emitGuardedPrimitiveI64CloneCall(
-          op, clone, clone.getSymName(), sources);
+          op, clone, clone.getSymName(), laneSources);
   if (mlir::failed(cloneAnswer))
     return mlir::failure();
 
@@ -527,7 +582,9 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
   mlir::Location loc = op.getLoc();
   llvm::SmallVector<mlir::Type, 10> ifResultTypes;
   ifResultTypes.append(objectTypes->begin(), objectTypes->end());
-  ifResultTypes.push_back(mlir::IntegerType::get(context, 64));
+  ifResultTypes.push_back(floatResult
+                              ? mlir::Type(mlir::Float64Type::get(context))
+                              : mlir::Type(mlir::IntegerType::get(context, 64)));
   ifResultTypes.push_back(mlir::IntegerType::get(context, 1));
 
   auto ifOp = mlir::scf::IfOp::create(builder, loc, ifResultTypes,
@@ -562,6 +619,35 @@ mlir::LogicalResult RuntimeBundleLowerer::emitPrimitiveI64CloneFallbackResult(
           op, original, originalName, sources);
   if (mlir::failed(fallbackCall))
     return mlir::failure();
+  // ⭐ A float original returns its object only (a boxed function carries no
+  // float lane); the lane is read back out of it, a pure load.
+  if (floatResult) {
+    std::optional<RuntimeSymbol> unbox =
+        manifest.primitive("builtins.float", "unbox.f64");
+    if (!unbox || (*fallbackCall).getNumResults() != objectTypes->size())
+      return op.emitError() << "primitive float clone fallback cannot read the "
+                               "original's float result";
+    mlir::func::CallOp read = RuntimeBundleLowerer::createRuntimeCall(
+        loc, *unbox, (*fallbackCall).getResults());
+    llvm::SmallVector<mlir::Value, 10> slowYield(
+        (*fallbackCall).getResults().begin(),
+        (*fallbackCall).getResults().end());
+    slowYield.push_back(read.getResult(0));
+    slowYield.push_back(constantBool(builder, loc, true));
+    mlir::scf::YieldOp::create(builder, loc, slowYield);
+    builder.setInsertionPointAfter(ifOp);
+    llvm::SmallVector<mlir::Value, 8> objectValues;
+    for (unsigned index = 0, end = static_cast<unsigned>(objectTypes->size());
+         index < end; ++index)
+      objectValues.push_back(ifOp.getResult(index));
+    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op, resultType, objectValues, result)))
+      return mlir::failure();
+    result.primitiveF64 =
+        RuntimePrimitiveI64Evidence{ifOp.getResult(objectTypes->size()),
+                                    ifOp.getResult(objectTypes->size() + 1)};
+    return mlir::success();
+  }
   if ((*fallbackCall).getNumResults() != ifResultTypes.size())
     return op.emitError() << "primitive i64 clone fallback call returned "
                           << (*fallbackCall).getNumResults()
@@ -623,7 +709,29 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
     for (auto [sourceIndex, source] : llvm::enumerate(sources)) {
       mlir::Value evidenceValue;
       mlir::Value evidenceValid;
-      if (RuntimeBundleLowerer::hasPrimitiveI64Evidence(source)) {
+      if (RuntimeBundleLowerer::hasPrimitiveF64Evidence(source)) {
+        evidenceValue = source->primitiveF64->value;
+        evidenceValid = source->primitiveF64->valid;
+      } else if (source && source->contractName() == "builtins.float" &&
+                 !source->physicalValues().empty()) {
+        // A boxed float: its value is a pure load, taken at `op` like the
+        // int unbox below.
+        std::optional<RuntimeSymbol> unbox =
+            manifest.primitive("builtins.float", "unbox.f64");
+        if (!unbox || unbox->function.getNumArguments() !=
+                          source->physicalValues().size())
+          return op.emitError()
+                 << "primitive clone '" << targetName << "' argument "
+                 << sourceIndex << " is a boxed float with no unbox.f64";
+        mlir::OpBuilder::InsertionGuard unboxGuard(builder);
+        builder.setInsertionPoint(op);
+        evidenceValue = RuntimeBundleLowerer::createRuntimeCall(
+                            op.getLoc(), *unbox, source->physicalValues())
+                            .getResult(0);
+        evidenceValid =
+            mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
+                .getResult();
+      } else if (RuntimeBundleLowerer::hasPrimitiveI64Evidence(source)) {
         evidenceValue = source->primitiveI64->value;
         evidenceValid = source->primitiveI64->valid;
       } else if (source && source->contractName() == "builtins.int" &&
@@ -665,7 +773,7 @@ RuntimeBundleLowerer::emitFunctionTargetRuntimeCall(
           inputIndex + 1 < functionType.getNumInputs() &&
           functionType.getInput(inputIndex + 1).isInteger(1);
       if (inputIndex >= functionType.getNumInputs() ||
-          !functionType.getInput(inputIndex).isInteger(64))
+          functionType.getInput(inputIndex) != evidenceValue.getType())
         return op.emitError() << "primitive i64 callable clone '" << targetName
                               << "' has malformed ABI at input " << inputIndex;
       operands.push_back(evidenceValue);

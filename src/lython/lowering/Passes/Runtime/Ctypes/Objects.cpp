@@ -619,6 +619,16 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerCtypesCallbackConstruction(
               "function or a runtime integer address";
   std::optional<std::string> clone =
       RuntimeBundleLowerer::primitiveI64CloneFor(target.functionTarget);
+  // A clone now also carries floats; the callback ABI is the int one.
+  if (clone)
+    if (auto cloneFunction = module.lookupSymbol<mlir::func::FuncOp>(*clone))
+      if (py::CallableType callable = callableTypeOf(cloneFunction))
+        if (runtimeContractName(callable.getResultTypes().front()) !=
+                "builtins.int" ||
+            llvm::any_of(callable.getPositionalTypes(), [](mlir::Type type) {
+              return runtimeContractName(type) != "builtins.int";
+            }))
+          clone.reset();
   if (!clone)
     return op.emitError()
            << "ctypes callback target '" << target.functionTarget

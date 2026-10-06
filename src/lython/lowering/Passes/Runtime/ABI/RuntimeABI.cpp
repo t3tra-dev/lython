@@ -870,6 +870,7 @@ void RuntimeBundle::copyEvidenceFrom(const RuntimeBundle &source) {
   generatorSources = source.generatorSources;
   generatorSourceBundles = source.generatorSourceBundles;
   primitiveI64 = source.primitiveI64;
+  primitiveF64 = source.primitiveF64;
   deferredObject = source.deferredObject;
   buffer = source.buffer;
   ctypes = source.ctypes;

@@ -621,6 +621,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBinarySpecial(
           op, inputs, "binary special method operands need runtime bundles",
           sources)))
     return mlir::failure();
+  if (RuntimeBundleLowerer::floatLaneApplies(op, methodName, sources)) {
+    if (mlir::failed(RuntimeBundleLowerer::lowerPrimitiveF64Special(
+            op, methodName, sources, resultValue)))
+      return mlir::failure();
+    erase.push_back(op);
+    return mlir::success();
+  }
   std::optional<PrimitiveI64ArithmeticKind> primitiveArithmetic =
       primitiveI64ArithmeticKind(methodName);
   // A bool-preserving bitwise op is only routed here when neither operand is a

@@ -155,6 +155,21 @@ RuntimeBundleLowerer::lowerFloatConstant(py::FloatConstantOp op) {
       mlir::arith::ConstantFloatOp::create(builder, op.getLoc(),
                                            builder.getF64Type(), op.getValue())
           .getResult();
+  // Inside a clone a float literal is its lane: an object here would be an
+  // allocation, and one allocation costs the clone its speculation.
+  auto function = op->getParentOfType<mlir::func::FuncOp>();
+  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function) &&
+      !function->hasAttr("ly.generator.resume")) {
+    RuntimeBundle lazy;
+    RuntimeBundleLowerer::makePrimitiveF64Bundle(
+        op.getResult().getType(), value,
+        mlir::arith::ConstantIntOp::create(builder, op.getLoc(), 1, 1)
+            .getResult(),
+        lazy);
+    valueBundles[op.getResult()] = std::move(lazy);
+    erase.push_back(op);
+    return mlir::success();
+  }
   RuntimeBundle result;
   if (mlir::failed(initializeObjectFromRawValues(
           op, op.getResult().getType(), mlir::ValueRange{value}, result)))

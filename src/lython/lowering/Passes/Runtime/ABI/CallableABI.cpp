@@ -575,11 +575,14 @@ bool RuntimeBundleLowerer::isPrimitiveI64CallableEligible(
       llvm::any_of(callable.getPositionalDefaults(),
                    [](mlir::BoolAttr attr) { return attr && attr.getValue(); }))
     return false;
-  if (runtimeContractName(callable.getResultTypes().front()) != "builtins.int")
+  // An int is carried as its i64 word, a float as its f64 value.
+  auto scalar = [](mlir::Type type) {
+    std::string contract = runtimeContractName(type);
+    return contract == "builtins.int" || contract == "builtins.float";
+  };
+  if (!scalar(callable.getResultTypes().front()))
     return false;
-  if (!llvm::all_of(callable.getPositionalTypes(), [](mlir::Type type) {
-        return runtimeContractName(type) == "builtins.int";
-      }))
+  if (!llvm::all_of(callable.getPositionalTypes(), scalar))
     return false;
   // A return value from a control-flow MERGE (if/loop) is a boxed object,
   // which the unboxed-i64 clone return ABI cannot represent.
@@ -619,7 +622,7 @@ bool isReplaySafeBody(mlir::func::FuncOp clone,
     }
     llvm::StringRef dialect = op->getName().getDialectNamespace();
     if (dialect == "arith" || dialect == "cf" || dialect == "scf" ||
-        dialect == "func")
+        dialect == "func" || dialect == "math")
       return mlir::WalkResult::advance();
     // The decision flag: a slot the clone allocates, writes and reads itself,
     // dead the moment it returns. Nothing outside can see it, which is the
@@ -691,7 +694,8 @@ bool RuntimeBundleLowerer::isSpeculablePrimitiveI64Clone(
       !RuntimeBundleLowerer::isPrimitiveI64CallableClone(clone))
     return false;
   mlir::FunctionType type = clone.getFunctionType();
-  if (type.getNumResults() != 2 || !type.getResult(0).isInteger(64) ||
+  if (type.getNumResults() != 2 ||
+      !(type.getResult(0).isInteger(64) || type.getResult(0).isF64()) ||
       !type.getResult(1).isInteger(1))
     return false;
 
@@ -806,13 +810,16 @@ RuntimeBundleLowerer::seedPrimitiveI64CallableEntryArgumentBundles(
 
   unsigned logicalArgCount = entry.getNumArguments();
   for (auto [index, logicalType] : llvm::enumerate(logicalTypes)) {
-    if (runtimeContractName(logicalType) != "builtins.int")
+    bool isFloat = runtimeContractName(logicalType) == "builtins.float";
+    if (!isFloat && runtimeContractName(logicalType) != "builtins.int")
       return function.emitError()
              << "primitive i64 callable clone argument " << index
-             << " must be builtins.int, got " << logicalType;
+             << " must be builtins.int or builtins.float, got " << logicalType;
     mlir::BlockArgument logicalArg = entry.getArgument(index);
     mlir::BlockArgument raw = entry.addArgument(
-        mlir::IntegerType::get(context, 64), logicalArg.getLoc());
+        isFloat ? mlir::Type(mlir::Float64Type::get(context))
+                : mlir::Type(mlir::IntegerType::get(context, 64)),
+        logicalArg.getLoc());
     // ⭐ VALIDITY IS THE CALLER'S OBLIGATION, NOT AN ARGUMENT. It used to ride
     // in as an i1 the body then AND-ed into its branches, which meant a clone
     // entered with valid=false took the wrong arm of every test -- `fib(93)`,
@@ -827,7 +834,10 @@ RuntimeBundleLowerer::seedPrimitiveI64CallableEntryArgumentBundles(
         logicalType, mlir::ValueRange{},
         ownership::logicalOwnershipKind(logicalType,
                                                 /*ownsObject=*/false));
-    bundle.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
+    if (isFloat)
+      bundle.primitiveF64 = RuntimePrimitiveI64Evidence{raw, valid};
+    else
+      bundle.primitiveI64 = RuntimePrimitiveI64Evidence{raw, valid};
     valueBundles[logicalArg] = std::move(bundle);
   }
   callableLogicalEntryArgCounts.push_back(
@@ -1043,6 +1053,11 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
             continue;
           }
         }
+        if (!generatorArgInfo &&
+            runtimeContractName(logicalType) == "builtins.float") {
+          inputTypes.push_back(mlir::Float64Type::get(context));
+          continue;
+        }
         if (runtimeContractName(logicalType) != "builtins.int") {
           // Naming the contract and the reason, not just the expected type: the
           // parameter this rejects is usually one the user never wrote (a
@@ -1102,7 +1117,9 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
                     (indexed.index() == 2 ||
                      generatorInfo->resultLane(indexed.index())))
                   return true;
-                return runtimeContractName(indexed.value()) == "builtins.int";
+                std::string contract = runtimeContractName(indexed.value());
+                return contract == "builtins.int" ||
+                       (!generatorInfo && contract == "builtins.float");
               })) {
         function.emitError()
             << "primitive i64 callable clone results must be builtins.int";
@@ -1140,6 +1157,11 @@ mlir::LogicalResult RuntimeBundleLowerer::prepareCallableFunctionABIs() {
                               static_cast<std::int64_t>(laneTypes.size()))),
           }));
           resultTypes.append(laneTypes.begin(), laneTypes.end());
+          continue;
+        }
+        if (runtimeContractName(resultType) == "builtins.float") {
+          resultTypes.push_back(mlir::Float64Type::get(context));
+          resultTypes.push_back(mlir::IntegerType::get(context, 1));
           continue;
         }
         RuntimeBundleLowerer::appendPrimitiveI64EvidenceTypes(resultType,
