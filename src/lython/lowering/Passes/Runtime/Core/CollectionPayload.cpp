@@ -1253,13 +1253,15 @@ mlir::LogicalResult RuntimeBundleLowerer::storeDictValuePayload(
     return mlir::failure();
   // The present word is what makes the slot findable; it is stored last so a
   // failed value store never leaves a slot claiming an entry it has not got.
+  // It is the entry's HASH word (the manifest's `__ly_dict_hashes`): 0 says
+  // "an entry, hash not computed yet", -1 says "no entry".
   mlir::FailureOr<mlir::Value> present =
       RuntimeBundleLowerer::containerInteriorView(
           op, container, ContainerInterior::Present, "dict present");
   if (mlir::failed(present))
     return mlir::failure();
   return storePayloadWord(op, builder, *present, index,
-                          constantI64(builder, op->getLoc(), 1),
+                          constantI64(builder, op->getLoc(), 0),
                           "dict present");
 }
 
@@ -1297,7 +1299,9 @@ mlir::LogicalResult RuntimeBundleLowerer::clearDictValuePayload(
           op, container, ContainerInterior::Present, "dict present");
   if (mlir::failed(present))
     return mlir::failure();
-  return storePayloadWord(op, builder, *present, index, zero, "dict present");
+  return storePayloadWord(op, builder, *present, index,
+                          constantI64(builder, op->getLoc(), -1),
+                          "dict present");
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::clearDictPayloadEntry(
