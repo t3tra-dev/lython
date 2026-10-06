@@ -549,6 +549,35 @@ TEST(DriverTest, StringAndBytesLiteralsInALoopStayOutOfTheFrame) {
          "written for";
 }
 
+// What: in a function with no clone (it takes a list), the ints an operator
+// answers and the accumulator the loop carries are deferred ints: no int
+// object is made from a computed value (every `LyLong_FromI64` the body calls
+// boxes a literal), and the operators' fast arms hold the stand-in.
+TEST(DriverTest, AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue) {
+  CompileResult result = compileSource(
+      "def count(xs: list[int]) -> int:\n"
+      "    total = 0\n"
+      "    for x in xs:\n"
+      "        total += x * 3 + 1\n"
+      "    return total\n\n\n"
+      "print(count([1, 2]))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *function =
+      result.verified.llvmModule->getFunction("count");
+  ASSERT_NE(function, nullptr);
+  unsigned standIns = 0;
+  for (const llvm::BasicBlock &block : *function)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          if (callee->getName() == "LyLong_FromI64")
+            EXPECT_TRUE(llvm::isa<llvm::ConstantInt>(call->getArgOperand(0)))
+                << "count boxes a computed int";
+          standIns += callee->getName() == "LyLong_DeferredStandIn";
+        }
+  EXPECT_GT(standIns, 0u) << "no operator answered with a deferred int";
+}
+
 // What: in a function with no clone (it takes a list), a float read out of
 // the list, the arithmetic on it and the float the loop carries are f64
 // values: the body calls no float operator, reads no slot as an object, and
@@ -2840,8 +2869,9 @@ bool callsFunctionNamed(llvm::Module &module, llvm::StringRef callee) {
 
 // What: an int or float a container or an instance field only stores goes
 // into its slot as the slot's own word -- an int known as an i64 through
-// `slot_word_from_i64` and a float lane through `slot_word_from_f64` (no
-// object made), an int or float object through `slot_word_taking_ref`
+// `slot_word_from_i64`, a deferred int through `slot_word_taking_deferred` and
+// a float lane through `slot_word_from_f64` (no object made when the value is
+// immediate), an int or float object through `slot_word_taking_ref`
 // (the object dropped again when the value is immediate) -- and a read of
 // such a slot goes through `from_slot_word`, which turns an immediate back
 // into an object. A literal keeps storing objects: its elements are also the
@@ -2862,12 +2892,15 @@ TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
                                  "        xs.append(i)\n"
                                  "    return xs[0]\n\n\nprint(run(3))\n";
   EXPECT_TRUE(calls(inFunction, "LyLong_SlotWordFromI64") ||
-              calls(inFunction, "LyLong_SlotWordTakingRef"));
+              calls(inFunction, "LyLong_SlotWordTakingRef") ||
+              calls(inFunction, "LyLong_SlotWordTakingDeferred"));
+  // An int an operator answered is a deferred int: its i64's word when the
+  // i64 is the value, its object's when not (`slot_word_taking_deferred`).
   EXPECT_TRUE(calls("xs: list[int] = []\n"
                     "for i in range(3):\n"
                     "    xs.append(i * 1000)\n"
                     "print(xs[1])\n",
-                    "LyLong_SlotWordTakingRef"));
+                    "LyLong_SlotWordTakingDeferred"));
   EXPECT_TRUE(calls("xs: list[int] = []\n"
                     "for i in range(3):\n"
                     "    xs.append(i * 1000)\n"
@@ -2907,7 +2940,7 @@ TEST(DriverTest, AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord) {
                     "        self.x = x\n\n\n"
                     "ps = [P(i * 1000) for i in range(3)]\n"
                     "print(ps[1].x)\n",
-                    "LyLong_SlotWordTakingRef"));
+                    "LyLong_SlotWordTakingDeferred"));
 }
 
 // What: a value is kept referenced to the end of its frame only when its

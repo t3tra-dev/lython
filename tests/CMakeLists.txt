@@ -196,6 +196,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.LiteralsAreStaticObjectsNotAllocations"
     "DriverTest.AFloatFunctionRunsUnboxedInItsClone"
     "DriverTest.AFloatLoopInAnOrdinaryFunctionMakesNoObjects"
+    "DriverTest.AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"

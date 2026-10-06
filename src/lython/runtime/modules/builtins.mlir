@@ -7698,10 +7698,53 @@ module attributes {
     func.return %held, %value, %valid : memref<2xi64>, i64, i1
   }
 
-  // The object a deferred read stands for, owned: a new int of the value when
-  // the value is valid, the held object (retained again) when it is not.
+  // The raises a slow arm can take, checked on the operand's i64 BEFORE the
+  // arm boxes anything: a box made in the arm is not released when the call
+  // in that arm raises. A divisor or a count that is no i64 is not zero and
+  // not negative-small, and the boxed call answers for it.
+  func.func @LyLong_CheckDivisor(%value: i64, %valid: i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "check_divisor.i64"} {
+    %zero = arith.constant 0 : i64
+    %is_zero = arith.cmpi eq, %value, %zero : i64
+    %raises = arith.andi %valid, %is_zero : i1
+    scf.if %raises {
+      func.call @__ly_long_raise_division_by_zero() : () -> ()
+    }
+    func.return
+  }
+
+  func.func @LyLong_CheckShift(%value: i64, %valid: i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "check_shift.i64"} {
+    %zero = arith.constant 0 : i64
+    %negative = arith.cmpi slt, %value, %zero : i64
+    %raises = arith.andi %valid, %negative : i1
+    scf.if %raises {
+      func.call @__ly_long_raise_negative_shift() : () -> ()
+    }
+    func.return
+  }
+
+  // What a deferred int holds while its i64 is the value: the immortal small
+  // int 0, owned in name only (its release does nothing), so that both arms
+  // of a deferred result yield an owned object and the frame owns the merge.
+  func.func @LyLong_DeferredStandIn() -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred_stand_in"} {
+    %zero = arith.constant 0 : i64
+    %held = func.call @LyLong_FromI64(%zero) : (i64) -> memref<2xi64>
+    func.return %held : memref<2xi64>
+  }
+
+  // The object a deferred read stands for, owned: the held object (retained
+  // again) when it is one -- not valid, or an object of the value an edge
+  // carried along -- else a new int of the value. Only the stand-in is held
+  // in place of a value, and it is the small int 0, so an object held with a
+  // valid i64 IS that value's object.
   func.func @LyLong_MaterializeRead(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "materialize_read"} {
-    %header = scf.if %valid -> (memref<2xi64>) {
+    %zero = arith.constant 0 : i64
+    func.call @__ly_long_small_ensure() : () -> ()
+    %stand_in = func.call @__ly_long_small_slot(%zero) : (i64) -> memref<2xi64>
+    %held_idx = memref.extract_aligned_pointer_as_index %held : memref<2xi64> -> index
+    %stand_idx = memref.extract_aligned_pointer_as_index %stand_in : memref<2xi64> -> index
+    %is_stand_in = arith.cmpi eq, %held_idx, %stand_idx : index
+    %fresh_needed = arith.andi %valid, %is_stand_in : i1
+    %header = scf.if %fresh_needed -> (memref<2xi64>) {
       %fresh = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
       scf.yield %fresh : memref<2xi64>
     } else {
@@ -7753,6 +7796,25 @@ module attributes {
     } else {
       %header = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
       %idx = memref.extract_aligned_pointer_as_index %header : memref<2xi64> -> index
+      %w = arith.index_cast %idx : index to i64
+      scf.yield %w : i64
+    }
+    func.return %word : i64
+  }
+
+  // The slot word for a deferred int (see `LyLong_MaterializeRead`) whose
+  // held object the slot has just been given a reference of (the lowering's
+  // aggregate retain), as `LyLong_SlotWordTakingRef` is for an object: its
+  // i64's word when the i64 is the value, dropping that reference (the held
+  // object is the stand-in, or an object of the same value that an edge
+  // carried along), else the held object's, keeping it.
+  func.func @LyLong_SlotWordTakingDeferred(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_taking_deferred"} {
+    %word = scf.if %valid -> (i64) {
+      %w = func.call @LyLong_SlotWordFromI64(%value) : (i64) -> i64
+      func.call @LyLong_DecRef(%held) : (memref<2xi64>) -> ()
+      scf.yield %w : i64
+    } else {
+      %idx = memref.extract_aligned_pointer_as_index %held : memref<2xi64> -> index
       %w = arith.index_cast %idx : index to i64
       scf.yield %w : i64
     }

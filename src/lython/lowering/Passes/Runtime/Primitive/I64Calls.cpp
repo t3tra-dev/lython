@@ -404,6 +404,30 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
       enclosingClone && !enclosingClone->hasAttr("ly.generator.resume");
   if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(enclosingClone) &&
       (cloneCanFallBack || !compare || isPinnedTrueFlag(operandsValid))) {
+    // ⛔ The same holds for an operator that RAISES: a resume's "cannot say"
+    // reached `next` as an invalid word, and `7 // 0` in a generator raised
+    // "int too large to convert" instead of ZeroDivisionError. The raise is
+    // decided on the operand's i64 here, before the word is used.
+    if (!cloneCanFallBack && arithmetic) {
+      llvm::StringRef check =
+          *arithmetic == PrimitiveI64ArithmeticKind::FloorDiv ||
+                  *arithmetic == PrimitiveI64ArithmeticKind::Mod
+              ? "check_divisor.i64"
+          : *arithmetic == PrimitiveI64ArithmeticKind::LShift ||
+                  *arithmetic == PrimitiveI64ArithmeticKind::RShift
+              ? "check_shift.i64"
+              : "";
+      if (!check.empty()) {
+        std::optional<RuntimeSymbol> checker =
+            manifest.primitive("builtins.int", check);
+        if (!checker)
+          return op->emitError() << "runtime manifest has no int " << check;
+        RuntimeBundleLowerer::createRuntimeCall(
+            loc, *checker,
+            mlir::ValueRange{sources[1]->primitiveI64->value,
+                             sources[1]->primitiveI64->valid});
+      }
+    }
     if (unary || arithmetic) {
       mlir::FailureOr<RuntimePrimitiveI64Evidence> fastEvidence =
           unary ? RuntimeBundleLowerer::emitPrimitiveI64UnaryEvidence(
@@ -501,6 +525,28 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
   auto emitFallbackYield = [&]() -> mlir::LogicalResult {
     mlir::Block *fallbackBlock = builder.getInsertionBlock();
     builder.setInsertionPointToEnd(fallbackBlock);
+    // The raises this arm can take, before it boxes anything: a box made here
+    // is not released when the call below raises (see `check_divisor.i64`).
+    if (arithmetic && sources.size() == 2) {
+      llvm::StringRef check =
+          *arithmetic == PrimitiveI64ArithmeticKind::FloorDiv ||
+                  *arithmetic == PrimitiveI64ArithmeticKind::Mod
+              ? "check_divisor.i64"
+          : *arithmetic == PrimitiveI64ArithmeticKind::LShift ||
+                  *arithmetic == PrimitiveI64ArithmeticKind::RShift
+              ? "check_shift.i64"
+              : "";
+      if (!check.empty()) {
+        std::optional<RuntimeSymbol> checker =
+            manifest.primitive("builtins.int", check);
+        if (!checker)
+          return op->emitError() << "runtime manifest has no int " << check;
+        RuntimeBundleLowerer::createRuntimeCall(
+            loc, *checker,
+            mlir::ValueRange{sources[1]->primitiveI64->value,
+                             sources[1]->primitiveI64->valid});
+      }
+    }
     llvm::SmallVector<RuntimeBundle, 2> materializedSources;
     llvm::SmallVector<const RuntimeBundle *, 2> fallbackSources;
     materializedSources.reserve(sources.size());
@@ -549,26 +595,35 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
     auto ifOp = mlir::scf::IfOp::create(builder, loc, *resultTypes, fastValid,
                                         /*withElseRegion=*/true);
 
+    // ⭐ THE FAST ARM MAKES NO OBJECT. Its answer is the i64; what it yields
+    // is the stand-in a deferred int holds while its i64 is the value, and
+    // the slow arm yields the real object. A reader that needs an object
+    // makes it where it reads (`materialize_read`).
+    // ⛔ Not the object of the i64 here: a loop counter or an accumulator
+    // then allocated on every trip for a value read only as an i64.
+    std::optional<RuntimeSymbol> standIn =
+        manifest.primitive("builtins.int", "deferred_stand_in");
+    if (!standIn)
+      return op->emitError() << "runtime manifest has no int deferred_stand_in";
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-    RuntimeBundle fastBundle;
-    if (mlir::failed(RuntimeBundleLowerer::initializeObjectFromRawValues(
-            op, resultType, mlir::ValueRange{rawResult}, fastBundle)))
-      return mlir::failure();
-    if (mlir::failed(checkPhysicalTypes(fastBundle.physicalValues(),
+    mlir::func::CallOp held = mlir::func::CallOp::create(
+        builder, loc, standIn->function, mlir::ValueRange{});
+    if (mlir::failed(checkPhysicalTypes(held.getResults(),
                                         "primitive i64 fast path")))
       return mlir::failure();
-    mlir::scf::YieldOp::create(builder, loc, fastBundle.physicalValues());
+    mlir::scf::YieldOp::create(builder, loc, held.getResults());
 
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
     if (mlir::failed(emitFallbackYield()))
       return mlir::failure();
 
     builder.setInsertionPointAfter(ifOp);
-    RuntimeBundle result;
-    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-            op, resultType, ifOp.getResults(), result)))
-      return mlir::failure();
+    RuntimeBundle result = RuntimeBundle::objectWithOwnership(
+        resultValue.getType(), mlir::ValueRange{},
+        ownership::logicalOwnershipKind(resultValue.getType(),
+                                        /*ownsObject=*/false));
     result.primitiveI64 = RuntimePrimitiveI64Evidence{rawResult, fastValid};
+    result.deferredObject = ifOp.getResult(0);
     valueBundles[resultValue] = std::move(result);
     return mlir::success();
   }
