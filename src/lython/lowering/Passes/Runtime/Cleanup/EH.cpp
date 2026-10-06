@@ -498,10 +498,32 @@ handledClassIds(llvm::BasicBlock *dispatch) {
     // are the inlined levels it leaves (ExceptionOps.cpp, lowerRaiseCurrent),
     // and an exception outside the list records the same levels on the
     // pad's passing edge instead.
+    //
+    // ⛔ UNLESS THE RE-RAISE IS ITSELF IN A `try` OF THIS FRAME. Then the
+    // exception the arms do not name goes on to that try's arms, in this
+    // frame, and a pad that lets it pass the frame by skips them:
+    //
+    //     try:
+    //         try:
+    //             boom()          # raises ValueError
+    //         except KeyError:
+    //             ...
+    //     except ValueError:      # never reached; the ValueError escaped
+    //         ...
+    //
+    // The re-raise says so by its call-site marker (or, converted already, by
+    // being an invoke), and such a frame keeps the catch-all pad.
     llvm::Instruction *tail = nullptr;
+    bool guardedRethrow = false;
     for (llvm::Instruction &instruction : *block) {
-      if (instruction.isDebugOrPseudoInst() || isErasedTryMarker(instruction))
+      if (instruction.isDebugOrPseudoInst())
         continue;
+      if (isErasedTryMarker(instruction)) {
+        if (const auto *marker = llvm::dyn_cast<llvm::CallInst>(&instruction))
+          guardedRethrow |= marker->getCalledFunction()->getName() ==
+                            "LyEH_TryCallSiteMarker";
+        continue;
+      }
       if (auto *push = llvm::dyn_cast<llvm::CallInst>(&instruction))
         if (push->getCalledFunction() &&
             push->getCalledFunction()->getName().starts_with(
@@ -512,7 +534,8 @@ handledClassIds(llvm::BasicBlock *dispatch) {
     }
     auto *rethrow = llvm::dyn_cast_or_null<llvm::CallBase>(tail);
     if (rethrow && rethrow->getCalledFunction() &&
-        rethrow->getCalledFunction()->getName() == "LyEH_RethrowCurrent")
+        rethrow->getCalledFunction()->getName() == "LyEH_RethrowCurrent" &&
+        !guardedRethrow && !llvm::isa<llvm::InvokeInst>(rethrow))
       return ids.empty() ? std::nullopt : std::optional(ids);
     return std::nullopt;
   }
