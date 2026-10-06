@@ -223,6 +223,18 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
                                               /*arity=*/0, bundle, {}, {})))
         return mlir::failure();
       mlir::Location loc = op.getLoc();
+      // Reserve the entries before inserting them: an empty dict's first
+      // growth is exactly what it is asked for, so the literal is its size
+      // rather than whatever growth from one entry at a time reaches.
+      if (std::optional<RuntimeSymbol> ensure =
+              manifest.primitive("builtins.dict", "ensure_capacity");
+          ensure && !dictKeyBundles.empty()) {
+        llvm::SmallVector<mlir::Value, 2> operands(
+            bundle.physicalValues().begin(), bundle.physicalValues().end());
+        operands.push_back(mlir::arith::ConstantIntOp::create(
+            builder, loc, static_cast<std::int64_t>(dictKeyBundles.size()), 64));
+        RuntimeBundleLowerer::createRuntimeCall(loc, *ensure, operands);
+      }
       for (auto [keyBundle, valueBundle] :
            llvm::zip(dictKeyBundles, dictValueBundles)) {
         mlir::FailureOr<RuntimeBundle> payloadKey =
