@@ -4,6 +4,8 @@
 #include "Runtime/Core/OwnedLocalMarker.h"
 
 #include "Runtime/ABI/BoxLayout.h"
+#include "Runtime/ABI/ConstantData.h"
+
 
 #include "PyProtocols.h"
 #include "PyTypeObject.h"
@@ -1904,12 +1906,113 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassDeallocators() {
   return mlir::success();
 }
 
+// The block `__ly_unicode_alloc_capacity` would build for `text`, with the
+// immortal refcount: [refcount, class, shape, capacity] then the code units,
+// each word little-endian (every supported target is). The width is PEP 393's,
+// chosen from the largest code point as `__ly_unicode_width_for` chooses it.
+// Empty when `text` is not strict UTF-8, which the runtime decoder rejects and
+// so is left to it.
+static std::optional<llvm::SmallVector<std::int8_t, 64>>
+staticStrImage(llvm::StringRef text, std::int64_t classId) {
+  llvm::SmallVector<std::uint32_t, 64> points;
+  std::size_t i = 0;
+  while (i < text.size()) {
+    auto byte = [&](std::size_t at) {
+      return static_cast<std::uint32_t>(static_cast<unsigned char>(text[at]));
+    };
+    std::uint32_t lead = byte(i);
+    unsigned length = lead < 0x80   ? 1
+                      : lead < 0xC2 ? 0
+                      : lead < 0xE0 ? 2
+                      : lead < 0xF0 ? 3
+                      : lead < 0xF5 ? 4
+                                    : 0;
+    if (length == 0 || i + length > text.size())
+      return std::nullopt;
+    std::uint32_t point = length == 1   ? lead
+                          : length == 2 ? (lead & 0x1F)
+                          : length == 3 ? (lead & 0x0F)
+                                        : (lead & 0x07);
+    for (unsigned k = 1; k < length; ++k) {
+      if ((byte(i + k) & 0xC0) != 0x80)
+        return std::nullopt;
+      point = (point << 6) | (byte(i + k) & 0x3F);
+    }
+    if ((length == 3 && (point < 0x800 || (point >= 0xD800 && point <= 0xDFFF))) ||
+        (length == 4 && (point < 0x10000 || point > 0x10FFFF)))
+      return std::nullopt;
+    points.push_back(point);
+    i += length;
+  }
+  std::uint32_t widest = 0;
+  for (std::uint32_t point : points)
+    widest = std::max(widest, point);
+  std::uint64_t width = widest < 256 ? 1 : widest < 65536 ? 2 : 4;
+  std::uint64_t dataBytes = points.size() * width;
+  llvm::SmallVector<std::int8_t, 64> image;
+  auto word = [&](std::uint64_t value) {
+    for (unsigned k = 0; k < 8; ++k)
+      image.push_back(static_cast<std::int8_t>((value >> (8 * k)) & 0xFF));
+  };
+  word(static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+  word(static_cast<std::uint64_t>(classId));
+  word((dataBytes << 3) | width);
+  word(dataBytes);
+  for (std::uint32_t point : points)
+    for (unsigned k = 0; k < width; ++k)
+      image.push_back(static_cast<std::int8_t>((point >> (8 * k)) & 0xFF));
+  return image;
+}
+
+
 // str and bytes share one physical shape (buffer, start, length), so the
 // contract name is the whole difference between materializing the two.
 mlir::LogicalResult RuntimeBundleLowerer::materializeByteBackedObject(
     mlir::Operation *op, llvm::StringRef contractName, llvm::StringRef data,
     RuntimeBundle &bundle) {
   mlir::Location loc = op->getLoc();
+  // ⭐ A str LITERAL IS ONE IMMORTAL OBJECT IN READ-ONLY DATA, as CPython's
+  // code-object constants are shared: `["hi" for _ in range(n)]` allocated
+  // and copied n strs where CPython holds one. Ownership is untouched -- the
+  // primitive's result is an owned token like `__new__`'s, and its retains
+  // and releases are no-ops at run time on the immortal refcount.
+  if (contractName == "builtins.str")
+    if (std::optional<RuntimeSymbol> fromStatic =
+            manifest.primitive("builtins.str", "from_static"))
+      if (std::optional<std::int64_t> classId = manifest.classId("builtins.str"))
+        if (std::optional<llvm::SmallVector<std::int8_t, 64>> image =
+                staticStrImage(data, *classId)) {
+          auto elements = mlir::DenseElementsAttr::get(
+              mlir::RankedTensorType::get(
+                  {static_cast<std::int64_t>(image->size())},
+                  builder.getI8Type()),
+              llvm::ArrayRef<std::int8_t>(*image));
+          mlir::Value block = constant_data::internReadOnlyBlock(
+              module, builder, loc, "str_object", data, elements,
+              /*alignment=*/16);
+          mlir::func::CallOp call =
+              RuntimeBundleLowerer::createRuntimeCall(loc, *fromStatic, {block});
+          return RuntimeBundleLowerer::bundleRuntimeResults(
+              op, runtimeContractType(context, contractName), call, bundle);
+        }
+  // ⭐ AND A bytes LITERAL, the same way; its payload address is the one word
+  // that has to be a relocation (the payload follows the four handle words).
+  if (contractName == "builtins.bytes")
+    if (std::optional<RuntimeSymbol> fromStatic =
+            manifest.primitive("builtins.bytes", "from_static"))
+      if (std::optional<std::int64_t> classId =
+              manifest.classId("builtins.bytes")) {
+        llvm::SmallVector<std::int64_t, 4> words{
+            std::numeric_limits<std::int64_t>::max(), *classId, 0,
+            static_cast<std::int64_t>(data.size())};
+        llvm::SmallVector<std::int8_t, 32> tail(data.begin(), data.end());
+        mlir::Value address = materializeStaticObjectAddress(
+            loc, "bytes", data, words, {{2u, 32}}, tail);
+        mlir::func::CallOp call =
+            RuntimeBundleLowerer::createRuntimeCall(loc, *fromStatic, {address});
+        return RuntimeBundleLowerer::bundleRuntimeResults(
+            op, runtimeContractType(context, contractName), call, bundle);
+      }
   mlir::Value bytes = RuntimeBundleLowerer::materializeByteBuffer(loc, data);
   mlir::Value start =
       mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();

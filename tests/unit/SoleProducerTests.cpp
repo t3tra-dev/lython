@@ -58,11 +58,14 @@ bool named(llvm::StringRef path, llvm::StringRef suffix) {
 } // namespace
 
 // `Common/MemRef1D.h` assembles the rank-1 memref descriptor, and is the only
-// thing that may.
+// thing that may. `ABI/StaticObjectImage.cpp` assembles a different struct --
+// a static object's read-only image, words then tail bytes -- in an LLVM
+// global's initializer.
 TEST(SoleProducerTest, TheRank1DescriptorIsAssembledInOnePlace) {
   llvm::SmallVector<std::string, 4> unexpected;
   for (const std::string &path : filesContaining("InsertValueOp::create"))
-    if (!named(path, "Common/MemRef1D.h"))
+    if (!named(path, "Common/MemRef1D.h") &&
+        !named(path, "ABI/StaticObjectImage.cpp"))
       unexpected.push_back(path);
 
   EXPECT_TRUE(unexpected.empty())
@@ -77,7 +80,8 @@ TEST(SoleProducerTest, TheRank1DescriptorIsAssembledInOnePlace) {
 // The allow-list above is only meaningful while every entry is load-bearing.
 // A stale exemption is the same species of rot as a stale comment.
 TEST(SoleProducerTest, TheDescriptorAssemblerExemptionsAreStillUsed) {
-  for (llvm::StringRef exemption : {"Common/MemRef1D.h"}) {
+  for (llvm::StringRef exemption :
+       {"Common/MemRef1D.h", "ABI/StaticObjectImage.cpp"}) {
     bool used = false;
     for (const std::string &path : filesContaining("InsertValueOp::create"))
       used = used || named(path, exemption);

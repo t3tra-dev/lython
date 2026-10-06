@@ -57,6 +57,8 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Metadata.h"
@@ -331,7 +333,37 @@ LogicalResult emitObjectFile(llvm::Module &llvmModule,
     llvm::errs() << "Target machine cannot emit object file\n";
     return failure();
   }
+  // ⭐ A CODEGEN ERROR FAILS THE COMPILE. The backend reports some failures
+  // as a diagnostic and carries on -- a static initializer it cannot
+  // relocate was printed as "error: unsupported expression in static
+  // initializer" while lyc exited 0 and the program ran on zeroed data.
+  struct CodegenErrors : llvm::DiagnosticHandler {
+    bool seen = false;
+    bool handleDiagnostics(const llvm::DiagnosticInfo &info) override {
+      if (info.getSeverity() != llvm::DS_Error)
+        return false;
+      seen = true;
+      llvm::errs() << "error: ";
+      llvm::DiagnosticPrinterRawOStream printer(llvm::errs());
+      info.print(printer);
+      llvm::errs() << "\n";
+      return true;
+    }
+  };
+  llvm::LLVMContext &llvmContext = llvmModule.getContext();
+  std::unique_ptr<llvm::DiagnosticHandler> previous =
+      llvmContext.getDiagnosticHandler();
+  llvmContext.setDiagnosticHandler(std::make_unique<CodegenErrors>());
   pass.run(llvmModule);
+  bool failedCodegen = static_cast<const CodegenErrors *>(
+                           llvmContext.getDiagHandlerPtr())
+                           ->seen;
+  llvmContext.setDiagnosticHandler(std::move(previous));
+  if (failedCodegen) {
+    dest.close();
+    llvm::sys::fs::remove(objectPath);
+    return failure();
+  }
   return success();
 }
 

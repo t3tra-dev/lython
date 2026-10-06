@@ -58,7 +58,8 @@ inline mlir::Value internReadOnlyBlock(mlir::ModuleOp module,
                                        mlir::OpBuilder &builder,
                                        mlir::Location loc, llvm::StringRef kind,
                                        llvm::StringRef contentKey,
-                                       mlir::DenseElementsAttr elements) {
+                                       mlir::DenseElementsAttr elements,
+                                       std::int64_t alignment = 0) {
   auto shaped = llvm::cast<mlir::ShapedType>(elements.getType());
   mlir::Type elementType = shaped.getElementType();
   auto globalType = mlir::MemRefType::get(shaped.getShape(), elementType);
@@ -81,7 +82,10 @@ inline mlir::Value internReadOnlyBlock(mlir::ModuleOp module,
       mlir::memref::GlobalOp::create(builder, loc, name,
                                      builder.getStringAttr("private"),
                                      globalType, elements,
-                                     /*constant=*/true, /*alignment=*/nullptr);
+                                     /*constant=*/true,
+                                     alignment ? builder.getI64IntegerAttr(
+                                                     alignment)
+                                               : mlir::IntegerAttr());
       break;
     }
     auto reusable = mlir::dyn_cast<mlir::memref::GlobalOp>(existing);

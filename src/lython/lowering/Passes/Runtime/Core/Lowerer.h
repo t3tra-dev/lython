@@ -637,6 +637,15 @@ private:
                                                   llvm::StringRef contractName,
                                                   llvm::StringRef data,
                                                   RuntimeBundle &bundle);
+  // The address, as an i64, of a read-only object image interned for
+  // `contentKey`: `words` (a word listed in `selfAddressWords` holds the
+  // image's own address plus the paired byte offset -- a relocation) and then
+  // `tail` bytes. The object reads back through a `from_static` primitive.
+  mlir::Value materializeStaticObjectAddress(
+      mlir::Location loc, llvm::StringRef kind, llvm::StringRef contentKey,
+      llvm::ArrayRef<std::int64_t> words,
+      llvm::ArrayRef<std::pair<unsigned, std::int64_t>> selfAddressWords,
+      llvm::ArrayRef<std::int8_t> tail);
   mlir::LogicalResult materializeStringObject(mlir::Operation *op,
                                               llvm::StringRef text,
                                               RuntimeBundle &bundle);
