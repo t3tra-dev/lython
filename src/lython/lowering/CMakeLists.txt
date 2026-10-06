@@ -65,6 +65,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Ops/UnionOps.cpp
     Passes/Runtime/Passes/Lowering.cpp
     Passes/Runtime/Passes/Ownership.cpp
+    Passes/Runtime/Passes/RegionExits.cpp
     Passes/Runtime/Passes/RefCountElision.cpp
     Passes/Runtime/Passes/ObservableRelease.cpp
     Passes/Runtime/Passes/Stubs.cpp

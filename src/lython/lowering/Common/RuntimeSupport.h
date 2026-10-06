@@ -172,6 +172,8 @@ createPublicationPreparationPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createObservableReleasePass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createRegionExitFlatteningPass();
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountInsertionPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createRefCountPairElisionPass();
