@@ -3434,6 +3434,9 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerExceptionFieldAttrGet(
       return op.emitError()
              << "runtime manifest has no builtins.int unbox.i64 primitive";
     auto bound = valueBundles.find(op.getResult());
+    // A deferred read already carries the lane (bindRetainedEvidenceValue).
+    if (bound != valueBundles.end() && bound->second.deferredObject)
+      return mlir::success();
     if (bound == valueBundles.end() || bound->second.physicalValues().empty())
       return op.emitError() << "exception field load produced no bundle";
     // Copy before building: createRuntimeCall may declare the callee, and the

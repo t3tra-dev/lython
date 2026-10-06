@@ -2266,7 +2266,12 @@ RuntimeBundleLowerer::lowerListRuntimeNext(py::NextOp op,
     if (mlir::failed(bindEvidenceObjectResult(op, op.getElement(),
                                               "runtime list element", element)))
       return mlir::failure();
-  } else {
+  } else if (mlir::FailureOr<bool> deferred =
+                 RuntimeBundleLowerer::bindDeferredIntRead(
+                     op, op.getElement(), element);
+             mlir::failed(deferred)) {
+    return mlir::failure();
+  } else if (!*deferred) {
     std::optional<RuntimeValue> retained =
         RuntimeBundleLowerer::retainEvidenceElement(op, element);
     if (!retained)

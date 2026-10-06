@@ -182,6 +182,19 @@ RuntimeBundleLowerer::materializePrimitiveI64ObjectAtCurrentInsertion(
   if (!RuntimeBundleLowerer::canMaterializePrimitiveI64Object(bundle))
     return op->emitError()
            << "bundle has no materializable primitive i64 object";
+  if (bundle.deferredObject) {
+    std::optional<RuntimeSymbol> materializeRead =
+        manifest.primitive("builtins.int", "materialize_read");
+    if (!materializeRead)
+      return op->emitError()
+             << "runtime manifest has no builtins.int materialize_read";
+    mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+        op->getLoc(), *materializeRead,
+        mlir::ValueRange{bundle.primitiveI64->value,
+                         bundle.primitiveI64->valid, bundle.deferredObject});
+    return RuntimeValue::object(bundle.objectValue.contract,
+                                mlir::ValueRange{call.getResult(0)});
+  }
   std::optional<RuntimeSymbol> initializer =
       manifest.initializer("builtins.int", "__new__");
   if (!initializer)

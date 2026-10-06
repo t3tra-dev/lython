@@ -135,6 +135,13 @@ RuntimeBundleLowerer::lanesFromBoxEntity(mlir::OpBuilder &builder,
                              .getResult();
   lanes.push_back(RuntimeBundleLowerer::memrefFromBoxWords(
       builder, loc, entityWord, headSize, head));
+  // An int view of a slot: `bindRetainedEvidenceValue` may read it without
+  // making an object (`LyLong_ReadSlotWord`), and this is how it knows the
+  // view came from a slot word rather than from an object.
+  if (contract == "builtins.int" && laneTypes.size() == 1)
+    if (mlir::Operation *def = lanes.front().getDefiningOp())
+      def->setAttr("ly.runtime.slot_entity_view",
+                   mlir::UnitAttr::get(builder.getContext()));
   if (laneTypes.size() == 1)
     return lanes;
 
