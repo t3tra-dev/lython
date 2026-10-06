@@ -549,6 +549,60 @@ TEST(DriverTest, StringAndBytesLiteralsInALoopStayOutOfTheFrame) {
          "written for";
 }
 
+// What: a function of float and int parameters gets an unboxed clone whose
+// body calls no runtime function -- its float arithmetic, comparisons and
+// loop-carried floats are f64 values -- and its call site calls that clone.
+TEST(DriverTest, AFloatFunctionRunsUnboxedInItsClone) {
+  CompileResult result = compileSource(
+      "def escape(cr: float, ci: float, limit: int) -> int:\n"
+      "    zr = 0.0\n"
+      "    zi = 0.0\n"
+      "    n = 0\n"
+      "    while n < limit and zr * zr + zi * zi <= 4.0:\n"
+      "        t = zr * zr - zi * zi + cr\n"
+      "        zi = 2.0 * zr * zi + ci\n"
+      "        zr = t\n"
+      "        n += 1\n"
+      "    return n\n\n\n"
+      "def f(x: float) -> float:\n"
+      "    return x * x - 2.0 * x\n\n\n"
+      "def integrate(a: float, b: float, n: int) -> float:\n"
+      "    h = (b - a) / n\n"
+      "    s = 0.0\n"
+      "    i = 0\n"
+      "    while i < n:\n"
+      "        s += f(a + (i + 0.5) * h)\n"
+      "        i += 1\n"
+      "    return s * h\n\n\n"
+      "print(escape(-0.5, 0.5, 50), integrate(0.0, 2.0, 100))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Module &module = *result.verified.llvmModule;
+  const llvm::Function *clone = module.getFunction("escape__lyrt_prim_i64");
+  ASSERT_NE(clone, nullptr) << "no clone was made for a float function";
+  // integrate's clone passes a computed float to f's clone: the argument
+  // must stay a lane, not be boxed for the call.
+  for (llvm::StringRef name :
+       {"escape__lyrt_prim_i64", "integrate__lyrt_prim_i64"}) {
+    const llvm::Function *function = module.getFunction(name);
+    ASSERT_NE(function, nullptr) << "no clone " << name.str();
+    for (const llvm::BasicBlock &block : *function)
+      for (const llvm::Instruction &instruction : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+          if (const llvm::Function *callee = call->getCalledFunction())
+            EXPECT_FALSE(callee->getName().starts_with("Ly"))
+                << name.str()
+                << " calls the runtime: " << callee->getName().str();
+  }
+  const llvm::Function *main = module.getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+  bool callsClone = false;
+  for (const llvm::BasicBlock &block : *main)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        callsClone = callsClone || call->getCalledFunction() == clone;
+  EXPECT_TRUE(callsClone) << "the call site does not speculate on the clone";
+}
+
 // What: a str, bytes or constant-tuple literal is one immortal static object,
 // not an allocation per evaluation -- the loop body calls the `from_static`
 // primitives and none of the allocating initializers.

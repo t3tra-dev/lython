@@ -325,6 +325,51 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           resultIndex += static_cast<unsigned>(operands.size()) - before;
           continue;
         }
+        // A float returns its f64 lane the same way an int returns its word.
+        if (bundle && bundle->kind == RuntimeBundle::Kind::Object &&
+            bundle->contractName() == "builtins.float" &&
+            resultIndex + 2 <= functionType.getNumResults() &&
+            functionType.getResult(resultIndex).isF64() &&
+            functionType.getResult(resultIndex + 1).isInteger(1)) {
+          if (bundle->primitiveF64) {
+            operands.push_back(bundle->primitiveF64->value);
+            operands.push_back(bundle->primitiveF64->valid);
+          } else {
+            // A float that became an object on the way (some op needed one,
+            // so this clone already calls the runtime and is never
+            // speculated on): its value is a pure load.
+            std::optional<RuntimeSymbol> unbox =
+                manifest.primitive("builtins.float", "unbox.f64");
+            if (!unbox || bundle->physicalValues().empty()) {
+              op.emitError() << "primitive clone float return has neither a "
+                                "lane nor an object";
+              result = mlir::failure();
+              return mlir::WalkResult::interrupt();
+            }
+            operands.push_back(RuntimeBundleLowerer::createRuntimeCall(
+                                   op.getLoc(), *unbox,
+                                   bundle->physicalValues())
+                                   .getResult(0));
+            operands.push_back(
+                constantInt(builder, op.getLoc(), builder.getI1Type(), 1));
+          }
+          if (primitiveI64CloneDecisionFlags.count(function.getOperation())) {
+            builder.setInsertionPoint(op);
+            if (mlir::Value intact =
+                    RuntimeBundleLowerer::primitiveI64CloneDecisionsIntact(
+                        op.getOperation(), function))
+              operands.back() =
+                  mlir::arith::AndIOp::create(builder, op.getLoc(),
+                                              operands.back(), intact)
+                      .getResult();
+          }
+          if (mlir::failed(releaseReturnedObjectIfOwned(*bundle))) {
+            result = mlir::failure();
+            return mlir::WalkResult::interrupt();
+          }
+          resultIndex += 2;
+          continue;
+        }
         if (!bundle || bundle->kind != RuntimeBundle::Kind::Object ||
             bundle->contractName() != "builtins.int") {
           op.emitError()

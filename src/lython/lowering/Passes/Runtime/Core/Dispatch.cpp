@@ -16,6 +16,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPyOp(mlir::Operation *op) {
   // A store into a slot gives the stored container a second holder; the pack
   // path records the same thing for a literal.
   RuntimeBundleLowerer::markAbsorbedContainerAsShared(op);
+  if (mlir::failed(RuntimeBundleLowerer::materializeLazyFloatOperands(op)))
+    return mlir::failure();
   return llvm::TypeSwitch<mlir::Operation *, mlir::LogicalResult>(op)
       .Case<py::ClassOp>([&](auto classOp) {
         erase.push_back(classOp.getOperation());

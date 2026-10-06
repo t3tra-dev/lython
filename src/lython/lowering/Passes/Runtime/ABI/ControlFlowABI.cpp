@@ -300,17 +300,29 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   // lane: the block argument ABI is the (i64, valid) evidence pair, keeping
   // loop-carried ints unboxed (the boxed expansion would sever the evidence
   // and drag the whole loop onto the boxed path).
+  // A float merges in an (f64, valid) lane the same way, in a clone that can
+  // fall back (not a generator resume, whose frame lanes are ints only).
+  // `primitiveIntLane` then names either scalar lane; the first physical
+  // type says which.
   auto enclosing = argument.getOwner()->getParentOp();
+  auto enclosingFunction =
+      mlir::dyn_cast_if_present<mlir::func::FuncOp>(enclosing);
+  bool inClone = enclosingFunction &&
+                 RuntimeBundleLowerer::isPrimitiveI64CallableClone(
+                     enclosingFunction);
+  bool primitiveFloatLane =
+      inClone && !enclosingFunction->hasAttr("ly.generator.resume") &&
+      runtimeContractName(argument.getType()) == "builtins.float";
   bool primitiveIntLane =
-      mlir::isa_and_nonnull<mlir::func::FuncOp>(enclosing) &&
-      RuntimeBundleLowerer::isPrimitiveI64CallableClone(
-          mlir::cast<mlir::func::FuncOp>(enclosing)) &&
-      runtimeContractName(argument.getType()) == "builtins.int";
+      (inClone && runtimeContractName(argument.getType()) == "builtins.int") ||
+      primitiveFloatLane;
 
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> physicalTypes;
   if (primitiveIntLane) {
     llvm::SmallVector<mlir::Type, 8> pairTypes;
-    pairTypes.push_back(mlir::IntegerType::get(context, 64));
+    pairTypes.push_back(primitiveFloatLane
+                            ? mlir::Type(mlir::Float64Type::get(context))
+                            : mlir::Type(mlir::IntegerType::get(context, 64)));
     pairTypes.push_back(mlir::IntegerType::get(context, 1));
     physicalTypes = std::move(pairTypes);
   } else {
@@ -339,8 +351,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
         argument.getType(), mlir::ValueRange{},
         ownership::logicalOwnershipKind(argument.getType(),
                                         /*ownsObject=*/false));
-    provisionalBundle.primitiveI64 = RuntimePrimitiveI64Evidence{
-        physicalArguments[0], physicalArguments[1]};
+    RuntimePrimitiveI64Evidence lane{physicalArguments[0],
+                                     physicalArguments[1]};
+    if (primitiveFloatLane)
+      provisionalBundle.primitiveF64 = lane;
+    else
+      provisionalBundle.primitiveI64 = lane;
   } else if (mlir::failed(RuntimeBundleLowerer::makeObjectBundle(
                  op, argument.getType(), physicalArguments,
                  provisionalBundle))) {
@@ -525,7 +541,27 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
              << "control-flow branch operand has no lowered runtime bundle";
 
     llvm::SmallVector<mlir::Value, 8> physicalOperands;
-    if (primitiveIntLane) {
+    if (primitiveIntLane && physicalTypes.front().isF64()) {
+      if (source->primitiveF64) {
+        physicalOperands.push_back(source->primitiveF64->value);
+        physicalOperands.push_back(source->primitiveF64->valid);
+      } else {
+        // A boxed float rejoining the lane: its value is a pure load.
+        std::optional<RuntimeSymbol> unbox =
+            manifest.primitive("builtins.float", "unbox.f64");
+        if (!unbox ||
+            unbox->function.getNumArguments() != source->physicalValues().size())
+          return anchor->emitError()
+                 << "primitive float merge source has neither a lane nor an "
+                    "unboxable representation";
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            anchor->getLoc(), *unbox, source->physicalValues());
+        physicalOperands.push_back(call.getResult(0));
+        physicalOperands.push_back(
+            mlir::arith::ConstantIntOp::create(builder, anchor->getLoc(), 1, 1)
+                .getResult());
+      }
+    } else if (primitiveIntLane) {
       if (source->primitiveI64) {
         physicalOperands.push_back(source->primitiveI64->value);
         physicalOperands.push_back(source->primitiveI64->valid);
@@ -705,9 +741,13 @@ mlir::LogicalResult RuntimeBundleLowerer::spliceControlFlowBlockArgumentEdges(
     // work. Only a lane the ABI already created for this argument is
     // protected.
     std::optional<RuntimePrimitiveI64Evidence> ownLane = merged.primitiveI64;
+    std::optional<RuntimePrimitiveI64Evidence> ownFloatLane =
+        merged.primitiveF64;
     merged.copyEvidenceFrom(sourceBundles.front());
     if (ownLane)
       merged.primitiveI64 = ownLane;
+    if (ownFloatLane)
+      merged.primitiveF64 = ownFloatLane;
     // Same physical identity does not imply same compile-time knowledge: an
     // arm may have recorded element/field evidence whose SSA values the other
     // arm never defines. Keeping the first arm's version would answer that
@@ -1007,6 +1047,45 @@ RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
   RuntimeBundle trueBundle = *truePtr;
   RuntimeBundle falseBundle = *falsePtr;
 
+  // Two float lanes select as lanes; a lazy float meeting an object becomes
+  // one first, since a select picks between equal physical spans.
+  {
+    builder.setInsertionPoint(select);
+    mlir::Location loc = select.getLoc();
+    bool trueLazy = RuntimeBundleLowerer::hasLazyPrimitiveF64Object(trueBundle);
+    bool falseLazy =
+        RuntimeBundleLowerer::hasLazyPrimitiveF64Object(falseBundle);
+    if (trueLazy && falseLazy) {
+      auto pick = [&](mlir::Value a, mlir::Value b) {
+        return mlir::arith::SelectOp::create(builder, loc,
+                                             select.getCondition(), a, b)
+            .getResult();
+      };
+      RuntimeBundle lazy;
+      RuntimeBundleLowerer::makePrimitiveF64Bundle(
+          result.getType(),
+          pick(trueBundle.primitiveF64->value, falseBundle.primitiveF64->value),
+          pick(trueBundle.primitiveF64->valid, falseBundle.primitiveF64->valid),
+          lazy);
+      valueBundles[result] = std::move(lazy);
+      erase.push_back(select);
+      return mlir::success();
+    }
+    for (RuntimeBundle *side : {&trueBundle, &falseBundle}) {
+      if (!RuntimeBundleLowerer::hasLazyPrimitiveF64Object(*side))
+        continue;
+      mlir::FailureOr<RuntimeValue> object =
+          RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+              select, *side);
+      if (mlir::failed(object))
+        return mlir::failure();
+      RuntimeBundle materialized =
+          RuntimeBundle::object(side->objectValue.contract, object->values);
+      materialized.copyEvidenceFrom(*side);
+      *side = std::move(materialized);
+    }
+  }
+
   mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> physicalTypes =
       RuntimeBundleLowerer::runtimeValueTypesFor(select, result.getType(),
                                                  "runtime value select");
@@ -1051,6 +1130,16 @@ RuntimeBundleLowerer::lowerRuntimeValueSelect(mlir::arith::SelectOp select) {
                             .getResult();
     bundle.primitiveI64 = RuntimePrimitiveI64Evidence{value, valid};
   }
+  if (trueBundle.primitiveF64 && falseBundle.primitiveF64)
+    bundle.primitiveF64 = RuntimePrimitiveI64Evidence{
+        mlir::arith::SelectOp::create(builder, loc, select.getCondition(),
+                                      trueBundle.primitiveF64->value,
+                                      falseBundle.primitiveF64->value)
+            .getResult(),
+        mlir::arith::SelectOp::create(builder, loc, select.getCondition(),
+                                      trueBundle.primitiveF64->valid,
+                                      falseBundle.primitiveF64->valid)
+            .getResult()};
   valueBundles[result] = std::move(bundle);
   erase.push_back(select);
   return mlir::success();

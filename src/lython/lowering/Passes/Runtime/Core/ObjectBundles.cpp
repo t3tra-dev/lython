@@ -146,6 +146,78 @@ bool RuntimeBundleLowerer::hasLazyPrimitiveI64Object(
          bundle.primitiveI64->valid.getType().isInteger(1);
 }
 
+void RuntimeBundleLowerer::makePrimitiveF64Bundle(mlir::Type contract,
+                                                  mlir::Value value,
+                                                  mlir::Value valid,
+                                                  RuntimeBundle &bundle) const {
+  bundle = RuntimeBundle::objectWithOwnership(
+      contract, mlir::ValueRange{},
+      ownership::logicalOwnershipKind(contract, /*ownsObject=*/false));
+  bundle.primitiveF64 = RuntimePrimitiveI64Evidence{value, valid};
+}
+
+bool RuntimeBundleLowerer::hasPrimitiveF64Evidence(
+    const RuntimeBundle *bundle) const {
+  return bundle && bundle->kind == RuntimeBundle::Kind::Object &&
+         bundle->contractName() == "builtins.float" && bundle->primitiveF64 &&
+         bundle->primitiveF64->value &&
+         bundle->primitiveF64->value.getType().isF64() &&
+         bundle->primitiveF64->valid &&
+         bundle->primitiveF64->valid.getType().isInteger(1);
+}
+
+bool RuntimeBundleLowerer::hasLazyPrimitiveF64Object(
+    const RuntimeBundle &bundle) const {
+  return RuntimeBundleLowerer::hasPrimitiveF64Evidence(&bundle) &&
+         bundle.physicalValues().empty();
+}
+
+mlir::FailureOr<RuntimeValue>
+RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+    mlir::Operation *op, const RuntimeBundle &bundle) {
+  if (!RuntimeBundleLowerer::hasLazyPrimitiveF64Object(bundle))
+    return op->emitError() << "bundle has no materializable float lane";
+  std::optional<RuntimeSymbol> initializer =
+      manifest.initializer("builtins.float", "__new__");
+  if (!initializer)
+    return op->emitError() << "runtime manifest has no builtins.float.__new__";
+  mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+      op->getLoc(), *initializer, mlir::ValueRange{bundle.primitiveF64->value});
+  return RuntimeValue::object(bundle.objectValue.contract,
+                              mlir::ValueRange{call.getResult(0)});
+}
+
+// ⭐ ONE PLACE TURNS A LANE INTO AN OBJECT, at the value's definition, so the
+// object dominates every later use whichever op asked first. ⛔ Not at the op
+// that asked: a use in another branch would then name an object made in this
+// one. And not at each of the two dozen readers that already handle a lazy
+// int: each would have to learn the float spelling, and one that did not would
+// read an f64 as an i64.
+mlir::LogicalResult
+RuntimeBundleLowerer::materializeLazyFloatOperands(mlir::Operation *op) {
+  if (RuntimeBundleLowerer::readsFloatLanes(op))
+    return mlir::success();
+  for (mlir::Value operand : op->getOperands()) {
+    auto found = valueBundles.find(operand);
+    if (found == valueBundles.end() ||
+        !RuntimeBundleLowerer::hasLazyPrimitiveF64Object(found->second))
+      continue;
+    RuntimeBundle lazy = found->second;
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfterValue(lazy.primitiveF64->value);
+    mlir::FailureOr<RuntimeValue> object =
+        RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+            op, lazy);
+    if (mlir::failed(object))
+      return mlir::failure();
+    RuntimeBundle materialized =
+        RuntimeBundle::object(lazy.objectValue.contract, object->values);
+    materialized.copyEvidenceFrom(lazy);
+    valueBundles[operand] = std::move(materialized);
+  }
+  return mlir::success();
+}
+
 bool RuntimeBundleLowerer::canMaterializePrimitiveI64Object(
     const RuntimeBundle &bundle) const {
   return RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle);

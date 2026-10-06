@@ -2556,6 +2556,20 @@ RuntimeBundleLowerer::lowerUnarySpecial(mlir::Operation *op, mlir::Value input,
   // three that would otherwise put a manifest call in the middle of an
   // otherwise-unboxed function -- and one such call is enough to cost the
   // function its clone, because a clone that allocates cannot be speculated on.
+  {
+    llvm::SmallVector<mlir::Value, 1> inputs{input};
+    llvm::SmallVector<const RuntimeBundle *, 1> sources;
+    if (const RuntimeBundle *bundle = RuntimeBundleLowerer::bundleFor(input))
+      sources.push_back(bundle);
+    if (sources.size() == 1 &&
+        RuntimeBundleLowerer::floatLaneApplies(op, methodName, sources)) {
+      if (mlir::failed(RuntimeBundleLowerer::lowerPrimitiveF64Special(
+              op, methodName, sources, resultValue)))
+        return mlir::failure();
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
   if (primitiveI64UnarySpecialSupported(methodName)) {
     llvm::SmallVector<mlir::Value, 1> inputs{input};
     llvm::SmallVector<const RuntimeBundle *, 1> sources;

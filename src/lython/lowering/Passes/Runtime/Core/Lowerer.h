@@ -400,6 +400,25 @@ private:
                                 mlir::ValueRange rawValues,
                                 RuntimeBundle &bundle);
   bool hasLazyPrimitiveI64Object(const RuntimeBundle &bundle) const;
+  // The float lane (`RuntimeBundle::primitiveF64`).
+  void makePrimitiveF64Bundle(mlir::Type contract, mlir::Value value,
+                              mlir::Value valid, RuntimeBundle &bundle) const;
+  bool hasPrimitiveF64Evidence(const RuntimeBundle *bundle) const;
+  bool hasLazyPrimitiveF64Object(const RuntimeBundle &bundle) const;
+  mlir::FailureOr<RuntimeValue>
+  materializePrimitiveF64ObjectAtCurrentInsertion(mlir::Operation *op,
+                                                  const RuntimeBundle &bundle);
+  // Gives every lazy-float operand of `op` an object, unless `op` reads the
+  // lane itself (`readsFloatLanes`).
+  mlir::LogicalResult materializeLazyFloatOperands(mlir::Operation *op);
+  bool readsFloatLanes(mlir::Operation *op) const;
+  // Primitive/F64Calls.cpp.
+  bool floatLaneApplies(mlir::Operation *op, llvm::StringRef method,
+                        llvm::ArrayRef<const RuntimeBundle *> sources) const;
+  mlir::LogicalResult
+  lowerPrimitiveF64Special(mlir::Operation *op, llvm::StringRef method,
+                           llvm::ArrayRef<const RuntimeBundle *> sources,
+                           mlir::Value resultValue);
   bool canMaterializePrimitiveI64Object(const RuntimeBundle &bundle) const;
   bool hasPrimitiveI64Evidence(const RuntimeBundle *bundle) const;
   bool allSourcesHavePrimitiveI64Evidence(
@@ -1997,6 +2016,10 @@ private:
 
 // Peels class-upcast / refine / protocol-view wrappers off a value: the
 // returned-value summaries must see the underlying object identity.
+// True when every use of `op` is a call's positional-argument pack
+// (Ops/PackAndBindingOps.cpp).
+bool packIsOnlyCallArguments(py::PackOp op);
+
 inline mlir::Value stripReturnedObjectView(mlir::Value value) {
   while (value) {
     mlir::Operation *def = value.getDefiningOp();

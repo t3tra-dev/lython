@@ -119,7 +119,41 @@ bool isNonUnwindingRefcountHelper(const llvm::Function *callee) {
          py::ownership::isRefcountMaintenanceSymbol(callee->getName());
 }
 
+bool mayPropagatePythonException(const llvm::Function *callee);
+
+// A primitive clone is a rehearsal (Primitive/I64Calls.cpp): it says "cannot
+// say" instead of raising, so it unwinds only if something it calls does.
+// ⛔ Not by its name alone: a clone that kept a boxed call (and so is never
+// speculated on) still reaches the runtime, which can raise.
+bool primitiveCloneMayPropagate(
+    const llvm::Function *clone,
+    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
+  if (!visiting.insert(clone).second)
+    return false;
+  for (const llvm::BasicBlock &block : *clone)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        const llvm::Function *callee = call->getCalledFunction();
+        if (!callee)
+          return true;
+        llvm::StringRef name = callee->getName();
+        bool primitive = name.contains("__lyrt_prim_i64") &&
+                         !name.contains("__lyrt_gen") &&
+                         !callee->isDeclaration();
+        if (primitive ? primitiveCloneMayPropagate(callee, visiting)
+                      : mayPropagatePythonException(callee))
+          return true;
+      }
+  return false;
+}
+
 bool mayPropagatePythonException(const llvm::Function *callee) {
+  if (callee && !callee->isDeclaration() &&
+      callee->getName().contains("__lyrt_prim_i64") &&
+      !callee->getName().contains("__lyrt_gen")) {
+    llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
+    return primitiveCloneMayPropagate(callee, visiting);
+  }
   if (isPythonDebugFunction(callee))
     return true;
   if (!callee || callee->isDeclaration() || callee->isIntrinsic() ||

@@ -69,6 +69,7 @@ add_library(LythonRuntimeLowering STATIC
     Passes/Runtime/Passes/ObservableRelease.cpp
     Passes/Runtime/Passes/Stubs.cpp
     Passes/Runtime/Primitive/I64Calls.cpp
+    Passes/Runtime/Primitive/F64Calls.cpp
     Passes/Runtime/Primitive/TensorGemm.cpp
     Passes/Runtime/Primitive/TensorPacking.cpp
     Passes/Runtime/Primitive/TensorParallel.cpp

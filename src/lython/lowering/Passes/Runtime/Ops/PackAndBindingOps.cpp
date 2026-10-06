@@ -61,6 +61,10 @@ static bool isOnlyUsedAsStaticMetadataSequence(py::PackOp op) {
 
 } // namespace
 
+bool packIsOnlyCallArguments(py::PackOp op) {
+  return isOnlyUsedAsCallArgumentPack(op);
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
   if (isOnlyUsedAsCallArgumentPack(op)) {
     RuntimeBundle bundle =
