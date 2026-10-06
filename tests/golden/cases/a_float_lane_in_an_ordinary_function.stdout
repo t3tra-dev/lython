@@ -1,0 +1,15 @@
+partial 17.5
+17.5
+ZeroDivisionError: division by zero
+ZeroDivisionError: division by zero
+[-1.0, -1.0] [0.25, 0.75]
+True False False False False False True True
+False False False False False True False True
+OverflowError: int too large to convert to float
+[1e+300, nan, -0.0, 5e-324, inf] {0: 1e+300, 1: nan, 2: -0.0, 3: 5e-324, 4: inf}
+5.0
+0.333 none
+[1.0, 0.5, 0.25, 0.125]
+0.0 0.25 1.0
+{1.0} True
+499.5 4.995000e+02 499.5 -499.5

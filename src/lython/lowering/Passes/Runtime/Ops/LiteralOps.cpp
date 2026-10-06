@@ -158,8 +158,7 @@ RuntimeBundleLowerer::lowerFloatConstant(py::FloatConstantOp op) {
   // Inside a clone a float literal is its lane: an object here would be an
   // allocation, and one allocation costs the clone its speculation.
   auto function = op->getParentOfType<mlir::func::FuncOp>();
-  if (RuntimeBundleLowerer::isPrimitiveI64CallableClone(function) &&
-      !function->hasAttr("ly.generator.resume")) {
+  if (function && !function->hasAttr("ly.generator.resume")) {
     RuntimeBundle lazy;
     RuntimeBundleLowerer::makePrimitiveF64Bundle(
         op.getResult().getType(), value,

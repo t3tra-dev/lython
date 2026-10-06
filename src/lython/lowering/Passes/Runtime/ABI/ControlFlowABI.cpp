@@ -310,8 +310,12 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
   bool inClone = enclosingFunction &&
                  RuntimeBundleLowerer::isPrimitiveI64CallableClone(
                      enclosingFunction);
+  // ⭐ A float merges in its lane in EVERY function, not only a clone: a float
+  // has no width to outgrow, so the lane is always valid and the loop that
+  // carries it allocates nothing. A reader that needs the object boxes it
+  // where it reads (materializeLazyFloatOperands).
   bool primitiveFloatLane =
-      inClone && !enclosingFunction->hasAttr("ly.generator.resume") &&
+      enclosingFunction && !enclosingFunction->hasAttr("ly.generator.resume") &&
       runtimeContractName(argument.getType()) == "builtins.float";
   bool primitiveIntLane =
       (inClone && runtimeContractName(argument.getType()) == "builtins.int") ||
@@ -353,6 +357,17 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerControlFlowBlockArgument(
                                         /*ownsObject=*/false));
     RuntimePrimitiveI64Evidence lane{physicalArguments[0],
                                      physicalArguments[1]};
+    // ⭐ Outside a clone every float lane is valid: nothing there answers
+    // "cannot say" (an op the lane cannot answer takes its slow arm on the
+    // spot), so the merged flag is the constant, and the ops downstream emit
+    // no slow arm for a flag that cannot be false.
+    if (primitiveFloatLane && !inClone) {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(block);
+      lane.valid =
+          mlir::arith::ConstantIntOp::create(builder, argument.getLoc(), 1, 1)
+              .getResult();
+    }
     if (primitiveFloatLane)
       provisionalBundle.primitiveF64 = lane;
     else

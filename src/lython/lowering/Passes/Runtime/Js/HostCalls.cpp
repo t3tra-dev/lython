@@ -116,6 +116,9 @@ RuntimeBundleLowerer::pushJsValue(mlir::Operation *op,
   std::string contract = source.contractName();
   if (contract == "types.NoneType")
     return callJsPrimitive(op, "push.none", {});
+  // A float lane crosses as the number it is, with no object made for it.
+  if (contract == "builtins.float" && source.primitiveF64)
+    return callJsPrimitive(op, "push.f64", source.primitiveF64->value);
   mlir::FailureOr<RuntimeBundle> materialized =
       RuntimeBundleLowerer::materializeObjectBundleForStorage(
           op, source, runtimeContractType(context, contract),

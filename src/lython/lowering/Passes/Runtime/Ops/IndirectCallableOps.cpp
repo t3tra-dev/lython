@@ -144,6 +144,21 @@ mlir::LogicalResult RuntimeBundleLowerer::appendBundlePhysicalOperands(
     llvm::SmallVectorImpl<mlir::Value> &operands) {
   llvm::ArrayRef<mlir::Value> values = bundle.physicalValues();
   std::optional<RuntimeValue> materializedObject;
+  // A float lane meets an object ABI here (a return, an edge into a non-lane
+  // argument, a union): it is boxed where it is handed over.
+  if (values.empty() &&
+      RuntimeBundleLowerer::hasLazyPrimitiveF64Object(bundle)) {
+    mlir::FailureOr<RuntimeValue> value =
+        RuntimeBundleLowerer::materializePrimitiveF64ObjectAtCurrentInsertion(
+            op, bundle);
+    if (mlir::failed(value))
+      return mlir::failure();
+    RuntimeBundle boxed = RuntimeBundle::object(bundle.objectValue.contract,
+                                                value->values);
+    boxed.copyEvidenceFrom(bundle);
+    return RuntimeBundleLowerer::appendBundlePhysicalOperands(
+        op, boxed, expectedTypes, operands);
+  }
   if (values.empty() &&
       RuntimeBundleLowerer::hasLazyPrimitiveI64Object(bundle)) {
     mlir::FailureOr<RuntimeValue> value =

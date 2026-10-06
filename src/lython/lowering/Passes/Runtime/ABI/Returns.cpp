@@ -605,6 +605,21 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
         result = mlir::failure();
         return mlir::WalkResult::interrupt();
       }
+      // A float returned as its lane leaves as an object made here, which the
+      // caller then owns.
+      RuntimeBundle boxedLane;
+      if (RuntimeBundleLowerer::hasLazyPrimitiveF64Object(*bundle)) {
+        mlir::FailureOr<RuntimeValue> object = RuntimeBundleLowerer::
+            materializePrimitiveF64ObjectAtCurrentInsertion(op, *bundle);
+        if (mlir::failed(object)) {
+          result = mlir::failure();
+          return mlir::WalkResult::interrupt();
+        }
+        boxedLane =
+            RuntimeBundle::object(bundle->objectValue.contract, object->values);
+        boxedLane.copyEvidenceFrom(*bundle);
+        bundle = &boxedLane;
+      }
       mlir::Type logicalResultType =
           logicalResultIndex < logicalResultTypes.size()
               ? logicalResultTypes[logicalResultIndex]

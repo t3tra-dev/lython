@@ -410,7 +410,14 @@ private:
                                                   const RuntimeBundle &bundle);
   // Gives every lazy-float operand of `op` an object, unless `op` reads the
   // lane itself (`readsFloatLanes`).
-  mlir::LogicalResult materializeLazyFloatOperands(mlir::Operation *op);
+  // Boxes each lazy float operand `op` reads as an object, just before `op`,
+  // and records the lane bundle to put back once `op` is lowered.
+  mlir::LogicalResult materializeLazyFloatOperands(
+      mlir::Operation *op,
+      llvm::SmallVectorImpl<std::pair<mlir::Value, RuntimeBundle>> &lazy);
+  mlir::LogicalResult lowerPyOpRule(mlir::Operation *op);
+  bool bindFloatSlotRead(mlir::Operation *op, mlir::Value resultValue,
+                         const RuntimeValue &value);
   bool readsFloatLanes(mlir::Operation *op) const;
   // Primitive/F64Calls.cpp.
   bool floatLaneApplies(mlir::Operation *op, llvm::StringRef method,
