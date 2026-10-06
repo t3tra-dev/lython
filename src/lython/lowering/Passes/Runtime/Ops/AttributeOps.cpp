@@ -1404,6 +1404,32 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
   }
 
+  // A builtin contract's property is a manifest primitive named
+  // `property.<name>` taking the object: `complex.real` reads a part out of
+  // the handle, where no field slot exists to load.
+  if (object->kind == RuntimeBundle::Kind::Object) {
+    std::string contract = runtimeContractName(op.getObject().getType());
+    if (std::optional<RuntimeSymbol> property = manifest.primitive(
+            contract, (llvm::Twine("property.") + op.getName()).str())) {
+      llvm::SmallVector<const RuntimeBundle *, 1> sources{object};
+      llvm::SmallVector<mlir::Value, 4> operands;
+      builder.setInsertionPoint(op);
+      if (mlir::failed(buildRuntimeCallOperands(op, *property, sources,
+                                                operands,
+                                                /*allowUnusedSources=*/false)))
+        return mlir::failure();
+      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+          op.getLoc(), *property, operands);
+      RuntimeBundle result;
+      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+              op, op.getResult().getType(), call, result)))
+        return mlir::failure();
+      valueBundles[op.getResult()] = std::move(result);
+      erase.push_back(op);
+      return mlir::success();
+    }
+  }
+
   // ExceptionGroup.message / .exceptions read the message lane and the
   // extended member block through manifest primitives — like args, there is
   // no field slot to load, so this must run before the class-field paths.

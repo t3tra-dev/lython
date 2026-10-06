@@ -1313,89 +1313,160 @@ std::optional<Value> ModuleEmitter::emitComplexBinary(const parser::Node &expr,
   auto isComplex = [&](const Value &value) {
     return types.widenLiteral(value.type) == complexType;
   };
-  if (!isComplex(lhs) && !isComplex(rhs))
+  auto isReal = [&](const Value &value) {
+    mlir::Type widened = types.widenLiteral(value.type);
+    return widened == types.intType() || widened == types.boolType() ||
+           widened == types.floatType();
+  };
+  bool lhsComplex = isComplex(lhs);
+  bool rhsComplex = isComplex(rhs);
+  if (!lhsComplex && !rhsComplex)
+    return std::nullopt;
+  // complex with something that is neither complex nor a real number is the
+  // general dispatch's question (and its refusal), not this one's.
+  if ((!lhsComplex && !isReal(lhs)) || (!rhsComplex && !isReal(rhs)))
     return std::nullopt;
 
   bool isAdd = ast::isOperator(op, "Add");
   bool isSub = ast::isOperator(op, "Sub");
   bool isMul = ast::isOperator(op, "Mult");
   bool isDiv = ast::isOperator(op, "Div");
-  if (!isAdd && !isSub && !isMul && !isDiv) {
+  bool isPow = ast::isOperator(op, "Pow");
+  if (!isAdd && !isSub && !isMul && !isDiv && !isPow) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
-        "complex supports only +, -, *, / (CPython raises TypeError for the "
-        "other operators)"});
+        "complex supports only +, -, *, / and ** (CPython raises TypeError "
+        "for the other operators)"});
     return emitNone(expr);
   }
+  llvm::StringRef method = isAdd   ? "__add__"
+                           : isSub ? "__sub__"
+                           : isMul ? "__mul__"
+                           : isDiv ? "__truediv__"
+                                   : "__pow__";
+  llvm::StringRef reflected = isAdd   ? "__radd__"
+                              : isSub ? "__rsub__"
+                              : isMul ? "__rmul__"
+                              : isDiv ? "__rtruediv__"
+                                      : "__rpow__";
 
-  // Compile-time parts of a constant operand (complex, float, or small int).
-  auto constantParts =
-      [&](const Value &value) -> std::optional<std::complex<double>> {
+  // A constant operand's value, when it has one.
+  auto constantComplex =
+      [&](const Value &value) -> std::optional<std::pair<double, double>> {
     if (!value.value)
       return std::nullopt;
     if (auto constant = value.value.getDefiningOp<py::ComplexConstantOp>())
-      return std::complex<double>(constant.getReal().convertToDouble(),
-                                  constant.getImag().convertToDouble());
+      return std::make_pair(constant.getReal().convertToDouble(),
+                            constant.getImag().convertToDouble());
+    return std::nullopt;
+  };
+  auto constantReal = [&](const Value &value) -> std::optional<double> {
+    if (!value.value)
+      return std::nullopt;
     if (auto constant = value.value.getDefiningOp<py::FloatConstantOp>())
-      return std::complex<double>(constant.getValue().convertToDouble(), 0.0);
+      return constant.getValue().convertToDouble();
     if (auto constant = value.value.getDefiningOp<py::IntConstantOp>()) {
       long long parsed = 0;
-      if (!llvm::StringRef(constant.getValue()).getAsInteger(10, parsed))
-        return std::complex<double>(static_cast<double>(parsed), 0.0);
+      // Exactly representable only: a wider int rounds, and CPython's
+      // conversion of it is the runtime's question.
+      if (!llvm::StringRef(constant.getValue()).getAsInteger(10, parsed) &&
+          parsed >= -(1LL << 53) && parsed <= (1LL << 53))
+        return static_cast<double>(parsed);
     }
     return std::nullopt;
   };
-  std::optional<std::complex<double>> lhsParts = constantParts(lhs);
-  std::optional<std::complex<double>> rhsParts = constantParts(rhs);
-
-  auto materialize = [&](std::complex<double> parts) -> Value {
+  auto materialize = [&](double re, double im) -> Value {
     auto constant = py::ComplexConstantOp::create(
-        builder, loc(expr), complexType, builder.getF64FloatAttr(parts.real()),
-        builder.getF64FloatAttr(parts.imag()));
+        builder, loc(expr), complexType, builder.getF64FloatAttr(re),
+        builder.getF64FloatAttr(im));
     return {constant.getResult(), complexType};
   };
 
-  // Both constant: fold (`1 + 2j` IS a BinOp over two constants). Constant
-  // division by zero stays a runtime raise.
-  if (lhsParts && rhsParts &&
-      !(isDiv && rhsParts->real() == 0.0 && rhsParts->imag() == 0.0)) {
-    std::complex<double> folded =
-        isAdd   ? *lhsParts + *rhsParts
-        : isSub ? *lhsParts - *rhsParts
-        : isMul ? *lhsParts * *rhsParts
-                : *lhsParts / *rhsParts;
-    return materialize(folded);
+  // ⭐ FOLDED ONLY WHERE THE ANSWER IS ONE IEEE OPERATION PER PART: + and -,
+  // which are `_Py_c_sum`, `_Py_cr_sum`, `_Py_c_diff`, `_Py_cr_diff` and
+  // `_Py_rc_diff` exactly (`1 + 2j` is a BinOp over two constants). ⛔ Not *,
+  // / or **: their last ulp is the TARGET's (CPython's C is contracted to
+  // fmuladd where the target has FMA), and folding here would give the
+  // compiling host's.
+  if (isAdd || isSub) {
+    std::optional<std::pair<double, double>> lc = constantComplex(lhs);
+    std::optional<std::pair<double, double>> rc = constantComplex(rhs);
+    std::optional<double> lr = lhsComplex ? std::nullopt : constantReal(lhs);
+    std::optional<double> rr = rhsComplex ? std::nullopt : constantReal(rhs);
+    if (lc && rc)
+      return isAdd ? materialize(lc->first + rc->first,
+                                 lc->second + rc->second)
+                   : materialize(lc->first - rc->first,
+                                 lc->second - rc->second);
+    if (lc && rr)
+      return materialize(isAdd ? lc->first + *rr : lc->first - *rr,
+                         lc->second);
+    if (lr && rc)
+      return isAdd ? materialize(*lr + rc->first, rc->second)
+                   : materialize(*lr - rc->first, -rc->second);
   }
 
-  auto promote = [&](Value value,
-                     std::optional<std::complex<double>> parts)
-      -> std::optional<Value> {
-    if (isComplex(value))
+  // ⭐ A REAL OPERAND STAYS REAL. CPython 3.14 combines a float (or an int,
+  // converted to float) with a complex directly -- `_Py_cr_sum` adds to the
+  // real part only -- so `complex(1, -0.0) + 1.0` keeps the -0.0 that
+  // promoting 1.0 to `1+0j` loses. The complex operand is the receiver either
+  // way; a real left operand reaches the reflected method, as CPython reaches
+  // `complex.__radd__` after `float.__add__` declines. The operands stay in
+  // source order: a reflected method's receiver is the right one.
+  auto asFloat = [&](Value value) -> Value {
+    if (types.widenLiteral(value.type) == types.floatType())
       return value;
-    if (parts)
-      return materialize(*parts);
-    return std::nullopt;
+    return emitFloatFromInt(expr, value);
   };
-  std::optional<Value> promotedLhs = promote(lhs, lhsParts);
-  std::optional<Value> promotedRhs = promote(rhs, rhsParts);
-  if (!promotedLhs || !promotedRhs) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, expr.range.start,
-        "complex arithmetic with a non-constant int/float operand is not "
-        "supported yet; both operands must be complex (or numeric constants)"});
-    return emitNone(expr);
+  if (lhsComplex && rhsComplex) {
+    if (isAdd)
+      return emitBinarySpecial<py::AddOp>(expr, method, lhs, rhs, complexType);
+    if (isSub)
+      return emitBinarySpecial<py::SubOp>(expr, method, lhs, rhs, complexType);
+    if (isMul)
+      return emitBinarySpecial<py::MulOp>(expr, method, lhs, rhs, complexType);
+    if (isDiv)
+      return emitBinarySpecial<py::DivOp>(expr, method, lhs, rhs, complexType);
+    return emitBinarySpecial<py::PowOp>(expr, method, lhs, rhs, complexType);
   }
+  if (lhsComplex) {
+    Value right = asFloat(rhs);
+    if (isAdd)
+      return emitBinarySpecial<py::AddOp>(expr, method, lhs, right,
+                                          complexType);
+    if (isSub)
+      return emitBinarySpecial<py::SubOp>(expr, method, lhs, right,
+                                          complexType);
+    if (isMul)
+      return emitBinarySpecial<py::MulOp>(expr, method, lhs, right,
+                                          complexType);
+    if (isDiv)
+      return emitBinarySpecial<py::DivOp>(expr, method, lhs, right,
+                                          complexType);
+    return emitBinarySpecial<py::PowOp>(expr, method, lhs, right, complexType);
+  }
+  Value left = asFloat(lhs);
+  CallInferenceResult inference =
+      types.inferMethodCallWithEvidence(rhs.type, reflected, {left.type});
+  if (!requireStaticEvidence(expr, inference))
+    return emitNone(expr);
+  auto build = [&](auto tag) -> Value {
+    using Op = decltype(tag);
+    auto built = Op::create(builder, loc(expr), complexType,
+                            mlir::FlatSymbolRefAttr::get(&context, reflected),
+                            reflected, callProtocolFor(inference), left.value,
+                            rhs.value);
+    return {built.getResult(), complexType};
+  };
   if (isAdd)
-    return emitBinarySpecial<py::AddOp>(expr, "__add__", *promotedLhs,
-                                        *promotedRhs, complexType);
+    return build(py::AddOp());
   if (isSub)
-    return emitBinarySpecial<py::SubOp>(expr, "__sub__", *promotedLhs,
-                                        *promotedRhs, complexType);
+    return build(py::SubOp());
   if (isMul)
-    return emitBinarySpecial<py::MulOp>(expr, "__mul__", *promotedLhs,
-                                        *promotedRhs, complexType);
-  return emitBinarySpecial<py::DivOp>(expr, "__truediv__", *promotedLhs,
-                                      *promotedRhs, complexType);
+    return build(py::MulOp());
+  if (isDiv)
+    return build(py::DivOp());
+  return build(py::PowOp());
 }
 
 // ⭐ `in` FALLS BACK TO ITERATION, which is what CPython does for a class with
@@ -2111,6 +2182,27 @@ Value ModuleEmitter::emitScalarCompare(const parser::Node &expr, Value lhs,
                                                types.boolType(), bit);
       return Value{pyBool.getResult(), types.boolType()};
     }
+  }
+  // ⭐ A REAL NUMBER EQUALS A COMPLEX THROUGH complex.__eq__: CPython's
+  // float.__eq__ (and int's) answer NotImplemented for a complex, and the
+  // reflected comparison is the same method with the operands swapped. A bool
+  // takes the int overload, as `PyLong_Check(True)` does.
+  if (ast::isOperator(op, "Eq") || ast::isOperator(op, "NotEq")) {
+    mlir::Type complexType = types.contract("builtins.complex");
+    auto isRealType = [&](mlir::Type type) {
+      return type == types.intType() || type == types.boolType() ||
+             type == types.floatType();
+    };
+    mlir::Type left = types.widenLiteral(lhs.type);
+    mlir::Type right = types.widenLiteral(rhs.type);
+    if (left == complexType && isRealType(right)) {
+      // already the receiver
+    } else if (right == complexType && isRealType(left)) {
+      std::swap(lhs, rhs);
+    }
+    if (types.widenLiteral(lhs.type) == complexType &&
+        types.widenLiteral(rhs.type) == types.boolType())
+      rhs = emitIntFromBool(expr, rhs);
   }
   if (ast::isOperator(op, "NotEq") || ast::isOperator(op, "IsNot")) {
     // CPython's object.__ne__ negates whatever __eq__ RESOLVED to, so a class
@@ -3038,8 +3130,8 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
   //
   // ⛔ `numerator`/`denominator` for an int only: a float has neither in
   // CPython (AttributeError), and complex has no `.numerator` either -- those
-  // keep whatever answer they had. complex's `.real`/`.imag` are real lanes
-  // rather than folds and are not this.
+  // keep whatever answer they had. complex's `.real`/`.imag` are read from
+  // the object (the manifest's `property.real`/`property.imag`), not folded.
   if (*attr == "real" || *attr == "imag" || *attr == "numerator" ||
       *attr == "denominator") {
     mlir::Type receiver = types.widenLiteral(object.type);
@@ -3058,18 +3150,13 @@ Value ModuleEmitter::emitAttribute(const parser::Node &expr) {
       Value zero = emitExpr(synth::intConstant(0, expr.range).get());
       return emitFloatFromInt(expr, zero);
     }
-    // ⛔ complex's two are REAL LANES and not folds -- slots 2 and 3 of its
-    // header -- and the manifest declares no accessor for either. Said here
-    // because the alternative is the lowering's "attr.get object type has no
-    // class schema", which describes the compiler rather than the program.
+    // complex's two parts are read out of the object, by the manifest's
+    // `property.real` / `property.imag`.
     if (receiver == types.contract("builtins.complex") &&
         (*attr == "real" || *attr == "imag")) {
-      diagnostics.push_back(parser::Diagnostic{
-          parser::Severity::Error, expr.range.start,
-          "complex." + std::string(*attr) +
-              " is not available: the runtime stores the two parts but "
-              "declares no accessor for them"});
-      return emitNone(expr);
+      auto read = py::AttrGetOp::create(builder, loc(expr), types.floatType(),
+                                        object.value, *attr);
+      return Value{read.getResult(), types.floatType()};
     }
   }
   // ⛔ `__doc__` IS NOT STORED. A docstring is dropped at emit time, so the
