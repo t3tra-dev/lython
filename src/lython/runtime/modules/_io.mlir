@@ -1931,8 +1931,8 @@ module attributes {
   func.func private @__ly_unicode_data_offset() -> i64
   func.func private @__ly_unicode_raw_bytes(%hdr_ptr: i64) -> i64
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
-  func.func private @LyUnicode_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
-  func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyUnicode_Repr(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
+  func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
 
   func.func private @__ly_io_meta_new(%name_header: memref<2xi64>, %mode_header: memref<2xi64>) -> i64 {
     %c0 = arith.constant 0 : index
@@ -1990,7 +1990,7 @@ module attributes {
 
   // name (0) or mode (1) of a stream, as a new reference. A standard stream
   // keeps no block: its descriptor names it, `<stdin>` read, the others write.
-  func.func private @__ly_io_meta_str(%self: memref<8xi64>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_io_meta_str(%self: memref<8xi64>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %meta_slot = arith.constant 7 : index
     %handle_slot = arith.constant 2 : index
@@ -2174,7 +2174,7 @@ module attributes {
   // FileIO's own spelling of its mode (fileio.c mode_string): x and a keep
   // their letter, a readable-and-writable stream is rb+ however it was
   // opened, and 'b' is always there.
-  func.func private @__ly_io_fileio_mode(%base: i64, %plus: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_io_fileio_mode(%base: i64, %plus: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %zero = arith.constant 0 : i64
     %x_byte = arith.constant 120 : i64

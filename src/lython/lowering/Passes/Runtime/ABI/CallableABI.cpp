@@ -913,6 +913,12 @@ mlir::LogicalResult RuntimeBundleLowerer::buildCallableProtocolArgumentABIs() {
         builder.insert(clone);
       }
       callableProtocolArgumentABIs[cloneName] = argumentTypes;
+      llvm::SmallVector<mlir::Attribute, 8> overrides;
+      for (mlir::Type type : argumentTypes)
+        overrides.push_back(type ? mlir::Attribute(mlir::TypeAttr::get(type))
+                                 : mlir::Attribute(builder.getUnitAttr()));
+      clone->setAttr(ownership::kProtocolArgumentTypesAttr,
+                     builder.getArrayAttr(overrides));
       if (auto returnedValue = returnedValueSummaries.find(entry.getKey());
           returnedValue != returnedValueSummaries.end())
         returnedValueSummaries[cloneName] = returnedValue->second;

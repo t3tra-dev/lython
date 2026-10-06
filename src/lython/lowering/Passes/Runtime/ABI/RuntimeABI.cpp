@@ -409,6 +409,8 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
     std::string name;
   };
   llvm::SmallVector<Entry, 8> entries;
+  llvm::SmallVector<mlir::NamedAttribute, 8> exceptionAliases;
+  mlir::Builder builder0(context);
   mlir::LogicalResult collected = mlir::success();
   module.walk([&](py::ClassOp classOp) {
     if (mlir::failed(collected))
@@ -428,9 +430,23 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeUserExceptionHooks() {
     entries.push_back(Entry{
         *classId, *parentId,
         py::contracts::displayClassNameForContract(classOp.getSymName())});
+    exceptionAliases.push_back(
+        mlir::NamedAttribute(builder0.getStringAttr(classOp.getSymName()),
+                             builder0.getStringAttr("builtins.BaseException")));
   });
   if (mlir::failed(collected))
     return mlir::failure();
+  // A program exception is released by BaseException's deallocator; say so
+  // by name (`collectRuntimeDeallocators`).
+  if (!exceptionAliases.empty()) {
+    llvm::SmallVector<mlir::NamedAttribute, 8> merged;
+    if (auto existing = module->getAttrOfType<mlir::DictionaryAttr>(
+            own::kDeallocatorAliasesAttr))
+      merged.append(existing.begin(), existing.end());
+    merged.append(exceptionAliases.begin(), exceptionAliases.end());
+    module->setAttr(own::kDeallocatorAliasesAttr,
+                    builder0.getDictionaryAttr(merged));
+  }
 
   mlir::OpBuilder builder(context);
   builder.setInsertionPointToEnd(module.getBody());

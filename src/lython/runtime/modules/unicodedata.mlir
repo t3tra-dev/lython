@@ -35,7 +35,7 @@ module attributes {
   ]
 } {
   // ---- declarations resolved by the runtime import merge ----
-  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64
   func.func private @__ly_unicode_count(%header: memref<2xi64>, %bytes: memref<?xi8>) -> i64
   func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64
@@ -47,7 +47,7 @@ module attributes {
   func.func private @__ly_ucd_ext_cp(%packed: i64, %j: i64) -> i64
   func.func private @__ly_ucd_numeric_value(%idx: i64) -> f64
   func.func private @__ly_ucd_category_char(%cat: i64, %j: i64) -> i64
-  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
@@ -292,7 +292,7 @@ module attributes {
   // widens, and needs no table: 'a'..'z' and 'A'..'Z' differ by one bit and
   // everything else is itself. `casefold` is `lower` here -- the two differ only
   // where the UCD says so, and it says so nowhere below 0x80.
-  func.func private @__ly_unicode_ascii_case(%bytes: memref<?xi8>, %n: index, %to_upper: i1) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_ascii_case(%bytes: memref<?xi8>, %n: index, %to_upper: i1) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %one = arith.constant 1 : i64
@@ -321,7 +321,7 @@ module attributes {
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_unicode_case_transform(%header: memref<2xi64>, %bytes: memref<?xi8>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_case_transform(%header: memref<2xi64>, %bytes: memref<?xi8>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -358,7 +358,7 @@ module attributes {
 
   // The general path: two walks over the UCD case tables, one to size the
   // result and pick its width and one to write it.
-  func.func private @__ly_unicode_case_transform_ucd(%header: memref<2xi64>, %bytes: memref<?xi8>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_case_transform_ucd(%header: memref<2xi64>, %bytes: memref<?xi8>, %which: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -501,7 +501,7 @@ module attributes {
   // 2 swapcase), the same measure-then-fill shape as
   // __ly_unicode_case_transform. Positions that lower a capital sigma go
   // through the Final_Sigma rule.
-  func.func private @__ly_unicode_word_case_transform(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_word_case_transform(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64

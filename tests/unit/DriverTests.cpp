@@ -2473,6 +2473,24 @@ TEST(DriverTest, AnImportedFunctionReturnsTheClassItsModuleImports) {
   EXPECT_TRUE(result.succeeded) << result.diagnostics;
 }
 
+// What: an imported module's annotated global names the module's own class
+// -- `list[A]` there is `lib.A` -- so a field of an element read from the
+// importer resolves, and a method of the module that fills it agrees.
+TEST(DriverTest, AnImportedGlobalAnnotationNamesItsModulesClass) {
+  CompileResult result = compileWithModules(
+      {{"lib", "class A:\n"
+               "    def __init__(self, n: int) -> None:\n"
+               "        self.n = n\n\n"
+               "    def push(self) -> None:\n"
+               "        _held.append(self)\n\n\n"
+               "_held: list[A] = []\n"
+               "_one: A = A(4)\n"}},
+      "import lib\n"
+      "lib.A(3).push()\n"
+      "print(lib._held[0].n, lib._one.n)\n");
+  EXPECT_TRUE(result.succeeded) << result.diagnostics;
+}
+
 // What: an imported module may keep callables in a container global, the
 // same as one callable global; the element type is resolved.
 TEST(DriverTest, AnImportedModuleKeepsCallablesInAContainer) {

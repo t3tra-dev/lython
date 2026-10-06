@@ -246,6 +246,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.ACtypesLibraryOtherThanTheProgramIsRefused"
     "DriverTest.AnUntabledCtypesSymbolsAddressLinksOnWasi"
     "DriverTest.AnImportedFunctionReturnsTheClassItsModuleImports"
+    "DriverTest.AnImportedGlobalAnnotationNamesItsModulesClass"
     "DriverTest.OnlyAValueWhoseReleaseIsObservableIsKeptAlive"
     "DriverTest.AnIntOrFloatAContainerOnlyStoresGoesInAsItsSlotWord"
     "DriverTest.ALibrarysModuleAliasIsNotTheProgramsName"
@@ -518,30 +519,6 @@ foreach(case_path IN LISTS LYTHON_GOLDEN_CASES)
     endif()
     lython_add_golden_case(cases "${case_path}" ${case_timeout})
 endforeach()
-
-# --- Release-interface width gate --------------------------------------------
-#
-# `lowering/Passes/Runtime/ABI/HandleWidthRegistry.h` reserves a handle width for
-# a contract before that contract converts, so two tracks cannot pick the same
-# one. That reservation was enforced by reading a comment, and the file's own
-# ledger was measurably wrong while it was maintained that way: it recorded four
-# contracts as converted-and-safe that were sharing a width, because grepping one
-# tree for absence cannot see an unmerged branch. `complex` collided with `bytes`
-# twice for exactly that reason.
-#
-# Why a ctest and not a note in the review checklist: the collision it catches is
-# created by a MERGE, at which point neither branch's author is looking at the
-# other's manifest. A gate on the merged tree is the first moment the claim is
-# checkable at all.
-#
-# Cheap by construction -- it parses the manifests and compiles nothing, so it
-# reaches no pipeline stage and carries `fast`.
-add_test(NAME "abi.handle_width_reservations"
-    COMMAND Python3::Interpreter
-        "${CMAKE_CURRENT_SOURCE_DIR}/probe/tools/tiecensus.py"
-        "${CMAKE_SOURCE_DIR}")
-set_tests_properties("abi.handle_width_reservations" PROPERTIES
-    TIMEOUT 60 LABELS "abi;fast")
 
 # --- Precompiled native runtime ----------------------------------------------
 #

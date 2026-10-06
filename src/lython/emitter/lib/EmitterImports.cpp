@@ -1315,6 +1315,14 @@ void ModuleEmitter::collectImportedModuleGlobals() {
       continue;
     const std::vector<parser::NodePtr> body =
         staticModuleStatements(types, *rawBody);
+    // The annotation is read in ITS module, where `A` is that module's class.
+    // ⛔ Not in the importer's scope, which is where this walk runs: there a
+    // bare `A` named `builtins.A`, a class nothing declares, so
+    // `_held: list[A]` in lib.py made every `lib._held[0].n` a read of no
+    // class ("attr.get object type has no class schema").
+    TypeSystem::ScopeIsolation isolation = types.isolateScopes();
+    auto moduleScope = types.pushScope();
+    bindSourceClassLocals(types, source.moduleName, body);
     for (const parser::NodePtr &statement : body) {
       if (!statement ||
           (statement->kind != "AnnAssign" && statement->kind != "Assign"))

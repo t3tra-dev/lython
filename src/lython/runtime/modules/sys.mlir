@@ -112,7 +112,7 @@ module attributes {
   // out does not move when the box narrows -- writing an element at the old
   // stride into a narrower array corrupts the NEXT element's refcount, which
   // is not a crash here but wherever that element is next released.
-  func.func @LySys_GetArgv() -> memref<9xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
+  func.func @LySys_GetArgv() -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.primitive = "sys_argv"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
 

@@ -1,3 +1,4 @@
+#include "ExceptionTaxonomy.h"
 #include "Ownership.h"
 
 #include "Common/PythonSourceRange.h"
@@ -31,29 +32,25 @@ namespace contracts = py::contracts;
 
 // Deallocator-lookup census, enabled by LYTHON_DEALLOC_CENSUS=1.
 //
-// Why NOT key the counters on `values[offset]`: an arity-1 key cannot name an
-// arity-3 tie.  The four container contracts led with `memref<2xi64>`, so a
-// census keyed on the leading value folded a 3-type tie into the width-2 bucket
-// and reported "all 119 ambiguous exits were on memref<2xi64>" when 63 of them
-// were the container tie.  The key here is the whole tied inputTypes list.
+// A lookup is by contract name only, so what is worth counting is where a
+// name was missing or named nothing the values have: a reader that lost a
+// name, or a lane (an unboxed int, a bool bit) that is not a resource at all.
 //
 // Why NOT a compile-time flag: the ablation has to run on ONE binary, so that a
 // with/without comparison cannot be confounded by a rebuild.
 namespace {
 
 struct DeallocCensus {
-  // Keyed by the printed inputTypes list of the tied release interface.
-  llvm::StringMap<uint64_t> ambiguous;   // Ownership.cpp:419, contract-less exit
-  llvm::StringMap<uint64_t> resolved;    // contract-aware overload succeeded
+  llvm::StringMap<uint64_t> resolved;    // contract name -> lookups that found it
   llvm::StringMap<uint64_t> unresolved;  // callee whose owned result found none
-  uint64_t emptyName = 0;                // :429, no contract name at the call
-  uint64_t fallback = 0;                 // :450, name present but no type match
-  uint64_t contractAwareAmbiguous = 0;   // named overload tied (same contract)
-  // Times a reader that HAS a callee fell to the contract-less overload because
-  // ownedResultContractName() returned nothing.  This -- not `emptyName` -- is
-  // where GAP 1 surfaces: the contract-aware overload is never entered at all,
-  // so its `contractName.empty()` guard never runs.
+  uint64_t emptyName = 0;                // asked with no contract name
+  uint64_t namedTie = 0;                 // two deallocators of one name fit
+  // Times a reader that HAS a callee asked with no name because
+  // ownedResultContractName() returned nothing: a declaration to add.
   uint64_t declaredNameAbsent = 0;
+  // A name that matched no deallocator against the values, keyed by the name,
+  // what it has, what was there, and who asked for which function.
+  llvm::StringMap<uint64_t> misses;
 
   static bool enabled() {
     static const bool on = [] {
@@ -67,17 +64,16 @@ struct DeallocCensus {
     if (!enabled())
       return;
     llvm::errs() << "[DEALLOC] empty_name=" << emptyName
-                 << " fallback_450=" << fallback
-                 << " contract_aware_ambiguous=" << contractAwareAmbiguous
+                 << " named_tie=" << namedTie
                  << " declared_name_absent=" << declaredNameAbsent << "\n";
-    for (auto &entry : ambiguous)
-      llvm::errs() << "[DEALLOC] ambiguous " << entry.getKey() << " = "
-                   << entry.getValue() << "\n";
     for (auto &entry : resolved)
       llvm::errs() << "[DEALLOC] resolved " << entry.getKey() << " = "
                    << entry.getValue() << "\n";
     for (auto &entry : unresolved)
       llvm::errs() << "[DEALLOC] unresolved_callee " << entry.getKey() << " = "
+                   << entry.getValue() << "\n";
+    for (auto &entry : misses)
+      llvm::errs() << "[DEALLOC] miss " << entry.getKey() << " = "
                    << entry.getValue() << "\n";
   }
 };
@@ -87,10 +83,35 @@ DeallocCensus &census() {
   return instance;
 }
 
-// Which collector asked.  An ambiguous exit is only actionable by declaring a
-// contract name if the asking collector has a callee to read the name from;
-// `collectRuntimeResourceGroups` scans a bare value range and has none.
+// Which collector asked: a miss is only actionable by declaring a contract
+// name if the asking collector has a callee to read the name from.
 const char *g_origin = "other";
+// The callee (or function) whose values the current lookup is about.
+std::string g_subject = "?";
+
+} // namespace
+
+DeallocCensusContext::DeallocCensusContext(const char *origin,
+                                           llvm::StringRef subject)
+    : previousOrigin(g_origin), previousSubject(g_subject) {
+  g_origin = origin;
+  g_subject = subject.str();
+}
+
+DeallocCensusContext::~DeallocCensusContext() {
+  g_origin = previousOrigin;
+  g_subject = previousSubject;
+}
+
+namespace {
+
+struct SubjectScope {
+  std::string previous;
+  explicit SubjectScope(llvm::StringRef name) : previous(g_subject) {
+    g_subject = name.str();
+  }
+  ~SubjectScope() { g_subject = previous; }
+};
 
 struct OriginScope {
   const char *previous;
@@ -412,6 +433,40 @@ collectRuntimeDeallocators(mlir::ModuleOp module) {
   for (RuntimeDeallocator &deallocator : deallocators)
     if (deallocator.shapeTypes.empty())
       deallocator.shapeTypes = deallocator.inputTypes;
+
+  // ⭐ A CONTRACT RELEASED BY ANOTHER'S DEALLOCATOR IS NAMED SO, not left to
+  // be found by its shape. Every builtin exception is released by
+  // `builtins.BaseException`'s (they share one layout), and the lowering lists
+  // the program's own exception classes in `kDeallocatorAliasesAttr`. Each
+  // alias is a copy of the target's entry under the alias's name, so a lookup
+  // by name finds it and none falls back to matching types.
+  // ⛔ Not resolved at lookup by walking an ancestry: the verifier and the
+  // inserter share this list and nothing else, and a second resolution rule
+  // in one of them is the divergence GAP 2 describes.
+  llvm::StringMap<std::string> aliases;
+  for (const py::exceptions::BuiltinExceptionInfo &info :
+       py::exceptions::kBuiltinExceptions)
+    aliases[info.contract] = "builtins.BaseException";
+  if (auto declared = module->getAttrOfType<mlir::DictionaryAttr>(
+          kDeallocatorAliasesAttr))
+    for (mlir::NamedAttribute entry : declared)
+      if (auto target = mlir::dyn_cast<mlir::StringAttr>(entry.getValue()))
+        aliases[entry.getName().getValue()] = target.getValue().str();
+  llvm::SmallVector<RuntimeDeallocator, 8> aliased;
+  for (auto &alias : aliases) {
+    if (llvm::any_of(deallocators, [&](const RuntimeDeallocator &existing) {
+          return existing.contractName == alias.getKey();
+        }))
+      continue;
+    for (const RuntimeDeallocator &target : deallocators)
+      if (target.contractName == alias.getValue()) {
+        RuntimeDeallocator copy = target;
+        copy.contractName = alias.getKey().str();
+        copy.alias = true;
+        aliased.push_back(std::move(copy));
+      }
+  }
+  deallocators.append(aliased.begin(), aliased.end());
   return deallocators;
 }
 
@@ -508,53 +563,17 @@ mlir::Value underlyingObjectValue(mlir::Value value) {
 
 const RuntimeDeallocator *
 findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
-                             llvm::ArrayRef<RuntimeDeallocator> deallocators) {
-  // Release interfaces are entity-root prefixes, so several contracts share
-  // the same inputTypes; disambiguate by the longest canonical-shape match
-  // (the interior-view tail differs per contract).
-  const RuntimeDeallocator *matched = nullptr;
-  bool ambiguous = false;
-  auto shapeMatch = [&](const RuntimeDeallocator &deallocator) -> unsigned {
-    if (deallocator.shapeTypes.size() <= deallocator.inputTypes.size())
-      return 0;
-    return valueRangeMatchesTypes(values, offset, deallocator.shapeTypes)
-               ? static_cast<unsigned>(deallocator.shapeTypes.size())
-               : 0;
-  };
-  unsigned matchedShape = 0;
-  for (const RuntimeDeallocator &deallocator : deallocators) {
-    if (!valueRangeMatchesTypes(values, offset, deallocator.inputTypes))
-      continue;
-    unsigned shape = shapeMatch(deallocator);
-    if (!matched || deallocator.inputTypes.size() > matched->inputTypes.size() ||
-        (deallocator.inputTypes.size() == matched->inputTypes.size() &&
-         shape > matchedShape)) {
-      matched = &deallocator;
-      matchedShape = shape;
-      ambiguous = false;
-      continue;
-    }
-    if (deallocator.inputTypes.size() == matched->inputTypes.size() &&
-        shape == matchedShape)
-      ambiguous = true;
-  }
-  if (ambiguous) {
-    if (DeallocCensus::enabled() && matched)
-      ++census().ambiguous[std::string(g_origin) + " " +
-                           typeListKey(matched->inputTypes)];
-    return nullptr;
-  }
-  return matched;
-}
-
-const RuntimeDeallocator *
-findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators,
                              llvm::StringRef contractName) {
+  // ⭐ BY NAME ONLY. A value whose contract is not named is not released
+  // through a guess at what it is: the shape of a handle is shared by every
+  // contract of that width (thirty user classes and `object` are all one
+  // 5-word box), so a shape match either ties -- and answered nothing -- or
+  // picks among contracts that merely look alike.
   if (contractName.empty()) {
     if (DeallocCensus::enabled())
       ++census().emptyName;
-    return findDeallocatorForValueGroup(values, offset, deallocators);
+    return nullptr;
   }
 
   const RuntimeDeallocator *matched = nullptr;
@@ -576,16 +595,27 @@ findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
   if (matched) {
     if (DeallocCensus::enabled()) {
       if (ambiguous)
-        ++census().contractAwareAmbiguous;
+        ++census().namedTie;
       else
         ++census().resolved[contractName];
     }
     return ambiguous ? nullptr : matched;
   }
 
-  if (DeallocCensus::enabled())
-    ++census().fallback;
-  return findDeallocatorForValueGroup(values, offset, deallocators);
+  if (DeallocCensus::enabled()) {
+    std::string have;
+    for (const RuntimeDeallocator &deallocator : deallocators)
+      if (deallocator.contractName == contractName)
+        have += typeListKey(deallocator.inputTypes);
+    std::string got;
+    if (offset < values.size())
+      got = typeListKey(llvm::SmallVector<mlir::Type, 2>{
+          values[offset].getType()});
+    ++census().misses[contractName.str() + " have=" +
+                      (have.empty() ? "none" : have) + " got=" + got + " in " +
+                      g_origin + " " + g_subject];
+  }
+  return nullptr;
 }
 
 llvm::SmallVector<mlir::Value, 4> valueSlice(mlir::ValueRange values,
@@ -793,44 +823,17 @@ OwnershipKind logicalOwnershipKind(mlir::Type logicalType, bool ownsObject) {
   return ownsObject ? OwnershipKind::Own : OwnershipKind::Borrow;
 }
 
-static std::optional<OwnershipCondition>
-optionalUnionPayloadCondition(mlir::func::FuncOp callee,
-                              mlir::func::CallOp call, unsigned groupOffset) {
-  if (!callee || groupOffset != 1 || call.getNumResults() < 2)
-    return std::nullopt;
-
-  auto callableAttr = callee->getAttrOfType<mlir::TypeAttr>(kCallableTypeAttr);
-  if (!callableAttr)
-    return std::nullopt;
-  auto callable =
-      mlir::dyn_cast_if_present<py::CallableType>(callableAttr.getValue());
-  if (!callable || callable.getResultTypes().size() != 1)
-    return std::nullopt;
-
-  auto unionType =
-      mlir::dyn_cast_if_present<py::UnionType>(callable.getResultTypes()[0]);
-  if (!unionType)
-    return std::nullopt;
-
-  llvm::ArrayRef<mlir::Type> members = unionType.getMemberTypes();
-  auto isNoneLike = [](mlir::Type type) {
-    return py::isPyNoneType(type);
-  };
-  if (members.size() != 2 ||
-      (!isNoneLike(members[0]) && !isNoneLike(members[1])))
-    return std::nullopt;
-
-  unsigned payloadIndex = isNoneLike(members[0]) ? 1 : 0;
-  return OwnershipCondition{call.getResult(0),
-                            static_cast<std::int64_t>(payloadIndex),
-                            static_cast<unsigned>(members.size())};
-}
-
 static bool isNoneLikeType(mlir::Type type) {
   return py::isPyNoneType(type);
 }
 
-static llvm::SmallVector<ResourceGroup, 4>
+static bool isReceiverEvidence(mlir::func::FuncOp callee) {
+  auto evidence =
+      callee->getAttrOfType<mlir::StringAttr>(contracts::kManifestResultEvidenceAttr);
+  return evidence && evidence.getValue() == "receiver";
+}
+
+llvm::SmallVector<ResourceGroup, 4>
 collectContractOwnedResultGroups(mlir::func::FuncOp callee,
                                  mlir::func::CallOp call,
                                  llvm::ArrayRef<RuntimeDeallocator>
@@ -870,9 +873,18 @@ collectContractOwnedResultGroups(mlir::func::FuncOp callee,
     // which is the defect rather than a guard against it.
     llvm::StringRef declaredName = ownedResultContractName(
         callee, *contract, static_cast<unsigned>(contractIndex));
+    // ⛔ The receiver's name only where the declaration says the result IS
+    // the receiver's kind: an initializer, or a method whose result evidence
+    // is its receiver. Anywhere else it is a guess, and `LyFloat_Repr`'s str
+    // released through float's deallocator was that guess.
+    if (declaredName.empty() &&
+        (callee->hasAttr(contracts::kManifestInitializerAttr) ||
+         isReceiverEvidence(callee)))
+      declaredName = contractAttr.getValue();
+    if (declaredName.empty())
+      continue;
     const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
-        call.getResults(), offset, deallocators,
-        declaredName.empty() ? contractAttr.getValue() : declaredName);
+        call.getResults(), offset, deallocators, declaredName);
     if (!deallocator)
       continue;
     ResourceGroup group;
@@ -894,6 +906,7 @@ deallocatorValueCountForType(mlir::ValueRange values, unsigned offset,
                              mlir::Type type) {
   if (isNoneLikeType(type))
     return 0;
+  OriginScope originScope("member-count");
   std::string contract = contracts::runtimeContractName(type);
   const RuntimeDeallocator *deallocator =
       findDeallocatorForValueGroup(values, offset, deallocators, contract);
@@ -912,6 +925,7 @@ collectTypedResourceGroups(mlir::Type type, mlir::ValueRange values,
   if (values.empty())
     return;
 
+  OriginScope originScope("typed");
   std::string contract = contracts::runtimeContractName(type);
   if (const RuntimeDeallocator *deallocator =
           findDeallocatorForValueGroup(values, 0, deallocators, contract)) {
@@ -1018,6 +1032,7 @@ logicalReturnValueCount(mlir::ValueRange values, unsigned offset,
     return size;
   }
 
+  OriginScope originScope("logical-return");
   std::string contract = logicalReturnObjectContract(type);
   if (contract.empty())
     return std::nullopt;
@@ -1103,32 +1118,6 @@ bool groupMatchesOwnedReturnRange(
   return matchesLogicalValue(matchesLogicalValue, range.offset, range.type);
 }
 
-llvm::SmallVector<ResourceGroup, 8>
-collectRuntimeResourceGroups(mlir::ValueRange values,
-                             llvm::ArrayRef<RuntimeDeallocator> deallocators) {
-  llvm::SmallVector<ResourceGroup, 8> groups;
-  OriginScope originScope("scan/collectRuntimeResourceGroups");
-  unsigned offset = 0;
-  while (offset < values.size()) {
-    const RuntimeDeallocator *deallocator =
-        findDeallocatorForValueGroup(values, offset, deallocators);
-    if (!deallocator) {
-      ++offset;
-      continue;
-    }
-    unsigned size = static_cast<unsigned>(deallocator->inputTypes.size());
-    ResourceGroup group;
-    group.offset = offset;
-    group.deallocator = deallocator;
-    group.values = valueSlice(values, offset, size);
-    group.root = entityRootOf(group.values);
-    appendEntityViews(group, values, offset);
-    unsigned span = size + static_cast<unsigned>(group.views.size());
-    groups.push_back(std::move(group));
-    offset += span;
-  }
-  return groups;
-}
 
 llvm::SmallVector<ResourceGroup, 4>
 collectOwnedLocalObjectGroups(mlir::Operation *op,
@@ -1141,6 +1130,8 @@ collectOwnedLocalObjectGroups(mlir::Operation *op,
       op->getAttrOfType<mlir::StringAttr>(kOwnedLocalObjectContractAttr);
   if (!contractAttr || op->getNumResults() == 0)
     return groups;
+  SubjectScope subjectScope(op->getName().getStringRef());
+  OriginScope originScope("owned-local-marker");
 
   const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
       op->getResults(), 0, deallocators, contractAttr.getValue());
@@ -1254,7 +1245,7 @@ llvm::StringRef ownedResultContractName(mlir::func::FuncOp function,
   }
   // Type-only matching cannot tell physical twins apart (str and bytes share the
   // (header, byte payload) shape), so a declared result contract names the
-  // entity before the structural fallback runs.
+  // entity.
   //
   // Why NOT also consult `ly.runtime.element_contract` / `next_contract` here:
   // those name a DIFFERENT result of the same call (the yielded element and the
@@ -1361,14 +1352,28 @@ llvm::SmallVector<mlir::Value, 4> staticEvidenceDuplicateLanes(
   mlir::FailureOr<FunctionContract> contract = readFunctionContract(callee);
   if (mlir::failed(contract) || contract->ownedResults.empty())
     return duplicates;
-  llvm::SmallSet<unsigned, 4> covered =
-      staticEvidenceCoveredLogicalOffsets(callee, *contract);
-  if (covered.empty())
-    return duplicates;
-  for (const ResourceGroup &group :
-       collectRuntimeResourceGroups(call.getResults(), deallocators))
-    if (covered.contains(group.offset))
-      duplicates.append(group.values.begin(), group.values.end());
+  OriginScope originScope("static-evidence");
+  SubjectScope subjectScope(callee.getName());
+  // The covered lanes are named by the owned result that duplicates them, so
+  // they are found by that name at their offset rather than by shape.
+  for (auto [contractIndex, offset] :
+       llvm::enumerate(contract->ownedResults.values)) {
+    llvm::StringRef contractName = ownedResultContractName(
+        callee, *contract, static_cast<unsigned>(contractIndex));
+    if (contractName.empty())
+      continue;
+    std::optional<unsigned> logicalOffset =
+        logicalPayloadOffsetCoveredByStaticEvidence(callee, contractName);
+    if (!logicalOffset || offset <= *logicalOffset)
+      continue;
+    if (const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
+            call.getResults(), *logicalOffset, deallocators, contractName)) {
+      llvm::SmallVector<mlir::Value, 4> lanes = valueSlice(
+          call.getResults(), *logicalOffset,
+          static_cast<unsigned>(deallocator->inputTypes.size()));
+      duplicates.append(lanes.begin(), lanes.end());
+    }
+  }
   return duplicates;
 }
 
@@ -1386,6 +1391,7 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
   if (!callee || call.getNumResults() == 0)
     return ownedGroups;
 
+  SubjectScope subjectScope(callee.getName());
   mlir::FailureOr<FunctionContract> functionContract =
       readFunctionContract(callee);
   llvm::SmallSet<unsigned, 4> staticEvidenceCoveredOffsets;
@@ -1444,12 +1450,8 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
       OriginScope originScope("sibling/callResultGroups");
       if (DeallocCensus::enabled() && contractName.empty())
         ++census().declaredNameAbsent;
-      const RuntimeDeallocator *deallocator =
-          contractName.empty()
-              ? findDeallocatorForValueGroup(call.getResults(), offset,
-                                             deallocators)
-              : findDeallocatorForValueGroup(call.getResults(), offset,
-                                             deallocators, contractName);
+      const RuntimeDeallocator *deallocator = findDeallocatorForValueGroup(
+          call.getResults(), offset, deallocators, contractName);
       if (!deallocator) {
         // Name the callees whose owned result no lookup can resolve, as a SET.
         // A count says how many groups went missing; only the names say which
@@ -1470,24 +1472,9 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
     }
   }
 
-  for (ResourceGroup group :
-       collectRuntimeResourceGroups(call.getResults(), deallocators)) {
-    if (resourceGroupStartsAt(ownedGroups, group.offset))
-      continue;
-    if (staticEvidenceCoveredOffsets.contains(group.offset))
-      continue;
-    if (callResultGroupIsOwned(callee, group.offset)) {
-      ownedGroups.push_back(std::move(group));
-      continue;
-    }
-
-    if (std::optional<OwnershipCondition> condition =
-            optionalUnionPayloadCondition(callee, call, group.offset)) {
-      group.condition = *condition;
-      ownedGroups.push_back(std::move(group));
-    }
-  }
-
+  // ⛔ No scan of the remaining results for something a deallocator's shape
+  // takes: every owned result is named above, and measured over every golden
+  // and example the scan added no group that the names had not.
   if (mlir::succeeded(functionContract)) {
     for (unsigned offset : functionContract->ownedResults.values)
       appendUnresolvedOwnedResultRoot(call, offset, ownedGroups);
@@ -2312,6 +2299,133 @@ void reportEntityRootParity(llvm::StringRef site,
                << " (" << lhs.size() << " vs " << rhs.size() << " lanes)\n";
   if (mode == RootParityMode::Abort)
     llvm::report_fatal_error("ownership root parity divergence");
+}
+
+llvm::SmallVector<mlir::Type, 8>
+callableLogicalInputTypes(mlir::func::FuncOp function) {
+  llvm::SmallVector<mlir::Type, 8> types;
+  auto callableAttr =
+      function->getAttrOfType<mlir::TypeAttr>(kCallableTypeAttr);
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      callableAttr ? callableAttr.getValue() : mlir::Type());
+  if (!callable)
+    return types;
+  types.append(callable.getPositionalTypes().begin(),
+               callable.getPositionalTypes().end());
+  types.append(callable.getKwOnlyTypes().begin(),
+               callable.getKwOnlyTypes().end());
+  if (callable.hasVararg())
+    types.push_back(callable.getVarargType());
+  if (callable.hasKwarg())
+    types.push_back(callable.getKwargType());
+  if (auto overrides =
+          function->getAttrOfType<mlir::ArrayAttr>(kProtocolArgumentTypesAttr))
+    for (auto [index, attr] : llvm::enumerate(overrides))
+      if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
+          typeAttr && index < types.size())
+        types[index] = typeAttr.getValue();
+
+  auto closureTypes = function->getAttrOfType<mlir::ArrayAttr>("closure_types");
+  if (!closureTypes)
+    return types;
+  for (mlir::Attribute attr : closureTypes) {
+    auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
+    if (!typeAttr)
+      return types;
+    types.push_back(typeAttr.getValue());
+  }
+  return types;
+}
+
+static bool logicalTypeHasPrimitiveI64Evidence(mlir::Type type) {
+  return contracts::runtimeContractName(type) == "builtins.int";
+}
+
+static void skipPrimitiveI64Evidence(mlir::Block &entry, unsigned &offset) {
+  if (offset + 2 > entry.getNumArguments())
+    return;
+  if (!entry.getArgument(offset).getType().isInteger(64) ||
+      !entry.getArgument(offset + 1).getType().isInteger(1))
+    return;
+  offset += 2;
+}
+
+// The groups a function's parameters arrive as and borrows, NAMED by the
+// parameter's declared type (`callable_type`): what the inserter retains
+// before a call that consumes one and what the verifier holds it to.
+llvm::SmallVector<EntryArgumentGroup, 8>
+collectBorrowedEntryGroups(mlir::func::FuncOp function,
+                           llvm::ArrayRef<RuntimeDeallocator> deallocators) {
+  llvm::SmallVector<EntryArgumentGroup, 8> resources;
+  if (!function || function.isDeclaration() || function.empty())
+    return resources;
+  OriginScope originScope("entry-groups");
+  SubjectScope subjectScope(function.getName());
+
+  llvm::SmallVector<mlir::Type, 8> logicalTypes =
+      callableLogicalInputTypes(function);
+  if (logicalTypes.empty())
+    return resources;
+
+  auto contract = readFunctionContract(function);
+  if (mlir::failed(contract))
+    return resources;
+
+  mlir::Block &entry = function.front();
+  unsigned offset = 0;
+  for (auto [logicalIndex, logicalType] : llvm::enumerate(logicalTypes)) {
+    if (offset >= entry.getNumArguments())
+      break;
+
+    unsigned groupOffset = offset;
+    // Named `values` like `ResourceGroup` and `UnwindTrackedGroup`: three
+    // structs calling one thing by two names is how they read as three
+    // different models of a resource when they are one.
+    llvm::SmallVector<mlir::Value, 4> group;
+    std::string contractName = contracts::runtimeContractName(logicalType);
+    const RuntimeDeallocator *deallocator =
+        contractName.empty()
+            ? nullptr
+            : findDeallocatorForValueGroup(entry.getArguments(), offset,
+                                           deallocators, contractName);
+    if (deallocator)
+      group = valueSlice(entry.getArguments(), offset,
+                         static_cast<unsigned>(deallocator->inputTypes.size()));
+    // ⭐ EACH PARAMETER'S SPAN IS ITS TYPE'S, the way a returned value's is
+    // (`logicalReturnValueCount`): a union is its tag and every member's
+    // lanes, None is none. ⛔ Not one lane for whatever has no contract name:
+    // a union parameter put every later parameter one or more lanes off, and
+    // `json.dumps`'s `bool` parameter was looked up on a str's header.
+    std::optional<unsigned> span =
+        deallocator ? std::optional<unsigned>(static_cast<unsigned>(
+                          deallocator->shapeTypes.size()))
+                    : logicalReturnValueCount(entry.getArguments(), offset,
+                                              deallocators, logicalType);
+    if (!span && offset < entry.getNumArguments() &&
+        entry.getArgument(offset).getType().isInteger(1))
+      span = 1;
+    // A parameter whose span its type does not give ends the walk: a guess
+    // would name every later lane wrongly.
+    if (!span)
+      break;
+    offset += *span;
+    if (logicalTypeHasPrimitiveI64Evidence(logicalType))
+      skipPrimitiveI64Evidence(entry, offset);
+
+    OwnershipKind ownership =
+        logicalOwnershipKind(logicalType, /*ownsObject=*/false);
+    if (group.empty() || ownership != OwnershipKind::Borrow)
+      continue;
+    if (contract->consumesArg(groupOffset))
+      continue;
+
+    EntryArgumentGroup resource;
+    resource.logicalIndex = static_cast<unsigned>(logicalIndex);
+    resource.inputOffset = groupOffset;
+    resource.values = std::move(group);
+    resources.push_back(std::move(resource));
+  }
+  return resources;
 }
 
 } // namespace py::ownership

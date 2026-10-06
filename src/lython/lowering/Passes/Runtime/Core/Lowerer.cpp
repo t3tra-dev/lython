@@ -34,11 +34,14 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
     return mlir::failure();
   if (mlir::failed(synthesizeSourceClassDeallocators()))
     return mlir::failure();
+  // Before the list is settled: the hooks also name the program's exception
+  // classes as released by BaseException's deallocator, and the list reads
+  // those names.
+  if (mlir::failed(synthesizeUserExceptionHooks()))
+    return mlir::failure();
   // Nothing after this makes a deallocator, so the py-op lowering reads one
   // list instead of walking the module for every slot it releases.
   settledDeallocators = ownership::collectRuntimeDeallocators(module);
-  if (mlir::failed(synthesizeUserExceptionHooks()))
-    return mlir::failure();
   if (mlir::failed(synthesizeSourceClassNameHook()))
     return mlir::failure();
   if (mlir::failed(lowerStructuredTryOps()))

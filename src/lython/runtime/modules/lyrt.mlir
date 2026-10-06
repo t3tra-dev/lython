@@ -28,7 +28,7 @@ module attributes {
   // ===== impls: lyrt_counter =====
   func.func private @Ly_IncRef(%header: memref<2xi64, strided<[1], offset: ?>> {ly.ownership.object_header})
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
-  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]}
 
   func.func @LyCounter_New(%limit: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 19 : i64, ly.runtime.contract = "lyrt.Counter", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
@@ -63,7 +63,7 @@ module attributes {
     func.return %counter : memref<4xi64>
   }
 
-  func.func @LyCounter_Next(%counter: memref<4xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<4xi64>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "lyrt.Counter", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "lyrt.Counter", ly.runtime.next_evidence = "receiver", ly.runtime.valid_result_index = 1 : i64} {
+  func.func @LyCounter_Next(%counter: memref<4xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<4xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.int", "lyrt.Counter"], ly.ownership.owned_results = [0, 2], ly.runtime.contract = "lyrt.Counter", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "lyrt.Counter", ly.runtime.next_evidence = "receiver", ly.runtime.valid_result_index = 1 : i64} {
     %current_slot = arith.constant 2 : index
     %limit_slot = arith.constant 3 : index
     %current = memref.load %counter[%current_slot] : memref<4xi64>

@@ -363,6 +363,8 @@ mlir::LogicalResult RuntimeBundleLowerer::releaseAggregateSlot(
     return mlir::success();
 
   std::string contract = runtimeContractName(slotType);
+  own::DeallocCensusContext censusContext("aggregate/release",
+                                          slotName.str());
   const own::RuntimeDeallocator *deallocator =
       own::findDeallocatorForValueGroup(values, 0, deallocators, contract);
   if (!deallocator || (deallocator->inputTypes.size() != values.size() &&
