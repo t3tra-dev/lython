@@ -20,6 +20,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -454,7 +455,9 @@ std::vector<std::string> allocasInRepeatedBlocks(const llvm::Function &function,
   return found;
 }
 
-// Is `text` the initializer of some read-only global of `module`?
+// Does some read-only global of `module` end with `text` -- an ASCII str
+// literal's static object, whose code units follow its header, or a bytes
+// literal's static image, whose payload is the last field of its struct?
 //
 // This is the anti-vacuity half of the literal test below: "no alloca in the
 // loop body" is also what a literal that was folded away entirely would produce,
@@ -464,9 +467,11 @@ bool hasConstantBytes(const llvm::Module &module, llvm::StringRef text) {
   for (const llvm::GlobalVariable &global : module.globals()) {
     if (!global.isConstant() || !global.hasInitializer())
       continue;
-    const auto *data =
-        llvm::dyn_cast<llvm::ConstantDataArray>(global.getInitializer());
-    if (data && data->isString() && data->getRawDataValues() == text)
+    const llvm::Constant *initializer = global.getInitializer();
+    if (const auto *image = llvm::dyn_cast<llvm::ConstantStruct>(initializer))
+      initializer = image->getOperand(image->getNumOperands() - 1);
+    const auto *data = llvm::dyn_cast<llvm::ConstantDataArray>(initializer);
+    if (data && data->isString() && data->getRawDataValues().ends_with(text))
       return true;
   }
   return false;
@@ -542,6 +547,36 @@ TEST(DriverTest, StringAndBytesLiteralsInALoopStayOutOfTheFrame) {
       << "the bytes literal's bytes are in neither the frame nor read-only "
          "data, so this test is no longer looking at the lowering it was "
          "written for";
+}
+
+// What: a str, bytes or constant-tuple literal is one immortal static object,
+// not an allocation per evaluation -- the loop body calls the `from_static`
+// primitives and none of the allocating initializers.
+TEST(DriverTest, LiteralsAreStaticObjectsNotAllocations) {
+  CompileResult result = compileSource("xs: list[str] = []\n"
+                                       "bs: list[bytes] = []\n"
+                                       "ts: list[tuple[int, int]] = []\n"
+                                       "for i in range(4):\n"
+                                       "    xs.append(\"static text\")\n"
+                                       "    bs.append(b\"static bytes\")\n"
+                                       "    ts.append((1, -2))\n"
+                                       "print(len(xs), len(bs), len(ts))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Module &module = *result.verified.llvmModule;
+  const llvm::Function *main = module.getFunction("__main__");
+  ASSERT_NE(main, nullptr);
+  llvm::StringSet<> called;
+  for (const llvm::BasicBlock &block : *main)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction())
+          called.insert(callee->getName());
+  EXPECT_TRUE(called.contains("LyUnicode_FromStatic"));
+  EXPECT_TRUE(called.contains("LyBytes_FromStatic"));
+  EXPECT_TRUE(called.contains("LyTuple_FromStatic"));
+  EXPECT_FALSE(called.contains("LyUnicode_FromBytes"));
+  EXPECT_FALSE(called.contains("LyBytes_FromBytes"));
+  EXPECT_FALSE(called.contains("__ly_tuple_alloc_fresh"));
 }
 
 // The `int` arm of the same class. `lowerIntConstant` splits a beyond-i64 literal

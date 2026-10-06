@@ -193,6 +193,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AdaptsBoxedBoolToUnboxedStrInput"
     "DriverTest.BoxedContainerLoopKeepsPayloadSlotsOutOfTheLoopBody"
     "DriverTest.StringAndBytesLiteralsInALoopStayOutOfTheFrame"
+    "DriverTest.LiteralsAreStaticObjectsNotAllocations"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"

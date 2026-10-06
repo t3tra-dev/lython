@@ -1,0 +1,7 @@
+['ascii', 'é latin', '日本', '😀 wide', ''] [5, 7, 2, 6, 0] É LATIN True
+asciié latin日本😀 wide 日本x True True
+['h', 'é', 'l', 'l', 'o'] é 233 ÿ Ā ['ú', 'û', 'ü', 'ý', 'þ', 'ÿ', 'Ā', 'ā']
+abc True True 0 True
+[b'bytes', b'bytes', b'bytes'] 121 5 b'bytes!' b'' b'BYTES'
+[(1, -2), (1, -2), (1, -2)] [(None, 0, -1073741824), (None, 0, -1073741824)] -2 3 True True
+-1 [(), ()] 0 (1,)

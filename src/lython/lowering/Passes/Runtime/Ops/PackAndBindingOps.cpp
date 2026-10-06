@@ -277,6 +277,63 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPack(py::PackOp op) {
     }
   }
 
+  // ⭐ A TUPLE OF CONSTANTS IS ONE IMMORTAL OBJECT IN READ-ONLY DATA, as
+  // CPython's is a code-object constant: `[(0, 1) for _ in range(n)]` held n
+  // tuples where CPython holds one. Only where its elements may go in as slot
+  // words anyway (`literalMayStoreWords`) -- the contents evidence is then
+  // dropped either way -- and only elements whose word is the same on every
+  // target: None, and an int a 31-bit immediate holds.
+  // ⛔ Not a float: a narrow target has no float immediates, so its word would
+  // be an object this image cannot name.
+  if (contractName == "builtins.tuple" && !values.empty() &&
+      literalMayStoreWords(op))
+    if (std::optional<RuntimeSymbol> fromStatic =
+            manifest.primitive("builtins.tuple", "from_static"))
+      if (std::optional<std::int64_t> classId =
+              manifest.classId("builtins.tuple")) {
+        llvm::SmallVector<std::int64_t, 8> items;
+        std::string key;
+        for (mlir::Value value : values) {
+          mlir::Operation *definition = value.getDefiningOp();
+          if (definition && mlir::isa<py::NoneOp>(definition)) {
+            items.push_back(0);
+            key += "N,";
+            continue;
+          }
+          auto constant = mlir::dyn_cast_if_present<py::IntConstantOp>(definition);
+          std::int64_t parsed = 0;
+          if (!constant ||
+              llvm::StringRef(constant.getValue()).getAsInteger(10, parsed) ||
+              parsed < -(std::int64_t{1} << 30) ||
+              parsed >= (std::int64_t{1} << 30))
+            break;
+          items.push_back(
+              static_cast<std::int64_t>(static_cast<std::uint64_t>(parsed) << 1) |
+              1);
+          key += std::to_string(parsed) + ",";
+        }
+        if (items.size() == values.size()) {
+          builder.setInsertionPoint(op);
+          llvm::SmallVector<std::int64_t, 8> words{
+              std::numeric_limits<std::int64_t>::max(), *classId,
+              static_cast<std::int64_t>(items.size()),
+              static_cast<std::int64_t>(items.size()), 0};
+          words.append(items.begin(), items.end());
+          mlir::Value address = materializeStaticObjectAddress(
+              op.getLoc(), "tuple", key, words, {{4u, 40}}, {});
+          mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+              op.getLoc(), *fromStatic, {address});
+          RuntimeBundle bundle;
+          if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+                  op, op.getResult().getType(), call, bundle)))
+            return mlir::failure();
+          bundle.sequenceCapacity = items.size();
+          valueBundles[op.getResult()] = std::move(bundle);
+          erase.push_back(op);
+          return mlir::success();
+        }
+      }
+
   RuntimeBundle bundle;
   std::uint64_t arity =
       contractName == "builtins.dict" ? values.size() / 2 : values.size();
