@@ -7526,6 +7526,65 @@ module attributes {
     func.return %class : i64
   }
 
+  // What `is` compares for a value, given the entity word a box or a slot keeps
+  // for it: the word a SLOT keeps for it. A slot keeps an int or a float that
+  // has an immediate as that immediate, and anything else as its address; a
+  // box keeps the address of the object it was made around. So one object
+  // reads as its immediate in a list and as its address in a box, and `is`
+  // between the two said False -- this names both by the slot's word.
+  // ⛔ Not the value for every int and float: a float with no immediate (a NaN,
+  // an infinity) keeps an object of its own in a slot too, and two of them
+  // are two objects -- `nan in [nan * 1.0]` is False in CPython.
+  func.func @LyObject_IdentityKey(%word: i64) -> i64 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "identity_key"} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %is_null = arith.cmpi eq, %word, %zero : i64
+    %plain = arith.ori %immediate, %is_null : i1
+    %key = scf.if %plain -> (i64) {
+      scf.yield %word : i64
+    } else {
+      %class = func.call @__ly_slot_class(%word) : (i64) -> i64
+      %is_int = arith.cmpi eq, %class, %one : i64
+      %is_float = arith.cmpi eq, %class, %two : i64
+      %canonical = scf.if %is_int -> (i64) {
+        %view = func.call @__ly_global_view_i64(%word, %two) : (i64, i64) -> memref<?xi64>
+        %header = memref.cast %view : memref<?xi64> to memref<2xi64>
+        %value, %fits = func.call @LyLong_TryAsI64(%header) : (memref<2xi64>) -> (i64, i1)
+        %small = func.call @__ly_int_immediate_fits(%value) : (i64) -> i1
+        %encodable = arith.andi %fits, %small : i1
+        %int_key = scf.if %encodable -> (i64) {
+          %w = func.call @__ly_int_to_immediate(%value) : (i64) -> i64
+          scf.yield %w : i64
+        } else {
+          scf.yield %word : i64
+        }
+        scf.yield %int_key : i64
+      } else {
+        %float_key = scf.if %is_float -> (i64) {
+          %view = func.call @__ly_global_view_i64(%word, %three) : (i64, i64) -> memref<?xi64>
+          %bits_slot = arith.constant 2 : index
+          %bits = memref.load %view[%bits_slot] : memref<?xi64>
+          %fits = func.call @__ly_float_immediate_fits(%bits) : (i64) -> i1
+          %fkey = scf.if %fits -> (i64) {
+            %w = func.call @__ly_float_to_immediate(%bits) : (i64) -> i64
+            scf.yield %w : i64
+          } else {
+            scf.yield %word : i64
+          }
+          scf.yield %fkey : i64
+        } else {
+          scf.yield %word : i64
+        }
+        scf.yield %float_key : i64
+      }
+      scf.yield %canonical : i64
+    }
+    func.return %key : i64
+  }
+
   // True when an address is as wide as a slot word. On a 32-bit target
   // (wasm32, armv7) a word that becomes a view is cut to the address's width
   // on the way, so an immediate has to survive that: there an int is
