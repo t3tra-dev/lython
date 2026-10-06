@@ -508,6 +508,10 @@ mlir::LogicalResult insertBorrowedConsumeRetains(
     if (mlir::failed(result) || function.empty() ||
         !own::functionUsesOwnedReturnABI(function))
       return;
+    llvm::SmallVector<own::EntryArgumentGroup, 8> entryGroups =
+        own::collectBorrowedEntryGroups(function, deallocators);
+    if (entryGroups.empty())
+      return;
     function.walk([&](mlir::func::CallOp call) {
       if (mlir::failed(result) || call.getNumOperands() == 0)
         return;
@@ -520,22 +524,29 @@ mlir::LogicalResult insertBorrowedConsumeRetains(
       // can be reading the group to make that machinery ask the question.
       if (own::isRefcountMaintenanceSymbol(call.getCallee()))
         return;
+      // ⭐ THE GROUPS ARE THE PARAMETERS', NAMED BY THEIR DECLARED TYPES, and
+      // a call operand is one of them when its lanes are. ⛔ Not the call's
+      // operands scanned for something whose shape a deallocator takes: that
+      // is a guess at what an operand is, and among same-width contracts it
+      // either finds nothing or the wrong one.
       unsigned offset = 0;
       while (offset < call.getNumOperands()) {
-        const own::RuntimeDeallocator *deallocator =
-            own::findDeallocatorForValueGroup(call.getOperands(), offset,
-                                              deallocators);
-        if (!deallocator) {
+        const own::EntryArgumentGroup *entryGroup = nullptr;
+        for (const own::EntryArgumentGroup &candidate : entryGroups)
+          if (!candidate.values.empty() &&
+              own::groupMatchesValues(call.getOperands(), offset,
+                                      candidate.values, aliases)) {
+            entryGroup = &candidate;
+            break;
+          }
+        if (!entryGroup) {
           ++offset;
           continue;
         }
         llvm::SmallVector<mlir::Value, 4> group = own::valueSlice(
             call.getOperands(), offset,
-            static_cast<unsigned>(deallocator->inputTypes.size()));
-        if (!group.empty() &&
-            (own::valueGroupEqualsEntryArgumentGroup(function, group) ||
-             valueGroupDerivedFromEntryArguments(function, group, aliases)) &&
-            !functionOwnsItsArgument(function, group.front()) &&
+            static_cast<unsigned>(entryGroup->values.size()));
+        if (!functionOwnsItsArgument(function, group.front()) &&
             callConsumesGroup(contracts, call, group, aliases)) {
           if (mlir::failed(
                   insertRetain(retain, call.getOperation(), group.front()))) {
@@ -543,7 +554,7 @@ mlir::LogicalResult insertBorrowedConsumeRetains(
             return;
           }
         }
-        offset += static_cast<unsigned>(deallocator->inputTypes.size());
+        offset += static_cast<unsigned>(entryGroup->values.size());
       }
     });
   });
@@ -612,6 +623,8 @@ mlir::LogicalResult insertBorrowedReturnRetains(
           mlir::succeeded(declared) && !declared->ownedResults.empty() &&
           declared->ownedResultContracts.size() ==
               declared->ownedResults.values.size()) {
+        own::DeallocCensusContext censusContext("return/declared",
+                                                function.getName());
         for (auto [index, resultIndex] :
              llvm::enumerate(declared->ownedResults.values)) {
           if (resultIndex >= returnOp.getNumOperands())
@@ -640,6 +653,8 @@ mlir::LogicalResult insertBorrowedReturnRetains(
         return;
       }
 
+      own::DeallocCensusContext censusContext("return/callable",
+                                              function.getName());
       unsigned offset = 0;
       while (offset < returnOp.getNumOperands()) {
         std::optional<std::string> logicalContract =
@@ -649,8 +664,7 @@ mlir::LogicalResult insertBorrowedReturnRetains(
                 ? own::findDeallocatorForValueGroup(returnOp.getOperands(),
                                                     offset, deallocators,
                                                     *logicalContract)
-                : own::findDeallocatorForValueGroup(returnOp.getOperands(),
-                                                    offset, deallocators);
+                : nullptr;
         if (!deallocator) {
           ++offset;
           continue;
@@ -2952,7 +2966,7 @@ bool releaseOwnedGroupByLiveness(
 // (Core/CollectionPayload.cpp) writes `words[0] = refcount` and
 // `words[1] = payloadClass`. Both populations carry the prefix, so no layout
 // predicate can separate them, and neither can the widths -- `builtins.object`
-// and the payload box are both 16 (ABI/HandleWidthRegistry.h).
+// and the payload box are both 16.
 //
 // What separates them is PROVENANCE, keyed over the four programs that pin the
 // two behaviours (one widened site each):

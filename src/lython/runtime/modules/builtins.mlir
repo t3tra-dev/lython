@@ -1638,9 +1638,9 @@ module attributes {
   // `LyBaseException_New` with extended word 6, and these are the same access
   // for the contracts that need no accessor of their own.
   //
-  // Why NOT widen the handle instead: the handle's width IS the contract's
-  // identity (HandleWidthRegistry.h), and widening one to hold a word no
-  // signature mentions moves it into somebody else's tie.
+  // Why NOT widen the handle instead: a word no signature mentions is a word
+  // no reader is told about. (The handle's width was also once the contract's
+  // identity; a deallocator is chosen by contract name (`findDeallocatorForValueGroup`), not by width.)
   func.func private @__ly_entity_word_set(%ptr: i64, %slot: i64, %value: i64) {
     %base = llvm.inttoptr %ptr : i64 to !llvm.ptr
     %slot_ptr = llvm.getelementptr %base[%slot] : (!llvm.ptr, i64) -> !llvm.ptr, i64
@@ -1812,7 +1812,7 @@ module attributes {
   // Multi-value args message: CPython's str(e) for len(args) > 1 is
   // repr(args) -- "(r0, r1, ...)". Renders from the payload boxes, replaces
   // the empty construction-time message, and returns the receiver triple.
-  func.func @LyBaseException_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "init_payload_message"} {
+  func.func @LyBaseException_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.BaseException"], ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "init_payload_message"} {
     %msg_h, %msg_b = func.call @__ly_exc_render_args(%header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
     func.call @__ly_exc_set_message(%header, %msg_h) : (memref<3xi64>, memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
@@ -2932,7 +2932,7 @@ module attributes {
   // repr(e) keyed by the DYNAMIC class id in the exception header, so an
   // instance caught through a base-class handler (or a user subclass, once
   // the class hook resolves it) still renders its own class name.
-  func.func private @__ly_exception_repr_by_id(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "repr_by_id", ly.ownership.owned_results = [0]} {
+  func.func private @__ly_exception_repr_by_id(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "repr_by_id", ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -3136,7 +3136,7 @@ module attributes {
   // ClassName('')).
   memref.global "private" constant @__ly_exc_lparen : memref<1xi8> = dense<40>
   memref.global "private" constant @__ly_exc_rparen : memref<1xi8> = dense<41>
-  func.func private @__ly_exception_repr(%message_header: memref<2xi64>, %message_bytes: memref<?xi8>, %name: memref<?xi8>, %name_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_exception_repr(%message_header: memref<2xi64>, %message_bytes: memref<?xi8>, %name: memref<?xi8>, %name_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1_i64 = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
@@ -3273,7 +3273,7 @@ module attributes {
   memref.global "private" constant @__ly_excgroup_str_close : memref<1xi8> = dense<41>
 
   // ASCII decimal rendering of a non-negative count (fits any payload size).
-  func.func private @__ly_exc_count_str(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "count_str", ly.ownership.owned_results = [0]} {
+  func.func private @__ly_exc_count_str(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "count_str", ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one_w = arith.constant 1 : i64
     %ten = arith.constant 10 : i64
@@ -3312,7 +3312,7 @@ module attributes {
     func.return %out_h, %out_b : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_exception_group_str(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "group_str", ly.ownership.owned_results = [0]} {
+  func.func private @__ly_exception_group_str(%header: memref<3xi64>, %message_header: memref<2xi64>, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "group_str", ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
@@ -4973,7 +4973,7 @@ module attributes {
   // Why one block and not a separate payload allocation: the release interface
   // has a single operand, so a second allocation would need a second free the
   // deallocator has no way to name.
-  func.func private @__ly_bytes_alloc(%len: i64) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "alloc"} {
+  func.func private @__ly_bytes_alloc(%len: i64) -> memref<6xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "alloc"} {
     %byte_count = arith.index_cast %len : i64 to index
     %block_prefix = arith.constant 48 : index
     %block_bytes = arith.addi %byte_count, %block_prefix : index
@@ -5274,7 +5274,7 @@ module attributes {
   }
 
   // bytes[i:j:k] -- byte-indexed strided copy into a fresh bytes object.
-  func.func @LyBytes_GetSlice(%header: memref<6xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getslice__"} {
+  func.func @LyBytes_GetSlice(%header: memref<6xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<6xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getslice__"} {
     %bytes = func.call @__ly_bytes_payload(%header) : (memref<6xi64>) -> memref<?xi8>
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -5392,7 +5392,7 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func @LyBytes_Concat(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__add__"} {
+  func.func @LyBytes_Concat(%lhs_header: memref<6xi64> {ly.ownership.object_header}, %rhs_header: memref<6xi64> {ly.ownership.object_header}) -> memref<6xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__add__"} {
     %lhs_bytes = func.call @__ly_bytes_payload(%lhs_header) : (memref<6xi64>) -> memref<?xi8>
     %rhs_bytes = func.call @__ly_bytes_payload(%rhs_header) : (memref<6xi64>) -> memref<?xi8>
     %c0 = arith.constant 0 : index
@@ -5904,7 +5904,7 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func private @__ly_bytes_slice(%bytes: memref<?xi8>, %start: index, %end: index) -> memref<6xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_bytes_slice(%bytes: memref<?xi8>, %start: index, %end: index) -> memref<6xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0]} {
     %span = arith.subi %end, %start : index
     %len = arith.index_cast %span : index to i64
     %result = func.call @LyBytes_FromBytes(%bytes, %start, %len) : (memref<?xi8>, index, i64) -> memref<6xi64>
@@ -5937,7 +5937,7 @@ module attributes {
     func.return %found : i1
   }
 
-  func.func private @__ly_bytes_strip_core(%bytes: memref<?xi8>, %mode: i64, %use_chars: i1, %chars: memref<?xi8>, %chars_n: index) -> memref<6xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_bytes_strip_core(%bytes: memref<?xi8>, %mode: i64, %use_chars: i1, %chars: memref<?xi8>, %chars_n: index) -> memref<6xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %one = arith.constant 1 : i64
@@ -7065,7 +7065,7 @@ module attributes {
   // the final digit count, so that view spans the whole buffer -- which is why
   // a caller must take it BEFORE narrowing the count to the normalized length.
   // Every caller does, on the line after the allocation.
-  func.func private @__ly_long_alloc_raw(%sign: i64, %capacity: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_alloc_raw(%sign: i64, %capacity: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %layout_int = arith.constant 1 : i64
@@ -7128,7 +7128,7 @@ module attributes {
     func.return
   }
 
-  func.func private @__ly_long_copy_with_sign(%sign: i64, %meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_copy_with_sign(%sign: i64, %meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %count_slot = arith.constant 1 : index
     %count = memref.load %meta_in[%count_slot] : memref<2xi64>
     %header = func.call @__ly_long_alloc_raw(%sign, %count) : (i64, i64) -> memref<2xi64>
@@ -7144,7 +7144,7 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
-  func.func private @__ly_long_copy(%meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_copy(%meta_in: memref<2xi64>, %digits_in: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %sign_slot = arith.constant 0 : index
     %sign = memref.load %meta_in[%sign_slot] : memref<2xi64>
     %header = func.call @__ly_long_copy_with_sign(%sign, %meta_in, %digits_in) : (i64, memref<2xi64>, memref<?xi32>) -> memref<2xi64>
@@ -7189,7 +7189,7 @@ module attributes {
     func.return %result : i64
   }
 
-  func.func private @__ly_long_add_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_add_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %mask = arith.constant 1073741823 : i64
@@ -7238,7 +7238,7 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
-  func.func private @__ly_long_sub_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_sub_abs(%sign: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %base = arith.constant 1073741824 : i64
@@ -7276,7 +7276,7 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
-  func.func private @__ly_long_add_signed_general(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_effective_sign: i64, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_add_signed_general(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_effective_sign: i64, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %sign_slot = arith.constant 0 : index
     %lhs_sign = memref.load %lhs_meta[%sign_slot] : memref<2xi64>
@@ -7413,7 +7413,7 @@ module attributes {
   // Constructor for compile-time digit spans (big int literals): the lowering
   // splits the literal into 30-bit limbs at compile time and this copies them
   // into a fresh heap object.
-  func.func @LyLong_FromDigits(%sign: i64, %digits_in: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "from_digits"} {
+  func.func @LyLong_FromDigits(%sign: i64, %digits_in: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "from_digits"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %count_index = memref.dim %digits_in, %c0 : memref<?xi32>
@@ -7621,7 +7621,7 @@ module attributes {
   // i64: that view is what tells ownership the read is inside the container,
   // and a bare word let the container be released between the load and here.
   // An immediate's view is never dereferenced.
-  func.func @LyLong_FromSlotWord(%slot_view: memref<2xi64>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "from_slot_word"} {
+  func.func @LyLong_FromSlotWord(%slot_view: memref<2xi64>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "from_slot_word"} {
     %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<2xi64> -> index
     %address = arith.index_cast %word_idx : index to i64
     %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
@@ -7647,7 +7647,7 @@ module attributes {
   // the immortal small int 0 -- never read, because `valid` is true -- so the
   // read allocates nothing; for an object it is the object, retained, since
   // the container may let it go before the fallback is taken.
-  func.func @LyLong_ReadSlotWord(%slot_view: memref<2xi64>) -> (memref<2xi64>, i64, i1) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_slot_word"} {
+  func.func @LyLong_ReadSlotWord(%slot_view: memref<2xi64>) -> (memref<2xi64>, i64, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_slot_word"} {
     %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<2xi64> -> index
     %address = arith.index_cast %word_idx : index to i64
     %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
@@ -7669,7 +7669,7 @@ module attributes {
 
   // The object a deferred read stands for, owned: a new int of the value when
   // the value is valid, the held object (retained again) when it is not.
-  func.func @LyLong_MaterializeRead(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "materialize_read"} {
+  func.func @LyLong_MaterializeRead(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "materialize_read"} {
     %header = scf.if %valid -> (memref<2xi64>) {
       %fresh = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
       scf.yield %fresh : memref<2xi64>
@@ -7970,14 +7970,14 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func @LyLong_Pos(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pos__"} {
+  func.func @LyLong_Pos(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pos__"} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %h = func.call @__ly_long_copy(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> memref<2xi64>
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_Neg(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__neg__"} {
+  func.func @LyLong_Neg(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__neg__"} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %sign_slot = arith.constant 0 : index
@@ -7988,7 +7988,7 @@ module attributes {
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_Invert(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__invert__"} {
+  func.func @LyLong_Invert(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__invert__"} {
     %neg_h = func.call @LyLong_Neg(%header) : (memref<2xi64>) -> memref<2xi64>
     %one = arith.constant 1 : i64
     %one_h = func.call @LyLong_FromI64(%one) : (i64) -> memref<2xi64>
@@ -8437,7 +8437,7 @@ module attributes {
   // than Knuth's algorithm D: the quotient-digit estimation/correction loop is
   // hard to verify in handwritten scf/arith, and correctness is the current
   // gate; swap in D behind this same contract if division ever profiles hot.
-  func.func private @__ly_long_divmod_abs(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0, 1]} {
+  func.func private @__ly_long_divmod_abs(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.int", "builtins.int"], ly.ownership.owned_results = [0, 1]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %thirty = arith.constant 30 : i64
@@ -8594,7 +8594,7 @@ module attributes {
   // Floor-divmod on signed views. Owns nothing on entry; returns fresh owned
   // (q, r) satisfying lhs = q * rhs + r with r sharing rhs's sign (CPython).
   // Requires rhs != 0 (callers raise the operator-specific ZeroDivisionError).
-  func.func private @__ly_long_floor_divmod(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0, 1]} {
+  func.func private @__ly_long_floor_divmod(%lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.int", "builtins.int"], ly.ownership.owned_results = [0, 1]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %neg_one = arith.constant -1 : i64
@@ -8666,7 +8666,7 @@ module attributes {
     func.return %q_abs#0, %q_abs#1 : memref<2xi64>, memref<2xi64>
   }
 
-  func.func @LyLong_Add(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__add__"} {
+  func.func @LyLong_Add(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__add__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -8711,7 +8711,7 @@ module attributes {
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_Sub(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__sub__"} {
+  func.func @LyLong_Sub(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__sub__"} {
     %lhs_meta, %lhs_digits = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta_view, %lhs_digits_view = func.call @__ly_long_operand_view(%lhs_meta, %lhs_digits) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -8757,7 +8757,7 @@ module attributes {
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_Mul(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mul__"} {
+  func.func @LyLong_Mul(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mul__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -8872,7 +8872,7 @@ module attributes {
 
   // |a| << k as a fresh positive magnitude (k >= 0). Sequential carry form of
   // CPython's v_lshift over the 30-bit limbs.
-  func.func private @__ly_long_abs_lshift_raw(%meta: memref<2xi64>, %digits: memref<?xi32>, %k: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_abs_lshift_raw(%meta: memref<2xi64>, %digits: memref<?xi32>, %k: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %thirty = arith.constant 30 : i64
@@ -8912,7 +8912,7 @@ module attributes {
 
   // |a| >> k as a fresh positive magnitude (0 <= k < bit_length(a)), plus a
   // sticky flag: whether any shifted-out bit was nonzero.
-  func.func private @__ly_long_abs_rshift_raw(%meta: memref<2xi64>, %digits: memref<?xi32>, %k: i64) -> (memref<2xi64>, i1) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_abs_rshift_raw(%meta: memref<2xi64>, %digits: memref<?xi32>, %k: i64) -> (memref<2xi64>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %thirty = arith.constant 30 : i64
@@ -9138,7 +9138,7 @@ module attributes {
     func.return %h : memref<3xi64>
   }
 
-  func.func @LyLong_FloorDiv(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__floordiv__"} {
+  func.func @LyLong_FloorDiv(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__floordiv__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9191,7 +9191,7 @@ module attributes {
     func.return %divmod#0 : memref<2xi64>
   }
 
-  func.func @LyLong_Mod(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mod__"} {
+  func.func @LyLong_Mod(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__mod__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9249,7 +9249,7 @@ module attributes {
   // then a negative result is converted back to sign-magnitude. Scratch
   // buffers are plain allocations, not objects, so no ownership is threaded
   // through the loops.
-  func.func private @__ly_long_bitop_general(%kind: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_bitop_general(%kind: i64, %lhs_meta: memref<2xi64>, %lhs_digits: memref<?xi32>, %rhs_meta: memref<2xi64>, %rhs_digits: memref<?xi32>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %neg_one = arith.constant -1 : i64
@@ -9342,7 +9342,7 @@ module attributes {
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_BitAnd(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__and__"} {
+  func.func @LyLong_BitAnd(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__and__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9365,7 +9365,7 @@ module attributes {
     func.return %gh : memref<2xi64>
   }
 
-  func.func @LyLong_BitOr(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__or__"} {
+  func.func @LyLong_BitOr(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__or__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9388,7 +9388,7 @@ module attributes {
     func.return %gh : memref<2xi64>
   }
 
-  func.func @LyLong_BitXor(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__xor__"} {
+  func.func @LyLong_BitXor(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__xor__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9411,7 +9411,7 @@ module attributes {
     func.return %gh : memref<2xi64>
   }
 
-  func.func @LyLong_LShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__lshift__"} {
+  func.func @LyLong_LShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__lshift__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9507,7 +9507,7 @@ module attributes {
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_RShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__rshift__"} {
+  func.func @LyLong_RShift(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__rshift__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -9635,7 +9635,7 @@ module attributes {
   // round(int, ndigits): identity for ndigits >= 0; otherwise round to the
   // nearest multiple of 10^-ndigits with ties to even (CPython int.__round__,
   // exact at any width: 10^n via square-and-multiply, then one divmod).
-  func.func @LyLong_Round(%header: memref<2xi64> {ly.ownership.object_header}, %ndigits: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__round__"} {
+  func.func @LyLong_Round(%header: memref<2xi64> {ly.ownership.object_header}, %ndigits: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__round__"} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %zero = arith.constant 0 : i64
@@ -9758,7 +9758,7 @@ module attributes {
   // __int__ on str (not part of the typed manifest surface: CPython has no
   // str.__int__; only the emitter's int(x) rewrite targets it). Unicode
   // digits are not accepted yet (ASCII only until the UCD tables land).
-  func.func private @__ly_long_from_ascii(%bytes: memref<?xi8>) -> (memref<2xi64>, i1) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_from_ascii(%bytes: memref<?xi8>) -> (memref<2xi64>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %neg_one = arith.constant -1 : i64
@@ -10048,7 +10048,7 @@ module attributes {
   // consumes, and returns owned values linearly, which the affine-ownership
   // verifier can follow; a loop would have to thread owned iter_args, which
   // it cannot.
-  func.func private @__ly_long_pow_rec(%base_header: memref<2xi64>, %exp: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_pow_rec(%base_header: memref<2xi64>, %exp: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %is_zero = arith.cmpi eq, %exp, %zero : i64
@@ -10076,7 +10076,7 @@ module attributes {
     func.return %square : memref<2xi64>
   }
 
-  func.func @LyLong_Pow(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pow__"} {
+  func.func @LyLong_Pow(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__pow__"} {
     %lhs_meta_raw, %lhs_digits_raw = func.call @__ly_long_parts(%lhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %rhs_meta_raw, %rhs_digits_raw = func.call @__ly_long_parts(%rhs_header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %lhs_meta, %lhs_digits = func.call @__ly_long_operand_view(%lhs_meta_raw, %lhs_digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -10691,13 +10691,13 @@ module attributes {
     func.return %offset : i64
   }
 
-  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"} {
+  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "alloc"} {
     %data_bytes = arith.muli %count, %width : i64
     %header, %bytes = func.call @__ly_unicode_alloc_capacity(%count, %width, %data_bytes) : (i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_unicode_alloc_capacity(%count: i64, %width: i64, %capacity: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_alloc_capacity(%count: i64, %width: i64, %capacity: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %data_bytes = arith.muli %count, %width : i64
     %room = arith.maxsi %capacity, %data_bytes : i64
     %byte_count = arith.index_cast %data_bytes : i64 to index
@@ -11160,7 +11160,7 @@ module attributes {
   // O(1) code-point indexing: fixed-width code units make the scan-free load
   // possible; the result re-canonicalizes to the smallest width for that one
   // code point.
-  func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__"} {
+  func.func @LyUnicode_GetItem(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %raw_index: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getitem__"} {
     %codepoints = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -11192,7 +11192,7 @@ module attributes {
   // gives O(1) indexing; the copy re-canonicalizes the width (pass 1 finds
   // the widest selected code point) so equal strings keep identical
   // representations, and a negative step reverses in iteration order.
-  func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
+  func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -11250,7 +11250,7 @@ module attributes {
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicode_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "copy"} {
+  func.func @LyUnicode_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "copy"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
@@ -11601,7 +11601,7 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"} {
+  func.func @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %lhs_width = func.call @__ly_unicode_width(%lhs_header) : (memref<2xi64>) -> i64
@@ -12202,7 +12202,7 @@ module attributes {
     func.return %result : memref<2xi64>
   }
 
-  func.func private @__ly_unicode_index_method(%header: memref<2xi64>, %bytes: memref<?xi8>, %sub_header: memref<2xi64>, %sub_bytes: memref<?xi8>, %start_raw: i64, %end_raw: i64, %reverse: i1) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_index_method(%header: memref<2xi64>, %bytes: memref<?xi8>, %sub_header: memref<2xi64>, %sub_bytes: memref<?xi8>, %start_raw: i64, %end_raw: i64, %reverse: i1) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %reverse) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
     %missing = arith.cmpi slt, %found, %zero : i64
@@ -12287,7 +12287,7 @@ module attributes {
     func.return %copy#0, %copy#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_unicode_slice(%header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_slice(%header: memref<2xi64>, %bytes: memref<?xi8>, %start: index, %end: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -12321,7 +12321,7 @@ module attributes {
   // Retained self, the CPython identity-return fast path (strip() with
   // nothing to strip etc. still copies; only methods documented to return
   // the receiver unchanged use this).
-  func.func private @__ly_unicode_retain_self(%header: memref<2xi64>, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_retain_self(%header: memref<2xi64>, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %view = memref.cast %header : memref<2xi64> to memref<2xi64, strided<[1], offset: ?>>
     func.call @Ly_IncRef(%view) : (memref<2xi64, strided<[1], offset: ?>>) -> ()
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
@@ -12344,7 +12344,7 @@ module attributes {
   // Shared strip walk. %mode bit 1 = strip left, bit 2 = strip right.
   // %use_chars false = Unicode whitespace (str.strip()); true = membership
   // in the chars operand.
-  func.func private @__ly_unicode_strip_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64, %use_chars: i1, %ch_bytes: memref<?xi8>, %ch_width: i64, %ch_count: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_strip_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64, %use_chars: i1, %ch_bytes: memref<?xi8>, %ch_width: i64, %ch_count: index) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %one = arith.constant 1 : i64
@@ -12411,7 +12411,7 @@ module attributes {
     func.return %out#0, %out#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_unicode_strip_ws(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_strip_ws(%header: memref<2xi64>, %bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %false_bit = arith.constant false
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -12419,7 +12419,7 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_unicode_strip_chars(%header: memref<2xi64>, %bytes: memref<?xi8>, %chars_header: memref<2xi64>, %chars_bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_strip_chars(%header: memref<2xi64>, %bytes: memref<?xi8>, %chars_header: memref<2xi64>, %chars_bytes: memref<?xi8>, %mode: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %true_bit = arith.constant true
     %ch_width = func.call @__ly_unicode_width(%chars_header) : (memref<2xi64>) -> i64
     %ch_count = func.call @__ly_unicode_count(%chars_header, %chars_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
@@ -12563,7 +12563,7 @@ module attributes {
 
   // Occurrence-driven replace: count with `__ly_unicode_find_core`, allocate
   // once, then copy the spans between matches with `__ly_unicode_copy_run`.
-  func.func private @__ly_unicode_replace_runs(%header: memref<2xi64>, %bytes: memref<?xi8>, %old_header: memref<2xi64>, %old_bytes: memref<?xi8>, %new_header: memref<2xi64>, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_replace_runs(%header: memref<2xi64>, %bytes: memref<?xi8>, %old_header: memref<2xi64>, %old_bytes: memref<?xi8>, %new_header: memref<2xi64>, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -12620,7 +12620,7 @@ module attributes {
 
   // Different-length replacement: count the occurrences, allocate once, then
   // copy the spans between them.
-  func.func private @__ly_unicode_replace_spans(%header: memref<2xi64>, %bytes: memref<?xi8>, %old_header: memref<2xi64>, %old_bytes: memref<?xi8>, %new_header: memref<2xi64>, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_replace_spans(%header: memref<2xi64>, %bytes: memref<?xi8>, %old_header: memref<2xi64>, %old_bytes: memref<?xi8>, %new_header: memref<2xi64>, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -12688,7 +12688,7 @@ module attributes {
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>
   }
 
-  func.func private @__ly_unicode_replace_scan(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %old_header: memref<2xi64> {ly.ownership.object_header}, %old_bytes: memref<?xi8>, %new_header: memref<2xi64> {ly.ownership.object_header}, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_replace_scan(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %old_header: memref<2xi64> {ly.ownership.object_header}, %old_bytes: memref<?xi8>, %new_header: memref<2xi64> {ly.ownership.object_header}, %new_bytes: memref<?xi8>, %limit: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -12817,7 +12817,7 @@ module attributes {
 
   // center/ljust/rjust core: %place 0 = pad left (rjust), 1 = pad right
   // (ljust), 2 = center with CPython's left = marg/2 + (marg & width & 1).
-  func.func private @__ly_unicode_pad(%header: memref<2xi64>, %bytes: memref<?xi8>, %target: i64, %fill_header: memref<2xi64>, %fill_bytes: memref<?xi8>, %place: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_pad(%header: memref<2xi64>, %bytes: memref<?xi8>, %target: i64, %fill_header: memref<2xi64>, %fill_bytes: memref<?xi8>, %place: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -13248,7 +13248,7 @@ module attributes {
   // MORE runs than the cap allows (`"  a  ".split(maxsplit=1)` is ['a'], not
   // ['a  ']): with no split actually withheld there is no remainder, and the
   // remainder is the only part that keeps its interior and trailing spaces.
-  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %maxsplit: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_split_ws_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %maxsplit: i64) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -13369,7 +13369,7 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func private @__ly_unicode_splitlines_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %keepends: i1) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_splitlines_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %keepends: i1) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %c1i = arith.constant 1 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -13502,7 +13502,7 @@ module attributes {
   // str.partition / str.rpartition: a 3-tuple of fresh strs (the separator
   // element is a retained reference to the operand, transferred to the
   // tuple).
-  func.func private @__ly_unicode_partition_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %sep_header: memref<2xi64>, %sep_bytes: memref<?xi8>, %reverse: i1) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_unicode_partition_core(%header: memref<2xi64>, %bytes: memref<?xi8>, %sep_header: memref<2xi64>, %sep_bytes: memref<?xi8>, %reverse: i1) -> memref<14xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -13855,7 +13855,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %buffer = memref.alloca() : memref<21xi8>
     %zero = arith.constant 0 : i64
     %ten = arith.constant 10 : i64
@@ -14626,7 +14626,7 @@ module attributes {
   // Shortest round-trip repr text for any double, CPython 3.14 rules:
   // fixed notation iff -4 < decpt <= 16, otherwise exponent form with a
   // sign and at least two exponent digits; nan has no sign.
-  func.func @LyUnicode_FromF64(%value: f64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func @LyUnicode_FromF64(%value: f64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %buffer = memref.alloca() : memref<40xi8>
     %buffer_view = memref.cast %buffer : memref<40xi8> to memref<?xi8>
     %digit_store = memref.alloca() : memref<24xi8>
@@ -15469,7 +15469,7 @@ module attributes {
   }
 
   // Materialize a code-point buffer as a canonical str.
-  func.func private @__ly_fmt_str_from_cps(%cps: memref<?xi32>, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_fmt_str_from_cps(%cps: memref<?xi32>, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -15495,7 +15495,7 @@ module attributes {
   // untouched rest (fraction/exponent/'%'), then width padding. '0'-fill
   // with '=' alignment refills *through* the grouping (CPython's regroup
   // rule), any other fill pads flat.
-  func.func private @__ly_fmt_render_number(%sign_cp: i64, %pre0: i64, %pre1: i64, %body: memref<?xi32>, %body_len: i64, %int_len: i64, %group_cp: i64, %group_size: i64, %fill_cp: i64, %align_cp: i64, %width_in: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_fmt_render_number(%sign_cp: i64, %pre0: i64, %pre1: i64, %body: memref<?xi32>, %body_len: i64, %int_len: i64, %group_cp: i64, %group_size: i64, %fill_cp: i64, %align_cp: i64, %width_in: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
@@ -15839,7 +15839,7 @@ module attributes {
 
   // The shared float presentation core (types e/E/f/F/g/G/n/%/none over a
   // parsed spec record); int and bool delegate here for float type codes.
-  func.func private @__ly_float_format_core(%value: f64, %spec: memref<?xi64>, %tname: memref<?xi8>, %tname_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_float_format_core(%value: f64, %spec: memref<?xi64>, %tname: memref<?xi8>, %tname_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %minus_one = arith.constant -1 : i64
@@ -16190,7 +16190,7 @@ module attributes {
 
   // Integer presentation over a parsed spec; bool delegates here with its
   // own type name so error texts match CPython's.
-  func.func private @__ly_long_format_impl(%header: memref<2xi64>, %spec: memref<?xi64>, %tname: memref<?xi8>, %tname_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_format_impl(%header: memref<2xi64>, %spec: memref<?xi64>, %tname: memref<?xi8>, %tname_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -16719,7 +16719,7 @@ module attributes {
   }
 
   // Decoded literal text from the cursor to the next field (or the end).
-  func.func private @__ly_fmtrt_literal_until_field(%header: memref<2xi64>, %bytes: memref<?xi8>, %cursor: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_fmtrt_literal_until_field(%header: memref<2xi64>, %bytes: memref<?xi8>, %cursor: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %two = arith.constant 2 : i64
@@ -17153,7 +17153,7 @@ module attributes {
   }
 
   // The float a slot's entity word names, as an owned object.
-  func.func @LyFloat_FromSlotWord(%slot_view: memref<3xi64>) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.primitive = "from_slot_word"} {
+  func.func @LyFloat_FromSlotWord(%slot_view: memref<3xi64>) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.primitive = "from_slot_word"} {
     %word_idx = memref.extract_aligned_pointer_as_index %slot_view : memref<3xi64> -> index
     %address = arith.index_cast %word_idx : index to i64
     %word = func.call @__ly_slot_word_from_view_address(%address) : (i64) -> i64
@@ -17233,19 +17233,11 @@ module attributes {
   // 3 imag bits, 4-6 unused. See LyFloat_Shape for why the width differs from
   // every lane width the two-lane form used.
   //
-  // Why 7 and not the 4 the payload needs: a one-lane handle width shared with
-  // another contract SUPPRESSES group formation, measured -- with builtins.bytes
-  // at memref<4xi64>, tied with the three lyrt counters, the contract-less
-  // findDeallocatorForValueGroup returned nullptr 28 times over a three-line
-  // bytes program and resolved builtins.bytes structurally 0 times; at an
-  // untied width, 0 nullptrs and 21 resolutions. A suppressed group is a
-  // release that is never placed and an obligation that is never checked, which
-  // is how str/bytes hid the exception family's double free. So a width is not
-  // a style choice. 7 is what ABI/HandleWidthRegistry.h has free -- read that
-  // file rather than grepping for absence, because a width can be taken by a
-  // track that has not merged yet: this contract sat at 4 (colliding with
-  // bytes), then 6 (colliding with bytes again after that track moved), before
-  // the registry existed to say so.
+  // Why 7 and not the 4 the payload needs: history. When a release was chosen
+  // by the handle's shape, a width shared with another contract tied and
+  // released nothing, so each contract needed a width of its own and 7 was
+  // free. Now a deallocator is chosen by contract name (`findDeallocatorForValueGroup`), not by width, and the width is free to
+  // shrink to what the payload needs.
   func.func private @LyComplex_Shape() -> memref<7xi64> attributes {ly.runtime.contract = "builtins.complex", ly.runtime.shape}
 
   func.func @LyComplex_FromParts(%real: f64 {ly.runtime.default_f64 = 0.0 : f64}, %imag: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 13 : i64, ly.runtime.contract = "builtins.complex", ly.runtime.initializer = "__new__"} {
@@ -17294,7 +17286,7 @@ module attributes {
     func.return
   }
 
-  func.func @LyComplex_Add(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__add__"} {
+  func.func @LyComplex_Add(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.complex"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__add__"} {
     %re_slot = arith.constant 2 : index
     %im_slot = arith.constant 3 : index
     %a_bits = memref.load %lhs_header[%re_slot] : memref<7xi64>
@@ -17311,7 +17303,7 @@ module attributes {
     func.return %header : memref<7xi64>
   }
 
-  func.func @LyComplex_Sub(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__sub__"} {
+  func.func @LyComplex_Sub(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.complex"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__sub__"} {
     %re_slot = arith.constant 2 : index
     %im_slot = arith.constant 3 : index
     %a_bits = memref.load %lhs_header[%re_slot] : memref<7xi64>
@@ -17328,7 +17320,7 @@ module attributes {
     func.return %header : memref<7xi64>
   }
 
-  func.func @LyComplex_Mul(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__mul__"} {
+  func.func @LyComplex_Mul(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.complex"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__mul__"} {
     %re_slot = arith.constant 2 : index
     %im_slot = arith.constant 3 : index
     %a_bits = memref.load %lhs_header[%re_slot] : memref<7xi64>
@@ -17362,7 +17354,7 @@ module attributes {
 
   // Textbook quotient (not Smith's algorithm): CPython's overflow/underflow
   // edge behavior for extreme components is out of scope for the first cut.
-  func.func @LyComplex_TrueDiv(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__truediv__"} {
+  func.func @LyComplex_TrueDiv(%lhs_header: memref<7xi64> {ly.ownership.object_header}, %rhs_header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.complex"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__truediv__"} {
     %re_slot = arith.constant 2 : index
     %im_slot = arith.constant 3 : index
     %a_bits = memref.load %lhs_header[%re_slot] : memref<7xi64>
@@ -17393,7 +17385,7 @@ module attributes {
     func.return %header : memref<7xi64>
   }
 
-  func.func @LyComplex_Neg(%header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__neg__"} {
+  func.func @LyComplex_Neg(%header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.complex"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__neg__"} {
     %re_slot = arith.constant 2 : index
     %im_slot = arith.constant 3 : index
     %a_bits = memref.load %header[%re_slot] : memref<7xi64>
@@ -17406,7 +17398,7 @@ module attributes {
     func.return %out_header : memref<7xi64>
   }
 
-  func.func @LyComplex_Pos(%header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__pos__"} {
+  func.func @LyComplex_Pos(%header: memref<7xi64> {ly.ownership.object_header}) -> memref<7xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.complex"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.complex", ly.runtime.method = "__pos__"} {
     %re_slot = arith.constant 2 : index
     %im_slot = arith.constant 3 : index
     %a_bits = memref.load %header[%re_slot] : memref<7xi64>
@@ -17461,7 +17453,7 @@ module attributes {
   // One component as text: float repr with CPython's complex-component rule
   // (format code 'r' without ADD_DOT_0) approximated by stripping a ".0"
   // suffix. Returns an owned str.
-  func.func private @__ly_complex_component_repr(%value: f64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_complex_component_repr(%value: f64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %float_header = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
     %repr_header, %repr_bytes = func.call @LyFloat_Repr(%float_header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyFloat_DecRef(%float_header) : (memref<3xi64>) -> ()
@@ -17579,7 +17571,7 @@ module attributes {
     func.return %h, %bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyFloat_Add(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__add__"} {
+  func.func @LyFloat_Add(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__add__"} {
     %lhs = func.call @LyFloat_AsF64(%lhs_header) : (memref<3xi64>) -> f64
     %rhs = func.call @LyFloat_AsF64(%rhs_header) : (memref<3xi64>) -> f64
     %value = arith.addf %lhs, %rhs : f64
@@ -17587,7 +17579,7 @@ module attributes {
     func.return %out_header : memref<3xi64>
   }
 
-  func.func @LyFloat_Sub(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__sub__"} {
+  func.func @LyFloat_Sub(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__sub__"} {
     %lhs = func.call @LyFloat_AsF64(%lhs_header) : (memref<3xi64>) -> f64
     %rhs = func.call @LyFloat_AsF64(%rhs_header) : (memref<3xi64>) -> f64
     %value = arith.subf %lhs, %rhs : f64
@@ -17595,7 +17587,7 @@ module attributes {
     func.return %out_header : memref<3xi64>
   }
 
-  func.func @LyFloat_Mul(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__mul__"} {
+  func.func @LyFloat_Mul(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__mul__"} {
     %lhs = func.call @LyFloat_AsF64(%lhs_header) : (memref<3xi64>) -> f64
     %rhs = func.call @LyFloat_AsF64(%rhs_header) : (memref<3xi64>) -> f64
     %value = arith.mulf %lhs, %rhs : f64
@@ -17603,7 +17595,7 @@ module attributes {
     func.return %out_header : memref<3xi64>
   }
 
-  func.func @LyFloat_TrueDiv(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__truediv__"} {
+  func.func @LyFloat_TrueDiv(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__truediv__"} {
     %lhs = func.call @LyFloat_AsF64(%lhs_header) : (memref<3xi64>) -> f64
     %rhs = func.call @LyFloat_AsF64(%rhs_header) : (memref<3xi64>) -> f64
     // Not arith.divf alone: IEEE would yield inf/nan for a zero divisor,
@@ -17916,7 +17908,7 @@ module attributes {
   // 0.0 ** negative raises ZeroDivisionError like CPython; a negative base
   // with a non-integral exponent yields a complex in CPython, which is not
   // implemented, so it raises instead (deviation until complex lands, R6).
-  func.func @LyFloat_Pow(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__pow__"} {
+  func.func @LyFloat_Pow(%lhs_header: memref<3xi64> {ly.ownership.object_header}, %rhs_header: memref<3xi64> {ly.ownership.object_header}) -> memref<3xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.float"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.float", ly.runtime.method = "__pow__"} {
     %base = func.call @LyFloat_AsF64(%lhs_header) : (memref<3xi64>) -> f64
     %exponent = func.call @LyFloat_AsF64(%rhs_header) : (memref<3xi64>) -> f64
     %zero = arith.constant 0.0 : f64
@@ -19718,14 +19710,14 @@ module attributes {
   // an exact int). A copy rather than a retain of the argument view: the
   // manifest method ABI owns result 0, and the incoming meta/digits are a
   // borrowed operand view, not an owned header.
-  func.func @LyLong_Index(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__index__"} {
+  func.func @LyLong_Index(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__index__"} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %h = func.call @__ly_long_copy(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> memref<2xi64>
     func.return %h : memref<2xi64>
   }
 
-  func.func @LyLong_Abs(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__abs__"} {
+  func.func @LyLong_Abs(%header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__abs__"} {
     %meta_raw, %digits_raw = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %meta, %digits = func.call @__ly_long_operand_view(%meta_raw, %digits_raw) : (memref<2xi64>, memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
     %c0 = arith.constant 0 : index
@@ -20029,7 +20021,7 @@ module attributes {
 
   // Power-of-two base rendering shared by hex/oct/bin: sign, "0<letter>",
   // then bl/bits digits pulled straight from the 30-bit limbs.
-  func.func private @__ly_long_format_pow2(%meta: memref<2xi64>, %digits: memref<?xi32>, %bits: i64, %letter: i8) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_long_format_pow2(%meta: memref<2xi64>, %digits: memref<?xi32>, %bits: i64, %letter: i8) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %zero = arith.constant 0 : i64
@@ -20890,7 +20882,7 @@ module attributes {
   // and in-place instead of "consume the entity and hand back a new tuple"
   // (rfc/memory-safety-proof.md, `Interior`). The word offsets are mirrored in
   // Passes/Runtime/ABI/ContainerLayout.h.
-  func.func private @__ly_dict_alloc(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_dict_alloc(%length: i64) -> memref<8xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.dict"], ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     // PyDict_MINSIZE.
     //
@@ -21054,12 +21046,8 @@ module attributes {
   //
   // Words 0-7 are the layout in Passes/Runtime/ABI/ContainerLayout.h, which
   // `dict` already uses; a sequence leaves 5 and 6 unused. Word 8 is dead
-  // space, and it is deliberate: 9 is the narrowest width that is FREE as a
-  // single-input release interface (Passes/Runtime/ABI/HandleWidthRegistry.h),
-  // and one-laning strips `shapeMatch` of any way to break a tie, so an
-  // untied width is what replaces the protection the conversion removes. It
-  // costs 32 B on a handle that already carries a 1024-slot (16 KB) items
-  // array at minimum capacity.
+  // space left from when a release was chosen by shape and 9 was the
+  // narrowest width no other contract held. Now a deallocator is chosen by contract name (`findDeallocatorForValueGroup`), not by width; and only words 0..4 are allocated.
   //
   // Why the items array is an ADDRESS in the handle and not a value beside it:
   // a growth writes the new address THROUGH the handle, so every holder
@@ -21069,7 +21057,7 @@ module attributes {
   // CPython's PyList_New takes exactly `size` slots; the over-allocation lives
   // in list_resize, not here. This used to take max(length, 64), which with a
   // 16-word element box is 8 KB for every list however short.
-  func.func private @__ly_list_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_list_alloc(%length: i64) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 10 : i64
@@ -21085,9 +21073,9 @@ module attributes {
     %pad_slot = arith.constant 8 : index
 
     // ⭐ ONLY THE WORDS THE HANDLE USES ARE ALLOCATED: 0..4. Its type
-    // stays memref<9xi64> because width selects the deallocator
-    // (ABI/HandleWidthRegistry.h); the rest is padding nothing reads or
-    // writes, and allocating it was 32 bytes on every object.
+    // stays memref<9xi64> from when width selected the deallocator; the rest
+    // is padding nothing reads or writes, and allocating it was 32 bytes on
+    // every object.
     %handle_bytes = arith.constant 40 : index
     %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
     %handle_at = arith.constant 0 : index
@@ -21129,14 +21117,14 @@ module attributes {
 
   // The four allocating list producers. Each is the list-shaped half of a
   // `__ly_sequence_*` twin: identical fill loop, different destination.
-  func.func private @__ly_list_copy_alloc(%src_len: i64, %src_items: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_list_copy_alloc(%src_len: i64, %src_items: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %self = func.call @__ly_list_alloc(%src_len) : (i64) -> memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @__ly_seq_fill_copy(%items, %src_len, %src_items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
     func.return %self : memref<9xi64>
   }
 
-  func.func private @__ly_list_concat_alloc(%llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_list_concat_alloc(%llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %total = arith.addi %llen, %rlen : i64
     %self = func.call @__ly_list_alloc(%total) : (i64) -> memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
@@ -21144,7 +21132,7 @@ module attributes {
     func.return %self : memref<9xi64>
   }
 
-  func.func private @__ly_list_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_list_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %total = arith.muli %len, %n : i64
     %self = func.call @__ly_list_alloc(%total) : (i64) -> memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
@@ -21152,7 +21140,7 @@ module attributes {
     func.return %self : memref<9xi64>
   }
 
-  func.func private @__ly_list_slice_alloc(%count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_list_slice_alloc(%count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) -> memref<9xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
     %self = func.call @__ly_list_alloc(%count) : (i64) -> memref<9xi64>
     %items = func.call @__ly_list_items(%self) : (memref<9xi64>) -> memref<?xi64>
     func.call @__ly_seq_fill_slice(%items, %count, %start, %step, %src_items) : (memref<?xi64>, i64, i64, i64, memref<?xi64>) -> ()
@@ -21175,10 +21163,9 @@ module attributes {
   //                               words 8-13 pad
   //
   // Words 0..7 are ContainerLayout.h, the same assignment `dict` and `list`
-  // use. Words 8..13 are dead space: 14 is the narrowest FREE single-input
-  // release interface left once `set` and `frozenset` took 11 and 13, and a
-  // one-lane contract has no `shapeMatch` protection to fall back on, so the
-  // width IS the disambiguator (ABI/HandleWidthRegistry.h).
+  // use. Words 8..13 are dead space, left from when a release was chosen by
+  // shape and 14 was the narrowest width no other contract held; now
+  // a deallocator is chosen by contract name (`findDeallocatorForValueGroup`), not by width.
   //
   // Why the items array is an ADDRESS in the handle and not a lane beside it:
   // a lane travels beside the root, so a holder can keep one across a
@@ -21197,7 +21184,7 @@ module attributes {
   // why the duplication was accepted, not a shared function still to unify.
   // PyTuple_New(n) takes exactly n slots, and a tuple never grows, so the
   // minimum this used to round up to was pure waste -- 8 KB for a pair.
-  func.func private @__ly_tuple_alloc(%length: i64) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_tuple_alloc(%length: i64) -> memref<14xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
     %one = arith.constant 1 : i64
     %handle_words = func.call @__ly_box_word_count() : () -> i64
     %class_id = arith.constant 11 : i64
@@ -21260,14 +21247,14 @@ module attributes {
   // `__ly_seq_fill_*` pairing: identical fill loop, different destination.
   // The fill helpers take a plain slot array and a length by value, so they
   // are shared with `list` and `set` untouched.
-  func.func private @__ly_tuple_copy_alloc(%src_len: i64, %src_items: memref<?xi64>) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_tuple_copy_alloc(%src_len: i64, %src_items: memref<?xi64>) -> memref<14xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
     %self = func.call @__ly_tuple_alloc(%src_len) : (i64) -> memref<14xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<14xi64>) -> memref<?xi64>
     func.call @__ly_seq_fill_copy(%items, %src_len, %src_items) : (memref<?xi64>, i64, memref<?xi64>) -> ()
     func.return %self : memref<14xi64>
   }
 
-  func.func private @__ly_tuple_concat_alloc(%llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_tuple_concat_alloc(%llen: i64, %li: memref<?xi64>, %rlen: i64, %ri: memref<?xi64>) -> memref<14xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
     %total = arith.addi %llen, %rlen : i64
     %self = func.call @__ly_tuple_alloc(%total) : (i64) -> memref<14xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<14xi64>) -> memref<?xi64>
@@ -21275,7 +21262,7 @@ module attributes {
     func.return %self : memref<14xi64>
   }
 
-  func.func private @__ly_tuple_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_tuple_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<14xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
     %total = arith.muli %len, %n : i64
     %self = func.call @__ly_tuple_alloc(%total) : (i64) -> memref<14xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<14xi64>) -> memref<?xi64>
@@ -21283,7 +21270,7 @@ module attributes {
     func.return %self : memref<14xi64>
   }
 
-  func.func private @__ly_tuple_slice_alloc(%count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) -> memref<14xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_tuple_slice_alloc(%count: i64, %start: i64, %step: i64, %src_items: memref<?xi64>) -> memref<14xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
     %self = func.call @__ly_tuple_alloc(%count) : (i64) -> memref<14xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<14xi64>) -> memref<?xi64>
     func.call @__ly_seq_fill_slice(%items, %count, %start, %step, %src_items) : (memref<?xi64>, i64, i64, i64, memref<?xi64>) -> ()
@@ -22606,7 +22593,7 @@ module attributes {
   // Uniform per-element repr dispatch, generated per program by the lowering
   // (class id -> the manifest __repr__); resolved at link. Returns an owned str
   // (header, bytes) plus a handled flag.
-  func.func private @__ly_repr_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>, i1) attributes {ly.ownership.owned_results = [0]}
+  func.func private @__ly_repr_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (memref<2xi64>, memref<?xi8>, i1) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
 
   memref.global "private" constant @__ly_repr_lbracket : memref<1xi8> = dense<91>
   memref.global "private" constant @__ly_repr_rbracket : memref<1xi8> = dense<93>
@@ -22868,7 +22855,7 @@ module attributes {
   // is insertion order for a set this compiler builds), not CPython's hash
   // order. The two agree for the small ints a reader is most likely to
   // print, and nothing else can be matched without adopting CPython's table.
-  func.func private @__ly_set_repr_body(%len: i64, %items_ptr: !llvm.ptr, %open_h: memref<2xi64> {ly.ownership.object_header}, %open_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.transfer_args = [2]} {
+  func.func private @__ly_set_repr_body(%len: i64, %items_ptr: !llvm.ptr, %open_h: memref<2xi64> {ly.ownership.object_header}, %open_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.ownership.transfer_args = [2]} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c0_i64 = arith.constant 0 : i64
@@ -23124,12 +23111,9 @@ module attributes {
   // Words 0-7 are the layout in Passes/Runtime/ABI/ContainerLayout.h, which
   // dict and list already use; a set spends 5 and 6 (a mapping's secondary
   // array and present flags) and 7 on the table instead. The words above 7
-  // are dead space and they are deliberate: one-laning makes a contract's shape
-  // arity equal its release-interface arity, so shapeMatch scores it 0 and it
-  // can never win a structural tiebreak, and an untied single-input interface
-  // is what replaces the protection the conversion removes
-  // (ABI/HandleWidthRegistry.h). 11 and 13 are what the registry assigns; both
-  // also have to be >= 8, which is isContainerHandleType's lower bound.
+  // are dead space, left from when a release was chosen by shape and each
+  // contract needed a width of its own; now a deallocator is chosen by contract name (`findDeallocatorForValueGroup`), not by width. Both also have to be >= 8, which is
+  // isContainerHandleType's lower bound.
   //
   // WHY THE TWO WIDTHS DIFFER when the layout does not. The frozenset wrappers
   // used to hand their own three lanes straight into the set bodies, which was
@@ -24602,16 +24586,16 @@ module attributes {
 
   // ---- builtins.set --------------------------------------------------------
 
-  func.func private @__ly_set_alloc(%length: i64) -> memref<11xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_set_alloc(%length: i64) -> memref<11xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.set"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %class_id = arith.constant 21 : i64
     %pad0_slot = arith.constant 8 : index
     %pad1_slot = arith.constant 9 : index
     %pad2_slot = arith.constant 10 : index
     // ⭐ ONLY THE WORDS THE HANDLE USES ARE ALLOCATED: 0..8. Its type
-    // stays memref<11xi64> because width selects the deallocator
-    // (ABI/HandleWidthRegistry.h); the rest is padding nothing reads or
-    // writes, and allocating it was 16 bytes on every object.
+    // stays memref<11xi64> from when width selected the deallocator; the rest
+    // is padding nothing reads or writes, and allocating it was 16 bytes on
+    // every object.
     %handle_bytes = arith.constant 72 : index
     %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
     %handle_at = arith.constant 0 : index
@@ -24634,7 +24618,7 @@ module attributes {
   // empty-and-same-mask branch of the merge is what makes a small copy come out
   // byte-identical; going through a bulk fill of the dense array instead would
   // give the copy no table at all.
-  func.func private @__ly_set_copy_alloc(%src: memref<?xi64>) -> memref<11xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_set_copy_alloc(%src: memref<?xi64>) -> memref<11xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.set"], ly.ownership.owned_results = [0]} {
     // The merge below can take the source's table and dense array VERBATIM,
     // which copies whatever order the source is in; every other path rebuilds
     // the order through `place` and gets it back at the next repr. So the
@@ -25011,7 +24995,7 @@ module attributes {
   // of insertion order).
   func.func private @LyFrozenSet_Shape() -> memref<13xi64> attributes {ly.runtime.contract = "builtins.frozenset", ly.runtime.shape}
 
-  func.func private @__ly_frozenset_alloc(%length: i64) -> memref<13xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_frozenset_alloc(%length: i64) -> memref<13xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.frozenset"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %class_id = arith.constant 23 : i64
     %pad0_slot = arith.constant 8 : index
@@ -25020,9 +25004,9 @@ module attributes {
     %pad3_slot = arith.constant 11 : index
     %pad4_slot = arith.constant 12 : index
     // ⭐ ONLY THE WORDS THE HANDLE USES ARE ALLOCATED: 0..8. Its type
-    // stays memref<13xi64> because width selects the deallocator
-    // (ABI/HandleWidthRegistry.h); the rest is padding nothing reads or
-    // writes, and allocating it was 32 bytes on every object.
+    // stays memref<13xi64> from when width selected the deallocator; the rest
+    // is padding nothing reads or writes, and allocating it was 32 bytes on
+    // every object.
     %handle_bytes = arith.constant 72 : index
     %handle_block = memref.alloc(%handle_bytes) {alignment = 16 : i64} : memref<?xi8>
     %handle_at = arith.constant 0 : index
@@ -25159,7 +25143,7 @@ module attributes {
   // The frozenset algebra is the set algebra with the other handle width; each
   // one is the same CPython function, so the shapes are kept side by side
   // rather than each simplified on its own.
-  func.func private @__ly_frozenset_copy_alloc(%src: memref<?xi64>) -> memref<13xi64> attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_frozenset_copy_alloc(%src: memref<?xi64>) -> memref<13xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.frozenset"], ly.ownership.owned_results = [0]} {
     %zero = arith.constant 0 : i64
     %self = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<13xi64>
     %raw = memref.cast %self : memref<13xi64> to memref<?xi64>
@@ -25580,7 +25564,7 @@ module attributes {
     func.return %aligned : i1
   }
 
-  func.func private @__ly_range_iterator_alloc(%current: i64, %stop: i64, %step: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 20 : i64, ly.runtime.contract = "builtins.range_iterator", ly.runtime.primitive = "alloc"} {
+  func.func private @__ly_range_iterator_alloc(%current: i64, %stop: i64, %step: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.range_iterator"], ly.ownership.owned_results = [0], ly.runtime.class_id = 20 : i64, ly.runtime.contract = "builtins.range_iterator", ly.runtime.primitive = "alloc"} {
     // One entity, one handle; see LyRange_New for why the byte block and the
     // view are kept rather than allocating memref<5xi64> directly.
     %block_bytes = arith.constant 40 : index
@@ -25623,7 +25607,7 @@ module attributes {
     func.return %self : memref<5xi64>
   }
 
-  func.func @LyRangeIterator_Next(%self: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<5xi64>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "builtins.range_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "builtins.range_iterator", ly.runtime.valid_result_index = 1 : i64} {
+  func.func @LyRangeIterator_Next(%self: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<5xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.int", "builtins.range_iterator"], ly.ownership.owned_results = [0, 2], ly.runtime.contract = "builtins.range_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "builtins.range_iterator", ly.runtime.valid_result_index = 1 : i64} {
     %current_slot = arith.constant 2 : index
     %stop_slot = arith.constant 3 : index
     %step_slot = arith.constant 4 : index
@@ -25686,7 +25670,7 @@ module attributes {
   // [4] the source bytes object. The state used to be its own allocation and
   // the source only a lane, so neither was reachable from the handle -- which
   // is what a box holds.
-  func.func private @__ly_bytes_iterator_alloc(%position: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 24 : i64, ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.primitive = "alloc"} {
+  func.func private @__ly_bytes_iterator_alloc(%position: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.bytes_iterator"], ly.ownership.owned_results = [0], ly.runtime.class_id = 24 : i64, ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.primitive = "alloc"} {
     %zero_index = arith.constant 0 : index
     %state_offset = arith.constant 16 : index
     %block_bytes = arith.constant 40 : index
@@ -25753,7 +25737,7 @@ module attributes {
     func.return %iter_header, %state_view, %source_view : memref<2xi64>, memref<2xi64>, memref<6xi64>
   }
 
-  func.func @LyBytesIterator_Next(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_results = [0, 2], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "builtins.bytes_iterator", ly.runtime.valid_result_index = 1 : i64} {
+  func.func @LyBytesIterator_Next(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<6xi64> {ly.ownership.object_header}) -> (memref<2xi64>, i1, memref<2xi64>, memref<2xi64>, memref<6xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.int", "builtins.bytes_iterator"], ly.ownership.owned_results = [0, 2], ly.runtime.contract = "builtins.bytes_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.int", ly.runtime.next_contract = "builtins.bytes_iterator", ly.runtime.valid_result_index = 1 : i64} {
     // ⛔ THE STATE COMES FROM THE RECORD AND NOT FROM THE LANE. They are the
     // same two words by construction, and stepping the recovered one is what
     // makes the record load-bearing: every `for b in some_bytes` walks it, so a
@@ -25806,7 +25790,7 @@ module attributes {
   }
 
   // ===== impls: str_iterator =====
-  func.func private @__ly_str_iterator_alloc(%position: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 7 : i64, ly.runtime.contract = "builtins.str_iterator", ly.runtime.primitive = "alloc"} {
+  func.func private @__ly_str_iterator_alloc(%position: i64, %length: i64) -> (memref<2xi64>, memref<2xi64>) attributes {ly.ownership.owned_result_contracts = ["builtins.str_iterator"], ly.ownership.owned_results = [0], ly.runtime.class_id = 7 : i64, ly.runtime.contract = "builtins.str_iterator", ly.runtime.primitive = "alloc"} {
     // One entity, one allocation: [0,16) header, [16,32) state view, [32,40)
     // the source str this walks -- the third lane, recorded so a box holding
     // the iterator can hand it back.
@@ -25866,7 +25850,7 @@ module attributes {
     func.return %iter_header, %state, %source_header, %source_bytes : memref<2xi64>, memref<2xi64>, memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicodeStrIterator_Next(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<2xi64> {ly.ownership.object_header}, %source_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>, i1, memref<2xi64>, memref<2xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0, 3], ly.runtime.contract = "builtins.str_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.str", ly.runtime.next_contract = "builtins.str_iterator", ly.runtime.valid_result_index = 2 : i64} {
+  func.func @LyUnicodeStrIterator_Next(%iter_header: memref<2xi64> {ly.ownership.object_header}, %state: memref<2xi64>, %source_header: memref<2xi64> {ly.ownership.object_header}, %source_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>, i1, memref<2xi64>, memref<2xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str", "builtins.str_iterator"], ly.ownership.owned_results = [0, 3], ly.runtime.contract = "builtins.str_iterator", ly.runtime.method = "__next__", ly.runtime.element_contract = "builtins.str", ly.runtime.next_contract = "builtins.str_iterator", ly.runtime.valid_result_index = 2 : i64} {
     %position_slot = arith.constant 0 : index
     %length_slot = arith.constant 1 : index
     %position = memref.load %state[%position_slot] : memref<2xi64>

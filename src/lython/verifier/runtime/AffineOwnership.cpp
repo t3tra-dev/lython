@@ -183,12 +183,11 @@ bool returnCarriesGroupInsideOwnedAggregate(
       // incomplete side, not a silently accepted double release.
       llvm::StringRef contractName = own::ownedResultContractName(
           function, *contract, static_cast<unsigned>(contractIndex));
+      own::DeallocCensusContext censusContext("verifier/owned-return",
+                                              function.getName());
       const own::RuntimeDeallocator *deallocator =
-          contractName.empty()
-              ? own::findDeallocatorForValueGroup(ret.getOperands(), offset,
-                                                  deallocators)
-              : own::findDeallocatorForValueGroup(ret.getOperands(), offset,
-                                                  deallocators, contractName);
+          own::findDeallocatorForValueGroup(ret.getOperands(), offset,
+                                            deallocators, contractName);
       if (!deallocator || group.size() >= deallocator->shapeTypes.size())
         continue;
       unsigned end = offset +
@@ -1918,109 +1917,22 @@ verifyStraightLineResource(FuncContractCache &contracts,
 
 llvm::SmallVector<mlir::Type, 8>
 callableLogicalInputTypes(mlir::func::FuncOp function) {
-  llvm::SmallVector<mlir::Type, 8> types;
-  auto callableAttr =
-      function->getAttrOfType<mlir::TypeAttr>(own::kCallableTypeAttr);
-  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
-      callableAttr ? callableAttr.getValue() : mlir::Type());
-  if (!callable)
-    return types;
-  types.append(callable.getPositionalTypes().begin(),
-               callable.getPositionalTypes().end());
-  types.append(callable.getKwOnlyTypes().begin(),
-               callable.getKwOnlyTypes().end());
-  if (callable.hasVararg())
-    types.push_back(callable.getVarargType());
-  if (callable.hasKwarg())
-    types.push_back(callable.getKwargType());
-
-  auto closureTypes = function->getAttrOfType<mlir::ArrayAttr>("closure_types");
-  if (!closureTypes)
-    return types;
-  for (mlir::Attribute attr : closureTypes) {
-    auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr);
-    if (!typeAttr)
-      return types;
-    types.push_back(typeAttr.getValue());
-  }
-  return types;
-}
-
-bool logicalTypeHasPrimitiveI64Evidence(mlir::Type type) {
-  return contracts::runtimeContractName(type) == "builtins.int";
-}
-
-void skipPrimitiveI64Evidence(mlir::Block &entry, unsigned &offset) {
-  if (offset + 2 > entry.getNumArguments())
-    return;
-  if (!entry.getArgument(offset).getType().isInteger(64) ||
-      !entry.getArgument(offset + 1).getType().isInteger(1))
-    return;
-  offset += 2;
+  return own::callableLogicalInputTypes(function);
 }
 
 llvm::SmallVector<BorrowedEntryResource, 8> collectBorrowedEntryResources(
     mlir::func::FuncOp function,
     llvm::ArrayRef<own::RuntimeDeallocator> deallocators) {
   llvm::SmallVector<BorrowedEntryResource, 8> resources;
-  if (!function || function.isDeclaration() || function.empty() ||
-      own::isRuntimeManifestFunction(function))
+  if (own::isRuntimeManifestFunction(function))
     return resources;
-
-  llvm::SmallVector<mlir::Type, 8> logicalTypes =
-      callableLogicalInputTypes(function);
-  if (logicalTypes.empty())
-    return resources;
-
-  auto contract = own::readFunctionContract(function);
-  if (mlir::failed(contract))
-    return resources;
-
-  mlir::Block &entry = function.front();
-  unsigned offset = 0;
-  for (auto [logicalIndex, logicalType] : llvm::enumerate(logicalTypes)) {
-    if (offset >= entry.getNumArguments())
-      break;
-
-    unsigned groupOffset = offset;
-    // Named `values` like `own::ResourceGroup` and `UnwindTrackedGroup`: three
-  // structs calling one thing by two names is how they read as three
-  // different models of a resource when they are one.
-  llvm::SmallVector<mlir::Value, 4> group;
-    std::string contractName = contracts::runtimeContractName(logicalType);
-    if (!contractName.empty()) {
-      if (const own::RuntimeDeallocator *deallocator =
-              own::findDeallocatorForValueGroup(entry.getArguments(), offset,
-                                                deallocators, contractName)) {
-        group = own::valueSlice(
-            entry.getArguments(), offset,
-            static_cast<unsigned>(deallocator->inputTypes.size()));
-        offset += static_cast<unsigned>(deallocator->shapeTypes.size());
-      } else if (own::isObjectHeaderLikeType(
-                     entry.getArgument(offset).getType())) {
-        group.push_back(entry.getArgument(offset));
-        ++offset;
-      } else {
-        ++offset;
-      }
-      if (logicalTypeHasPrimitiveI64Evidence(logicalType))
-        skipPrimitiveI64Evidence(entry, offset);
-    } else {
-      ++offset;
-    }
-
-    own::OwnershipKind ownership =
-        own::logicalOwnershipKind(logicalType, /*ownsObject=*/false);
-    if (group.empty() || ownership != own::OwnershipKind::Borrow)
-      continue;
-    if (contract->consumesArg(groupOffset))
-      continue;
-
+  for (own::EntryArgumentGroup &group :
+       own::collectBorrowedEntryGroups(function, deallocators)) {
     BorrowedEntryResource resource;
     resource.function = function;
-    resource.logicalIndex = static_cast<unsigned>(logicalIndex);
-    resource.inputOffset = groupOffset;
-    resource.values = std::move(group);
+    resource.logicalIndex = group.logicalIndex;
+    resource.inputOffset = group.inputOffset;
+    resource.values = std::move(group.values);
     resources.push_back(std::move(resource));
   }
   return resources;

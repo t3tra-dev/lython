@@ -109,17 +109,17 @@ module attributes {
   // ===== from builtins =====
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1
   func.func private @__ly_raise_message_object(%class_id: i64, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>)
-  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @__ly_unicode_alloc(%count: i64, %width: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1)
-  func.func private @LyLong_Repr(%header: memref<2xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyLong_Repr(%header: memref<2xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0]}
-  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0]}
+  func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]}
 
   // ===== the proxy object =====
-  // Words: refcount, class id, handle. Width 17 is this contract's alone
-  // (HandleWidthRegistry.h): a release chosen by shape cannot be another
-  // contract's, which would drop the object without dropping the handle.
+  // Words: refcount, class id, handle. The width is the one it was given when
+  // a release was chosen by shape; it is now chosen by contract name, so the
+  // width no longer has to be this contract's alone.
   func.func @LyJsProxy_New(%handle: i32) -> memref<17xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 151 : i64, ly.runtime.contract = "_js.JsProxy", ly.runtime.initializer = "__new__"} {
     %one = arith.constant 1 : i64
     %class_id = arith.constant 151 : i64
@@ -340,7 +340,7 @@ module attributes {
     func.return %truth : i1
   }
 
-  func.func @LyJsProxy_TakeStr(%handle: i32) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "take.str"} {
+  func.func @LyJsProxy_TakeStr(%handle: i32) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "_js.JsProxy", ly.runtime.primitive = "take.str"} {
     %string = arith.constant 3 : i32
     func.call @__ly_js_expect(%handle, %string) : (i32, i32) -> ()
     %header, %bytes = func.call @__ly_js_string(%handle) : (i32) -> (memref<2xi64>, memref<?xi8>)
@@ -370,7 +370,7 @@ module attributes {
 
   // A host string as a str of the narrowest width that holds it, written
   // by the host straight into the new str's storage.
-  func.func private @__ly_js_string(%handle: i32) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+  func.func private @__ly_js_string(%handle: i32) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
     %count32 = func.call @LyJs_StrCount(%handle) : (i32) -> i32
     %width32 = func.call @LyJs_StrWidth(%handle) : (i32) -> i32
     %count = arith.extui %count32 : i32 to i64

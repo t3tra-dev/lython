@@ -132,18 +132,35 @@ word 5..13 (解放関数を幅で選ぶための詰め物) は確保しない。
 evidence を兼ねるので即値にしない (残りの差の大半は要素の int オブジェクト)。
 
 P6 は当初「幅による解放関数の区別 (`HandleWidthRegistry`) を class id に置き換え、
-詰め物ワードを削除」だった。実施したのは後半だけ: list (9 ワード中 5)、set
+詰め物ワードを削除」だった。先に後半を行った: list (9 ワード中 5)、set
 (11 中 9)、frozenset (13 中 9)、tuple (P5) のハンドルを、使うワードだけ確保する。
-型は詰め物込みの幅のまま残すので解放関数の選択は変わらず、詰め物は型の上にしか
+型は詰め物込みの幅のまま残し、詰め物は型の上にしか
 無い (読み書きされないことを確保箇所以外の全アクセスで確認した)。list 1 個は
 80 B から 48 B のブロックになり、`[[i] for i in range(10**6)]` は 117 MB
 (CPython の tracemalloc で 104 MB)。
 
-前半 (解放関数を幅でなく contract 名か class id で選ぶ) は行っていない。メモリ上の
-詰め物は無くなったので残る動機は「幅の割り当てが尽きている」ことだけで、それは
-所有権検証器のモデル (`HandleWidthRegistry.h` の GAP 1 / GAP 2: owned result の
-約 4 割が contract 名を持たない) を変える仕事であり、ABI の軽量化とは別の作業と
-して扱う。
+前半は後から行った。解放関数は contract 名だけで選ぶ (`findDeallocatorForValueGroup`
+に名前の無い呼び出しは無い)。名前が無い・名前に合う解放関数が無い値は解放しない
+側に倒れ、所有権検証器が拒否する。名前を揃えるために行ったこと:
+
+- manifest の owned result 126 関数に `ly.ownership.owned_result_contracts` を宣言した。
+- 例外クラスは別名表 (`ly.ownership.deallocator_aliases`) で
+  `builtins.BaseException` の解放関数を引く。別名は名前でしか引かれない。
+- 受け手の contract を結果の名前にするのは、initializer と
+  `ly.runtime.result_evidence = "receiver"` だけにした。
+- 引数の lane は宣言型の幅で数える。union 引数は tag と各メンバーの幅を合計する。
+  以前は 1 lane と数えていたので、後続の引数の名前が 1 lane 以上ずれていた。
+- protocol clone の引数には具体型 (`ly.ownership.protocol_argument_types`) を記録する。
+- raise に渡す借用引数は、呼び出しの operand を形で走査せず、関数の引数グループ
+  (宣言型で名前の付いたもの) と一致するかで判定する。
+- 戻り値を走査して形の合う解放関数を探す処理 (`collectRuntimeResourceGroups`) は
+  削除した。全 golden と examples で、名前で見つかる以上のグループを足していな
+  かった。
+
+幅を予約していた `HandleWidthRegistry.h` と、その検査 `abi.handle_width_reservations`
+は削除した。ハンドル型の幅は、名前で引く前の割り当てのまま残っている。使う
+ワードまで縮めるのは別の作業で、型の上の詰め物はメモリを消費していない。
+
 即値を読むたびにオブジェクトを作るので、`d[k]` の読み出しが多いループは P1α と
 同程度にとどまる (読み出しで evidence に直接載せるのは P2 の f64 / i64 evidence
 と合わせて扱う)。

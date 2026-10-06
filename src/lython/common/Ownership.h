@@ -82,6 +82,18 @@ namespace py::ownership {
 //                                             absorbing retain, so a walk can
 //                                             find the holder
 //   ly.ownership.aggregate_id_next            the allocator for those ids
+//   ly.ownership.deallocator_aliases          which contract's deallocator
+//                                             releases a class that has none
+//                                             of its own -- a ClassId-to-
+//                                             release-function table the
+//                                             model has no notion of, like
+//                                             `owned_result_contracts`
+//   ly.ownership.protocol_argument_types      the concrete type a protocol
+//                                             clone's parameter arrives as,
+//                                             where `callable_type` still
+//                                             says the protocol -- what names
+//                                             its lanes, as `callable_type`
+//                                             does every other parameter's
 //
 // The last three are how the compiler FINDS the parent. The model names it
 // directly -- `field′ p k` is indexed by the parent object -- so having no
@@ -155,6 +167,14 @@ inline constexpr llvm::StringLiteral kOwnedLocalObjectContractAttr{
     "ly.ownership.owned_local_object_contract"};
 inline constexpr llvm::StringLiteral kObjectReleaseToZeroAttr{
     "ly.ownership.object_release_to_zero"};
+// Module attribute: {contract name: contract whose deallocator releases it},
+// for the program's classes that have no deallocator of their own.
+inline constexpr llvm::StringLiteral kDeallocatorAliasesAttr{
+    "ly.ownership.deallocator_aliases"};
+// Function attribute: one entry per logical parameter, a TypeAttr where a
+// protocol clone receives a concrete type and a UnitAttr where it does not.
+inline constexpr llvm::StringLiteral kProtocolArgumentTypesAttr{
+    "ly.ownership.protocol_argument_types"};
 inline constexpr llvm::StringLiteral kAggregateRetainAttr{
     "ly.ownership.aggregate_retain"};
 inline constexpr llvm::StringLiteral kAggregateReleaseAttr{
@@ -422,6 +442,10 @@ struct RuntimeDeallocator {
   // values are interior views whose USES still pin the entity's liveness.
   llvm::SmallVector<mlir::Type, 4> shapeTypes;
   FunctionContract contract;
+  // A copy of another contract's entry under an alias's name
+  // (`kDeallocatorAliasesAttr`): found by name only, never by shape, where
+  // it would tie with the entry it copies.
+  bool alias = false;
 };
 
 llvm::SmallVector<RuntimeDeallocator, 8>
@@ -458,10 +482,35 @@ mlir::Value spellHeaderPrefix(mlir::OpBuilder &builder, mlir::Location loc,
 // Strips identity-shaped unrealized-cast markers (owned-local-object rooting
 // and similar value-group markers keep types and arity) so SSA-identity
 // comparisons see the underlying value regardless of ownership rewrapping.
+// Names who is looking a deallocator up, and for which function, in the
+// LYTHON_DEALLOC_CENSUS report; a no-op when the census is off.
+// A borrowed parameter's lanes in a function's entry block.
+struct EntryArgumentGroup {
+  unsigned logicalIndex = 0;
+  unsigned inputOffset = 0;
+  llvm::SmallVector<mlir::Value, 4> values;
+};
+
+llvm::SmallVector<mlir::Type, 8>
+callableLogicalInputTypes(mlir::func::FuncOp function);
+
+llvm::SmallVector<EntryArgumentGroup, 8>
+collectBorrowedEntryGroups(mlir::func::FuncOp function,
+                           llvm::ArrayRef<RuntimeDeallocator> deallocators);
+
+class DeallocCensusContext {
+public:
+  DeallocCensusContext(const char *origin, llvm::StringRef subject);
+  ~DeallocCensusContext();
+
+private:
+  const char *previousOrigin;
+  std::string previousSubject;
+};
+
 mlir::Value underlyingObjectValue(mlir::Value value);
-const RuntimeDeallocator *
-findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
-                             llvm::ArrayRef<RuntimeDeallocator> deallocators);
+// The deallocator of the contract `contractName` whose release interface the
+// values at `offset` have; nullptr when the name is empty or names none.
 const RuntimeDeallocator *
 findDeallocatorForValueGroup(mlir::ValueRange values, unsigned offset,
                              llvm::ArrayRef<RuntimeDeallocator> deallocators,
@@ -571,10 +620,6 @@ llvm::SmallVector<unsigned, 32> numberStronglyConnectedComponents(
 void collectBoxWordDerivedViews(llvm::ArrayRef<mlir::Value> groupValues,
                                 llvm::SmallVectorImpl<mlir::Value> &views,
                                 FuncContractCache *contracts = nullptr);
-
-llvm::SmallVector<ResourceGroup, 8>
-collectRuntimeResourceGroups(mlir::ValueRange values,
-                             llvm::ArrayRef<RuntimeDeallocator> deallocators);
 llvm::SmallVector<ResourceGroup, 4>
 collectOwnedLocalObjectGroups(mlir::Operation *op,
                               llvm::ArrayRef<RuntimeDeallocator> deallocators);

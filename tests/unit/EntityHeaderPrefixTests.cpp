@@ -15,7 +15,7 @@
 // COMPLETES, and no golden covering it existed when this was written.
 //
 // The width columns are deliberate: 9 is `builtins.list` and 16 is both
-// `builtins.object` AND the transient payload box (ABI/HandleWidthRegistry.h),
+// `builtins.object` AND the transient payload box,
 // so the tests state that the answer does NOT come from the width.
 
 #include "Runtime/ABI/EntityHeaderPrefix.h"

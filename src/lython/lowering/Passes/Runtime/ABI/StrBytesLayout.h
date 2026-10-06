@@ -26,28 +26,11 @@
 // (rfc/lane-conversion-playbook.md step 1). Two is what `bytes` came from, so
 // four is the smallest width that satisfies that rule for this contract.
 //
-// Why SIX and not four. Four also satisfies the rule above, and four is what this
-// contract was first converted to -- wrongly. Four is the release-interface width
-// of `lyrt.Counter`, `lyrt.AsyncCounter` and `lyrt.ReadyAsyncCounter`, and
-// `findDeallocatorForValueGroup`'s contract-less overload filters candidates by
-// `inputTypes` and only then breaks the tie on `shapeMatch`. A tie there is
-// resolved by NEITHER width nor shape when the scores are equal: every candidate
-// after the first sets `ambiguous`, and the function returns nullptr. Scoring
-// zero is not the safe case, it is the INDISTINGUISHABLE case.
-//
-// That was measured, not reasoned. With `bytes` at four, a three-line program
-// (`b = b"hello"; len(b); b + b"!"`) reached the contract-less overload 28 times
-// with a bare `memref<4xi64>` and got nullptr every time -- so a bytes handle had
-// no owner group on those paths. Six is unused by every release interface in the
-// tree (7 and 9-15 are too), and the same probe reports zero ambiguous hits for
-// `memref<6xi64>`.
-//
-// The tie this replaced was the same mechanism with a positive score: `str` and
-// `bytes` were both two-lane, both scored `shapeMatch` 2 against a real two-lane
-// group, and the collector refused a group it had in hand -- which is what hid a
-// double release of the exception message (see rfc/memory-safety-proof.md,
-// `NonInstantiationIsNotConformance`). Positive-score and zero-score ties differ
-// only in what is suppressed, not in whether suppression happens.
+// Why SIX and not four: four was the release-interface width of the lyrt
+// counters, and while a release was chosen by shape a shared width tied and
+// released nothing (28 lost groups on a three-line bytes program). A release
+// is now chosen by contract name (`findDeallocatorForValueGroup`), so the
+// width only has to satisfy the rule above.
 
 #include <cstdint>
 
