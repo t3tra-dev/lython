@@ -578,6 +578,41 @@ TEST(DriverTest, AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue) {
   EXPECT_GT(standIns, 0u) << "no operator answered with a deferred int";
 }
 
+// What: the slow arm of an int operator outside a clone is one call that
+// takes its operands as deferred ints (`LyLong_MulDeferred`,
+// `LyLong_GtDeferred`, ...) -- the arm boxes nothing and calls no operator on
+// boxes itself, so nothing it made is live when an operator raises.
+TEST(DriverTest, AnIntSlowArmIsOneDeferredCall) {
+  CompileResult result = compileSource(
+      "def mix(xs: list[int], k: int) -> int:\n"
+      "    t = 0\n"
+      "    for x in xs:\n"
+      "        if x * k > t:\n"
+      "            t = t + x // k\n"
+      "    return t\n\n\n"
+      "print(mix([1, 2], 3))\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Function *function =
+      result.verified.llvmModule->getFunction("mix");
+  ASSERT_NE(function, nullptr);
+  unsigned binary = 0, compare = 0;
+  for (const llvm::BasicBlock &block : *function)
+    for (const llvm::Instruction &instruction : block)
+      if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (const llvm::Function *callee = call->getCalledFunction()) {
+          llvm::StringRef name = callee->getName();
+          EXPECT_FALSE(name == "LyLong_Add" || name == "LyLong_Mul" ||
+                       name == "LyLong_FloorDiv" || name == "LyLong_GtBool")
+              << "mix's slow arm calls " << name.str() << " itself";
+          binary += name == "LyLong_MulDeferred" ||
+                    name == "LyLong_AddDeferred" ||
+                    name == "LyLong_FloorDivDeferred";
+          compare += name == "LyLong_GtDeferred";
+        }
+  EXPECT_EQ(binary, 3u);
+  EXPECT_EQ(compare, 1u);
+}
+
 // What: in a function with no clone (it takes a list), a float read out of
 // the list, the arithmetic on it and the float the loop carries are f64
 // values: the body calls no float operator, reads no slot as an object, and

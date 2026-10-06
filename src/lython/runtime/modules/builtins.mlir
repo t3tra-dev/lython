@@ -7722,6 +7722,254 @@ module attributes {
     func.return
   }
 
+  // The slow arm of an int operator whose operands are deferred ints (see
+  // `LyLong_MaterializeRead`), one per operator: the raises it can take,
+  // decided on the i64s and the held objects before anything is made, then
+  // the operator on objects -- a held object borrowed as it is, an int made
+  // only for an i64 -- and what it made released again.
+  // ⛔ Not the arm building those objects itself and calling the operator: a
+  // box the arm makes is not released when the operator raises out of it,
+  // and every int slow arm then had to be written out as blocks for the
+  // unwind cleanup to see it (Runtime/Passes/RegionExits.cpp).
+  // ⛔ Not one helper switching on the operator: it names every operator, so
+  // a program that adds links the shifts and the bitwise ones too.
+  func.func @LyLong_AddDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__add__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Add(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_SubDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__sub__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Sub(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_MulDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__mul__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Mul(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_FloorDivDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__floordiv__"} {
+    func.call @LyLong_CheckDivisor(%bv, %bok) : (i64, i1) -> ()
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_FloorDiv(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_ModDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__mod__"} {
+    func.call @LyLong_CheckDivisor(%bv, %bok) : (i64, i1) -> ()
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Mod(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_LShiftDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__lshift__"} {
+    func.call @__ly_long_deferred_check_shift(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> ()
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_LShift(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_RShiftDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__rshift__"} {
+    func.call @__ly_long_deferred_check_shift(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> ()
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_RShift(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_BitAndDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__and__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_BitAnd(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_BitOrDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__or__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_BitOr(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_BitXorDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__xor__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_BitXor(%a, %b) : (memref<2xi64>, memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_EqDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__eq__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_EqBool(%a, %b) : (memref<2xi64>, memref<2xi64>) -> i1
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : i1
+  }
+
+  func.func @LyLong_NeDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__ne__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_NeBool(%a, %b) : (memref<2xi64>, memref<2xi64>) -> i1
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : i1
+  }
+
+  func.func @LyLong_LtDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__lt__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_LtBool(%a, %b) : (memref<2xi64>, memref<2xi64>) -> i1
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : i1
+  }
+
+  func.func @LyLong_LeDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__le__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_LeBool(%a, %b) : (memref<2xi64>, memref<2xi64>) -> i1
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : i1
+  }
+
+  func.func @LyLong_GtDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__gt__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_GtBool(%a, %b) : (memref<2xi64>, memref<2xi64>) -> i1
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : i1
+  }
+
+  func.func @LyLong_GeDeferred(%av: i64, %aok: i1, %aheld: memref<2xi64> {ly.ownership.object_header}, %bv: i64, %bok: i1, %bheld: memref<2xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__ge__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%av, %aok, %aheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %b, %b_made = func.call @__ly_long_deferred_operand(%bv, %bok, %bheld) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_GeBool(%a, %b) : (memref<2xi64>, memref<2xi64>) -> i1
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.call @__ly_long_deferred_release(%b, %b_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : i1
+  }
+
+  func.func @LyLong_NegDeferred(%v: i64, %ok: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__neg__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%v, %ok, %held) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Neg(%a) : (memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_InvertDeferred(%v: i64, %ok: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__invert__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%v, %ok, %held) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Invert(%a) : (memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  func.func @LyLong_AbsDeferred(%v: i64, %ok: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred.__abs__"} {
+    %a, %a_made = func.call @__ly_long_deferred_operand(%v, %ok, %held) : (i64, i1, memref<2xi64>) -> (memref<2xi64>, i1)
+    %result = func.call @LyLong_Abs(%a) : (memref<2xi64>) -> memref<2xi64>
+    func.call @__ly_long_deferred_release(%a, %a_made) : (memref<2xi64>, i1) -> ()
+    func.return %result : memref<2xi64>
+  }
+
+  // A shift's raise, on its count as a deferred int: a negative count, which
+  // a count that is no i64 can be too.
+  func.func private @__ly_long_deferred_check_shift(%value: i64, %valid: i1, %held: memref<2xi64>) attributes {ly.runtime.contract = "builtins.int"} {
+    %negative = func.call @__ly_long_deferred_is_negative(%value, %valid, %held) : (i64, i1, memref<2xi64>) -> i1
+    scf.if %negative {
+      func.call @__ly_long_raise_negative_shift() : () -> ()
+    }
+    func.return
+  }
+
+  // The release of what `__ly_long_deferred_operand` made, and nothing when
+  // it lent the held object.
+  func.func private @__ly_long_deferred_release(%object: memref<2xi64>, %made: i1) attributes {ly.runtime.contract = "builtins.int"} {
+    scf.if %made {
+      func.call @LyLong_DecRef(%object) : (memref<2xi64>) -> ()
+    }
+    func.return
+  }
+
+  // An operand of those slow arms as an object to read: the held object,
+  // borrowed, when it is one -- an object held with a valid i64 is that
+  // value's, since only the stand-in is held in place of one -- else an int
+  // made of the i64. `made` says whether the caller releases it.
+  // Runtime code (the contract attribute): an owned-or-borrowed result is a
+  // shape the frame-ownership insertion would "release before return".
+  func.func private @__ly_long_deferred_operand(%value: i64, %valid: i1, %held: memref<2xi64>) -> (memref<2xi64>, i1) attributes {ly.runtime.contract = "builtins.int"} {
+    %zero = arith.constant 0 : i64
+    func.call @__ly_long_small_ensure() : () -> ()
+    %stand_in = func.call @__ly_long_small_slot(%zero) : (i64) -> memref<2xi64>
+    %held_idx = memref.extract_aligned_pointer_as_index %held : memref<2xi64> -> index
+    %stand_idx = memref.extract_aligned_pointer_as_index %stand_in : memref<2xi64> -> index
+    %is_stand_in = arith.cmpi eq, %held_idx, %stand_idx : index
+    %make = arith.andi %valid, %is_stand_in : i1
+    %object = scf.if %make -> (memref<2xi64>) {
+      %fresh = func.call @LyLong_FromI64(%value) : (i64) -> memref<2xi64>
+      scf.yield %fresh : memref<2xi64>
+    } else {
+      scf.yield %held : memref<2xi64>
+    }
+    func.return %object, %make : memref<2xi64>, i1
+  }
+
+  // Whether a deferred int is negative, read off its i64 or its held object.
+  func.func private @__ly_long_deferred_is_negative(%value: i64, %valid: i1, %held: memref<2xi64>) -> i1 attributes {ly.runtime.contract = "builtins.int"} {
+    %zero = arith.constant 0 : i64
+    %negative = scf.if %valid -> (i1) {
+      %below = arith.cmpi slt, %value, %zero : i64
+      scf.yield %below : i1
+    } else {
+      %meta, %digits = func.call @__ly_long_parts(%held) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+      %sign_slot = arith.constant 0 : index
+      %sign = memref.load %meta[%sign_slot] : memref<2xi64>
+      %below = arith.cmpi slt, %sign, %zero : i64
+      scf.yield %below : i1
+    }
+    func.return %negative : i1
+  }
+
+  // The stand-in, BORROWED: what a slow arm hands a deferred-int helper as the
+  // held object of an int that is only an i64 (a literal), so the arm makes
+  // nothing it would have to release.
+  func.func @LyLong_DeferredStandInBorrowed() -> memref<2xi64> attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred_stand_in_borrowed"} {
+    %zero = arith.constant 0 : i64
+    func.call @__ly_long_small_ensure() : () -> ()
+    %held = func.call @__ly_long_small_slot(%zero) : (i64) -> memref<2xi64>
+    func.return %held : memref<2xi64>
+  }
+
   // What a deferred int holds while its i64 is the value: the immortal small
   // int 0, owned in name only (its release does nothing), so that both arms
   // of a deferred result yield an owned object and the frame owns the merge.

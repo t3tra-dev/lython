@@ -530,6 +530,14 @@ LogicalResult runLoweringPipeline(ModuleOp module,
   dumpMLIRForPass(irDump, "runtime-native-verifier", module);
 
   // Phase 10: insert and simplify ownership operations once calls are concrete.
+  // First, the arms whose owned values the unwind cleanup could not see
+  // otherwise are written out as blocks (Runtime/Passes/RegionExits.cpp).
+  if (failed(runPhase("region-exit-flattening", [&](PassManager &pm) {
+        pm.addPass(createRegionExitFlatteningPass());
+      })))
+    return failure();
+  dumpMLIRForPass(irDump, "region-exit-flattening", module);
+
   if (failed(runPhase("refcount-insertion", [&](PassManager &pm) {
         pm.addPass(createRefCountInsertionPass());
       }))) {

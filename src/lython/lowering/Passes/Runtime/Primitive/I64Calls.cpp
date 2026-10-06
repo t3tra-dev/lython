@@ -6,6 +6,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include <array>
 #include <limits>
 
 namespace py::lowering {
@@ -522,8 +523,83 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerPrimitiveI64BinarySpecial(
 
   context->loadDialect<mlir::scf::SCFDialect>();
 
+  // Each operand as a deferred int (`LyLong_MaterializeRead`): its i64,
+  // whether that is the value, and the object it holds -- a deferred int's
+  // own, an int object's self (with its i64 when it has one, else "not the
+  // value"). None when it is neither, and the arm then boxes as before.
+  auto deferredTriple =
+      [&](const RuntimeBundle *source)
+      -> std::optional<std::array<mlir::Value, 3>> {
+    if (!source)
+      return std::nullopt;
+    if (source->physicalValues().empty()) {
+      if (source->primitiveI64 && source->deferredObject)
+        return std::array<mlir::Value, 3>{source->primitiveI64->value,
+                                          source->primitiveI64->valid,
+                                          source->deferredObject};
+      // An int that is only its i64 (a literal) holds the stand-in, borrowed.
+      if (source->primitiveI64 && isPinnedTrueFlag(source->primitiveI64->valid))
+        if (std::optional<RuntimeSymbol> standIn = manifest.primitive(
+                "builtins.int", "deferred_stand_in_borrowed"))
+          return std::array<mlir::Value, 3>{
+              source->primitiveI64->value, source->primitiveI64->valid,
+              mlir::func::CallOp::create(builder, loc, standIn->function,
+                                         mlir::ValueRange{})
+                  .getResult(0)};
+      return std::nullopt;
+    }
+    if (source->physicalValues().size() != 1)
+      return std::nullopt;
+    mlir::Value object = source->physicalValues().front();
+    if (source->primitiveI64)
+      return std::array<mlir::Value, 3>{source->primitiveI64->value,
+                                        source->primitiveI64->valid, object};
+    return std::array<mlir::Value, 3>{constantI64(builder, loc, 0),
+                                      constantBool(builder, loc, false),
+                                      object};
+  };
+  // ⭐ THE SLOW ARM IS ONE CALL (`LyLong_AddDeferred` and its siblings, one
+  // per operator), which checks the raises, makes what objects it needs and
+  // releases them itself. ⛔ Not the objects made here and the operator
+  // called on them: a box made in the arm is not released when the operator
+  // raises, and an arm holding one had to be written out as blocks for the
+  // unwind cleanup to see it (Runtime/Passes/RegionExits.cpp) -- every int
+  // slow arm, for nothing but MemoryError.
+  auto emitDeferredSlowCall = [&]() -> mlir::FailureOr<bool> {
+    std::optional<RuntimeSymbol> helper = manifest.primitive(
+        "builtins.int", (llvm::Twine("deferred.") + methodName).str());
+    if (!helper)
+      return false;
+    llvm::SmallVector<mlir::Value, 8> operands;
+    for (const RuntimeBundle *source : sources) {
+      std::optional<std::array<mlir::Value, 3>> triple =
+          deferredTriple(source);
+      if (!triple)
+        return false;
+      operands.append(triple->begin(), triple->end());
+    }
+    mlir::FunctionType type = helper->function.getFunctionType();
+    if (type.getNumInputs() != operands.size())
+      return false;
+    for (auto [operand, expected] : llvm::zip(operands, type.getInputs()))
+      if (operand.getType() != expected)
+        return false;
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(loc, *helper, operands);
+    if (mlir::failed(checkPhysicalTypes(call.getResults(), "fallback call")))
+      return mlir::failure();
+    mlir::scf::YieldOp::create(builder, loc, call.getResults());
+    return true;
+  };
+
   auto emitFallbackYield = [&]() -> mlir::LogicalResult {
     mlir::Block *fallbackBlock = builder.getInsertionBlock();
+    builder.setInsertionPointToEnd(fallbackBlock);
+    mlir::FailureOr<bool> deferred = emitDeferredSlowCall();
+    if (mlir::failed(deferred))
+      return mlir::failure();
+    if (*deferred)
+      return mlir::success();
     builder.setInsertionPointToEnd(fallbackBlock);
     // The raises this arm can take, before it boxes anything: a box made here
     // is not released when the call below raises (see `check_divisor.i64`).

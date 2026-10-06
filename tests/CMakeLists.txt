@@ -197,6 +197,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AFloatFunctionRunsUnboxedInItsClone"
     "DriverTest.AFloatLoopInAnOrdinaryFunctionMakesNoObjects"
     "DriverTest.AnIntLoopInAnOrdinaryFunctionBoxesNoComputedValue"
+    "DriverTest.AnIntSlowArmIsOneDeferredCall"
     "DriverTest.BigIntLiteralInALoopStaysOutOfTheFrame"
     "DriverTest.CompilesHelloToVerifiedLLVMIR"
     "DriverTest.AWASIProgramWithAJsHostImportsLythonJs"
@@ -849,6 +850,13 @@ set(LYTHON_LEAK_GATE_CASES
     # The finally form of the same thing: the non-returning path yields an
     # EMPTY container as its default, and that object has to be released.
     a_container_returned_through_a_finally
+    # Boxes made inside an arm of an scf.if and live across a call there that
+    # raises: the clone fallback re-running a function with the arguments it
+    # boxed for it. The unwind cleanup sees only function-level values; such an
+    # arm is now written out as blocks (Runtime/Passes/RegionExits.cpp). Also a
+    # `j = m` edge whose py.incref was read as moving m's token, so a raise
+    # past it left m unreleased.
+    a_raise_out_of_a_fallback_releases_what_it_was_given
     # Two closures over one captured object: the merge's heap dead placeholder
     # is a real object with a refcount, and marking it complete moves where the
     # edge retain goes.

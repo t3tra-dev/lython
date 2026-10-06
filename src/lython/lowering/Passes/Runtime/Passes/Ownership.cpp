@@ -930,29 +930,73 @@ emitterLaneIncrefInBlock(mlir::Block *block, mlir::Value header,
   return nullptr;
 }
 
-// Does `block` LEND this group's entity to a merge argument -- i.e. does it
-// contain the `block-arg-merge-borrow` retain that pays for the destination
-// argument group's token?
+// Does this edge LEND the group's entity to the merge arguments it fills --
+// does its block hold the `block-arg-merge-borrow` retain that pays for the
+// destination argument group's token?
 //
 // The lend is what makes a forwarding edge NOT a transfer. Without it the
 // destination argument group inherits this group's token and the source is
 // consumed on the edge; with it the destination has an increment of its own and
 // the source keeps hers, so both are live past the merge and both need a
 // cleanup on an unwinding edge.
-bool blockLendsGroupToMergeArgument(mlir::Block *block,
-                                    llvm::ArrayRef<mlir::Value> group,
-                                    own::AliasAnalysis &aliases) {
-  if (!block || group.empty())
+//
+// ⭐ AND THE EMITTER'S `py.incref` LENDS THE SAME WAY. It is the token the
+// merge machinery credits to a lane before it would lend one of its own
+// (`emitterLaneIncrefInBlock`), so a `j = m` edge pays j's lane with it and
+// m keeps her token. Read as a move, m was "not held" past the loop header on
+// every path -- including the first trip, which never took that edge -- and a
+// raise there left her token unreleased: 100 ints per 100 IndexErrors for
+//
+//     m = len(out) + extra
+//     while j < m:
+//         x = out[j]               # IndexError
+//         if x == "stop":
+//             j = m                # incref m, forward to j's lane
+//             continue
+//
+// ⛔ COUNTED, not "is there one". Each lane the edge forwards the group into
+// takes one increment; an edge that forwards more lanes than the block lent
+// moves the group's own token into one of them, and a release of the group
+// in the block takes one lent increment back.
+bool terminatorLendsGroupToMergeArguments(mlir::Operation *terminator,
+                                          llvm::ArrayRef<mlir::Value> group,
+                                          own::AliasAnalysis &aliases) {
+  auto branch = mlir::dyn_cast_or_null<mlir::BranchOpInterface>(terminator);
+  if (!branch || group.empty())
     return false;
-  for (mlir::Operation &op : *block) {
+  mlir::Value head = group.front();
+  int lent = 0;
+  for (mlir::Operation &op : *terminator->getBlock()) {
+    if (&op == terminator)
+      break;
     auto call = mlir::dyn_cast<mlir::func::CallOp>(&op);
-    if (!call || !own::isBlockArgMergeBorrowRetain(call) ||
-        call.getNumOperands() != 1)
+    if (!call || call.getNumOperands() == 0)
       continue;
-    if (aliases.same(retainSpellingRoot(call.getOperand(0)), group.front()))
-      return true;
+    llvm::StringRef callee = call.getCallee();
+    bool lends = (own::isBlockArgMergeBorrowRetain(call) ||
+                  own::isEmitterIncrefRetain(call)) &&
+                 call.getNumOperands() == 1;
+    bool releases = callee == "Ly_DecRef" || callee.ends_with("_DecRef") ||
+                    callee.starts_with("__ly_dealloc_");
+    if (!lends && !releases)
+      continue;
+    if (!aliases.same(retainSpellingRoot(call.getOperand(0)), head))
+      continue;
+    lent += lends ? 1 : -1;
   }
-  return false;
+  if (lent <= 0)
+    return false;
+  for (unsigned index = 0, end = terminator->getNumSuccessors(); index < end;
+       ++index) {
+    mlir::SuccessorOperands operands = branch.getSuccessorOperands(index);
+    int lanes = 0;
+    for (unsigned at = 0, size = operands.size(); at < size; ++at)
+      if (operands[at] && aliases.same(operands[at], head))
+        ++lanes;
+    if (lanes > lent)
+      return false;
+  }
+  return true;
 }
 
 mlir::Operation *latestUserInBlock(mlir::Operation *lhs, mlir::Operation *rhs) {
@@ -5190,12 +5234,12 @@ void collectUnwindGroupSites(FuncContractCache &contracts,
           // past the merge never sees this group as held (the destination
           // group covers it there).
           //
-          // Unless the edge LENDS (`blockLendsGroupToMergeArgument`): then the
-          // destination was given an increment of its own and nothing moved, so
-          // reading the forward as a consume would retire a token that is still
-          // held.
-          if (!blockLendsGroupToMergeArgument(user->getBlock(), group.values,
-                                              aliases) &&
+          // Unless the edge LENDS (`terminatorLendsGroupToMergeArguments`):
+          // then the destination was given an increment of its own and nothing
+          // moved, so reading the forward as a consume would retire a token
+          // that is still held.
+          if (!terminatorLendsGroupToMergeArguments(user, group.values,
+                                                    aliases) &&
               !deadAfterRaise.deadAfter(contracts, user) &&
               seenConsumes.insert(user).second)
             group.consumeSites.push_back(user);
