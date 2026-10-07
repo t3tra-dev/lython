@@ -2230,6 +2230,48 @@ bool ModuleEmitter::specializationArgumentNodes(
   return true;
 }
 
+// The parameter type a call re-reads its callee at when the argument is a
+// lower numeric rung than the parameter declares, or null when it is not.
+//
+// Only a tower rung is re-read. Every other proper subtype already reaches the
+// declared body correctly (a subclass instance travels the object ABI,
+// `take(Dog(4))` against `def take(a: Animal)` runs today), and specializing
+// those would emit a second body for no difference in behaviour.
+//
+// ⭐ A UNION PARAMETER TOO: `def f(v: int | None)` called with True is read at
+// `bool | None`, the nearest tower member above the argument replaced by the
+// argument's own rung -- what the scalar case does to the whole parameter.
+// Passing the bool unchanged reached the lowering as "arguments do not match
+// Callable contract for function target f", a union having no place for it.
+static mlir::Type lowerRungParameter(TypeSystem &types, mlir::Type declared,
+                                     mlir::Type supplied) {
+  int suppliedRung = numericTowerRung(types, supplied);
+  if (suppliedRung < 0)
+    return {};
+  int declaredRung = numericTowerRung(types, declared);
+  if (declaredRung >= 0)
+    return suppliedRung < declaredRung ? supplied : mlir::Type();
+  auto unionType = mlir::dyn_cast_if_present<py::UnionType>(declared);
+  if (!unionType || unionType.hasMember(supplied))
+    return {};
+  std::optional<unsigned> nearest;
+  int nearestRung = -1;
+  for (auto [memberIndex, member] :
+       llvm::enumerate(unionType.getMemberTypes())) {
+    int rung = numericTowerRung(types, types.widenLiteral(member));
+    if (rung > suppliedRung && (!nearest || rung < nearestRung)) {
+      nearest = memberIndex;
+      nearestRung = rung;
+    }
+  }
+  if (!nearest)
+    return {};
+  llvm::SmallVector<mlir::Type, 4> members(unionType.getMemberTypes().begin(),
+                                           unionType.getMemberTypes().end());
+  members[*nearest] = supplied;
+  return types.join(members);
+}
+
 bool ModuleEmitter::mayArgumentSpecialize(const parser::Node &expr,
                                           const GenericFunctionInfo &info) {
   llvm::SmallVector<const parser::Node *, 4> nodes;
@@ -2238,13 +2280,10 @@ bool ModuleEmitter::mayArgumentSpecialize(const parser::Node &expr,
   llvm::ArrayRef<mlir::Type> declared = info.signature.positionalTypes;
   if (nodes.size() != declared.size())
     return false;
-  for (auto [index, node] : llvm::enumerate(nodes)) {
-    mlir::Type supplied = types.widenLiteral(types.inferExpr(node));
-    int suppliedRung = numericTowerRung(types, supplied);
-    int declaredRung = numericTowerRung(types, declared[index]);
-    if (suppliedRung >= 0 && declaredRung >= 0 && suppliedRung < declaredRung)
+  for (auto [index, node] : llvm::enumerate(nodes))
+    if (lowerRungParameter(types, declared[index],
+                           types.widenLiteral(types.inferExpr(node))))
       return true;
-  }
   return false;
 }
 
@@ -2289,19 +2328,19 @@ Value ModuleEmitter::emitArgumentSpecializedCall(const parser::Node &expr,
   bool anyLowerRung = false;
   for (auto [index, supplied] : llvm::enumerate(suppliedTypes)) {
     mlir::Type widened = types.widenLiteral(supplied);
-    int suppliedRung = numericTowerRung(types, widened);
-    int declaredRung = numericTowerRung(types, declared[index]);
-    // Only a tower rung is re-read. Every other proper subtype already
-    // reaches the declared body correctly (a subclass instance travels the
-    // object ABI, `take(Dog(4))` against `def take(a: Animal)` runs today),
-    // and specializing those would emit a second body for no difference in
-    // behaviour.
-    if (suppliedRung >= 0 && declaredRung >= 0 && suppliedRung < declaredRung) {
-      actual.push_back(widened);
+    if (mlir::Type lowered =
+            lowerRungParameter(types, declared[index], widened)) {
+      actual.push_back(lowered);
       anyLowerRung = true;
       continue;
     }
-    if (widened != declared[index])
+    // ⛔ Not equality: a union parameter given one of its members (`w: int |
+    // str` given "s") keeps its declaration in the specialized body, and
+    // demanding the exact type sent `g(2, "s")` against `def g(v: float |
+    // None, w: int | str)` back to the refusal the first position escaped.
+    if (widened != declared[index] &&
+        !(mlir::isa<py::UnionType>(declared[index]) &&
+          mlir::cast<py::UnionType>(declared[index]).hasMember(widened)))
       return ordinary();
     actual.push_back(declared[index]);
   }
