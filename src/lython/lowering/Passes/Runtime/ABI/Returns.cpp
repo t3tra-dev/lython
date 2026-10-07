@@ -315,6 +315,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
               duplicate = true;
           }
           unsigned before = static_cast<unsigned>(operands.size());
+          // ⭐ A FRAME LANE NOTHING HOLDS AT THIS SUSPEND carries the dead
+          // lane value. The state machine fills it with a bare `py.none`
+          // (a union local's live value is always the WRAPPED union), and for
+          // a boxed lane the path below boxed that None into a fresh HEAP box
+          // -- which the next state never reads and nothing released: 48
+          // bytes per run of a generator whose union local dies before a
+          // later yield (golden a_generator_keeps_an_optional_across_a_yield).
+          if (operandIndex >= 5 && suspendLane->contract == "builtins.object" &&
+              operand.getDefiningOp<py::NoneOp>()) {
+            mlir::FailureOr<llvm::SmallVector<mlir::Value, 4>> dead =
+                RuntimeBundleLowerer::materializeGeneratorDeadLaneValues(
+                    op.getOperation(), *suspendLane);
+            if (mlir::failed(dead)) {
+              result = mlir::failure();
+              return mlir::WalkResult::interrupt();
+            }
+            operands.append(dead->begin(), dead->end());
+            resultIndex += static_cast<unsigned>(operands.size()) - before;
+            continue;
+          }
           if (mlir::failed(
                   RuntimeBundleLowerer::appendGeneratorLaneReturnOperands(
                       op, *suspendLane, *bundle, operands,

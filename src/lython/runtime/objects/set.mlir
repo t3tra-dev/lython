@@ -333,7 +333,6 @@ module attributes {
   // (rfc/memory-safety-proof.md, `Interior`), and those five plus
   // frozenset.__init__ were the six `transfer_args` declarations these two
   // contracts owned.
-  func.func private @boxed_int_value(%meta_bits: i64, %digits_bits: i64) -> i64
 
   func.func private @LySet_Shape() -> memref<9xi64> attributes {ly.runtime.contract = "builtins.set", ly.runtime.shape}
 

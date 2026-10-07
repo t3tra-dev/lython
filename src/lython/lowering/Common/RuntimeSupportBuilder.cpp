@@ -1688,85 +1688,6 @@ void buildWriteBuffered(SupportBuilder &b) {
   mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{});
 }
 
-// i64 boxed_int_value(i64 meta_bits, i64 digits_bits): decode a boxed int
-// payload (sign at meta[0], digit count at meta[1], base-2^30 digits) into a
-// signed i64 — the runtime's small-int envelope. Shared ABI: builtins.mlir
-// declares and calls it.
-void buildBoxedIntValue(SupportBuilder &b) {
-  auto fn = b.beginFunction(
-      "boxed_int_value", b.builder.getFunctionType({b.i64(), b.i64()},
-                                                   {b.i64()}));
-  mlir::Block *entry = fn.addEntryBlock();
-  mlir::Region &body = fn.getBody();
-  mlir::Block *zeroBlock = b.builder.createBlock(&body);
-  mlir::Block *decode = b.builder.createBlock(&body);
-  mlir::Block *digits = b.builder.createBlock(&body);
-  b.builder.setInsertionPointToEnd(entry);
-  mlir::Value zero = b.iconst(0);
-  mlir::Value metaMissing = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                   entry->getArgument(0), zero);
-  mlir::Value digitsMissing = b.cmpi(mlir::arith::CmpIPredicate::eq,
-                                     entry->getArgument(1), zero);
-  mlir::Value missing = b.orBit(metaMissing, digitsMissing);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, missing, zeroBlock,
-                                 mlir::ValueRange{}, decode,
-                                 mlir::ValueRange{});
-  b.builder.setInsertionPointToEnd(zeroBlock);
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{zero});
-  b.builder.setInsertionPointToEnd(decode);
-  mlir::Value metaPtr = b.intToPtr(entry->getArgument(0));
-  mlir::Value digitsPtr = b.intToPtr(entry->getArgument(1));
-  mlir::Value sign = b.loadI64(b.gepI64(metaPtr, zero));
-  mlir::Value count = b.loadI64(b.gepI64(metaPtr, b.iconst(1)));
-  mlir::Value countEmpty =
-      b.cmpi(mlir::arith::CmpIPredicate::sle, count, zero);
-  mlir::cf::CondBranchOp::create(b.builder, b.loc, countEmpty, zeroBlock,
-                                 mlir::ValueRange{}, digits,
-                                 mlir::ValueRange{});
-  b.builder.setInsertionPointToEnd(digits);
-  mlir::Value countIndex = mlir::arith::IndexCastOp::create(
-      b.builder, b.loc, b.builder.getIndexType(), count);
-  mlir::Value zeroIndex =
-      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 0);
-  mlir::Value oneIndex =
-      mlir::arith::ConstantIndexOp::create(b.builder, b.loc, 1);
-  mlir::Value one = b.iconst(1);
-  mlir::Value base = b.iconst(1073741824);
-  auto loop = mlir::scf::ForOp::create(b.builder, b.loc, zeroIndex, countIndex,
-                                       oneIndex, mlir::ValueRange{zero});
-  {
-    mlir::OpBuilder::InsertionGuard guard(b.builder);
-    b.builder.setInsertionPointToStart(loop.getBody());
-    mlir::Value position = mlir::arith::IndexCastOp::create(
-        b.builder, b.loc, b.i64(), loop.getInductionVar());
-    mlir::Value fromEnd =
-        mlir::arith::AddIOp::create(b.builder, b.loc, position, one);
-    mlir::Value digitIndex =
-        mlir::arith::SubIOp::create(b.builder, b.loc, count, fromEnd);
-    mlir::Value digitPtr = mlir::LLVM::GEPOp::create(
-        b.builder, b.loc, b.ptr(), b.i32(), digitsPtr,
-        mlir::ValueRange{digitIndex});
-    mlir::Value digit = mlir::LLVM::LoadOp::create(b.builder, b.loc, b.i32(),
-                                                   digitPtr, /*alignment=*/4);
-    mlir::Value wide =
-        mlir::arith::ExtUIOp::create(b.builder, b.loc, b.i64(), digit);
-    mlir::Value shifted = mlir::arith::MulIOp::create(
-        b.builder, b.loc, loop.getRegionIterArg(0), base);
-    mlir::Value accumulated =
-        mlir::arith::AddIOp::create(b.builder, b.loc, shifted, wide);
-    mlir::scf::YieldOp::create(b.builder, b.loc,
-                               mlir::ValueRange{accumulated});
-  }
-  mlir::Value magnitude = loop.getResult(0);
-  mlir::Value isNegative = b.cmpi(mlir::arith::CmpIPredicate::slt, sign, zero);
-  mlir::Value negated =
-      mlir::arith::SubIOp::create(b.builder, b.loc, zero, magnitude);
-  mlir::Value result = mlir::arith::SelectOp::create(b.builder, b.loc,
-                                                     isNegative, negated,
-                                                     magnitude);
-  mlir::func::ReturnOp::create(b.builder, b.loc, mlir::ValueRange{result});
-}
-
 // void print_bytes(i32 fd, ptr data, i64 offset, i64 size, i64 stride,
 // i64 len): validated memref-view write. Contiguous views write in one call;
 // strided views write per element. Invalid descriptors abort.
@@ -4285,7 +4206,6 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   buildWriteChar(support);
   buildWriteHexI64(support);
   buildWriteBuffered(support);
-  buildBoxedIntValue(support);
   buildPrintBytes(support);
   buildHostSupport(support);
   buildOsSupport(support);

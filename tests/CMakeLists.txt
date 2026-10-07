@@ -618,6 +618,10 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # A union local that dies before a generator's later yield: its frame
+    # lane crosses that suspension as a placeholder, which was boxed into a
+    # heap box no state ever read back.
+    a_generator_keeps_an_optional_across_a_yield
     # What a runtime body owed when an exception left it half way -- the
     # copy `sorted` sorts, a dict or set insertion's boxes, a frozenset being
     # built -- given back where the exception is caught; only a leak check sees
