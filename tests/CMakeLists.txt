@@ -242,6 +242,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AWasmModuleCarriesItsPadsAsFunclets"
     "DriverTest.PutsIsDeclaredWithItsCPrototype"
     "DriverTest.ASizePastTheTargetsReachIsMemoryErrorAndTheAllocatorNeverRaises"
+    "DriverTest.TheSameProgramCompilesToTheSameModule"
     "DriverTest.A32BitTargetCompilesOnlyWhereItsLibcWasMeasured"
     "DriverTest.TheObjectAllocatorAlignsWhereMallocDoesNot"
     "DriverTest.OnlyDarwinMapsBigBlocksAndPooledBlocksHaveNoHeader"

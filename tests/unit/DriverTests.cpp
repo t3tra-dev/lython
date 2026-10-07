@@ -47,6 +47,7 @@
 #include <memory>
 #include <optional>
 
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -2331,6 +2332,77 @@ TEST(DriverTest, ASizePastTheTargetsReachIsMemoryErrorAndTheAllocatorNeverRaises
           answered = value->getSExtValue();
     EXPECT_EQ(answered, std::optional<std::int64_t>(expected.maxRequest))
         << expected.triple;
+  }
+}
+
+// What: the same program compiles to the same module, compile after compile.
+//
+// A chain built through a guarded tail seeds owned-merge candidates from more
+// than one branch, and their order became the argument order of an outlined
+// unwind cleanup. That order was read off a use list (ordered by when each use
+// was created) and off alias buckets listed in address order, so it moved with
+// the allocator: one program, two modules. Each compile here first takes a
+// differently sized set of small blocks, so the objects land at different
+// addresses: before the fix twelve compiles disagreed in 9 runs of 10.
+TEST(DriverTest, TheSameProgramCompilesToTheSameModule) {
+  const char *source = "class N:\n"
+                       "    def __init__(self, v: int) -> None:\n"
+                       "        self.v = v\n"
+                       "        self.nxt: \"N | None\" = None\n"
+                       "\n"
+                       "def build(xs: list[int]) -> \"N | None\":\n"
+                       "    head: \"N | None\" = None\n"
+                       "    tail: \"N | None\" = None\n"
+                       "    for v in xs:\n"
+                       "        node = N(v)\n"
+                       "        if head is None:\n"
+                       "            head = node\n"
+                       "            tail = node\n"
+                       "        else:\n"
+                       "            if tail is not None:\n"
+                       "                tail.nxt = node\n"
+                       "            tail = node\n"
+                       "    return head\n"
+                       "\n"
+                       "def build_while(n: int) -> \"N | None\":\n"
+                       "    head: \"N | None\" = None\n"
+                       "    tail: \"N | None\" = None\n"
+                       "    i = 0\n"
+                       "    while i < n:\n"
+                       "        node = N(i)\n"
+                       "        if tail is not None:\n"
+                       "            tail.nxt = node\n"
+                       "        else:\n"
+                       "            head = node\n"
+                       "        tail = node\n"
+                       "        i += 1\n"
+                       "    return head\n"
+                       "\n"
+                       "h = build([1, 2, 3])\n"
+                       "w = build_while(3)\n"
+                       "print(h is not None, w is not None)\n";
+  // The one name that is numbered per PROCESS rather than per module: the
+  // `cf.assert` lowering counts its message globals across compiles, so a
+  // second compile in this process spells them differently and means the
+  // same thing.
+  const std::regex assertMessage("@assert_msg(_[0-9]+)?\\b");
+  std::string first;
+  for (int round = 0; round < 12; ++round) {
+    std::vector<std::unique_ptr<char[]>> elsewhere;
+    for (int block = 0; block < 97 * (round + 1); ++block)
+      elsewhere.push_back(std::make_unique<char[]>(16 + 16 * (block % 31)));
+    CompileResult result = compileSource(source);
+    ASSERT_TRUE(result.succeeded) << result.diagnostics;
+    std::string printed;
+    llvm::raw_string_ostream os(printed);
+    result.verified.llvmModule->print(os, nullptr);
+    std::string text =
+        std::regex_replace(printed, assertMessage, "@assert_msg_N");
+    if (round == 0)
+      first = text;
+    else
+      ASSERT_EQ(text, first) << "compile " << round
+                             << " made a different module";
   }
 }
 

@@ -672,6 +672,9 @@ private:
   void rebuildAliasBuckets();
 
   llvm::DenseMap<mlir::Value, mlir::Value> parent;
+  // Every tracked value, in the order it was first seen: the order a bucket
+  // lists its names in.
+  llvm::SmallVector<mlir::Value, 0> tracked;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 8>> aliasBuckets;
   bool aliasBucketsDirty = true;
 };

@@ -3232,6 +3232,16 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
   // the receiver to move the forward next to it. That destination group was
   // never created, so no pass released the name the verifier had renamed onto,
   // and the token reached the function exit still owned.
+  //
+  // In the order of their blocks. ⛔ Not in the order the uses were found: a
+  // use list is ordered by when each use was CREATED, which earlier passes do
+  // not keep stable from run to run, and the order here is the order merge
+  // candidates are seeded in -- it reached the argument order of an outlined
+  // unwind cleanup, and one program compiled to two different modules.
+  // Nothing in this phase adds or removes a block, so each function's block
+  // positions are counted once.
+  llvm::DenseMap<mlir::Region *, llvm::DenseMap<mlir::Block *, unsigned>>
+      blockPositions;
   auto forwardingTerminators = [&](mlir::func::FuncOp fn,
                                    llvm::ArrayRef<mlir::Value> values) {
     llvm::SmallVector<mlir::Operation *, 4> terminators;
@@ -3250,6 +3260,18 @@ mlir::LogicalResult insertOwnedBlockArgumentReleases(
         if (seen.insert(user).second)
           terminators.push_back(user);
       }
+    if (terminators.size() > 1) {
+      auto [positions, fresh] = blockPositions.try_emplace(body);
+      if (fresh) {
+        unsigned position = 0;
+        for (mlir::Block &block : *body)
+          positions->second[&block] = position++;
+      }
+      llvm::sort(terminators, [&](mlir::Operation *lhs, mlir::Operation *rhs) {
+        return positions->second.lookup(lhs->getBlock()) <
+               positions->second.lookup(rhs->getBlock());
+      });
+    }
     return terminators;
   };
 
