@@ -881,6 +881,8 @@ const Table &Table::get(mlir::MLIRContext &context) {
       classInfo.isProtocol = hasMarker(classOp, "ly.typing.protocol");
       classInfo.isAbstract = hasMarker(classOp, "ly.typing.abstract");
       classInfo.isFinal = hasMarker(classOp, "ly.typing.final");
+      classInfo.keepsArguments =
+          hasMarker(classOp, "ly.typing.keeps_arguments");
       std::vector<std::string> baseNames;
       if (auto bases = classOp.getBaseNamesAttr())
         for (mlir::Attribute base : bases)

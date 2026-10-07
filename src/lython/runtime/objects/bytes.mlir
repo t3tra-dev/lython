@@ -13,6 +13,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.bytes", "builtins.bytes_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
@@ -84,7 +85,7 @@ module attributes {
                     "isupper", "__contains__", "__contains__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__iter__",
                     "__init__", "__init__", "__init__", "__init__",
-                    "__init__"],
+                    "__init__", "__getslice__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -154,7 +155,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.list", [!py.contract<"builtins.int">]>] -> [!py.literal<None>]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.list", [!py.contract<"builtins.int">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.bytes">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -167,7 +169,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance",
-                    "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   // ===== impls: bytes =====
@@ -471,6 +473,13 @@ module attributes {
       memref.store %byte, %out_bytes[%k] : memref<?xi8>
     }
     func.return %out_header : memref<4xi64>
+  }
+
+  // b[s] for a slice object (bytes_subscript).
+  func.func @LyBytes_SliceSubscript(%header: memref<4xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__getslice__"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    %result = func.call @LyBytes_GetSlice(%header, %start, %stop, %step, %mask) : (memref<4xi64>, i64, i64, i64, i64) -> memref<4xi64>
+    func.return %result : memref<4xi64>
   }
 
   func.func @LyBytes_EqBool(%lhs_header: memref<4xi64> {ly.ownership.object_header}, %rhs_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__eq__"} {

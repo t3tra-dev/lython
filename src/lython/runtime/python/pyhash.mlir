@@ -3,6 +3,9 @@
 // passes.
 
 module {
+  // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64
+  func.func private @__ly_box_word_count() -> i64
   // ===== impls: hash =====
   // Runtime hash state: [k0, k1, initialized]. Filled once, lazily, from the
   // OS entropy pool (CPython randomizes str/bytes hashes per process; int and
@@ -156,5 +159,35 @@ module {
     %is_neg_one = arith.cmpi eq, %h, %neg_one : i64
     %fixed = arith.select %is_neg_one, %neg_two, %h : i1, i64
     func.return %fixed : i64
+  }
+  // The xxHash lanes tuplehash and slice_hash both run over their items
+  // (Objects/tupleobject.c, Objects/sliceobject.c): each item's hash mixed
+  // in by XXPRIME_2, rotated 31, multiplied by XXPRIME_1. The two differ
+  // after the loop -- a tuple adds its length, a slice does not -- so each
+  // finishes the accumulator itself.
+  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64) -> i64 {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %words = func.call @__ly_box_word_count() : () -> i64
+    %count_index = arith.index_cast %count : i64 to index
+    %prime1 = arith.constant -7046029288634856825 : i64
+    %prime2 = arith.constant -4417276706812531889 : i64
+    %acc_init = arith.constant 2870177450012600261 : i64
+    %c31 = arith.constant 31 : i64
+    %c33 = arith.constant 33 : i64
+    %acc = scf.for %i = %c0 to %count_index step %c1 iter_args(%a = %acc_init) -> (i64) {
+      %i_i64 = arith.index_cast %i : index to i64
+      %off = arith.muli %i_i64, %words : i64
+      %box_ptr = llvm.getelementptr %items[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %lane = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+      %scaled = arith.muli %lane, %prime2 : i64
+      %added = arith.addi %a, %scaled : i64
+      %rot_hi = arith.shli %added, %c31 : i64
+      %rot_lo = arith.shrui %added, %c33 : i64
+      %rotated = arith.ori %rot_hi, %rot_lo : i64
+      %next = arith.muli %rotated, %prime1 : i64
+      scf.yield %next : i64
+    }
+    func.return %acc : i64
   }
 }

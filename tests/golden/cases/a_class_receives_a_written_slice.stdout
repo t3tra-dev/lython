@@ -1,0 +1,16 @@
+get slice(1, 3, None)
+get slice(None, None, 2)
+get slice(None, None, None)
+get slice(4, None, None)
+get slice(None, -1, None)
+get slice(1, 5, 2)
+[1, 2] [0, 2, 4] [0, 1, 2, 3, 4, 5] [4, 5] [0, 1, 2, 3, 4] [1, 3]
+get slice(2, 4, None)
+[2, 3]
+set slice(0, 2, None) [7, 7, 7]
+[7, 7, 7, 2, 3, 4, 5]
+del slice(None, None, 3)
+[7, 7, 3, 4]
+get slice(3, None, None)
+[3, 4, 5]
+11 [11, 12, 13] [14, 12, 10] 14

@@ -201,9 +201,15 @@ mlir::LogicalResult RuntimeBundleLowerer::appendRuntimeSource(
       isErasedObjectStorageType(expected)) {
     std::optional<RuntimeBundle> boxedSource;
     if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract)) {
+      // ⛔ The box OWNS its payload even for an input the callee only reads.
+      // A borrowed box neither keeps the payload alive nor is released: its
+      // entity word is an integer the ownership pass cannot see through, so
+      // the source's release landed between the box and the call
+      // (`slice(2**70)` read a freed int), and the box itself was never freed.
+      // Owned, the frame releases it after the call, and the payload with it.
       mlir::FailureOr<RuntimeBundle> boxed =
           RuntimeBundleLowerer::boxRuntimeObjectAtCurrentInsertion(
-              op, source, runtimeInputConsumesObject(symbol, inputIndex));
+              op, source, /*retainPayload=*/true);
       if (mlir::failed(boxed))
         return mlir::failure();
       boxedSource = std::move(*boxed);
@@ -516,15 +522,27 @@ bool RuntimeBundleLowerer::canAppendRuntimeSource(
     }
   }
   if (source.kind == RuntimeBundle::Kind::Object &&
-      isErasedObjectStorageType(expected) && !sourceValues.empty() &&
-      compatibleRankOneMemRefStorage(sourceValues.front().getType(), expected,
-                                     /*targetMustBeDynamic=*/true)) {
-    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract))
-      return false;
-    if (runtimeInputConsumesObject(symbol, inputIndex))
-      return false;
-    ++inputIndex;
-    return true;
+      isErasedObjectStorageType(expected)) {
+    // ⭐ AN ERASED OBJECT INPUT TAKES ANY OBJECT: appendRuntimeSource boxes a
+    // concrete one -- None, a union, a bool, an int object -- the way it boxes
+    // a lazy int above.
+    // ⛔ This answered "no" for every contract but builtins.object while the
+    // append side boxed them, so a call whose overload takes erased inputs was
+    // not chosen for `slice(None, 5)`: the selection fell to the overload
+    // that could leave an argument unused, and the slice came out without its
+    // stop.
+    if (!RuntimeBundleLowerer::isBuiltinsObjectContract(source.contract)) {
+      ++inputIndex;
+      return true;
+    }
+    if (!sourceValues.empty() &&
+        compatibleRankOneMemRefStorage(sourceValues.front().getType(), expected,
+                                       /*targetMustBeDynamic=*/true)) {
+      if (runtimeInputConsumesObject(symbol, inputIndex))
+        return false;
+      ++inputIndex;
+      return true;
+    }
   }
 
   if (source.kind == RuntimeBundle::Kind::Object &&

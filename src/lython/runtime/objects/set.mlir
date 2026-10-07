@@ -109,7 +109,7 @@ module attributes {
                     "union", "intersection", "difference",
                     "symmetric_difference", "issubset", "issuperset",
                     "isdisjoint", "__or__", "__and__", "__sub__", "__xor__",
-                    "__le__", "__lt__", "__ge__", "__gt__"],
+                    "__le__", "__lt__", "__ge__", "__gt__", "__new__", "__init__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>, !py.contract<"builtins.set", [!py.contract<"$T">]>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.self]>,
@@ -135,7 +135,9 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">, !py.contract<"builtins.frozenset">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.frozenset">>] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.frozenset">] -> [!py.literal<None>]>
     ],
     method_kinds = ["classmethod", "classmethod", "instance", "instance",
                     "instance",
@@ -143,7 +145,7 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "classmethod", "instance"]
   } {}
 
   // set.__repr__ / frozenset.__repr__: `{e0, e1, ...}`, `set()` and

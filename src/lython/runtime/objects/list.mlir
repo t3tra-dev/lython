@@ -9,6 +9,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.list"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyErr_NoMemory() attributes {ly.runtime.contract = "builtins.MemoryError"}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
@@ -64,7 +65,7 @@ module attributes {
                     "__delslice__", "__setitem__", "__delitem__",
                     "__contains__", "__repr__", "sort", "reverse", "copy",
                     "count", "index", "__add__", "__mul__", "__eq__",
-                    "__ne__", "__lt__", "__le__", "__gt__", "__ge__"],
+                    "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__getslice__", "__setslice__", "__delslice__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.list">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.protocol<"Iterable", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
@@ -97,7 +98,10 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.list">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.list", [!py.contract<"$T">]>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">, !py.contract<"builtins.list", [!py.contract<"$T">]>] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.list">, !py.contract<"builtins.slice">] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
@@ -106,7 +110,7 @@ module attributes {
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   // ===== impls: list methods =====
@@ -1058,6 +1062,14 @@ module attributes {
     func.return %result : memref<5xi64>
   }
 
+  // xs[s] for a slice object: list_subscript's PySlice_Unpack, then the
+  // slice `xs[a:b:c]` takes.
+  func.func @LyList_SliceSubscript(%self: memref<5xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.list"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    %result = func.call @LyList_GetSlice(%self, %start, %stop, %step, %mask) : (memref<5xi64>, i64, i64, i64, i64) -> memref<5xi64>
+    func.return %result : memref<5xi64>
+  }
+
   // list[i:j:k] = xs (CPython list_ass_subscript): step 1 splices with an
   // arbitrary-length replacement; any other step requires len(xs) equal to
   // the slice length and replaces per selected slot. Always rebuilds the
@@ -1165,6 +1177,13 @@ module attributes {
     func.return
   }
 
+  // xs[s] = ys for a slice object (list_ass_subscript).
+  func.func @LyList_SliceAssign(%self: memref<5xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}, %src: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    func.call @LyList_SetSlice(%self, %start, %stop, %step, %mask, %src) : (memref<5xi64>, i64, i64, i64, i64, memref<5xi64>) -> ()
+    func.return
+  }
+
   // del list[i:j:k] (CPython list_ass_subscript with NULL value): compact
   // the non-selected boxes into a fresh array, releasing the selected ones.
   // One general path covers step 1 and extended slices, either sign.
@@ -1233,6 +1252,13 @@ module attributes {
     memref.store %new_capacity, %self[%capacity_slot] : memref<5xi64>
     memref.store %new_items_word, %self[%items_slot] : memref<5xi64>
     func.call @free_raw_i64_ptr(%old_items_word) : (i64) -> ()
+    func.return
+  }
+
+  // del xs[s] for a slice object (list_ass_subscript with no value).
+  func.func @LyList_SliceDelete(%self: memref<5xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__delslice__"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    func.call @LyList_DelSlice(%self, %start, %stop, %step, %mask) : (memref<5xi64>, i64, i64, i64, i64) -> ()
     func.return
   }
 
