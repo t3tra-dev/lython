@@ -30,5 +30,15 @@ bytes(2**64) OverflowError
 -1 >> 2**100 ok -1
 xs *= 2**62 MemoryError 
 a list made in a callee MemoryError 
-after [1, 2, 3, 1, 2, 3] ababab 4 1180591620717411303424
+f'{1:{2**62}}' MemoryError 
+format('x', 2**62) MemoryError 
+format(1.0, 2**62) MemoryError 
+format(1, 2**63) ValueError Too many decimal digits in format string
+format(1.0, '.2**62f') ValueError precision too big
+format(1.0, '.2**31f') ValueError precision too big
+'%4611686018427387904d' % 1 MemoryError 
+'%.4611686018427387904f' % 1.0 ValueError precision too big
+expandtabs(2**31) OverflowError Python int too large to convert to C int
+expandtabs(-2**50) OverflowError Python int too large to convert to C int
+after [1, 2, 3, 1, 2, 3] ababab 4 1180591620717411303424 00007 2.500 a   b
 whole digits [131, 161, 191] -5

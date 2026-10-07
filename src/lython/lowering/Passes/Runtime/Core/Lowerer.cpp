@@ -39,10 +39,6 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   // those names.
   if (mlir::failed(synthesizeUserExceptionHooks()))
     return mlir::failure();
-  // The allocator's MemoryError is the native runtime's to call, as those
-  // hooks are: public, so symbol DCE keeps it for the link to resolve.
-  if (auto noMemory = module.lookupSymbol<mlir::func::FuncOp>("LyErr_NoMemory"))
-    noMemory.setPublic();
   // Nothing after this makes a deallocator, so the py-op lowering reads one
   // list instead of walking the module for every slot it releases.
   settledDeallocators = ownership::collectRuntimeDeallocators(module);

@@ -68,11 +68,23 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
   // `passthrough` attribute there does not survive to the LLVM function, and
   // with these inlined `LyMem_Alloc` saved six register pairs on every call
   // and was inlined nowhere.
+  // `LyErr_NoMemory` (builtins.mlir) is the MemoryError every size check
+  // calls on its refusal: inlined, the exception's construction was copied
+  // into each of them (genexpr.wasm's `__main__` +7 KB).
   for (const char *cold : {"LyMem_LargeAlloc", "LyMem_MapAlloc", "LyMem_Refill",
-                           "LyMem_NoMemory"})
+                           "LyMem_NoMemory", "ly_mem_refuse", "LyErr_NoMemory"})
     if (llvm::Function *function = module.getFunction(cold)) {
       function->addFnAttr(llvm::Attribute::NoInline);
       function->addFnAttr(llvm::Attribute::Cold);
+    }
+  // ⭐ The allocator's refusal ends the program (abort), and says so to the
+  // optimizer. ⛔ Not left to inference: `abort` and `write` reach it as plain
+  // declarations, and an allocation that MAY unwind is one every allocating
+  // call inherits -- genexpr.wasm's `__main__` kept 16 more landing pads.
+  for (const char *fatal : {"LyMem_NoMemory", "ly_mem_refuse"})
+    if (llvm::Function *function = module.getFunction(fatal)) {
+      function->addFnAttr(llvm::Attribute::NoUnwind);
+      function->addFnAttr(llvm::Attribute::NoReturn);
     }
   struct Redirect {
     const char *from;
@@ -84,10 +96,8 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
       {"realloc", "LyMem_Realloc"},
       {"aligned_alloc", "LyMem_AlignedAlloc"}};
   // ⭐ Under the sanitizers the SYSTEM allocator, behind the pool's answer to
-  // a request it cannot meet (MemoryError, never null). ⛔ Not the system
-  // calls bare, which is what the bypass left: nothing checked their null, and
-  // LeakSanitizer's refusal of a request past 1 TB (`bytes(2**50)`) was an
-  // abort the leak gate could not measure through.
+  // a request it cannot meet (never null). ⛔ Not the system calls bare,
+  // which is what the bypass left: nothing checked their null.
   static constexpr Redirect kChecked[] = {
       {"malloc", "LyMem_SystemAlloc"},
       {"realloc", "LyMem_SystemRealloc"},

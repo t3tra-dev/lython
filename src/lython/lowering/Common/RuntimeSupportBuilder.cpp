@@ -611,9 +611,6 @@ constexpr std::int64_t kObjectAllocatorArenaBytes =
 constexpr std::int64_t kObjectAllocatorMapBits = 14;
 // Above this a Darwin block is mapped rather than malloc'd (see above).
 constexpr std::int64_t kObjectAllocatorMapThreshold = 1 << 20;
-// A request below this that the system cannot meet ends the program instead of
-// raising: the MemoryError is made of small blocks itself.
-constexpr std::int64_t kSmallestRaisedRequest = 1 << 16;
 // Large-block prefix kinds.
 constexpr std::int64_t kLargeMalloc = 1;
 constexpr std::int64_t kLargeMapped = 2;
@@ -625,14 +622,17 @@ void buildObjectAllocator(SupportBuilder &b) {
   const bool mapsLargeBlocks = b.triple.isOSDarwin();
   const std::int64_t pageBytes =
       b.triple.getArch() == llvm::Triple::aarch64 ? 16384 : 4096;
-  // The largest request the system is asked for; above it the answer is
-  // MemoryError without asking. ⛔ Not every i64: the prefix and the alignment
-  // added to a request must not wrap it, and a 32-bit libc takes its size_t
-  // truncated (LibcPrototypes.cpp) -- `malloc(2^32 + 24)` there is a 24-byte
-  // block the caller writes 2^32 bytes into.
+  // The largest request the system is asked for: the user address space of
+  // every 64-bit target (2^47), or just under 2^31 on a 32-bit one. A size the
+  // program computes past it is MemoryError before anything is asked
+  // (builtins.mlir `__ly_alloc_count`, through `ly_mem_max_request`).
+  // ⛔ Not every i64: the prefix and the alignment added to a request must not
+  // wrap it, and a 32-bit libc takes its size_t truncated (LibcPrototypes.cpp)
+  // -- `malloc(2^32 + 24)` there is a 24-byte block the caller writes 2^32
+  // bytes into.
   const std::int64_t maxRequest = b.triple.isArch32Bit()
                                       ? (std::int64_t(1) << 31) - (1 << 16)
-                                      : std::int64_t(1) << 62;
+                                      : std::int64_t(1) << 47;
   b.declareExternal("malloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
   b.declareExternal("aligned_alloc",
                     b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
@@ -783,28 +783,43 @@ void buildObjectAllocator(SupportBuilder &b) {
   }
 
   // ---- void LyMem_NoMemory(i64 size) ---------------------------------------
-  // A request the system did not meet: MemoryError (`LyErr_NoMemory`), as
-  // CPython's allocation failures raise. Never returns, so no allocator
-  // answers null. ⛔ Not null to the caller, which is what it was: nothing
-  // checked it, and `'x' * 2**62` wrote through it.
+  // A request the system did not meet ends the program, saying so. Never
+  // returns, so no allocator answers null. ⛔ Not null to the caller, which is
+  // what it was: nothing checked it, and `'x' * 2**62` wrote through it.
+  // ⛔ Not a MemoryError raised from here: an allocation that may unwind makes
+  // every call that allocates one that may, and a program that raises nothing
+  // else then keeps the uncaught-exception report it never needed --
+  // hello.wasm went from 26 KB to 71 KB. The MemoryError a program can catch
+  // is raised where it computes a size (`__ly_alloc_count`), and what is left
+  // here is the system running out under a size it accepted.
   b.stringGlobal(".lymem_out_of_memory",
-                 "lython: out of memory (a small block could not be "
-                 "allocated)\n");
+                 "lython: out of memory: the system did not provide a block "
+                 "the program asked for\n");
   {
     auto fn = b.beginFunction(
         "LyMem_NoMemory", b.builder.getFunctionType({b.i64()}, {}),
         /*isPrivate=*/true);
     b.builder.setInsertionPointToEnd(fn.addEntryBlock());
-    mlir::Value size = fn.getArgument(0);
-    guardReturn(b.cmpi(Pred::ult, size, b.iconst(kSmallestRaisedRequest)),
-                [&] {
-                  b.call("write_cstr", mlir::TypeRange{},
-                         mlir::ValueRange{b.iconst32(2),
-                                          b.addrOf(".lymem_out_of_memory")});
-                  b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
-                  ret({});
-                });
-    b.call("LyErr_NoMemory", mlir::TypeRange{}, mlir::ValueRange{});
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.addrOf(".lymem_out_of_memory")});
+    b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
+    ret({});
+  }
+  // ---- void ly_mem_refuse(i64 count) ---------------------------------------
+  // The manifests' guard (builtins.mlir `__ly_alloc_count`) refusing a size
+  // that reached an allocator unchecked: a size the program computes is
+  // MemoryError where it is computed, so this firing is a path that forgot
+  // to check, and says so. Ends the program, under a name no pass reads as a
+  // call that may raise.
+  b.stringGlobal(".lymem_unchecked_size",
+                 "lython: a size past the allocator's reach got to an "
+                 "allocation without being checked (a runtime defect)\n");
+  {
+    auto fn = b.beginFunction("ly_mem_refuse",
+                              b.builder.getFunctionType({b.i64()}, {}));
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    b.call("write_cstr", mlir::TypeRange{},
+           mlir::ValueRange{b.iconst32(2), b.addrOf(".lymem_unchecked_size")});
     b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
     ret({});
   }
@@ -832,8 +847,8 @@ void buildObjectAllocator(SupportBuilder &b) {
 
   // ---- ptr LyMem_System{Alloc,AlignedAlloc,Realloc} ------------------------
   // The system allocator's own blocks with the answers above to a request it
-  // cannot meet, for a build that measures the system allocator (the
-  // sanitizers, LLVMFinalize.cpp). A null for no bytes is the C library's to
+  // cannot meet (never null), for a build that measures the system allocator
+  // (the sanitizers, LLVMFinalize.cpp). A null for no bytes is the C library's to
   // give and is not a failure. ⛔ Not on Windows, whose CRT has no
   // `aligned_alloc` to name and whose builds are not sanitized.
   auto checkedSystemBlock = [&](mlir::Value block, mlir::Value size) {
@@ -4236,9 +4251,6 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   support.declareExternal(
       "ftruncate", builder.getFunctionType({support.i32(), support.i64()},
                                            {support.i32()}));
-  // The MemoryError the allocator raises (builtins.mlir), defined in every
-  // program; resolved at link time like the hooks below.
-  support.declareExternal("LyErr_NoMemory", builder.getFunctionType({}, {}));
   // Generated per program in the user module (the manifest deallocators);
   // resolved at link time.
   support.declareExternal(

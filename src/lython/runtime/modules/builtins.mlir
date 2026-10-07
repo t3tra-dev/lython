@@ -2379,6 +2379,7 @@ module attributes {
   func.func private @free_raw_i64_ptr(%address: i64)
   func.func private @realloc_raw_i64_ptr(%address: i64, %bytes: i64) -> i64
   func.func private @ly_mem_max_request() -> i64
+  func.func private @ly_mem_refuse(i64)
   // Rebuild a rank-1 memref over the payload a raw pointer word addresses
   // (buildGlobalViewFunction: allocated == aligned, offset 0, stride 1). The
   // manifest's only route to a descriptor -- writing the insertvalue chain and
@@ -5088,6 +5089,9 @@ module attributes {
     %zero = arith.constant 0 : i64
     %negative = arith.cmpi slt, %count, %zero : i64
     %length = arith.select %negative, %zero, %count : i64
+    %one_byte = arith.constant 1 : i64
+    %bytes_prefix = arith.constant 32 : i64
+    func.call @__ly_check_alloc_count(%length, %one_byte, %bytes_prefix) : (i64, i64, i64) -> ()
     %header = func.call @__ly_bytes_alloc(%length) : (i64) -> memref<4xi64>
     %payload = func.call @__ly_bytes_payload(%header) : (memref<4xi64>) -> memref<?xi8>
     %count_index = arith.index_cast %length : i64 to index
@@ -6856,6 +6860,9 @@ module attributes {
       func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
     }
     %total = arith.muli %len, %n : i64
+    %one_byte = arith.constant 1 : i64
+    %bytes_prefix = arith.constant 32 : i64
+    func.call @__ly_check_alloc_count(%total, %one_byte, %bytes_prefix) : (i64, i64, i64) -> ()
     %out_header = func.call @__ly_bytes_alloc(%total) : (i64) -> memref<4xi64>
     %out_bytes = func.call @__ly_bytes_payload(%out_header) : (memref<4xi64>) -> memref<?xi8>
     // No trips over nothing (see `__ly_seq_fill_repeat`).
@@ -7042,11 +7049,9 @@ module attributes {
     func.return
   }
 
-  // ⭐ WHAT THE ALLOCATOR RAISES when the system has no block for a request
-  // (`LyMem_NoMemory`, RuntimeSupportBuilder.cpp): `MemoryError()`, with no
-  // arguments, as CPython's PyErr_NoMemory. The native runtime calls it by
-  // name, so the lowering keeps it public in every program (Lowerer.cpp), the
-  // way it keeps the per-program exception hooks.
+  // `MemoryError()`, with no arguments, as CPython's PyErr_NoMemory: what a
+  // size the program computes past the allocator's reach raises
+  // (`__ly_check_alloc_count`, the repeats).
   func.func private @LyErr_NoMemory() attributes {ly.runtime.contract = "builtins.MemoryError"} {
     %class_id = arith.constant 109 : i64
     %exception:3 = func.call @LyMemoryError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
@@ -7054,14 +7059,33 @@ module attributes {
     func.return
   }
 
-  // ⭐ THE COUNT OF A BUFFER TO ALLOCATE, refused with MemoryError when its
-  // size -- `count` elements of `element_bytes` past `extra` bytes -- would
-  // pass the largest request the allocator makes on this target
-  // (`ly_mem_max_request`), as CPython refuses a size past PY_SSIZE_T_MAX.
-  // ⛔ Not left to the allocator: the size is computed here, and cast to
-  // `index`, before the allocator sees it, and both wrap -- the cast at 2^32
-  // on a 32-bit target -- into a small block the caller then writes past.
+  // ⭐ THE COUNT OF A BUFFER TO ALLOCATE, guarded: past the largest request
+  // the allocator makes on this target (`ly_mem_max_request`: the user
+  // address space) -- `count` elements of `element_bytes` past `extra` bytes
+  // -- the program ends (`ly_mem_refuse`). Every allocator below takes its
+  // count through it, so a size that would wrap -- the product, or the cast to
+  // `index`, at 2^32 on a 32-bit target -- is never a small block written
+  // past. A size the PROGRAM computes is checked before it gets here, by
+  // `__ly_check_alloc_count`, and is MemoryError.
+  // ⛔ Not the MemoryError here: these allocators are behind every int, str
+  // and list a program makes, and a call that may raise is one every caller
+  // inherits as a landing pad -- genexpr.wasm's `__main__` grew 5 KB.
   func.func private @__ly_alloc_count(%count: i64, %element_bytes: i64, %extra: i64) -> index {
+    %limit = func.call @ly_mem_max_request() : () -> i64
+    %room = arith.subi %limit, %extra : i64
+    %most = arith.divui %room, %element_bytes : i64
+    %too_many = arith.cmpi ugt, %count, %most : i64
+    scf.if %too_many {
+      func.call @ly_mem_refuse(%count) : (i64) -> ()
+    }
+    %n = arith.index_cast %count : i64 to index
+    func.return %n : index
+  }
+
+  // The same reach as `__ly_alloc_count`, refused with MemoryError: where a
+  // size comes from the program (a repeat count, a pad width, `bytes(n)`, a
+  // shift), as CPython's allocator refuses what no system can give.
+  func.func private @__ly_check_alloc_count(%count: i64, %element_bytes: i64, %extra: i64) {
     %limit = func.call @ly_mem_max_request() : () -> i64
     %room = arith.subi %limit, %extra : i64
     %most = arith.divui %room, %element_bytes : i64
@@ -7069,8 +7093,7 @@ module attributes {
     scf.if %too_many {
       func.call @LyErr_NoMemory() : () -> ()
     }
-    %n = arith.index_cast %count : i64 to index
-    func.return %n : index
+    func.return
   }
 
   // CPython's PyNumber_AsSsize_t(n, OverflowError), what a sequence repeat
@@ -7100,6 +7123,7 @@ module attributes {
     func.return %overflows : i1
   }
 
+  memref.global "private" constant @__ly_unicode_msg_int_too_large_c_int : memref<40xi8> = dense<[80, 121, 116, 104, 111, 110, 32, 105, 110, 116, 32, 116, 111, 111, 32, 108, 97, 114, 103, 101, 32, 116, 111, 32, 99, 111, 110, 118, 101, 114, 116, 32, 116, 111, 32, 67, 32, 105, 110, 116]>
   memref.global "private" constant @__ly_unicode_msg_repeat_too_long : memref<27xi8> = dense<[114, 101, 112, 101, 97, 116, 101, 100, 32, 115, 116, 114, 105, 110, 103, 32, 105, 115, 32, 116, 111, 111, 32, 108, 111, 110, 103]>
   memref.global "private" constant @__ly_bytes_msg_repeat_too_long : memref<27xi8> = dense<[114, 101, 112, 101, 97, 116, 101, 100, 32, 98, 121, 116, 101, 115, 32, 97, 114, 101, 32, 116, 111, 111, 32, 108, 111, 110, 103]>
 
@@ -7177,13 +7201,6 @@ module attributes {
     %layout_int = arith.constant 1 : i64
     %needs_one = arith.cmpi sle, %capacity, %zero : i64
     %alloc_count_i64 = arith.select %needs_one, %one, %capacity : i1, i64
-    // CPython 3.14's MAX_LONG_DIGITS, PY_SSIZE_T_MAX / PyLong_SHIFT: the most
-    // digits whose bit count is still a Py_ssize_t.
-    %max_digits = arith.constant 307445734561825860 : i64
-    %too_many_digits = arith.cmpi sgt, %alloc_count_i64, %max_digits : i64
-    scf.if %too_many_digits {
-      func.call @__ly_long_raise_too_many_digits() : () -> ()
-    }
     // One entity, one allocation: [0,16) header, [16,32) meta, [32,..) digits.
     // The header view carries the allocation; meta/digits are interior views
     // and must never be freed separately.
@@ -9968,6 +9985,17 @@ module attributes {
     %has_bits = arith.cmpi ne, %bit_shift, %zero : i64
     %carry_digit = arith.extui %has_bits : i1 to i64
     %capacity = arith.addi %grow, %carry_digit : i64
+    // CPython 3.14's MAX_LONG_DIGITS, PY_SSIZE_T_MAX / PyLong_SHIFT: the most
+    // digits whose bit count is still a Py_ssize_t; under it, a result past
+    // the allocator's reach is MemoryError.
+    %max_digits = arith.constant 307445734561825860 : i64
+    %too_many_digits = arith.cmpi sgt, %capacity, %max_digits : i64
+    scf.if %too_many_digits {
+      func.call @__ly_long_raise_too_many_digits() : () -> ()
+    }
+    %digit_bytes_i64 = arith.constant 4 : i64
+    %digit_prefix = arith.constant 32 : i64
+    func.call @__ly_check_alloc_count(%capacity, %digit_bytes_i64, %digit_prefix) : (i64, i64, i64) -> ()
     %h = func.call @__ly_long_alloc_raw(%lhs_sign, %capacity) : (i64, i64) -> memref<2xi64>
     %m, %d = func.call @__ly_long_parts(%h) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
     %c0 = arith.constant 0 : index
@@ -13408,6 +13436,8 @@ module attributes {
       }
       %maxcp = arith.maxui %self_max, %fill_cp : i64
       %out_width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+      %str_prefix = arith.constant 32 : i64
+      func.call @__ly_check_alloc_count(%target, %out_width, %str_prefix) : (i64, i64, i64) -> ()
       %out_header, %out_bytes = func.call @__ly_unicode_alloc(%target, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
       %margin = arith.subi %target, %len : i64
       %half = arith.divsi %margin, %two : i64
@@ -13475,6 +13505,8 @@ module attributes {
       }
       %maxcp = arith.maxui %self_max, %ascii_zero : i64
       %out_width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+      %str_prefix = arith.constant 32 : i64
+      func.call @__ly_check_alloc_count(%target, %out_width, %str_prefix) : (i64, i64, i64) -> ()
       %out_header, %out_bytes = func.call @__ly_unicode_alloc(%target, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
       %has_any = arith.cmpi sgt, %len, %zero : i64
       %first = scf.if %has_any -> (i64) {
@@ -13518,6 +13550,19 @@ module attributes {
     %nl = arith.constant 10 : i64
     %cr = arith.constant 13 : i64
     %space = arith.constant 32 : i64
+    // CPython's tabsize is a C int.
+    %int_max = arith.constant 2147483647 : i64
+    %int_min = arith.constant -2147483648 : i64
+    %above_int = arith.cmpi sgt, %tabsize, %int_max : i64
+    %below_int = arith.cmpi slt, %tabsize, %int_min : i64
+    %past_int = arith.ori %above_int, %below_int : i1
+    scf.if %past_int {
+      %class_id = arith.constant 104 : i64
+      %length = arith.constant 40 : i64
+      %message_static = memref.get_global @__ly_unicode_msg_int_too_large_c_int : memref<40xi8>
+      %message = memref.cast %message_static : memref<40xi8> to memref<?xi8>
+      func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+    }
     %width = func.call @__ly_unicode_width(%header) : (memref<2xi64>) -> i64
     %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %len_index = arith.index_cast %len : i64 to index
@@ -13552,6 +13597,8 @@ module attributes {
     }
 
     %out_width = func.call @__ly_unicode_width_for(%measure#2) : (i64) -> i64
+    %str_prefix = arith.constant 32 : i64
+    func.call @__ly_check_alloc_count(%measure#0, %out_width, %str_prefix) : (i64, i64, i64) -> ()
     %out_header, %out_bytes = func.call @__ly_unicode_alloc(%measure#0, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
 
     scf.for %i = %c0 to %len_index step %c1 iter_args(%pos = %c0, %col = %zero) -> (index, i64) {
@@ -13608,6 +13655,8 @@ module attributes {
     %total = arith.muli %len, %n : i64
     %is_empty = arith.cmpi eq, %total, %zero : i64
     %out_width = arith.select %is_empty, %one, %width : i64
+    %str_prefix = arith.constant 32 : i64
+    func.call @__ly_check_alloc_count(%total, %out_width, %str_prefix) : (i64, i64, i64) -> ()
     %out_header, %out_bytes = func.call @__ly_unicode_alloc(%total, %out_width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
     %len_index = arith.index_cast %len : i64 to index
     // No trips over nothing (see `__ly_seq_fill_repeat`).
@@ -15681,6 +15730,26 @@ module attributes {
     func.return
   }
 
+  // CPython's get_integer past PY_SSIZE_T_MAX, for a width or a precision.
+  memref.global "private" constant @__ly_fmt_msg_too_many_digits : memref<40xi8> = dense<[84, 111, 111, 32, 109, 97, 110, 121, 32, 100, 101, 99, 105, 109, 97, 108, 32, 100, 105, 103, 105, 116, 115, 32, 105, 110, 32, 102, 111, 114, 109, 97, 116, 32, 115, 116, 114, 105, 110, 103]>
+  func.func private @__ly_fmt_raise_too_many_digits() {
+    %ms = memref.get_global @__ly_fmt_msg_too_many_digits : memref<40xi8>
+    %m = memref.cast %ms : memref<40xi8> to memref<?xi8>
+    %l = arith.constant 40 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
+  // CPython's float formatting past INT_MAX digits of precision.
+  memref.global "private" constant @__ly_fmt_msg_precision_too_big : memref<17xi8> = dense<[112, 114, 101, 99, 105, 115, 105, 111, 110, 32, 116, 111, 111, 32, 98, 105, 103]>
+  func.func private @__ly_fmt_raise_precision_too_big() {
+    %ms = memref.get_global @__ly_fmt_msg_precision_too_big : memref<17xi8>
+    %m = memref.cast %ms : memref<17xi8> to memref<?xi8>
+    %l = arith.constant 17 : i64
+    func.call @__ly_fmt_raise_bytes(%m, %l) : (memref<?xi8>, i64) -> ()
+    func.return
+  }
+
   func.func private @__ly_fmt_raise_missing_precision() {
     %ms = memref.get_global @__ly_fmt_msg_missing_precision : memref<34xi8>
     %m = memref.cast %ms : memref<34xi8> to memref<?xi8>
@@ -15739,7 +15808,7 @@ module attributes {
     %two = arith.constant 2 : i64
     %minus_one = arith.constant -1 : i64
     %ten = arith.constant 10 : i64
-    %cap = arith.constant 1000000000000000 : i64
+    %ssize_max = arith.constant 9223372036854775807 : i64
     %s0 = arith.constant 0 : index
     %s1 = arith.constant 1 : index
     %s2 = arith.constant 2 : index
@@ -15919,10 +15988,18 @@ module attributes {
       %ix = arith.index_cast %p : i64 to index
       %ch = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
       %d = arith.subi %ch, %zero_ch : i64
+      // CPython's get_integer: `acc * 10 + d` passes PY_SSIZE_T_MAX iff
+      // `acc > (PY_SSIZE_T_MAX - d) / 10`. ⛔ Not clamped, as it was (at
+      // 10**15): a width past the word is CPython's ValueError, and one under
+      // it is a size like any other (MemoryError where it cannot be met).
+      %room = arith.subi %ssize_max, %d : i64
+      %most = arith.divsi %room, %ten : i64
+      %over = arith.cmpi sgt, %acc, %most : i64
+      scf.if %over {
+        func.call @__ly_fmt_raise_too_many_digits() : () -> ()
+      }
       %acc10 = arith.muli %acc, %ten : i64
-      %nacc0 = arith.addi %acc10, %d : i64
-      %over = arith.cmpi sgt, %nacc0, %cap : i64
-      %nacc = arith.select %over, %cap, %nacc0 : i64
+      %nacc = arith.addi %acc10, %d : i64
       %np = arith.addi %p, %one : i64
       scf.yield %np, %nacc, %one : i64, i64, i64
     }
@@ -16000,10 +16077,14 @@ module attributes {
         %ix = arith.index_cast %p : i64 to index
         %ch = func.call @__ly_unicode_get(%spec_b, %wid, %ix) : (memref<?xi8>, i64, index) -> i64
         %d = arith.subi %ch, %zero_ch : i64
+        %room = arith.subi %ssize_max, %d : i64
+        %most = arith.divsi %room, %ten : i64
+        %over = arith.cmpi sgt, %acc, %most : i64
+        scf.if %over {
+          func.call @__ly_fmt_raise_too_many_digits() : () -> ()
+        }
         %acc10 = arith.muli %acc, %ten : i64
-        %nacc0 = arith.addi %acc10, %d : i64
-        %over = arith.cmpi sgt, %nacc0, %cap : i64
-        %nacc = arith.select %over, %cap, %nacc0 : i64
+        %nacc = arith.addi %acc10, %d : i64
         %np = arith.addi %p, %one : i64
         scf.yield %np, %nacc, %one : i64, i64, i64
       }
@@ -16069,6 +16150,12 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %width = arith.maxsi %width_in, %zero : i64
+    // The result is at least `width` code units: one past the allocator's
+    // reach is MemoryError, here as where the callers check it before they
+    // allocate. ⛔ Not after the padding is worked out: the `=` fill with
+    // grouping counts up to the width a digit at a time.
+    %code_unit = arith.constant 4 : i64
+    func.call @__ly_check_alloc_count(%width, %code_unit, %zero) : (i64, i64, i64) -> ()
     %has_sign = arith.cmpi ne, %sign_cp, %zero : i64
     %sign_len = arith.select %has_sign, %one, %zero : i64
     %has_p0 = arith.cmpi ne, %pre0, %zero : i64
@@ -16502,10 +16589,22 @@ module attributes {
 
     // precision resolution
     %prec_or6 = arith.select %no_prec, %six, %prec_rec : i64
+    %int_max = arith.constant 2147483647 : i64
+    %prec_too_big = arith.cmpi sgt, %prec_or6, %int_max : i64
+    scf.if %prec_too_big {
+      func.call @__ly_fmt_raise_precision_too_big() : () -> ()
+    }
     %g_p = arith.maxsi %prec_or6, %one : i64
     %gdot_dec = arith.select %gdot_mode, %one, %zero : i64
     %g_thr = arith.subi %g_p, %gdot_dec : i64
 
+    // A width past the allocator's reach is MemoryError before either path
+    // makes anything (see `__ly_long_format_impl`).
+    // (No width is -1, which unsigned is the largest of all.)
+    %code_unit_bytes = arith.constant 4 : i64
+    %nothing_before = arith.constant 0 : i64
+    %width_or_none = arith.maxsi %width_rec, %nothing_before : i64
+    func.call @__ly_check_alloc_count(%width_or_none, %code_unit_bytes, %nothing_before) : (i64, i64, i64) -> ()
     cf.cond_br %special, ^special_case, ^finite_case
 
   ^special_case:
@@ -16602,6 +16701,8 @@ module attributes {
     %cap1 = arith.addi %cap0, %prec_or6 : i64
     %cap2 = arith.addi %cap1, %neg_dec_c : i64
     %body_cap = arith.addi %cap2, %margin : i64
+    %body_unit = arith.constant 4 : i64
+    func.call @__ly_check_alloc_count(%body_cap, %body_unit, %zero) : (i64, i64, i64) -> ()
     %body_cap_idx = arith.index_cast %body_cap : i64 to index
     %body = memref.alloc(%body_cap_idx) : memref<?xi32>
 
@@ -16891,6 +16992,16 @@ module attributes {
     scf.if %out_of_range {
       func.call @__ly_fmt_raise_c_range() : () -> ()
     }
+    // A width past the allocator's reach is MemoryError before this makes
+    // anything: what is made here is freed after the render, not when the
+    // render raises (`__ly_fmt_render_number` checks again, for its own sake).
+    // ⛔ Not once before the 'c'/digits branch: the 'c' path's own errors
+    // come first, as CPython's do.
+    // (No width is -1, which unsigned is the largest of all.)
+    %code_unit_bytes = arith.constant 4 : i64
+    %nothing_before = arith.constant 0 : i64
+    %width_or_none = arith.maxsi %width_rec, %nothing_before : i64
+    func.call @__ly_check_alloc_count(%width_or_none, %code_unit_bytes, %nothing_before) : (i64, i64, i64) -> ()
     %cbuf_cap = arith.constant 1 : index
     %cbuf = memref.alloc(%cbuf_cap) : memref<?xi32>
     %cval32 = arith.trunci %cval : i64 to i32
@@ -16898,6 +17009,10 @@ module attributes {
     cf.br ^render(%cbuf, %one, %one, %zero, %zero, %zero, %zero : memref<?xi32>, i64, i64, i64, i64, i64, i64)
 
   ^digits_path:
+    %digit_unit_bytes = arith.constant 4 : i64
+    %none_before = arith.constant 0 : i64
+    %digits_width = arith.maxsi %width_rec, %none_before : i64
+    func.call @__ly_check_alloc_count(%digits_width, %digit_unit_bytes, %none_before) : (i64, i64, i64) -> ()
     %sign_slot = arith.constant 0 : index
     %sgn = memref.load %meta[%sign_slot] : memref<2xi64>
     %negative = arith.cmpi slt, %sgn, %zero : i64
@@ -17142,6 +17257,9 @@ module attributes {
     %pad_raw = arith.subi %width_c, %shown : i64
     %pad = arith.maxsi %pad_raw, %zero : i64
     %total = arith.addi %shown, %pad : i64
+    %code_unit = arith.constant 4 : i64
+    %nothing_before = arith.constant 0 : i64
+    func.call @__ly_check_alloc_count(%total, %code_unit, %nothing_before) : (i64, i64, i64) -> ()
     %zero_flag = arith.cmpi ne, %zero_rec, %zero : i64
     %fill_unset = arith.cmpi eq, %fill_rec, %minus_one : i64
     %fill_zero = arith.constant 48 : i64
@@ -22442,12 +22560,18 @@ module attributes {
   }
 
   func.func private @__ly_list_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.list"], ly.ownership.owned_results = [0]} {
-    // CPython's list_repeat: a length past the word is MemoryError.
+    // CPython's list_repeat: a length past the word, or past the allocator's
+    // reach, is MemoryError.
     %overflows = func.call @__ly_repeat_overflows(%len, %n) : (i64, i64) -> i1
     scf.if %overflows {
       func.call @LyErr_NoMemory() : () -> ()
     }
     %total = arith.muli %len, %n : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
+    %word_bytes = arith.constant 8 : i64
+    %slot_bytes = arith.muli %handle_words, %word_bytes : i64
+    %no_prefix = arith.constant 0 : i64
+    func.call @__ly_check_alloc_count(%total, %slot_bytes, %no_prefix) : (i64, i64, i64) -> ()
     %self = func.call @__ly_list_alloc(%total) : (i64) -> memref<5xi64>
     %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
     func.call @__ly_seq_fill_repeat(%items, %len, %li, %n) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
@@ -22602,12 +22726,18 @@ module attributes {
   }
 
   func.func private @__ly_tuple_repeat_alloc(%len: i64, %li: memref<?xi64>, %n: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]} {
-    // CPython's tuple_repeat: a length past the word is MemoryError.
+    // CPython's tuple_repeat: a length past the word, or past the allocator's
+    // reach, is MemoryError.
     %overflows = func.call @__ly_repeat_overflows(%len, %n) : (i64, i64) -> i1
     scf.if %overflows {
       func.call @LyErr_NoMemory() : () -> ()
     }
     %total = arith.muli %len, %n : i64
+    %handle_words = func.call @__ly_box_word_count() : () -> i64
+    %word_bytes = arith.constant 8 : i64
+    %slot_bytes = arith.muli %handle_words, %word_bytes : i64
+    %handle_prefix = arith.constant 40 : i64
+    func.call @__ly_check_alloc_count(%total, %slot_bytes, %handle_prefix) : (i64, i64, i64) -> ()
     %self = func.call @__ly_tuple_alloc(%total) : (i64) -> memref<5xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<5xi64>) -> memref<?xi64>
     func.call @__ly_seq_fill_repeat(%items, %len, %li, %n) : (memref<?xi64>, i64, memref<?xi64>, i64) -> ()
