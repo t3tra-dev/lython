@@ -663,8 +663,16 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
   // Before the branches, so a name only one of them binds has somewhere to
   // live afterwards. Names BOTH arms bind are merged as block arguments
   // below and are already in scope by the time this runs for them.
-  bindConditionallyAssignedLocals(
-      statement, {ast::nodeList(statement, "body"), orelse});
+  {
+    // ⛔ No UNION slot for an `if`: its arms join through block arguments,
+    // which carry each arm's narrowed value, and the slot is typed by a walk
+    // that does not narrow -- `if initial is None: value = seq[0] else: value
+    // = initial` got a `T | None` slot where the join has `T`, and
+    // functools.reduce stopped compiling.
+    llvm::SaveAndRestore<bool> noUnionSlots(regionSlotsTakeUnions, false);
+    bindConditionallyAssignedLocals(statement,
+                                    {ast::nodeList(statement, "body"), orelse});
+  }
 
   // Merge candidates: names freshly assigned (not pre-existing) in BOTH
   // branches. Threading them as continuation block arguments lets their value
@@ -1602,11 +1610,12 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   if (inferred.empty())
     return {};
   mlir::Type joined = types.join(inferred);
-  // ⛔ AND NOT AN OPTIONAL EITHER, measured 2026-09-06. The try statement's own
-  // carry-out rule takes one (`T | None` is stored as ONE box whose empty
-  // entity word IS the None), so this looked like the same relaxation the
-  // callable above turned out to be -- and it is not: letting an optional
-  // through here CRASHES the compiler on
+  // ⭐ A UNION GETS A SLOT (2026-10-08). It was refused twice, and both
+  // walls were one defect: the slot starts from `py.unbound`, whose union
+  // dead value ZEROED every member's lanes, and the slot stores an Optional as
+  // one box whose payload it retains unconditionally -- so the retain hit a
+  // zero header ("Ly_IncRef observed non-positive refcount", which the 2026-09
+  // note recorded as a compiler crash on
   //
   //     w: Optional[int] = 3
   //     match flag:
@@ -1614,19 +1623,17 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   //         case _: v = w
   //     return 0 if v is None else v
   //
-  // where the refusal it replaces is a clean "unresolved name 'v'". The two
-  // rules reach different storage: the try's cell is written and read on the
-  // statement's own edges, and this slot is read by whatever follows the
-  // region. Recorded in tests/probe/wb_an_optional_first_bound_inside_a_region.py.
+  // -- now golden a_union_first_bound_inside_a_region). The unbound
+  // union now lays out each member's own dead value, as `union.wrap` does
+  // (`lowerUnbound`), and `for w in ws: got = d.get(w)` then `print(got)`
+  // reads the slot.
   //
-  // ⛔ ONLY A PLAIN CONTRACT GETS A SLOT. The slot is a synthesized class's
-  // box-fronted field, so whatever goes in it has to be storable there: a
-  // union keeps every member's lanes and is refused at the box, and a `type[X]`
-  // has no object handle at all -- `WPROTO = ctypes.CFUNCTYPE(...)` inside a
-  // nested `if` (runtime/lib/stackguard_support.py) failed to lower as
-  // "collection payload element ... has no physical object handle". A join
-  // that reached the erased top is excluded for the opposite reason: the slot
-  // would accept every write and refuse every read.
+  // ⛔ ONLY A CONTRACT, A CALLABLE OR A UNION GETS A SLOT. A `type[X]` has no
+  // object handle at all -- `WPROTO = ctypes.CFUNCTYPE(...)` inside a nested
+  // `if` (runtime/lib/stackguard_support.py) failed to lower as "collection
+  // payload element ... has no physical object handle". A join that reached
+  // the erased top is excluded for the opposite reason: the slot would accept
+  // every write and refuse every read.
   //
   // ⛔ AND `None`, which reads like a missing arm and is the same wall
   // measured (2026-09-06): letting it through turns "unresolved name 'v'" into
@@ -1652,6 +1659,8 @@ mlir::Type ModuleEmitter::inferConditionalLocalType(
   // position, both compile. One question, three spellings, one of them
   // answered.
   if (mlir::isa_and_nonnull<py::CallableType>(joined))
+    return joined;
+  if (mlir::isa_and_nonnull<py::UnionType>(joined) && regionSlotsTakeUnions)
     return joined;
 
   if (!mlir::isa_and_nonnull<py::ContractType>(joined) ||
