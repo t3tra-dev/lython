@@ -232,11 +232,11 @@ TEST(DriverTest, AJsHostExecutableKeepsItsExportsExternal) {
   }
 }
 
-// The functions the generated repr hook calls directly, by name.
-std::vector<std::string> reprHookCallees(const llvm::Module &module) {
+// The functions a generated boxed hook calls directly, by name.
+std::vector<std::string> hookCallees(const llvm::Module &module,
+                                     llvm::StringRef hookName) {
   std::vector<std::string> names;
-  const llvm::Function *hook =
-      module.getFunction("__ly_repr_boxed_by_contract");
+  const llvm::Function *hook = module.getFunction(hookName);
   if (!hook)
     return names;
   for (const llvm::BasicBlock &block : *hook)
@@ -245,6 +245,10 @@ std::vector<std::string> reprHookCallees(const llvm::Module &module) {
         if (const llvm::Function *callee = call->getCalledFunction())
           names.push_back(callee->getName().str());
   return names;
+}
+
+std::vector<std::string> reprHookCallees(const llvm::Module &module) {
+  return hookCallees(module, "__ly_repr_boxed_by_contract");
 }
 
 // What: a program whose values are strs and ints in lists gets a repr hook
@@ -274,6 +278,36 @@ TEST(DriverTest, TheReprHookArmsOnlyTheClassesTheProgramHolds) {
       trap |= data->isString() &&
               data->getAsString().contains("judged unreachable");
   EXPECT_TRUE(trap);
+}
+
+// What: the eq, hash, lt and release hooks arm the classes the program can
+// hold as the repr hook does -- a program sorting and hashing strs and ints
+// gets their arms and none for slice, bytearray, memoryview, complex or
+// range -- while every exception keeps its release arm.
+TEST(DriverTest, TheComparisonHashAndReleaseHooksArmOnlyHeldClasses) {
+  CompileResult result = compileSource(
+      "words: list[str] = [\"b\", \"a\"]\n"
+      "seen: set[str] = set(words)\n"
+      "counts: dict[int, str] = {1: \"x\"}\n"
+      "print(sorted(words), \"a\" in seen, counts[1], [3, 1] == [3, 1])\n");
+  ASSERT_TRUE(result.succeeded) << result.diagnostics;
+  const llvm::Module &module = *result.verified.llvmModule;
+  for (llvm::StringRef hook :
+       {"__ly_eq_boxed_by_contract", "__ly_hash_boxed_by_contract",
+        "__ly_lt_boxed_by_contract", "__ly_release_boxed_by_contract"}) {
+    std::vector<std::string> callees = hookCallees(module, hook);
+    ASSERT_FALSE(callees.empty()) << hook.str();
+    for (llvm::StringRef pruned :
+         {"Slice", "ByteArray", "MemoryView", "Complex", "Range"})
+      for (const std::string &callee : callees)
+        EXPECT_FALSE(llvm::StringRef(callee).starts_with(
+            (llvm::Twine("Ly") + pruned + "_").str()))
+            << hook.str() << " calls " << callee;
+  }
+  std::vector<std::string> released =
+      hookCallees(module, "__ly_release_boxed_by_contract");
+  EXPECT_TRUE(llvm::is_contained(released, "LyUnicode_DecRef"));
+  EXPECT_TRUE(llvm::is_contained(released, "LyBaseException_DecRef"));
 }
 
 // What: a program that holds an `object` keeps an arm for every class.

@@ -108,7 +108,7 @@ ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0:allow_user_poisoning=0 \
 - `LYTHON_DUMP_LOCS=1` — `LYTHON_DUMP_ON_FAILURE` のダンプに各 op の source location を付ける (location しか持たない診断が、どの op を指しているかを探すため)
 - `LYTHON_PERF=1` — フェーズごとの wall time を出力
 - `LYTHON_ABLATE_PRECOMPILED_RUNTIME=1` — ビルド時にホスト向けに事前コンパイルして lyc に埋め込んだネイティブランタイム (`LythonNativeRuntimeBitcode`) を使わず、コンパイルのたびに下げる。両者が同じモジュールであることを `lyc.precompiled_runtime_is_the_lowered_runtime` が検査する
-- `LYTHON_TRACE_REPR_CLOSURE=1` — repr / str フックの分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す
+- `LYTHON_TRACE_REPR_CLOSURE=1` — 箱詰めの値のフック (repr / str / eq / hash / lt / release) の分岐を絞る根拠 (プログラムが持ち得るクラスの閉包) を stderr に出す。開いた (全分岐を残した) ときはその型と op の位置を出す。`LYTHON_ABLATE_REPR_CLOSURE=1` で常に全分岐を残す (release は例外の系統を常に残す)
 - `LYTHON_NUM_THREADS=N` — 実行時: 大きい行列積の fork-join ワーカー数 (デフォルト 4、1 で逐次)
 
 ## アーキテクチャ
