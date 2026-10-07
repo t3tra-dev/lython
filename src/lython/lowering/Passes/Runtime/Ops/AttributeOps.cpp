@@ -2070,6 +2070,15 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         !py::isAssignableTo(cached->objectValue.contract,
                             op.getResult().getType(), op))
       cached = nullptr;
+    // ⛔ AND ONLY A STORE WHOSE VALUES REACH THE READ, as for an unboxed
+    // field above. The entry is keyed on the OBJECT, so a store inside one arm
+    // of an `if` is what every later read finds -- on the path that skipped it
+    // too. `if self.xs is None: self.xs = []` then `self.xs.append(s)` read
+    // the empty literal's evidence on the second call, when the arm had not
+    // run, and the append wrote past the list's real length: `['a', None]`
+    // where CPython prints `['a', 'a']`.
+    if (cached && !lanesReachRead(*cached))
+      cached = nullptr;
   }
   mlir::Type loadedContract = cached ? cached->objectValue.contract : fieldType;
   if (boxedField) {
