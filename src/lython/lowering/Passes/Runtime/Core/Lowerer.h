@@ -1130,6 +1130,7 @@ private:
   mlir::LogicalResult generateBoxedLtHook();
   // le, gt and ge instances, for an ordering written with that operator.
   mlir::LogicalResult generateBoxedOrderingHooks();
+  mlir::Type globalCellReadType(py::GlobalSetOp op);
   mlir::LogicalResult lowerListEvidenceNext(py::NextOp op,
                                             RuntimeBundle iterator);
   // True when `op` sits in a different block than the one defining the
@@ -1974,6 +1975,8 @@ private:
   mutable llvm::DenseSet<mlir::Type> expandingContracts;
   mutable llvm::DenseSet<mlir::Type> laneCountQueries;
   mutable std::optional<llvm::StringSet<>> subclassedContracts;
+  // Read type of each module-global cell, collected once (globalCellReadType).
+  std::optional<llvm::StringMap<mlir::Type>> globalCellReadTypes;
   llvm::DenseMap<mlir::Value, mlir::Operation *> ownedLocalObjectMarkers;
   llvm::StringMap<ReturnedValueSummary> returnedValueSummaries;
   llvm::StringMap<ReturnedCallableSummary> returnedCallableSummaries;

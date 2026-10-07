@@ -1,0 +1,17 @@
+build
+{'a': 1} {'a': 1}
+None 3
+4
+x None
+y None
+None None
+True None
+module narrowing
+[4, 3, 2, 1, 0]
+4 3 [2, 1, 0]
+21
+s!
+0
+1
+10 10 10 10 10 10 10 10 10 10 
+none

@@ -2498,6 +2498,37 @@ TEST(EmitterTest, ASubscriptedSliceAnnotationNamesTheSlice) {
 // A classmethod through an instance is re-spelled as the class's call only
 // while the class name still names the class: a program that binds `bytes`
 // keeps the refusal instead of calling whatever the name now holds.
+// A union cell -- a module global a function uses, a class attribute -- holds
+// each member as itself, so a numeric value of a rung the union does not name
+// is refused where it is written, naming the union as the program spelled it.
+TEST(EmitterTest, AUnionCellRefusesARungItDoesNotHold) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (auto [source, expected] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"o: int | None = None\no = True\ndef r() -> None:\n    print(o)\n",
+            "module global 'o' holds int | None and this assignment gives it "
+            "bool"},
+           {"o: float | None = None\ndef w() -> None:\n    global o\n    o = "
+            "1\n",
+            "module global 'o' holds float | None and this assignment gives it "
+            "int"},
+           {"class P:\n    v: int | None = True\n",
+            "class attribute 'P.v' holds int | None and this initializer gives "
+            "it bool"}}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << source;
+    EXPECT_NE(diagnostics.find(expected), std::string::npos)
+        << source << diagnostics;
+  }
+}
+
 TEST(EmitterTest, AClassmethodThroughAnInstanceNeedsItsClassName) {
   lython::driver::DriverOptions native;
   native.targetTriple = llvm::sys::getDefaultTargetTriple();

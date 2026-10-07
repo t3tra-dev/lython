@@ -205,8 +205,12 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
     for (const auto &entry : narrowedMemberTypes) {
       llvm::StringRef path = entry.getKey();
       auto dot = path.find('.');
-      if (dot == llvm::StringRef::npos)
+      if (dot == llvm::StringRef::npos) {
+        if (moduleGlobals.count(path) &&
+            callAssignsModuleGlobal(*call, path, /*depth=*/3, entry.second))
+          dead.push_back(path.str());
         continue;
+      }
       if (callAssignsMemberPath(*call, path.take_front(dot),
                                 path.drop_front(dot + 1), /*depth=*/3,
                                 /*allowMethods=*/true, entry.second))
@@ -219,6 +223,9 @@ void ModuleEmitter::invalidateMemberNarrowings(const parser::Node &statement) {
     if (!target)
       continue;
     if (target->kind == "Name") {
+      // The name's own proof too, where it has one: a cell's or a module
+      // global's, which the store just overwrote.
+      narrowedMemberTypes.erase(ast::nameSpelling(*target));
       std::string prefix = std::string(ast::nameSpelling(*target)) + ".";
       for (auto entry = narrowedMemberTypes.begin();
            entry != narrowedMemberTypes.end();)
@@ -386,6 +393,83 @@ bool ModuleEmitter::callAssignsMemberPath(const parser::Node &call,
   return false;
 }
 
+// Whether calling `call` may rebind the module global `name`: the named
+// callee declares `global name` and assigns it -- a literal of the proved
+// member keeps the proof, as a field setter's does -- or calls, within
+// `depth` hops, a function that does.
+//
+// ⛔ A NAMED FUNCTION only, as for a field path: a method's body would be
+// resolved against a receiver type this scope does not describe. A callee
+// not seen keeps the proof, and the checked read is what makes that safe.
+bool ModuleEmitter::callAssignsModuleGlobal(const parser::Node &call,
+                                            llvm::StringRef name,
+                                            unsigned depth, mlir::Type proved) {
+  const parser::Node *callee = ast::node(call, "func");
+  if (!callee || callee->kind != "Name")
+    return false;
+  const parser::Node *def =
+      moduleFunctionDef(llvm::StringRef(ast::nameSpelling(*callee)));
+  if (!def)
+    return false;
+  bool declared = false, rebinds = false, forwards = false;
+  auto writes = [&](const parser::Node *target, const parser::Node *value) {
+    if (!target || target->kind != "Name" ||
+        llvm::StringRef(ast::nameSpelling(*target)) != name)
+      return;
+    if (!value || value->kind != "Constant" || !proved ||
+        types.widenLiteral(types.inferExpr(value)) != proved)
+      rebinds = true;
+  };
+  auto walk = [&](const parser::Node &node, auto &&recurse) -> void {
+    if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" ||
+        node.kind == "Lambda" || node.kind == "ClassDef")
+      return;
+    if (node.kind == "Global")
+      if (const auto *names = ast::stringList(node, "names"))
+        for (const auto &each : *names)
+          if (llvm::StringRef(each) == name)
+            declared = true;
+    if (node.kind == "Assign") {
+      if (const auto *targets = ast::nodeList(node, "targets"))
+        for (const parser::NodePtr &target : *targets)
+          writes(target.get(), ast::node(node, "value"));
+    } else if (node.kind == "AnnAssign" || node.kind == "AugAssign") {
+      writes(ast::node(node, "target"),
+             node.kind == "AnnAssign" ? ast::node(node, "value") : nullptr);
+    } else if (node.kind == "Call" && depth > 0 &&
+               callAssignsModuleGlobal(node, name, depth - 1, proved)) {
+      forwards = true;
+    }
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, recurse);
+    }
+  };
+  if (const auto *body = ast::nodeList(*def, "body"))
+    for (const parser::NodePtr &statement : *body)
+      if (statement)
+        walk(*statement, walk);
+  return (declared && rebinds) || forwards;
+}
+
+// ⭐ A NAME WHOSE STORAGE IS RE-READ AT EVERY USE -- a captured local's cell,
+// or a module global's -- carries a proof the way a field path does: recorded
+// by bare name and spent at each read, with a check. `if _cache is None:` in
+// a function is about the slot every later read goes back to.
+bool ModuleEmitter::proofIsSpentAtRead(llvm::StringRef name) const {
+  if (auto bound = values.find(name); bound != values.end())
+    return isCellContract(bound->second.type);
+  return isModuleGlobalRead(name);
+}
+
 void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
                                          const BranchTypeNarrowing &fact,
                                          bool conditionIsTrue) {
@@ -417,8 +501,7 @@ void ModuleEmitter::applyBranchNarrowing(const parser::Node &anchor,
     // while `w = v` inside `inner` compiles and prints CPython's answer. The
     // key is the bare name, which no field path can collide with: a member
     // path always carries a dot.
-    if (auto cellBound = values.find(fact.name);
-        cellBound != values.end() && isCellContract(cellBound->second.type)) {
+    if (proofIsSpentAtRead(fact.name)) {
       mlir::Type proved = conditionIsTrue ? fact.trueType : fact.falseType;
       if (proved && proved != types.none())
         narrowedMemberTypes[fact.name] = proved;
@@ -958,7 +1041,7 @@ void ModuleEmitter::emitIf(const parser::Node &statement) {
       // FIELDS.
       elseMembers = savedMembers;
       for (const BranchTypeNarrowing &fact : narrowings) {
-        if (!fact.isMemberPath)
+        if (!fact.isMemberPath && !proofIsSpentAtRead(fact.name))
           continue;
         if (fact.falseType && fact.falseType != types.none())
           elseMembers[fact.name] = fact.falseType;

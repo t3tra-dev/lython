@@ -920,10 +920,18 @@ private:
   // storages that are RE-READ rather than held: a field and a CELL. The tag
   // the guard saw is evidence about the past, so the read tests it, raises
   // where it fails, and refines where it holds. `subject` names what the
-  // sentence is about; `subjectIsField` picks between the two spellings.
+  // sentence is about; `subjectKind` ("attribute", "captured local",
+  // "module global") names it, and an attribute's failure is AttributeError.
+  // Whether `name` is a cell or a module global, whose proofs are recorded
+  // by bare name and spent at each read rather than by unwrapping a value.
+  bool proofIsSpentAtRead(llvm::StringRef name) const;
+  mlir::Type storeProvedMember(py::UnionType declared, mlir::Type stored) const;
+  std::string cellTypeSpelling(mlir::Type type) const;
+  bool callAssignsModuleGlobal(const parser::Node &call, llvm::StringRef name,
+                               unsigned depth, mlir::Type proved);
   Value emitCheckedNarrowedRead(const parser::Node &anchor, Value raw,
                                 mlir::Type proved, llvm::StringRef subject,
-                                bool subjectIsField);
+                                llvm::StringRef subjectKind);
   Value emitFormattedValue(const parser::Node &expr);
   // str(value) semantics on an already-emitted value (str kept, source-class
   // __str__ inlined, manifest __str__, then __repr__) — print's stringify
