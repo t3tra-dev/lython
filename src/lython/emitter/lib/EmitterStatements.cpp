@@ -610,6 +610,35 @@ bool ModuleEmitter::functionBindsName(const parser::Node &function,
   return binds && !declaredGlobal;
 }
 
+// The member of `declared` a store of a `stored` value proves the storage
+// holds, or null: the value's own type when it is a member other than None,
+// and for an EMPTY container literal -- typed with `object` arguments, which
+// no member is -- the one member of that container kind it was coerced into.
+// `if self.xs is None: self.xs = []` is how a lazy list is written.
+mlir::Type ModuleEmitter::storeProvedMember(py::UnionType declared,
+                                            mlir::Type stored) const {
+  stored = types.widenLiteral(stored);
+  if (!stored || stored == types.none() || stored == mlir::Type(declared))
+    return {};
+  if (declared.hasMember(stored))
+    return stored;
+  auto empty = mlir::dyn_cast<py::ContractType>(stored);
+  if (!empty || empty.getArguments().empty() ||
+      !llvm::all_of(empty.getArguments(), [&](mlir::Type argument) {
+        return argument == types.object();
+      }))
+    return {};
+  mlir::Type only;
+  for (mlir::Type member : declared.getMemberTypes())
+    if (auto contract = mlir::dyn_cast<py::ContractType>(member);
+        contract && contract.getContractName() == empty.getContractName()) {
+      if (only)
+        return {};
+      only = member;
+    }
+  return only;
+}
+
 void ModuleEmitter::emitPendingDefaultCells(const parser::Node &statement) {
   auto pending = pendingDefaultCells.find(&statement);
   if (pending == pendingDefaultCells.end())
@@ -837,6 +866,20 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
                       lookupClassField(objectType, *attr)) {
                 value = emitExprExpected(rhs, *fieldType);
                 emittedWithContext = true;
+              } else if (auto typeObject =
+                             mlir::dyn_cast_if_present<py::TypeType>(
+                                 types.widenLiteral(objectType))) {
+                // And a CLASS attribute's cell, written through the class:
+                // `Reg.items = []` for `items: list[str] | None` stored a
+                // `list[object]` the union cell has no lanes for.
+                if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(
+                        typeObject.getInstanceType()))
+                  if (std::optional<std::pair<llvm::StringRef, mlir::Type>>
+                          slot = resolveClassAttrSlot(
+                              contract.getContractName(), *attr)) {
+                    value = emitExprExpected(rhs, slot->second);
+                    emittedWithContext = true;
+                  }
               }
             }
     }
@@ -1075,7 +1118,14 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       // A slice receiver is re-read, which is a second evaluation this does
       // not remove; the BOUNDS, which are where an index expression usually
       // sits, are shared.
-      if (!sliceTarget)
+      // ⛔ Nor an attribute of a plain NAME, which re-reads for free and is
+      // the shape a proof is keyed by: shared, `self.v += 1` after `if
+      // self.v is None: self.v = 0` read `<ref>.v`, matched no `self.v` fact,
+      // and was refused as the union's `__add__`.
+      const parser::Node *receiverNode = ast::node(*shared, "value");
+      bool plainNameAttribute = shared->kind == "Attribute" && receiverNode &&
+                                receiverNode->kind == "Name";
+      if (!sliceTarget && !plainNameAttribute)
         shareField(*shared, "value");
       if (shared->kind == "Subscript") {
         const parser::Node *slice = ast::node(*shared, "slice");
@@ -2025,12 +2075,16 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
             return "bool";
           return numeric == types.intType() ? "int" : "float";
         };
-        bool insideContainer = declaredLeaf != types.widenLiteral(type);
+        bool insideUnion = mlir::isa<py::UnionType>(types.widenLiteral(type));
+        bool insideContainer =
+            !insideUnion && declaredLeaf != types.widenLiteral(type);
         diagnostics.push_back(parser::Diagnostic{
             parser::Severity::Error, target.range.start,
             "module global '" + name.str() + "' holds " +
                 (insideContainer ? "a container of " : "") +
-                spell(declaredLeaf).str() + " and this assignment gives it " +
+                (insideUnion ? cellTypeSpelling(type)
+                             : spell(declaredLeaf).str()) +
+                " and this assignment gives it " +
                 (insideContainer ? "a container of " : "") +
                 spell(assignedLeaf).str() +
                 "; a module global has one runtime representation and these "
@@ -2043,6 +2097,13 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
                                         builder.getStringAttr(name),
                                         coerced.value);
       markBoxedModuleGlobal(op);
+      // ⭐ THE STORE PROVES WHAT IT WROTE, as a field store does: the lazy
+      // global (`if _cache is None: _cache = {...}` then `return _cache`) needs
+      // the dict on both paths, and each read spends it with a check.
+      if (auto declared =
+              mlir::dyn_cast<py::UnionType>(types.widenLiteral(type)))
+        if (mlir::Type proved = storeProvedMember(declared, value.type))
+          memberNarrowingsFromStores[name.str()] = proved;
       return;
     }
     // A name bound to a nonlocal cell (owner scope or a `nonlocal`-declaring
@@ -2172,6 +2233,16 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
             py::GlobalSetOp::create(builder, loc(target),
                                     builder.getStringAttr(cellName),
                                     coerced.value);
+            // ⭐ THE STORE PROVES WHAT IT WROTE, as a field's does, under the
+            // path it was written through (`cls.cache`, `Config.cache`): the
+            // lazy class cache reads it back on the path after the `if`.
+            if (auto declared = mlir::dyn_cast<py::UnionType>(slot->second))
+              if (mlir::Type proved = storeProvedMember(declared, value.type))
+                if (const parser::Node *owner = ast::node(target, "value");
+                    owner && owner->kind == "Name")
+                  memberNarrowingsFromStores[std::string(
+                                                 ast::nameSpelling(*owner)) +
+                                             "." + std::string(*attr)] = proved;
             return;
           }
         }
@@ -2230,15 +2301,12 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       if (storedFieldType && storedValueType)
         if (auto declared =
                 mlir::dyn_cast<py::UnionType>(types.widenLiteral(*storedFieldType)))
-          if (declared.hasMember(storedValueType) &&
-              storedValueType != mlir::Type(declared) &&
-              storedValueType != types.none())
+          if (mlir::Type proved = storeProvedMember(declared, storedValueType))
             if (const parser::Node *owner = ast::node(target, "value");
                 owner && owner->kind == "Name")
               memberNarrowingsFromStores[std::string(
                                              ast::nameSpelling(*owner)) +
-                                         "." + std::string(*attr)] =
-                  storedValueType;
+                                         "." + std::string(*attr)] = proved;
       if (lookupClassField(object.type, *attr))
         op->setAttr("ly.attr.kind", builder.getStringAttr("field"));
       if (auto contract =

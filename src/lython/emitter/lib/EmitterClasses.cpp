@@ -1179,19 +1179,30 @@ void ModuleEmitter::emitClassAttrInitializers(const parser::Node &classDef,
     // printed 0, both silently, because the outer contract names match and the
     // scalar test stopped there.
     mlir::Type declared, supplied;
+    // ⛔ And the initializer's OWN type, not only what came back: an expected
+    // union wraps the value first, so `v: int | None = True` came back as the
+    // union and the bool reached the lowering.
     if (numericRepresentationMismatch(slot->second, initial.type, declared,
-                                      supplied)) {
+                                      supplied) ||
+        numericRepresentationMismatch(
+            slot->second, types.widenLiteral(types.inferExpr(value)), declared,
+            supplied)) {
       auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
         if (numeric == types.boolType())
           return "bool";
         return numeric == types.intType() ? "int" : "float";
       };
-      bool insideContainer = declared != types.widenLiteral(slot->second);
+      bool insideUnion =
+          mlir::isa<py::UnionType>(types.widenLiteral(slot->second));
+      bool insideContainer =
+          !insideUnion && declared != types.widenLiteral(slot->second);
       diagnostics.push_back(parser::Diagnostic{
           parser::Severity::Error, statement->range.start,
           "class attribute '" + std::string(*name) + "." + attrName.str() +
               "' holds " + (insideContainer ? "a container of " : "") +
-              spell(declared).str() + " and this initializer gives it " +
+              (insideUnion ? cellTypeSpelling(slot->second)
+                           : spell(declared).str()) +
+              " and this initializer gives it " +
               (insideContainer ? "a container of " : "") +
               spell(supplied).str() +
               "; the attribute's cell has one runtime representation and these "
@@ -2080,64 +2091,83 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
       // corner (`C().V(1)` passes the instance, which is what @staticmethod
       // exists to opt out of), so the read is a shape question before it is a
       // storage one.
-      bool storable =
-          widened == types.intType() || widened == types.strType() ||
-          widened == types.floatType() || widened == types.boolType() ||
-          mlir::isa_and_nonnull<py::CallableType>(widened);
-      if (!storable) {
-        if (auto attrContract =
-                mlir::dyn_cast_if_present<py::ContractType>(widened)) {
-          llvm::StringRef attrContractName = attrContract.getContractName();
-          // ⭐ A CONTAINER IS SLOT-BACKED TOO, and the reason it was not is a
-          // paragraph that stopped being true. The note above said container
-          // cells "would go stale against reallocation, the same reason
-          // collectModuleGlobals excludes them" -- and that exclusion is gone:
-          // the runtime's growth (objects/list.mlir, objects/set.mlir) writes
-          // THROUGH the handle, so the cell holds what stays valid. Without
-          // this a container class attribute could not even be READ:
-          //
-          //     class R:
-          //         items: list[str] = []
-          //     print(R.items)
-          //     # unsupported static class attribute expression for 'items'
-          //
-          // because the constant channel re-materializes the value per read and
-          // has no arm for a container -- and could not have one, since every
-          // read of a mutable attribute must be the SAME object.
-          //
-          // ⛔ EXCEPT a container whose ELEMENT type is a union, which
-          // `collectModuleGlobals` still excludes for its own measured reason: a
-          // cell hands back the handle, and a union-typed element read needs the
-          // literal's per-element evidence.
-          //
-          // ⛔ And EXCEPT a `_dunder_` name. `ctypes.Structure._fields_` is a
-          // list the COMPILER consumes, not a runtime value; slotting it emits a
-          // module-level store, and a runtime-internal lib module may not run
-          // module-level code (`stackguard_support.py` stopped building).
-          bool erasedElement = false;
-          for (mlir::Type argument : attrContract.getArguments())
-            if (mlir::isa<py::UnionType>(argument))
-              erasedElement = true;
-          llvm::StringRef attrSpelling(attrName);
-          bool compilerConsumed = attrSpelling.size() > 2 &&
-                                  attrSpelling.starts_with("_") &&
-                                  attrSpelling.ends_with("_");
-          storable = !erasedElement && !compilerConsumed &&
-                     (attrContractName == "builtins.bytes" ||
-                      attrContractName == "builtins.list" ||
-                      attrContractName == "builtins.dict" ||
-                      attrContractName == "builtins.set" ||
-                      attrContractName == "builtins.tuple" ||
-                      attrContractName == "builtins.frozenset" ||
-                      // ⛔ The declaration map, not the name's shape: an
-                      // IMPORTED class is `mod.Kind`, so a class attribute
-                      // typed by one got no slot and the read reached the
-                      // constant channel, which has no arm for an instance --
-                      // "Failed to run lowering pipeline", where the same
-                      // class written in one file is read fine.
-                      isSourceClassContract(attrContract));
+      auto storableAs = [&](mlir::Type widened) -> bool {
+        bool storable =
+            widened == types.intType() || widened == types.strType() ||
+            widened == types.floatType() || widened == types.boolType() ||
+            mlir::isa_and_nonnull<py::CallableType>(widened);
+        if (!storable) {
+          if (auto attrContract =
+                  mlir::dyn_cast_if_present<py::ContractType>(widened)) {
+            llvm::StringRef attrContractName = attrContract.getContractName();
+            // ⭐ A CONTAINER IS SLOT-BACKED TOO, and the reason it was not is a
+            // paragraph that stopped being true. The note above said container
+            // cells "would go stale against reallocation, the same reason
+            // collectModuleGlobals excludes them" -- and that exclusion is
+            // gone: the runtime's growth (objects/list.mlir, objects/set.mlir)
+            // writes THROUGH the handle, so the cell holds what stays valid.
+            // Without this a container class attribute could not even be READ:
+            //
+            //     class R:
+            //         items: list[str] = []
+            //     print(R.items)
+            //     # unsupported static class attribute expression for 'items'
+            //
+            // because the constant channel re-materializes the value per read
+            // and has no arm for a container -- and could not have one, since
+            // every read of a mutable attribute must be the SAME object.
+            //
+            // ⛔ EXCEPT a container whose ELEMENT type is a union, which
+            // `collectModuleGlobals` still excludes for its own measured
+            // reason: a cell hands back the handle, and a union-typed element
+            // read needs the literal's per-element evidence.
+            //
+            // ⛔ And EXCEPT a `_dunder_` name. `ctypes.Structure._fields_` is a
+            // list the COMPILER consumes, not a runtime value; slotting it
+            // emits a module-level store, and a runtime-internal lib module may
+            // not run module-level code (`stackguard_support.py` stopped
+            // building).
+            bool erasedElement = false;
+            for (mlir::Type argument : attrContract.getArguments())
+              if (mlir::isa<py::UnionType>(argument))
+                erasedElement = true;
+            llvm::StringRef attrSpelling(attrName);
+            bool compilerConsumed = attrSpelling.size() > 2 &&
+                                    attrSpelling.starts_with("_") &&
+                                    attrSpelling.ends_with("_");
+            storable = !erasedElement && !compilerConsumed &&
+                       (attrContractName == "builtins.bytes" ||
+                        attrContractName == "builtins.list" ||
+                        attrContractName == "builtins.dict" ||
+                        attrContractName == "builtins.set" ||
+                        attrContractName == "builtins.tuple" ||
+                        attrContractName == "builtins.frozenset" ||
+                        // ⛔ The declaration map, not the name's shape: an
+                        // IMPORTED class is `mod.Kind`, so a class attribute
+                        // typed by one got no slot and the read reached the
+                        // constant channel, which has no arm for an instance --
+                        // "Failed to run lowering pipeline", where the same
+                        // class written in one file is read fine.
+                        isSourceClassContract(attrContract));
+          }
         }
-      }
+        return storable;
+      };
+      bool storable = storableAs(widened);
+      // ⭐ A UNION IS SLOT-BACKED WHEN EACH MEMBER WOULD BE, None aside. The
+      // constant channel has nothing to say about it: `debug: bool | None =
+      // None` was read as the None CONSTANT with no union tag ("union.test
+      // input has no runtime tag"), and `Config.debug = True` was "class
+      // static attribute mutation is not supported" -- a settings class, as
+      // CPython code writes one. The cell holds the tag and every member's
+      // lanes, as a union module global's does.
+      if (!storable)
+        if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(widened))
+          storable =
+              llvm::all_of(unionType.getMemberTypes(), [&](mlir::Type member) {
+                member = types.widenLiteral(member);
+                return member == types.none() || storableAs(member);
+              });
       if (storable)
         slots[attrName] = widened;
     }

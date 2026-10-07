@@ -383,7 +383,19 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
   // and a retain with no holder recorded is a leak by construction. Measured:
   // one reference per object-global read, so `ORIGIN.x + ORIGIN.y` left the
   // instance at 3 and the rebinding release could not reach 0.
-  if (ownership::isObjectHeaderLikeType(values.front().getType())) {
+  // ⭐ A UNION CELL's reader takes a reference per member, as a union read out
+  // of a container does: the tag lane comes first, so the header test below
+  // never fires for it, and the read handed out the cell's own reference --
+  // the reader's release then freed the object the cell still held, and the
+  // next read of `_cache` crashed.
+  auto unionType = mlir::dyn_cast<py::UnionType>(type);
+  if (unionType) {
+    mlir::FailureOr<llvm::SmallVector<mlir::Value, 8>> owned =
+        RuntimeBundleLowerer::retainUnionMemberValues(op, unionType, values);
+    if (mlir::failed(owned))
+      return mlir::failure();
+    values.assign(owned->begin(), owned->end());
+  } else if (ownership::isObjectHeaderLikeType(values.front().getType())) {
     std::optional<RuntimeValue> owned =
         RuntimeBundleLowerer::retainEvidenceElement(
             op.getOperation(), RuntimeValue::object(type, values),
@@ -401,11 +413,24 @@ RuntimeBundleLowerer::lowerObjectGlobalGet(py::GlobalGetOp op) {
   RuntimeBundle result;
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
           op.getOperation(), type, values, result,
-          ownership::OwnershipKind::Own)))
+          unionType ? ownership::logicalOwnershipKind(type, /*ownsObject=*/true)
+                    : ownership::OwnershipKind::Own)))
     return mlir::failure();
   valueBundles[op.getResult()] = std::move(result);
   erase.push_back(op);
   return mlir::success();
+}
+
+// The type the reads of `op`'s cell use, or null when nothing reads it.
+mlir::Type RuntimeBundleLowerer::globalCellReadType(py::GlobalSetOp op) {
+  if (!globalCellReadTypes) {
+    globalCellReadTypes.emplace();
+    module.walk([&](py::GlobalGetOp get) {
+      globalCellReadTypes->try_emplace(get.getName(),
+                                       get.getResult().getType());
+    });
+  }
+  return globalCellReadTypes->lookup(op.getName());
 }
 
 mlir::LogicalResult
@@ -466,6 +491,26 @@ RuntimeBundleLowerer::lowerObjectGlobalSet(py::GlobalSetOp op) {
       value = &boxed;
     }
   }
+  // ⛔ AND THE CELL'S OWN LAYOUT, which is what its READS assume. The layout
+  // above is the stored VALUE's, and a store of another type laid other lanes
+  // into the same words: `Reg.items = []` wrote a `list[object]` into a
+  // `list[str] | None` cell and the next read took the list's words for a
+  // tag. A cell has one declared type, and every read of it is spelled with
+  // that type.
+  if (mlir::Type readType = RuntimeBundleLowerer::globalCellReadType(op))
+    if (readType != op.getValue().getType()) {
+      mlir::FailureOr<llvm::SmallVector<mlir::Type, 8>> readLanes =
+          RuntimeBundleLowerer::runtimeValueTypesFor(
+              op, globalStorageContract(context, readType),
+              "module global object ABI");
+      if (mlir::failed(readLanes))
+        return mlir::failure();
+      if (*readLanes != *valueTypes)
+        return op.emitError()
+               << "module global '" << op.getName() << "' is read as "
+               << readType << " and this store gives it "
+               << op.getValue().getType() << ", whose runtime layout differs";
+    }
   llvm::ArrayRef<mlir::Value> newValues = value->physicalValues();
   // ⛔ The types, not only how many: a value of another layout with the same
   // number of lanes is what the cell above took for a box.

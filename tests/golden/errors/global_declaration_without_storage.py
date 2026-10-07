@@ -3,16 +3,25 @@
 # declaration is an explicit statement that the assignment is not a local one,
 # so binding a local is the one answer it cannot have.
 #
-# This was a `list[int]` until container globals got cells. A union is what is
-# left: it stays value-bound so isinstance narrowing keeps working on the
-# module flow, which means there is nothing for the write to reach.
-X: list[int] | None = [1]
+# This was a `list[int]` until container globals got cells, and then a
+# `list[int] | None` until a union a function uses got one. A class object is
+# what is left: `type[X]` is compile-time evidence with no runtime value group,
+# so there is nothing for the write to reach.
+class A:
+    pass
+
+
+class B(A):
+    pass
+
+
+X: type[A] = A
 
 
 def f() -> None:
     global X
-    X = [2]
+    X = B
 
 
 f()
-print(X)
+print(X.__name__)

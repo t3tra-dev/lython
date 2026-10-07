@@ -9,6 +9,7 @@
 #include "TypeSystemSolver.h"
 
 #include "AstAccess.h"
+#include "Contracts.h"
 
 #include "llvm/ADT/ScopeExit.h"
 #include "PyProtocols.h"
@@ -146,7 +147,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
           if (auto narrowed = narrowedMemberTypes.find(name);
               narrowed != narrowedMemberTypes.end() && narrowed->second)
             return emitCheckedNarrowedRead(*expr, loaded, narrowed->second,
-                                           name, /*subjectIsField=*/false);
+                                           name, "captured local");
         return loaded;
       }
       return found->second;
@@ -159,6 +160,14 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       auto op = py::GlobalGetOp::create(builder, loc(*expr), type,
                                         builder.getStringAttr(name));
       markBoxedModuleGlobal(op);
+      // A module cell is re-read at every use, as a captured local's cell is,
+      // so a guard's proof about it is spent here with the same check.
+      if (!suppressMemberNarrowing && !narrowedMemberTypes.empty())
+        if (auto narrowed = narrowedMemberTypes.find(name);
+            narrowed != narrowedMemberTypes.end() && narrowed->second)
+          return emitCheckedNarrowedRead(*expr, {op.getResult(), type},
+                                         narrowed->second, name,
+                                         "module global");
       return {op.getResult(), type};
     }
     // The same cell under its canonical name: an imported module's container
@@ -311,7 +320,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
             suppressMemberNarrowing = false;
           }
           return emitCheckedNarrowedRead(*expr, raw, found->second, *attr,
-                                         /*subjectIsField=*/true);
+                                         "attribute");
         }
       }
   }
@@ -818,7 +827,7 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         const BranchTypeNarrowing &narrowing = *proven[index];
         // A path's proof is a fact the READ spends, so it is recorded for the
         // operands after the one that proved it and undone with the values.
-        if (narrowing.isMemberPath) {
+        if (narrowing.isMemberPath || proofIsSpentAtRead(narrowing.name)) {
           auto standing = narrowedMemberTypes.find(narrowing.name);
           restoreMembers.push_back(
               {narrowing.name, standing == narrowedMemberTypes.end()
@@ -2466,7 +2475,8 @@ ModuleEmitter::tryEmitReflectedBinary(const parser::Node &anchor,
 Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
                                              Value raw, mlir::Type proved,
                                              llvm::StringRef subject,
-                                             bool subjectIsField) {
+                                             llvm::StringRef subjectKind) {
+  bool subjectIsField = subjectKind == "attribute";
   if (!proved)
     return raw;
   auto rawUnion = mlir::dyn_cast_if_present<py::UnionType>(raw.value.getType());
@@ -2497,7 +2507,7 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   mlir::cf::CondBranchOp::create(builder, loc(anchor), bit, ok,
                                  mlir::ValueRange{}, bad, mlir::ValueRange{});
   builder.setInsertionPointToStart(bad);
-  std::string what = subjectIsField ? "attribute '" : "captured local '";
+  std::string what = subjectKind.str() + " '";
   what += std::string(subject);
   // ⛔ "a guard OR AN ASSIGNMENT": a store proves what it wrote, the same way a
   // test proves what it tested, and the reader of this sentence was sent
@@ -5147,6 +5157,27 @@ std::string ModuleEmitter::keptArgumentRepresentationMismatch(
   return {};
 }
 
+// A cell's declared type as the program spelled it, for a refusal: `int |
+// None` and not the dialect's `!py.union<...>`.
+std::string ModuleEmitter::cellTypeSpelling(mlir::Type type) const {
+  type = types.widenLiteral(type);
+  if (type == types.none())
+    return "None";
+  if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
+    std::string spelled;
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      if (!spelled.empty())
+        spelled += " | ";
+      spelled += cellTypeSpelling(member);
+    }
+    return spelled;
+  }
+  if (auto contract = mlir::dyn_cast_if_present<py::ContractType>(type))
+    return py::contracts::displayClassNameForContract(
+        contract.getContractName());
+  return typeText(type);
+}
+
 bool ModuleEmitter::numericRepresentationMismatch(
     mlir::Type declared, mlir::Type assigned, mlir::Type &declaredLeaf,
     mlir::Type &assignedLeaf) const {
@@ -5160,6 +5191,35 @@ bool ModuleEmitter::numericRepresentationMismatch(
     declaredLeaf = widenedDeclared;
     assignedLeaf = widenedAssigned;
     return true;
+  }
+  // ⭐ A UNION CELL HOLDS EACH MEMBER AS ITSELF, so a numeric value is stored
+  // as itself only where its own rung is a member: `o: int | None` has no
+  // lanes for a bool, and the store reached the lowering's layout check. An
+  // assigned union asks the same of each numeric member.
+  auto numericMembers = [&](mlir::Type type) {
+    llvm::SmallVector<mlir::Type, 2> members;
+    if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
+      for (mlir::Type member : unionType.getMemberTypes())
+        if (mlir::Type widened = types.widenLiteral(member);
+            isNumericPrimitiveContract(widened))
+          members.push_back(widened);
+    } else if (isNumericPrimitiveContract(type)) {
+      members.push_back(type);
+    }
+    return members;
+  };
+  if (mlir::isa_and_present<py::UnionType>(widenedDeclared) ||
+      mlir::isa_and_present<py::UnionType>(widenedAssigned)) {
+    llvm::SmallVector<mlir::Type, 2> held = numericMembers(widenedDeclared);
+    if (held.empty())
+      return false;
+    for (mlir::Type given : numericMembers(widenedAssigned))
+      if (!llvm::is_contained(held, given)) {
+        declaredLeaf = held.front();
+        assignedLeaf = given;
+        return true;
+      }
+    return false;
   }
   auto declaredContract =
       mlir::dyn_cast_if_present<py::ContractType>(widenedDeclared);

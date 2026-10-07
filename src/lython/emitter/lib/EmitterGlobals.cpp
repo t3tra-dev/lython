@@ -61,7 +61,45 @@
 
 namespace lython::emitter {
 
+// Every name spelled inside a function, a lambda or a class body, at any
+// depth: the module-level names a body may read or declare `global`.
+//
+// ⛔ A SPELLING, not a resolved reference: a body's local of the same name
+// counts too. That only gives a union a cell it did not need, which costs a
+// load per module-level read and changes no answer.
+static llvm::StringSet<>
+namesUsedInsideFunctions(const parser::Node &moduleNode) {
+  llvm::StringSet<> names;
+  auto walk = [&](const parser::Node &node, bool inside,
+                  auto &&recurse) -> void {
+    bool nested = inside || node.kind == "FunctionDef" ||
+                  node.kind == "AsyncFunctionDef" || node.kind == "Lambda" ||
+                  node.kind == "ClassDef";
+    if (nested && node.kind == "Name")
+      names.insert(ast::nameSpelling(node));
+    if (nested && node.kind == "Global")
+      if (const auto *declared = ast::stringList(node, "names"))
+        for (const std::string &name : *declared)
+          names.insert(name);
+    for (const parser::Field &field : node.fields) {
+      if (const auto *child = std::get_if<parser::NodePtr>(&field.value)) {
+        if (*child)
+          recurse(**child, nested, recurse);
+        continue;
+      }
+      if (const auto *children =
+              std::get_if<std::vector<parser::NodePtr>>(&field.value))
+        for (const parser::NodePtr &child : *children)
+          if (child)
+            recurse(*child, nested, recurse);
+    }
+  };
+  walk(moduleNode, false, walk);
+  return names;
+}
+
 void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
+  std::optional<llvm::StringSet<>> usedInsideFunctions;
   // Opt-in: an annotated module-level assignment (`NAME: T = ...`) becomes a
   // storage-backed mutable global. Plain `NAME = expr` at module scope keeps
   // its value-binding behaviour (module-scope constants).
@@ -138,6 +176,24 @@ void ModuleEmitter::collectModuleGlobals(const parser::Node &moduleNode) {
     // is (see lowerGlobalGet).
     bool storageBacked = mlir::isa<py::ContractType>(annotated) ||
                          mlir::isa<py::CallableType>(annotated);
+    // ⭐ A UNION GETS A CELL WHEN A FUNCTION NEEDS ONE -- reads the name or
+    // declares it `global`. Without it `_cache: dict | None = None` read from
+    // any function was "unresolved name '_cache'", and `global _cache;
+    // _cache = {...}` was refused as having nothing to write to: the lazy
+    // module cache, written exactly as CPython code writes it.
+    //
+    // ⛔ Not every union, which is what the first attempt did: a cell's read
+    // hands back a union whose tag is a runtime fact, and module code that
+    // relied on the value binding's STATIC member then changed meaning --
+    // `first: "ValueError | KeyError" = ValueError(m); raise first` is a plain
+    // raise while value-bound and a union raise through a cell, which is
+    // refused (tests/probe/wb_raise_a_runtime_chosen_exception.py). A name
+    // only the module body touches keeps that evidence.
+    if (!storageBacked && mlir::isa<py::UnionType>(annotated)) {
+      if (!usedInsideFunctions)
+        usedInsideFunctions = namesUsedInsideFunctions(moduleNode);
+      storageBacked = usedInsideFunctions->contains(ast::nameSpelling(*target));
+    }
     // ⛔ EXCEPT a container whose ELEMENT type is a union. A cell hands back
     // the handle and nothing else, and a union-typed element read needs the
     // per-element evidence the literal recorded -- the runtime read declines a
@@ -465,8 +521,12 @@ void ModuleEmitter::rebindStructuralMutation(const parser::Node &at,
     values[name] = rebound;
     return;
   }
+  // ⛔ In the CELL's type, not the receiver's: a union global's receiver is
+  // the member a guard proved, and storing that bare put a list's lanes where
+  // the cell keeps a tag -- `if buf is not None: buf.append(s)` segfaulted.
+  Value stored = coerceValue(rebound, moduleGlobals.lookup(name), at);
   auto op = py::GlobalSetOp::create(builder, loc(at),
-                                    builder.getStringAttr(name), rebound.value);
+                                    builder.getStringAttr(name), stored.value);
   markBoxedModuleGlobal(op);
 }
 
