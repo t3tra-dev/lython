@@ -1089,6 +1089,41 @@ module attributes {
     func.return %header : memref<2xi64>
   }
 
+  // PyNumber_AsSsize_t(v, NULL): the word an index means -- the value, or the
+  // nearest end of the word when the value is wider -- which is how
+  // _PyEval_SliceIndex reads a slice bound and str.find its window, so
+  // `xs[:2**70]` is the whole list rather than an OverflowError.
+  func.func @LyLong_AsI64Clipped(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "unbox.i64.clip"} {
+    %meta, %digits = func.call @__ly_long_parts(%header) : (memref<2xi64>) -> (memref<2xi64>, memref<?xi32>)
+    %fits = func.call @__ly_long_view_fits_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i1
+    %result = scf.if %fits -> (i64) {
+      %v = func.call @__ly_long_view_as_i64(%meta, %digits) : (memref<2xi64>, memref<?xi32>) -> i64
+      scf.yield %v : i64
+    } else {
+      %sign_slot = arith.constant 0 : index
+      %zero = arith.constant 0 : i64
+      %min = arith.constant -9223372036854775808 : i64
+      %max = arith.constant 9223372036854775807 : i64
+      %sign = memref.load %meta[%sign_slot] : memref<2xi64>
+      %negative = arith.cmpi slt, %sign, %zero : i64
+      %end = arith.select %negative, %min, %max : i64
+      scf.yield %end : i64
+    }
+    func.return %result : i64
+  }
+
+  // The i64 a deferred read stands for, for an index input: clipped as
+  // LyLong_AsI64Clipped clips when the value is wider.
+  func.func @LyLong_ReadValueClipped(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_value_clipped"} {
+    %result = scf.if %valid -> (i64) {
+      scf.yield %value : i64
+    } else {
+      %v = func.call @LyLong_AsI64Clipped(%held) : (memref<2xi64>) -> i64
+      scf.yield %v : i64
+    }
+    func.return %result : i64
+  }
+
   // The i64 a deferred read stands for, for a callee that takes one: raises
   // as LyLong_AsI64 does when the value is wider.
   func.func @LyLong_ReadValueChecked(%value: i64, %valid: i1, %held: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "read_value_checked"} {

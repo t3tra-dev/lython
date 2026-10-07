@@ -349,7 +349,7 @@ module attributes {
   // multiplied. The result is a range again, spelled with the clamped stop:
   // `range(10)[1:8:3]` is `range(1, 8, 3)`, not the `range(1, 10, 3)` that a
   // length would give.
-  func.func @LyRange_GetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.range"} {
+  func.func @LyRange_GetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.range"} {
     %zero = arith.constant 0 : i64
     %start_slot = arith.constant 2 : index
     %step_slot = arith.constant 4 : index

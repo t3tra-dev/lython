@@ -443,7 +443,7 @@ module attributes {
     func.return %length : i64
   }
 
-  func.func @LyTuple_GetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.tuple"} {
+  func.func @LyTuple_GetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.tuple"} {
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %b:3 = func.call @__ly_seq_slice_bounds(%len, %start_raw, %stop_raw, %step_raw, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64, i64)

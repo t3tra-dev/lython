@@ -43,6 +43,11 @@ inline constexpr llvm::StringLiteral kManifestClassIdArgumentAttr{
     "ly.runtime.class_id_argument"};
 inline constexpr llvm::StringLiteral kManifestDefaultI64Attr{
     "ly.runtime.default_i64"};
+// An i64 input that takes an int the way CPython reads an index with
+// PyNumber_AsSsize_t(v, NULL): past the word it is the nearest end of the
+// word, not an OverflowError (a slice bound, str.find's window).
+inline constexpr llvm::StringLiteral kManifestClipI64Attr{
+    "ly.runtime.clip_i64"};
 inline constexpr llvm::StringLiteral kManifestDefaultF64Attr{
     "ly.runtime.default_f64"};
 inline constexpr llvm::StringLiteral kManifestDefaultStrAttr{

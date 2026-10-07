@@ -1048,7 +1048,7 @@ module attributes {
     func.return %length : i64
   }
 
-  func.func @LyList_GetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.list"} {
+  func.func @LyList_GetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.list", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.list"} {
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %b:3 = func.call @__ly_seq_slice_bounds(%len, %start_raw, %stop_raw, %step_raw, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64, i64)
@@ -1070,7 +1070,7 @@ module attributes {
   // Both interior views are derived before the reallocation on purpose: the
   // splice reads the OLD array (and `a[1:3] = a` makes the source the same
   // array), so the reads must happen before the base word moves.
-  func.func @LyList_SetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64, %src: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
+  func.func @LyList_SetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64, %src: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -1167,7 +1167,7 @@ module attributes {
   // del list[i:j:k] (CPython list_ass_subscript with NULL value): compact
   // the non-selected boxes into a fresh array, releasing the selected ones.
   // One general path covers step 1 and extended slices, either sign.
-  func.func @LyList_DelSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__delslice__"} {
+  func.func @LyList_DelSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__delslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index

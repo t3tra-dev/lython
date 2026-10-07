@@ -924,7 +924,7 @@ module attributes {
   // gives O(1) indexing; the copy re-canonicalizes the width (pass 1 finds
   // the widest selected code point) so equal strings keep identical
   // representations, and a negative step reverses in iteration order.
-  func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64, %stop_raw: i64, %step_raw: i64, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
+  func.func @LyUnicode_GetSlice(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %c0 = arith.constant 0 : index
@@ -1853,7 +1853,7 @@ module attributes {
     func.return %answer : i64
   }
 
-  func.func @LyUnicode_StartsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %prefix_header: memref<2xi64> {ly.ownership.object_header}, %prefix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "startswith"} {
+  func.func @LyUnicode_StartsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %prefix_header: memref<2xi64> {ly.ownership.object_header}, %prefix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "startswith"} {
     %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %start, %end = func.call @__ly_unicode_adjust_range(%len, %start_raw, %end_raw) : (i64, i64, i64) -> (i64, i64)
     %n = func.call @__ly_unicode_count(%prefix_header, %prefix_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
@@ -1874,7 +1874,7 @@ module attributes {
     func.return %result : i1
   }
 
-  func.func @LyUnicode_EndsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %suffix_header: memref<2xi64> {ly.ownership.object_header}, %suffix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "endswith"} {
+  func.func @LyUnicode_EndsWith(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %suffix_header: memref<2xi64> {ly.ownership.object_header}, %suffix_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> i1 attributes {ly.runtime.contract = "builtins.str", ly.runtime.method = "endswith"} {
     %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
     %start, %end = func.call @__ly_unicode_adjust_range(%len, %start_raw, %end_raw) : (i64, i64, i64) -> (i64, i64)
     %n = func.call @__ly_unicode_count(%suffix_header, %suffix_bytes) : (memref<2xi64>, memref<?xi8>) -> i64
@@ -1906,7 +1906,7 @@ module attributes {
     func.return %found : i64
   }
 
-  func.func @LyUnicode_Find(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "find", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicode_Find(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "find", ly.runtime.result_contract = "builtins.int"} {
     %false_bit = arith.constant false
     %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %false_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
     %result = func.call @LyLong_FromI64(%found) : (i64) -> memref<2xi64>
@@ -1926,7 +1926,7 @@ module attributes {
     func.return %present : i1
   }
 
-  func.func @LyUnicode_RFind(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rfind", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicode_RFind(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rfind", ly.runtime.result_contract = "builtins.int"} {
     %true_bit = arith.constant true
     %found = func.call @__ly_unicode_find_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %true_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> i64
     %result = func.call @LyLong_FromI64(%found) : (i64) -> memref<2xi64>
@@ -1948,20 +1948,20 @@ module attributes {
     func.return %result : memref<2xi64>
   }
 
-  func.func @LyUnicode_Index(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "index", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicode_Index(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "index", ly.runtime.result_contract = "builtins.int"} {
     %false_bit = arith.constant false
     %result = func.call @__ly_unicode_index_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %false_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> memref<2xi64>
     func.return %result : memref<2xi64>
   }
 
-  func.func @LyUnicode_RIndex(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rindex", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicode_RIndex(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "rindex", ly.runtime.result_contract = "builtins.int"} {
     %true_bit = arith.constant true
     %result = func.call @__ly_unicode_index_method(%header, %bytes, %sub_header, %sub_bytes, %start_raw, %end_raw, %true_bit) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>, i64, i64, i1) -> memref<2xi64>
     func.return %result : memref<2xi64>
   }
 
   // Non-overlapping occurrence count in [start, end).
-  func.func @LyUnicode_CountSub(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "count", ly.runtime.result_contract = "builtins.int"} {
+  func.func @LyUnicode_CountSub(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %sub_header: memref<2xi64> {ly.ownership.object_header}, %sub_bytes: memref<?xi8>, %start_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 0 : i64}, %end_raw: i64 {ly.runtime.clip_i64, ly.runtime.default_i64 = 9223372036854775807 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "count", ly.runtime.result_contract = "builtins.int"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
     %len = func.call @__ly_unicode_count(%header, %bytes) : (memref<2xi64>, memref<?xi8>) -> i64
