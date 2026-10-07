@@ -1580,6 +1580,7 @@ classifyOwnershipConditionBranch(mlir::Operation *op,
 void AliasAnalysis::track(mlir::Value value) {
   if (value && !parent.contains(value)) {
     parent[value] = value;
+    tracked.push_back(value);
     invalidateAliasBuckets();
   }
 }
@@ -1631,9 +1632,15 @@ void AliasAnalysis::invalidateAliasBuckets() {
 
 void AliasAnalysis::rebuildAliasBuckets() {
   aliasBuckets.clear();
-  for (auto &entry : parent) {
-    mlir::Value root = find(entry.first);
-    aliasBuckets[root].push_back(entry.first);
+  // ⛔ Not over `parent`: a DenseMap keyed by Value iterates in the order of
+  // the values' ADDRESSES, so each bucket listed its names in an order that
+  // changed from run to run, and so did everything read off it -- the order
+  // `forwardingTerminators` seeds merge candidates in, and with it the
+  // argument order of an outlined unwind cleanup. The same program compiled
+  // to two different modules.
+  for (mlir::Value value : tracked) {
+    mlir::Value root = find(value);
+    aliasBuckets[root].push_back(value);
   }
   aliasBucketsDirty = false;
 }
