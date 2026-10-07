@@ -1,0 +1,19 @@
+cannot use 'list' as a dict key (unhashable type: 'list')
+cannot use 'list' as a set element (unhashable type: 'list')
+cannot use 'list' as a set element (unhashable type: 'list')
+cannot use 'list' as a dict key (unhashable type: 'list')
+cannot use 'bytearray' as a set element (unhashable type: 'bytearray')
+cannot use 'bytearray' as a dict key (unhashable type: 'bytearray')
+cannot use 'set' as a set element (unhashable type: 'set')
+cannot use 'tuple' as a dict key (unhashable type: 'list')
+cannot use 'tuple' as a set element (unhashable type: 'list')
+unhashable type: 'list'
+unhashable type: 'list'
+cannot use 'list' as a dict key (unhashable type: 'list')
+cannot use 'list' as a set element (unhashable type: 'list')
+cannot use 'tuple' as a dict key (unhashable type: 'list')
+3 2
+2 1
+2
+cannot use 'tuple' as a dict key (unhashable type: 'list')
+unhashable type: 'list'

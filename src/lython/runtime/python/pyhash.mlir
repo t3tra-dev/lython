@@ -4,7 +4,7 @@
 
 module {
   // ===== declared here, defined in another runtime file or built by the lowering =====
-  func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64
+  func.func private @__ly_box_hash_as(%box: !llvm.ptr, %role: i64, %key_class: i64) -> i64
   func.func private @__ly_box_word_count() -> i64
   // ===== impls: hash =====
   // Runtime hash state: [k0, k1, initialized]. Filled once, lazily, from the
@@ -165,7 +165,9 @@ module {
   // in by XXPRIME_2, rotated 31, multiplied by XXPRIME_1. The two differ
   // after the loop -- a tuple adds its length, a slice does not -- so each
   // finishes the accumulator itself.
-  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64) -> i64 {
+  // `role` and `key_class` as `__ly_box_hash_as` reads them: 0 for a hash()
+  // of the tuple or slice itself.
+  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64, %role: i64, %key_class: i64) -> i64 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %words = func.call @__ly_box_word_count() : () -> i64
@@ -179,7 +181,7 @@ module {
       %i_i64 = arith.index_cast %i : index to i64
       %off = arith.muli %i_i64, %words : i64
       %box_ptr = llvm.getelementptr %items[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %lane = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+      %lane = func.call @__ly_box_hash_as(%box_ptr, %role, %key_class) : (!llvm.ptr, i64, i64) -> i64
       %scaled = arith.muli %lane, %prime2 : i64
       %added = arith.addi %a, %scaled : i64
       %rot_hi = arith.shli %added, %c31 : i64

@@ -16,7 +16,7 @@ module attributes {
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
-  func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64
+  func.func private @__ly_box_hash_key(%box: !llvm.ptr, %role: i64) -> i64
   func.func private @__ly_box_move_slot(%dst: memref<?xi64>, %d: i64, %src: memref<?xi64>, %s: i64)
   func.func private @__ly_box_word_count() -> i64
   func.func private @__ly_dict_raise_missing_key(%key_box: !llvm.ptr) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "raise_missing_key_ptr"}
@@ -1174,7 +1174,8 @@ module attributes {
         %ii = arith.index_cast %i : index to i64
         %base = arith.muli %ii, %c16 : i64
         %entry = llvm.getelementptr %items_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+        %hash_role_1 = arith.constant 2 : i64
+        %entry_hash = func.call @__ly_box_hash_key(%entry, %hash_role_1) : (!llvm.ptr, i64) -> i64
         %hash_matches = arith.cmpi eq, %entry_hash, %elem_hash : i64
         %matched = scf.if %hash_matches -> (i64) {
           %eq = func.call @__ly_box_equal(%entry, %elem_box) : (!llvm.ptr, !llvm.ptr) -> i1
@@ -1210,7 +1211,8 @@ module attributes {
   // its own copy for the probes that matter, and the set algebra that asks
   // here (union, difference, comparisons) hashes each element once per call.
   func.func private @__ly_set_entry_hash(%entry: !llvm.ptr) -> i64 {
-    %hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+    %hash_role_2 = arith.constant 2 : i64
+    %hash = func.call @__ly_box_hash_key(%entry, %hash_role_2) : (!llvm.ptr, i64) -> i64
     func.return %hash : i64
   }
 
@@ -1545,7 +1547,8 @@ module attributes {
         %ii = arith.index_cast %i : index to i64
         %off = arith.muli %ii, %c16_i64 : i64
         %entry = llvm.getelementptr %ai_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+        %hash_role_3 = arith.constant 2 : i64
+        %entry_hash = func.call @__ly_box_hash_key(%entry, %hash_role_3) : (!llvm.ptr, i64) -> i64
         %in_b = func.call @__ly_set_probe(%blen, %bi, %entry, %entry_hash) : (i64, memref<?xi64>, !llvm.ptr, i64) -> i64
         %present = arith.cmpi ne, %in_b, %minus_one : i64
         scf.yield %present : i1
@@ -1574,7 +1577,8 @@ module attributes {
         %ii = arith.index_cast %i : index to i64
         %off = arith.muli %ii, %c16_i64 : i64
         %entry = llvm.getelementptr %ai_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-        %entry_hash = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+        %hash_role_4 = arith.constant 2 : i64
+        %entry_hash = func.call @__ly_box_hash_key(%entry, %hash_role_4) : (!llvm.ptr, i64) -> i64
         %in_b = func.call @__ly_set_probe(%blen, %bi, %entry, %entry_hash) : (i64, memref<?xi64>, !llvm.ptr, i64) -> i64
         %absent = arith.cmpi eq, %in_b, %minus_one : i64
         scf.yield %absent : i1
@@ -1723,7 +1727,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_5 = arith.constant 2 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_5) : (!llvm.ptr, i64) -> i64
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %src = memref.cast %elem_box : memref<5xi64> to memref<?xi64>
     %probe:3 = func.call @__ly_set_table_add_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> (i64, i64, i1)
@@ -1743,7 +1748,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_6 = arith.constant 2 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_6) : (!llvm.ptr, i64) -> i64
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %found = func.call @__ly_set_raw_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
     %result = arith.cmpi ne, %found, %minus_one : i64
@@ -1756,7 +1762,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_7 = arith.constant 2 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_7) : (!llvm.ptr, i64) -> i64
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %found = func.call @__ly_set_raw_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
     %present = arith.cmpi ne, %found, %minus_one : i64
@@ -1772,7 +1779,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_8 = arith.constant 2 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_8) : (!llvm.ptr, i64) -> i64
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %found = func.call @__ly_set_raw_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
     %missing = arith.cmpi eq, %found, %minus_one : i64
@@ -2113,7 +2121,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_9 = arith.constant 2 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_9) : (!llvm.ptr, i64) -> i64
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %found = func.call @__ly_set_raw_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> i64
     %result = arith.cmpi ne, %found, %minus_one : i64
@@ -2147,7 +2156,8 @@ module attributes {
       %ii = arith.index_cast %i : index to i64
       %off = arith.muli %ii, %c16_i64 : i64
       %entry = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %eh = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+      %hash_role_10 = arith.constant 2 : i64
+      %eh = func.call @__ly_box_hash_key(%entry, %hash_role_10) : (!llvm.ptr, i64) -> i64
       %x1 = arith.xori %eh, %magic1 : i64
       %shifted = arith.shli %eh, %c16_shift : i64
       %x2 = arith.xori %x1, %shifted : i64
