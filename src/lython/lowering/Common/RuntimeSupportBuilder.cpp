@@ -611,6 +611,9 @@ constexpr std::int64_t kObjectAllocatorArenaBytes =
 constexpr std::int64_t kObjectAllocatorMapBits = 14;
 // Above this a Darwin block is mapped rather than malloc'd (see above).
 constexpr std::int64_t kObjectAllocatorMapThreshold = 1 << 20;
+// A request below this that the system cannot meet ends the program instead of
+// raising: the MemoryError is made of small blocks itself.
+constexpr std::int64_t kSmallestRaisedRequest = 1 << 16;
 // Large-block prefix kinds.
 constexpr std::int64_t kLargeMalloc = 1;
 constexpr std::int64_t kLargeMapped = 2;
@@ -622,6 +625,14 @@ void buildObjectAllocator(SupportBuilder &b) {
   const bool mapsLargeBlocks = b.triple.isOSDarwin();
   const std::int64_t pageBytes =
       b.triple.getArch() == llvm::Triple::aarch64 ? 16384 : 4096;
+  // The largest request the system is asked for; above it the answer is
+  // MemoryError without asking. ⛔ Not every i64: the prefix and the alignment
+  // added to a request must not wrap it, and a 32-bit libc takes its size_t
+  // truncated (LibcPrototypes.cpp) -- `malloc(2^32 + 24)` there is a 24-byte
+  // block the caller writes 2^32 bytes into.
+  const std::int64_t maxRequest = b.triple.isArch32Bit()
+                                      ? (std::int64_t(1) << 31) - (1 << 16)
+                                      : std::int64_t(1) << 62;
   b.declareExternal("malloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
   b.declareExternal("aligned_alloc",
                     b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
@@ -771,6 +782,106 @@ void buildObjectAllocator(SupportBuilder &b) {
     ret(b.cmpi(Pred::ne, set, b.iconst(0)));
   }
 
+  // ---- void LyMem_NoMemory(i64 size) ---------------------------------------
+  // A request the system did not meet: MemoryError (`LyErr_NoMemory`), as
+  // CPython's allocation failures raise. Never returns, so no allocator
+  // answers null. ⛔ Not null to the caller, which is what it was: nothing
+  // checked it, and `'x' * 2**62` wrote through it.
+  b.stringGlobal(".lymem_out_of_memory",
+                 "lython: out of memory (a small block could not be "
+                 "allocated)\n");
+  {
+    auto fn = b.beginFunction(
+        "LyMem_NoMemory", b.builder.getFunctionType({b.i64()}, {}),
+        /*isPrivate=*/true);
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    mlir::Value size = fn.getArgument(0);
+    guardReturn(b.cmpi(Pred::ult, size, b.iconst(kSmallestRaisedRequest)),
+                [&] {
+                  b.call("write_cstr", mlir::TypeRange{},
+                         mlir::ValueRange{b.iconst32(2),
+                                          b.addrOf(".lymem_out_of_memory")});
+                  b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
+                  ret({});
+                });
+    b.call("LyErr_NoMemory", mlir::TypeRange{}, mlir::ValueRange{});
+    b.call("abort", mlir::TypeRange{}, mlir::ValueRange{});
+    ret({});
+  }
+  // ---- i64 ly_mem_max_request() --------------------------------------------
+  // `maxRequest`, for code that sizes a buffer before asking for it
+  // (builtins.mlir `__ly_alloc_count`): the manifests are built once for every
+  // target and cannot know it.
+  {
+    auto fn = b.beginFunction("ly_mem_max_request",
+                              b.builder.getFunctionType({}, {b.i64()}));
+    b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+    ret(b.iconst(maxRequest));
+  }
+  auto noMemory = [&](mlir::Value size) {
+    b.call("LyMem_NoMemory", mlir::TypeRange{}, mlir::ValueRange{size});
+  };
+  // Above `maxRequest` (unsigned, so a size that went negative is one) the
+  // request fails before any arithmetic on it.
+  auto refuseOversized = [&](mlir::Value size) {
+    guardReturn(b.cmpi(Pred::ugt, size, b.iconst(maxRequest)), [&] {
+      noMemory(size);
+      ret(b.nullPtr());
+    });
+  };
+
+  // ---- ptr LyMem_System{Alloc,AlignedAlloc,Realloc} ------------------------
+  // The system allocator's own blocks with the answers above to a request it
+  // cannot meet, for a build that measures the system allocator (the
+  // sanitizers, LLVMFinalize.cpp). A null for no bytes is the C library's to
+  // give and is not a failure. ⛔ Not on Windows, whose CRT has no
+  // `aligned_alloc` to name and whose builds are not sanitized.
+  auto checkedSystemBlock = [&](mlir::Value block, mlir::Value size) {
+    mlir::Value missing = mlir::arith::AndIOp::create(
+        b.builder, b.loc, b.ptrEq(block, b.nullPtr()),
+        b.cmpi(Pred::ne, size, b.iconst(0)));
+    guardReturn(missing, [&] {
+      noMemory(size);
+      ret(b.nullPtr());
+    });
+    ret(block);
+  };
+  if (!b.triple.isOSWindows()) {
+    {
+      auto fn = b.beginFunction(
+          "LyMem_SystemAlloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
+      b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+      mlir::Value size = fn.getArgument(0);
+      refuseOversized(size);
+      checkedSystemBlock(
+          b.call("malloc", b.ptr(), mlir::ValueRange{size}).front(), size);
+    }
+    {
+      auto fn = b.beginFunction(
+          "LyMem_SystemAlignedAlloc",
+          b.builder.getFunctionType({b.i64(), b.i64()}, {b.ptr()}));
+      b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+      mlir::Value size = fn.getArgument(1);
+      refuseOversized(size);
+      checkedSystemBlock(b.call("aligned_alloc", b.ptr(),
+                                mlir::ValueRange{fn.getArgument(0), size})
+                             .front(),
+                         size);
+    }
+    {
+      auto fn = b.beginFunction(
+          "LyMem_SystemRealloc",
+          b.builder.getFunctionType({b.ptr(), b.i64()}, {b.ptr()}));
+      b.builder.setInsertionPointToEnd(fn.addEntryBlock());
+      mlir::Value size = fn.getArgument(1);
+      refuseOversized(size);
+      checkedSystemBlock(b.call("realloc", b.ptr(),
+                                mlir::ValueRange{fn.getArgument(0), size})
+                             .front(),
+                         size);
+    }
+  }
+
   // ---- ptr LyMem_LargeAlloc(i64 size) --------------------------------------
   // A block from the system, behind a (kind, capacity) prefix.
   {
@@ -779,6 +890,7 @@ void buildObjectAllocator(SupportBuilder &b) {
         /*isPrivate=*/true);
     b.builder.setInsertionPointToEnd(fn.addEntryBlock());
     mlir::Value size = fn.getArgument(0);
+    refuseOversized(size);
     if (mapsLargeBlocks)
       guardReturn(b.cmpi(Pred::sge, size,
                          b.iconst(kObjectAllocatorMapThreshold)),
@@ -787,7 +899,10 @@ void buildObjectAllocator(SupportBuilder &b) {
                                mlir::ValueRange{size}));
                   });
     mlir::Value base = systemAlloc(add(size, b.iconst(16)));
-    guardReturn(b.ptrEq(base, b.nullPtr()), [&] { ret(b.nullPtr()); });
+    guardReturn(b.ptrEq(base, b.nullPtr()), [&] {
+      noMemory(size);
+      ret(b.nullPtr());
+    });
     storeI64At(b.iconst(kLargeMalloc), base);
     storeI64At(size, b.gepI64(base, b.iconst(1)));
     ret(b.gepI8(base, b.iconst(16)));
@@ -808,8 +923,10 @@ void buildObjectAllocator(SupportBuilder &b) {
                                 b.iconst32(0x1002), b.iconst32(-1),
                                 b.iconst(0)})
             .front();
-    guardReturn(b.cmpi(Pred::eq, b.ptrToInt(base), b.iconst(-1)),
-                [&] { ret(b.nullPtr()); });
+    guardReturn(b.cmpi(Pred::eq, b.ptrToInt(base), b.iconst(-1)), [&] {
+      noMemory(fn.getArgument(0));
+      ret(b.nullPtr());
+    });
     storeI64At(b.iconst(kLargeMapped), base);
     storeI64At(sub(length, b.iconst(16)), b.gepI64(base, b.iconst(1)));
     ret(b.gepI8(base, b.iconst(16)));
@@ -949,7 +1066,9 @@ void buildObjectAllocator(SupportBuilder &b) {
         "LyMem_Alloc", b.builder.getFunctionType({b.i64()}, {b.ptr()}));
     b.builder.setInsertionPointToEnd(fn.addEntryBlock());
     mlir::Value size = fn.getArgument(0);
-    guardReturn(b.cmpi(Pred::sgt, size,
+    // Unsigned: a negative size is a large request, refused there. ⛔ Signed,
+    // it took the pooled path with a class index past the table.
+    guardReturn(b.cmpi(Pred::ugt, size,
                        b.iconst(kObjectAllocatorGranularity *
                                 kObjectAllocatorClasses)),
                 [&] {
@@ -998,8 +1117,12 @@ void buildObjectAllocator(SupportBuilder &b) {
                 [&] {
                   ret(b.call("LyMem_Alloc", b.ptr(), mlir::ValueRange{size}));
                 });
+    refuseOversized(size);
     mlir::Value base = systemAlloc(add(add(size, alignment), b.iconst(32)));
-    guardReturn(b.ptrEq(base, b.nullPtr()), [&] { ret(b.nullPtr()); });
+    guardReturn(b.ptrEq(base, b.nullPtr()), [&] {
+      noMemory(size);
+      ret(b.nullPtr());
+    });
     mlir::Value payload = andI(
         add(add(b.ptrToInt(base), b.iconst(32)), sub(alignment, b.iconst(1))),
         sub(b.iconst(0), alignment));
@@ -1060,6 +1183,7 @@ void buildObjectAllocator(SupportBuilder &b) {
     guardReturn(b.ptrEq(block, b.nullPtr()), [&] {
       ret(b.call("LyMem_Alloc", b.ptr(), mlir::ValueRange{size}));
     });
+    refuseOversized(size);
     // Moves `block` (of `capacity` usable bytes) into a fresh allocation.
     auto moveTo = [&](mlir::Value fresh, mlir::Value capacity) {
       guardReturn(b.ptrEq(fresh, b.nullPtr()), [&] { ret(b.nullPtr()); });
@@ -1134,7 +1258,10 @@ void buildObjectAllocator(SupportBuilder &b) {
         b.call("realloc", b.ptr(),
                mlir::ValueRange{prefix, add(size, b.iconst(16))})
             .front();
-    guardReturn(b.ptrEq(grown, b.nullPtr()), [&] { ret(b.nullPtr()); });
+    guardReturn(b.ptrEq(grown, b.nullPtr()), [&] {
+      noMemory(size);
+      ret(b.nullPtr());
+    });
     if (!mallocIsAligned) {
       // realloc keeps only malloc's alignment. A block it moved off the
       // 16-byte grid is copied onto it.
@@ -1150,6 +1277,13 @@ void buildObjectAllocator(SupportBuilder &b) {
         b.builder.setInsertionPointToStart(&realign.getThenRegion().front());
         mlir::Value bytes = add(size, b.iconst(16));
         mlir::Value fixed = systemAlloc(bytes);
+        auto missing = mlir::scf::IfOp::create(
+            b.builder, b.loc, b.ptrEq(fixed, b.nullPtr()), /*withElse=*/false);
+        {
+          mlir::OpBuilder::InsertionGuard missingGuard(b.builder);
+          b.builder.setInsertionPointToStart(&missing.getThenRegion().front());
+          noMemory(size);
+        }
         b.call("memcpy", b.ptr(), mlir::ValueRange{fixed, grown, bytes});
         b.call("free", mlir::TypeRange{}, mlir::ValueRange{grown});
         mlir::scf::YieldOp::create(b.builder, b.loc, mlir::ValueRange{fixed});
@@ -4102,6 +4236,9 @@ buildNativeRuntimeSupportModule(mlir::MLIRContext &context,
   support.declareExternal(
       "ftruncate", builder.getFunctionType({support.i32(), support.i64()},
                                            {support.i32()}));
+  // The MemoryError the allocator raises (builtins.mlir), defined in every
+  // program; resolved at link time like the hooks below.
+  support.declareExternal("LyErr_NoMemory", builder.getFunctionType({}, {}));
   // Generated per program in the user module (the manifest deallocators);
   // resolved at link time.
   support.declareExternal(

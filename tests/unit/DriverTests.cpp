@@ -2283,6 +2283,44 @@ TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
   EXPECT_TRUE(puts->getReturnType()->isIntegerTy(32));
 }
 
+// What: an allocation the system cannot meet ends in the program's own
+// MemoryError -- the runtime's failure path calls `LyErr_NoMemory` and the
+// linked program defines it -- and the largest request the allocator makes is
+// the target's: under 2^31 where libc takes a 32-bit size_t (wasm32, armv7),
+// 2^62 on a 64-bit target.
+TEST(DriverTest, AnAllocationPastTheTargetsReachIsTheProgramsMemoryError) {
+  struct Expected {
+    const char *triple;
+    std::int64_t maxRequest;
+  };
+  for (Expected expected :
+       {Expected{"wasm32-wasip1", (std::int64_t(1) << 31) - (1 << 16)},
+        Expected{"armv7-unknown-linux-gnueabihf",
+                 (std::int64_t(1) << 31) - (1 << 16)},
+        Expected{"x86_64-unknown-linux-gnu", std::int64_t(1) << 62}}) {
+    lython::driver::VerifiedLLVMModule linked =
+        compileAndLinkFor("print(len([0] * 3))\n", expected.triple);
+    ASSERT_TRUE(linked.llvmModule) << expected.triple;
+    const llvm::Module &module = *linked.llvmModule;
+    const llvm::Function *raise = module.getFunction("LyErr_NoMemory");
+    ASSERT_NE(raise, nullptr) << expected.triple;
+    EXPECT_FALSE(raise->isDeclaration())
+        << expected.triple << ": the runtime's MemoryError is not defined";
+    EXPECT_TRUE(isCalled(module, "LyErr_NoMemory")) << expected.triple;
+    const llvm::Function *cap = module.getFunction("ly_mem_max_request");
+    ASSERT_NE(cap, nullptr) << expected.triple;
+    std::optional<std::int64_t> answered;
+    for (const llvm::BasicBlock &block : *cap)
+      if (const auto *ret =
+              llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator()))
+        if (const auto *value =
+                llvm::dyn_cast_or_null<llvm::ConstantInt>(ret->getReturnValue()))
+          answered = value->getSExtValue();
+    EXPECT_EQ(answered, std::optional<std::int64_t>(expected.maxRequest))
+        << expected.triple;
+  }
+}
+
 // What: a 32-bit target compiles only where its libc was measured -- armv7
 // glibc and wasm32 wasi-libc -- and any other is refused before lowering
 // rather than read through guessed struct layouts.

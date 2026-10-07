@@ -1,0 +1,34 @@
+[0] * 2**62 MemoryError 
+[0, 1] * 2**62 MemoryError 
+(0,) * 2**62 MemoryError 
+[0, 0, 0] * 2**62 MemoryError 
+[0] * (2**64 + 1) OverflowError cannot fit 'int' into an index-sized integer
+(0,) * (2**64 + 1) OverflowError cannot fit 'int' into an index-sized integer
+[0] * 2**63 OverflowError cannot fit 'int' into an index-sized integer
+[0] * -2**70 OverflowError cannot fit 'int' into an index-sized integer
+[] * 2**62 ok 0
+() * 2**62 ok 0
+'' * 2**62 ok 0
+b'' * 2**62 ok 0
+'ab' * 2**62 OverflowError repeated string is too long
+b'ab' * 2**62 OverflowError repeated bytes are too long
+'x' * (2**63 - 1) MemoryError 
+'x' * (2**64 + 1) OverflowError
+b'x' * (2**64 + 1) OverflowError
+bytes(2**62) MemoryError 
+bytes(2**50) MemoryError 
+bytes(2**64) OverflowError
+'x'.ljust(2**62) MemoryError 
+'x'.zfill(2**62) MemoryError 
+'x'.center(2**64) OverflowError
+1 << 2**62 MemoryError 
+1 << (2**63 - 1) OverflowError too many digits in integer
+1 << 2**64 OverflowError too many digits in integer
+1 << (2**63 - 38) MemoryError 
+1 << (2**63 - 37) OverflowError too many digits in integer
+0 << 2**100 ok 0
+-1 >> 2**100 ok -1
+xs *= 2**62 MemoryError 
+a list made in a callee MemoryError 
+after [1, 2, 3, 1, 2, 3] ababab 4 1180591620717411303424
+whole digits [131, 161, 191] -5

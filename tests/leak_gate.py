@@ -104,8 +104,12 @@ SUPPRESSIONS = pathlib.Path(__file__).with_name("lsan_suppressions.txt")
 # Hardcoded, not merged with the caller's environment: the determinism of every
 # figure this gate prints depends on them, so letting LSAN_OPTIONS through from
 # outside would let a caller silently turn the gate into a coin flip.
-DETECT_ENV = f"use_stacks=0:use_registers=0:suppressions={SUPPRESSIONS}"
-NO_DETECT_ENV = "detect_leaks=0"
+# allocator_may_return_null: a request past the sanitizer's limit answers null,
+# which the runtime turns into the MemoryError the program expects, instead of
+# a sanitizer abort the measurement could not see through.
+DETECT_ENV = (f"use_stacks=0:use_registers=0:allocator_may_return_null=1:"
+              f"suppressions={SUPPRESSIONS}")
+NO_DETECT_ENV = "detect_leaks=0:allocator_may_return_null=1"
 
 # From the measured 1-in-40 silence rate; see the module docstring.
 ATTEMPTS = 3

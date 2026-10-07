@@ -68,22 +68,33 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
   // `passthrough` attribute there does not survive to the LLVM function, and
   // with these inlined `LyMem_Alloc` saved six register pairs on every call
   // and was inlined nowhere.
-  for (const char *cold : {"LyMem_LargeAlloc", "LyMem_MapAlloc", "LyMem_Refill"})
+  for (const char *cold : {"LyMem_LargeAlloc", "LyMem_MapAlloc", "LyMem_Refill",
+                           "LyMem_NoMemory"})
     if (llvm::Function *function = module.getFunction(cold)) {
       function->addFnAttr(llvm::Attribute::NoInline);
       function->addFnAttr(llvm::Attribute::Cold);
     }
-  if (bypass)
-    return 0;
   struct Redirect {
     const char *from;
     const char *to;
   };
-  static constexpr Redirect kRedirects[] = {
+  static constexpr Redirect kPooled[] = {
       {"malloc", "LyMem_Alloc"},
       {"free", "LyMem_Free"},
       {"realloc", "LyMem_Realloc"},
       {"aligned_alloc", "LyMem_AlignedAlloc"}};
+  // ⭐ Under the sanitizers the SYSTEM allocator, behind the pool's answer to
+  // a request it cannot meet (MemoryError, never null). ⛔ Not the system
+  // calls bare, which is what the bypass left: nothing checked their null, and
+  // LeakSanitizer's refusal of a request past 1 TB (`bytes(2**50)`) was an
+  // abort the leak gate could not measure through.
+  static constexpr Redirect kChecked[] = {
+      {"malloc", "LyMem_SystemAlloc"},
+      {"realloc", "LyMem_SystemRealloc"},
+      {"aligned_alloc", "LyMem_SystemAlignedAlloc"}};
+  llvm::ArrayRef<Redirect> kRedirects =
+      bypass ? llvm::ArrayRef<Redirect>(kChecked)
+             : llvm::ArrayRef<Redirect>(kPooled);
   unsigned moved = 0;
   llvm::SmallVector<llvm::CallBase *, 16> retired;
   for (llvm::Function &function : module) {
@@ -104,7 +115,8 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
         // all of its blocks are 16-aligned. Rewritten here rather than left
         // to `LyMem_AlignedAlloc`'s first test, so the allocation fast path is
         // one call that inlines, not two.
-        if (callee->getName() == "aligned_alloc" && call->arg_size() == 2)
+        if (!bypass && callee->getName() == "aligned_alloc" &&
+            call->arg_size() == 2)
           if (auto *alignment =
                   llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0)))
             if (alignment->getZExtValue() <= 16)
