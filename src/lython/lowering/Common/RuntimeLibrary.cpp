@@ -226,12 +226,18 @@ mlir::LogicalResult applyEmbeddedLoweringStrategies(mlir::ModuleOp module) {
     const embedded::Module &entry = embedded::modules()[index];
     if (entry.kind != embedded::ModuleKind::MLIRBytecode)
       continue;
+    llvm::StringRef bytes(reinterpret_cast<const char *>(entry.data),
+                          entry.size);
+    // ⛔ Not every manifest parsed again: one in forty carries a strategy
+    // library, and a sequence is matched by its `__lython_strategy_` name,
+    // which bytecode keeps verbatim in its string section -- a manifest
+    // without that prefix has nothing to apply.
+    if (!bytes.contains("__lython_strategy_"))
+      continue;
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(
-        llvm::MemoryBuffer::getMemBuffer(
-            llvm::StringRef(reinterpret_cast<const char *>(entry.data),
-                            entry.size),
-            entry.name, /*RequiresNullTerminator=*/false),
+        llvm::MemoryBuffer::getMemBuffer(bytes, entry.name,
+                                         /*RequiresNullTerminator=*/false),
         llvm::SMLoc());
     auto source =
         mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, module.getContext());
