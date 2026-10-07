@@ -571,10 +571,10 @@ mlir::LogicalResult RuntimeBundleLowerer::synthesizeSourceClassNameHook() {
   mlir::Location loc = module.getLoc();
   mlir::Type i64 = builder.getI64Type();
   auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
-  // ⛔ The manifest DECLARES this symbol (builtins.mlir calls it), so the
-  // existing lookup is an external declaration and has to be replaced, not
-  // treated as "already generated" -- that mistake linked nothing and the JIT
-  // reported "Symbols not found: ___ly_source_class_name".
+  // ⛔ The manifest DECLARES this symbol (objects/object.mlir calls it), so
+  // the existing lookup is an external declaration and has to be replaced,
+  // not treated as "already generated" -- that mistake linked nothing and the
+  // JIT reported "Symbols not found: ___ly_source_class_name".
   if (auto existing =
           module.lookupSymbol<mlir::func::FuncOp>("__ly_source_class_name")) {
     if (!existing.isExternal())

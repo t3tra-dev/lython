@@ -93,9 +93,15 @@ bool shouldImportSymbol(mlir::Operation &op) {
   return mlir::isa<mlir::SymbolOpInterface>(op);
 }
 
-bool isFunctionDeclaration(mlir::Operation &op) {
+// A symbol another manifest defines: a function without a body, or a global
+// without a value. ⛔ Not only functions: the object manifests share their
+// constant globals (objects/object.mlir's repr punctuation) by declaring
+// them, and a declaration imported after the definition replaced it.
+bool isSymbolDeclaration(mlir::Operation &op) {
   if (auto function = mlir::dyn_cast<mlir::func::FuncOp>(op))
     return function.getBody().empty();
+  if (auto global = mlir::dyn_cast<mlir::memref::GlobalOp>(op))
+    return global.isExternal();
   if (!mlir::isa<mlir::FunctionOpInterface>(op))
     return false;
   return op.getNumRegions() == 0 || op.getRegion(0).empty();
@@ -104,7 +110,7 @@ bool isFunctionDeclaration(mlir::Operation &op) {
 void importSymbol(mlir::ModuleOp target, mlir::Operation &op) {
   auto symbol = mlir::cast<mlir::SymbolOpInterface>(op);
   if (mlir::Operation *existing = target.lookupSymbol(symbol.getName())) {
-    if (isFunctionDeclaration(op))
+    if (isSymbolDeclaration(op))
       return;
     existing->erase();
   }

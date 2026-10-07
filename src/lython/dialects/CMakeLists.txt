@@ -12,8 +12,11 @@ message(STATUS "Generated files will be placed in: ${CMAKE_CURRENT_BINARY_DIR}")
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
+# The builtin objects carry their classes' contracts (runtime/objects/); the
+# interpreter-level helpers (runtime/python/) carry none and are not read.
 file(GLOB LYTHON_PROTOCOL_MANIFEST_MLIR CONFIGURE_DEPENDS
   "${CMAKE_SOURCE_DIR}/src/lython/runtime/modules/*.mlir"
+  "${CMAKE_SOURCE_DIR}/src/lython/runtime/objects/*.mlir"
 )
 # _ucd.mlir carries no typing metadata, only the generated Unicode tables;
 # embedding it here would re-parse ~300KB of dense attributes as text in
@@ -39,7 +42,12 @@ string(REPLACE "," ";" module_list "${MODULES}")
 set(arrays "")
 set(entries "")
 foreach(path IN LISTS module_list)
-    get_filename_component(name "${path}" NAME_WE)
+    # <group>_<stem>, as the runtime bytecode is named: objects/ and modules/
+    # may hold the same file name.
+    get_filename_component(stem "${path}" NAME_WE)
+    get_filename_component(dir "${path}" DIRECTORY)
+    get_filename_component(group "${dir}" NAME)
+    set(name "${group}_${stem}")
     if(NOT EXISTS "${path}")
         message(FATAL_ERROR "typing manifest source is missing: ${path}")
     endif()

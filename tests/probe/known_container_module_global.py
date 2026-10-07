@@ -6,8 +6,8 @@
 # ⭐ THE EXCLUSION WAS A STALE RATIONALE, NOT A MISSING MECHANISM. It read
 # "their structural mutations reallocate the interior arrays through SSA
 # rebinding, which a storage cell would go stale against", and that describes
-# a representation this compiler stopped having. `builtins.mlir` says the
-# current one, once per container: "a growth writes the new address THROUGH
+# a representation this compiler stopped having. The runtime says the current
+# one, once per container (objects/list.mlir, objects/set.mlir): "a growth writes the new address THROUGH
 # the handle, so every holder observes it with no further action and a
 # mutation has nothing to rename. That is what lets ensure_capacity / extend /
 # __setslice__ / __delslice__ be void and non-transferring." A cell holds the

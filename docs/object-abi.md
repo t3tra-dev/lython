@@ -252,7 +252,7 @@ value types is an implementation detail")。`id()` は無い。したがって�
 
 **`Int` の即値幅が 63 bit である理由。** 8 B に収めると判別に 1 ビット要る。
 `Ly_IncRef` は既に「アドレスのビット 0 が立っていたら何もしない」分岐を持つ
-(`builtins.mlir:1497-1504`) ので、retain / release はそのまま使える。63 bit を
+(`runtime/objects/object.mlir` の `Ly_IncRef`) ので、retain / release はそのまま使える。63 bit を
 超える値だけが `LyLong` を確保する (CPython が int オブジェクトを常に確保する
 のに対し、ほとんどのプログラムで 0 回)。
 

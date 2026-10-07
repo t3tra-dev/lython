@@ -71,14 +71,21 @@ constexpr llvm::StringRef kOwnedResults = "ly.ownership.owned_results";
 constexpr llvm::StringRef kReleaseArgs = "ly.ownership.release_args";
 constexpr llvm::StringRef kTransferArgs = "ly.ownership.transfer_args";
 
+// The modules, the builtin objects and the interpreter-level helpers: one
+// runtime, split into files the way CPython's Modules/, Objects/ and Python/
+// are.
 std::vector<std::string> runtimeModulePaths() {
   std::vector<std::string> paths;
-  std::error_code ec;
-  for (llvm::sys::fs::directory_iterator it(LYTHON_RUNTIME_MODULES_DIR, ec), end;
-       it != end && !ec; it.increment(ec)) {
-    llvm::StringRef path = it->path();
-    if (llvm::sys::path::extension(path) == ".mlir")
-      paths.push_back(path.str());
+  for (const char *group : {"modules", "objects", "python"}) {
+    llvm::SmallString<256> dir(LYTHON_RUNTIME_DIR);
+    llvm::sys::path::append(dir, group);
+    std::error_code ec;
+    for (llvm::sys::fs::directory_iterator it(dir, ec), end;
+         it != end && !ec; it.increment(ec)) {
+      llvm::StringRef path = it->path();
+      if (llvm::sys::path::extension(path) == ".mlir")
+        paths.push_back(path.str());
+    }
   }
   std::sort(paths.begin(), paths.end());
   return paths;
@@ -102,12 +109,18 @@ llvm::DenseSet<unsigned> indexSet(mlir::Operation *op, llvm::StringRef name) {
 // call that does not come back. `__ly_posix_throw` qualifies (straight line, one
 // return, the call is in the same block); `__ly_io_fopen` does not (its raising
 // blocks dominate nothing).
-llvm::DenseSet<llvm::StringRef> nonReturning(mlir::ModuleOp module) {
+// Over every module at once: a helper one file defines is a declaration in the
+// files that call it. ⛔ Not one module at a time, which is what this was: the
+// raise helpers live in python/errors.mlir, and a module that only declares
+// them derived nothing from them.
+llvm::DenseSet<llvm::StringRef>
+nonReturning(llvm::ArrayRef<mlir::ModuleOp> modules) {
   llvm::DenseSet<llvm::StringRef> known;
   known.insert(kThrower);
   bool changed = true;
   while (changed) {
     changed = false;
+    for (mlir::ModuleOp module : modules)
     module.walk([&](mlir::func::FuncOp function) {
       if (function.isExternal() || known.contains(function.getSymName()))
         return;
@@ -152,11 +165,25 @@ struct Finding {
 // (so the object exists there) and no release/transfer of it dominates the raise
 // (so it is still held). A release placed AFTER the raise dominates nothing, which
 // is exactly why the defect was invisible to reading.
+// A callee's ownership attributes, by name, from whichever module defines it
+// (a declaration elsewhere carries the same ones, copied).
+using FunctionsByName = llvm::DenseMap<llvm::StringRef, mlir::func::FuncOp>;
+
+FunctionsByName functionsByName(llvm::ArrayRef<mlir::ModuleOp> modules) {
+  FunctionsByName byName;
+  for (mlir::ModuleOp module : modules)
+    module.walk([&](mlir::func::FuncOp f) {
+      auto [slot, inserted] = byName.try_emplace(f.getSymName(), f);
+      if (!inserted && slot->second.isExternal() && !f.isExternal())
+        slot->second = f;
+    });
+  return byName;
+}
+
 std::vector<Finding> findingsFor(mlir::ModuleOp module,
-                                 const llvm::DenseSet<llvm::StringRef> &noReturn) {
+                                 const llvm::DenseSet<llvm::StringRef> &noReturn,
+                                 const FunctionsByName &byName) {
   std::vector<Finding> findings;
-  llvm::DenseMap<llvm::StringRef, mlir::func::FuncOp> byName;
-  module.walk([&](mlir::func::FuncOp f) { byName[f.getSymName()] = f; });
 
   module.walk([&](mlir::func::FuncOp function) {
     if (function.isExternal() || noReturn.contains(function.getSymName()))
@@ -176,7 +203,8 @@ std::vector<Finding> findingsFor(mlir::ModuleOp module,
       if (callee == byName.end())
         return;
       llvm::DenseSet<unsigned> owned =
-          indexSet(callee->second.getOperation(), kOwnedResults);
+          indexSet(mlir::func::FuncOp(callee->second).getOperation(),
+                   kOwnedResults);
       if (owned.empty())
         return;
       for (unsigned index : owned) {
@@ -202,9 +230,11 @@ std::vector<Finding> findingsFor(mlir::ModuleOp module,
             if (target == byName.end())
               continue;
             llvm::DenseSet<unsigned> release =
-                indexSet(target->second.getOperation(), kReleaseArgs);
+                indexSet(mlir::func::FuncOp(target->second).getOperation(),
+                         kReleaseArgs);
             llvm::DenseSet<unsigned> transfer =
-                indexSet(target->second.getOperation(), kTransferArgs);
+                indexSet(mlir::func::FuncOp(target->second).getOperation(),
+                         kTransferArgs);
             for (unsigned position = 0; position < call.getNumOperands();
                  ++position) {
               if (call.getOperand(position) != object)
@@ -257,21 +287,34 @@ TEST(RuntimeRaisePathTest, NoOwnedObjectIsHeldAcrossARaise) {
   std::vector<std::string> paths = runtimeModulePaths();
   // A test that parsed nothing would pass. Say so instead.
   ASSERT_GE(paths.size(), 10u) << "expected the runtime module tree at "
-                               << LYTHON_RUNTIME_MODULES_DIR;
+                               << LYTHON_RUNTIME_DIR;
+
+  std::vector<mlir::OwningOpRef<mlir::ModuleOp>> owned;
+  llvm::SmallVector<mlir::ModuleOp, 32> modules;
+  for (const std::string &path : paths) {
+    owned.push_back(sources.parse(path));
+    ASSERT_TRUE(owned.back()) << "could not parse " << path;
+    modules.push_back(*owned.back());
+  }
+  llvm::DenseSet<llvm::StringRef> noReturn = nonReturning(modules);
+  FunctionsByName byName = functionsByName(modules);
 
   unsigned parsed = 0;
   unsigned withRaises = 0;
   std::vector<std::string> report;
-  for (const std::string &path : paths) {
-    mlir::OwningOpRef<mlir::ModuleOp> module = sources.parse(path);
-    ASSERT_TRUE(module) << "could not parse " << path;
+  for (auto [path, module] : llvm::zip(paths, modules)) {
     ++parsed;
-    llvm::DenseSet<llvm::StringRef> noReturn = nonReturning(*module);
-    // The thrower alone means nothing was derived; every module that raises has
-    // at least one helper above it.
-    if (noReturn.size() > 1)
+    // A module that DEFINES a derived helper: every module that raises has at
+    // least one helper above the thrower, here or in a file it calls into.
+    bool definesHelper = false;
+    module.walk([&](mlir::func::FuncOp function) {
+      definesHelper |= !function.isExternal() &&
+                       function.getSymName() != kThrower &&
+                       noReturn.contains(function.getSymName());
+    });
+    if (definesHelper)
       ++withRaises;
-    for (const Finding &finding : findingsFor(*module, noReturn))
+    for (const Finding &finding : findingsFor(module, noReturn, byName))
       report.push_back(llvm::sys::path::filename(path).str() + ": " +
                        finding.function + " holds the owned result of @" +
                        finding.producer + " across @" + finding.raise);

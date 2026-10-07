@@ -2,7 +2,7 @@
 # defect that the first draft of this file misattributed to inheritance.
 #
 # WHAT WAS WRONG: `py.class @bool` declares nine methods and
-# `base_names = ["int"]` (runtime/modules/builtins.mlir:209), and CPython's bool
+# `base_names = ["int"]` (runtime/objects/bool.mlir), and CPython's bool
 # inherits every one of int's. Three tables answered differently about that:
 #
 #   1. the protocol/contract table -- KNEW the base. `ProtocolInfo::bases` is

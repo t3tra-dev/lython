@@ -13,12 +13,13 @@
 // ⛔ THE SECOND ANSWER USED TO EXCLUDE EVERY CONTAINER, on the ground that "a
 // structural mutation reallocates the interior arrays through SSA rebinding,
 // which a cell would go stale against". That describes a representation this
-// compiler no longer has. `builtins.mlir` states the current one twice, once
-// per container: "a growth writes the new address THROUGH the handle, so every
-// holder observes it with no further action and a mutation has nothing to
-// rename. That is what lets ensure_capacity / extend / __setslice__ /
-// __delslice__ be void and non-transferring." A cell holds the handle, and the
-// handle is what stays put.
+// compiler no longer has. The runtime states the current one twice, once per
+// container (objects/list.mlir, objects/set.mlir): "a growth writes the new
+// address THROUGH the handle, so every holder observes it with no further
+// action and a mutation has nothing to rename. That is what lets
+// ensure_capacity / extend / __setslice__ / __delslice__ be void and
+// non-transferring." A cell holds the handle, and the handle is what stays
+// put.
 //
 // What that exclusion cost was not one construct: `T: dict[str, int] = {...}`
 // read from any function was "unresolved name 'T'", and so were `list`,

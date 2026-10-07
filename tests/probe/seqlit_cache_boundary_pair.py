@@ -22,7 +22,7 @@
 # PROVENANCE of the value (produced by the outer loop's iterator) combined with
 # the frequency mismatch, not the value itself.
 #
-# ⛔ Do not touch the cache in builtins.mlir to "fix" this; the cache is doing
+# ⛔ Do not touch the cache in objects/long.mlir to "fix" this; the cache is doing
 # nothing wrong. It is the reason the defect took this long to surface.
 cached = 0
 for i in range(0, 3):

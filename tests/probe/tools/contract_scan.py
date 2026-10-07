@@ -1,6 +1,6 @@
 """Narrow the candidates for declared-but-unimplemented contract methods.
 
-For each `py.class` in `runtime/modules/*.mlir`, report the names in
+For each `py.class` in `runtime/{modules,objects}/*.mlir`, report the names in
 `method_names` that have no `ly.runtime.method` / `ly.runtime.primitive` /
 `ly.runtime.initializer` symbol under the same `ly.runtime.contract`.
 
@@ -29,7 +29,9 @@ import sys
 
 ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1
                     else pathlib.Path(__file__).resolve().parents[3])
-MODULES = sorted((ROOT / "src/lython/runtime/modules").glob("*.mlir"))
+MODULES = sorted([*(ROOT / "src/lython/runtime/modules").glob("*.mlir"),
+                  *(ROOT / "src/lython/runtime/objects").glob("*.mlir"),
+                  *(ROOT / "src/lython/runtime/python").glob("*.mlir")])
 if not MODULES:
     sys.exit(f"no manifests under {ROOT}/src/lython/runtime/modules")
 
@@ -109,10 +111,11 @@ for path in MODULES:
 
 # --- compare against typing contracts --------------------------------------
 # A py.class names its contract implicitly: `<ly.typing.module>.<ClassName>`,
-# with builtins.mlir defaulting to `builtins`. Only six of the seventy-nine
-# classes spell `ly.runtime.contract` out, so keying off that attribute alone
-# hid int/float/str/object and every other implicitly-named contract from this
-# scan -- which is why the first pass reported only seven.
+# with a manifest that names no module (objects/) defaulting to `builtins`.
+# Only six of the seventy-nine classes spell `ly.runtime.contract` out, so
+# keying off that attribute alone hid int/float/str/object and every other
+# implicitly-named contract from this scan -- which is why the first pass
+# reported only seven.
 rows = []
 for path in MODULES:
     text = path.read_text()

@@ -1242,7 +1242,7 @@ TEST(DriverTest, AParkedExceptionIsReachedByPointer) {
   }
 }
 
-// The word offsets builtins.mlir reads are the ones the C++ structs have.
+// The word offsets the runtime manifests read are the ones the C++ structs have.
 //
 // A manifest body cannot name a C++ struct, so where one reaches into a
 // runtime structure it counts words: `__ly_exc_star_combine` reads a parked
@@ -1282,7 +1282,8 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
   auto *node = llvm::StructType::getTypeByName(
       result.verified.llvmModule->getContext(), "ExceptionChainNode");
   ASSERT_NE(node, nullptr)
-      << "the chain node type is gone; builtins.mlir still reads its words";
+      << "the chain node type is gone; objects/exceptions.mlir still reads "
+         "its words";
 
   // node -> payload -> section -> field, in bytes. The member index comes from
   // the enum rather than a literal, so that reordering the struct reports a
@@ -1293,8 +1294,8 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
       node->getElementType(payloadMember));
   ASSERT_NE(parts, nullptr)
       << "member " << payloadMember
-      << " of the chain node is not the payload any more, and builtins.mlir "
-         "still reads the payload's fields by word";
+      << " of the chain node is not the payload any more, and "
+         "objects/exceptions.mlir still reads the payload's fields by word";
   auto fieldWord = [&](unsigned section, unsigned field) -> std::uint64_t {
     std::uint64_t offset =
         layout.getStructLayout(node)->getElementOffset(payloadMember);
@@ -1326,7 +1327,7 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
   // ⭐ THE PAYLOAD BOX IS READ OUT OF THE MANIFEST, not restated here. What
   // stood in this place compared the C++ constants against literals -- which
   // says nothing about the manifest, and the manifest is the half that indexes
-  // box words. `builtins.mlir` now states the layout once, in the
+  // box words. `objects/object.mlir` states the layout once, in the
   // `__ly_box_*_word` helpers, and this reads their constants back.
   //
   // Why it matters that this is mechanical: narrowing the box is a type change
@@ -1336,8 +1337,8 @@ TEST(DriverTest, ManifestWordOffsetsMatchTheRuntimeStructs) {
   // what would have named them.
   {
     std::ifstream manifest(LYTHON_SOURCE_DIR
-                           "/src/lython/runtime/modules/builtins.mlir");
-    ASSERT_TRUE(manifest.good()) << "cannot read builtins.mlir";
+                           "/src/lython/runtime/objects/object.mlir");
+    ASSERT_TRUE(manifest.good()) << "cannot read objects/object.mlir";
     std::stringstream buffer;
     buffer << manifest.rdbuf();
     const std::string text = buffer.str();

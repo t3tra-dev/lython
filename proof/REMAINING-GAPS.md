@@ -306,7 +306,7 @@ GAP-ANALYSIS の "read-back token" 行が「モデルが先に正解を出した
 | IR 対照 | リテラルタプル | `lit_r1`/`lit_r4` = 0。**`LyObject_FromSlot` を 1 度も呼ばない** (静的解決) |
 | フェーズ帰属 | `LYTHON_IR_DUMP=all` | retain は **`runtime-lowering`**、release は **`refcount-insertion`** |
 
-**根本原因**: `LyObject_FromSlot` (`runtime/modules/builtins.mlir`) は `memref.store %one, %box[0]` で refcount を 1 に初期化して返し、`ly.ownership.owned_results = [0]` とも宣言している。呼び出し側は既に参照を持っている。ところが lowering がその上に `Ly_IncRef` を重ねて 2 にし、`refcount-insertion` が release 1 つで 1 に戻す。**net +1 / ボックス化スロット読み 1 回。** release は同一値・同一ブロック鎖の正しい位置に**存在する**。
+**根本原因**: `LyObject_FromSlot` (`runtime/objects/object.mlir`) は `memref.store %one, %box[0]` で refcount を 1 に初期化して返し、`ly.ownership.owned_results = [0]` とも宣言している。呼び出し側は既に参照を持っている。ところが lowering がその上に `Ly_IncRef` を重ねて 2 にし、`refcount-insertion` が release 1 つで 1 に戻す。**net +1 / ボックス化スロット読み 1 回。** release は同一値・同一ブロック鎖の正しい位置に**存在する**。
 
 つまり配置でも境界でもなく、**余分な retain** — 意味論が要求していない操作の発行である。
 

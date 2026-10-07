@@ -116,10 +116,14 @@ target_compile_options(LythonRuntimeMlirBytecode PRIVATE -frtti)
 
 set(LYTHON_RUNTIME_MODULE_BYTECODE_DIR "${CMAKE_CURRENT_BINARY_DIR}/runtime_modules")
 # Module manifests carry contracts, lowering strategies, and runtime
-# implementations together (runtime/modules/<module>.mlir); they all ride the
-# same parse/verify/bytecode embedding path.
+# implementations together (runtime/modules/<module>.mlir), and so do the
+# builtin objects (runtime/objects/<name>.mlir, CPython's Objects/) and the
+# interpreter-level helpers they share (runtime/python/<name>.mlir, CPython's
+# Python/); they all ride the same parse/verify/bytecode embedding path.
 file(GLOB LYTHON_RUNTIME_MODULE_MLIR CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/lython/runtime/modules/*.mlir"
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/objects/*.mlir"
+    "${CMAKE_SOURCE_DIR}/src/lython/runtime/python/*.mlir"
 )
 list(SORT LYTHON_RUNTIME_MODULE_MLIR)
 

@@ -579,7 +579,7 @@ RuntimeBundleLowerer::lowerExceptCurrentMatch(py::ExceptCurrentMatchOp op) {
 
 // except* (PEP 654). The star frame lives in the native runtime; the split
 // and combine steps are manifest primitives so the group machinery stays in
-// builtins.mlir, and this glue only branches between them.
+// objects/exceptions.mlir, and this glue only branches between them.
 
 namespace {
 
