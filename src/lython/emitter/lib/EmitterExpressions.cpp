@@ -2544,6 +2544,20 @@ Value ModuleEmitter::emitCheckedNarrowedRead(const parser::Node &anchor,
   if (!insertionBlockTerminated(builder))
     mlir::cf::BranchOp::create(builder, loc(anchor), ok);
   builder.setInsertionPointToStart(ok);
+  // ⭐ A FIELD IS READ AGAIN WHERE IT IS USED, past the check. The value the
+  // test looked at is defined in the block before the split, and a mutation
+  // of a field container is refused when its storage was defined in another
+  // block -- so `if self.xs is None: self.xs = []` then `self.xs.append(s)`
+  // was "list.append on a field ... inside a branch or loop body" for the
+  // lazy-list idiom. Nothing runs between the two loads.
+  //
+  // ⛔ Not by widening that refusal to ignore the raising arm, which was
+  // measured: it compiled, and the second call printed `['a', None]`.
+  if (subjectIsField) {
+    suppressMemberNarrowing = true;
+    raw = emitExpr(&anchor);
+    suppressMemberNarrowing = false;
+  }
   mlir::Value narrowedValue =
       testableUnion
           ? py::UnionUnwrapOp::create(builder, loc(anchor), proved, raw.value)
