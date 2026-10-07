@@ -618,6 +618,11 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # What a runtime body owed when an exception left it half way -- the
+    # copy `sorted` sorts, a dict or set insertion's boxes, a frozenset being
+    # built -- given back where the exception is caught; only a leak check sees
+    # whether it was.
+    a_native_body_gives_back_what_it_owed
     # A view's references -- the object it views, one of a bytearray's
     # exports, a slice's own of each, an iterator's of the view -- each given
     # back by release() or by the last reference, which nothing a golden

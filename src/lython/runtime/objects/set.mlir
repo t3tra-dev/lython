@@ -7,6 +7,8 @@ module attributes {
   ly.typing.manifest,
   ly.runtime.contracts = ["builtins.set"]
 } {
+  func.func private @__ly_pending_push(%mark: i64, %kind: i64, %value: i64) -> i64
+  func.func private @__ly_pending_pop(%index: i64)
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyObject_ReleaseBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
@@ -1721,17 +1723,27 @@ module attributes {
   // TypeError for unhashable elements). The caller retained the box; a
   // duplicate element consumes it here. Void and non-transferring: the growth
   // publishes the new items base through the handle.
+  // ⭐ The box is this call's to place, so it is registered until it is
+  // placed: hashing it and comparing it against the table can raise, and the
+  // caller has already handed its reference over (errors.mlir, "what a native
+  // body owes").
   func.func @LySet_AddBox(%self: memref<9xi64> {ly.ownership.object_header}, %elem_box: memref<5xi64>) attributes {ly.runtime.contract = "builtins.set", ly.runtime.primitive = "add_box"} {
     %zero = arith.constant 0 : i64
     %minus_one = arith.constant -1 : i64
     %box_idx = memref.extract_aligned_pointer_as_index %elem_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %mark_slot = memref.alloca() : memref<1xi64>
+    %mark_index = memref.extract_aligned_pointer_as_index %mark_slot : memref<1xi64> -> index
+    %mark = arith.index_cast %mark_index : index to i64
+    %box_kind = arith.constant 1 : i64
+    %pending = func.call @__ly_pending_push(%mark, %box_kind, %box_i64) : (i64, i64, i64) -> i64
     %hash_role_5 = arith.constant 2 : i64
     %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_5) : (!llvm.ptr, i64) -> i64
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
     %src = memref.cast %elem_box : memref<5xi64> to memref<?xi64>
     %probe:3 = func.call @__ly_set_table_add_probe(%raw, %box_ptr, %hash) : (memref<?xi64>, !llvm.ptr, i64) -> (i64, i64, i1)
+    func.call @__ly_pending_pop(%pending) : (i64) -> ()
     %missing = arith.cmpi eq, %probe#0, %minus_one : i64
     scf.if %missing {
       %entity = func.call @__ly_set_raw_place(%raw, %probe#1, %probe#2, %src, %zero, %hash) : (memref<?xi64>, i64, i1, memref<?xi64>, i64, i64) -> i64
@@ -2087,9 +2099,20 @@ module attributes {
     %zero = arith.constant 0 : i64
     %self = func.call @__ly_frozenset_alloc(%zero) : (i64) -> memref<9xi64>
     %raw = memref.cast %self : memref<9xi64> to memref<?xi64>
+    // The set being built is this body's until it returns, and an element
+    // that will not hash raises half way (errors.mlir, "what a native body
+    // owes").
+    %mark_slot = memref.alloca() : memref<1xi64>
+    %mark_index = memref.extract_aligned_pointer_as_index %mark_slot : memref<1xi64> -> index
+    %mark = arith.index_cast %mark_index : index to i64
+    %self_index = memref.extract_aligned_pointer_as_index %self : memref<9xi64> -> index
+    %self_word = arith.index_cast %self_index : index to i64
+    %frozenset_kind = arith.constant 4 : i64
+    %pending = func.call @__ly_pending_push(%mark, %frozenset_kind, %self_word) : (i64, i64, i64) -> i64
     // __ly_set_raw_merge already skips a slot the destination holds, so the
     // dedupe is the merge itself rather than a second probe here.
     func.call @__ly_set_raw_merge(%raw, %olen, %oi) : (memref<?xi64>, i64, memref<?xi64>) -> ()
+    func.call @__ly_pending_pop(%pending) : (i64) -> ()
     func.return %self : memref<9xi64>
   }
 

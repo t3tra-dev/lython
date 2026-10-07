@@ -71,6 +71,19 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
   // `LyErr_NoMemory` (python/errors.mlir) is the MemoryError every size check
   // calls on its refusal: inlined, the exception's construction was copied
   // into each of them (genexpr.wasm's `__main__` +7 KB).
+  // ⭐ A body that REGISTERS what it owes on an exception keeps a frame of its
+  // own: its entry's mark is the address of a slot in that frame, and a
+  // catcher releases the entries below ITS stack pointer
+  // (runtime/python/errors.mlir). Inlined into the catcher, the mark sat in
+  // the catcher's frame and the entry was never released -- a one-entry dict
+  // literal whose key would not hash still leaked the key. Asked of the call,
+  // not of a list of names, so a new registering body needs nothing here.
+  if (llvm::Function *push = module.getFunction("__ly_pending_push"))
+    for (llvm::User *user : push->users())
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(user))
+        if (llvm::Function *caller = call->getFunction();
+            caller && caller != push)
+          caller->addFnAttr(llvm::Attribute::NoInline);
   for (const char *cold : {"LyMem_LargeAlloc", "LyMem_MapAlloc", "LyMem_Refill",
                            "LyMem_NoMemory", "ly_mem_refuse", "LyErr_NoMemory"})
     if (llvm::Function *function = module.getFunction(cold)) {

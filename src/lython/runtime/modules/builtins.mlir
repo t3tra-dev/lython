@@ -53,6 +53,8 @@ module attributes {
     !py.callable<[!py.contract<"builtins.list", [!py.typevar<"T">]>], returns = [!py.contract<"builtins.tuple", [!py.typevar<"T">]>]>
   ]
 } {
+  func.func private @__ly_pending_push(%mark: i64, %kind: i64, %value: i64) -> i64
+  func.func private @__ly_pending_pop(%index: i64)
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
@@ -164,13 +166,25 @@ module attributes {
   }
 
   // sorted(xs): a fresh sorted list (the argument is untouched).
+  // ⭐ The copy is registered while the sort runs: a comparison can raise
+  // (`sorted([1, "a"])`, a user `__lt__`), and CPython's sorted releases its
+  // new list before returning the error (errors.mlir, "what a native body
+  // owes").
   func.func @LyBuiltin_Sorted(%self: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.builtin = "sorted", ly.runtime.builtin_lowering = "direct", ly.runtime.contract = "builtins.list", ly.runtime.primitive = "builtin_sorted", ly.runtime.result_contract = "builtins.list"} {
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %items = func.call @__ly_list_items(%self) : (memref<5xi64>) -> memref<?xi64>
     %copy = func.call @__ly_list_copy_alloc(%len, %items) : (i64, memref<?xi64>) -> memref<5xi64>
     %copy_items = func.call @__ly_list_items(%copy) : (memref<5xi64>) -> memref<?xi64>
+    %mark_slot = memref.alloca() : memref<1xi64>
+    %mark_index = memref.extract_aligned_pointer_as_index %mark_slot : memref<1xi64> -> index
+    %mark = arith.index_cast %mark_index : index to i64
+    %copy_index = memref.extract_aligned_pointer_as_index %copy : memref<5xi64> -> index
+    %copy_word = arith.index_cast %copy_index : index to i64
+    %list_kind = arith.constant 2 : i64
+    %pending = func.call @__ly_pending_push(%mark, %list_kind, %copy_word) : (i64, i64, i64) -> i64
     func.call @__ly_sort_slots(%copy_items, %len) : (memref<?xi64>, i64) -> ()
+    func.call @__ly_pending_pop(%pending) : (i64) -> ()
     func.return %copy : memref<5xi64>
   }
 

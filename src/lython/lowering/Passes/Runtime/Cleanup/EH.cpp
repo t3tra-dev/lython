@@ -445,12 +445,31 @@ bool isErasedTryMarker(const llvm::Instruction &instruction) {
          name == "LyEH_TryCatchAnchor";
 }
 
+// The release of what the abandoned native bodies owed (TryOps.cpp) and the
+// stack pointer it is given. ⭐ Work a frame may SKIP for an exception it does
+// not name: the entries stay registered, below the stack pointer of whichever
+// frame does catch it, and that frame's release reaches them.
+bool isPendingRelease(const llvm::Instruction &instruction) {
+  if (const auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+    if (call->getIntrinsicID() == llvm::Intrinsic::stacksave)
+      return true;
+    const llvm::Function *callee = call->getCalledFunction();
+    return callee && callee->getName() == "LyEH_ReleasePendingBelow";
+  }
+  if (const auto *cast = llvm::dyn_cast<llvm::PtrToIntInst>(&instruction))
+    if (const auto *source =
+            llvm::dyn_cast<llvm::CallInst>(cast->getPointerOperand()))
+      return source->getIntrinsicID() == llvm::Intrinsic::stacksave;
+  return false;
+}
+
 // The only instructions a block may hold and still count as "does nothing for
 // an exception it does not name".
 bool holdsOnly(llvm::BasicBlock &block,
                llvm::ArrayRef<const llvm::Instruction *> allowed) {
   for (llvm::Instruction &instruction : block) {
-    if (instruction.isDebugOrPseudoInst() || isErasedTryMarker(instruction))
+    if (instruction.isDebugOrPseudoInst() || isErasedTryMarker(instruction) ||
+        isPendingRelease(instruction))
       continue;
     if (!llvm::is_contained(allowed, &instruction))
       return false;

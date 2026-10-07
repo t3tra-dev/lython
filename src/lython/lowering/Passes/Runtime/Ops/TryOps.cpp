@@ -485,6 +485,27 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerTry(py::TryOp op) {
             .getResult();
     mlir::func::CallOp marker = mlir::func::CallOp::create(
         builder, loc, getOrCreateTryCatchMarker(), mlir::ValueRange{idValue});
+    // ⭐ What the native bodies the exception abandoned still owed is released
+    // where it is caught: every entry registered below this frame's stack
+    // pointer (runtime/python/errors.mlir, "what a native body owes").
+    // `sorted` raising mid-sort lost its copy, and a dict insertion whose key
+    // would not hash lost the key and the value, on every catch.
+    //
+    // ⛔ Not in the personality, which would cost no code: it is this
+    // compiler's own only on 64-bit targets, and wasm and armv7 unwind through
+    // the C++ one. And not in the EH pass's pads, which come after the symbol
+    // DCE that would have dropped the release this call keeps alive.
+    {
+      mlir::Value sp = mlir::LLVM::StackSaveOp::create(
+          builder, loc, mlir::LLVM::LLVMPointerType::get(context));
+      mlir::Value spWord = mlir::LLVM::PtrToIntOp::create(
+          builder, loc, builder.getI64Type(), sp);
+      mlir::func::FuncOp release = getOrCreatePrivateFunction(
+          module, builder, "LyEH_ReleasePendingBelow",
+          builder.getFunctionType({builder.getI64Type()}, {}));
+      mlir::func::CallOp::create(builder, loc, release,
+                                 mlir::ValueRange{spWord});
+    }
     if (finalHandlerId) {
       mlir::Block *matchEntry =
           exceptEntry->splitBlock(std::next(marker->getIterator()));

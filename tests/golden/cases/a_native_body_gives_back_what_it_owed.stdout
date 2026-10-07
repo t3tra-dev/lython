@@ -1,0 +1,4 @@
+caught the hash
+'<' not supported between instances of 'str' and 'int'
+['a', 'b', 'c'] [3, 10] [L(1), L(2), L(3)]
+c True 2
