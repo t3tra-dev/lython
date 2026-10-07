@@ -1854,6 +1854,7 @@ void TypeSystem::seedBuiltins() {
   bindClass("str", strType());
   bindClass("bytes", contract("builtins.bytes"));
   bindClass("bytearray", contract("builtins.bytearray"));
+  bindClass("memoryview", contract("builtins.memoryview"));
   // ⭐ complex was reachable only as a LITERAL: `1 + 2j` runs, and the manifest
   // has the whole arithmetic surface plus a __new__ that takes two f64 with
   // defaults -- but the NAME was never bound, so `complex(1, 2)` was
@@ -2429,7 +2430,7 @@ bool TypeSystem::namesAType(const parser::Node *node) const {
     for (llvm::StringRef builtin :
          {"int", "str", "bool", "float", "complex", "bytes", "bytearray",
           "object", "Any", "None", "list", "dict", "set", "frozenset", "tuple",
-          "range", "slice", "type"})
+          "range", "slice", "memoryview", "type"})
       if (annotationNameIs(name, builtin))
         return true;
     // The typing spellings an import brings in -- `Optional`, `Callable`,

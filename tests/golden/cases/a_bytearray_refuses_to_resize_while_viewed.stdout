@@ -1,0 +1,20 @@
+pop BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+remove BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+del item BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+del slice BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+del ext BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+shrink BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+grow BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+insert BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+extend BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
++= BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+*= BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+clear BufferError Existing exports of data: object cannot be re-sized bytearray(b'abcdef')
+same size ok bytearray(b'1Y2d3f')
+empty extended BufferError Existing exports of data: object cannot be re-sized
+ValueError first value not found in bytearray
+released bytearray(b'1Y2d3')
+clear empty ok bytearray(b'')
+97
+120
+ValueError operation forbidden on released memoryview object

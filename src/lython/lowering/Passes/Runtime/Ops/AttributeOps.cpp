@@ -1329,6 +1329,26 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
   // need it would have been a second copy of the same three steps.
   if (object->kind == RuntimeBundle::Kind::Object) {
     std::string contract = runtimeContractName(op.getObject().getType());
+    // ⭐ A field whose type differs from its siblings' is read by a primitive
+    // of its own, `field.<name>`: one `field` primitive answers with one
+    // type, which range's three ints share and memoryview's readonly, format
+    // and shape do not.
+    if (!contract.empty())
+      if (std::optional<RuntimeSymbol> named = manifest.primitive(
+              contract, (llvm::Twine("field.") + op.getName()).str())) {
+        builder.setInsertionPoint(op);
+        llvm::SmallVector<mlir::Value, 2> operands(
+            object->physicalValues().begin(), object->physicalValues().end());
+        mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
+            op.getLoc(), *named, operands);
+        RuntimeBundle result;
+        if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+                op, op.getResult().getType(), call, result)))
+          return mlir::failure();
+        valueBundles[op.getResult()] = std::move(result);
+        erase.push_back(op);
+        return mlir::success();
+      }
     std::optional<RuntimeSymbol> fieldPrimitive =
         contract.empty() ? std::nullopt
                          : manifest.primitive(contract, "field");
