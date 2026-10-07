@@ -8,6 +8,8 @@ module attributes {
   ly.runtime.contracts = ["builtins.tuple"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
+  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64) -> i64
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyErr_NoMemory() attributes {ly.runtime.contract = "builtins.MemoryError"}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
@@ -54,7 +56,7 @@ module attributes {
                     "__iter__",
                     "__add__", "__mul__", "count", "index", "__repr__",
                     "__hash__", "__eq__", "__ne__", "__lt__", "__le__",
-                    "__gt__", "__ge__"],
+                    "__gt__", "__ge__", "__getslice__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.object">] -> [!py.contract<"builtins.bool">]>,
@@ -75,47 +77,27 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.tuple">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.tuple">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.tuple">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.tuple">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.tuple">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.tuple">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.tuple", [!py.contract<"$T">]>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   // tuple.__hash__: CPython's xxHash-based combiner (tuples of equal elements
   // hash equal; unhashable elements raise through __ly_box_hash).
   func.func @LyTuple_Hash(%self: memref<5xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__hash__"} {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<5xi64>) -> memref<?xi64>
-    %len_index = arith.index_cast %len : i64 to index
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
     %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
-    %prime1 = arith.constant -7046029288634856825 : i64
-    %prime2 = arith.constant -4417276706812531889 : i64
-    %prime5 = arith.constant 2870177450012600261 : i64
-    %acc_init = arith.constant 2870177450012600261 : i64
-    %c31 = arith.constant 31 : i64
-    %c33 = arith.constant 33 : i64
-    %acc = scf.for %i = %c0 to %len_index step %c1 iter_args(%a = %acc_init) -> (i64) {
-      %i_i64 = arith.index_cast %i : index to i64
-      %off = arith.muli %i_i64, %c16_i64 : i64
-      %box_ptr = llvm.getelementptr %items_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-      %lane = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
-      %scaled = arith.muli %lane, %prime2 : i64
-      %added = arith.addi %a, %scaled : i64
-      %rot_hi = arith.shli %added, %c31 : i64
-      %rot_lo = arith.shrui %added, %c33 : i64
-      %rotated = arith.ori %rot_hi, %rot_lo : i64
-      %next = arith.muli %rotated, %prime1 : i64
-      scf.yield %next : i64
-    }
+    %acc = func.call @__ly_xxhash_slot_lanes(%items_ptr, %len) : (!llvm.ptr, i64) -> i64
     // acc += len ^ (XXPRIME_5 ^ 3527539)
+    %prime5 = arith.constant 2870177450012600261 : i64
     %salt = arith.constant 3527539 : i64
     %mix0 = arith.xori %prime5, %salt : i64
     %mix1 = arith.xori %len, %mix0 : i64
@@ -450,6 +432,13 @@ module attributes {
     %b:3 = func.call @__ly_seq_slice_bounds(%len, %start_raw, %stop_raw, %step_raw, %mask) : (i64, i64, i64, i64, i64) -> (i64, i64, i64)
     %items = func.call @__ly_tuple_items(%self) : (memref<5xi64>) -> memref<?xi64>
     %result = func.call @__ly_tuple_slice_alloc(%b#1, %b#0, %b#2, %items) : (i64, i64, i64, memref<?xi64>) -> memref<5xi64>
+    func.return %result : memref<5xi64>
+  }
+
+  // t[s] for a slice object (tuplesubscript).
+  func.func @LyTuple_SliceSubscript(%self: memref<5xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.tuple"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    %result = func.call @LyTuple_GetSlice(%self, %start, %stop, %step, %mask) : (memref<5xi64>, i64, i64, i64, i64) -> memref<5xi64>
     func.return %result : memref<5xi64>
   }
 

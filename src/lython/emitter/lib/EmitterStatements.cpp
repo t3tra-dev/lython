@@ -1781,16 +1781,22 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
     if (!target)
       continue;
     if (target->kind == "Subscript") {
+      const parser::Node *containerNode = ast::node(*target, "value");
+      Value container = emitExpr(containerNode);
       if (const parser::Node *sliceNode = ast::node(*target, "slice");
           sliceNode && sliceNode->kind == "Slice") {
-        emitSliceMutation(*target, ast::node(*target, "value"), *sliceNode,
+        emitSliceMutation(*target, containerNode, container, *sliceNode,
                           "__delslice__", std::nullopt);
         continue;
       }
-      Value container = emitExpr(ast::node(*target, "value"));
       Value index = emitExpr(ast::node(*target, "slice"));
       if (tryEmitClassDunder(*target, container, "__delitem__", {index}))
         continue;
+      if (receiverSlicesWith(container, "__delslice__", index)) {
+        emitSliceProtocolMutation(*target, containerNode, container, {index},
+                                  "__delslice__", std::nullopt);
+        continue;
+      }
       CallInferenceResult inference = types.inferMethodCallWithEvidence(
           container.type, "__delitem__", {index.type});
       if (!requireStaticEvidence(*target, inference))
@@ -1828,43 +1834,24 @@ void ModuleEmitter::emitDelete(const parser::Node &statement) {
 // mutations (the splice may reallocate the items storage), so they lower
 // through the same rebinding bound-method call shape as list.append —
 // `__setslice__`/`__delslice__` carry the (start, stop, step, mask) pack the
-// slice READ path already uses, plus the replacement list for assignment.
+// slice READ path already uses (or one slice object), plus the replacement
+// list for assignment. A class that defines `__setitem__`/`__delitem__`
+// receives the slice object instead.
 void ModuleEmitter::emitSliceMutation(const parser::Node &target,
                                       const parser::Node *containerNode,
+                                      Value container,
                                       const parser::Node &sliceNode,
                                       llvm::StringRef methodName,
                                       std::optional<Value> payload) {
-  bool isAssignment = payload.has_value();
-  auto unsupported = [&](llvm::StringRef reason) {
-    diagnostics.push_back(parser::Diagnostic{
-        parser::Severity::Error, target.range.start,
-        (isAssignment ? llvm::Twine("slice assignment ")
-                      : llvm::Twine("slice deletion "))
-                .concat(reason)
-                .str()});
-  };
-  if (!containerNode) {
-    unsupported("has no target expression");
+  llvm::StringRef dunder = payload ? "__setitem__" : "__delitem__";
+  if (classTakesSliceObject(container, dunder)) {
+    Value sliceObject = emitSliceObject(sliceNode);
+    llvm::SmallVector<Value, 2> arguments{sliceObject};
+    if (payload)
+      arguments.push_back(*payload);
+    (void)tryEmitClassDunder(target, container, dunder, arguments);
     return;
   }
-  Value container = emitExpr(containerNode);
-  // ⭐ A NAME IS NOT REQUIRED. `self.rows[:n] = [9]` and `del self.rows[:n]`
-  // were "requires a named local list target (field containers are not
-  // supported yet)", and `g[0][:1] = [9]` with them. A list is handle-fronted:
-  // the splice writes the new items address THROUGH the handle, so a holder
-  // that is a field slot, a class-attribute cell or a container element
-  // observes it with nothing to rename -- which is exactly why the LOWERING
-  // stopped needing the rebind (Runtime/Ops/CallableOps.cpp). What the rebind
-  // still buys where it applies is the demotion of the local's element
-  // evidence, so the two shapes stay distinct here rather than collapsing:
-  // a name gets the two-result rebinding call, anything else the plain one.
-  llvm::StringRef containerName;
-  if (containerNode->kind == "Name")
-    containerName = ast::nameSpelling(*containerNode);
-  bool rebindable =
-      !containerName.empty() &&
-      isStructuralMutationRebindable(containerName, container.value);
-
   const parser::Node *lower = ast::node(sliceNode, "lower");
   const parser::Node *upper = ast::node(sliceNode, "upper");
   const parser::Node *step = ast::node(sliceNode, "step");
@@ -1880,11 +1867,47 @@ void ModuleEmitter::emitSliceMutation(const parser::Node &target,
   Value stepValue = step ? emitExpr(step) : intConstant(1);
   long long maskBits = (lower ? 1 : 0) | (upper ? 2 : 0);
   Value maskValue = intConstant(maskBits);
+  emitSliceProtocolMutation(target, containerNode, container,
+                            {startValue, stopValue, stepValue, maskValue},
+                            methodName, payload);
+}
 
-  llvm::SmallVector<mlir::Type, 5> argumentTypes{
-      startValue.type, stopValue.type, stepValue.type, maskValue.type};
-  llvm::SmallVector<Value, 5> arguments{startValue, stopValue, stepValue,
-                                        maskValue};
+void ModuleEmitter::emitSliceProtocolMutation(const parser::Node &target,
+                                              const parser::Node *containerNode,
+                                              Value container,
+                                              llvm::ArrayRef<Value> bounds,
+                                              llvm::StringRef methodName,
+                                              std::optional<Value> payload) {
+  bool isAssignment = payload.has_value();
+  auto unsupported = [&](llvm::StringRef reason) {
+    diagnostics.push_back(parser::Diagnostic{
+        parser::Severity::Error, target.range.start,
+        (isAssignment ? llvm::Twine("slice assignment ")
+                      : llvm::Twine("slice deletion "))
+                .concat(reason)
+                .str()});
+  };
+  // ⭐ A NAME IS NOT REQUIRED. `self.rows[:n] = [9]` and `del self.rows[:n]`
+  // were "requires a named local list target (field containers are not
+  // supported yet)", and `g[0][:1] = [9]` with them. A list is handle-fronted:
+  // the splice writes the new items address THROUGH the handle, so a holder
+  // that is a field slot, a class-attribute cell or a container element
+  // observes it with nothing to rename -- which is exactly why the LOWERING
+  // stopped needing the rebind (Runtime/Ops/CallableOps.cpp). What the rebind
+  // still buys where it applies is the demotion of the local's element
+  // evidence, so the two shapes stay distinct here rather than collapsing:
+  // a name gets the two-result rebinding call, anything else the plain one.
+  llvm::StringRef containerName;
+  if (containerNode && containerNode->kind == "Name")
+    containerName = ast::nameSpelling(*containerNode);
+  bool rebindable =
+      !containerName.empty() &&
+      isStructuralMutationRebindable(containerName, container.value);
+
+  llvm::SmallVector<mlir::Type, 5> argumentTypes;
+  llvm::SmallVector<Value, 5> arguments(bounds.begin(), bounds.end());
+  for (const Value &bound : bounds)
+    argumentTypes.push_back(bound.type);
   if (payload) {
     argumentTypes.push_back(payload->type);
     arguments.push_back(*payload);
@@ -2267,15 +2290,22 @@ void ModuleEmitter::emitAssignTarget(const parser::Node &target, Value value) {
       }
       return;
     }
+    // ⛔ The container already emitted above, not emitted again: the slice
+    // path emitted its own, so `get(xs)[0:1] = [9]` called `get` twice.
     if (const parser::Node *sliceNode = ast::node(target, "slice");
         sliceNode && sliceNode->kind == "Slice") {
-      emitSliceMutation(target, containerNode, *sliceNode, "__setslice__",
-                        value);
+      emitSliceMutation(target, containerNode, container, *sliceNode,
+                        "__setslice__", value);
       return;
     }
     Value index = emitExpr(ast::node(target, "slice"));
     if (tryEmitClassDunder(target, container, "__setitem__", {index, value}))
       return;
+    if (receiverSlicesWith(container, "__setslice__", index, value)) {
+      emitSliceProtocolMutation(target, containerNode, container, {index},
+                                "__setslice__", value);
+      return;
+    }
     CallInferenceResult inference = types.inferMethodCallWithEvidence(
         container.type, "__setitem__", {index.type, value.type});
     if (!requireStaticEvidence(target, inference))

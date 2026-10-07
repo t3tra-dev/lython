@@ -2405,3 +2405,89 @@ TEST(EmitterTest, ACodecErrorTakesItsCodecArguments) {
       "main.py", "<lython-no-import-dir>", native, context, module, diag)))
       << diagnostics;
 }
+
+// What: a constructor call is checked against the class's declared __init__
+// arities whether it passes arguments or not -- slice() and range() take one to
+// three, so none, four, or a str/float bound is refused at emit, and the
+// arities CPython accepts (frozenset() included) emit.
+TEST(EmitterTest, AConstructorCallIsCheckedAgainstItsInitArities) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (const char *refused :
+       {"s = slice()\n", "s = slice(1, 2, 3, 4)\n", "s = slice(\"a\")\n",
+        "s = slice(1.5)\n", "r = range()\n", "r = range(1, 2, 3, 4)\n",
+        "r = range(1.5)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        refused, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << refused;
+    EXPECT_NE(diagnostics.find("has manifest method '__init__' but no "
+                               "signature that accepts"),
+              std::string::npos)
+        << refused << diagnostics;
+  }
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+      "a = slice(1)\nb = slice(None, 2)\nc = slice(1, None, -1)\n"
+      "f = frozenset()\nr = range(3)\nq = range(1, 9, 2)\n"
+      "print(a, b, c, f, r, q)\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+      << diagnostics;
+}
+
+// What: a slice keeps the objects it is given and reads its bounds back as
+// `int | None`, so a bool bound -- a literal, or a `bool | None` value -- is
+// refused naming the argument, where reading it back as an int would print 1
+// for CPython's True.
+TEST(EmitterTest, ASliceBoundIsNotABool) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (auto [source, argument] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"s = slice(True)\n", "argument 1"},
+           {"s = slice(1, False)\n", "argument 2"},
+           {"def f(b: bool | None) -> slice:\n"
+            "    return slice(None, 2, b)\n",
+            "argument 3"}}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << source;
+    EXPECT_NE(diagnostics.find(std::string("slice() keeps ") + argument +
+                               " as it is given and reads it back as int; "
+                               "this call gives it bool"),
+              std::string::npos)
+        << source << diagnostics;
+  }
+}
+
+// What: `slice[A, B, C]` -- typeshed's generic spelling -- names the slice
+// type this compiler has, quoted or not, so a parameter annotated that way
+// accepts the slices passed to it.
+TEST(EmitterTest, ASubscriptedSliceAnnotationNamesTheSlice) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+      "def f(s: slice[int, int, int]) -> slice:\n"
+      "    return s\n"
+      "def g(s: \"slice[int, None, None]\") -> int:\n"
+      "    return 0 if s.start is None else s.start\n"
+      "print(f(slice(1, 2, 3)), g(slice(4)))\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+      << diagnostics;
+}

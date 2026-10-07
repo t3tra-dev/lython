@@ -17,6 +17,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.range", "builtins.range_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
@@ -44,20 +45,24 @@ module attributes {
       !py.contract<"builtins.int">,
       !py.contract<"builtins.int">
     ],
-    method_names = ["__new__", "__new__", "__new__", "__init__", "__iter__",
-                    "__eq__", "__ne__", "__getslice__"],
+    method_names = ["__new__", "__new__", "__new__", "__init__", "__init__",
+                    "__init__", "__iter__", "__eq__", "__ne__", "__getslice__", "__getslice__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.range">>, !py.contract<"builtins.int">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.range">>, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.range">>, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.self]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.paramspec<"P">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.range">] -> [!py.contract<"builtins.range_iterator">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.range">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.range">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.range">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.range">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.range">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.range">]>
     ],
     method_kinds = ["classmethod", "classmethod", "classmethod", "instance",
-                    "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance",
+                    "instance", "instance"]
   } {}
 
   py.class @range_iterator attributes {
@@ -379,6 +384,13 @@ module attributes {
 
   ^make:
     %result = func.call @__ly_range_alloc(%sub_start, %sub_stop, %sub_step) : (i64, i64, i64) -> memref<5xi64>
+    func.return %result : memref<5xi64>
+  }
+
+  // r[s] for a slice object (range_subscript).
+  func.func @LyRange_SliceSubscript(%self: memref<5xi64> {ly.ownership.object_header}, %slice: memref<5xi64> {ly.ownership.object_header}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.range", ly.runtime.method = "__getslice__", ly.runtime.result_contract = "builtins.range"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    %result = func.call @LyRange_GetSlice(%self, %start, %stop, %step, %mask) : (memref<5xi64>, i64, i64, i64, i64) -> memref<5xi64>
     func.return %result : memref<5xi64>
   }
 

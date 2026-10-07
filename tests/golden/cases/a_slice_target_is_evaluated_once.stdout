@@ -1,0 +1,4 @@
+['assign'] [9, 2, 3, 4]
+['assign', 'delete'] [9, 3, 4]
+['assign', 'delete', 'object'] [5, 6, 3, 4]
+['assign', 'delete', 'object', 'object delete'] [6, 4]

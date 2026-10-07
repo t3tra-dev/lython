@@ -1,0 +1,17 @@
+slice(1, 10, 3) 1 10 3
+slice(None, 7, None) slice(None, None, -1) slice(2, None, None)
+slice(1180591620717411303424, -1180591620717411303424, None) 1180591620717411303424 -1180591620717411303424 None
+1180591620717411303425
+True True True
+True True True False
+[slice(1, 2, None), slice(1, 9, None), slice(3, 4, None)]
+True True
+a b 2
+(1, 10, 3) (9, -1, -1) (1, 4, 1)
+(0, 5, 1) (0, 5, 2) (0, 0, 2)
+(0, 5, 1180591620717411303424) (4, -1, -9223372036854775808)
+(0, 1180591620717411303424, 1) (1180591620717411303421, 1180591620717411303424, 1) (1180591620717411303423, -1, -1)
+(5, 1180591620717411303419, -2) (1180591620717411303423, -1, -1)
+ValueError length should not be negative
+ValueError length should not be negative
+ValueError slice step cannot be zero

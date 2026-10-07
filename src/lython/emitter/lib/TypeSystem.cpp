@@ -1880,6 +1880,7 @@ void TypeSystem::seedBuiltins() {
           .value_or(contract("builtins.function")));
   bindClass("nullcontext", contract("contextlib.nullcontext"));
   bindClass("range", contract("builtins.range"));
+  bindClass("slice", contract("builtins.slice"));
 }
 
 mlir::Type TypeSystem::object() const { return contract("builtins.object"); }
@@ -2427,7 +2428,7 @@ bool TypeSystem::namesAType(const parser::Node *node) const {
     for (llvm::StringRef builtin :
          {"int", "str", "bool", "float", "complex", "bytes", "bytearray",
           "object", "Any", "None", "list", "dict", "set", "frozenset", "tuple",
-          "range", "type"})
+          "range", "slice", "type"})
       if (annotationNameIs(name, builtin))
         return true;
     // The typing spellings an import brings in -- `Optional`, `Callable`,
@@ -3480,6 +3481,18 @@ mlir::Type TypeSystem::annotationType(const parser::Node *node) const {
         if (mlir::Type specialized = resolveGenericClass(
                 contractType.getContractName(), arguments))
           return specialized;
+        // ⛔ Not kept on a builtin that declares no type parameters: they
+        // made `slice[int, int, int]` -- typeshed's slice is generic, this
+        // compiler's is not (objects/slice.mlir) -- a type no slice value
+        // has, so the annotated parameter refused every slice passed to it.
+        // Only a builtin: a source class keeps its parameterized reading
+        // until it is specialized (resolveGenericClass).
+        if (contractType.getContractName().starts_with("builtins."))
+          if (const py::protocols::ProtocolInfo *info =
+                  py::protocols::Table::get(context).lookup(
+                      manifestNameForContract(contractType.getContractName()));
+              info && info->params.empty())
+            return contract(contractType.getContractName());
         return contract(contractType.getContractName(), arguments);
       }
       return *knownClass;

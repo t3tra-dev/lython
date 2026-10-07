@@ -2611,6 +2611,11 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
   if (std::optional<Value> item =
           tryEmitClassDunder(expr, container, "__getitem__", {index}))
     return *item;
+  // ⭐ A SLICE OBJECT INDEXES THE WAY A WRITTEN SLICE DOES: `xs[s]` is
+  // `xs[a:b:c]` with the parts read out of `s` at run time.
+  // ⛔ Only on a receiver that slices: a dict's slice KEY is looked up.
+  if (receiverSlicesWith(container, "__getslice__", index))
+    return emitSliceProtocolRead(expr, container, {index});
   // ⭐ A UNION IS INDEXED BY TAG, the same way it is counted and added. Both
   // members of a `list[int] | str` answer `__getitem__`, which is what
   // `def f(x: "list[int] | str"): return x[0]` needs and what CPython does
@@ -2651,6 +2656,13 @@ Value ModuleEmitter::emitSubscript(const parser::Node &expr) {
 Value ModuleEmitter::emitSliceSubscript(const parser::Node &expr,
                                         Value container,
                                         const parser::Node &sliceNode) {
+  if (classTakesSliceObject(container, "__getitem__")) {
+    Value sliceObject = emitSliceObject(sliceNode);
+    if (std::optional<Value> item =
+            tryEmitClassDunder(expr, container, "__getitem__", {sliceObject}))
+      return *item;
+    return emitNone(expr);
+  }
   const parser::Node *lower = ast::node(sliceNode, "lower");
   const parser::Node *upper = ast::node(sliceNode, "upper");
   const parser::Node *step = ast::node(sliceNode, "step");
@@ -2669,21 +2681,28 @@ Value ModuleEmitter::emitSliceSubscript(const parser::Node &expr,
   Value stepValue = step ? emitExpr(step) : intConstant(1);
   long long maskBits = (lower ? 1 : 0) | (upper ? 2 : 0);
   Value maskValue = intConstant(maskBits);
+  return emitSliceProtocolRead(expr, container,
+                               {startValue, stopValue, stepValue, maskValue});
+}
 
+Value ModuleEmitter::emitSliceProtocolRead(const parser::Node &expr,
+                                           Value container,
+                                           llvm::ArrayRef<Value> bounds) {
+  llvm::SmallVector<mlir::Type, 4> boundTypes;
+  for (const Value &bound : bounds)
+    boundTypes.push_back(bound.type);
   CallInferenceResult inference = types.inferMethodCallWithEvidence(
-      container.type, "__getslice__",
-      {startValue.type, stopValue.type, stepValue.type, maskValue.type});
+      container.type, "__getslice__", boundTypes);
   if (!inference) {
     diagnostics.push_back(parser::Diagnostic{
         parser::Severity::Error, expr.range.start,
         "slicing is not supported for this receiver type (str/list/tuple/"
-        "bytes provide `__getslice__`)"});
+        "bytes/range provide `__getslice__`)"});
     return emitNone(expr);
   }
   if (!requireStaticEvidence(expr, inference))
     return emitNone(expr);
-  Value posPack =
-      emitPack({startValue, stopValue, stepValue, maskValue});
+  Value posPack = emitPack(bounds);
   Value namePack = emitPack({});
   Value valuePack = emitPack({});
   mlir::Type resultType = inference.resultType;
@@ -2692,6 +2711,50 @@ Value ModuleEmitter::emitSliceSubscript(const parser::Node &expr,
                                posPack.value, namePack.value, valuePack.value);
   op->setAttr("ly.bound_method", builder.getStringAttr("__getslice__"));
   return {op.getResults().front(), resultType};
+}
+
+Value ModuleEmitter::emitSliceObject(const parser::Node &sliceNode) {
+  auto part = [&](llvm::StringRef field) -> parser::NodePtr {
+    if (const parser::Field *found = parser::findField(sliceNode, field))
+      if (const auto *node = std::get_if<parser::NodePtr>(&found->value);
+          node && *node)
+        return *node;
+    return synth::noneConstant(sliceNode.range);
+  };
+  // ⛔ Built against builtins.slice, not through the name `slice`: a
+  // subscript does not look the name up, so a program that binds `slice` to
+  // something else still slices.
+  parser::NodePtr call = synth::call(
+      synth::name("slice", sliceNode.range),
+      {part("lower"), part("upper"), part("step")}, sliceNode.range);
+  synthesizedSliceObjects.push_back(call);
+  return emitClassInstantiation(*call, "slice",
+                                types.contract("builtins.slice"));
+}
+
+bool ModuleEmitter::isSliceObjectType(mlir::Type type) const {
+  auto contract =
+      mlir::dyn_cast_if_present<py::ContractType>(types.widenLiteral(type));
+  return contract && contract.getContractName() == "builtins.slice";
+}
+
+bool ModuleEmitter::receiverSlicesWith(Value container,
+                                       llvm::StringRef methodName,
+                                       Value sliceObject,
+                                       std::optional<Value> payload) const {
+  if (!isSliceObjectType(sliceObject.type))
+    return false;
+  llvm::SmallVector<mlir::Type, 2> argumentTypes{sliceObject.type};
+  if (payload)
+    argumentTypes.push_back(payload->type);
+  return static_cast<bool>(types.inferMethodCallWithEvidence(
+      container.type, methodName, argumentTypes));
+}
+
+bool ModuleEmitter::classTakesSliceObject(Value container,
+                                          llvm::StringRef dunder) {
+  return lookupClassMethod(types.widenLiteral(container.type), dunder)
+      .has_value();
 }
 
 Value ModuleEmitter::emitMethodObject(const parser::Node &anchor, Value object,
@@ -4985,6 +5048,69 @@ std::string ModuleEmitter::cellElementRepresentationMismatch(
            spell(assignedLeaf).str() +
            "; the cell has one runtime representation and these two do not "
            "share one, so write the value in the declared type";
+  }
+  return {};
+}
+
+std::string ModuleEmitter::keptArgumentRepresentationMismatch(
+    llvm::StringRef className, mlir::Type instanceType,
+    const CallInferenceResult &inference,
+    llvm::ArrayRef<mlir::Type> argumentTypes) const {
+  auto contract = mlir::dyn_cast_if_present<py::ContractType>(instanceType);
+  if (!contract)
+    return {};
+  const py::protocols::ProtocolInfo *info =
+      py::protocols::Table::get(context).lookup(
+          manifestNameForContract(contract.getContractName()));
+  if (!info || !info->keepsArguments)
+    return {};
+  auto callable = mlir::dyn_cast_if_present<py::CallableType>(
+      inference.evidence.callableContract);
+  if (!callable)
+    return {};
+  // The numeric rungs a type can hold: itself, or each member of a union.
+  auto rungs = [&](mlir::Type type) {
+    llvm::SmallVector<mlir::Type, 2> result;
+    type = types.widenLiteral(type);
+    if (auto unionType = mlir::dyn_cast_if_present<py::UnionType>(type)) {
+      for (mlir::Type member : unionType.getMemberTypes())
+        if (mlir::Type widened = types.widenLiteral(member);
+            isNumericPrimitiveContract(widened))
+          result.push_back(widened);
+    } else if (isNumericPrimitiveContract(type)) {
+      result.push_back(type);
+    }
+    return result;
+  };
+  auto spell = [&](mlir::Type numeric) -> llvm::StringRef {
+    if (numeric == types.boolType())
+      return "bool";
+    return numeric == types.intType() ? "int" : "float";
+  };
+  llvm::ArrayRef<mlir::Type> parameters = callable.getPositionalTypes();
+  // Aligned from the end: parameter 0 is the receiver.
+  std::size_t offset = parameters.size() > argumentTypes.size()
+                           ? parameters.size() - argumentTypes.size()
+                           : 0;
+  for (auto [index, argument] : llvm::enumerate(argumentTypes)) {
+    if (index + offset >= parameters.size())
+      break;
+    llvm::SmallVector<mlir::Type, 2> declared =
+        rungs(parameters[index + offset]);
+    if (declared.empty())
+      continue;
+    // ⛔ Not the subtype question: bool IS an int to the checker, which is why
+    // the call matched. Each rung has its own representation, so a value is
+    // kept as itself only where its own rung is declared.
+    for (mlir::Type assigned : rungs(argument)) {
+      if (llvm::is_contained(declared, assigned))
+        continue;
+      return className.str() + "() keeps argument " +
+             std::to_string(index + 1) + " as it is given and reads it back "
+             "as " + spell(declared.front()).str() + "; this call gives it " +
+             spell(assigned).str() + ", and the two do not share a runtime "
+             "representation, so write the value in the declared type";
+    }
   }
   return {};
 }

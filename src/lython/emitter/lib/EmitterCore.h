@@ -884,10 +884,31 @@ private:
   std::optional<Value> tryEmitHashCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   void emitSliceMutation(const parser::Node &target,
-                         const parser::Node *containerNode,
+                         const parser::Node *containerNode, Value container,
                          const parser::Node &sliceNode,
                          llvm::StringRef methodName,
                          std::optional<Value> payload);
+  // The slice protocol's mutator (`__setslice__` / `__delslice__`) called
+  // with `bounds`: the four parts of a written `a:b:c`, or one slice object.
+  void emitSliceProtocolMutation(const parser::Node &target,
+                                 const parser::Node *containerNode,
+                                 Value container, llvm::ArrayRef<Value> bounds,
+                                 llvm::StringRef methodName,
+                                 std::optional<Value> payload);
+  // `slice(a, b, c)` for a written `a:b:c`, None for each absent part -- the
+  // object CPython's BUILD_SLICE makes.
+  Value emitSliceObject(const parser::Node &sliceNode);
+  bool isSliceObjectType(mlir::Type type) const;
+  // `sliceObject` is a slice and the receiver's slice protocol method
+  // (`__getslice__` / `__setslice__` / `__delslice__`) takes it -- a list
+  // slices with it where a dict looks it up as a key.
+  bool receiverSlicesWith(Value container, llvm::StringRef methodName,
+                          Value sliceObject,
+                          std::optional<Value> payload = std::nullopt) const;
+  // A source class that defines `dunder` receives a written slice as a slice
+  // object.
+  bool classTakesSliceObject(Value container, llvm::StringRef dunder);
+  std::vector<parser::NodePtr> synthesizedSliceObjects;
   std::optional<Value> tryEmitReprCall(const parser::Node &expr,
                                        const parser::Node *calleeNode);
   std::optional<Value> tryEmitFormatCall(const parser::Node &expr,
@@ -1079,6 +1100,10 @@ private:
   // normalization, new copy).
   Value emitSliceSubscript(const parser::Node &expr, Value container,
                            const parser::Node &sliceNode);
+  // `__getslice__` called with `bounds`: the four parts of a written `a:b:c`,
+  // or one slice object.
+  Value emitSliceProtocolRead(const parser::Node &expr, Value container,
+                              llvm::ArrayRef<Value> bounds);
   Value emitAttribute(const parser::Node &expr);
   Value emitAwait(const parser::Node &expr);
   Value emitAwaitValue(const parser::Node &anchor, Value awaitable);
@@ -1226,6 +1251,13 @@ private:
   std::string declaredCellNameFor(const parser::Node *container) const;
   // Diagnostic text when a call writes into a declared cell's ELEMENT storage
   // at a different numeric rung, or empty when it does not.
+  // A constructor marked `ly.typing.keeps_arguments` given an argument of
+  // another numeric rung than the parameter keeps it: the reason to refuse,
+  // or empty.
+  std::string keptArgumentRepresentationMismatch(
+      llvm::StringRef className, mlir::Type instanceType,
+      const CallInferenceResult &inference,
+      llvm::ArrayRef<mlir::Type> argumentTypes) const;
   std::string cellElementRepresentationMismatch(
       const parser::Node *containerNode, mlir::Type containerType,
       const CallInferenceResult &inference,

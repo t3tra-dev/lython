@@ -18,6 +18,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.str", "builtins.str_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
   func.func private @__ly_bytes_alloc(%len: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "alloc"}
   func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
@@ -79,7 +80,7 @@ module attributes {
                     "rsplit", "rsplit", "rsplit", "splitlines", "splitlines",
                     "partition", "rpartition", "__hash__", "__format__", "__ascii__",
                     "__fmt_next__", "__fmt_prefix__", "__fmt_tail__", "__fmt_conv__", "__fmt_spec__",
-                    "__fmt_end__", "__fmt_pick__", "__ly_iadd__"],
+                    "__fmt_end__", "__fmt_pick__", "__ly_iadd__", "__getslice__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.str">>, !py.contract<"builtins.object">] -> [!py.self]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">] -> [!py.contract<"builtins.int">]>,
@@ -178,7 +179,8 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.str">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.contract<"builtins.str">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.str">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.str">]>
     ],
     method_kinds = ["classmethod", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -199,7 +201,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance"]
   } {}
 
   py.class @str_iterator attributes {
@@ -1186,6 +1188,13 @@ module attributes {
       }
     }
     func.return %out_header, %out_bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // s[sl] for a slice object (unicode_subscript).
+  func.func @LyUnicode_SliceSubscript(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>, %slice: memref<5xi64> {ly.ownership.object_header}) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__getslice__"} {
+    %start, %stop, %step, %mask = func.call @__ly_slice_unpack(%slice) : (memref<5xi64>) -> (i64, i64, i64, i64)
+    %result_header, %result_bytes = func.call @LyUnicode_GetSlice(%header, %bytes, %start, %stop, %step, %mask) : (memref<2xi64>, memref<?xi8>, i64, i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
   }
 
   func.func @LyUnicode_Copy(%header: memref<2xi64> {ly.ownership.object_header}, %bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.primitive = "copy"} {

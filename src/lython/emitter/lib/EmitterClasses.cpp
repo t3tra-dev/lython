@@ -5316,7 +5316,15 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
     bool noRuntimeInitArgs = operands.positional.empty() &&
                              operands.keywordValues.empty() &&
                              !hasUnpackedPositional;
-    if (!init && noRuntimeInitArgs) {
+    // ⛔ NOT PAST A DECLARED __init__ THAT TAKES ARGUMENTS. A call with none
+    // skipped the check below, so `range()` reached the lowering ("runtime
+    // call is missing input 0 for builtins.range.__new__"), and a constructor
+    // whose inputs all have defaults would have built what CPython refuses.
+    bool initTakesNoArguments =
+        !types.declaresManifestMethod(inferredInstanceType, "__init__") ||
+        static_cast<bool>(types.inferMethodCallWithEvidence(
+            inferredInstanceType, "__init__", {}, {}));
+    if (!init && noRuntimeInitArgs && initTakesNoArguments) {
       (void)namePack;
       (void)valuePack;
       return {newOp.getInstance(), inferredInstanceType};
@@ -5368,6 +5376,14 @@ Value ModuleEmitter::emitClassInstantiation(const parser::Node &expr,
       if (!requireStaticEvidence(expr, initInference))
         return emitNone(expr);
       initContract = callProtocolFor(initInference);
+    }
+    if (std::string mismatch = keptArgumentRepresentationMismatch(
+            name, inferredInstanceType, initInference,
+            operands.positionalTypes);
+        !mismatch.empty()) {
+      diagnostics.push_back(parser::Diagnostic{
+          parser::Severity::Error, expr.range.start, std::move(mismatch)});
+      return emitNone(expr);
     }
     auto initOp =
         py::InitOp::create(builder, loc(expr), types.none(),

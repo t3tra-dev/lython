@@ -108,6 +108,10 @@ struct ProtocolInfo {
   bool isProtocol = false;
   bool isAbstract = false;
   bool isFinal = false;
+  // `ly.typing.keeps_arguments`: the constructor stores the objects it is
+  // given as they are (slice), so each `__init__` parameter is a declared
+  // storage the argument has to share a representation with.
+  bool keepsArguments = false;
 };
 
 // Manifest-backed binding proof for a receiver type. This is intentionally
