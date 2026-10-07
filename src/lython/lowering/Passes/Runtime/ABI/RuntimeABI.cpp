@@ -2142,6 +2142,42 @@ mlir::LogicalResult RuntimeBundleLowerer::materializeDefaultObjectRepr(
 // not in the always-loaded native library — because runtime object modules
 // are merged per contract on demand, so only the lowering knows which
 // deallocators exist (including generated source-class deallocators).
+// ⛔ A pruned class does not MISS. A miss is an answer -- repr's caller prints
+// the default `<X object at 0x...>`, eq's says "not equal", lt's raises
+// TypeError -- and for a class that has the method it is the wrong one.
+// Reaching a pruned id means the closure the pruning trusted was wrong: stop,
+// saying so.
+mlir::LogicalResult RuntimeBundleLowerer::endWithPrunedClassTrap(
+    mlir::func::FuncOp hook, mlir::Block *check, mlir::Block *miss,
+    mlir::Value classValue, llvm::ArrayRef<std::int64_t> prunedIds,
+    llvm::StringRef hookName) {
+  mlir::Location loc = hook.getLoc();
+  mlir::Block *trap = hook.addBlock();
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(trap);
+    mlir::Value never = mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
+    mlir::cf::AssertOp::create(
+        builder, loc, never,
+        (hookName + ": a class judged unreachable by this program's types "
+                    "reached it")
+            .str());
+    mlir::cf::BranchOp::create(builder, loc, miss);
+  }
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(check);
+  llvm::SmallVector<llvm::APInt, 16> cases;
+  for (std::int64_t id : prunedIds)
+    cases.push_back(
+        llvm::APInt(64, static_cast<std::uint64_t>(id), /*isSigned=*/true));
+  llvm::SmallVector<mlir::Block *, 16> destinations(prunedIds.size(), trap);
+  llvm::SmallVector<mlir::ValueRange, 16> operands(prunedIds.size(),
+                                                   mlir::ValueRange{});
+  mlir::cf::SwitchOp::create(builder, loc, classValue, miss, mlir::ValueRange{},
+                             cases, destinations, operands);
+  return mlir::success();
+}
+
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     llvm::StringRef hookName,
     llvm::function_ref<bool(mlir::func::FuncOp)> selects,
@@ -2433,38 +2469,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHook(
     }
     check = next;
   }
-  if (!prunedIds.empty()) {
-    // ⛔ A pruned class does not MISS. A miss is an answer -- its caller
-    // prints the default `<X object at 0x...>` -- and for a class that has a
-    // __repr__ it is the wrong one. Reaching here means the closure the
-    // pruning trusted was wrong: stop, saying so.
-    mlir::Block *trap = hook.addBlock();
-    {
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(trap);
-      mlir::Value never =
-          mlir::arith::ConstantIntOp::create(builder, loc, 0, 1);
-      mlir::cf::AssertOp::create(
-          builder, loc, never,
-          (hookName + ": a class judged unreachable by this program's types "
-                      "reached it")
-              .str());
-      mlir::cf::BranchOp::create(builder, loc, miss);
-    }
-    mlir::OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(check);
-    llvm::SmallVector<llvm::APInt, 16> cases;
-    for (std::int64_t id : prunedIds)
-      cases.push_back(llvm::APInt(64, static_cast<std::uint64_t>(id),
-                                  /*isSigned=*/true));
-    llvm::SmallVector<mlir::Block *, 16> destinations(prunedIds.size(), trap);
-    llvm::SmallVector<mlir::ValueRange, 16> operands(prunedIds.size(),
-                                                     mlir::ValueRange{});
-    mlir::cf::SwitchOp::create(builder, loc, classValue, miss,
-                               mlir::ValueRange{}, cases, destinations,
-                               operands);
-    return mlir::success();
-  }
+  if (!prunedIds.empty())
+    return endWithPrunedClassTrap(hook, check, miss, classValue, prunedIds,
+                                  hookName);
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(check);
@@ -2477,12 +2484,22 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReleaseHook() {
   // Release is one instance of the uniform boxed-method dispatch: class id ->
   // the manifest deallocator (which returns void). Exception subclasses share
   // BaseException's deallocator.
+  // ⛔ The exception family is never pruned here: its subclasses' arms are
+  // made from BaseException's, so a pruned BaseException would leave every
+  // boxed exception to the MISS -- an object that is silently not released.
+  const py::protocols::Table &table = py::protocols::Table::get(*context);
   return generateBoxedMethodHook(
       "__ly_release_boxed_by_contract",
       [](mlir::func::FuncOp function) {
         return function->hasAttr(contracts::kManifestDeallocatorAttr);
       },
-      /*calleeResultTypes=*/{}, /*shareExceptionSubclasses=*/true);
+      /*calleeResultTypes=*/{}, /*shareExceptionSubclasses=*/true, "",
+      [&](llvm::StringRef contract) {
+        return table.isManifestSubclassOf(
+                   runtimeContractType(context, contract),
+                   "builtins.BaseException") ||
+               RuntimeBundleLowerer::boxMayHoldContract(contract);
+      });
 }
 
 // Both string-shaped hooks hand back an owned `builtins.str`; the refcount
@@ -2519,10 +2536,12 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedMethodHookFor(
     mlir::TypeRange calleeResultTypes) {
   if (!boxedHookIsDemanded(hookName))
     return mlir::success();
-  return generateBoxedMethodHook(hookName, manifestMethodIs(methodName),
-                                 calleeResultTypes,
-                                 /*shareExceptionSubclasses=*/false,
-                                 methodName);
+  return generateBoxedMethodHook(
+      hookName, manifestMethodIs(methodName), calleeResultTypes,
+      /*shareExceptionSubclasses=*/false, methodName,
+      [&](llvm::StringRef contract) {
+        return RuntimeBundleLowerer::boxMayHoldContract(contract);
+      });
 }
 
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
@@ -2530,8 +2549,11 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
     mlir::TypeRange calleeResultTypes) {
   if (!boxedHookIsDemanded(hookName))
     return mlir::success();
-  return generateBoxedBinaryMethodHook(hookName, manifestMethodIs(methodName),
-                                       calleeResultTypes, methodName);
+  return generateBoxedBinaryMethodHook(
+      hookName, manifestMethodIs(methodName), calleeResultTypes, methodName,
+      [&](llvm::StringRef contract) {
+        return RuntimeBundleLowerer::boxMayHoldContract(contract);
+      });
 }
 
 // ⭐ WHAT A BOX IN THIS PROGRAM CAN HOLD, ASKED OF ITS TYPES. The repr and str
@@ -2556,7 +2578,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHookFor(
 // ⛔ Open -- every class kept -- at the first type that admits classes it
 // does not name: object, a type variable, an in-flight exception.
 // A protocol names its classes by the conformance rule the emitter admitted
-// them by (reprMayReachContract). An exception names itself and what the
+// them by (boxMayHoldContract). An exception names itself and what the
 // runtime puts in the args of one it raises -- str, int, bytes, None; what a
 // program puts there is an op's result and read like any other.
 // A callable value is a function object; what it returns is made by the call,
@@ -2699,7 +2721,7 @@ void RuntimeBundleLowerer::collectReprReachableContracts() {
   }
 }
 
-bool RuntimeBundleLowerer::reprMayReachContract(
+bool RuntimeBundleLowerer::boxMayHoldContract(
     llvm::StringRef contract) const {
   if (!reprReachableContracts || reprReachableContracts->contains(contract))
     return true;
@@ -2729,7 +2751,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedReprHook() {
           hookName, manifestMethodIs("__repr__"), {strHeader, strBytes},
           /*shareExceptionSubclasses=*/false, "__repr__",
           [&](llvm::StringRef contract) {
-            return RuntimeBundleLowerer::reprMayReachContract(contract);
+            return RuntimeBundleLowerer::boxMayHoldContract(contract);
           })))
     return mlir::failure();
   stampBoxedStrHookResult("__ly_repr_boxed_by_contract");
@@ -2747,7 +2769,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedStrHook() {
           hookName, manifestMethodIs("__str__"), {strHeader, strBytes},
           /*shareExceptionSubclasses=*/false, "__str__",
           [&](llvm::StringRef contract) {
-            return RuntimeBundleLowerer::reprMayReachContract(contract);
+            return RuntimeBundleLowerer::boxMayHoldContract(contract);
           })))
     return mlir::failure();
   stampBoxedStrHookResult("__ly_str_boxed_by_contract");
@@ -2884,7 +2906,8 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedHashHook() {
 mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     llvm::StringRef hookName,
     llvm::function_ref<bool(mlir::func::FuncOp)> selects,
-    mlir::TypeRange calleeResultTypes, llvm::StringRef sourceClassMethodName) {
+    mlir::TypeRange calleeResultTypes, llvm::StringRef sourceClassMethodName,
+    llvm::function_ref<bool(llvm::StringRef)> keepsContract) {
   if (auto existing = module.lookupSymbol<mlir::func::FuncOp>(hookName)) {
     if (!existing.isExternal())
       return mlir::success();
@@ -2924,6 +2947,7 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
   };
   llvm::SmallVector<HookEntry, 16> entries;
   llvm::SmallDenseSet<std::int64_t, 16> seenIds;
+  llvm::SmallVector<std::int64_t, 16> prunedIds;
   // ⛔ WHAT THE SECOND PARAMETER IS, ASKED OF THE DECLARATION AND NOT OF ITS
   // SHAPE. The shapes decided it until a class with three body words met
   // `object`: both are five i64 words, so `__eq__(self: K, other: object)`
@@ -2983,6 +3007,10 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     }
     if (!classId || !conforms(function) || !seenIds.insert(*classId).second)
       return;
+    if (keepsContract && !keepsContract(contractAttr.getValue())) {
+      prunedIds.push_back(*classId);
+      return;
+    }
     entries.push_back(HookEntry{*classId, function,
                                 contractAttr.getValue().str(),
                                 declaredOtherIsObject(function)});
@@ -3155,6 +3183,9 @@ mlir::LogicalResult RuntimeBundleLowerer::generateBoxedBinaryMethodHook(
     }
     check = next;
   }
+  if (!prunedIds.empty())
+    return endWithPrunedClassTrap(hook, check, miss, classValue, prunedIds,
+                                  hookName);
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(check);

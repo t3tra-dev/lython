@@ -1075,7 +1075,7 @@ private:
   // py type in the module before the lowering erases them; std::nullopt when
   // some type admits any class (object, a protocol, an exception's args).
   void collectReprReachableContracts();
-  bool reprMayReachContract(llvm::StringRef contract) const;
+  bool boxMayHoldContract(llvm::StringRef contract) const;
   // ⭐ ONE INSTANCE OF EITHER DISPATCH, BY METHOD NAME. Every instance below
   // is the same three steps -- generate only when the merged manifest left an
   // external declaration asking for it, select the manifest functions carrying
@@ -1111,7 +1111,13 @@ private:
       llvm::StringRef hookName,
       llvm::function_ref<bool(mlir::func::FuncOp)> selects,
       mlir::TypeRange calleeResultTypes,
-      llvm::StringRef sourceClassMethodName = "");
+      llvm::StringRef sourceClassMethodName = "",
+      llvm::function_ref<bool(llvm::StringRef)> keepsContract = nullptr);
+  // The trap a hook ends with when it pruned classes: those ids assert.
+  mlir::LogicalResult endWithPrunedClassTrap(
+      mlir::func::FuncOp hook, mlir::Block *check, mlir::Block *miss,
+      mlir::Value classValue, llvm::ArrayRef<std::int64_t> prunedIds,
+      llvm::StringRef hookName);
   // eq instance of the binary dispatch (dict/set key equality over erased
   // keys).
   mlir::LogicalResult generateBoxedEqHook();

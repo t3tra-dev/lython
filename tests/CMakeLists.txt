@@ -209,6 +209,7 @@ set(LYTHON_UNIT_PATTERNS_lower
     "DriverTest.AnExecutableKeepsOnlyItsEntryExternal"
     "DriverTest.AJsHostExecutableKeepsItsExportsExternal"
     "DriverTest.TheReprHookArmsOnlyTheClassesTheProgramHolds"
+    "DriverTest.TheComparisonHashAndReleaseHooksArmOnlyHeldClasses"
     "DriverTest.AnObjectValueKeepsEveryReprArm"
     "DriverTest.IteratingATupleOfBoolsCompiles"
     "DriverTest.ALoopBodyLoweredEarlyKeepsItsInitOrder"
