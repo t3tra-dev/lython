@@ -1926,6 +1926,19 @@ TypeSystem::manifestMethodReceiverContract(mlir::Type typeObject,
   return contract;
 }
 
+bool TypeSystem::dictGetDefaultIsValue(mlir::Type valueType,
+                                       const parser::Node *defaultNode) const {
+  if (!valueType || !defaultNode)
+    return false;
+  mlir::Type given = widenLiteral(inferExpr(defaultNode));
+  if (given == valueType)
+    return true;
+  auto value = mlir::dyn_cast<py::ContractType>(valueType);
+  auto empty = mlir::dyn_cast_if_present<py::ContractType>(given);
+  return value && empty && isEmptyContainerExpression(defaultNode) &&
+         value.getContractName() == empty.getContractName();
+}
+
 bool TypeSystem::isManifestClassMethod(mlir::Type instance,
                                        llvm::StringRef methodName) const {
   auto contract = mlir::dyn_cast_if_present<py::ContractType>(instance);
@@ -4910,6 +4923,25 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
                                 {key, callArgs->size() == 2
                                           ? widenLiteral(positional.back())
                                           : none()});
+          }
+          // ⭐ `dict.get(k, default)` with a default of another type is
+          // typeshed's `V | T` overload, which the emitter desugars; the
+          // manifest has no signature for it, so the walk types it here. A
+          // default that IS a value (`dictGetDefaultIsValue`) takes the native
+          // `get(k, V) -> V`.
+          if (auto dictContract = mlir::dyn_cast_if_present<py::ContractType>(
+                  widenLiteral(receiver));
+              dictContract && *methodName == "get" &&
+              dictContract.getContractName() == "builtins.dict" &&
+              dictContract.getArguments().size() == 2 && keywords.empty()) {
+            const auto *callArgs = ast::nodeList(*node, "args");
+            if (callArgs && callArgs->size() == 2 && callArgs->back() &&
+                callArgs->back()->kind != "Starred") {
+              mlir::Type value = dictContract.getArguments()[1];
+              if (dictGetDefaultIsValue(value, callArgs->back().get()))
+                return value;
+              return join({value, widenLiteral(positional.back())});
+            }
           }
           // ⭐ A manifest classmethod through an instance is the class's call
           // (the emitter re-spells it so), and is typed as that call.

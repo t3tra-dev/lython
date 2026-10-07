@@ -1307,10 +1307,25 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
     return std::nullopt;
   if (!isDictTypedExpr(receiver.get()))
     return std::nullopt;
-  // get with an explicit default has a native lowering; only the one-argument
-  // (None-default) form desugars here.
-  if (*attr == "get" && argCount != 1)
-    return std::nullopt;
+  // get with a default of the VALUE type has a native lowering; the
+  // one-argument form and a default of any other type desugar here.
+  //
+  // ⭐ A DEFAULT OF ANOTHER TYPE IS typeshed's third overload, `get(k,
+  // default: T) -> V | T`, and the manifest has no native body for it: `{1:
+  // 2}.get(3, "no")`, `m.get(k, None)` over a `dict[str, list[int]]` and
+  // `m.get(k, [])` all reached the lowering as "runtime manifest has no
+  // builtins.dict.get method". The one-argument desugar is that overload with
+  // None for the default.
+  if (*attr == "get" && argCount != 1) {
+    if (argCount != 2 || !(*args)[1] || (*args)[1]->kind == "Starred")
+      return std::nullopt;
+    auto dictContract = mlir::dyn_cast_if_present<py::ContractType>(
+        types.widenLiteral(types.inferExpr(receiver.get())));
+    if (!dictContract || dictContract.getArguments().size() != 2 ||
+        types.dictGetDefaultIsValue(dictContract.getArguments()[1],
+                                    (*args)[1].get()))
+      return std::nullopt;
+  }
 
   std::string dictName = scratch("d");
   bool needsTemp = receiver->kind != "Name";
@@ -1331,13 +1346,16 @@ ModuleEmitter::tryEmitDictMethodSugar(const parser::Node &expr,
   };
 
   if (*attr == "get") {
-    // __r = None; if __k in d: __r = d[__k]  →  Optional[V]
+    // __r = default; if __k in d: __r = d[__k]  →  V | type(default), with
+    // None for the default when there is none. The key and then the default
+    // are evaluated before the lookup, as CPython evaluates the arguments.
     std::string keyName = scratch("gk");
     std::string resultName = scratch("gr");
     return withPrologue({keyName, resultName}, [&]() -> std::optional<Value> {
       emitStatement(*synth::assign(synth::name(keyName, range), (*args)[0], range));
-      emitStatement(*synth::assign(synth::name(resultName, range),
-                                synth::noneConstant(range), range));
+      emitStatement(*synth::assign(
+          synth::name(resultName, range),
+          argCount == 2 ? (*args)[1] : synth::noneConstant(range), range));
       NodePtr hit = synth::ifStmt(
           synth::compareIn(synth::name(keyName, range), dictRef, range),
           {synth::assign(synth::name(resultName, range),

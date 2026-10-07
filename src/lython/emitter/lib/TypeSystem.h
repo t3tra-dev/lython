@@ -231,6 +231,11 @@ public:
   // the class object -- so `instance.methodName(...)` is the class's call.
   bool isManifestClassMethod(mlir::Type instance,
                              llvm::StringRef methodName) const;
+  // Whether `dict.get(k, default)` over values of `valueType` takes the
+  // default AS a value: it has that type, or it is an empty container of the
+  // same kind (`{}` for a dict of dicts), which CPython does not tell apart.
+  bool dictGetDefaultIsValue(mlir::Type valueType,
+                             const parser::Node *defaultNode) const;
   mlir::Type boolType() const;
   mlir::Type intType() const;
   mlir::Type strType() const;
