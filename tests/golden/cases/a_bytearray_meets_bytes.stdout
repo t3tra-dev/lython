@@ -1,0 +1,11 @@
+[bytearray(b'a'), bytearray(b'bc')] 2
+True True True
+{'k': bytearray(b'vw')}
+6
+40 bytearray(b'ABCDE') bytearray(b'LMN')
+(bytearray(b'x'), 1)
+[bytearray(b'a'), bytearray(b'b')]
+True
+bytearray(b'q') bytearray(b'z')
+[bytearray(b'a'), b'b', b'c'] True True
+bytearray(b'x12') bytearray(b'w') bytearray(b'-1-3-5')

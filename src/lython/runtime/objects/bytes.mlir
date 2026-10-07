@@ -85,7 +85,7 @@ module attributes {
                     "isupper", "__contains__", "__contains__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__iter__",
                     "__init__", "__init__", "__init__", "__init__",
-                    "__init__", "__getslice__"],
+                    "__init__", "__getslice__", "__new__", "__init__", "__add__", "__contains__", "__lt__", "__le__", "__gt__", "__ge__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -156,7 +156,15 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytes">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.str">, !py.contract<"builtins.str">] -> [!py.literal<None>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.list", [!py.contract<"builtins.int">]>] -> [!py.literal<None>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.bytes">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.slice">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bytes">>, !py.contract<"builtins.bytearray">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.literal<None>]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bytes">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -164,12 +172,12 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
-                    "instance", "classmethod", "instance", "instance",
+                    "instance", "instance", "classmethod", "instance",
                     "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
   // ===== impls: bytes =====
@@ -191,12 +199,15 @@ module attributes {
 
   // One-lane bytes entity (rfc/object-ownership-kernel.md stage 4b): the handle
   // IS the object and the payload is reached by loading its base out of word 2,
-  // so a holder cannot keep a lane a reallocation left behind. Word layout is
-  // bytes_abi in Passes/Runtime/ABI/StrBytesLayout.h.
+  // so a holder cannot keep a lane a reallocation left behind. The handle's
+  // words: 0 the refcount, 1 the class (70), 2 the payload's address, 3 its
+  // length in bytes. bytearray (objects/bytearray.mlir) has the same four, which
+  // is what lets it hand its handle to the functions here that only read one.
   //
-  // Why one block and not a separate payload allocation: the release interface
-  // has a single operand, so a second allocation would need a second free the
-  // deallocator has no way to name.
+  // ⛔ Why one block and not a payload of its own, as bytearray's: a bytes
+  // never grows, so the block it is allocated in is the only one it needs --
+  // a deallocator can free a second block by the address in word 2, as
+  // bytearray's and list's do, but bytes has nothing to put there.
   // A bytes laid out at compile time in read-only data with the immortal
   // refcount, its payload address pointing into itself: a literal.
   func.func @LyBytes_FromStatic(%address: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "from_static"} {

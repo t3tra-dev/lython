@@ -168,19 +168,16 @@ module attributes {
     func.return %start, %count : i64, i64
   }
 
-  // "attempt to assign sequence of size "
-  memref.global "private" constant @__ly_slice_msg_extended_prefix : memref<35xi8> = dense<[97, 116, 116, 101, 109, 112, 116, 32, 116, 111, 32, 97, 115, 115, 105, 103, 110, 32, 115, 101, 113, 117, 101, 110, 99, 101, 32, 111, 102, 32, 115, 105, 122, 101, 32]>
   // " to extended slice of size "
   memref.global "private" constant @__ly_slice_msg_extended_middle : memref<27xi8> = dense<[32, 116, 111, 32, 101, 120, 116, 101, 110, 100, 101, 100, 32, 115, 108, 105, 99, 101, 32, 111, 102, 32, 115, 105, 122, 101, 32]>
 
-  // ValueError for `a[i:j:k] = xs` with k != 1 and len(xs) != slicelength,
-  // message text matching CPython list_ass_subscript.
-  func.func private @__ly_slice_raise_extended_mismatch(%src_len: i64, %slice_len: i64) {
+  // ValueError for `a[i:j:k] = xs` with k != 1 and len(xs) != slicelength:
+  // `prefix` + the given size + " to extended slice of size " + the slice's,
+  // the prefix naming what was assigned -- "attempt to assign sequence of
+  // size " for list_ass_subscript, "... bytes of size " for bytearray's.
+  func.func private @__ly_slice_raise_extended_mismatch(%prefix: memref<?xi8>, %prefix_len: i64, %src_len: i64, %slice_len: i64) {
     %class_id = arith.constant 53 : i64
     %start = arith.constant 0 : index
-    %prefix_static = memref.get_global @__ly_slice_msg_extended_prefix : memref<35xi8>
-    %prefix = memref.cast %prefix_static : memref<35xi8> to memref<?xi8>
-    %prefix_len = arith.constant 35 : i64
     %middle_static = memref.get_global @__ly_slice_msg_extended_middle : memref<27xi8>
     %middle = memref.cast %middle_static : memref<27xi8> to memref<?xi8>
     %middle_len = arith.constant 27 : i64

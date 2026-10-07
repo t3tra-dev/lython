@@ -1,0 +1,50 @@
+bytearray(b'hello') 5 104 111 bytearray(b'el') True False
+bytearray(b'Hello!')
+bytearray(b'Hello! world!?') 3 7 True
+bytearray(b'HELLO! WORLD!?') Hello! world!? 48656c [72, 101, 108]
+bytearray(b'\x00\x00\x00') bytearray(b'AB') bytearray(b'\xc3\xa9') bytearray(b'xy') b'xy'
+bytearray(b'ababab') True True True
+IndexError bytearray index out of range
+ValueError byte must be in range(0, 256)
+ValueError byte must be in range(0, 256)
+IndexError bytearray index out of range
+IndexError bytearray index out of range
+IndexError pop from empty bytearray
+IndexError pop index out of range
+ValueError value not found in bytearray
+ValueError byte must be in range(0, 256)
+ValueError byte must be in range(0, 256)
+ValueError negative count
+ValueError byte must be in range(0, 256)
+bytearray(b'a\'b"c\x00\xff') bytearray(b'')
+bytearray(b'ababab') bytearray(b'abab') bytearray(b'')
+bytearray(b'bc') bytearray(b'cba') bytearray(b'ab') [bytearray(b'a'), bytearray(b'b')]
+bytearray(b'a-b') bytearray(b'ab') True True
+b'xy' -1 False
+ValueError byte must be in range(0, 256)
+bytearray(b'aXYZc')
+bytearray(b'\x01X\x02Z\x03')
+ValueError attempt to assign bytes of size 2 to extended slice of size 3
+bytearray(b'XZ')
+bytearray(b'XZ!!')
+bytearray(b'XZ!!XZ!!')
+bytearray(b'XZ!!XZ!!ab\x01\x02z')
+bytearray(b'z\x02\x01ba!!ZX!!ZX') bytearray(b'z\x02\x01ba!!ZX!!ZX')
+bytearray(b'') 0
+bytearray(b'aaaa')
+bytearray(b'aaaaaaa')
+bytearray(b'aaaaaaa')
+BufferError Existing exports of data: object cannot be re-sized
+bytearray(b'')
+97
+[98, 99, 100]
+97
+[]
+99
+IndexError pop index out of range
+bytearray(b'xabcy')
+bytearray(b'bca')
+bytearray(b'bd')
+bytearray(b'0235689')
+bytearray(b'258')
+bytearray(b'abcZ')

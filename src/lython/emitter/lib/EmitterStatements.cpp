@@ -1209,7 +1209,14 @@ void ModuleEmitter::emitStatement(const parser::Node &statement) {
       mlir::Type targetType = types.inferExpr(target.get());
       std::optional<MethodBinding> inPlace =
           lookupClassMethod(targetType, entry.method);
-      if (!inPlace || !inPlace->method)
+      // ⭐ A MANIFEST CLASS THAT DECLARES THE DUNDER TAKES IT TOO, by the same
+      // rule. bytearray's `__iadd__` extends in place; spelled `b = b + x`,
+      // `w = b; b += x` left `w` the old bytes and `b` a new object.
+      bool manifestInPlace =
+          (!inPlace || !inPlace->method) &&
+          types.declaresManifestMethod(types.widenLiteral(targetType),
+                                       entry.method);
+      if ((!inPlace || !inPlace->method) && !manifestInPlace)
         break;
       parser::NodePtr attribute = synth::attribute(target, std::string(entry.method), statement.range);
       parser::NodePtr call = synth::call(std::move(attribute), std::vector<parser::NodePtr>{rhs}, statement.range);
@@ -1922,10 +1929,11 @@ void ModuleEmitter::emitSliceProtocolMutation(const parser::Node &target,
   }
   if (!requireStaticEvidence(target, inference))
     return;
-  if (!types.isStructuralMutatorMethod(container.type, methodName)) {
-    unsupported("target's manifest does not declare the slice mutator");
-    return;
-  }
+  // ⛔ Not refused when the method is no structural mutator: the rebind only
+  // demotes a list's element evidence, and a receiver with none to demote --
+  // bytearray, whose payload moves under its handle -- takes the plain call.
+  if (!types.isStructuralMutatorMethod(container.type, methodName))
+    rebindable = false;
   Value posPack = emitPack(arguments);
   Value namePack = emitPack({});
   Value valuePack = emitPack({});
