@@ -8,6 +8,8 @@ module attributes {
   ly.typing.manifest,
   ly.runtime.contracts = ["builtins.dict"]
 } {
+  func.func private @__ly_pending_push(%mark: i64, %kind: i64, %value: i64) -> i64
+  func.func private @__ly_pending_pop(%index: i64)
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
@@ -1049,6 +1051,11 @@ module attributes {
   // it may trigger updates the handle, and the entry it writes lands in an
   // array the handle points at. Nothing about the entity is renamed, so the
   // caller's reference is still the caller's after the call.
+  // ⭐ The two boxes are this call's to place, so they are registered until
+  // they are placed: hashing the key and comparing it against the table can
+  // raise (an unhashable key, a user `__hash__` or `__eq__`), and the caller
+  // has already handed their references over (errors.mlir, "what a native
+  // body owes").
   func.func @LyDict_SetItemBox(%self: memref<8xi64> {ly.ownership.object_header}, %key_box: memref<5xi64>, %value_box: memref<5xi64>) attributes {ly.runtime.contract = "builtins.dict", ly.runtime.primitive = "setitem_box"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -1062,9 +1069,18 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
+    %mark_slot = memref.alloca() : memref<1xi64>
+    %mark_index = memref.extract_aligned_pointer_as_index %mark_slot : memref<1xi64> -> index
+    %mark = arith.index_cast %mark_index : index to i64
+    %value_idx = memref.extract_aligned_pointer_as_index %value_box : memref<5xi64> -> index
+    %value_i64 = arith.index_cast %value_idx : index to i64
+    %box_kind = arith.constant 1 : i64
+    %pending = func.call @__ly_pending_push(%mark, %box_kind, %box_i64) : (i64, i64, i64) -> i64
+    %pending_value = func.call @__ly_pending_push(%mark, %box_kind, %value_i64) : (i64, i64, i64) -> i64
     %hash_role_3 = arith.constant 1 : i64
     %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_3) : (!llvm.ptr, i64) -> i64
     %found = func.call @__ly_dict_probe(%self, %box_ptr, %hash) : (memref<8xi64>, !llvm.ptr, i64) -> i64
+    func.call @__ly_pending_pop(%pending) : (i64) -> ()
 
     %missing = arith.cmpi eq, %found, %minus_one : i64
     scf.if %missing {
