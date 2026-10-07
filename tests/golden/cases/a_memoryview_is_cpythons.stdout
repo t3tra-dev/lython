@@ -1,0 +1,24 @@
+5 101 111 b'el' b'olleh' [104, 108, 111]
+False B 1 5 1 (5,) (1,) True True True
+(-1,) (3,) False
+True True True False False
+True True True
+IndexError index out of bounds on dimension 1
+BufferError Existing exports of data: object cannot be re-sized
+bytearray(b'Hello')
+ValueError memoryview: invalid value for format 'B'
+bytearray(b'HEllo')
+ValueError memoryview assignment: lvalue and rvalue have different structures
+48456c6c6f b'HEllo' [72, 69, 108, 108, 111] bytearray(b'HEllo')
+ValueError cannot hash writable memoryview object
+TypeError cannot modify read-only memory
+True True True True
+ValueError operation forbidden on released memoryview object
+ValueError operation forbidden on released memoryview object
+bytearray(b'HEllo!')
+72
+ValueError operation forbidden on released memoryview object
+BufferError Existing exports of data: object cannot be re-sized
+7
+b'xyz' [97, 98] True False [99, 98, 97]
+<memory at 0x

@@ -2527,3 +2527,42 @@ TEST(EmitterTest, ABytearrayTakesWhatCPythonTakes) {
       "main.py", "<lython-no-import-dir>", native, context, module, diag)))
       << diagnostics;
 }
+
+// What: a memoryview views bytes, a bytearray or another view -- a str is
+// refused as CPython refuses it at run time, and so are deleting an item
+// (CPython's "cannot delete memory") and cast(), which this port leaves out;
+// the spellings it accepts emit, attributes included.
+TEST(EmitterTest, AMemoryviewTakesWhatItCanView) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (auto [source, expected] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"m = memoryview(\"abc\")\n", "but no signature that accepts"},
+           {"m = memoryview(bytearray(b\"ab\"))\ndel m[0]\n",
+            "'__delitem__'"},
+           {"m = memoryview(b\"ab\")\nc = m.cast(\"B\")\n", "'cast'"}}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << source;
+    EXPECT_NE(diagnostics.find(expected), std::string::npos)
+        << source << diagnostics;
+  }
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+      "b = bytearray(b\"abc\")\nm = memoryview(b)\nr = memoryview(b\"x\")\n"
+      "v = memoryview(m)\ns = m[::-1]\nm[0] = 1\nm[0:1] = b\"z\"\n"
+      "print(len(m), m[0], s.tolist(), m.readonly, m.format, m.shape,\n"
+      "      m.strides, m.nbytes, bytes(m), bytearray(v), m == b\"abc\")\n"
+      "with memoryview(r) as w:\n    print(w.tobytes(), w.hex())\n"
+      "m.release()\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+      << diagnostics;
+}

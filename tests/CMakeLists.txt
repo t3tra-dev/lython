@@ -617,6 +617,13 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # A view's references -- the object it views, one of a bytearray's
+    # exports, a slice's own of each, an iterator's of the view -- each given
+    # back by release() or by the last reference, which nothing a golden
+    # prints can tell from a view that keeps them. It also holds an empty
+    # bytearray to the end, whose payload address once pointed one past its
+    # block and read as a 16-byte leak.
+    a_bytearray_refuses_to_resize_while_viewed
     # An element read folded back to the loop variable it came from: the
     # element's token is an alias of the loop-carried argument, so nothing in
     # placement or verification can tell the two references apart by name. Only

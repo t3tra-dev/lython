@@ -13,6 +13,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.bytes", "builtins.bytes_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @LyMemoryView_ToBytes(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "tobytes"}
   func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
@@ -85,7 +86,7 @@ module attributes {
                     "isupper", "__contains__", "__contains__",
                     "__lt__", "__le__", "__gt__", "__ge__", "__iter__",
                     "__init__", "__init__", "__init__", "__init__",
-                    "__init__", "__getslice__", "__new__", "__init__", "__add__", "__contains__", "__lt__", "__le__", "__gt__", "__ge__"],
+                    "__init__", "__getslice__", "__new__", "__init__", "__add__", "__contains__", "__lt__", "__le__", "__gt__", "__ge__", "__new__", "__init__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">] -> [!py.contract<"builtins.int">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"typing.SupportsIndex">] -> [!py.contract<"builtins.int">]>,
@@ -164,7 +165,9 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.bool">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bytes">>, !py.contract<"builtins.memoryview">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytes">, !py.contract<"builtins.memoryview">] -> [!py.literal<None>]>
     ],
     method_kinds = ["instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance",
@@ -177,7 +180,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance",
                     "instance",
-                    "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "classmethod", "instance"]
   } {}
 
   // ===== impls: bytes =====
@@ -293,6 +296,16 @@ module attributes {
   }
 
   func.func @LyBytes_InitEmpty(%self: memref<4xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
+  // bytes(view): the bytes a memoryview shows (_PyBytes_FromBuffer).
+  func.func @LyBytes_NewFromView(%view: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"} {
+    %bytes = func.call @LyMemoryView_ToBytes(%view) : (memref<8xi64>) -> memref<4xi64>
+    func.return %bytes : memref<4xi64>
+  }
+
+  func.func @LyBytes_InitFromView(%self: memref<4xi64> {ly.ownership.object_header}, %view: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__init__"} {
     func.return
   }
 

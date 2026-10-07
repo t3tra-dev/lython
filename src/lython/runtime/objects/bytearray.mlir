@@ -24,6 +24,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.bytearray", "builtins.bytearray_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @LyMemoryView_ToBytes(%self: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.memoryview", ly.runtime.method = "tobytes"}
   func.func private @LyBytes_Bool(%header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__bool__"}
   func.func private @LyBytes_Capitalize(%header: memref<4xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.method = "capitalize", ly.runtime.result_contract = "builtins.bytes"}
   func.func private @LyBytes_ContainsBytes(%header: memref<4xi64> {ly.ownership.object_header}, %sub_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__contains__"}
@@ -115,7 +116,7 @@ module attributes {
                     "isspace", "isascii", "islower", "isupper", "upper", "lower", "swapcase",
                     "capitalize", "title", "strip", "strip", "lstrip", "lstrip", "rstrip",
                     "rstrip", "removeprefix", "removesuffix", "replace", "replace", "split",
-                    "split", "split", "join"],
+                    "split", "split", "join", "__new__", "__init__"],
     method_contracts = [
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bytearray">>] -> [!py.self]>,
       !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bytearray">>, !py.contract<"builtins.int">] -> [!py.self]>,
@@ -220,7 +221,9 @@ module attributes {
       !py.protocol<"Callable", [!py.contract<"builtins.bytearray">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.bytearray">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytearray">, !py.contract<"builtins.bytes">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.bytearray">]>]>,
       !py.protocol<"Callable", [!py.contract<"builtins.bytearray">, !py.contract<"builtins.bytes">, !py.contract<"builtins.int">] -> [!py.contract<"builtins.list", [!py.contract<"builtins.bytearray">]>]>,
-      !py.protocol<"Callable", [!py.contract<"builtins.bytearray">, !py.protocol<"Iterable", [!py.contract<"builtins.bytes">]>] -> [!py.contract<"builtins.bytearray">]>
+      !py.protocol<"Callable", [!py.contract<"builtins.bytearray">, !py.protocol<"Iterable", [!py.contract<"builtins.bytes">]>] -> [!py.contract<"builtins.bytearray">]>,
+      !py.protocol<"Callable", [!py.type<!py.contract<"builtins.bytearray">>, !py.contract<"builtins.memoryview">] -> [!py.self]>,
+      !py.protocol<"Callable", [!py.contract<"builtins.bytearray">, !py.contract<"builtins.memoryview">] -> [!py.literal<None>]>
     ],
     method_kinds = ["classmethod", "classmethod", "classmethod", "classmethod", "classmethod",
                     "classmethod", "instance", "instance", "instance", "instance", "instance",
@@ -239,7 +242,7 @@ module attributes {
                     "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance",
                     "instance", "instance", "instance", "instance", "instance", "instance",
-                    "instance", "instance", "instance"]
+                    "instance", "instance", "instance", "classmethod", "instance"]
   } {}
 
   py.class @bytearray_iterator attributes {
@@ -257,19 +260,59 @@ module attributes {
   //
   // The handle is bytes' four words -- refcount, class 26, the payload's
   // address, the length -- and the payload lives in a block of its own:
-  // [ob_alloc][ob_alloc bytes]. The block moves when PyByteArray_Resize's
-  // policy says so, and the handle's address word moves with it, so every
-  // holder reads the payload where it is now.
+  // [ob_alloc][ob_exports][ob_alloc bytes]. The block moves when
+  // PyByteArray_Resize's policy says so, and the handle's address word moves
+  // with it, so every holder reads the payload where it is now -- except a
+  // memoryview, which holds the address itself and counts in ob_exports, and
+  // while it does nothing may resize (CPython's _canresize).
   func.func private @LyByteArray_Shape() -> memref<4xi64> attributes {ly.runtime.contract = "builtins.bytearray", ly.runtime.shape}
   func.func private @LyByteArrayIterator_Shape() -> memref<4xi64> attributes {ly.runtime.contract = "builtins.bytearray_iterator", ly.runtime.shape}
 
-  // The block's address: one word before the payload.
+  // The block's address: two words before the payload.
   func.func private @__ly_bytearray_block(%self: memref<4xi64>) -> i64 attributes {ly.runtime.contract = "builtins.bytearray"} {
     %payload_slot = arith.constant 2 : index
-    %word = arith.constant 8 : i64
+    %prefix = arith.constant 16 : i64
     %payload = memref.load %self[%payload_slot] : memref<4xi64>
-    %block = arith.subi %payload, %word : i64
+    %block = arith.subi %payload, %prefix : i64
     func.return %block : i64
+  }
+
+  // ob_exports, the block's second word: the memoryviews holding the payload.
+  func.func private @__ly_bytearray_exports(%self: memref<4xi64>) -> i64 attributes {ly.runtime.contract = "builtins.bytearray"} {
+    %c1 = arith.constant 1 : index
+    %two = arith.constant 2 : i64
+    %block = func.call @__ly_bytearray_block(%self) : (memref<4xi64>) -> i64
+    %view = func.call @__ly_global_view_i64(%block, %two) : (i64, i64) -> memref<?xi64>
+    %exports = memref.load %view[%c1] : memref<?xi64>
+    func.return %exports : i64
+  }
+
+  // One export taken (+1) or given back (-1) -- bytearray_getbuffer and
+  // bytearray_releasebuffer.
+  func.func private @__ly_bytearray_add_export(%self: memref<4xi64>, %delta: i64) attributes {ly.runtime.contract = "builtins.bytearray"} {
+    %c1 = arith.constant 1 : index
+    %two = arith.constant 2 : i64
+    %block = func.call @__ly_bytearray_block(%self) : (memref<4xi64>) -> i64
+    %view = func.call @__ly_global_view_i64(%block, %two) : (i64, i64) -> memref<?xi64>
+    %exports = memref.load %view[%c1] : memref<?xi64>
+    %next = arith.addi %exports, %delta : i64
+    memref.store %next, %view[%c1] : memref<?xi64>
+    func.return
+  }
+
+  // _canresize: BufferError while a memoryview holds the payload.
+  func.func private @__ly_bytearray_check_resizable(%self: memref<4xi64>) attributes {ly.runtime.contract = "builtins.bytearray"} {
+    %zero = arith.constant 0 : i64
+    %exports = func.call @__ly_bytearray_exports(%self) : (memref<4xi64>) -> i64
+    %exported = arith.cmpi sgt, %exports, %zero : i64
+    scf.if %exported {
+      %buffer_error = arith.constant 105 : i64
+      %message_length = arith.constant 51 : i64
+      %static = memref.get_global @__ly_bytearray_msg_exported : memref<51xi8>
+      %message = memref.cast %static : memref<51xi8> to memref<?xi8>
+      func.call @__ly_bytearray_raise(%buffer_error, %message, %message_length) : (i64, memref<?xi8>, i64) -> ()
+    }
+    func.return
   }
 
   // ob_alloc, the block's first word.
@@ -282,20 +325,34 @@ module attributes {
     func.return %alloc : i64
   }
 
-  // A block for `alloc` bytes -- `old_block` moved by realloc, or a new one
-  // when it is 0 -- published as the payload of `self`.
+  // A block for `alloc` bytes -- `old_block` moved by realloc, which keeps
+  // its export count, or a new one with none when it is 0 -- published as the
+  // payload of `self`.
   func.func private @__ly_bytearray_reblock(%self: memref<4xi64>, %old_block: i64, %alloc: i64) attributes {ly.runtime.contract = "builtins.bytearray"} {
     %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %word = arith.constant 8 : i64
+    %two = arith.constant 2 : i64
+    %prefix = arith.constant 16 : i64
     %payload_slot = arith.constant 2 : index
-    %bytes = func.call @__ly_alloc_count(%alloc, %one, %word) : (i64, i64, i64) -> index
+    %bytes = func.call @__ly_alloc_count(%alloc, %one, %prefix) : (i64, i64, i64) -> index
     %bytes_word = arith.index_cast %bytes : index to i64
-    %total = arith.addi %bytes_word, %word : i64
+    // ⛔ Never no payload at all, even for an ob_alloc of 0: the address word
+    // would point one past the block's end, which is legal but is not a
+    // pointer INTO the block, so LeakSanitizer took an empty bytearray held to
+    // the end of the program for a leaked one.
+    %empty = arith.cmpi eq, %bytes_word, %zero : i64
+    %room = arith.select %empty, %one, %bytes_word : i64
+    %total = arith.addi %room, %prefix : i64
     %block = func.call @realloc_raw_i64_ptr(%old_block, %total) : (i64, i64) -> i64
-    %view = func.call @__ly_global_view_i64(%block, %one) : (i64, i64) -> memref<?xi64>
+    %view = func.call @__ly_global_view_i64(%block, %two) : (i64, i64) -> memref<?xi64>
     memref.store %alloc, %view[%c0] : memref<?xi64>
-    %payload = arith.addi %block, %word : i64
+    %fresh = arith.cmpi eq, %old_block, %zero : i64
+    scf.if %fresh {
+      memref.store %zero, %view[%c1] : memref<?xi64>
+    }
+    %payload = arith.addi %block, %prefix : i64
     memref.store %payload, %self[%payload_slot] : memref<4xi64>
     func.return
   }
@@ -345,6 +402,10 @@ module attributes {
     %keeps_block_down = arith.xori %major_down, %true : i1
     %minor_down = arith.andi %fits, %keeps_block_down : i1
     %stays = arith.ori %unchanged, %minor_down : i1
+    scf.if %unchanged {
+    } else {
+      func.call @__ly_bytearray_check_resizable(%self) : (memref<4xi64>) -> ()
+    }
     scf.if %stays {
     } else {
       // `size <= alloc * 1.125`, exact in integers: the step past alloc is at
@@ -588,6 +649,18 @@ module attributes {
     func.return
   }
 
+  // bytearray(view): a copy of the bytes a memoryview shows.
+  func.func @LyByteArray_NewFromView(%view: memref<8xi64> {ly.ownership.object_header}) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
+    %bytes = func.call @LyMemoryView_ToBytes(%view) : (memref<8xi64>) -> memref<4xi64>
+    %self = func.call @__ly_bytearray_from_bytes(%bytes) : (memref<4xi64>) -> memref<4xi64>
+    func.call @LyBytes_DecRef(%bytes) : (memref<4xi64>) -> ()
+    func.return %self : memref<4xi64>
+  }
+
+  func.func @LyByteArray_InitFromView(%self: memref<4xi64> {ly.ownership.object_header}, %view: memref<8xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.bytearray", ly.runtime.method = "__init__"} {
+    func.return
+  }
+
   // bytearray(text, encoding): the text encoded, as bytes(text, encoding) is.
   func.func @LyByteArray_NewEncoded(%text_header: memref<2xi64> {ly.ownership.object_header}, %text_bytes: memref<?xi8>, %encoding_header: memref<2xi64> {ly.ownership.object_header}, %encoding_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 26 : i64, ly.runtime.contract = "builtins.bytearray", ly.runtime.initializer = "__new__"} {
     %encoded = func.call @LyBytes_NewEncoded(%text_header, %text_bytes, %encoding_header, %encoding_bytes) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> memref<4xi64>
@@ -642,6 +715,7 @@ module attributes {
     %one = arith.constant 1 : i64
     %length_slot = arith.constant 3 : index
     %index = func.call @__ly_bytearray_index(%self, %raw_index) : (memref<4xi64>, i64) -> i64
+    func.call @__ly_bytearray_check_resizable(%self) : (memref<4xi64>) -> ()
     %length = memref.load %self[%length_slot] : memref<4xi64>
     %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
     %next = arith.addi %index, %one : i64
@@ -699,6 +773,15 @@ module attributes {
     %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
     %nothing = arith.cmpi eq, %count, %zero : i64
     %contiguous = arith.cmpi eq, %step, %one : i64
+    // An extended slice is checked even when it selects nothing: CPython's
+    // deletion asks _canresize before it looks at the slice's length.
+    %true = arith.constant true
+    %something = arith.xori %nothing, %true : i1
+    %extended = arith.xori %contiguous, %true : i1
+    %checked = arith.ori %something, %extended : i1
+    scf.if %checked {
+      func.call @__ly_bytearray_check_resizable(%self) : (memref<4xi64>) -> ()
+    }
     scf.if %nothing {
     } else {
       scf.if %contiguous {
@@ -780,6 +863,7 @@ module attributes {
       %grows = arith.cmpi sgt, %growth, %zero : i64
       %new_length = arith.addi %length, %growth : i64
       scf.if %shrinks {
+        func.call @__ly_bytearray_check_resizable(%self) : (memref<4xi64>) -> ()
         %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
         func.call @__ly_bytearray_move(%payload, %new_hi, %hi, %tail) : (memref<?xi8>, i64, i64, i64) -> ()
         func.call @__ly_bytearray_resize(%self, %new_length) : (memref<4xi64>, i64) -> ()
@@ -1001,6 +1085,7 @@ module attributes {
       %message = memref.cast %static : memref<22xi8> to memref<?xi8>
       func.call @__ly_bytearray_raise(%index_error, %message, %message_length) : (i64, memref<?xi8>, i64) -> ()
     }
+    func.call @__ly_bytearray_check_resizable(%self) : (memref<4xi64>) -> ()
     %payload = func.call @__ly_bytes_payload(%self) : (memref<4xi64>) -> memref<?xi8>
     %at = arith.index_cast %index : i64 to index
     %byte = memref.load %payload[%at] : memref<?xi8>
@@ -1050,6 +1135,7 @@ module attributes {
       %message = memref.cast %static : memref<28xi8> to memref<?xi8>
       func.call @__ly_bytearray_raise(%value_error, %message, %message_length) : (i64, memref<?xi8>, i64) -> ()
     }
+    func.call @__ly_bytearray_check_resizable(%self) : (memref<4xi64>) -> ()
     %next = arith.addi %found, %one : i64
     %tail = arith.subi %length, %next : i64
     func.call @__ly_bytearray_move(%payload, %found, %next, %tail) : (memref<?xi8>, i64, i64, i64) -> ()
