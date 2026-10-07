@@ -43,7 +43,7 @@ module attributes {
   func.func private @__ly_sequence_equal_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i1
   func.func private @__ly_sequence_find_lens(%len: i64, %items: memref<?xi64>, %probe: !llvm.ptr) -> i64
   func.func private @__ly_slice_adjust(%len: i64, %start_in: i64, %stop_in: i64, %step: i64, %mask: i64) -> (i64, i64)
-  func.func private @__ly_slice_raise_extended_mismatch(%src_len: i64, %slice_len: i64)
+  func.func private @__ly_slice_raise_extended_mismatch(%prefix: memref<?xi8>, %prefix_len: i64, %src_len: i64, %slice_len: i64)
   func.func private @__ly_slice_raise_zero_step()
   func.func private @__ly_slot_class(%word: i64) -> i64
   func.func private @__ly_slot_less(%items_ptr: !llvm.ptr, %a: i64, %b: i64) -> i1
@@ -1083,6 +1083,9 @@ module attributes {
   // Both interior views are derived before the reallocation on purpose: the
   // splice reads the OLD array (and `a[1:3] = a` makes the source the same
   // array), so the reads must happen before the base word moves.
+  // "attempt to assign sequence of size "
+  memref.global "private" constant @__ly_list_msg_assign_prefix : memref<35xi8> = dense<[97, 116, 116, 101, 109, 112, 116, 32, 116, 111, 32, 97, 115, 115, 105, 103, 110, 32, 115, 101, 113, 117, 101, 110, 99, 101, 32, 111, 102, 32, 115, 105, 122, 101, 32]>
+
   func.func @LyList_SetSlice(%self: memref<5xi64> {ly.ownership.object_header}, %start_raw: i64 {ly.runtime.clip_i64}, %stop_raw: i64 {ly.runtime.clip_i64}, %step_raw: i64 {ly.runtime.clip_i64}, %mask: i64, %src: memref<5xi64> {ly.ownership.object_header}) attributes {ly.runtime.contract = "builtins.list", ly.runtime.method = "__setslice__"} {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
@@ -1162,7 +1165,10 @@ module attributes {
       %len_matches = arith.cmpi eq, %src_len, %adj#1 : i64
       scf.if %len_matches {
       } else {
-        func.call @__ly_slice_raise_extended_mismatch(%src_len, %adj#1) : (i64, i64) -> ()
+        %sequence_prefix_static = memref.get_global @__ly_list_msg_assign_prefix : memref<35xi8>
+        %sequence_prefix = memref.cast %sequence_prefix_static : memref<35xi8> to memref<?xi8>
+        %sequence_prefix_len = arith.constant 35 : i64
+        func.call @__ly_slice_raise_extended_mismatch(%sequence_prefix, %sequence_prefix_len, %src_len, %adj#1) : (memref<?xi8>, i64, i64, i64) -> ()
       }
       %count = arith.index_cast %adj#1 : i64 to index
       scf.for %k = %c0 to %count step %c1 {

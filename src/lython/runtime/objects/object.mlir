@@ -22,6 +22,8 @@ module attributes {
   ly.runtime.contracts = ["types.NoneType", "builtins.object"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @LyBytes_EqBool(%lhs_header: memref<4xi64> {ly.ownership.object_header}, %rhs_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__eq__"}
+  func.func private @LyBytes_LtBool(%lhs_header: memref<4xi64> {ly.ownership.object_header}, %rhs_header: memref<4xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.method = "__lt__"}
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyFloat_SlotWordAsF64(%word: i64) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_as_f64"}
   func.func private @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"}
@@ -765,6 +767,7 @@ module attributes {
   memref.global "private" constant @__ly_hash_msg_unhashable_list : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 108, 105, 115, 116, 39]>
   memref.global "private" constant @__ly_hash_msg_unhashable_dict : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 100, 105, 99, 116, 39]>
   memref.global "private" constant @__ly_hash_msg_unhashable_set : memref<22xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 115, 101, 116, 39]>
+  memref.global "private" constant @__ly_hash_msg_unhashable_bytearray : memref<28xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 98, 121, 116, 101, 97, 114, 114, 97, 121, 39]>
 
   func.func private @__ly_hash_raise_unhashable(%class_id: i64) {
     %type_error = arith.constant 52 : i64
@@ -784,10 +787,19 @@ module attributes {
         %len = arith.constant 23 : i64
         func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
       } else {
-        %msg_static = memref.get_global @__ly_hash_msg_unhashable_set : memref<22xi8>
-        %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
-        %len = arith.constant 22 : i64
-        func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+        %c26 = arith.constant 26 : i64
+        %is_bytearray = arith.cmpi eq, %class_id, %c26 : i64
+        scf.if %is_bytearray {
+          %msg_static = memref.get_global @__ly_hash_msg_unhashable_bytearray : memref<28xi8>
+          %msg = memref.cast %msg_static : memref<28xi8> to memref<?xi8>
+          %len = arith.constant 28 : i64
+          func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+        } else {
+          %msg_static = memref.get_global @__ly_hash_msg_unhashable_set : memref<22xi8>
+          %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
+          %len = arith.constant 22 : i64
+          func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+        }
       }
     }
     func.return
@@ -884,8 +896,11 @@ module attributes {
       %is_list = arith.cmpi eq, %class_id, %c10 : i64
       %is_dict = arith.cmpi eq, %class_id, %c12 : i64
       %is_set = arith.cmpi eq, %class_id, %c21 : i64
+      %c26 = arith.constant 26 : i64
+      %is_bytearray = arith.cmpi eq, %class_id, %c26 : i64
       %mut0 = arith.ori %is_list, %is_dict : i1
-      %unhashable = arith.ori %mut0, %is_set : i1
+      %mut1 = arith.ori %mut0, %is_set : i1
+      %unhashable = arith.ori %mut1, %is_bytearray : i1
       scf.if %unhashable {
         func.call @__ly_hash_raise_unhashable(%class_id) : (i64) -> ()
       }
@@ -1149,6 +1164,30 @@ module attributes {
   // semantics: identity implies equality (NaN keys), then the numeric tower
   // compares across int/bool/float, then same-class `__eq__` through the
   // generated hook. Distinct classes outside the tower compare unequal.
+  // A bytes (70) and a bytearray (26), in either order.
+  func.func private @__ly_box_bytes_like_pair(%lhs_class: i64, %rhs_class: i64) -> i1 {
+    %bytes_class = arith.constant 70 : i64
+    %bytearray_class = arith.constant 26 : i64
+    %lhs_bytes = arith.cmpi eq, %lhs_class, %bytes_class : i64
+    %lhs_bytearray = arith.cmpi eq, %lhs_class, %bytearray_class : i64
+    %rhs_bytes = arith.cmpi eq, %rhs_class, %bytes_class : i64
+    %rhs_bytearray = arith.cmpi eq, %rhs_class, %bytearray_class : i64
+    %forward = arith.andi %lhs_bytes, %rhs_bytearray : i1
+    %backward = arith.andi %lhs_bytearray, %rhs_bytes : i1
+    %pair = arith.ori %forward, %backward : i1
+    func.return %pair : i1
+  }
+
+  // The two bytes-shaped handles two slot words address.
+  func.func private @__ly_box_bytes_handles(%lhs_word: i64, %rhs_word: i64) -> (memref<4xi64>, memref<4xi64>) {
+    %four = arith.constant 4 : i64
+    %lhs_view = func.call @__ly_global_view_i64(%lhs_word, %four) : (i64, i64) -> memref<?xi64>
+    %rhs_view = func.call @__ly_global_view_i64(%rhs_word, %four) : (i64, i64) -> memref<?xi64>
+    %lhs = memref.cast %lhs_view : memref<?xi64> to memref<4xi64>
+    %rhs = memref.cast %rhs_view : memref<?xi64> to memref<4xi64>
+    func.return %lhs, %rhs : memref<4xi64>, memref<4xi64>
+  }
+
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1 {
     %zero = arith.constant 0 : i64
     %true = arith.constant true
@@ -1227,9 +1266,20 @@ module attributes {
           // found the ids unequal, and answered False without asking anything.
           // The hook decides now -- it accepts a right-hand class that resolves
           // the same implementation -- and `%handled` is the whole answer.
-          %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
-          %same_result = arith.andi %eq, %handled : i1
-          scf.yield %same_result : i1
+          // ⭐ A bytes and a bytearray compare by content, as CPython's
+          // bytearray_richcompare answers for either order. Their handles share
+          // the words bytes' comparison reads.
+          %bytes_mixed = func.call @__ly_box_bytes_like_pair(%lhs_class, %rhs_class) : (i64, i64) -> i1
+          %by_content = scf.if %bytes_mixed -> (i1) {
+            %lh, %rh = func.call @__ly_box_bytes_handles(%lhs_ptr, %rhs_ptr) : (i64, i64) -> (memref<4xi64>, memref<4xi64>)
+            %c = func.call @LyBytes_EqBool(%lh, %rh) : (memref<4xi64>, memref<4xi64>) -> i1
+            scf.yield %c : i1
+          } else {
+            %eq, %handled = func.call @__ly_eq_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+            %same_result = arith.andi %eq, %handled : i1
+            scf.yield %same_result : i1
+          }
+          scf.yield %by_content : i1
         }
         scf.yield %num_result_inner : i1
         }
@@ -1445,12 +1495,20 @@ module attributes {
       // The same rule as the equality hook: a subclass resolves its base's
       // `__lt__`, so the two ids need not be equal for the callee's lanes to be
       // there. `sorted([Q(2), P(1)])` raised TypeError where CPython sorts.
-      %lt, %handled = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
-      scf.if %handled {
+      %bytes_mixed = func.call @__ly_box_bytes_like_pair(%lhs_class, %rhs_class) : (i64, i64) -> i1
+      %inner = scf.if %bytes_mixed -> (i1) {
+        %lh, %rh = func.call @__ly_box_bytes_handles(%lhs_word, %rhs_word) : (i64, i64) -> (memref<4xi64>, memref<4xi64>)
+        %c = func.call @LyBytes_LtBool(%lh, %rh) : (memref<4xi64>, memref<4xi64>) -> i1
+        scf.yield %c : i1
       } else {
-        func.call @__ly_cmp_raise_unorderable() : () -> ()
+        %lt, %handled = func.call @__ly_lt_boxed_by_contract(%lhs, %rhs, %lhs_class, %rhs_class) : (!llvm.ptr, !llvm.ptr, i64, i64) -> (i1, i1)
+        scf.if %handled {
+        } else {
+          func.call @__ly_cmp_raise_unorderable() : () -> ()
+        }
+        %ordered = arith.select %handled, %lt, %false : i1
+        scf.yield %ordered : i1
       }
-      %inner = arith.select %handled, %lt, %false : i1
       scf.yield %inner : i1
     }
     func.return %result : i1

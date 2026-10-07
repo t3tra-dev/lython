@@ -1,0 +1,5 @@
+bytearray(b'abc') bytearray(b'abc') True
+bytearray(b'abcabc') bytearray(b'abcabc') True
+bytearray(b'abcabc!')
+bytearray(b'') bytearray(b'') 0 True
+bytearray(b'xyz') bytearray(b'xyz') True

@@ -73,9 +73,8 @@
 namespace py::lowering::entity_header {
 
 // Words 0 and 1 of every entity: the refcount and the layout/destructor family
-// id. The same pair ContainerLayout.h and StrBytesLayout.h name for their own
-// contracts, stated once here for contracts that have no layout header of their
-// own.
+// id. The same pair ContainerLayout.h names for its own contracts, stated once
+// here for contracts that have no layout header of their own.
 inline constexpr std::int64_t kRefcountWord = 0;
 inline constexpr std::int64_t kClassIdWord = 1;
 inline constexpr std::int64_t kPrefixWordCount = 2;

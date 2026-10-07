@@ -2491,3 +2491,39 @@ TEST(EmitterTest, ASubscriptedSliceAnnotationNamesTheSlice) {
       "main.py", "<lython-no-import-dir>", native, context, module, diag)))
       << diagnostics;
 }
+
+// What: what CPython's bytearray refuses with a TypeError as it runs -- a float
+// or a str without an encoding to build from, a list to `+=` -- is refused
+// here when the program is compiled, and the spellings it accepts emit.
+TEST(EmitterTest, ABytearrayTakesWhatCPythonTakes) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (auto [source, method] :
+       std::initializer_list<std::pair<const char *, const char *>>{
+           {"b = bytearray(1.5)\n", "'__init__'"},
+           {"b = bytearray(\"abc\")\n", "'__init__'"},
+           {"b = bytearray(b\"a\")\nb += [1]\n", "'__iadd__'"}}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        source, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << source;
+    EXPECT_NE(diagnostics.find(std::string("has manifest method ") + method +
+                               " but no signature that accepts"),
+              std::string::npos)
+        << source << diagnostics;
+  }
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+      "a = bytearray()\nb = bytearray(3)\nc = bytearray(b\"x\")\n"
+      "d = bytearray(c)\ne = bytearray([1, 2])\nf = bytearray(\"x\", \"utf-8\")\n"
+      "a += b\nb *= 2\nc[0:1] = [65]\ndel d[::2]\nprint(a, b, c, d, e, f, 2 * e)\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+      << diagnostics;
+}

@@ -1853,6 +1853,7 @@ void TypeSystem::seedBuiltins() {
   bindClass("float", floatType());
   bindClass("str", strType());
   bindClass("bytes", contract("builtins.bytes"));
+  bindClass("bytearray", contract("builtins.bytearray"));
   // ⭐ complex was reachable only as a LITERAL: `1 + 2j` runs, and the manifest
   // has the whole arithmetic surface plus a __new__ that takes two f64 with
   // defaults -- but the NAME was never bound, so `complex(1, 2)` was
