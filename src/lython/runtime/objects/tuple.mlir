@@ -9,7 +9,7 @@ module attributes {
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @__ly_slice_unpack(%self: memref<5xi64>) -> (i64, i64, i64, i64)
-  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64) -> i64
+  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64, %role: i64, %key_class: i64) -> i64
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyErr_NoMemory() attributes {ly.runtime.contract = "builtins.MemoryError"}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
@@ -19,7 +19,6 @@ module attributes {
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_alloc_count(%count: i64, %element_bytes: i64, %extra: i64) -> index
-  func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64
   func.func private @__ly_box_store_entity(%items: memref<?xi64>, %slot: i64, %class_id: i64, %entity: i64)
   func.func private @__ly_box_word_count() -> i64
   func.func private @__ly_check_alloc_count(%count: i64, %element_bytes: i64, %extra: i64)
@@ -87,15 +86,16 @@ module attributes {
   } {}
 
   // tuple.__hash__: CPython's xxHash-based combiner (tuples of equal elements
-  // hash equal; unhashable elements raise through __ly_box_hash).
-  func.func @LyTuple_Hash(%self: memref<5xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__hash__"} {
+  // hash equal; unhashable elements raise through __ly_box_hash_as, with the
+  // role and key class of the dict or set hashing it).
+  func.func private @__ly_tuple_hash_as(%self: memref<5xi64>, %role: i64, %key_class: i64) -> i64 {
     %length_slot = arith.constant 2 : index
     %len = memref.load %self[%length_slot] : memref<5xi64>
     %items = func.call @__ly_tuple_items(%self) : (memref<5xi64>) -> memref<?xi64>
     %items_idx = memref.extract_aligned_pointer_as_index %items : memref<?xi64> -> index
     %items_i64 = arith.index_cast %items_idx : index to i64
     %items_ptr = llvm.inttoptr %items_i64 : i64 to !llvm.ptr
-    %acc = func.call @__ly_xxhash_slot_lanes(%items_ptr, %len) : (!llvm.ptr, i64) -> i64
+    %acc = func.call @__ly_xxhash_slot_lanes(%items_ptr, %len, %role, %key_class) : (!llvm.ptr, i64, i64, i64) -> i64
     // acc += len ^ (XXPRIME_5 ^ 3527539)
     %prime5 = arith.constant 2870177450012600261 : i64
     %salt = arith.constant 3527539 : i64
@@ -107,6 +107,12 @@ module attributes {
     %is_sentinel = arith.cmpi eq, %final, %sentinel : i64
     %result = arith.select %is_sentinel, %replacement, %final : i1, i64
     func.return %result : i64
+  }
+
+  func.func @LyTuple_Hash(%self: memref<5xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__hash__"} {
+    %plain = arith.constant 0 : i64
+    %h = func.call @__ly_tuple_hash_as(%self, %plain, %plain) : (memref<5xi64>, i64, i64) -> i64
+    func.return %h : i64
   }
 
   func.func @LyTuple_EqBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.method = "__eq__"} {

@@ -46,7 +46,7 @@ module attributes {
   func.func private @__ly_slot_word_is_immediate(%word: i64) -> i1
   func.func private @__ly_tuple_alloc(%length: i64) -> memref<5xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.tuple"], ly.ownership.owned_results = [0]}
   func.func private @__ly_tuple_items(%self: memref<5xi64>) -> memref<?xi64> attributes {ly.runtime.contract = "builtins.tuple", ly.runtime.interior_word, ly.runtime.primitive = "items_view"}
-  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64) -> i64
+  func.func private @__ly_xxhash_slot_lanes(%items: !llvm.ptr, %count: i64, %role: i64, %key_class: i64) -> i64
   func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
@@ -628,7 +628,8 @@ module attributes {
     %zero = arith.constant 0 : i64
     %three = arith.constant 3 : i64
     %first = func.call @__ly_slice_word_ptr(%self, %zero) : (memref<5xi64>, i64) -> !llvm.ptr
-    %acc = func.call @__ly_xxhash_slot_lanes(%first, %three) : (!llvm.ptr, i64) -> i64
+    %plain = arith.constant 0 : i64
+    %acc = func.call @__ly_xxhash_slot_lanes(%first, %three, %plain, %plain) : (!llvm.ptr, i64, i64, i64) -> i64
     %sentinel = arith.constant -1 : i64
     %replacement = arith.constant 1546275796 : i64
     %is_sentinel = arith.cmpi eq, %acc, %sentinel : i64

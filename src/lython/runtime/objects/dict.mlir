@@ -20,7 +20,7 @@ module attributes {
   func.func private @LyUnicode_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.str", ly.runtime.deallocator}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
-  func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64
+  func.func private @__ly_box_hash_key(%box: !llvm.ptr, %role: i64) -> i64
   func.func private @__ly_box_word_count() -> i64
   func.func private @__ly_default_repr_from_addr(%ptr: i64, %prefix: memref<?xi8>, %prefix_len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.object", ly.runtime.primitive = "default_repr_addr", ly.runtime.result_contract = "builtins.str"}
   func.func private @__ly_exc_ext_set(%header: memref<3xi64>, %slot: i64, %value: i64) attributes {ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "ext_set"}
@@ -612,7 +612,8 @@ module attributes {
         %unknown = arith.cmpi eq, %cached, %zero : i64
         %hash = scf.if %unknown -> (i64) {
           %entry = llvm.getelementptr %keys_ptr[%base] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-          %computed = func.call @__ly_box_hash(%entry) : (!llvm.ptr) -> i64
+          %hash_role_1 = arith.constant 1 : i64
+          %computed = func.call @__ly_box_hash_key(%entry, %hash_role_1) : (!llvm.ptr, i64) -> i64
           memref.store %computed, %hashes[%i] : memref<?xi64>
           scf.yield %computed : i64
         } else {
@@ -920,7 +921,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_2 = arith.constant 1 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_2) : (!llvm.ptr, i64) -> i64
     %slot = func.call @__ly_dict_probe(%self, %box_ptr, %hash) : (memref<8xi64>, !llvm.ptr, i64) -> i64
     func.return %slot : i64
   }
@@ -1060,7 +1062,8 @@ module attributes {
     %box_idx = memref.extract_aligned_pointer_as_index %key_box : memref<5xi64> -> index
     %box_i64 = arith.index_cast %box_idx : index to i64
     %box_ptr = llvm.inttoptr %box_i64 : i64 to !llvm.ptr
-    %hash = func.call @__ly_box_hash(%box_ptr) : (!llvm.ptr) -> i64
+    %hash_role_3 = arith.constant 1 : i64
+    %hash = func.call @__ly_box_hash_key(%box_ptr, %hash_role_3) : (!llvm.ptr, i64) -> i64
     %found = func.call @__ly_dict_probe(%self, %box_ptr, %hash) : (memref<8xi64>, !llvm.ptr, i64) -> i64
 
     %missing = arith.cmpi eq, %found, %minus_one : i64
@@ -1229,7 +1232,8 @@ module attributes {
     %cached = memref.load %src_hashes[%src_slot] : memref<?xi64>
     %unknown = arith.cmpi eq, %cached, %zero : i64
     %hash = scf.if %unknown -> (i64) {
-      %computed = func.call @__ly_box_hash(%key_entry) : (!llvm.ptr) -> i64
+      %hash_role_4 = arith.constant 1 : i64
+      %computed = func.call @__ly_box_hash_key(%key_entry, %hash_role_4) : (!llvm.ptr, i64) -> i64
       memref.store %computed, %src_hashes[%src_slot] : memref<?xi64>
       scf.yield %computed : i64
     } else {
@@ -1359,7 +1363,8 @@ module attributes {
             %ii = arith.index_cast %i : index to i64
             %off = arith.muli %ii, %c16_i64 : i64
             %key_entry = llvm.getelementptr %keys_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
-            %key_hash = func.call @__ly_box_hash(%key_entry) : (!llvm.ptr) -> i64
+            %hash_role_5 = arith.constant 1 : i64
+            %key_hash = func.call @__ly_box_hash_key(%key_entry, %hash_role_5) : (!llvm.ptr, i64) -> i64
             %slot = func.call @__ly_dict_probe(%other, %key_entry, %key_hash) : (memref<8xi64>, !llvm.ptr, i64) -> i64
             %found = arith.cmpi ne, %slot, %minus_one : i64
             %value_ok = scf.if %found -> (i1) {

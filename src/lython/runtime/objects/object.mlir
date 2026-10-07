@@ -761,47 +761,71 @@ module attributes {
   // Uniform per-element hash/eq dispatch, generated per program by the
   // lowering (class id -> the manifest __hash__ / __eq__); resolved at link.
   func.func private @__ly_hash_boxed_by_contract(%box: !llvm.ptr, %class_id: i64) -> (i64, i1)
+  func.func private @__ly_tuple_hash_as(%self: memref<5xi64>, %role: i64, %key_class: i64) -> i64
   func.func private @__ly_eq_boxed_by_contract(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %class_id: i64, %rhs_class_id: i64) -> (i1, i1)
 
-  // "unhashable type: '<name>'"
-  memref.global "private" constant @__ly_hash_msg_unhashable_list : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 108, 105, 115, 116, 39]>
-  memref.global "private" constant @__ly_hash_msg_unhashable_dict : memref<23xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 100, 105, 99, 116, 39]>
-  memref.global "private" constant @__ly_hash_msg_unhashable_set : memref<22xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 115, 101, 116, 39]>
-  memref.global "private" constant @__ly_hash_msg_unhashable_bytearray : memref<28xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39, 98, 121, 116, 101, 97, 114, 114, 97, 121, 39]>
+  // PyObject_Hash's refusal, and what dict and set make of it in 3.14
+  // (dictobject.c's dict_unhashable_type, setobject.c's set_unhashable_type):
+  // `role` 0 is hash() -- "unhashable type: 'list'" -- 1 a dict key and 2 a
+  // set element -- "cannot use 'tuple' as a dict key (unhashable type:
+  // 'list')", the first name the KEY's class and the second the item that
+  // refused, which differ when a tuple holds the list.
+  memref.global "private" constant @__ly_hash_msg_cannot_use : memref<12xi8> = dense<[99, 97, 110, 110, 111, 116, 32, 117, 115, 101, 32, 39]>
+  memref.global "private" constant @__ly_hash_msg_as_dict_key : memref<17xi8> = dense<[39, 32, 97, 115, 32, 97, 32, 100, 105, 99, 116, 32, 107, 101, 121, 32, 40]>
+  memref.global "private" constant @__ly_hash_msg_as_set_element : memref<20xi8> = dense<[39, 32, 97, 115, 32, 97, 32, 115, 101, 116, 32, 101, 108, 101, 109, 101, 110, 116, 32, 40]>
+  memref.global "private" constant @__ly_hash_msg_unhashable : memref<18xi8> = dense<[117, 110, 104, 97, 115, 104, 97, 98, 108, 101, 32, 116, 121, 112, 101, 58, 32, 39]>
 
-  func.func private @__ly_hash_raise_unhashable(%class_id: i64) {
-    %type_error = arith.constant 52 : i64
-    %c10 = arith.constant 10 : i64
-    %c12 = arith.constant 12 : i64
-    %is_list = arith.cmpi eq, %class_id, %c10 : i64
-    %is_dict = arith.cmpi eq, %class_id, %c12 : i64
-    scf.if %is_list {
-      %msg_static = memref.get_global @__ly_hash_msg_unhashable_list : memref<23xi8>
-      %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
-      %len = arith.constant 23 : i64
-      func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
-    } else {
-      scf.if %is_dict {
-        %msg_static = memref.get_global @__ly_hash_msg_unhashable_dict : memref<23xi8>
-        %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
-        %len = arith.constant 23 : i64
-        func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
+  func.func private @__ly_hash_raise_unhashable(%class_id: i64, %role: i64, %key_class: i64) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c0_i64 = arith.constant 0 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %quote = arith.constant 39 : i8
+    %close = arith.constant 41 : i8
+    %buffer_static = memref.alloca() : memref<320xi8>
+    %buffer = memref.cast %buffer_static : memref<320xi8> to memref<?xi8>
+    %keyed = arith.cmpi ne, %role, %c0_i64 : i64
+    %opened = scf.if %keyed -> (index) {
+      %cu_static = memref.get_global @__ly_hash_msg_cannot_use : memref<12xi8>
+      %cu = memref.cast %cu_static : memref<12xi8> to memref<?xi8>
+      %cu_len = arith.constant 12 : index
+      %a1 = func.call @__ly_msg_append(%buffer, %c0, %cu, %cu_len) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+      %a2 = func.call @__ly_msg_append_class_name(%buffer, %a1, %key_class) : (memref<?xi8>, index, i64) -> (index)
+      %is_dict = arith.cmpi eq, %role, %c1_i64 : i64
+      %a3 = scf.if %is_dict -> (index) {
+        %dk_static = memref.get_global @__ly_hash_msg_as_dict_key : memref<17xi8>
+        %dk = memref.cast %dk_static : memref<17xi8> to memref<?xi8>
+        %dk_len = arith.constant 17 : index
+        %e = func.call @__ly_msg_append(%buffer, %a2, %dk, %dk_len) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+        scf.yield %e : index
       } else {
-        %c26 = arith.constant 26 : i64
-        %is_bytearray = arith.cmpi eq, %class_id, %c26 : i64
-        scf.if %is_bytearray {
-          %msg_static = memref.get_global @__ly_hash_msg_unhashable_bytearray : memref<28xi8>
-          %msg = memref.cast %msg_static : memref<28xi8> to memref<?xi8>
-          %len = arith.constant 28 : i64
-          func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
-        } else {
-          %msg_static = memref.get_global @__ly_hash_msg_unhashable_set : memref<22xi8>
-          %msg = memref.cast %msg_static : memref<22xi8> to memref<?xi8>
-          %len = arith.constant 22 : i64
-          func.call @__ly_raise_static_message(%type_error, %msg, %len) : (i64, memref<?xi8>, i64) -> ()
-        }
+        %se_static = memref.get_global @__ly_hash_msg_as_set_element : memref<20xi8>
+        %se = memref.cast %se_static : memref<20xi8> to memref<?xi8>
+        %se_len = arith.constant 20 : index
+        %e = func.call @__ly_msg_append(%buffer, %a2, %se, %se_len) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+        scf.yield %e : index
       }
+      scf.yield %a3 : index
+    } else {
+      scf.yield %c0 : index
     }
+    %uh_static = memref.get_global @__ly_hash_msg_unhashable : memref<18xi8>
+    %uh = memref.cast %uh_static : memref<18xi8> to memref<?xi8>
+    %uh_len = arith.constant 18 : index
+    %b1 = func.call @__ly_msg_append(%buffer, %opened, %uh, %uh_len) : (memref<?xi8>, index, memref<?xi8>, index) -> (index)
+    %b2 = func.call @__ly_msg_append_class_name(%buffer, %b1, %class_id) : (memref<?xi8>, index, i64) -> (index)
+    memref.store %quote, %buffer[%b2] : memref<?xi8>
+    %b3 = arith.addi %b2, %c1 : index
+    %end = scf.if %keyed -> (index) {
+      memref.store %close, %buffer[%b3] : memref<?xi8>
+      %b4 = arith.addi %b3, %c1 : index
+      scf.yield %b4 : index
+    } else {
+      scf.yield %b3 : index
+    }
+    %length = arith.index_cast %end : index to i64
+    %type_error = arith.constant 52 : i64
+    func.call @__ly_raise_static_message(%type_error, %buffer, %length) : (i64, memref<?xi8>, i64) -> ()
     func.return
   }
 
@@ -878,7 +902,30 @@ module attributes {
     func.return
   }
 
+  // PyObject_Hash.
   func.func private @__ly_box_hash(%box: !llvm.ptr) -> i64 {
+    %plain = arith.constant 0 : i64
+    %h = func.call @__ly_box_hash_as(%box, %plain, %plain) : (!llvm.ptr, i64, i64) -> i64
+    func.return %h : i64
+  }
+
+  // A dict key's or a set element's hash (`role` 1 or 2, as
+  // `__ly_hash_raise_unhashable` reads it): the refusal names the key.
+  func.func private @__ly_box_hash_key(%box: !llvm.ptr, %role: i64) -> i64 {
+    %slot_word = llvm.load %box : !llvm.ptr -> i64
+    %key_class = func.call @__ly_slot_class(%slot_word) : (i64) -> i64
+    %h = func.call @__ly_box_hash_as(%box, %role, %key_class) : (!llvm.ptr, i64, i64) -> i64
+    func.return %h : i64
+  }
+
+  // ⛔ The role is carried down, not caught and rewrapped as CPython does it:
+  // a native body cannot catch, and a role parked in a global goes stale when
+  // something else unwinds through the hash. So a keyed hash of a tuple takes
+  // the tuple's items itself (`__ly_tuple_hash_as`) rather than the hook,
+  // whose `__hash__` has no role to pass on. What this cannot reach: a source
+  // class's `__hash__` -- its own TypeError, or a hash() it calls -- keeps the
+  // bare message where CPython adds the prefix.
+  func.func private @__ly_box_hash_as(%box: !llvm.ptr, %role: i64, %key_class: i64) -> i64 {
     %zero = arith.constant 0 : i64
     %c1_i64 = arith.constant 1 : i64
     %c2_i64 = arith.constant 2 : i64
@@ -902,7 +949,7 @@ module attributes {
       %mut1 = arith.ori %mut0, %is_set : i1
       %unhashable = arith.ori %mut1, %is_bytearray : i1
       scf.if %unhashable {
-        func.call @__ly_hash_raise_unhashable(%class_id) : (i64) -> ()
+        func.call @__ly_hash_raise_unhashable(%class_id, %role, %key_class) : (i64, i64, i64) -> ()
       }
       // ⭐ An immediate int hashes from its value, with no object made for
       // the hook to read: CPython's long_hash, v mod (2^61 - 1) with the sign
@@ -924,8 +971,22 @@ module attributes {
         %true_h = arith.constant true
         scf.yield %signed, %true_h : i64, i1
       } else {
-        %hh, %hd = func.call @__ly_hash_boxed_by_contract(%box, %class_id) : (!llvm.ptr, i64) -> (i64, i1)
-        scf.yield %hh, %hd : i64, i1
+        %tuple_class = arith.constant 11 : i64
+        %is_tuple = arith.cmpi eq, %class_id, %tuple_class : i64
+        %keyed = arith.cmpi ne, %role, %zero : i64
+        %keyed_tuple = arith.andi %is_tuple, %keyed : i1
+        %th, %td = scf.if %keyed_tuple -> (i64, i1) {
+          %five = arith.constant 5 : i64
+          %view = func.call @__ly_global_view_i64(%entity0, %five) : (i64, i64) -> memref<?xi64>
+          %handle = memref.cast %view : memref<?xi64> to memref<5xi64>
+          %tuple_hash = func.call @__ly_tuple_hash_as(%handle, %role, %key_class) : (memref<5xi64>, i64, i64) -> i64
+          %true_t = arith.constant true
+          scf.yield %tuple_hash, %true_t : i64, i1
+        } else {
+          %hh, %hd = func.call @__ly_hash_boxed_by_contract(%box, %class_id) : (!llvm.ptr, i64) -> (i64, i1)
+          scf.yield %hh, %hd : i64, i1
+        }
+        scf.yield %th, %td : i64, i1
       }
       %dispatched = scf.if %handled -> (i64) {
         %fixed = func.call @__ly_hash_fixup(%h) : (i64) -> i64
