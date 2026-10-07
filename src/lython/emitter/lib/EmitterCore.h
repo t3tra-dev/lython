@@ -925,6 +925,9 @@ private:
   // Whether `name` is a cell or a module global, whose proofs are recorded
   // by bare name and spent at each read rather than by unwrapping a value.
   bool proofIsSpentAtRead(llvm::StringRef name) const;
+  // Whether a region-bound name may get a UNION slot (cleared for an `if`,
+  // whose arms join through block arguments instead).
+  bool regionSlotsTakeUnions = true;
   mlir::Type storeProvedMember(py::UnionType declared, mlir::Type stored) const;
   std::string cellTypeSpelling(mlir::Type type) const;
   bool callAssignsModuleGlobal(const parser::Node &call, llvm::StringRef name,

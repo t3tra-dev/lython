@@ -232,6 +232,27 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerUnbound(py::UnboundOp op) {
           op, op.getResult().getType(), "unbound local");
   if (mlir::failed(dead))
     return mlir::failure();
+  // ⭐ A UNION'S MEMBER LANES ARE EACH MEMBER'S OWN DEAD VALUE, as a
+  // `union.wrap` lays out the members it does not hold. The whole-union dead
+  // value zeroes them, and the slot a region-bound name lives in stores an
+  // Optional as one box whose payload is retained unconditionally -- a zeroed
+  // header there was "Ly_IncRef observed non-positive refcount" for every
+  // `got = d.get(w)` first bound inside a loop. The tag stays the one the
+  // dead union names, which owns nothing.
+  if (auto unionType = mlir::dyn_cast<py::UnionType>(op.getResult().getType());
+      unionType && !dead->values.empty()) {
+    llvm::SmallVector<mlir::Value, 8> lanes{dead->values.front()};
+    for (mlir::Type member : unionType.getMemberTypes()) {
+      mlir::FailureOr<RuntimeValue> memberDead =
+          RuntimeBundleLowerer::materializeNonOwningDeadObjectValue(
+              op, member, "unbound local union member");
+      if (mlir::failed(memberDead))
+        return mlir::failure();
+      lanes.append(memberDead->values.begin(), memberDead->values.end());
+    }
+    if (lanes.size() == dead->values.size())
+      dead->values.assign(lanes.begin(), lanes.end());
+  }
   RuntimeBundle bundle;
   if (mlir::failed(RuntimeBundleLowerer::makeObjectBundleWithOwnership(
           op, op.getResult().getType(), dead->values, bundle, dead->ownership)))
