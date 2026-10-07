@@ -2283,12 +2283,13 @@ TEST(DriverTest, PutsIsDeclaredWithItsCPrototype) {
   EXPECT_TRUE(puts->getReturnType()->isIntegerTy(32));
 }
 
-// What: an allocation the system cannot meet ends in the program's own
-// MemoryError -- the runtime's failure path calls `LyErr_NoMemory` and the
-// linked program defines it -- and the largest request the allocator makes is
-// the target's: under 2^31 where libc takes a 32-bit size_t (wasm32, armv7),
-// 2^62 on a 64-bit target.
-TEST(DriverTest, AnAllocationPastTheTargetsReachIsTheProgramsMemoryError) {
+// What: a size the program computes past the target's reach is the
+// program's MemoryError (`LyErr_NoMemory`, called where the size is checked),
+// the reach is the target's -- under 2^31 where libc takes a 32-bit size_t
+// (wasm32, armv7), 2^47 on a 64-bit target -- and neither the allocator's own
+// failure path nor the guard behind every allocation raises, so allocating
+// never makes a call one that may unwind.
+TEST(DriverTest, ASizePastTheTargetsReachIsMemoryErrorAndTheAllocatorNeverRaises) {
   struct Expected {
     const char *triple;
     std::int64_t maxRequest;
@@ -2297,16 +2298,27 @@ TEST(DriverTest, AnAllocationPastTheTargetsReachIsTheProgramsMemoryError) {
        {Expected{"wasm32-wasip1", (std::int64_t(1) << 31) - (1 << 16)},
         Expected{"armv7-unknown-linux-gnueabihf",
                  (std::int64_t(1) << 31) - (1 << 16)},
-        Expected{"x86_64-unknown-linux-gnu", std::int64_t(1) << 62}}) {
+        Expected{"x86_64-unknown-linux-gnu", std::int64_t(1) << 47}}) {
     lython::driver::VerifiedLLVMModule linked =
         compileAndLinkFor("print(len([0] * 3))\n", expected.triple);
     ASSERT_TRUE(linked.llvmModule) << expected.triple;
     const llvm::Module &module = *linked.llvmModule;
     const llvm::Function *raise = module.getFunction("LyErr_NoMemory");
     ASSERT_NE(raise, nullptr) << expected.triple;
-    EXPECT_FALSE(raise->isDeclaration())
-        << expected.triple << ": the runtime's MemoryError is not defined";
+    EXPECT_FALSE(raise->isDeclaration()) << expected.triple;
     EXPECT_TRUE(isCalled(module, "LyErr_NoMemory")) << expected.triple;
+    for (llvm::StringRef ending : {"LyMem_NoMemory", "ly_mem_refuse"}) {
+      const llvm::Function *failed = module.getFunction(ending);
+      ASSERT_NE(failed, nullptr) << expected.triple << " " << ending.str();
+      for (const llvm::BasicBlock &block : *failed)
+        for (const llvm::Instruction &instruction : block)
+          if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+            if (const llvm::Function *callee = call->getCalledFunction())
+              EXPECT_TRUE(callee->getName() == "write_cstr" ||
+                          callee->getName() == "abort")
+                  << expected.triple << ": " << ending.str() << " calls "
+                  << callee->getName().str();
+    }
     const llvm::Function *cap = module.getFunction("ly_mem_max_request");
     ASSERT_NE(cap, nullptr) << expected.triple;
     std::optional<std::int64_t> answered;
