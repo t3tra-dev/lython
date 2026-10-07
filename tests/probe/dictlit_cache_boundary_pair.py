@@ -21,7 +21,7 @@
 # over-release and is the reason this took an extra repair cycle to surface after
 # the sequence side closed.
 #
-# ⛔ Do not touch the cache in builtins.mlir to "fix" this; the cache is doing
+# ⛔ Do not touch the cache in objects/long.mlir to "fix" this; the cache is doing
 # nothing wrong.
 cached = 0
 for i in range(0, 3):

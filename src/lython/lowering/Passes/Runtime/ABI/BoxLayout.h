@@ -3,10 +3,10 @@
 // Physical layout of a payload slot: one i64 word per element, the entity --
 // the address of the value's object, or 0 for None, or for an int or float
 // the value itself with a nonzero low two bits (an "immediate";
-// `__ly_slot_word_is_immediate` in builtins.mlir has the encodings). A slot
-// owns a reference exactly when its entity is an address. The runtime support
-// module (RuntimeSupportBuilder) and every lower* TU that probes or rebuilds
-// boxed payloads must agree on this; it is defined only here.
+// `__ly_slot_word_is_immediate` in objects/object.mlir has the encodings). A
+// slot owns a reference exactly when its entity is an address. The runtime
+// support module (RuntimeSupportBuilder) and every lower* TU that probes or
+// rebuilds boxed payloads must agree on this; it is defined only here.
 //
 // ⛔ WHY THE POINTER WORDS ARE WORDS, since two other slots in this tree were
 // changed to hold real pointers and this one cannot be.

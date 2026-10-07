@@ -504,7 +504,7 @@ mlir::LogicalResult insertBorrowedConsumeRetains(
     // `__ly_raise_message_object` is handed a message its caller built and
     // never releases, so a retain there leaks (79 B on `io_seek`) -- and a
     // manifest attribute does not mark it, because it is a plain private
-    // helper inside builtins.mlir rather than a declared contract.
+    // helper inside python/errors.mlir rather than a declared contract.
     if (mlir::failed(result) || function.empty() ||
         !own::functionUsesOwnedReturnABI(function))
       return;

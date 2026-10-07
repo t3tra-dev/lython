@@ -2092,9 +2092,9 @@ void ModuleEmitter::emitClassContract(const parser::Node &classDef,
           // paragraph that stopped being true. The note above said container
           // cells "would go stale against reallocation, the same reason
           // collectModuleGlobals excludes them" -- and that exclusion is gone:
-          // `builtins.mlir`'s growth writes THROUGH the handle, so the cell
-          // holds what stays valid. Without this a container class attribute
-          // could not even be READ:
+          // the runtime's growth (objects/list.mlir, objects/set.mlir) writes
+          // THROUGH the handle, so the cell holds what stays valid. Without
+          // this a container class attribute could not even be READ:
           //
           //     class R:
           //         items: list[str] = []

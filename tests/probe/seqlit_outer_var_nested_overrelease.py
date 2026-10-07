@@ -22,7 +22,7 @@
 # same binary, so an exit-code-only check misses half of it. Survives --release.
 #
 # The immortal small-int cache is exactly {0, 1, 2} (`__ly_long_zero/one/two_*`,
-# builtins.mlir), so the over-release is absorbed while the loop variable stays
+# objects/long.mlir), so the over-release is absorbed while the loop variable stays
 # in that set. That -- not the trip count -- is the axis: `range(0,3)` (trips 3)
 # is clean and `range(3,6)` (trips 3) is not.
 total = 0

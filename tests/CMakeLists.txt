@@ -132,10 +132,10 @@ target_link_libraries(lython_unit_tests
 )
 # The raise-path test reads the runtime manifest sources themselves, so it needs
 # to know where they are. A define rather than a generated header: it is one path,
-# and the test asserts the directory holds at least ten modules so a wrong value
+# and the test asserts the tree holds at least ten modules so a wrong value
 # fails loudly instead of passing on an empty scan.
 target_compile_definitions(lython_unit_tests PRIVATE
-    LYTHON_RUNTIME_MODULES_DIR="${CMAKE_SOURCE_DIR}/src/lython/runtime/modules"
+    LYTHON_RUNTIME_DIR="${CMAKE_SOURCE_DIR}/src/lython/runtime"
     # ModelCorrespondenceTests reads common/Ownership.h and the model's
     # syntax, comparing the tree against itself, so it needs the tree.
     LYTHON_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

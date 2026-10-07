@@ -933,7 +933,7 @@ private:
   // and take no reference because the element already arrives with one.
   //
   // The two halves were one function, and that coupling was a measured leak.
-  // `LyObject_FromSlot` (runtime/modules/builtins.mlir) allocates a fresh box
+  // `LyObject_FromSlot` (runtime/objects/object.mlir) allocates a fresh box
   // and stores 1 into its refcount word -- it is declared
   // `ly.ownership.owned_results = [0]` and it means it. Retaining that result
   // as well left the counter at 2 against one release, so every boxed slot read

@@ -654,7 +654,9 @@ collectOwnedCallResultGroups(mlir::ModuleOp module, mlir::func::CallOp call,
 
 class AliasAnalysis {
 public:
-  void build(mlir::Operation *root);
+  // `symbols` resolves the callees when `root` is not itself the symbol table
+  // (a function): without it each call is a scan of the module from the top.
+  void build(mlir::Operation *root, mlir::SymbolTable *symbols = nullptr);
   void track(mlir::Value value);
   mlir::Value find(mlir::Value value);
   bool same(mlir::Value lhs, mlir::Value rhs);

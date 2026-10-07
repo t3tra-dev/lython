@@ -151,7 +151,7 @@ module attributes {
     method_kinds = ["instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance", "instance"]
   } {}
 
-  // ===== shared runtime declarations (defined in builtins.mlir / support) =====
+  // ===== shared runtime declarations (defined in runtime/objects/ and runtime/python/, or by the support) =====
   func.func private @LyHost_WriteBytes(i32, memref<?xi8>, i64)
   func.func private @LyHost_FOpen(memref<?xi8>, i64, memref<?xi8>, i64) -> i64
   func.func private @LyHost_FRead(i64, memref<?xi8>, i64, i64) -> i64

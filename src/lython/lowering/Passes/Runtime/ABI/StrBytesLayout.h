@@ -3,7 +3,7 @@
 // Handle-word layout of the one-lane byte-payload entities (`builtins.bytes`
 // today; `builtins.str` keeps its two lanes until that contract converts),
 // shared by the C++ lowering and the runtime manifest (LyBytes_Shape and the
-// LyBytes_* bodies in runtime/modules/builtins.mlir).
+// LyBytes_* bodies in runtime/objects/bytes.mlir).
 //
 // Words 0 and 1 are the refcount and the layout/destructor family id of every
 // entity. A byte-payload entity adds the BASE ADDRESS of its payload and the

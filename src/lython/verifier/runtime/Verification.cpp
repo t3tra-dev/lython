@@ -13,6 +13,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 
 #include <cstddef>
@@ -311,14 +312,21 @@ public:
 // classifier refusing valid IR, which is worse than the gap it closes. With the
 // shared predicate the count over all 297 golden cases is zero.
 mlir::LogicalResult
-verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
+verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function,
+                               mlir::SymbolTable &symbols) {
+  llvm::SmallVector<mlir::Operation *, 8> tokens;
+  function.walk([&](mlir::Operation *op) {
+    if (op->hasAttr(own::kOwnedLocalObjectAttr) && op->getNumOperands() != 0)
+      tokens.push_back(op);
+  });
+  // ⛔ Not an alias analysis of every function: most of the runtime holds no
+  // token, and the analysis resolves the callee of every call it walks.
+  if (tokens.empty())
+    return mlir::success();
   own::AliasAnalysis aliases;
-  aliases.build(function);
+  aliases.build(function, &symbols);
   mlir::LogicalResult result = mlir::success();
-  function.walk([&](mlir::Operation *token) {
-    if (!token->hasAttr(own::kOwnedLocalObjectAttr) ||
-        token->getNumOperands() == 0)
-      return;
+  for (mlir::Operation *token : tokens) {
     // Back through the identity casts to what defines the marked value. A
     // `memref.view` is one of them: a view of a fresh block IS that block's
     // only owner, which is how `__ly_unicode_alloc` shapes a str and how a
@@ -342,23 +350,22 @@ verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
     mlir::Operation *def = root.getDefiningOp();
     // `alloc` + `init`: the frame made the storage, so it owns the object.
     if (def && mlir::isa<mlir::memref::AllocOp>(def))
-      return;
+      continue;
     // `callIn`: the callee's contract handed over a +1.
     if (auto call = def ? mlir::dyn_cast<mlir::func::CallOp>(def)
                         : mlir::func::CallOp()) {
-      auto callee = function->getParentOfType<mlir::ModuleOp>()
-                        .lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+      auto callee = symbols.lookup<mlir::func::FuncOp>(call.getCallee());
       if (callee) {
         auto contract = own::readFunctionContract(callee);
         if (mlir::succeeded(contract) &&
             contract->ownedResults.contains(
                 mlir::cast<mlir::OpResult>(root).getResultNumber()))
-          return;
+          continue;
       }
     }
     // `dup`: a retain minted this token.
     if (own::ownedLocalMarkerIsRetainRooted(token, aliases))
-      return;
+      continue;
     result =
         token->emitError()
         << own::kOwnedLocalObjectAttr
@@ -367,7 +374,7 @@ verifyOwnedTokensAreAcquiredIn(mlir::func::FuncOp function) {
            "no retain roots it. A value read out of a slot is BORROWED -- "
            "the slot still holds it -- so the release this token earns "
            "would discharge a reference the frame does not have";
-  });
+  }
   return result;
 }
 
@@ -509,8 +516,15 @@ mlir::LogicalResult verifyOwnedTokenUniquenessImpl(mlir::ModuleOp module) {
   if (mlir::failed(
           walkVerify<mlir::func::FuncOp>(module, verifyInitialisationWindowIn)))
     return mlir::failure();
+  // ⛔ Not `ModuleOp::lookupSymbol` per call: that scans the module's body
+  // from the top, so the phase cost the call count times how far down the
+  // runtime the callees sit -- 9 ms of hello.py moved with nothing but the
+  // order the runtime files were imported in.
+  mlir::SymbolTable symbols(module);
   if (mlir::failed(walkVerify<mlir::func::FuncOp>(
-          module, verifyOwnedTokensAreAcquiredIn)))
+          module, [&](mlir::func::FuncOp function) {
+            return verifyOwnedTokensAreAcquiredIn(function, symbols);
+          })))
     return mlir::failure();
   return walkVerify<mlir::func::FuncOp>(module, verifyOwnedTokenUniquenessIn);
 }

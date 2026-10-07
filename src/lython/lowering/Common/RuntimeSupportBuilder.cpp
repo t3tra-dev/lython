@@ -458,7 +458,7 @@ void buildEHClassIdMatches(SupportBuilder &b) {
 
 // i1 raw_bytes_equal(i64 p1, i64 n1, i64 p2, i64 n2): byte-equality of two raw
 // buffers. Control/logic in scf/arith; the raw byte loads are the irreducible
-// pointer part (llvm dialect). Shared with builtins.mlir (dict key compare).
+// pointer part (llvm dialect). Shared with objects/bytes.mlir (bytes ==).
 void buildRawBytesEqual(SupportBuilder &b) {
   auto fn = b.beginFunction(
       "raw_bytes_equal",
@@ -625,7 +625,8 @@ void buildObjectAllocator(SupportBuilder &b) {
   // The largest request the system is asked for: the user address space of
   // every 64-bit target (2^47), or just under 2^31 on a 32-bit one. A size the
   // program computes past it is MemoryError before anything is asked
-  // (builtins.mlir `__ly_alloc_count`, through `ly_mem_max_request`).
+  // (objects/obmalloc.mlir `__ly_check_alloc_count`, through
+  // `ly_mem_max_request`).
   // ⛔ Not every i64: the prefix and the alignment added to a request must not
   // wrap it, and a 32-bit libc takes its size_t truncated (LibcPrototypes.cpp)
   // -- `malloc(2^32 + 24)` there is a 24-byte block the caller writes 2^32
@@ -806,8 +807,8 @@ void buildObjectAllocator(SupportBuilder &b) {
     ret({});
   }
   // ---- void ly_mem_refuse(i64 count) ---------------------------------------
-  // The manifests' guard (builtins.mlir `__ly_alloc_count`) refusing a size
-  // that reached an allocator unchecked: a size the program computes is
+  // The manifests' guard (objects/obmalloc.mlir `__ly_alloc_count`) refusing
+  // a size that reached an allocator unchecked: a size the program computes is
   // MemoryError where it is computed, so this firing is a path that forgot
   // to check, and says so. Ends the program, under a name no pass reads as a
   // call that may raise.
@@ -825,8 +826,8 @@ void buildObjectAllocator(SupportBuilder &b) {
   }
   // ---- i64 ly_mem_max_request() --------------------------------------------
   // `maxRequest`, for code that sizes a buffer before asking for it
-  // (builtins.mlir `__ly_alloc_count`): the manifests are built once for every
-  // target and cannot know it.
+  // (objects/obmalloc.mlir): the manifests are built once for every target and
+  // cannot know it.
   {
     auto fn = b.beginFunction("ly_mem_max_request",
                               b.builder.getFunctionType({}, {b.i64()}));
@@ -2565,9 +2566,9 @@ void buildCurrentExceptionMatches(SupportBuilder &b) {
 // words before the 3-word storage itself is freed — word 3 (ExceptionGroup
 // members / multi-value args) and word 4 (user-exception fields) each hold a
 // [count, count x box16] i64 block whose slots own one reference apiece.
-// Lives here (not in builtins.mlir) because every raw free site — the
-// manifest deallocator, the discard path, and chain-node destruction — must
-// share one implementation.
+// Lives here (not in objects/exceptions.mlir) because every raw free site —
+// the manifest deallocator, the discard path, and chain-node destruction —
+// must share one implementation.
 void buildReleaseExceptionExtras(SupportBuilder &b) {
   auto fn = b.beginFunction("release_exception_extras",
                             b.builder.getFunctionType({b.ptr()}, {}),

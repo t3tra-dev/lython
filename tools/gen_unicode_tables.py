@@ -8,7 +8,8 @@ emits:
   src/lython/runtime/modules/_ucd.mlir   -- two-stage lookup tables plus the
                                             generated accessor functions the
                                             handwritten unicodedata.mlir and
-                                            builtins.mlir primitives call
+                                            objects/unicode.mlir primitives
+                                            call
   tests/unit/UnicodeTablesData.inc       -- the same tables as C++ arrays so
                                             the unit tests can validate the
                                             checked-in data without a JIT

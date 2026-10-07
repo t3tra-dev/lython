@@ -68,7 +68,7 @@ unsigned redirectAllocationsToObjectAllocator(llvm::Module &module,
   // `passthrough` attribute there does not survive to the LLVM function, and
   // with these inlined `LyMem_Alloc` saved six register pairs on every call
   // and was inlined nowhere.
-  // `LyErr_NoMemory` (builtins.mlir) is the MemoryError every size check
+  // `LyErr_NoMemory` (python/errors.mlir) is the MemoryError every size check
   // calls on its refusal: inlined, the exception's construction was copied
   // into each of them (genexpr.wasm's `__main__` +7 KB).
   for (const char *cold : {"LyMem_LargeAlloc", "LyMem_MapAlloc", "LyMem_Refill",

@@ -10,7 +10,7 @@
 # about the set was correct except the one thing an array cannot have, which is
 # a slot order.
 #
-# ⭐ WHAT REPLACED IT. CPython's table, transcribed into builtins.mlir:
+# ⭐ WHAT REPLACED IT. CPython's table, transcribed into objects/set.mlir:
 # PySet_MINSIZE 8, LINEAR_PROBES 9, PERTURB_SHIFT 5, the `fill*5 >= mask*3`
 # growth trigger and the `used > 50000 ? used*2 : used*4` target, with the
 # dense array KEPT IN SLOT ORDER so that `items[0..used)` -- what __repr__, the
@@ -47,7 +47,7 @@
 #   200k `in`    4.6 s -> 2.6 s
 #
 # The route to O(1) inserts is written down at the layout comment in
-# builtins.mlir; it was not taken here.
+# objects/set.mlir; it was not taken here.
 #
 # ⭐ AND IT FOUND A SECOND, SEPARATE DIVERGENCE, which is NOT the set's:
 # CPython's COMPILER folds an all-constant set literal of more than two

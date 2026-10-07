@@ -93,7 +93,8 @@ for spec in sys.argv[2:]:
     arms.append((contract, int(width)))
 
 mdir = root / "src/lython/runtime/modules"
-paths = sorted(mdir.glob("*.mlir"))
+paths = sorted([p for d in ("modules", "objects", "python")
+                for p in (root / "src/lython/runtime" / d).glob("*.mlir")])
 if not paths:
     sys.exit(f"REFUSING: no manifests under {mdir}")
 

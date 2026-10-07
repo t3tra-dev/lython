@@ -944,8 +944,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerBoundMethodCall(
     // lanes beside its handle. `LySet_AddBox` is void now -- the growth writes
     // the new items address THROUGH the handle, so every holder observes it
     // with no further action and the mutation has nothing to rename
-    // (builtins.mlir, `__ly_list_alloc`'s note). `rebindMutatedContainer` says
-    // so itself for an empty result range: it hands the receiver back.
+    // (objects/list.mlir, `__ly_list_alloc`'s note). `rebindMutatedContainer`
+    // says so itself for an empty result range: it hands the receiver back.
     //
     // Why NOT keep the guard for safety: it did not guard anything reachable.
     // It refused `self.tags.add(x)`, `cls.tags.add(x)`, `xs[0].add(x)` and

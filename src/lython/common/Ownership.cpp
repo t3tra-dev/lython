@@ -1688,23 +1688,22 @@ static void unionStaticEvidenceCallResultAliases(AliasAnalysis &aliases,
   }
 }
 
-void AliasAnalysis::build(mlir::Operation *root) {
+void AliasAnalysis::build(mlir::Operation *root, mlir::SymbolTable *symbols) {
   // Resolving each call's callee through `Operation::lookupSymbol` walks the
   // module's symbol list, so the per-call static-evidence union below cost
   // O(calls x symbols) -- the term that exploded once an imported stdlib
   // module's symbols joined the module. One symbol table answers the same
   // question (immediate symbol children of `root`) in constant time.
-  std::optional<mlir::SymbolTable> symbols;
-  if (root->hasTrait<mlir::OpTrait::SymbolTable>())
-    symbols.emplace(root);
+  std::optional<mlir::SymbolTable> rootSymbols;
+  if (!symbols && root->hasTrait<mlir::OpTrait::SymbolTable>())
+    symbols = &rootSymbols.emplace(root);
   root->walk([&](mlir::Operation *op) {
     for (mlir::Value operand : op->getOperands())
       track(operand);
     for (mlir::Value result : op->getResults())
       track(result);
     if (auto call = mlir::dyn_cast<mlir::func::CallOp>(op))
-      unionStaticEvidenceCallResultAliases(
-          *this, call, symbols ? &*symbols : nullptr);
+      unionStaticEvidenceCallResultAliases(*this, call, symbols);
     if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(op)) {
       unionValues(subview.getResult(), subview.getSource());
       return;

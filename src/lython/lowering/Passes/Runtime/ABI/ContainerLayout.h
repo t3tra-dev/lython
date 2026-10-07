@@ -2,7 +2,7 @@
 
 // Handle-word layout of a one-lane container entity, shared by the C++
 // lowering and the runtime manifest (LyDict_Shape / the LyDict_* bodies in
-// runtime/modules/builtins.mlir).
+// runtime/objects/dict.mlir).
 //
 // Words 0 and 1 are the refcount and the layout/destructor family id of every
 // entity. A container adds its length, its capacity, and the BASE ADDRESS of

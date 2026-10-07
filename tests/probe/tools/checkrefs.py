@@ -49,7 +49,8 @@ import sys
 SEARCH = ("tests/probe", "tests/probe/tools", "tests/probe/tools/fixtures",
           "tests/golden", "tests/golden/cases", "tests/golden/errors",
           "tests/unit", "examples",
-          "src/lython/runtime/lib", "src/lython/runtime/modules")
+          "src/lython/runtime/lib", "src/lython/runtime/modules",
+          "src/lython/runtime/objects", "src/lython/runtime/python")
 
 CITATION = re.compile(r"[\w./{},*-]*?[\w-]+\.(?:py|mlir|stdout|exitcode|stderr-re)")
 BRACES = re.compile(r"\{([^}]*)\}")
