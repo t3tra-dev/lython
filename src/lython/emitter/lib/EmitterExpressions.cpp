@@ -747,8 +747,15 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
       // `other.x` was emitted against a string -- "attr.get object type has no
       // class schema", for a comparison CPython answers False.
       unsigned operandCount = static_cast<unsigned>(operandNodes->size());
+      // ⛔ Each operand's TYPE is read before its own proof is bound: the
+      // proof holds for the operands after it, and `s and 5` read `s` as the
+      // `str` its truth proves, typed the result without None, and handed the
+      // lowering a None where it had laid out a str.
+      llvm::SmallVector<mlir::Type, 4> operandTypes;
       for (unsigned index = 0; index < operandCount; ++index) {
         const parser::Node *operand = (*operandNodes)[index].get();
+        operandTypes.push_back(operand ? types.widenLiteral(types.inferExpr(operand))
+                                       : mlir::Type());
         if (!operand || !boolTyped(operand))
           allBool = false;
         std::optional<BranchTypeNarrowing> narrowing =
@@ -910,7 +917,12 @@ Value ModuleEmitter::emitExpr(const parser::Node *expr) {
         restoreNarrowedValues();
         return {boxed.getResult(), types.boolType()};
       }
-      Value result = emitBoolOpValue(*expr, isAnd, *operandNodes);
+      Value result = emitBoolOpValue(
+          *expr, isAnd, *operandNodes, operandTypes, [&](unsigned index) {
+            restoreNarrowedValues();
+            for (unsigned earlier = 0; earlier < index; ++earlier)
+              proveValue(earlier);
+          });
       restoreNarrowedValues();
       return result;
     }
@@ -3990,8 +4002,11 @@ Value ModuleEmitter::emitSetLiteral(const parser::Node &expr,
 // whole union while an always-truthy member narrows to None); the final
 // operand flows through unchanged. The join of those contributions must be
 // statically representable, otherwise the combination is rejected.
-Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
-                                     const std::vector<parser::NodePtr> &operands) {
+Value ModuleEmitter::emitBoolOpValue(
+    const parser::Node &expr, bool isAnd,
+    const std::vector<parser::NodePtr> &operands,
+    llvm::ArrayRef<mlir::Type> operandTypes,
+    llvm::function_ref<void(unsigned)> proveEarlierOperands) {
   auto reject = [&](const std::string &message) {
     diagnostics.push_back(
         parser::Diagnostic{parser::Severity::Error, expr.range.start, message});
@@ -4019,10 +4034,20 @@ Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
     if (!contract)
       return true; // conservative: keep the whole union in the falsy arm
     llvm::StringRef name = contract.getContractName();
-    return name == "builtins.list" || name == "builtins.dict" ||
-           name == "builtins.set" || name == "builtins.tuple" ||
-           name == "builtins.str" || name == "builtins.bytes" ||
-           name == "builtins.int" || name == "builtins.float";
+    if (name == "builtins.list" || name == "builtins.dict" ||
+        name == "builtins.set" || name == "builtins.tuple" ||
+        name == "builtins.str" || name == "builtins.bytes" ||
+        name == "builtins.int" || name == "builtins.float")
+      return true;
+    // ⭐ CPython's truth test: `__bool__`, else `__len__`, else always true.
+    // ⛔ Not the names above alone: an empty frozenset, `0j`, an empty
+    // bytearray and a source class whose `__len__` answers 0 are falsy too,
+    // and `s and 5` over one answered None for CPython's empty frozenset.
+    for (llvm::StringRef dunder : {"__bool__", "__len__"})
+      if (types.declaresManifestMethod(widened, dunder) ||
+          lookupClassMethod(widened, dunder))
+        return true;
+    return false;
   };
 
   // ⭐ AN EMPTY LITERAL OPERAND CONTRIBUTES NO ELEMENT TYPE, which is what
@@ -4047,7 +4072,9 @@ Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
     if (anyNonEmptyOperand && isEmptyLiteralOperand(operand.get()))
       continue;
     mlir::Type operandType =
-        types.widenLiteral(types.inferExpr(operand.get()));
+        index < operandTypes.size() && operandTypes[index]
+            ? operandTypes[index]
+            : types.widenLiteral(types.inferExpr(operand.get()));
     if (index + 1 == operands.size()) {
       parts.push_back(operandType);
       break;
@@ -4084,6 +4111,10 @@ Value ModuleEmitter::emitBoolOpValue(const parser::Node &expr, bool isAnd,
   builder.setInsertionPointToEnd(origin);
 
   for (unsigned index = 0, count = operands.size(); index < count; ++index) {
+    // The earlier operands' proofs, unwrapped in the block that only runs
+    // when they decided that way.
+    if (proveEarlierOperands)
+      proveEarlierOperands(index);
     Value current = emitExpr(operands[index].get());
     if (index + 1 == count) {
       mlir::Value last = coerceValue(current, resultType, expr).value;

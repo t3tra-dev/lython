@@ -1120,8 +1120,11 @@ private:
   // `and`/`or` over non-bool operands: CPython's operand-value result,
   // restricted to operand combinations whose join is statically representable
   // (R1). The all-bool fast path stays in emitExpr.
-  Value emitBoolOpValue(const parser::Node &expr, bool isAnd,
-                        const std::vector<parser::NodePtr> &operands);
+  Value emitBoolOpValue(
+      const parser::Node &expr, bool isAnd,
+      const std::vector<parser::NodePtr> &operands,
+      llvm::ArrayRef<mlir::Type> operandTypes = {},
+      llvm::function_ref<void(unsigned)> proveEarlierOperands = nullptr);
   Value emitListComp(const parser::Node &expr);
   Value emitDictComp(const parser::Node &expr);
   Value emitComprehension(const parser::Node &expr, bool isDict,

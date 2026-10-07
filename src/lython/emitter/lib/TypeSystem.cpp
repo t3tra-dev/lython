@@ -551,9 +551,13 @@ void applyGuardNarrowing(
       narrow(ast::nameSpelling(*subject), *narrowed);
     return;
   }
-  if (test->kind != "Compare")
+  // ⭐ A BARE NAME'S TRUTH proves it is not None, as `NAME is not None`
+  // does: the emitter narrows `s and s.upper()` that way, and this walk
+  // answered the operand as a method of the union, which it cannot type.
+  bool truthTest = !onFalseSide && test->kind == "Name";
+  if (test->kind != "Compare" && !truthTest)
     return;
-  const parser::Node *left = ast::node(*test, "left");
+  const parser::Node *left = truthTest ? test : ast::node(*test, "left");
   const auto *ops = ast::nodeList(*test, "ops");
   const auto *comparators = ast::nodeList(*test, "comparators");
   // ⭐ A `name.attr` SUBJECT TOO, reported under its dotted path. `if
@@ -563,11 +567,13 @@ void applyGuardNarrowing(
   bool subjectIsAPath = left && left->kind == "Attribute" &&
                         ast::node(*left, "value") &&
                         ast::node(*left, "value")->kind == "Name";
-  if (!left || (left->kind != "Name" && !subjectIsAPath) || !ops ||
-      ops->size() != 1 || !comparators || comparators->size() != 1 ||
-      !comparators->front() ||
-      !ast::isOperator(ops->front().get(), onFalseSide ? "Is" : "IsNot") ||
-      !ast::isNoneField(*comparators->front(), "value"))
+  if (!left || (left->kind != "Name" && !subjectIsAPath))
+    return;
+  if (!truthTest &&
+      (!ops || ops->size() != 1 || !comparators || comparators->size() != 1 ||
+       !comparators->front() ||
+       !ast::isOperator(ops->front().get(), onFalseSide ? "Is" : "IsNot") ||
+       !ast::isNoneField(*comparators->front(), "value")))
     return;
   std::string pathStorage;
   if (subjectIsAPath)
@@ -3978,10 +3984,41 @@ mlir::Type TypeSystem::inferExprImpl(const parser::Node *node,
     const bool isOr = op && op->kind == "Or";
     llvm::SmallVector<mlir::Type, 4> parts;
     llvm::SmallVector<const parser::Node *, 4> partNodes;
+    // ⭐ EACH OPERAND IS READ UNDER WHAT THE EARLIER ONES PROVED, as the
+    // emitter emits it: an `and` operand runs only when every earlier one was
+    // true, an `or` operand only when every earlier one was false. Without
+    // this `s and s.upper()` typed its second operand as a method of
+    // `str | None`, fell back to bool, and `print` -- which asks this walk
+    // whether its argument is a union -- passed the union on unrendered.
+    llvm::StringMap<mlir::Type> provenLocals;
+    if (ctx && ctx->localSymbols)
+      provenLocals = *ctx->localSymbols;
+    bool anyProof = false;
+    auto scope = pushScope();
     for (auto [index, operand] : llvm::enumerate(*operands)) {
       if (!operand)
         return boolType();
-      mlir::Type operandType = widenLiteral(lenientRecurse(operand.get()));
+      mlir::Type operandType;
+      if (anyProof) {
+        static const llvm::StringMap<mlir::Type> kNoCallables;
+        ExprInferenceContext provenCtx{kNoCallables, nullptr, &provenLocals,
+                                       /*strict=*/false};
+        operandType = widenLiteral(inferExprImpl(operand.get(), &provenCtx));
+      } else {
+        operandType = widenLiteral(lenientRecurse(operand.get()));
+      }
+      applyGuardNarrowing(
+          *this, operand.get(),
+          [&](llvm::StringRef spelling) -> mlir::Type {
+            auto found = provenLocals.find(spelling);
+            return found == provenLocals.end() ? mlir::Type() : found->second;
+          },
+          [&](llvm::StringRef spelling, mlir::Type narrowed) {
+            provenLocals[spelling] = narrowed;
+            bindLocalSymbol(spelling, narrowed);
+            anyProof = true;
+          },
+          /*onFalseSide=*/isOr);
       if (isOr && index + 1 != operands->size())
         if (auto unionType =
                 mlir::dyn_cast_if_present<py::UnionType>(operandType)) {
