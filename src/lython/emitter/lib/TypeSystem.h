@@ -226,6 +226,11 @@ public:
   // manifest does not resolve to exactly one method.
   mlir::Type manifestMethodReceiverContract(mlir::Type typeObject,
                                             llvm::StringRef methodName) const;
+  // True when the manifest class of the instance type `instance` declares
+  // `methodName` as a CLASSMETHOD in every overload -- its first parameter is
+  // the class object -- so `instance.methodName(...)` is the class's call.
+  bool isManifestClassMethod(mlir::Type instance,
+                             llvm::StringRef methodName) const;
   mlir::Type boolType() const;
   mlir::Type intType() const;
   mlir::Type strType() const;

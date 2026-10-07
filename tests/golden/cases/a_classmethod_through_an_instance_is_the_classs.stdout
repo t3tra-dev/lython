@@ -1,0 +1,9 @@
+receiver
+argument
+b'AB'
+{'x': 7, 'y': 7} {'a': 1}
+bytearray(b'\xff') {97: 99, 98: 100}
+b'\x00\xff' {299: None}
+mine x
+b'\x00\xff' {2: None} {2: None} {97: 98}
+True True

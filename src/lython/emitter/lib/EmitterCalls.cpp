@@ -1351,6 +1351,58 @@ Value ModuleEmitter::emitCall(const parser::Node &expr) {
             return emitCall(*rewritten);
           }
         }
+        // ⭐ A CLASSMETHOD CALLED THROUGH AN INSTANCE IS THE CLASS'S CALL:
+        // `b"x".fromhex("41")` is `bytes.fromhex("41")` and `{}.fromkeys(ks)`
+        // is `dict.fromkeys(ks)`, as CPython binds a classmethod to the
+        // instance's type. The receiver is emitted first because it still has
+        // to happen, and the call is re-spelled as the class name -- the path
+        // that already resolves. Without this the instance was offered to a
+        // first parameter that is the class object, and the call was reported
+        // as "has manifest method 'fromhex' but no signature that accepts
+        // (str)".
+        //
+        // ⭐ And the class-level methods the emitter builds itself instead of
+        // taking from the manifest -- `str.maketrans` (a staticmethod) and
+        // `dict.fromkeys` -- which no signature describes, so they are named.
+        //
+        // ⛔ Only when the class name still names the class here: a program
+        // that binds `bytes` to something else keeps the refusal rather than
+        // calling whatever the name now holds.
+        if (auto instance = mlir::dyn_cast_if_present<py::ContractType>(
+                types.widenLiteral(types.inferExpr(receiverNode)));
+            instance && (types.isManifestClassMethod(instance, *methodName) ||
+                         llvm::is_contained(
+                             {std::pair<llvm::StringRef, llvm::StringRef>{
+                                  "builtins.str", "maketrans"},
+                              {"builtins.dict", "fromkeys"}},
+                             std::pair<llvm::StringRef, llvm::StringRef>{
+                                 instance.getContractName(), *methodName}))) {
+          llvm::StringRef name = instance.getContractName();
+          auto tail = name.rsplit('.').second;
+          std::string spelling = tail.empty() ? name.str() : tail.str();
+          // The builtin name either resolves to this class or is not bound at
+          // all (`dict` is the emitter's, and only an unbound name is it).
+          std::optional<mlir::Type> bound = types.lookupClass(spelling);
+          auto named = mlir::dyn_cast_if_present<py::ContractType>(
+              bound.value_or(mlir::Type()));
+          bool namesTheClass = bound ? named && named.getContractName() == name
+                                     : !types.lookupSymbol(spelling);
+          if (namesTheClass && !values.count(spelling) &&
+              !programBindsName(spelling)) {
+            emitExpr(receiverNode);
+            parser::NodePtr rewritten = parser::makeNode("Call", expr.range);
+            parser::addField(
+                *rewritten, "func",
+                synth::attribute(synth::name(spelling, receiverNode->range),
+                                 *methodName, calleeNode->range));
+            for (llvm::StringRef field : {"args", "keywords"})
+              if (const parser::Field *original =
+                      parser::findField(expr, field))
+                rewritten->fields.push_back(*original);
+            synthesizedIteratorDefs.push_back(rewritten);
+            return emitCall(*rewritten);
+          }
+        }
         // ⭐ `Exception.__init__(self, msg)` IS `super().__init__(msg)` when
         // the class named is the base the receiver derives from. Both are how
         // an exception subclass forwards its message, both appear in real
