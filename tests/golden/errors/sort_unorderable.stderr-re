@@ -1,1 +1,1 @@
-TypeError:\ '<'\ not\ supported\ between\ operand\ types
+TypeError:\ '<'\ not\ supported\ between\ instances\ of\ 'str'\ and\ 'int'

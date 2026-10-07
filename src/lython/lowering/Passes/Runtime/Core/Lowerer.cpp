@@ -44,6 +44,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   settledDeallocators = ownership::collectRuntimeDeallocators(module);
   if (mlir::failed(synthesizeSourceClassNameHook()))
     return mlir::failure();
+  if (mlir::failed(synthesizeClassDerivesHook()))
+    return mlir::failure();
   if (mlir::failed(lowerStructuredTryOps()))
     return mlir::failure();
 
@@ -105,6 +107,8 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerModule() {
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedEqHook()))
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedLtHook()))
+    return mlir::failure();
+  if (mlir::failed(RuntimeBundleLowerer::generateBoxedOrderingHooks()))
     return mlir::failure();
   if (mlir::failed(RuntimeBundleLowerer::generateBoxedReleaseHook()))
     return mlir::failure();

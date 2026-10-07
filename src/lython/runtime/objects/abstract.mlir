@@ -8,7 +8,7 @@ module {
   // ===== declared here, defined in another runtime file or built by the lowering =====
   func.func private @LyObject_RetainBoxedPayloadArraySlotRaw(%payload: memref<?xi64>, %logical_index: i64)
   func.func private @__ly_box_equal(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
-  func.func private @__ly_box_less(%lhs: !llvm.ptr, %rhs: !llvm.ptr) -> i1
+  func.func private @__ly_box_order(%lhs: !llvm.ptr, %rhs: !llvm.ptr, %op: i64) -> i1
   func.func private @__ly_box_word_count() -> i64
   func.func private @__ly_handle_retain_raw(%entity: i64)
   func.func private @__ly_long_operand_view(%meta: memref<2xi64>, %digits: memref<?xi32>) -> (memref<2xi64>, memref<?xi32>)
@@ -47,7 +47,7 @@ module {
 
   // tuple.__eq__: element-wise recursive equality over the boxed payloads.
   // Element-wise sequence equality core, length by value for the same reason
-  // as @__ly_sequence_compare_lens.
+  // as @__ly_sequence_compare_op.
   func.func private @__ly_sequence_equal_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i1 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
@@ -83,57 +83,76 @@ module {
     func.return %result : i1
   }
 
-  // Lexicographic tuple comparison core: -1 / 0 / 1.
+  // Lexicographic sequence ordering, tuplerichcompare / list_richcompare: the
+  // first index whose items are not equal decides, by comparing THOSE items
+  // with `op` itself (CPython's numbers: Py_LT 0, Py_LE 1, Py_GT 4, Py_GE 5);
+  // with none, the lengths do.
+  //
+  // ⛔ Not a -1/0/1 answer that each operator reads: "the items differ and
+  // the left is not less" is not "the left is greater" -- `[nan] > [1.0]`
+  // answered True where CPython answers False -- and the refusal has to name
+  // the operator the program wrote.
   //
   // Takes the LENGTH by value rather than reading a `meta` lane, because the
   // length lives in a lane for a lane-carrying sequence (tuple, set,
   // frozenset) and in handle word 2 for a handle-fronted one (list). One core
   // plus a lane-shaped wrapper serves both; duplicating the loop per
   // representation is how the two copies drift.
-  func.func private @__ly_sequence_compare_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i64 {
+  func.func private @__ly_sequence_compare_op(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>, %op: i64) -> i1 {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c16_i64 = func.call @__ly_box_word_count() : () -> i64
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %minus_one = arith.constant -1 : i64
+    %four = arith.constant 4 : i64
     %lhs_shorter = arith.cmpi slt, %lhs_len, %rhs_len : i64
     %common = arith.select %lhs_shorter, %lhs_len, %rhs_len : i1, i64
-    %common_index = arith.index_cast %common : i64 to index
     %lhs_idx = memref.extract_aligned_pointer_as_index %lhs_items : memref<?xi64> -> index
     %rhs_idx = memref.extract_aligned_pointer_as_index %rhs_items : memref<?xi64> -> index
     %lhs_i64 = arith.index_cast %lhs_idx : index to i64
     %rhs_i64 = arith.index_cast %rhs_idx : index to i64
     %lhs_ptr = llvm.inttoptr %lhs_i64 : i64 to !llvm.ptr
     %rhs_ptr = llvm.inttoptr %rhs_i64 : i64 to !llvm.ptr
-    %scan = scf.for %i = %c0 to %common_index step %c1 iter_args(%acc = %zero) -> (i64) {
-      %undecided = arith.cmpi eq, %acc, %zero : i64
-      %next = scf.if %undecided -> (i64) {
-        %ii = arith.index_cast %i : index to i64
-        %off = arith.muli %ii, %c16_i64 : i64
+    // The first index whose items differ, or `common`.
+    %differs = scf.while (%i = %zero) : (i64) -> i64 {
+      %inside = arith.cmpi slt, %i, %common : i64
+      %same = scf.if %inside -> (i1) {
+        %off = arith.muli %i, %c16_i64 : i64
         %lbox = llvm.getelementptr %lhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %rbox = llvm.getelementptr %rhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
         %eq = func.call @__ly_box_equal(%lbox, %rbox) : (!llvm.ptr, !llvm.ptr) -> i1
-        %step_result = scf.if %eq -> (i64) {
-          scf.yield %zero : i64
-        } else {
-          %lt = func.call @__ly_box_less(%lbox, %rbox) : (!llvm.ptr, !llvm.ptr) -> i1
-          %sel = arith.select %lt, %minus_one, %one : i1, i64
-          scf.yield %sel : i64
-        }
-        scf.yield %step_result : i64
+        scf.yield %eq : i1
       } else {
-        scf.yield %acc : i64
+        %no = arith.constant false
+        scf.yield %no : i1
       }
+      scf.condition(%same) %i : i64
+    } do {
+    ^bb0(%i: i64):
+      %next = arith.addi %i, %one : i64
       scf.yield %next : i64
     }
-    %decided = arith.cmpi ne, %scan, %zero : i64
-    %len_lt = arith.cmpi slt, %lhs_len, %rhs_len : i64
-    %len_gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
-    %len_cmp0 = arith.select %len_gt, %one, %zero : i1, i64
-    %len_cmp = arith.select %len_lt, %minus_one, %len_cmp0 : i1, i64
-    %result = arith.select %decided, %scan, %len_cmp : i1, i64
-    func.return %result : i64
+    %decided = arith.cmpi slt, %differs, %common : i64
+    %result = scf.if %decided -> (i1) {
+      %off = arith.muli %differs, %c16_i64 : i64
+      %lbox = llvm.getelementptr %lhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %rbox = llvm.getelementptr %rhs_ptr[%off] : (!llvm.ptr, i64) -> !llvm.ptr, i64
+      %ordered = func.call @__ly_box_order(%lbox, %rbox, %op) : (!llvm.ptr, !llvm.ptr, i64) -> i1
+      scf.yield %ordered : i1
+    } else {
+      %lt = arith.cmpi slt, %lhs_len, %rhs_len : i64
+      %le = arith.cmpi sle, %lhs_len, %rhs_len : i64
+      %gt = arith.cmpi sgt, %lhs_len, %rhs_len : i64
+      %ge = arith.cmpi sge, %lhs_len, %rhs_len : i64
+      %greater_side = arith.cmpi uge, %op, %four : i64
+      %equal_bit = arith.andi %op, %one : i64
+      %or_equal = arith.cmpi ne, %equal_bit, %zero : i64
+      %less_pick = arith.select %or_equal, %le, %lt : i1
+      %greater_pick = arith.select %or_equal, %ge, %gt : i1
+      %pick = arith.select %greater_side, %greater_pick, %less_pick : i1
+      scf.yield %pick : i1
+    }
+    func.return %result : i1
   }
 
   // Copy `src_len` element boxes into an already-sized destination array,

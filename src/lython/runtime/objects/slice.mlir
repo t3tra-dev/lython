@@ -26,7 +26,7 @@ module attributes {
   func.func private @LyLong_SlotWordTakingRef(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_taking_ref"}
   func.func private @LyLong_Sub(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_header: memref<2xi64> {ly.ownership.object_header}) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.method = "__sub__"}
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "try_unbox.i64"}
-  func.func private @__ly_sequence_compare_lens(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>) -> i64
+  func.func private @__ly_sequence_compare_op(%lhs_len: i64, %lhs_items: memref<?xi64>, %rhs_len: i64, %rhs_items: memref<?xi64>, %op: i64) -> i1
   func.func private @LyLong_AsI64Clipped(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "unbox.i64.clip"}
   func.func private @LyLong_DeferredStandIn() -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "deferred_stand_in"}
   func.func private @LyLong_FromSlotWord(%slot_view: memref<2xi64>) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.int", ly.runtime.primitive = "from_slot_word"}
@@ -590,39 +590,35 @@ module attributes {
   // slice < slice and the other orderings: slice_richcompare compares the
   // (start, stop, step) tuples, so the slice's three words are compared as
   // a tuple's items are.
-  func.func private @__ly_slice_compare(%lhs: memref<5xi64>, %rhs: memref<5xi64>) -> i64 {
+  func.func private @__ly_slice_compare(%lhs: memref<5xi64>, %rhs: memref<5xi64>, %op: i64) -> i1 {
     %three = arith.constant 3 : i64
     %lhs_items = func.call @__ly_slice_items(%lhs) : (memref<5xi64>) -> memref<?xi64>
     %rhs_items = func.call @__ly_slice_items(%rhs) : (memref<5xi64>) -> memref<?xi64>
-    %cmp = func.call @__ly_sequence_compare_lens(%three, %lhs_items, %three, %rhs_items) : (i64, memref<?xi64>, i64, memref<?xi64>) -> i64
-    func.return %cmp : i64
+    %cmp = func.call @__ly_sequence_compare_op(%three, %lhs_items, %three, %rhs_items, %op) : (i64, memref<?xi64>, i64, memref<?xi64>, i64) -> i1
+    func.return %cmp : i1
   }
 
   func.func @LySlice_LtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.slice", ly.runtime.method = "__lt__"} {
-    %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_slice_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %result = arith.cmpi slt, %cmp, %zero : i64
+    %op = arith.constant 0 : i64
+    %result = func.call @__ly_slice_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
     func.return %result : i1
   }
 
   func.func @LySlice_LeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.slice", ly.runtime.method = "__le__"} {
-    %one = arith.constant 1 : i64
-    %cmp = func.call @__ly_slice_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %result = arith.cmpi slt, %cmp, %one : i64
+    %op = arith.constant 1 : i64
+    %result = func.call @__ly_slice_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
     func.return %result : i1
   }
 
   func.func @LySlice_GtBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.slice", ly.runtime.method = "__gt__"} {
-    %zero = arith.constant 0 : i64
-    %cmp = func.call @__ly_slice_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %result = arith.cmpi sgt, %cmp, %zero : i64
+    %op = arith.constant 4 : i64
+    %result = func.call @__ly_slice_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
     func.return %result : i1
   }
 
   func.func @LySlice_GeBool(%lhs: memref<5xi64> {ly.ownership.object_header}, %rhs: memref<5xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.slice", ly.runtime.method = "__ge__"} {
-    %minus_one = arith.constant -1 : i64
-    %cmp = func.call @__ly_slice_compare(%lhs, %rhs) : (memref<5xi64>, memref<5xi64>) -> i64
-    %result = arith.cmpi sgt, %cmp, %minus_one : i64
+    %op = arith.constant 5 : i64
+    %result = func.call @__ly_slice_compare(%lhs, %rhs, %op) : (memref<5xi64>, memref<5xi64>, i64) -> i1
     func.return %result : i1
   }
 
