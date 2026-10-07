@@ -54,6 +54,7 @@ module attributes {
   ]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
@@ -379,7 +380,7 @@ module attributes {
     %msg = memref.cast %msg_static : memref<23xi8> to memref<?xi8>
     %msg_len = arith.constant 23 : i64
     %exception:3 = func.call @LyBaseException_New(%eof_class) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%msg, %c0, %msg_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @__ly_unicode_from_valid_utf8(%msg, %c0, %msg_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %initialized:3 = func.call @LyBaseException_Init(%exception#0, %exception#1, %exception#2, %message_header, %message_bytes) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyEH_ThrowException(%initialized#0, %initialized#1, %initialized#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     // The throw does not return; satisfy the CFG with an empty line.

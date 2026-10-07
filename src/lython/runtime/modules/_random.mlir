@@ -71,6 +71,7 @@ module attributes {
     !py.callable<[!py.contract<"builtins.float">], arg_names = ["value"], arg_defaults = [false], returns = [!py.literal<None>]>
   ]
 } {
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   // --- shared runtime entry points -----------------------------------------
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
@@ -130,7 +131,7 @@ module attributes {
       %dest = arith.addi %c44, %i : index
       memref.store %byte, %buffer[%dest] : memref<?xi8>
     }
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     // This one really needs a buffer -- it joins two globals -- so it is freed as
     // soon as the string object has copied it, and BEFORE the throw, which does
     // not return. That is why it raises through the message-object entry and

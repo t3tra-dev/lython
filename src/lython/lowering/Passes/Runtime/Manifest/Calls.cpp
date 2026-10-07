@@ -1047,8 +1047,13 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerInit(py::InitOp op) {
         manifest.primitive("builtins.BaseExceptionGroup", "members_alloc");
     std::optional<RuntimeSymbol> storeWords =
         manifest.primitive("builtins.BaseException", "payload_store_words");
+    // The class's own payload-message init when it has one (the codec errors
+    // render what went wrong where), BaseException's otherwise.
     std::optional<RuntimeSymbol> initPayloadMessage =
-        manifest.primitive("builtins.BaseException", "init_payload_message");
+        manifest.primitive(exceptionRootContract, "init_payload_message");
+    if (!initPayloadMessage)
+      initPayloadMessage =
+          manifest.primitive("builtins.BaseException", "init_payload_message");
     if (!membersAlloc || !storeWords || !initPayloadMessage)
       return op.emitError() << "runtime manifest has no exception payload "
                                "primitives";

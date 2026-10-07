@@ -12,14 +12,16 @@
 //     produce. The cap rides the whitespace overload as a bare int, so
 //     `split(1)` -- a TypeError in CPython, which reads the int as the
 //     separator -- is accepted here.
-//   - A decode failure says "invalid utf-8 sequence" rather than CPython's
-//     codec message naming the byte and its position.
 
 module attributes {
   ly.typing.manifest,
   ly.runtime.contracts = ["builtins.str", "builtins.str_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
+  func.func private @__ly_bytes_alloc(%len: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.bytes", ly.runtime.primitive = "alloc"}
+  func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
+  func.func private @LyUnicodeDecodeError_Create(%encoding_h: memref<2xi64> {ly.ownership.object_header}, %encoding_b: memref<?xi8>, %object: memref<4xi64> {ly.ownership.object_header}, %start: i64, %end: i64, %reason_h: memref<2xi64> {ly.ownership.object_header}, %reason_b: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.UnicodeDecodeError"], ly.ownership.owned_results = [0], ly.ownership.transfer_args = [0, 2, 5]}
   func.func private @LyBytes_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 70 : i64, ly.runtime.contract = "builtins.bytes", ly.runtime.initializer = "__new__"}
   func.func private @LyHost_WriteBytes(i32, memref<?xi8>, i64)
   func.func private @LyList_FromLength(%length: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<5xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 10 : i64, ly.runtime.contract = "builtins.list", ly.runtime.initializer = "__new__", ly.runtime.result_contract = "builtins.list"}
@@ -304,15 +306,187 @@ module attributes {
     func.return
   }
 
-  // "invalid utf-8 sequence"
-  memref.global "private" constant @__ly_unicode_msg_invalid_utf8 : memref<22xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 117, 116, 102, 45, 56, 32, 115, 101, 113, 117, 101, 110, 99, 101]>
+  // `digits` lowercase hex digits of `value`, as a str -- the %02x, %04x and
+  // %08x of a codec error's message.
+  func.func private @__ly_unicode_from_hex(%value: i64, %digits: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
+    %one = arith.constant 1 : i64
+    %c0 = arith.constant 0 : index
+    %header, %out = func.call @__ly_unicode_alloc(%digits, %one) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %count = arith.index_cast %digits : i64 to index
+    func.call @__ly_unicode_put_hex(%out, %one, %c0, %value, %count) : (memref<?xi8>, i64, index, i64, index) -> ()
+    func.return %header, %out : memref<2xi64>, memref<?xi8>
+  }
 
-  func.func private @__ly_unicode_raise_decode_error() {
-    %class_id = arith.constant 122 : i64
-    %length = arith.constant 22 : i64
-    %message_static = memref.get_global @__ly_unicode_msg_invalid_utf8 : memref<22xi8>
-    %message = memref.cast %message_static : memref<22xi8> to memref<?xi8>
-    func.call @__ly_raise_static_message(%class_id, %message, %length) : (i64, memref<?xi8>, i64) -> ()
+  // CPython's verdict on a UTF-8 sequence that does not decode, at byte `i`
+  // of the input (utf8_decode in Objects/stringlib/codecs.h, and its caller in
+  // unicodeobject.c): the reason -- 0 "invalid start byte", 1 "invalid
+  // continuation byte", 2 "unexpected end of data" -- and where the bad bytes
+  // end: past the start byte, past the continuation bytes that were valid
+  // before the bad one, or at the end of an input that cuts the sequence
+  // short. __ly_utf8_step has already said the sequence is bad, with the same
+  // ranges (E0 needs A0..BF next, ED 80..9F, F0 90..BF, F4 80..8F); this says
+  // how.
+  func.func private @__ly_utf8_error_at(%bytes: memref<?xi8>, %start: index, %len: i64, %i: i64) -> (i64, i64) {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %true = arith.constant true
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %cont_mask = arith.constant 192 : i64
+    %cont_tag = arith.constant 128 : i64
+    %remaining = arith.subi %len, %i : i64
+    %i_index = arith.index_cast %i : i64 to index
+    %at = arith.addi %start, %i_index : index
+    %b0_raw = memref.load %bytes[%at] : memref<?xi8>
+    %b0 = arith.extui %b0_raw : i8 to i64
+    %end1 = arith.addi %i, %one : i64
+    %end2 = arith.addi %i, %two : i64
+    %end3 = arith.addi %i, %three : i64
+    %lead2 = arith.constant 194 : i64
+    %lead3 = arith.constant 224 : i64
+    %lead4 = arith.constant 240 : i64
+    %past4 = arith.constant 245 : i64
+    %below2 = arith.cmpi ult, %b0, %lead2 : i64
+    cf.cond_br %below2, ^invalid_start, ^not_below2
+
+  ^not_below2:
+    %below3 = arith.cmpi ult, %b0, %lead3 : i64
+    cf.cond_br %below3, ^two_bytes, ^not_below3
+
+  ^two_bytes:
+    // A whole two-byte sequence fails only at its continuation byte.
+    %short_two = arith.cmpi slt, %remaining, %two : i64
+    cf.cond_br %short_two, ^short, ^continuation1
+
+  ^not_below3:
+    %below5 = arith.cmpi ult, %b0, %past4 : i64
+    cf.cond_br %below5, ^multi, ^invalid_start
+
+  ^multi:
+    %short_one = arith.cmpi slt, %remaining, %two : i64
+    cf.cond_br %short_one, ^short, ^second
+
+  ^second:
+    %p1 = arith.addi %at, %c1 : index
+    %b1_raw = memref.load %bytes[%p1] : memref<?xi8>
+    %b1 = arith.extui %b1_raw : i8 to i64
+    %b1_tag = arith.andi %b1, %cont_mask : i64
+    %b1_cont = arith.cmpi eq, %b1_tag, %cont_tag : i64
+    %b1_not_cont = arith.xori %b1_cont, %true : i1
+    // The second byte's range for the leads that narrow it.
+    %e0 = arith.constant 224 : i64
+    %ed = arith.constant 237 : i64
+    %f0 = arith.constant 240 : i64
+    %f4 = arith.constant 244 : i64
+    %a0 = arith.constant 160 : i64
+    %x90 = arith.constant 144 : i64
+    %is_e0 = arith.cmpi eq, %b0, %e0 : i64
+    %is_ed = arith.cmpi eq, %b0, %ed : i64
+    %is_f0 = arith.cmpi eq, %b0, %f0 : i64
+    %is_f4 = arith.cmpi eq, %b0, %f4 : i64
+    %below_a0 = arith.cmpi ult, %b1, %a0 : i64
+    %below_90 = arith.cmpi ult, %b1, %x90 : i64
+    %at_least_a0 = arith.xori %below_a0, %true : i1
+    %at_least_90 = arith.xori %below_90, %true : i1
+    %bad_e0 = arith.andi %is_e0, %below_a0 : i1
+    %bad_ed = arith.andi %is_ed, %at_least_a0 : i1
+    %bad_f0 = arith.andi %is_f0, %below_90 : i1
+    %bad_f4 = arith.andi %is_f4, %at_least_90 : i1
+    %bad_3 = arith.ori %bad_e0, %bad_ed : i1
+    %bad_4 = arith.ori %bad_f0, %bad_f4 : i1
+    %bad_range = arith.ori %bad_3, %bad_4 : i1
+    %bad_second = arith.ori %b1_not_cont, %bad_range : i1
+    cf.cond_br %bad_second, ^continuation1, ^after_second
+
+  ^after_second:
+    %short_two_more = arith.cmpi slt, %remaining, %three : i64
+    cf.cond_br %short_two_more, ^short, ^third
+
+  ^third:
+    %is_three = arith.cmpi ult, %b0, %lead4 : i64
+    // A whole three-byte sequence with a good second byte fails at its third.
+    cf.cond_br %is_three, ^continuation2, ^four_third
+
+  ^four_third:
+    %p2 = arith.addi %at, %c2 : index
+    %b2_raw = memref.load %bytes[%p2] : memref<?xi8>
+    %b2 = arith.extui %b2_raw : i8 to i64
+    %b2_tag = arith.andi %b2, %cont_mask : i64
+    %b2_cont = arith.cmpi eq, %b2_tag, %cont_tag : i64
+    cf.cond_br %b2_cont, ^after_third, ^continuation2
+
+  ^after_third:
+    %short_three_more = arith.cmpi slt, %remaining, %four : i64
+    // A whole four-byte sequence that got here fails at its fourth byte.
+    cf.cond_br %short_three_more, ^short, ^continuation3
+
+  ^invalid_start:
+    func.return %zero, %end1 : i64, i64
+
+  ^continuation1:
+    func.return %one, %end1 : i64, i64
+
+  ^continuation2:
+    func.return %one, %end2 : i64, i64
+
+  ^continuation3:
+    func.return %one, %end3 : i64, i64
+
+  ^short:
+    func.return %two, %len : i64, i64
+  }
+
+  // "utf-8"
+  memref.global "private" constant @__ly_unicode_utf8_name : memref<5xi8> = dense<[117, 116, 102, 45, 56]>
+  // "invalid start byte"
+  memref.global "private" constant @__ly_unicode_utf8_invalid_start : memref<18xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 115, 116, 97, 114, 116, 32, 98, 121, 116, 101]>
+  // "invalid continuation byte"
+  memref.global "private" constant @__ly_unicode_utf8_invalid_continuation : memref<25xi8> = dense<[105, 110, 118, 97, 108, 105, 100, 32, 99, 111, 110, 116, 105, 110, 117, 97, 116, 105, 111, 110, 32, 98, 121, 116, 101]>
+  // "unexpected end of data"
+  memref.global "private" constant @__ly_unicode_utf8_unexpected_end : memref<22xi8> = dense<[117, 110, 101, 120, 112, 101, 99, 116, 101, 100, 32, 101, 110, 100, 32, 111, 102, 32, 100, 97, 116, 97]>
+
+  // UnicodeDecodeError('utf-8', <the input>, start, end, reason), what
+  // CPython's decoder raises: the input is copied into the bytes object the
+  // exception carries, and the positions are the input's.
+  func.func private @__ly_unicode_raise_utf8_error(%bytes: memref<?xi8>, %start: index, %len: i64, %i: i64) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %reason, %end = func.call @__ly_utf8_error_at(%bytes, %start, %len, %i) : (memref<?xi8>, index, i64, i64) -> (i64, i64)
+    %object = func.call @__ly_bytes_alloc(%len) : (i64) -> memref<4xi64>
+    %payload = func.call @__ly_bytes_payload(%object) : (memref<4xi64>) -> memref<?xi8>
+    %count = arith.index_cast %len : i64 to index
+    scf.for %k = %c0 to %count step %c1 {
+      %from = arith.addi %start, %k : index
+      %byte = memref.load %bytes[%from] : memref<?xi8>
+      memref.store %byte, %payload[%k] : memref<?xi8>
+    }
+    %name_ref = memref.get_global @__ly_unicode_utf8_name : memref<5xi8>
+    %name = memref.cast %name_ref : memref<5xi8> to memref<?xi8>
+    %name_len = arith.constant 5 : i64
+    %encoding_h, %encoding_b = func.call @__ly_unicode_from_valid_utf8(%name, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %start_ref = memref.get_global @__ly_unicode_utf8_invalid_start : memref<18xi8>
+    %start_text = memref.cast %start_ref : memref<18xi8> to memref<?xi8>
+    %cont_ref = memref.get_global @__ly_unicode_utf8_invalid_continuation : memref<25xi8>
+    %cont_text = memref.cast %cont_ref : memref<25xi8> to memref<?xi8>
+    %short_ref = memref.get_global @__ly_unicode_utf8_unexpected_end : memref<22xi8>
+    %short_text = memref.cast %short_ref : memref<22xi8> to memref<?xi8>
+    %start_len = arith.constant 18 : i64
+    %cont_len = arith.constant 25 : i64
+    %short_len = arith.constant 22 : i64
+    %is_start = arith.cmpi eq, %reason, %zero : i64
+    %is_cont = arith.cmpi eq, %reason, %one : i64
+    %late_text = arith.select %is_cont, %cont_text, %short_text : memref<?xi8>
+    %late_len = arith.select %is_cont, %cont_len, %short_len : i64
+    %reason_text = arith.select %is_start, %start_text, %late_text : memref<?xi8>
+    %reason_len = arith.select %is_start, %start_len, %late_len : i64
+    %reason_h, %reason_b = func.call @__ly_unicode_from_valid_utf8(%reason_text, %c0, %reason_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %exception:3 = func.call @LyUnicodeDecodeError_Create(%encoding_h, %encoding_b, %object, %i, %end, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, memref<4xi64>, i64, i64, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.call @LyEH_ThrowException(%exception#0, %exception#1, %exception#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
     func.return
   }
 
@@ -710,30 +884,39 @@ module attributes {
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
-  func.func @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"} {
+  // The code points a UTF-8 input holds, and the widest of them -- or, at the
+  // first sequence that does not decode, where it starts (`bad`, -1 when every
+  // sequence decodes). Raises nothing: a caller that trusts its input reads
+  // past the answer it does not need.
+  func.func private @__ly_unicode_scan_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (i64, i64, i64) {
     %zero = arith.constant 0 : i64
     %one = arith.constant 1 : i64
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %true_bit = arith.constant true
-    %scan:3 = scf.while (%i = %zero, %count = %zero, %maxcp = %zero) : (i64, i64, i64) -> (i64, i64, i64) {
+    %none = arith.constant -1 : i64
+    %scan:4 = scf.while (%i = %zero, %count = %zero, %maxcp = %zero, %bad = %none) : (i64, i64, i64, i64) -> (i64, i64, i64, i64) {
       %more = arith.cmpi slt, %i, %len : i64
-      scf.condition(%more) %i, %count, %maxcp : i64, i64, i64
+      %clean = arith.cmpi slt, %bad, %zero : i64
+      %go = arith.andi %more, %clean : i1
+      scf.condition(%go) %i, %count, %maxcp, %bad : i64, i64, i64, i64
     } do {
-    ^bb0(%i: i64, %count: i64, %maxcp: i64):
+    ^bb0(%i: i64, %count: i64, %maxcp: i64, %bad: i64):
       %cp, %next, %ok = func.call @__ly_utf8_step(%bytes, %start, %len, %i) : (memref<?xi8>, index, i64, i64) -> (i64, i64, i1)
-      %bad = arith.xori %ok, %true_bit : i1
-      scf.if %bad {
-        func.call @__ly_unicode_raise_decode_error() : () -> ()
-      }
+      %new_bad = arith.select %ok, %bad, %i : i64
       %bigger = arith.cmpi ugt, %cp, %maxcp : i64
       %new_max = arith.select %bigger, %cp, %maxcp : i64
       %new_count = arith.addi %count, %one : i64
-      scf.yield %next, %new_count, %new_max : i64, i64, i64
+      scf.yield %next, %new_count, %new_max, %new_bad : i64, i64, i64, i64
     }
-    %width = func.call @__ly_unicode_width_for(%scan#2) : (i64) -> i64
-    %header, %out = func.call @__ly_unicode_alloc(%scan#1, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
-    %count_index = arith.index_cast %scan#1 : i64 to index
+    func.return %scan#1, %scan#2, %scan#3 : i64, i64, i64
+  }
+
+  // The str of a UTF-8 input already scanned.
+  func.func private @__ly_unicode_build_utf8(%bytes: memref<?xi8>, %start: index, %len: i64, %count: i64, %maxcp: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
+    %zero = arith.constant 0 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %width = func.call @__ly_unicode_width_for(%maxcp) : (i64) -> i64
+    %header, %out = func.call @__ly_unicode_alloc(%count, %width) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %count_index = arith.index_cast %count : i64 to index
     %fill:2 = scf.while (%i = %zero, %k = %c0) : (i64, index) -> (i64, index) {
       %more = arith.cmpi slt, %k, %count_index : index
       scf.condition(%more) %i, %k : i64, index
@@ -744,6 +927,29 @@ module attributes {
       %next_k = arith.addi %k, %c1 : index
       scf.yield %next, %next_k : i64, index
     }
+    func.return %header, %out : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"} {
+    %zero = arith.constant 0 : i64
+    %count, %maxcp, %bad = func.call @__ly_unicode_scan_utf8(%bytes, %start, %len) : (memref<?xi8>, index, i64) -> (i64, i64, i64)
+    %broken = arith.cmpi sge, %bad, %zero : i64
+    scf.if %broken {
+      func.call @__ly_unicode_raise_utf8_error(%bytes, %start, %len, %bad) : (memref<?xi8>, index, i64, i64) -> ()
+    }
+    %header, %out = func.call @__ly_unicode_build_utf8(%bytes, %start, %len, %count, %maxcp) : (memref<?xi8>, index, i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %header, %out : memref<2xi64>, memref<?xi8>
+  }
+
+  // A str of text the runtime itself holds -- its messages, which are static
+  // and valid UTF-8 -- built without the check LyUnicode_FromBytes makes.
+  // ⛔ Not LyUnicode_FromBytes for them: its check raises CPython's
+  // UnicodeDecodeError, whose construction and message is a few kilobytes,
+  // and every raise in the runtime builds its message here -- a program that
+  // never decodes a byte carried all of it (fib.wasm +29%).
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
+    %count, %maxcp, %bad = func.call @__ly_unicode_scan_utf8(%bytes, %start, %len) : (memref<?xi8>, index, i64) -> (i64, i64, i64)
+    %header, %out = func.call @__ly_unicode_build_utf8(%bytes, %start, %len, %count, %maxcp) : (memref<?xi8>, index, i64, i64, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %header, %out : memref<2xi64>, memref<?xi8>
   }
 
@@ -3630,7 +3836,7 @@ module attributes {
     %length_index = arith.subi %end, %start_index : index
     %length = arith.index_cast %length_index : index to i64
     %buffer_view = memref.cast %buffer : memref<21xi8> to memref<?xi8>
-    %header, %bytes = func.call @LyUnicode_FromBytes(%buffer_view, %start_index, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%buffer_view, %start_index, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -4239,7 +4445,7 @@ module attributes {
       }
       scf.yield %np : index
     }
-    %rh, %rb = func.call @LyUnicode_FromBytes(%buf, %c0, %out_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %rh, %rb = func.call @__ly_unicode_from_valid_utf8(%buf, %c0, %out_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buf : memref<?xi8>
     func.return %rh, %rb : memref<2xi64>, memref<?xi8>
   }
@@ -4345,7 +4551,7 @@ module attributes {
     } else {
       %start = arith.constant 0 : index
       %zero = arith.constant 0 : i64
-      %empty_header, %empty_bytes = func.call @LyUnicode_FromBytes(%source_bytes, %start, %zero) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %empty_header, %empty_bytes = func.call @__ly_unicode_from_valid_utf8(%source_bytes, %start, %zero) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %empty_header, %empty_bytes : memref<2xi64>, memref<?xi8>
     }
 

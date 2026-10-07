@@ -17,6 +17,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.range", "builtins.range_iterator"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
   func.func private @LyUnicode_Concat(%lhs_header: memref<2xi64> {ly.ownership.object_header}, %lhs_bytes: memref<?xi8>, %rhs_header: memref<2xi64> {ly.ownership.object_header}, %rhs_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.str", ly.runtime.method = "__add__"}
@@ -87,14 +88,14 @@ module attributes {
     %step = memref.load %self[%step_slot] : memref<5xi64>
     %open_ref = memref.get_global @__ly_repr_range_open : memref<6xi8>
     %open_dyn = memref.cast %open_ref : memref<6xi8> to memref<?xi8>
-    %oh, %ob = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c6_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %oh, %ob = func.call @__ly_unicode_from_valid_utf8(%open_dyn, %c0, %c6_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %sh0, %sb0 = func.call @LyUnicode_FromI64(%start) : (i64) -> (memref<2xi64>, memref<?xi8>)
     %a_h, %a_b = func.call @LyUnicode_Concat(%oh, %ob, %sh0, %sb0) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%oh) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%sh0) : (memref<2xi64>) -> ()
     %comma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
     %comma_dyn = memref.cast %comma_ref : memref<2xi8> to memref<?xi8>
-    %ch0, %cb0 = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %ch0, %cb0 = func.call @__ly_unicode_from_valid_utf8(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %ch0, %cb0) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%a_h) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%ch0) : (memref<2xi64>) -> ()
@@ -106,7 +107,7 @@ module attributes {
     %d:2 = scf.if %unit_step -> (memref<2xi64>, memref<?xi8>) {
       scf.yield %c_h, %c_b : memref<2xi64>, memref<?xi8>
     } else {
-      %ch1, %cb1 = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %ch1, %cb1 = func.call @__ly_unicode_from_valid_utf8(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %e_h, %e_b = func.call @LyUnicode_Concat(%c_h, %c_b, %ch1, %cb1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%c_h) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%ch1) : (memref<2xi64>) -> ()
@@ -118,7 +119,7 @@ module attributes {
     }
     %rp_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
     %rp_dyn = memref.cast %rp_ref : memref<1xi8> to memref<?xi8>
-    %rph, %rpb = func.call @LyUnicode_FromBytes(%rp_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %rph, %rpb = func.call @__ly_unicode_from_valid_utf8(%rp_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %out_h, %out_b = func.call @LyUnicode_Concat(%d#0, %d#1, %rph, %rpb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%d#0) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%rph) : (memref<2xi64>) -> ()

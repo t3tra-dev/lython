@@ -2368,3 +2368,40 @@ TEST(EmitterTest, AWASIProgramHasAJsHostOnlyWhenAskedFor) {
     EXPECT_TRUE(emitted.succeeded) << triple << " " << emitted.diagnostics;
   }
 }
+
+// What: a codec error takes the codec's arguments -- UnicodeDecodeError and
+// UnicodeEncodeError five, UnicodeTranslateError four, as typeshed declares
+// them -- and a single message is refused here, where CPython raises
+// TypeError when the call runs; the codec form compiles.
+TEST(EmitterTest, ACodecErrorTakesItsCodecArguments) {
+  lython::driver::DriverOptions native;
+  native.targetTriple = llvm::sys::getDefaultTargetTriple();
+  for (const char *refused :
+       {"e = UnicodeDecodeError(\"bad\")\n",
+        "e = UnicodeEncodeError(\"ascii\", \"x\", 0, 1)\n",
+        "e = UnicodeTranslateError(\"x\", 0, 1)\n"}) {
+    mlir::MLIRContext context(testRegistry());
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    std::string diagnostics;
+    llvm::raw_string_ostream diag(diagnostics);
+    EXPECT_TRUE(mlir::failed(lython::driver::emitMLIRFromSource(
+        refused, "main.py", "<lython-no-import-dir>", native, context, module,
+        diag)))
+        << refused;
+    EXPECT_NE(diagnostics.find("has manifest method '__init__' but no "
+                               "signature that accepts"),
+              std::string::npos)
+        << refused << diagnostics;
+  }
+  mlir::MLIRContext context(testRegistry());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string diagnostics;
+  llvm::raw_string_ostream diag(diagnostics);
+  EXPECT_TRUE(mlir::succeeded(lython::driver::emitMLIRFromSource(
+      "d = UnicodeDecodeError(\"utf-8\", b\"\\xff\", 0, 1, \"bad\")\n"
+      "e = UnicodeEncodeError(\"ascii\", \"\\xe9\", 0, 1, \"bad\")\n"
+      "t = UnicodeTranslateError(\"\\xe9\", 0, 1, \"bad\")\n"
+      "print(d.start, e.reason, t.end, d.object, e.encoding, t.object)\n",
+      "main.py", "<lython-no-import-dir>", native, context, module, diag)))
+      << diagnostics;
+}

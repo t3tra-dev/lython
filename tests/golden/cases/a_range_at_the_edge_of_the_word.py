@@ -10,19 +10,21 @@
 # WHY THIS IS RUN AND NOT CHECKED AT A LOWER LAYER: every answer is computed
 # from run-time words at the edge of their range; a wrapped length or a
 # wrapped iterator compiles exactly like a right one.
-import sys
 
-step = sys.maxsize // 2 + 1
-print(range(5, sys.maxsize), len(range(sys.maxsize - 1, sys.maxsize)))
-print(range(0, 10, sys.maxsize), list(range(0, 10, sys.maxsize)))
-r = range(0, sys.maxsize, step)
+# The edge of the 64-bit word -- spelled out, not sys.maxsize, which is the
+# 32-bit word on a 32-bit target.
+WORD_MAX = 2**63 - 1
+step = WORD_MAX // 2 + 1
+print(range(5, WORD_MAX), len(range(WORD_MAX - 1, WORD_MAX)))
+print(range(0, 10, WORD_MAX), list(range(0, 10, WORD_MAX)))
+r = range(0, WORD_MAX, step)
 print(list(r), len(r), list(iter(r)), r[-1], step in r, step + 1 in r)
-q = range(0, -sys.maxsize - 1, -step)
+q = range(0, -WORD_MAX - 1, -step)
 print(list(q), sum(1 for _ in q), q[1], -step in q)
-w = range(-sys.maxsize, sys.maxsize, sys.maxsize)
-print(list(w), len(w), w[1], w[-2], sys.maxsize - 1 in w, 0 in w, -sys.maxsize in w)
-huge = range(-sys.maxsize, sys.maxsize)
-print(huge[0], huge[-1], huge[sys.maxsize], 0 in huge, 2**70 in huge, 2**70 in range(10))
+w = range(-WORD_MAX, WORD_MAX, WORD_MAX)
+print(list(w), len(w), w[1], w[-2], WORD_MAX - 1 in w, 0 in w, -WORD_MAX in w)
+huge = range(-WORD_MAX, WORD_MAX)
+print(huge[0], huge[-1], huge[WORD_MAX], 0 in huge, 2**70 in huge, 2**70 in range(10))
 seen = 0
 for v in huge:
     seen += 1

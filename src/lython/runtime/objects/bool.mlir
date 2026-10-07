@@ -8,6 +8,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.bool"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyLong_DecRef(%header: memref<2xi64> {ly.ownership.object_header}) attributes {ly.ownership.release_args = [0], ly.runtime.contract = "builtins.int", ly.runtime.deallocator}
   func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
@@ -48,13 +49,13 @@ module attributes {
       %true_static = memref.get_global @__ly_bool_repr_true : memref<4xi8>
       %true_bytes = memref.cast %true_static : memref<4xi8> to memref<?xi8>
       %true_len = arith.constant 4 : i64
-      %header, %bytes = func.call @LyUnicode_FromBytes(%true_bytes, %c0, %true_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%true_bytes, %c0, %true_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %header, %bytes : memref<2xi64>, memref<?xi8>
     } else {
       %false_static = memref.get_global @__ly_bool_repr_false : memref<5xi8>
       %false_bytes = memref.cast %false_static : memref<5xi8> to memref<?xi8>
       %false_len = arith.constant 5 : i64
-      %header, %bytes = func.call @LyUnicode_FromBytes(%false_bytes, %c0, %false_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%false_bytes, %c0, %false_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %header, %bytes : memref<2xi64>, memref<?xi8>
     }
     func.return %result#0, %result#1 : memref<2xi64>, memref<?xi8>

@@ -57,6 +57,7 @@ module attributes {
   ly.typing.int_constant_names = ["_io.DEFAULT_BUFFER_SIZE"],
   ly.typing.int_constant_values = [131072 : i64]
 } {
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   // TextIOWrapper instance layout (memref<8xi64>):
   //   [0] refcount   [1] class id (65)  [2] handle (fd or FILE*)
   //   [3] kind (0 = raw fd, 1 = FILE*)  [4] readable  [5] writable
@@ -959,7 +960,7 @@ module attributes {
     %len_index = arith.index_cast %len : i64 to index
     %temp = memref.alloc(%len_index) : memref<?xi8>
     func.call @LyHost_BufferCopyOut(%ptr, %zero, %temp, %len) : (i64, i64, memref<?xi8>, i64) -> ()
-    %header, %bytes = func.call @LyUnicode_FromBytes(%temp, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%temp, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %temp : memref<?xi8>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
@@ -1018,7 +1019,7 @@ module attributes {
       }
       scf.yield %scan#0 : i64
     }
-    %header, %bytes = func.call @LyUnicode_FromBytes(%temp, %c0, %take) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%temp, %c0, %take) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %temp : memref<?xi8>
     %new_pos = arith.addi %pos, %take : i64
     memref.store %new_pos, %self[%pos_slot] : memref<8xi64>
@@ -2002,7 +2003,7 @@ module attributes {
       %empty_g = memref.get_global @__ly_io_lit_r : memref<1xi8>
       %empty_d = memref.cast %empty_g : memref<1xi8> to memref<?xi8>
       %no_bytes = arith.constant 0 : i64
-      %empty_h, %empty_b = func.call @LyUnicode_FromBytes(%empty_d, %c0, %no_bytes) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %empty_h, %empty_b = func.call @__ly_unicode_from_valid_utf8(%empty_d, %c0, %no_bytes) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %copy_h, %copy_b = func.call @LyUnicode_Concat(%empty_h, %empty_b, %h, %b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%empty_h) : (memref<2xi64>) -> ()
       scf.yield %copy_h, %copy_b : memref<2xi64>, memref<?xi8>
@@ -2017,20 +2018,20 @@ module attributes {
     %in_h_g = memref.get_global @__ly_io_lit_stdin : memref<7xi8>
     %in_h_d = memref.cast %in_h_g : memref<7xi8> to memref<?xi8>
     %in_h_n = arith.constant 7 : i64
-    %in_h, %in_b = func.call @LyUnicode_FromBytes(%in_h_d, %c0, %in_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %in_h, %in_b = func.call @__ly_unicode_from_valid_utf8(%in_h_d, %c0, %in_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           scf.yield %in_h, %in_b : memref<2xi64>, memref<?xi8>
         } else {
           %out:2 = scf.if %is_stdout -> (memref<2xi64>, memref<?xi8>) {
     %o_h_g = memref.get_global @__ly_io_lit_stdout : memref<8xi8>
     %o_h_d = memref.cast %o_h_g : memref<8xi8> to memref<?xi8>
     %o_h_n = arith.constant 8 : i64
-    %o_h, %o_b = func.call @LyUnicode_FromBytes(%o_h_d, %c0, %o_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %o_h, %o_b = func.call @__ly_unicode_from_valid_utf8(%o_h_d, %c0, %o_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
             scf.yield %o_h, %o_b : memref<2xi64>, memref<?xi8>
           } else {
     %e_h_g = memref.get_global @__ly_io_lit_stderr : memref<8xi8>
     %e_h_d = memref.cast %e_h_g : memref<8xi8> to memref<?xi8>
     %e_h_n = arith.constant 8 : i64
-    %e_h, %e_b = func.call @LyUnicode_FromBytes(%e_h_d, %c0, %e_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %e_h, %e_b = func.call @__ly_unicode_from_valid_utf8(%e_h_d, %c0, %e_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
             scf.yield %e_h, %e_b : memref<2xi64>, memref<?xi8>
           }
           scf.yield %out#0, %out#1 : memref<2xi64>, memref<?xi8>
@@ -2041,13 +2042,13 @@ module attributes {
     %r_h_g = memref.get_global @__ly_io_lit_r : memref<1xi8>
     %r_h_d = memref.cast %r_h_g : memref<1xi8> to memref<?xi8>
     %r_h_n = arith.constant 1 : i64
-    %r_h, %r_b = func.call @LyUnicode_FromBytes(%r_h_d, %c0, %r_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %r_h, %r_b = func.call @__ly_unicode_from_valid_utf8(%r_h_d, %c0, %r_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           scf.yield %r_h, %r_b : memref<2xi64>, memref<?xi8>
         } else {
     %w_h_g = memref.get_global @__ly_io_lit_w : memref<1xi8>
     %w_h_d = memref.cast %w_h_g : memref<1xi8> to memref<?xi8>
     %w_h_n = arith.constant 1 : i64
-    %w_h, %w_b = func.call @LyUnicode_FromBytes(%w_h_d, %c0, %w_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %w_h, %w_b = func.call @__ly_unicode_from_valid_utf8(%w_h_d, %c0, %w_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           scf.yield %w_h, %w_b : memref<2xi64>, memref<?xi8>
         }
         scf.yield %m#0, %m#1 : memref<2xi64>, memref<?xi8>
@@ -2079,7 +2080,7 @@ module attributes {
     %p0_h_g = memref.get_global @__ly_io_lit_textio : memref<24xi8>
     %p0_h_d = memref.cast %p0_h_g : memref<24xi8> to memref<?xi8>
     %p0_h_n = arith.constant 24 : i64
-    %p0_h, %p0_b = func.call @LyUnicode_FromBytes(%p0_h_d, %c0, %p0_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %p0_h, %p0_b = func.call @__ly_unicode_from_valid_utf8(%p0_h_d, %c0, %p0_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %n_h, %n_b = func.call @__ly_io_meta_str(%self, %zero) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
     %nr_h, %nr_b = func.call @LyUnicode_Repr(%n_h, %n_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%n_h) : (memref<2xi64>) -> ()
@@ -2089,7 +2090,7 @@ module attributes {
     %ml_h_g = memref.get_global @__ly_io_lit_mode : memref<6xi8>
     %ml_h_d = memref.cast %ml_h_g : memref<6xi8> to memref<?xi8>
     %ml_h_n = arith.constant 6 : i64
-    %ml_h, %ml_b = func.call @LyUnicode_FromBytes(%ml_h_d, %c0, %ml_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %ml_h, %ml_b = func.call @__ly_unicode_from_valid_utf8(%ml_h_d, %c0, %ml_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %p2_h, %p2_b = func.call @LyUnicode_Concat(%p1_h, %p1_b, %ml_h, %ml_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%p1_h) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%ml_h) : (memref<2xi64>) -> ()
@@ -2105,13 +2106,13 @@ module attributes {
     %s_h_g = memref.get_global @__ly_io_lit_enc_std : memref<18xi8>
     %s_h_d = memref.cast %s_h_g : memref<18xi8> to memref<?xi8>
     %s_h_n = arith.constant 18 : i64
-    %s_h, %s_b = func.call @LyUnicode_FromBytes(%s_h_d, %c0, %s_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %s_h, %s_b = func.call @__ly_unicode_from_valid_utf8(%s_h_d, %c0, %s_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %s_h, %s_b : memref<2xi64>, memref<?xi8>
     } else {
     %f_h_g = memref.get_global @__ly_io_lit_enc_file : memref<18xi8>
     %f_h_d = memref.cast %f_h_g : memref<18xi8> to memref<?xi8>
     %f_h_n = arith.constant 18 : i64
-    %f_h, %f_b = func.call @LyUnicode_FromBytes(%f_h_d, %c0, %f_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %f_h, %f_b = func.call @__ly_unicode_from_valid_utf8(%f_h_d, %c0, %f_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
     }
     %out_h, %out_b = func.call @LyUnicode_Concat(%p3_h, %p3_b, %enc#0, %enc#1) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
@@ -2133,13 +2134,13 @@ module attributes {
     %c_h_g = memref.get_global @__ly_io_lit_fileio_closed : memref<21xi8>
     %c_h_d = memref.cast %c_h_g : memref<21xi8> to memref<?xi8>
     %c_h_n = arith.constant 21 : i64
-    %c_h, %c_b = func.call @LyUnicode_FromBytes(%c_h_d, %c0, %c_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %c_h, %c_b = func.call @__ly_unicode_from_valid_utf8(%c_h_d, %c0, %c_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       scf.yield %c_h, %c_b : memref<2xi64>, memref<?xi8>
     } else {
     %p0_h_g = memref.get_global @__ly_io_lit_fileio : memref<17xi8>
     %p0_h_d = memref.cast %p0_h_g : memref<17xi8> to memref<?xi8>
     %p0_h_n = arith.constant 17 : i64
-    %p0_h, %p0_b = func.call @LyUnicode_FromBytes(%p0_h_d, %c0, %p0_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %p0_h, %p0_b = func.call @__ly_unicode_from_valid_utf8(%p0_h_d, %c0, %p0_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %n_h, %n_b = func.call @__ly_io_meta_str(%self, %zero) : (memref<8xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
       %nr_h, %nr_b = func.call @LyUnicode_Repr(%n_h, %n_b) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%n_h) : (memref<2xi64>) -> ()
@@ -2149,7 +2150,7 @@ module attributes {
     %ml_h_g = memref.get_global @__ly_io_lit_mode : memref<6xi8>
     %ml_h_d = memref.cast %ml_h_g : memref<6xi8> to memref<?xi8>
     %ml_h_n = arith.constant 6 : i64
-    %ml_h, %ml_b = func.call @LyUnicode_FromBytes(%ml_h_d, %c0, %ml_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %ml_h, %ml_b = func.call @__ly_unicode_from_valid_utf8(%ml_h_d, %c0, %ml_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %p2_h, %p2_b = func.call @LyUnicode_Concat(%p1_h, %p1_b, %ml_h, %ml_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%p1_h) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%ml_h) : (memref<2xi64>) -> ()
@@ -2162,7 +2163,7 @@ module attributes {
     %cf_h_g = memref.get_global @__ly_io_lit_closefd : memref<14xi8>
     %cf_h_d = memref.cast %cf_h_g : memref<14xi8> to memref<?xi8>
     %cf_h_n = arith.constant 14 : i64
-    %cf_h, %cf_b = func.call @LyUnicode_FromBytes(%cf_h_d, %c0, %cf_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %cf_h, %cf_b = func.call @__ly_unicode_from_valid_utf8(%cf_h_d, %c0, %cf_h_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %p4_h, %p4_b = func.call @LyUnicode_Concat(%p3_h, %p3_b, %cf_h, %cf_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%p3_h) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%cf_h) : (memref<2xi64>) -> ()
@@ -2189,13 +2190,13 @@ module attributes {
     %h1_g = memref.get_global @__ly_io_lit_xbp : memref<3xi8>
     %h1_d = memref.cast %h1_g : memref<3xi8> to memref<?xi8>
     %h1_n = arith.constant 3 : i64
-    %h1, %b1 = func.call @LyUnicode_FromBytes(%h1_d, %c0, %h1_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h1, %b1 = func.call @__ly_unicode_from_valid_utf8(%h1_d, %c0, %h1_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         scf.yield %h1, %b1 : memref<2xi64>, memref<?xi8>
       } else {
     %h2_g = memref.get_global @__ly_io_lit_xb : memref<2xi8>
     %h2_d = memref.cast %h2_g : memref<2xi8> to memref<?xi8>
     %h2_n = arith.constant 2 : i64
-    %h2, %b2 = func.call @LyUnicode_FromBytes(%h2_d, %c0, %h2_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h2, %b2 = func.call @__ly_unicode_from_valid_utf8(%h2_d, %c0, %h2_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         scf.yield %h2, %b2 : memref<2xi64>, memref<?xi8>
       }
       scf.yield %x#0, %x#1 : memref<2xi64>, memref<?xi8>
@@ -2205,13 +2206,13 @@ module attributes {
     %h3_g = memref.get_global @__ly_io_lit_abp : memref<3xi8>
     %h3_d = memref.cast %h3_g : memref<3xi8> to memref<?xi8>
     %h3_n = arith.constant 3 : i64
-    %h3, %b3 = func.call @LyUnicode_FromBytes(%h3_d, %c0, %h3_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h3, %b3 = func.call @__ly_unicode_from_valid_utf8(%h3_d, %c0, %h3_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           scf.yield %h3, %b3 : memref<2xi64>, memref<?xi8>
         } else {
     %h4_g = memref.get_global @__ly_io_lit_ab : memref<2xi8>
     %h4_d = memref.cast %h4_g : memref<2xi8> to memref<?xi8>
     %h4_n = arith.constant 2 : i64
-    %h4, %b4 = func.call @LyUnicode_FromBytes(%h4_d, %c0, %h4_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h4, %b4 = func.call @__ly_unicode_from_valid_utf8(%h4_d, %c0, %h4_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           scf.yield %h4, %b4 : memref<2xi64>, memref<?xi8>
         }
         scf.yield %a#0, %a#1 : memref<2xi64>, memref<?xi8>
@@ -2220,20 +2221,20 @@ module attributes {
     %h5_g = memref.get_global @__ly_io_lit_rbp : memref<3xi8>
     %h5_d = memref.cast %h5_g : memref<3xi8> to memref<?xi8>
     %h5_n = arith.constant 3 : i64
-    %h5, %b5 = func.call @LyUnicode_FromBytes(%h5_d, %c0, %h5_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h5, %b5 = func.call @__ly_unicode_from_valid_utf8(%h5_d, %c0, %h5_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           scf.yield %h5, %b5 : memref<2xi64>, memref<?xi8>
         } else {
           %ro:2 = scf.if %is_r -> (memref<2xi64>, memref<?xi8>) {
     %h6_g = memref.get_global @__ly_io_lit_rb : memref<2xi8>
     %h6_d = memref.cast %h6_g : memref<2xi8> to memref<?xi8>
     %h6_n = arith.constant 2 : i64
-    %h6, %b6 = func.call @LyUnicode_FromBytes(%h6_d, %c0, %h6_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h6, %b6 = func.call @__ly_unicode_from_valid_utf8(%h6_d, %c0, %h6_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
             scf.yield %h6, %b6 : memref<2xi64>, memref<?xi8>
           } else {
     %h7_g = memref.get_global @__ly_io_lit_wb : memref<2xi8>
     %h7_d = memref.cast %h7_g : memref<2xi8> to memref<?xi8>
     %h7_n = arith.constant 2 : i64
-    %h7, %b7 = func.call @LyUnicode_FromBytes(%h7_d, %c0, %h7_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h7, %b7 = func.call @__ly_unicode_from_valid_utf8(%h7_d, %c0, %h7_n) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
             scf.yield %h7, %b7 : memref<2xi64>, memref<?xi8>
           }
           scf.yield %ro#0, %ro#1 : memref<2xi64>, memref<?xi8>

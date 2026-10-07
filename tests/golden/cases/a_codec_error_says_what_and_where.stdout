@@ -1,0 +1,40 @@
+'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte') 0 1 invalid start byte 1
+'utf-8' codec can't decode byte 0x80 in position 3: invalid start byte
+UnicodeDecodeError('utf-8', b'abc\x80def', 3, 4, 'invalid start byte') 3 4 invalid start byte 7
+'utf-8' codec can't decode byte 0xc3 in position 0: unexpected end of data
+UnicodeDecodeError('utf-8', b'\xc3', 0, 1, 'unexpected end of data') 0 1 unexpected end of data 1
+'utf-8' codec can't decode byte 0xe0 in position 0: invalid continuation byte
+UnicodeDecodeError('utf-8', b'\xe0\x80\x80', 0, 1, 'invalid continuation byte') 0 1 invalid continuation byte 3
+'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte
+UnicodeDecodeError('utf-8', b'\xed\xa0\x80', 0, 1, 'invalid continuation byte') 0 1 invalid continuation byte 3
+'utf-8' codec can't decode bytes in position 0-1: unexpected end of data
+UnicodeDecodeError('utf-8', b'\xe2\x82', 0, 2, 'unexpected end of data') 0 2 unexpected end of data 2
+'utf-8' codec can't decode byte 0xe2 in position 0: invalid continuation byte
+UnicodeDecodeError('utf-8', b'\xe2(\xa1', 0, 1, 'invalid continuation byte') 0 1 invalid continuation byte 3
+'utf-8' codec can't decode bytes in position 0-2: unexpected end of data
+UnicodeDecodeError('utf-8', b'\xf0\x9f\x98', 0, 3, 'unexpected end of data') 0 3 unexpected end of data 3
+'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte
+UnicodeDecodeError('utf-8', b'\xf0\x9f(\x8c', 0, 2, 'invalid continuation byte') 0 2 invalid continuation byte 4
+'utf-8' codec can't decode bytes in position 0-2: invalid continuation byte
+UnicodeDecodeError('utf-8', b'\xf0\x9f\x98(', 0, 3, 'invalid continuation byte') 0 3 invalid continuation byte 4
+'utf-8' codec can't decode byte 0xf4 in position 0: invalid continuation byte
+UnicodeDecodeError('utf-8', b'\xf4\x90\x80\x80', 0, 1, 'invalid continuation byte') 0 1 invalid continuation byte 4
+'utf-8' codec can't decode byte 0xf5 in position 0: invalid start byte
+UnicodeDecodeError('utf-8', b'\xf5\x80', 0, 1, 'invalid start byte') 0 1 invalid start byte 2
+'utf-8' codec can't decode byte 0xc0 in position 0: invalid start byte
+UnicodeDecodeError('utf-8', b'\xc0\xaf', 0, 1, 'invalid start byte') 0 1 invalid start byte 2
+'utf-8' codec can't decode byte 0xff in position 6: invalid start byte
+UnicodeDecodeError('utf-8', b'ok\xe2\x82\xacx\xff', 6, 7, 'invalid start byte') 6 7 invalid start byte 7
+utf-8 b'caf\xc3(' b'\xc3'
+café good 😀 text
+'utf-8' codec can't decode byte 0xff in position 2: invalid start byte ('utf-8', b'ab\xffcd', 2, 3, 'invalid start byte')
+'ascii' codec can't decode bytes in position 1-3: ordinal not in range(128) ('ascii', b'abcdef', 1, 4, 'ordinal not in range(128)')
+'utf-8' codec can't decode bytes in position 5-5: out of range ('utf-8', b'x', 5, 6, 'out of range')
+'ascii' codec can't encode character '\xe9' in position 3: ordinal not in range(128) ascii é 4
+'ascii' codec can't encode character '\u20ac' in position 0: nope ascii € 1
+'latin-1' codec can't encode character '\U0001f600' in position 1: nope latin-1 😀 2
+'ascii' codec can't encode characters in position 0-2: nope ascii a 3
+can't translate character '\xe9' in position 0: no mapping é 0 1 no mapping
+can't translate characters in position 1-2: no mapping abc 1 3 no mapping
+'utf-8' codec can't decode byte 0xff in position 1: bad-- utf-8 bad-- ('utf-8', b'\x00\xff', 1, 2, 'bad--')
