@@ -618,6 +618,16 @@ set(LYTHON_LEAK_GATE_RUNNER "${CMAKE_CURRENT_SOURCE_DIR}/leak_gate.py")
 #     dict literal family whose dict side was repaired earlier and which
 #     rfc/test-suite-debt.md listed as still leaking. Both are net zero now.
 set(LYTHON_LEAK_GATE_CASES
+    # asyncio: a task's driver holds the task (a cycle the run breaks when the
+    # task is done), and an awaited Future or Task crosses its `__await__`'s
+    # suspension in a payload box that takes its own reference -- each once
+    # leaked every task or awaited object of a run.
+    asyncio_tasks_interleave_and_settle
+    a_local_read_after_a_try_that_holds_an_async_with
+    an_async_for_suspends_inside_anext
+    a_future_prints_its_state
+    an_async_context_manager_written_in_python
+    an_async_loop_awaits_its_target
     # A union local that dies before a generator's later yield: its frame
     # lane crosses that suspension as a placeholder, which was boxed into a
     # heap box no state ever read back.

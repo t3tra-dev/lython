@@ -297,8 +297,19 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerFunctionReturns() {
           // second trip aborted the program in `Ly_DecRef` with a
           // non-positive refcount. The physical group is where they meet:
           // both lanes resolved to `memref<9xi64>` block argument 6.
-          bool duplicate = !laneCarriedValues.insert(operand).second;
-          if (!bundle->physicalValues().empty()) {
+          // ⛔ A lane that BOXES the value takes a reference of its own --
+          // the box retains its payload (boxForObjectLane) -- so it does not
+          // spend the value's token, and the lane after it is no second
+          // carrier. Counted as one, `yield self` from an inlined `__await__`
+          // that reads `self` after resuming retained `self` again for the
+          // frame lane: the awaited object leaked once per await, and asyncio
+          // leaked every Future and Task it awaited.
+          bool boxesItsOwn =
+              suspendLane->contract == "builtins.object" &&
+              runtimeContractName(bundle->contract) != "builtins.object";
+          bool duplicate =
+              !boxesItsOwn && !laneCarriedValues.insert(operand).second;
+          if (!boxesItsOwn && !bundle->physicalValues().empty()) {
             LaneEntityQuery visiting;
             if (std::getenv("LYTHON_TRACE_LANES")) {
               LaneEntityQuery probe;
