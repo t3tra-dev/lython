@@ -510,7 +510,12 @@ class Task[T](_Waiter):
         super().__init__(True)
         self._result: list[T] = []
         self._coro = coro
-        self._driver: CoroutineType[object, None, None] = self._drive()
+        # ⛔ Let go of once the task is done (`_finish_driving`): the driver's
+        # frame holds this task, so the two are a cycle, and with no cycle
+        # collector here every `asyncio.run` leaked its task, the loop it
+        # names and everything they held (12 objects a run, CPython's gc
+        # takes them).
+        self._driver: CoroutineType[object, None, None] | None = self._drive()
         self._loop.call_soon(self._step)
 
     async def _drive(self) -> None:
@@ -541,8 +546,12 @@ class Task[T](_Waiter):
             "repr() of a Task: CPython names its coroutine's source location, "
             "which this runtime does not keep")
 
+    def _finish_driving(self) -> None:
+        self._driver = None
+
     def _step(self) -> None:
-        if self.done():
+        driver = self._driver
+        if self.done() or driver is None:
             return
         # ⛔ What the coroutine yielded is handled inside the `try`, not after
         # it as CPython does: a value assigned in a `try` and read after it
@@ -551,9 +560,9 @@ class Task[T](_Waiter):
         try:
             if self._must_cancel:
                 self._must_cancel = False
-                yielded = self._driver.throw(CancelledError(self._cancel_message))
+                yielded = driver.throw(CancelledError(self._cancel_message))
             else:
-                yielded = self._driver.send(None)
+                yielded = driver.send(None)
             if isinstance(yielded, _Waiter):
                 if self._must_cancel:
                     yielded.cancel(self._cancel_message)
@@ -561,11 +570,14 @@ class Task[T](_Waiter):
             else:
                 self._loop.call_soon(self._step)
         except StopIteration:
+            self._finish_driving()
             self._state = "FINISHED"
             self._schedule_callbacks()
         except CancelledError:
+            self._finish_driving()
             self._set_cancelled(self._cancel_message)
         except BaseException as exc:
+            self._finish_driving()
             self.set_exception(exc)
 
     def __await__(self) -> Generator[object, None, T]:
