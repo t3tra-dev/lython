@@ -1430,6 +1430,41 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
     }
   }
 
+  // An exception attribute a manifest primitive answers: the primitive
+  // takes the exception and hands back the attribute's value.
+  auto lowerExceptionAttributePrimitive =
+      [&](const RuntimeSymbol &primitive) -> mlir::LogicalResult {
+    llvm::SmallVector<const RuntimeBundle *, 1> sources{object};
+    llvm::SmallVector<mlir::Value, 4> operands;
+    builder.setInsertionPoint(op);
+    if (mlir::failed(buildRuntimeCallOperands(op, primitive, sources, operands,
+                                              /*allowUnusedSources=*/false)))
+      return mlir::failure();
+    mlir::func::CallOp call =
+        RuntimeBundleLowerer::createRuntimeCall(op.getLoc(), primitive, operands);
+    RuntimeBundle result;
+    if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
+            op, op.getResult().getType(), call, result)))
+      return mlir::failure();
+    valueBundles[op.getResult()] = std::move(result);
+    erase.push_back(op);
+    return mlir::success();
+  };
+
+  // The codec errors' encoding / object / start / end / reason are the
+  // arguments in their payload block, read by primitives named after them.
+  if (object->kind == RuntimeBundle::Kind::Object &&
+      object->physicalValues().size() == 3) {
+    static constexpr llvm::StringLiteral kCodecErrors[] = {
+        "builtins.UnicodeDecodeError", "builtins.UnicodeEncodeError",
+        "builtins.UnicodeTranslateError"};
+    std::string contract = runtimeContractName(op.getObject().getType());
+    if (llvm::is_contained(kCodecErrors, contract))
+      if (std::optional<RuntimeSymbol> primitive =
+              manifest.primitive(contract, op.getName()))
+        return lowerExceptionAttributePrimitive(*primitive);
+  }
+
   // ExceptionGroup.message / .exceptions read the message lane and the
   // extended member block through manifest primitives — like args, there is
   // no field slot to load, so this must run before the class-field paths.
@@ -1454,22 +1489,7 @@ mlir::LogicalResult RuntimeBundleLowerer::lowerAttrGet(py::AttrGetOp op) {
         return op.emitError()
                << "runtime manifest has no BaseExceptionGroup " << op.getName()
                << " primitive";
-      llvm::SmallVector<const RuntimeBundle *, 1> sources{object};
-      llvm::SmallVector<mlir::Value, 4> operands;
-      builder.setInsertionPoint(op);
-      if (mlir::failed(buildRuntimeCallOperands(op, *primitive, sources,
-                                                operands,
-                                                /*allowUnusedSources=*/false)))
-        return mlir::failure();
-      mlir::func::CallOp call = RuntimeBundleLowerer::createRuntimeCall(
-          op.getLoc(), *primitive, operands);
-      RuntimeBundle result;
-      if (mlir::failed(RuntimeBundleLowerer::bundleRuntimeResults(
-              op, op.getResult().getType(), call, result)))
-        return mlir::failure();
-      valueBundles[op.getResult()] = std::move(result);
-      erase.push_back(op);
-      return mlir::success();
+      return lowerExceptionAttributePrimitive(*primitive);
     }
   }
 

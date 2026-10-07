@@ -22,6 +22,7 @@ module attributes {
   ly.runtime.contracts = ["types.NoneType", "builtins.object"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyFloat_SlotWordAsF64(%word: i64) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.primitive = "slot_word_as_f64"}
   func.func private @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"}
   func.func private @LyLong_TryAsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "try_unbox.i64"}
@@ -117,7 +118,7 @@ module attributes {
     %none_static = memref.get_global @__ly_object_repr_none : memref<4xi8>
     %none_bytes = memref.cast %none_static : memref<4xi8> to memref<?xi8>
     %none_len = arith.constant 4 : i64
-    %nh, %nb = func.call @LyUnicode_FromBytes(%none_bytes, %c0, %none_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %nh, %nb = func.call @__ly_unicode_from_valid_utf8(%none_bytes, %c0, %none_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     cf.br ^done(%nh, %nb : memref<2xi64>, memref<?xi8>)
 
   ^try_hook:
@@ -327,7 +328,7 @@ module attributes {
     %suffix_pos = arith.addi %prefix_len_index, %hex_digits_index : index
     memref.store %ascii_gt, %buffer[%suffix_pos] : memref<?xi8>
     %start = arith.constant 0 : index
-    %result_header, %result_bytes = func.call @LyUnicode_FromBytes(%buffer, %start, %total_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %result_header, %result_bytes = func.call @__ly_unicode_from_valid_utf8(%buffer, %start, %total_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %result_header, %result_bytes : memref<2xi64>, memref<?xi8>
   }
 
@@ -480,7 +481,7 @@ module attributes {
     %fallback = memref.get_global @__ly_class_name_object : memref<6xi8>
     %fallback_dyn = memref.cast %fallback : memref<6xi8> to memref<?xi8>
     %fallback_len = arith.constant 6 : i64
-    %fh, %fb = func.call @LyUnicode_FromBytes(%fallback_dyn, %c0, %fallback_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %fh, %fb = func.call @__ly_unicode_from_valid_utf8(%fallback_dyn, %c0, %fallback_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %fh, %fb : memref<2xi64>, memref<?xi8>
 
   ^known:
@@ -514,7 +515,7 @@ module attributes {
     %leaf_len_index = arith.subi %scan#0, %scan#2 : index
     %name_len = arith.index_cast %leaf_len_index : index to i64
     %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
-    %nh, %nb = func.call @LyUnicode_FromBytes(%name_dyn, %scan#2, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %nh, %nb = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %scan#2, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %nh, %nb : memref<2xi64>, memref<?xi8>
   }
 

@@ -6,15 +6,27 @@
 // Deviations from CPython:
 //   - An empty message and no message share one payload: `repr(X(''))`
 //     renders as `X()` and `X('').args` is `()`.
-//   - UnicodeDecodeError / UnicodeEncodeError / UnicodeTranslateError have no
-//     codec-aware `__str__`: built with CPython's 5-argument form, `str(e)`
-//     renders the arguments as BaseException does.
+//   - The codec errors take their codec arguments and nothing else:
+//     `UnicodeDecodeError("message")` is refused at compile time where CPython
+//     raises TypeError when it runs, and a decode error's `object` is bytes
+//     rather than any buffer.
 
 module attributes {
   ly.typing.manifest,
   ly.runtime.contracts = ["builtins.BaseException", "builtins.Exception", "builtins.RuntimeError", "builtins.TypeError", "builtins.ValueError", "builtins.ArithmeticError", "builtins.LookupError", "builtins.ZeroDivisionError", "builtins.KeyError", "builtins.IndexError", "builtins.AssertionError", "builtins.StopIteration", "builtins.StopAsyncIteration", "builtins.SystemExit", "builtins.GeneratorExit", "builtins.OSError", "builtins.FileNotFoundError", "builtins.KeyboardInterrupt", "builtins.BaseExceptionGroup", "builtins.ExceptionGroup", "builtins.FloatingPointError", "builtins.OverflowError", "builtins.BufferError", "builtins.EOFError", "builtins.ImportError", "builtins.ModuleNotFoundError", "builtins.MemoryError", "builtins.NameError", "builtins.UnboundLocalError", "builtins.AttributeError", "builtins.ReferenceError", "builtins.NotImplementedError", "builtins.RecursionError", "builtins.PythonFinalizationError", "builtins.SyntaxError", "builtins.IndentationError", "builtins.TabError", "builtins.SystemError", "builtins.UnicodeError", "builtins.UnicodeDecodeError", "builtins.UnicodeEncodeError", "builtins.UnicodeTranslateError", "builtins.Warning", "builtins.BytesWarning", "builtins.DeprecationWarning", "builtins.EncodingWarning", "builtins.FutureWarning", "builtins.ImportWarning", "builtins.PendingDeprecationWarning", "builtins.ResourceWarning", "builtins.RuntimeWarning", "builtins.SyntaxWarning", "builtins.UnicodeWarning", "builtins.UserWarning", "builtins.BlockingIOError", "builtins.ChildProcessError", "builtins.ConnectionError", "builtins.BrokenPipeError", "builtins.ConnectionAbortedError", "builtins.ConnectionRefusedError", "builtins.ConnectionResetError", "builtins.FileExistsError", "builtins.InterruptedError", "builtins.IsADirectoryError", "builtins.NotADirectoryError", "builtins.PermissionError", "builtins.ProcessLookupError", "builtins.TimeoutError"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_slot_word_is_immediate(%word: i64) -> i1
+  func.func private @__ly_int_from_immediate(%word: i64) -> i64
+  func.func private @LyLong_FromI64(%value: i64 {ly.runtime.default_i64 = 0 : i64}) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 1 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
+  func.func private @LyUnicode_FromI64(%value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
+  func.func private @__ly_unicode_width(%header: memref<2xi64>) -> i64
+  func.func private @__ly_unicode_get(%bytes: memref<?xi8>, %width: i64, %i: index) -> i64
+  func.func private @__ly_bytes_payload(%self: memref<4xi64>) -> memref<?xi8> attributes {ly.runtime.contract = "builtins.bytes", ly.runtime.interior_word, ly.runtime.primitive = "payload_view"}
+  func.func private @LyLong_SlotWordAsI64(%word: i64) -> (i64, i1) attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_as_i64"}
+  func.func private @LyLong_SlotWordFromI64(%value: i64) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "slot_word_from_i64"}
+  func.func private @__ly_unicode_from_hex(%value: i64, %digits: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBool_Unbox(%header: memref<3xi64> {ly.ownership.object_header}) -> i1 attributes {ly.runtime.contract = "builtins.bool", ly.runtime.primitive = "unbox"}
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.method = "__int__", ly.runtime.primitive = "unbox.i64"}
   func.func private @LyObject_ReleaseStorageToZero(%storage: memref<?xi64>) -> i1 attributes {ly.runtime.contract = "builtins.object", ly.runtime.primitive = "release_to_zero"}
@@ -127,9 +139,56 @@ module attributes {
   py.class @TabError attributes {base_names = ["IndentationError"]} {}
   py.class @SystemError attributes {base_names = ["Exception"]} {}
   py.class @UnicodeError attributes {base_names = ["ValueError"]} {}
-  py.class @UnicodeDecodeError attributes {base_names = ["UnicodeError"]} {}
-  py.class @UnicodeEncodeError attributes {base_names = ["UnicodeError"]} {}
-  py.class @UnicodeTranslateError attributes {base_names = ["UnicodeError"]} {}
+  // The codec errors take the codec's own arguments, as typeshed declares
+  // them (`object` is bytes for a decode: the buffer protocol is not
+  // modelled), and keep them as these attributes.
+  py.class @UnicodeDecodeError attributes {
+    base_names = ["UnicodeError"],
+    field_names = ["encoding", "object", "start", "end", "reason"],
+    field_contract_types = [
+      !py.contract<"builtins.str">,
+      !py.contract<"builtins.bytes">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.str">
+    ],
+    method_names = ["__init__"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"builtins.UnicodeDecodeError">, !py.contract<"builtins.str">, !py.contract<"builtins.bytes">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.literal<None>]>
+    ],
+    method_kinds = ["instance"]
+  } {}
+  py.class @UnicodeEncodeError attributes {
+    base_names = ["UnicodeError"],
+    field_names = ["encoding", "object", "start", "end", "reason"],
+    field_contract_types = [
+      !py.contract<"builtins.str">,
+      !py.contract<"builtins.str">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.str">
+    ],
+    method_names = ["__init__"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"builtins.UnicodeEncodeError">, !py.contract<"builtins.str">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.literal<None>]>
+    ],
+    method_kinds = ["instance"]
+  } {}
+  py.class @UnicodeTranslateError attributes {
+    base_names = ["UnicodeError"],
+    field_names = ["object", "start", "end", "reason"],
+    field_contract_types = [
+      !py.contract<"builtins.str">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.int">,
+      !py.contract<"builtins.str">
+    ],
+    method_names = ["__init__"],
+    method_contracts = [
+      !py.protocol<"Callable", [!py.contract<"builtins.UnicodeTranslateError">, !py.contract<"builtins.str">, !py.contract<"builtins.int">, !py.contract<"builtins.int">, !py.contract<"builtins.str">] -> [!py.literal<None>]>
+    ],
+    method_kinds = ["instance"]
+  } {}
   py.class @Warning attributes {base_names = ["Exception"]} {}
   py.class @BytesWarning attributes {base_names = ["Warning"]} {}
   py.class @DeprecationWarning attributes {base_names = ["Warning"]} {}
@@ -350,6 +409,568 @@ module attributes {
     func.return
   }
 
+  // ===== the codec errors' messages (UnicodeDecodeError_str and its two
+  // siblings in Objects/exceptions.c) =====
+  // "'"
+  memref.global "private" constant @__ly_exc_codec_quote : memref<1xi8> = dense<[39]>
+  // "' codec can't decode byte 0x"
+  memref.global "private" constant @__ly_exc_codec_decode_byte : memref<28xi8> = dense<[39, 32, 99, 111, 100, 101, 99, 32, 99, 97, 110, 39, 116, 32, 100, 101, 99, 111, 100, 101, 32, 98, 121, 116, 101, 32, 48, 120]>
+  // "' codec can't decode bytes in position "
+  memref.global "private" constant @__ly_exc_codec_decode_bytes : memref<39xi8> = dense<[39, 32, 99, 111, 100, 101, 99, 32, 99, 97, 110, 39, 116, 32, 100, 101, 99, 111, 100, 101, 32, 98, 121, 116, 101, 115, 32, 105, 110, 32, 112, 111, 115, 105, 116, 105, 111, 110, 32]>
+  // "' codec can't encode character '\"
+  memref.global "private" constant @__ly_exc_codec_encode_char : memref<33xi8> = dense<[39, 32, 99, 111, 100, 101, 99, 32, 99, 97, 110, 39, 116, 32, 101, 110, 99, 111, 100, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 39, 92]>
+  // "' codec can't encode characters in position "
+  memref.global "private" constant @__ly_exc_codec_encode_chars : memref<44xi8> = dense<[39, 32, 99, 111, 100, 101, 99, 32, 99, 97, 110, 39, 116, 32, 101, 110, 99, 111, 100, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 115, 32, 105, 110, 32, 112, 111, 115, 105, 116, 105, 111, 110, 32]>
+  // "can't translate character '\"
+  memref.global "private" constant @__ly_exc_codec_translate_char : memref<28xi8> = dense<[99, 97, 110, 39, 116, 32, 116, 114, 97, 110, 115, 108, 97, 116, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 32, 39, 92]>
+  // "can't translate characters in position "
+  memref.global "private" constant @__ly_exc_codec_translate_chars : memref<39xi8> = dense<[99, 97, 110, 39, 116, 32, 116, 114, 97, 110, 115, 108, 97, 116, 101, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 115, 32, 105, 110, 32, 112, 111, 115, 105, 116, 105, 111, 110, 32]>
+  // " in position "
+  memref.global "private" constant @__ly_exc_codec_in_position : memref<13xi8> = dense<[32, 105, 110, 32, 112, 111, 115, 105, 116, 105, 111, 110, 32]>
+  // "' in position "
+  memref.global "private" constant @__ly_exc_codec_char_in_position : memref<14xi8> = dense<[39, 32, 105, 110, 32, 112, 111, 115, 105, 116, 105, 111, 110, 32]>
+  // ": "
+  memref.global "private" constant @__ly_exc_codec_colon : memref<2xi8> = dense<[58, 32]>
+  // "-"
+  memref.global "private" constant @__ly_exc_codec_dash : memref<1xi8> = dense<[45]>
+  // "x"
+  memref.global "private" constant @__ly_exc_codec_x : memref<1xi8> = dense<[120]>
+  // "u"
+  memref.global "private" constant @__ly_exc_codec_u : memref<1xi8> = dense<[117]>
+  // "U"
+  memref.global "private" constant @__ly_exc_codec_U : memref<1xi8> = dense<[85]>
+
+  // acc + piece, as a new str; both inputs are released -- the one step a
+  // codec error's message is built by.
+  func.func private @__ly_exc_append(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %piece_h: memref<2xi64> {ly.ownership.object_header}, %piece_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0, 2]} {
+    %h, %b = func.call @LyUnicode_Concat(%acc_h, %acc_b, %piece_h, %piece_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%acc_h) : (memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%piece_h) : (memref<2xi64>) -> ()
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + a str the caller only borrows (an argument the payload block still
+  // holds); acc is released.
+  func.func private @__ly_exc_append_borrowed(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %piece_h: memref<2xi64> {ly.ownership.object_header}, %piece_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %h, %b = func.call @LyUnicode_Concat(%acc_h, %acc_b, %piece_h, %piece_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @LyUnicode_DecRef(%acc_h) : (memref<2xi64>) -> ()
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + `length` bytes of ASCII text; acc is released.
+  func.func private @__ly_exc_append_text(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %text: memref<?xi8>, %length: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %c0 = arith.constant 0 : index
+    %piece_h, %piece_b = func.call @__ly_unicode_from_valid_utf8(%text, %c0, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_exc_append(%acc_h, %acc_b, %piece_h, %piece_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + the decimal digits of `value` (PyUnicode_FromFormat's %zd); acc is
+  // released.
+  func.func private @__ly_exc_append_int(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %value: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %piece_h, %piece_b = func.call @LyUnicode_FromI64(%value) : (i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_exc_append(%acc_h, %acc_b, %piece_h, %piece_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + `digits` lowercase hex digits of `value` (%02x, %04x, %08x); acc is
+  // released.
+  func.func private @__ly_exc_append_hex(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %value: i64, %digits: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %piece_h, %piece_b = func.call @__ly_unicode_from_hex(%value, %digits) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_exc_append(%acc_h, %acc_b, %piece_h, %piece_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + a character the way the encode and translate messages escape it:
+  // \xhh up to 0xff, \uhhhh up to 0xffff, \Uhhhhhhhh beyond (the backslash
+  // is already in the text before it); acc is released.
+  func.func private @__ly_exc_append_escape(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %ch: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %four = arith.constant 4 : i64
+    %eight = arith.constant 8 : i64
+    %byte_max = arith.constant 255 : i64
+    %bmp_max = arith.constant 65535 : i64
+    %is_byte = arith.cmpi ule, %ch, %byte_max : i64
+    %is_bmp = arith.cmpi ule, %ch, %bmp_max : i64
+    %x_ref = memref.get_global @__ly_exc_codec_x : memref<1xi8>
+    %x = memref.cast %x_ref : memref<1xi8> to memref<?xi8>
+    %u_ref = memref.get_global @__ly_exc_codec_u : memref<1xi8>
+    %u = memref.cast %u_ref : memref<1xi8> to memref<?xi8>
+    %big_u_ref = memref.get_global @__ly_exc_codec_U : memref<1xi8>
+    %big_u = memref.cast %big_u_ref : memref<1xi8> to memref<?xi8>
+    %wide_letter = arith.select %is_bmp, %u, %big_u : memref<?xi8>
+    %letter = arith.select %is_byte, %x, %wide_letter : memref<?xi8>
+    %wide_digits = arith.select %is_bmp, %four, %eight : i64
+    %digits = arith.select %is_byte, %two, %wide_digits : i64
+    %lettered_h, %lettered_b = func.call @__ly_exc_append_text(%acc_h, %acc_b, %letter, %one) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_exc_append_hex(%lettered_h, %lettered_b, %ch, %digits) : (memref<2xi64>, memref<?xi8>, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + "<start>: <reason>"; acc is released.
+  func.func private @__ly_exc_append_position(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %start: i64, %reason_h: memref<2xi64> {ly.ownership.object_header}, %reason_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %two = arith.constant 2 : i64
+    %colon_ref = memref.get_global @__ly_exc_codec_colon : memref<2xi8>
+    %colon = memref.cast %colon_ref : memref<2xi8> to memref<?xi8>
+    %a_h, %a_b = func.call @__ly_exc_append_int(%acc_h, %acc_b, %start) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %b_h, %b_b = func.call @__ly_exc_append_text(%a_h, %a_b, %colon, %two) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_exc_append_borrowed(%b_h, %b_b, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // acc + "<start>-<end - 1>: <reason>"; acc is released.
+  func.func private @__ly_exc_append_span(%acc_h: memref<2xi64> {ly.ownership.object_header}, %acc_b: memref<?xi8>, %start: i64, %end: i64, %reason_h: memref<2xi64> {ly.ownership.object_header}, %reason_b: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [0]} {
+    %one = arith.constant 1 : i64
+    %dash_ref = memref.get_global @__ly_exc_codec_dash : memref<1xi8>
+    %dash = memref.cast %dash_ref : memref<1xi8> to memref<?xi8>
+    %a_h, %a_b = func.call @__ly_exc_append_int(%acc_h, %acc_b, %start) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %b_h, %b_b = func.call @__ly_exc_append_text(%a_h, %a_b, %dash, %one) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+    %last = arith.subi %end, %one : i64
+    %h, %b = func.call @__ly_exc_append_position(%b_h, %b_b, %last, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // The str an argument slot holds, as views the payload block keeps alive.
+  func.func private @__ly_exc_slot_str(%word: i64) -> (memref<2xi64>, memref<?xi8>) {
+    %two = arith.constant 2 : i64
+    %header_dyn = func.call @__ly_global_view_i64(%word, %two) : (i64, i64) -> memref<?xi64>
+    %header = memref.cast %header_dyn : memref<?xi64> to memref<2xi64>
+    %bytes_ptr, %byte_len = func.call @__ly_unicode_lane_words(%word) : (i64) -> (i64, i64)
+    %bytes = func.call @__ly_global_view_i8(%bytes_ptr, %byte_len) : (i64, i64) -> memref<?xi8>
+    func.return %header, %bytes : memref<2xi64>, memref<?xi8>
+  }
+
+  // Whether argument `slot` is an object of class `class_id`.
+  func.func private @__ly_exc_slot_is(%block: i64, %slot: i64, %class_id: i64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %word = func.call @__ly_exc_payload_box_word(%block, %slot, %zero) : (i64, i64, i64) -> i64
+    %class = func.call @__ly_slot_class(%word) : (i64) -> i64
+    %is = arith.cmpi eq, %class, %class_id : i64
+    func.return %is : i1
+  }
+
+  // Whether argument `slot` is an int that is a word (the Py_ssize_t the
+  // "n" of the codec errors' __init__ format takes).
+  func.func private @__ly_exc_slot_is_index(%block: i64, %slot: i64) -> i1 {
+    %zero = arith.constant 0 : i64
+    %int_class = arith.constant 1 : i64
+    %false = arith.constant false
+    %is_int = func.call @__ly_exc_slot_is(%block, %slot, %int_class) : (i64, i64, i64) -> i1
+    %fits = scf.if %is_int -> (i1) {
+      %word = func.call @__ly_exc_payload_box_word(%block, %slot, %zero) : (i64, i64, i64) -> i64
+      %value, %ok = func.call @LyLong_SlotWordAsI64(%word) : (i64) -> (i64, i1)
+      scf.yield %ok : i1
+    } else {
+      scf.yield %false : i1
+    }
+    func.return %fits : i1
+  }
+
+  // Which codec error's message the arguments can spell: 1 for
+  // UnicodeDecodeError's, 2 for UnicodeEncodeError's, 3 for
+  // UnicodeTranslateError's, 0 for none -- the class is none of the three
+  // (their subclasses count, as CPython's __str__ is inherited) or the
+  // arguments are not what their __init__ takes: (str, bytes, int, int,
+  // str), (str, str, int, int, str), (str, int, int, str). Lython also builds
+  // these with a single message, which renders as BaseException does.
+  func.func private @__ly_exc_codec_error_kind(%header: memref<3xi64>, %block: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %five = arith.constant 5 : i64
+    %str_class = arith.constant 4 : i64
+    %bytes_class = arith.constant 70 : i64
+    %decode_root = arith.constant 122 : i64
+    %encode_root = arith.constant 123 : i64
+    %translate_root = arith.constant 124 : i64
+    %false = arith.constant false
+    %class_slot = arith.constant 2 : index
+    %class = memref.load %header[%class_slot] : memref<3xi64>
+    %is_decode = func.call @LyEH_ClassIdMatches(%class, %decode_root) : (i64, i64) -> i1
+    %is_encode = func.call @LyEH_ClassIdMatches(%class, %encode_root) : (i64, i64) -> i1
+    %is_translate = func.call @LyEH_ClassIdMatches(%class, %translate_root) : (i64, i64) -> i1
+    %count = func.call @__ly_exc_payload_count(%block) : (i64) -> i64
+    %five_args = arith.cmpi eq, %count, %five : i64
+    %four_args = arith.cmpi eq, %count, %four : i64
+    %codec = arith.ori %is_decode, %is_encode : i1
+    %codec_shaped = arith.andi %codec, %five_args : i1
+    %translate_shaped = arith.andi %is_translate, %four_args : i1
+    %kind = scf.if %codec_shaped -> (i64) {
+      %encoding_ok = func.call @__ly_exc_slot_is(%block, %zero, %str_class) : (i64, i64, i64) -> i1
+      %object_class = arith.select %is_decode, %bytes_class, %str_class : i64
+      %object_ok = func.call @__ly_exc_slot_is(%block, %one, %object_class) : (i64, i64, i64) -> i1
+      %start_ok = func.call @__ly_exc_slot_is_index(%block, %two) : (i64, i64) -> i1
+      %end_ok = func.call @__ly_exc_slot_is_index(%block, %three) : (i64, i64) -> i1
+      %reason_ok = func.call @__ly_exc_slot_is(%block, %four, %str_class) : (i64, i64, i64) -> i1
+      %a = arith.andi %encoding_ok, %object_ok : i1
+      %b = arith.andi %a, %start_ok : i1
+      %c = arith.andi %b, %end_ok : i1
+      %all = arith.andi %c, %reason_ok : i1
+      %which = arith.select %is_decode, %one, %two : i64
+      %answer = arith.select %all, %which, %zero : i64
+      scf.yield %answer : i64
+    } else {
+      %t = scf.if %translate_shaped -> (i64) {
+        %object_ok = func.call @__ly_exc_slot_is(%block, %zero, %str_class) : (i64, i64, i64) -> i1
+        %start_ok = func.call @__ly_exc_slot_is_index(%block, %one) : (i64, i64) -> i1
+        %end_ok = func.call @__ly_exc_slot_is_index(%block, %two) : (i64, i64) -> i1
+        %reason_ok = func.call @__ly_exc_slot_is(%block, %three, %str_class) : (i64, i64, i64) -> i1
+        %a = arith.andi %object_ok, %start_ok : i1
+        %b = arith.andi %a, %end_ok : i1
+        %all = arith.andi %b, %reason_ok : i1
+        %answer = arith.select %all, %three, %zero : i64
+        scf.yield %answer : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      scf.yield %t : i64
+    }
+    func.return %kind : i64
+  }
+
+  // CPython's UnicodeDecodeError_str / UnicodeEncodeError_str /
+  // UnicodeTranslateError_str for arguments __ly_exc_codec_error_kind
+  // accepted: one byte or character in range is named, anything else is a
+  // span "start-(end - 1)".
+  func.func private @__ly_exc_render_codec_error(%block: i64, %kind: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0]} {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %is_decode = arith.cmpi eq, %kind, %one : i64
+    %is_translate = arith.cmpi eq, %kind, %three : i64
+    // The translate error has no encoding: its arguments start a slot earlier.
+    %object_slot = arith.select %is_translate, %zero, %one : i64
+    %start_slot = arith.addi %object_slot, %one : i64
+    %end_slot = arith.addi %object_slot, %two : i64
+    %reason_slot = arith.addi %object_slot, %three : i64
+    %start_word = func.call @__ly_exc_payload_box_word(%block, %start_slot, %zero) : (i64, i64, i64) -> i64
+    %start, %start_fits = func.call @LyLong_SlotWordAsI64(%start_word) : (i64) -> (i64, i1)
+    %end_word = func.call @__ly_exc_payload_box_word(%block, %end_slot, %zero) : (i64, i64, i64) -> i64
+    %end, %end_fits = func.call @LyLong_SlotWordAsI64(%end_word) : (i64) -> (i64, i1)
+    %reason_word = func.call @__ly_exc_payload_box_word(%block, %reason_slot, %zero) : (i64, i64, i64) -> i64
+    %reason_h, %reason_b = func.call @__ly_exc_slot_str(%reason_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
+    %object_word = func.call @__ly_exc_payload_box_word(%block, %object_slot, %zero) : (i64, i64, i64) -> i64
+    %start_low = arith.cmpi sge, %start, %zero : i64
+    // The object's length, and the byte or character at `start` when there is
+    // one to read.
+    %length, %bad = scf.if %is_decode -> (i64, i64) {
+      %bytes_header_dyn = func.call @__ly_global_view_i64(%object_word, %four) : (i64, i64) -> memref<?xi64>
+      %bytes_header = memref.cast %bytes_header_dyn : memref<?xi64> to memref<4xi64>
+      %payload = func.call @__ly_bytes_payload(%bytes_header) : (memref<4xi64>) -> memref<?xi8>
+      %dim = memref.dim %payload, %c0 : memref<?xi8>
+      %len = arith.index_cast %dim : index to i64
+      %start_high = arith.cmpi slt, %start, %len : i64
+      %in = arith.andi %start_low, %start_high : i1
+      %byte = scf.if %in -> (i64) {
+        %at = arith.index_cast %start : i64 to index
+        %raw = memref.load %payload[%at] : memref<?xi8>
+        %wide = arith.extui %raw : i8 to i64
+        scf.yield %wide : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      scf.yield %len, %byte : i64, i64
+    } else {
+      %object_h, %object_b = func.call @__ly_exc_slot_str(%object_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
+      %len = func.call @__ly_unicode_count(%object_h, %object_b) : (memref<2xi64>, memref<?xi8>) -> i64
+      %width = func.call @__ly_unicode_width(%object_h) : (memref<2xi64>) -> i64
+      %start_high = arith.cmpi slt, %start, %len : i64
+      %in = arith.andi %start_low, %start_high : i1
+      %ch = scf.if %in -> (i64) {
+        %at = arith.index_cast %start : i64 to index
+        %code = func.call @__ly_unicode_get(%object_b, %width, %at) : (memref<?xi8>, i64, index) -> i64
+        scf.yield %code : i64
+      } else {
+        scf.yield %zero : i64
+      }
+      scf.yield %len, %ch : i64, i64
+    }
+    %start_high = arith.cmpi slt, %start, %length : i64
+    %end_low = arith.cmpi sge, %end, %zero : i64
+    %end_high = arith.cmpi sle, %end, %length : i64
+    %next = arith.addi %start, %one : i64
+    %one_wide = arith.cmpi eq, %end, %next : i64
+    %s1 = arith.andi %start_low, %start_high : i1
+    %s2 = arith.andi %s1, %end_low : i1
+    %s3 = arith.andi %s2, %end_high : i1
+    %single = arith.andi %s3, %one_wide : i1
+    %message:2 = scf.if %is_translate -> (memref<2xi64>, memref<?xi8>) {
+      %t:2 = scf.if %single -> (memref<2xi64>, memref<?xi8>) {
+        %head_ref = memref.get_global @__ly_exc_codec_translate_char : memref<28xi8>
+        %head = memref.cast %head_ref : memref<28xi8> to memref<?xi8>
+        %head_len = arith.constant 28 : i64
+        %a_h, %a_b = func.call @__ly_unicode_from_valid_utf8(%head, %c0, %head_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %b_h, %b_b = func.call @__ly_exc_append_escape(%a_h, %a_b, %bad) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        %pos_ref = memref.get_global @__ly_exc_codec_char_in_position : memref<14xi8>
+        %pos = memref.cast %pos_ref : memref<14xi8> to memref<?xi8>
+        %pos_len = arith.constant 14 : i64
+        %c_h, %c_b = func.call @__ly_exc_append_text(%b_h, %b_b, %pos, %pos_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+        %d_h, %d_b = func.call @__ly_exc_append_position(%c_h, %c_b, %start, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %d_h, %d_b : memref<2xi64>, memref<?xi8>
+      } else {
+        %head_ref = memref.get_global @__ly_exc_codec_translate_chars : memref<39xi8>
+        %head = memref.cast %head_ref : memref<39xi8> to memref<?xi8>
+        %head_len = arith.constant 39 : i64
+        %a_h, %a_b = func.call @__ly_unicode_from_valid_utf8(%head, %c0, %head_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %d_h, %d_b = func.call @__ly_exc_append_span(%a_h, %a_b, %start, %end, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+        scf.yield %d_h, %d_b : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %t#0, %t#1 : memref<2xi64>, memref<?xi8>
+    } else {
+      // "'" + encoding, then the rest by kind.
+      %quote_ref = memref.get_global @__ly_exc_codec_quote : memref<1xi8>
+      %quote = memref.cast %quote_ref : memref<1xi8> to memref<?xi8>
+      %q_h, %q_b = func.call @__ly_unicode_from_valid_utf8(%quote, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %encoding_word = func.call @__ly_exc_payload_box_word(%block, %zero, %zero) : (i64, i64, i64) -> i64
+      %encoding_h, %encoding_b = func.call @__ly_exc_slot_str(%encoding_word) : (i64) -> (memref<2xi64>, memref<?xi8>)
+      %e_h, %e_b = func.call @__ly_exc_append_borrowed(%q_h, %q_b, %encoding_h, %encoding_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+      %r:2 = scf.if %is_decode -> (memref<2xi64>, memref<?xi8>) {
+        %d:2 = scf.if %single -> (memref<2xi64>, memref<?xi8>) {
+          %text_ref = memref.get_global @__ly_exc_codec_decode_byte : memref<28xi8>
+          %text = memref.cast %text_ref : memref<28xi8> to memref<?xi8>
+          %text_len = arith.constant 28 : i64
+          %a_h, %a_b = func.call @__ly_exc_append_text(%e_h, %e_b, %text, %text_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %b_h, %b_b = func.call @__ly_exc_append_hex(%a_h, %a_b, %bad, %two) : (memref<2xi64>, memref<?xi8>, i64, i64) -> (memref<2xi64>, memref<?xi8>)
+          %pos_ref = memref.get_global @__ly_exc_codec_in_position : memref<13xi8>
+          %pos = memref.cast %pos_ref : memref<13xi8> to memref<?xi8>
+          %pos_len = arith.constant 13 : i64
+          %c_h, %c_b = func.call @__ly_exc_append_text(%b_h, %b_b, %pos, %pos_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %f_h, %f_b = func.call @__ly_exc_append_position(%c_h, %c_b, %start, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
+        } else {
+          %text_ref = memref.get_global @__ly_exc_codec_decode_bytes : memref<39xi8>
+          %text = memref.cast %text_ref : memref<39xi8> to memref<?xi8>
+          %text_len = arith.constant 39 : i64
+          %a_h, %a_b = func.call @__ly_exc_append_text(%e_h, %e_b, %text, %text_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %f_h, %f_b = func.call @__ly_exc_append_span(%a_h, %a_b, %start, %end, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %d#0, %d#1 : memref<2xi64>, memref<?xi8>
+      } else {
+        %d:2 = scf.if %single -> (memref<2xi64>, memref<?xi8>) {
+          %text_ref = memref.get_global @__ly_exc_codec_encode_char : memref<33xi8>
+          %text = memref.cast %text_ref : memref<33xi8> to memref<?xi8>
+          %text_len = arith.constant 33 : i64
+          %a_h, %a_b = func.call @__ly_exc_append_text(%e_h, %e_b, %text, %text_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %b_h, %b_b = func.call @__ly_exc_append_escape(%a_h, %a_b, %bad) : (memref<2xi64>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %pos_ref = memref.get_global @__ly_exc_codec_char_in_position : memref<14xi8>
+          %pos = memref.cast %pos_ref : memref<14xi8> to memref<?xi8>
+          %pos_len = arith.constant 14 : i64
+          %c_h, %c_b = func.call @__ly_exc_append_text(%b_h, %b_b, %pos, %pos_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %f_h, %f_b = func.call @__ly_exc_append_position(%c_h, %c_b, %start, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
+        } else {
+          %text_ref = memref.get_global @__ly_exc_codec_encode_chars : memref<44xi8>
+          %text = memref.cast %text_ref : memref<44xi8> to memref<?xi8>
+          %text_len = arith.constant 44 : i64
+          %a_h, %a_b = func.call @__ly_exc_append_text(%e_h, %e_b, %text, %text_len) : (memref<2xi64>, memref<?xi8>, memref<?xi8>, i64) -> (memref<2xi64>, memref<?xi8>)
+          %f_h, %f_b = func.call @__ly_exc_append_span(%a_h, %a_b, %start, %end, %reason_h, %reason_b) : (memref<2xi64>, memref<?xi8>, i64, i64, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
+          scf.yield %f_h, %f_b : memref<2xi64>, memref<?xi8>
+        }
+        scf.yield %d#0, %d#1 : memref<2xi64>, memref<?xi8>
+      }
+      scf.yield %r#0, %r#1 : memref<2xi64>, memref<?xi8>
+    }
+    func.return %message#0, %message#1 : memref<2xi64>, memref<?xi8>
+  }
+
+  // The codec errors' attributes are their payload slots: the arguments
+  // __init__ took, in its order (exceptions.c keeps them in fields). Each
+  // reader hands back a reference of its own.
+  func.func private @__ly_exc_codec_slot_word(%header: memref<3xi64>, %slot: i64) -> i64 {
+    %zero = arith.constant 0 : i64
+    %payload_slot = arith.constant 3 : i64
+    %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %word = func.call @__ly_exc_payload_box_word(%block, %slot, %zero) : (i64, i64, i64) -> i64
+    func.return %word : i64
+  }
+
+  func.func private @__ly_exc_codec_str(%header: memref<3xi64>, %slot: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]} {
+    %word = func.call @__ly_exc_codec_slot_word(%header, %slot) : (memref<3xi64>, i64) -> i64
+    func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+    %h, %b = func.call @__ly_exc_slot_str(%word) : (i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func private @__ly_exc_codec_bytes(%header: memref<3xi64>, %slot: i64) -> memref<4xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.bytes"], ly.ownership.owned_results = [0]} {
+    %four = arith.constant 4 : i64
+    %word = func.call @__ly_exc_codec_slot_word(%header, %slot) : (memref<3xi64>, i64) -> i64
+    func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+    %view = func.call @__ly_global_view_i64(%word, %four) : (i64, i64) -> memref<?xi64>
+    %object = memref.cast %view : memref<?xi64> to memref<4xi64>
+    func.return %object : memref<4xi64>
+  }
+
+  func.func private @__ly_exc_codec_int(%header: memref<3xi64>, %slot: i64) -> memref<2xi64> attributes {ly.ownership.owned_result_contracts = ["builtins.int"], ly.ownership.owned_results = [0]} {
+    %word = func.call @__ly_exc_codec_slot_word(%header, %slot) : (memref<3xi64>, i64) -> i64
+    %immediate = func.call @__ly_slot_word_is_immediate(%word) : (i64) -> i1
+    %value = scf.if %immediate -> (memref<2xi64>) {
+      %v = func.call @__ly_int_from_immediate(%word) : (i64) -> i64
+      %fresh = func.call @LyLong_FromI64(%v) : (i64) -> memref<2xi64>
+      scf.yield %fresh : memref<2xi64>
+    } else {
+      %two = arith.constant 2 : i64
+      func.call @__ly_handle_retain_raw(%word) : (i64) -> ()
+      %view = func.call @__ly_global_view_i64(%word, %two) : (i64, i64) -> memref<?xi64>
+      %held = memref.cast %view : memref<?xi64> to memref<2xi64>
+      scf.yield %held : memref<2xi64>
+    }
+    func.return %value : memref<2xi64>
+  }
+
+  func.func @LyUnicodeDecodeError_Encoding(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.primitive = "encoding", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 0 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+  func.func @LyUnicodeDecodeError_Object(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<4xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.primitive = "object", ly.runtime.result_contract = "builtins.bytes"} {
+    %slot = arith.constant 1 : i64
+    %object = func.call @__ly_exc_codec_bytes(%header, %slot) : (memref<3xi64>, i64) -> memref<4xi64>
+    func.return %object : memref<4xi64>
+  }
+  func.func @LyUnicodeDecodeError_Start(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.primitive = "start", ly.runtime.result_contract = "builtins.int"} {
+    %slot = arith.constant 2 : i64
+    %value = func.call @__ly_exc_codec_int(%header, %slot) : (memref<3xi64>, i64) -> memref<2xi64>
+    func.return %value : memref<2xi64>
+  }
+  func.func @LyUnicodeDecodeError_End(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.primitive = "end", ly.runtime.result_contract = "builtins.int"} {
+    %slot = arith.constant 3 : i64
+    %value = func.call @__ly_exc_codec_int(%header, %slot) : (memref<3xi64>, i64) -> memref<2xi64>
+    func.return %value : memref<2xi64>
+  }
+  func.func @LyUnicodeDecodeError_Reason(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.primitive = "reason", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 4 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicodeEncodeError_Encoding(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.primitive = "encoding", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 0 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+  func.func @LyUnicodeEncodeError_Object(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.primitive = "object", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 1 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+  func.func @LyUnicodeEncodeError_Start(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.primitive = "start", ly.runtime.result_contract = "builtins.int"} {
+    %slot = arith.constant 2 : i64
+    %value = func.call @__ly_exc_codec_int(%header, %slot) : (memref<3xi64>, i64) -> memref<2xi64>
+    func.return %value : memref<2xi64>
+  }
+  func.func @LyUnicodeEncodeError_End(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.primitive = "end", ly.runtime.result_contract = "builtins.int"} {
+    %slot = arith.constant 3 : i64
+    %value = func.call @__ly_exc_codec_int(%header, %slot) : (memref<3xi64>, i64) -> memref<2xi64>
+    func.return %value : memref<2xi64>
+  }
+  func.func @LyUnicodeEncodeError_Reason(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.primitive = "reason", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 4 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicodeTranslateError_Object(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.primitive = "object", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 0 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+  func.func @LyUnicodeTranslateError_Start(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.primitive = "start", ly.runtime.result_contract = "builtins.int"} {
+    %slot = arith.constant 1 : i64
+    %value = func.call @__ly_exc_codec_int(%header, %slot) : (memref<3xi64>, i64) -> memref<2xi64>
+    func.return %value : memref<2xi64>
+  }
+  func.func @LyUnicodeTranslateError_End(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.primitive = "end", ly.runtime.result_contract = "builtins.int"} {
+    %slot = arith.constant 2 : i64
+    %value = func.call @__ly_exc_codec_int(%header, %slot) : (memref<3xi64>, i64) -> memref<2xi64>
+    func.return %value : memref<2xi64>
+  }
+  func.func @LyUnicodeTranslateError_Reason(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.primitive = "reason", ly.runtime.result_contract = "builtins.str"} {
+    %slot = arith.constant 3 : i64
+    %h, %b = func.call @__ly_exc_codec_str(%header, %slot) : (memref<3xi64>, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.return %h, %b : memref<2xi64>, memref<?xi8>
+  }
+
+  // The payload message of a codec error: what went wrong where, as CPython's
+  // UnicodeDecodeError_str and its siblings say it, when the arguments are
+  // the codec's; BaseException's rendering otherwise.
+  // ⛔ Not a branch in __ly_exc_render_args, which every exception built
+  // with arguments shares: a KeyError(key) then carried the codec messages'
+  // whole construction (fib.wasm +29%). The lowering picks this init by the
+  // exception's class, so only a program that builds a codec error has it.
+  //
+  // The message's reference moves into the header's lane (set_message stores
+  // it and takes nothing), which the release insertion cannot follow -- like
+  // LyBaseException_InitPayloadMessage this is a manifest function, whose
+  // ownership is the one written here.
+  func.func private @__ly_exc_init_codec_payload_message(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.UnicodeError"} {
+    %zero = arith.constant 0 : i64
+    %payload_slot = arith.constant 3 : i64
+    %block = func.call @__ly_exc_ext_get(%header, %payload_slot) : (memref<3xi64>, i64) -> i64
+    %kind = func.call @__ly_exc_codec_error_kind(%header, %block) : (memref<3xi64>, i64) -> i64
+    %is_codec = arith.cmpi ne, %kind, %zero : i64
+    cf.cond_br %is_codec, ^codec, ^plain
+
+  ^codec:
+    %codec_h, %codec_b = func.call @__ly_exc_render_codec_error(%block, %kind) : (i64, i64) -> (memref<2xi64>, memref<?xi8>)
+    func.call @__ly_exc_set_message(%header, %codec_h) : (memref<3xi64>, memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
+    func.return %header, %codec_h, %codec_b : memref<3xi64>, memref<2xi64>, memref<?xi8>
+
+  ^plain:
+    %plain_h, %plain_b = func.call @__ly_exc_render_args(%header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
+    func.call @__ly_exc_set_message(%header, %plain_h) : (memref<3xi64>, memref<2xi64>) -> ()
+    func.call @LyUnicode_DecRef(%old_mh) : (memref<2xi64>) -> ()
+    func.return %header, %plain_h, %plain_b : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicodeDecodeError_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.UnicodeDecodeError"], ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.UnicodeDecodeError", ly.runtime.primitive = "init_payload_message"} {
+    %e:3 = func.call @__ly_exc_init_codec_payload_message(%header, %old_mh, %old_mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %e#0, %e#1, %e#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicodeEncodeError_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.UnicodeEncodeError"], ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.UnicodeEncodeError", ly.runtime.primitive = "init_payload_message"} {
+    %e:3 = func.call @__ly_exc_init_codec_payload_message(%header, %old_mh, %old_mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %e#0, %e#1, %e#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  func.func @LyUnicodeTranslateError_InitPayloadMessage(%header: memref<3xi64> {ly.ownership.object_header}, %old_mh: memref<2xi64> {ly.ownership.object_header}, %old_mb: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.UnicodeTranslateError"], ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0], ly.runtime.contract = "builtins.UnicodeTranslateError", ly.runtime.primitive = "init_payload_message"} {
+    %e:3 = func.call @__ly_exc_init_codec_payload_message(%header, %old_mh, %old_mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %e#0, %e#1, %e#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
+  // CPython PyUnicodeDecodeError_Create: a UnicodeDecodeError built with its
+  // five arguments, and its message rendered from them. The encoding, the
+  // object and the reason are the block's from here on.
+  func.func @LyUnicodeDecodeError_Create(%encoding_h: memref<2xi64> {ly.ownership.object_header}, %encoding_b: memref<?xi8>, %object: memref<4xi64> {ly.ownership.object_header}, %start: i64, %end: i64, %reason_h: memref<2xi64> {ly.ownership.object_header}, %reason_b: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.UnicodeDecodeError"], ly.ownership.owned_results = [0], ly.ownership.transfer_args = [0, 2, 5]} {
+    %zero = arith.constant 0 : i64
+    %one = arith.constant 1 : i64
+    %two = arith.constant 2 : i64
+    %three = arith.constant 3 : i64
+    %four = arith.constant 4 : i64
+    %five = arith.constant 5 : i64
+    %class_id = arith.constant 122 : i64
+    %exception:3 = func.call @LyUnicodeDecodeError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    %block = func.call @LyBaseExceptionGroup_MembersAlloc(%exception#0, %exception#1, %exception#2, %five) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, i64) -> i64
+    func.call @__ly_exc_payload_store_unicode(%block, %zero, %encoding_h, %encoding_b) : (i64, i64, memref<2xi64>, memref<?xi8>) -> ()
+    %object_index = memref.extract_aligned_pointer_as_index %object : memref<4xi64> -> index
+    %object_word = arith.index_cast %object_index : index to i64
+    func.call @__ly_exc_payload_store_words(%block, %one, %object_word) : (i64, i64, i64) -> ()
+    %start_word = func.call @LyLong_SlotWordFromI64(%start) : (i64) -> i64
+    func.call @__ly_exc_payload_store_words(%block, %two, %start_word) : (i64, i64, i64) -> ()
+    %end_word = func.call @LyLong_SlotWordFromI64(%end) : (i64) -> i64
+    func.call @__ly_exc_payload_store_words(%block, %three, %end_word) : (i64, i64, i64) -> ()
+    func.call @__ly_exc_payload_store_unicode(%block, %four, %reason_h, %reason_b) : (i64, i64, memref<2xi64>, memref<?xi8>) -> ()
+    %initialized:3 = func.call @LyUnicodeDecodeError_InitPayloadMessage(%exception#0, %exception#1, %exception#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
+    func.return %initialized#0, %initialized#1, %initialized#2 : memref<3xi64>, memref<2xi64>, memref<?xi8>
+  }
+
   // Multi-value args message: CPython's str(e) for len(args) > 1 is
   // repr(args) -- "(r0, r1, ...)". Renders from the payload boxes, replaces
   // the empty construction-time message, and returns the receiver triple.
@@ -416,7 +1037,7 @@ module attributes {
     %block_ptr = llvm.inttoptr %block : i64 to !llvm.ptr
     %open_ref = memref.get_global @__ly_repr_lparen : memref<1xi8>
     %open_dyn = memref.cast %open_ref : memref<1xi8> to memref<?xi8>
-    %r0_h, %r0_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %r0_h, %r0_b = func.call @__ly_unicode_from_valid_utf8(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %comma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
     %comma_dyn = memref.cast %comma_ref : memref<2xi8> to memref<?xi8>
     %count_index = arith.index_cast %count : i64 to index
@@ -424,7 +1045,7 @@ module attributes {
       %i_i64 = arith.index_cast %i : index to i64
       %is_pos = arith.cmpi sgt, %i_i64, %c0_i64 : i64
       %sep:2 = scf.if %is_pos -> (memref<2xi64>, memref<?xi8>) {
-        %sh, %sb = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %sh, %sb = func.call @__ly_unicode_from_valid_utf8(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         %jh, %jb = func.call @LyUnicode_Concat(%rh, %rb, %sh, %sb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%rh) : (memref<2xi64>) -> ()
         func.call @LyUnicode_DecRef(%sh) : (memref<2xi64>) -> ()
@@ -448,7 +1069,7 @@ module attributes {
     }
     %close_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
     %close_dyn = memref.cast %close_ref : memref<1xi8> to memref<?xi8>
-    %cl_h, %cl_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %cl_h, %cl_b = func.call @__ly_unicode_from_valid_utf8(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %out_h, %out_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %cl_h, %cl_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%loop#0) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%cl_h) : (memref<2xi64>) -> ()
@@ -1095,7 +1716,7 @@ module attributes {
     %header = memref.view %block[%zero_index][] {ly.ownership.object_header, ly.ownership.owned_local_object} : memref<?xi8> to memref<3xi64>
     %extended = memref.view %block[%zero_index][] : memref<?xi8> to memref<7xi64>
     %empty_bytes = memref.alloca(%zero_index) : memref<?xi8>
-    %message_header, %message_bytes = func.call @LyUnicode_FromBytes(%empty_bytes, %zero_index, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %message_header, %message_bytes = func.call @__ly_unicode_from_valid_utf8(%empty_bytes, %zero_index, %zero_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %message_ptr_index = memref.extract_aligned_pointer_as_index %message_header : memref<2xi64> -> index
     %message_ptr = arith.index_cast %message_ptr_index : index to i64
 
@@ -1248,7 +1869,7 @@ module attributes {
     %leaf_len = arith.subi %scan#0, %scan#2 : index
     %name_len = arith.index_cast %leaf_len : index to i64
     %name_dyn = memref.cast %buffer : memref<64xi8> to memref<?xi8>
-    %name_h, %name_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %name_h, %name_b = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %name_h, %name_b : memref<2xi64>, memref<?xi8>
   }
 
@@ -1315,10 +1936,10 @@ module attributes {
     %result:2 = scf.if %grouped -> (memref<2xi64>, memref<?xi8>) {
       %c1_i64 = arith.constant 1 : i64
       %c2_i64 = arith.constant 2 : i64
-      %name_h, %name_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %name_h, %name_b = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %lparen_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
       %lparen_dyn = memref.cast %lparen_ref : memref<1xi8> to memref<?xi8>
-      %lp_h, %lp_b = func.call @LyUnicode_FromBytes(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %lp_h, %lp_b = func.call @__ly_unicode_from_valid_utf8(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %head_h, %head_b = func.call @LyUnicode_Concat(%name_h, %name_b, %lp_h, %lp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%name_h) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%lp_h) : (memref<2xi64>) -> ()
@@ -1328,7 +1949,7 @@ module attributes {
       func.call @LyUnicode_DecRef(%msg_h) : (memref<2xi64>) -> ()
       %comma_ref = memref.get_global @__ly_repr_comma : memref<2xi8>
       %comma_dyn = memref.cast %comma_ref : memref<2xi8> to memref<?xi8>
-      %sep0_h, %sep0_b = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %sep0_h, %sep0_b = func.call @__ly_unicode_from_valid_utf8(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %sep0_h, %sep0_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%a_h) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%sep0_h) : (memref<2xi64>) -> ()
@@ -1340,7 +1961,7 @@ module attributes {
       %open_paren_ref = memref.get_global @__ly_repr_lparen : memref<1xi8>
       %open_pick = arith.select %tuple_style, %open_paren_ref, %open_ref : memref<1xi8>
       %open_dyn = memref.cast %open_pick : memref<1xi8> to memref<?xi8>
-      %ob_h, %ob_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %ob_h, %ob_b = func.call @__ly_unicode_from_valid_utf8(%open_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %c_h, %c_b = func.call @LyUnicode_Concat(%b_h, %b_b, %ob_h, %ob_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%b_h) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%ob_h) : (memref<2xi64>) -> ()
@@ -1349,7 +1970,7 @@ module attributes {
         %i_i64 = arith.index_cast %i : index to i64
         %is_pos = arith.cmpi sgt, %i_i64, %zero_i64 : i64
         %sep:2 = scf.if %is_pos -> (memref<2xi64>, memref<?xi8>) {
-          %sh, %sb = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+          %sh, %sb = func.call @__ly_unicode_from_valid_utf8(%comma_dyn, %c0, %c2_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
           %jh, %jb = func.call @LyUnicode_Concat(%rh, %rb, %sh, %sb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
           func.call @LyUnicode_DecRef(%rh) : (memref<2xi64>) -> ()
           func.call @LyUnicode_DecRef(%sh) : (memref<2xi64>) -> ()
@@ -1368,7 +1989,7 @@ module attributes {
       %is_single = arith.cmpi eq, %count, %c1_i64 : i64
       %needs_comma = arith.andi %tuple_style, %is_single : i1
       %joined:2 = scf.if %needs_comma -> (memref<2xi64>, memref<?xi8>) {
-        %comma1_h, %comma1_b = func.call @LyUnicode_FromBytes(%comma_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %comma1_h, %comma1_b = func.call @__ly_unicode_from_valid_utf8(%comma_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         %jc_h, %jc_b = func.call @LyUnicode_Concat(%loop#0, %loop#1, %comma1_h, %comma1_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%comma1_h) : (memref<2xi64>) -> ()
         scf.yield %jc_h, %jc_b : memref<2xi64>, memref<?xi8>
@@ -1381,13 +2002,13 @@ module attributes {
       %close_paren_ref = memref.get_global @__ly_repr_rparen : memref<1xi8>
       %close_pick = arith.select %tuple_style, %close_paren_ref, %close_ref : memref<1xi8>
       %close_dyn = memref.cast %close_pick : memref<1xi8> to memref<?xi8>
-      %cb_h, %cb_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %cb_h, %cb_b = func.call @__ly_unicode_from_valid_utf8(%close_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %d_h, %d_b = func.call @LyUnicode_Concat(%joined#0, %joined#1, %cb_h, %cb_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%joined#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%cb_h) : (memref<2xi64>) -> ()
       %rparen_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
       %rparen_dyn = memref.cast %rparen_ref : memref<1xi8> to memref<?xi8>
-      %rp_h, %rp_b = func.call @LyUnicode_FromBytes(%rparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %rp_h, %rp_b = func.call @__ly_unicode_from_valid_utf8(%rparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %e_h, %e_b = func.call @LyUnicode_Concat(%d_h, %d_b, %rp_h, %rp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%d_h) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%rp_h) : (memref<2xi64>) -> ()
@@ -1399,10 +2020,10 @@ module attributes {
       %preplain:2 = scf.if %args_repr -> (memref<2xi64>, memref<?xi8>) {
         %ac1 = arith.constant 1 : i64
         %ac2 = arith.constant 2 : i64
-        %an_h, %an_b = func.call @LyUnicode_FromBytes(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %an_h, %an_b = func.call @__ly_unicode_from_valid_utf8(%name_dyn, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         %alp_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
         %alp_dyn = memref.cast %alp_ref : memref<1xi8> to memref<?xi8>
-        %alp_h, %alp_b = func.call @LyUnicode_FromBytes(%alp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %alp_h, %alp_b = func.call @__ly_unicode_from_valid_utf8(%alp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         %ah_h, %ah_b = func.call @LyUnicode_Concat(%an_h, %an_b, %alp_h, %alp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%an_h) : (memref<2xi64>) -> ()
         func.call @LyUnicode_DecRef(%alp_h) : (memref<2xi64>) -> ()
@@ -1414,7 +2035,7 @@ module attributes {
           %ai_i64 = arith.index_cast %ai : index to i64
           %ais_pos = arith.cmpi sgt, %ai_i64, %zero_i64 : i64
           %asep:2 = scf.if %ais_pos -> (memref<2xi64>, memref<?xi8>) {
-            %ash, %asb = func.call @LyUnicode_FromBytes(%acomma_dyn, %c0, %ac2) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+            %ash, %asb = func.call @__ly_unicode_from_valid_utf8(%acomma_dyn, %c0, %ac2) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
             %ajh, %ajb = func.call @LyUnicode_Concat(%arh, %arb, %ash, %asb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
             func.call @LyUnicode_DecRef(%arh) : (memref<2xi64>) -> ()
             func.call @LyUnicode_DecRef(%ash) : (memref<2xi64>) -> ()
@@ -1437,7 +2058,7 @@ module attributes {
         }
         %arp_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
         %arp_dyn = memref.cast %arp_ref : memref<1xi8> to memref<?xi8>
-        %arp_h, %arp_b = func.call @LyUnicode_FromBytes(%arp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %arp_h, %arp_b = func.call @__ly_unicode_from_valid_utf8(%arp_dyn, %c0, %ac1) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         %aout_h, %aout_b = func.call @LyUnicode_Concat(%aloop#0, %aloop#1, %arp_h, %arp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%aloop#0) : (memref<2xi64>) -> ()
         func.call @LyUnicode_DecRef(%arp_h) : (memref<2xi64>) -> ()
@@ -1462,13 +2083,13 @@ module attributes {
     %c0 = arith.constant 0 : index
     %c1_i64 = arith.constant 1 : i64
     %zero = arith.constant 0 : i64
-    %name_h, %name_b = func.call @LyUnicode_FromBytes(%name, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %name_h, %name_b = func.call @__ly_unicode_from_valid_utf8(%name, %c0, %name_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %lparen_ref = memref.get_global @__ly_exc_lparen : memref<1xi8>
     %lparen_dyn = memref.cast %lparen_ref : memref<1xi8> to memref<?xi8>
-    %lp_h, %lp_b = func.call @LyUnicode_FromBytes(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %lp_h, %lp_b = func.call @__ly_unicode_from_valid_utf8(%lparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %rparen_ref = memref.get_global @__ly_exc_rparen : memref<1xi8>
     %rparen_dyn = memref.cast %rparen_ref : memref<1xi8> to memref<?xi8>
-    %rp_h, %rp_b = func.call @LyUnicode_FromBytes(%rparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %rp_h, %rp_b = func.call @__ly_unicode_from_valid_utf8(%rparen_dyn, %c0, %c1_i64) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %head_h, %head_b = func.call @LyUnicode_Concat(%name_h, %name_b, %lp_h, %lp_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%name_h) : (memref<2xi64>) -> ()
     func.call @LyUnicode_DecRef(%lp_h) : (memref<2xi64>) -> ()
@@ -1651,11 +2272,11 @@ module attributes {
     } else {
       %open_ref = memref.get_global @__ly_excgroup_str_open : memref<2xi8>
       %open_dyn = memref.cast %open_ref : memref<2xi8> to memref<?xi8>
-      %open_h, %open_b = func.call @LyUnicode_FromBytes(%open_dyn, %c0, %two) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %open_h, %open_b = func.call @__ly_unicode_from_valid_utf8(%open_dyn, %c0, %two) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %count_h, %count_b = func.call @__ly_exc_count_str(%count) : (i64) -> (memref<2xi64>, memref<?xi8>)
       %word_ref = memref.get_global @__ly_excgroup_str_word : memref<14xi8>
       %word_dyn = memref.cast %word_ref : memref<14xi8> to memref<?xi8>
-      %word_h, %word_b = func.call @LyUnicode_FromBytes(%word_dyn, %c0, %fourteen) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %word_h, %word_b = func.call @__ly_unicode_from_valid_utf8(%word_dyn, %c0, %fourteen) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %a_h, %a_b = func.call @LyUnicode_Concat(%message_header, %message_bytes, %open_h, %open_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%open_h) : (memref<2xi64>) -> ()
       %b_h, %b_b = func.call @LyUnicode_Concat(%a_h, %a_b, %count_h, %count_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
@@ -1668,7 +2289,7 @@ module attributes {
       %d:2 = scf.if %is_plural -> (memref<2xi64>, memref<?xi8>) {
         %s_ref = memref.get_global @__ly_excgroup_str_plural : memref<1xi8>
         %s_dyn = memref.cast %s_ref : memref<1xi8> to memref<?xi8>
-        %s_h, %s_b = func.call @LyUnicode_FromBytes(%s_dyn, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+        %s_h, %s_b = func.call @__ly_unicode_from_valid_utf8(%s_dyn, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
         %p_h, %p_b = func.call @LyUnicode_Concat(%c_h, %c_b, %s_h, %s_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
         func.call @LyUnicode_DecRef(%s_h) : (memref<2xi64>) -> ()
         scf.yield %p_h, %p_b : memref<2xi64>, memref<?xi8>
@@ -1679,7 +2300,7 @@ module attributes {
       func.call @LyUnicode_DecRef(%c_h) : (memref<2xi64>) -> ()
       %close_ref = memref.get_global @__ly_excgroup_str_close : memref<1xi8>
       %close_dyn = memref.cast %close_ref : memref<1xi8> to memref<?xi8>
-      %close_h, %close_b = func.call @LyUnicode_FromBytes(%close_dyn, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %close_h, %close_b = func.call @__ly_unicode_from_valid_utf8(%close_dyn, %c0, %one) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       %e_h, %e_b = func.call @LyUnicode_Concat(%d#0, %d#1, %close_h, %close_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
       func.call @LyUnicode_DecRef(%d#0) : (memref<2xi64>) -> ()
       func.call @LyUnicode_DecRef(%close_h) : (memref<2xi64>) -> ()

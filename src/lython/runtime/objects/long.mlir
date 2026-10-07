@@ -9,6 +9,7 @@ module attributes {
   ly.runtime.contracts = ["builtins.int"]
 } {
   // ===== declared here, defined in another runtime file or built by the lowering =====
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyBaseException_Init(%header: memref<3xi64> {ly.ownership.object_header}, %old_message_header: memref<2xi64> {ly.ownership.object_header}, %old_message_bytes: memref<?xi8>, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.ownership.release_args = [1], ly.ownership.transfer_args = [0, 3], ly.runtime.contract = "builtins.BaseException", ly.runtime.method = "__init__", ly.runtime.result_evidence = "receiver"}
   func.func private @LyBaseException_New(%class_id: i64 {ly.runtime.class_id_argument}) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 5 : i64, ly.runtime.contract = "builtins.BaseException", ly.runtime.initializer = "__new__"}
   func.func private @LyEH_ThrowException(%header: memref<3xi64> {ly.ownership.object_header}, %message_header: memref<2xi64> {ly.ownership.object_header}, %message_bytes: memref<?xi8>) attributes {ly.ownership.transfer_args = [0, 1], ly.runtime.contract = "builtins.BaseException", ly.runtime.primitive = "raise"}
@@ -1569,7 +1570,7 @@ module attributes {
     %prefix_length = arith.constant 40 : i64
     %prefix_static = memref.get_global @__ly_long_msg_invalid_int_literal_prefix : memref<40xi8>
     %prefix_bytes = memref.cast %prefix_static : memref<40xi8> to memref<?xi8>
-    %prefix_h, %prefix_b = func.call @LyUnicode_FromBytes(%prefix_bytes, %start, %prefix_length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %prefix_h, %prefix_b = func.call @__ly_unicode_from_valid_utf8(%prefix_bytes, %start, %prefix_length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %quoted_h, %quoted_b = func.call @LyUnicode_Repr(%subject_header, %subject_bytes) : (memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     %full_h, %full_b = func.call @LyUnicode_Concat(%prefix_h, %prefix_b, %quoted_h, %quoted_b) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
     func.call @LyUnicode_DecRef(%prefix_h) : (memref<2xi64>) -> ()
@@ -3712,7 +3713,7 @@ module attributes {
       }
       %length_index = arith.subi %decimal_capacity_index, %start : index
       %length = arith.index_cast %length_index : index to i64
-      %h, %b = func.call @LyUnicode_FromBytes(%buffer, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+      %h, %b = func.call @__ly_unicode_from_valid_utf8(%buffer, %start, %length) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
       memref.dealloc %buffer : memref<?xi8>
       memref.dealloc %tmp : memref<?xi32>
       scf.yield %h, %b : memref<2xi64>, memref<?xi8>
@@ -4082,7 +4083,7 @@ module attributes {
       %dst = arith.addi %digits_start, %k : index
       memref.store %ch, %buffer[%dst] : memref<?xi8>
     }
-    %h, %b = func.call @LyUnicode_FromBytes(%buffer, %c0, %total) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %h, %b = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %total) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     func.return %h, %b : memref<2xi64>, memref<?xi8>
   }
 }

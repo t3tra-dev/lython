@@ -100,6 +100,7 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">, !py.contract<"builtins.int">], arg_names = ["n", "k"], arg_defaults = [false, false], returns = [!py.contract<"builtins.int">]>
   ]
 } {
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyFloat_AsF64(%header: memref<3xi64> {ly.ownership.object_header}) -> f64 attributes {ly.runtime.contract = "builtins.float", ly.runtime.method = "__float__", ly.runtime.primitive = "unbox.f64"}
   func.func private @LyFloat_FromF64(%value: f64 {ly.runtime.default_f64 = 0.0 : f64}) -> memref<3xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.float", ly.runtime.initializer = "__new__"}
   func.func private @LyLong_AsI64(%header: memref<2xi64> {ly.ownership.object_header}) -> i64 attributes {ly.runtime.contract = "builtins.int", ly.runtime.primitive = "unbox.i64"}
@@ -128,7 +129,7 @@ module attributes {
   func.func private @__ly_math_domain_raise(%prefix_bytes: memref<?xi8>, %prefix_len: i64, %value: f64) {
     %c0 = arith.constant 0 : index
     %class_id = arith.constant 53 : i64
-    %ph, %pb = func.call @LyUnicode_FromBytes(%prefix_bytes, %c0, %prefix_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %ph, %pb = func.call @__ly_unicode_from_valid_utf8(%prefix_bytes, %c0, %prefix_len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %value_header = func.call @LyFloat_FromF64(%value) : (f64) -> memref<3xi64>
     %vh, %vb = func.call @LyFloat_Repr(%value_header) : (memref<3xi64>) -> (memref<2xi64>, memref<?xi8>)
     %mh, %mb = func.call @LyUnicode_Concat(%ph, %pb, %vh, %vb) : (memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<2xi64>, memref<?xi8>)
@@ -189,7 +190,7 @@ module attributes {
     %class_id = arith.constant 53 : i64
     %msg_ref = memref.get_global @__ly_math_factorial_msg : memref<43xi8>
     %msg_dyn = memref.cast %msg_ref : memref<43xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -203,7 +204,7 @@ module attributes {
     %class_id = arith.constant 53 : i64
     %msg_ref = memref.get_global @__ly_math_isqrt_msg : memref<36xi8>
     %msg_dyn = memref.cast %msg_ref : memref<36xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -217,7 +218,7 @@ module attributes {
     %class_id = arith.constant 53 : i64
     %msg_ref = memref.get_global @__ly_math_n_msg : memref<32xi8>
     %msg_dyn = memref.cast %msg_ref : memref<32xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -239,7 +240,7 @@ module attributes {
     %n_dyn = memref.cast %n_ref : memref<32xi8> to memref<?xi8>
     %k_dyn = memref.cast %k_ref : memref<32xi8> to memref<?xi8>
     %msg_dyn = arith.select %blame_k, %k_dyn, %n_dyn : memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -252,7 +253,7 @@ module attributes {
     %class_id = arith.constant 53 : i64
     %msg_ref = memref.get_global @__ly_math_k_msg : memref<32xi8>
     %msg_dyn = memref.cast %msg_ref : memref<32xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -553,7 +554,7 @@ module attributes {
     %class_id = arith.constant 104 : i64
     %msg_ref = memref.get_global @__ly_math_range_msg : memref<16xi8>
     %msg_dyn = memref.cast %msg_ref : memref<16xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyOverflowError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyOverflowError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyOverflowError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -596,7 +597,7 @@ module attributes {
     %class_id = arith.constant 53 : i64
     %msg_ref = memref.get_global @__ly_math_domain_msg : memref<17xi8>
     %msg_dyn = memref.cast %msg_ref : memref<17xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()
@@ -718,7 +719,7 @@ module attributes {
     %class_id = arith.constant 53 : i64
     %msg_ref = memref.get_global @__ly_math_msg_negative_tolerance : memref<31xi8>
     %msg_dyn = memref.cast %msg_ref : memref<31xi8> to memref<?xi8>
-    %mh, %mb = func.call @LyUnicode_FromBytes(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %mh, %mb = func.call @__ly_unicode_from_valid_utf8(%msg_dyn, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     %exc:3 = func.call @LyValueError_New(%class_id) : (i64) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     %init:3 = func.call @LyValueError_Init(%exc#0, %exc#1, %exc#2, %mh, %mb) : (memref<3xi64>, memref<2xi64>, memref<?xi8>, memref<2xi64>, memref<?xi8>) -> (memref<3xi64>, memref<2xi64>, memref<?xi8>)
     func.call @LyValueError_Raise(%init#0, %init#1, %init#2) : (memref<3xi64>, memref<2xi64>, memref<?xi8>) -> ()

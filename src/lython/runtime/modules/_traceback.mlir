@@ -68,6 +68,7 @@ module attributes {
     !py.callable<[!py.contract<"builtins.int">], arg_names = ["level"], arg_defaults = [false], returns = [!py.contract<"builtins.int">]>
   ]
 } {
+  func.func private @__ly_unicode_from_valid_utf8(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_result_contracts = ["builtins.str"], ly.ownership.owned_results = [0]}
   func.func private @LyLong_FromI64(%value: i64) -> memref<2xi64> attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 2 : i64, ly.runtime.contract = "builtins.int", ly.runtime.initializer = "__new__"}
   func.func private @LyUnicode_FromBytes(%bytes: memref<?xi8>, %start: index, %len: i64) -> (memref<2xi64>, memref<?xi8>) attributes {ly.ownership.owned_results = [0], ly.runtime.class_id = 4 : i64, ly.runtime.contract = "builtins.str", ly.runtime.initializer = "__new__"}
 
@@ -127,7 +128,7 @@ module attributes {
     %len_index = arith.index_cast %len : i64 to index
     %buffer = memref.alloc(%len_index) : memref<?xi8>
     func.call @LyTraceback_FrameFileCopy(%index, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
-    %header, %bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
@@ -138,7 +139,7 @@ module attributes {
     %len_index = arith.index_cast %len : i64 to index
     %buffer = memref.alloc(%len_index) : memref<?xi8>
     func.call @LyTraceback_FrameNameCopy(%index, %buffer, %len) : (i64, memref<?xi8>, i64) -> ()
-    %header, %bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
@@ -153,7 +154,7 @@ module attributes {
     %len_index = arith.index_cast %len : i64 to index
     %buffer = memref.alloc(%len_index) : memref<?xi8>
     func.call @LyTraceback_ExcLineCopy(%buffer, %len) : (memref<?xi8>, i64) -> ()
-    %header, %bytes = func.call @LyUnicode_FromBytes(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
+    %header, %bytes = func.call @__ly_unicode_from_valid_utf8(%buffer, %c0, %len) : (memref<?xi8>, index, i64) -> (memref<2xi64>, memref<?xi8>)
     memref.dealloc %buffer : memref<?xi8>
     func.return %header, %bytes : memref<2xi64>, memref<?xi8>
   }
